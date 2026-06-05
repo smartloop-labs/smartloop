@@ -34,8 +34,8 @@ class ProjectsCommand(Command):
         project_model_name = getattr(self.args, "model", None)
         project_dev_token = getattr(self.args, "developer_token", None) or self.developer_token
         try:
-            # Bind the project to the directory the CLI was invoked from
-            # (honors -C/--path, which has already chdir'd the process).
+            # Bind the project to the resolved working directory (-C/--path, or
+            # the ~/smartloop default). Sent as cwd; the server creates it.
             payload = {"name": self.args.name, "cwd": self.project_dir}
             if project_model_name:
                 payload["model_name"] = project_model_name

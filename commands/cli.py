@@ -98,7 +98,7 @@ def main():
     parser.add_argument("--resume", metavar="CONVERSATION_ID", default=None,
                         help="Resume a previous conversation by session ID")
     parser.add_argument("-C", "--path", default=None, metavar="PATH",
-                        help="Working directory to use (defaults to current directory)")
+                        help="Working directory to use (defaults to ~/smartloop or ~/smartloop/<project>)")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
  
     # Run command
