@@ -4,7 +4,7 @@ set -euo pipefail
 # Restore cursor visibility on any exit (crash during download progress)
 trap 'printf "\033[?25h" 2>/dev/null' EXIT
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 BASE_URL="https://github.com/smartloop-ai/smartloop/releases/download/v${VERSION}"
 BASE_DIR="$HOME/.smartloop"
 INSTALL_DIR="${BASE_DIR}/${VERSION}"
