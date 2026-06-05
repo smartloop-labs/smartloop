@@ -44,10 +44,28 @@ jobs:
       - name: Build relocatable distribution + archive
         run: make archive CUDA=1
 
-      - name: Verify (relocation test)
+      # Relocate + static GPU-packaging checks. CI has no NVIDIA driver, so we
+      # can't actually offload here — instead we assert the build HAS GPU
+      # bindings and the CUDA 12 runtime is bundled, so it works on a real GPU.
+      - name: Verify (relocation + GPU packaging)
         run: |
+          set -euo pipefail
           mkdir -p /tmp/relocate && tar -xzf linux-amd64-slp.tar.gz -C /tmp/relocate
-          /tmp/relocate/slp-app/bin/slp --version
+          APP=/tmp/relocate/slp-app
+          "$APP/bin/slp" --version
+          LIBDIR="$("$APP/python/bin/python3" -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')"
+          echo "llama lib dir: $LIBDIR"
+          # 1. GPU backend compiled in (else the build silently went CPU-only)
+          test -f "$LIBDIR/libggml-cuda.so" || { echo "FAIL: libggml-cuda.so missing — CPU-only build"; exit 1; }
+          # 2. CUDA 12 runtime bundled next to it ($ORIGIN-discoverable on the user's box)
+          for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+            test -e "$LIBDIR/$so" || { echo "FAIL: $so not bundled into the archive"; exit 1; }
+          done
+          # 3. Resolved against the bundle alone, only the GPU *driver* (libcuda.so.1,
+          #    always present on the user's GPU box) may be unresolved — nothing else.
+          missing="$(LD_LIBRARY_PATH="$LIBDIR" ldd "$LIBDIR/libggml-cuda.so" | awk '/not found/{print $1}' | grep -vxF 'libcuda.so.1' || true)"
+          if [ -n "$missing" ]; then echo "FAIL: unresolved non-driver deps:"; echo "$missing"; exit 1; fi
+          echo "OK: GPU bindings present, CUDA runtime bundled; only the driver is external."
 
       - name: Compute SHA256
         run: sha256sum linux-amd64-slp.tar.gz | tee linux-amd64-sha256.txt

@@ -144,6 +144,14 @@ else
     LLAMA_VARIANT := cpu
 endif
 
+# A CUDA build = the cu124 variant (CUDA=1 or an NVIDIA GPU present). Used to
+# decide whether `dist` bundles the CUDA 12 runtime into the relocatable archive.
+ifeq ($(LLAMA_VARIANT),cu124)
+    LLAMA_IS_CUDA := yes
+else
+    LLAMA_IS_CUDA := no
+endif
+
 # Local-version tags for OUR (gcp) wheels, e.g. 0.3.25+cu124. Off by default
 # (single untagged wheel per platform); enable with LLAMA_VARIANT_TAGS=1.
 LLAMA_VARIANT_TAGS ?=
@@ -244,6 +252,20 @@ dist: ensure-uv
 	uv pip install --python "$(APP_PY)" -r requirements.txt; \
 	echo "=== [3/5] Installing llama-cpp-python ==="; \
 	$(LLAMA_DIST_CMD); \
+	echo "--- Bundling CUDA runtime libraries (GPU build) ---"; \
+	if [ "$(LLAMA_IS_CUDA)" = "yes" ] && [ "$(PLATFORM)" = "linux" ]; then \
+	  LLAMA_LIB="$$("$(APP_PY)" -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')"; \
+	  CUDA_SO="$$LLAMA_LIB/libggml-cuda.so"; \
+	  [ -f "$$CUDA_SO" ] || { echo "ERROR: $$CUDA_SO missing — llama-cpp was built CPU-only (no GPU bindings)"; exit 1; }; \
+	  for soname in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do \
+	    src="$$(ldd "$$CUDA_SO" | awk -v s="$$soname" '$$1==s{print $$3}')"; \
+	    [ -n "$$src" ] && [ -e "$$src" ] || { echo "ERROR: $$soname not resolvable at build time — install the CUDA 12 runtime"; exit 1; }; \
+	    cp -aL "$$src" "$$LLAMA_LIB/$$soname"; \
+	    echo "  bundled $$soname  <-  $$src"; \
+	  done; \
+	else \
+	  echo "  skip (non-CUDA or non-Linux build)"; \
+	fi; \
 	echo "=== [4/5] Installing slp (non-editable) ==="; \
 	uv pip install --python "$(APP_PY)" --no-deps . ; \
 	echo "=== [5/5] Writing relocatable launcher ==="; \
