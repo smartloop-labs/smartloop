@@ -24,6 +24,11 @@ CHECKSUMS_FILE=""
 # Framework cache directory
 CACHE_DIR="${HOME}/.cache/smartloop"
 
+# Temp workspace. /tmp is often small or quota-limited, and the large release
+# archives won't fit there. Route all temp files (mktemp, curl, tar) here
+# instead. Override with: SMARTLOOP_TMPDIR=/path/with/space ./install.sh
+WORK_DIR="${SMARTLOOP_TMPDIR:-${BASE_DIR}/tmp}"
+
 error() { echo -e "${RED}Error:${NC} $1" >&2; exit 1; }
 
 detect_platform() {
@@ -371,6 +376,12 @@ install_smartloop() {
     detect_platform
     echo -e "${MUTED}Reading package lists... Done${NC}"
 
+    # Route temp files off /tmp so mktemp scratch files and the multi-GB
+    # download/extract land on a filesystem with space. Every mktemp call
+    # below, plus curl and tar, inherits this via $TMPDIR.
+    mkdir -p "$WORK_DIR" || error "Cannot create temp directory: $WORK_DIR"
+    export TMPDIR="$WORK_DIR"
+
     # Skip download + extract if this version is already installed
     local slp_existing="${INSTALL_DIR}/bin/slp"
     [ "$OS" = "windows" ] && slp_existing="${INSTALL_DIR}/bin/slp.cmd"
@@ -471,8 +482,10 @@ LAUNCHER
         port="$(cat "$port_file")"
     fi
 
+    # First start loads heavy deps (torch/CUDA), so allow plenty of time.
+    local max_attempts=90
     local attempts=0
-    while [ $attempts -lt 15 ]; do
+    while [ $attempts -lt $max_attempts ]; do
         if curl -sf "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
             echo -e "${GREEN}Service started${NC}"
             break
@@ -484,7 +497,7 @@ LAUNCHER
         attempts=$((attempts + 1))
     done
 
-    if [ $attempts -ge 15 ]; then
+    if [ $attempts -ge $max_attempts ]; then
         echo -e "${RED}Service did not start in time. Run 'slp status' to check.${NC}"
     fi
 

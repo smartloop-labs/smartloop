@@ -39,7 +39,8 @@ uninstall_smartloop() {
     # Unload launchd user agent (macOS)
     if [ -f "$LAUNCHD_PLIST" ]; then
         info "Unloading smartloop launchd user agent..."
-        launchctl bootout "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || \
+        launchctl bootout "gui/$(id -u)/com.smartloop.server" 2>/dev/null || \
+            launchctl bootout "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || \
             launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
         rm -f "$LAUNCHD_PLIST"
         info "Launchd user agent removed"
@@ -54,13 +55,26 @@ uninstall_smartloop() {
         info "Legacy launchd daemon removed"
     fi
 
-    # Kill any remaining slp processes
-    if pkill -f "${INSTALL_DIR}/slp" 2>/dev/null; then
-        info "Stopped running slp processes"
-        sleep 1
-        # Force kill if still running
-        pkill -9 -f "${INSTALL_DIR}/slp" 2>/dev/null || true
-    fi
+    # Kill any remaining smartloop processes. The launcher execs into
+    # "python -m commands.cli", so the live process no longer carries "slp"
+    # in its argv — "${INSTALL_DIR}/slp" never matches it. Match the install
+    # path (the bundled python lives under it) and the module name instead.
+    info "Stopping any running smartloop processes..."
+    pkill -f "$INSTALL_DIR"   2>/dev/null || true
+    pkill -f "commands.cli"   2>/dev/null || true
+
+    # Wait for them to actually exit. While a process is alive it keeps
+    # recreating files (server.port, logs) inside $INSTALL_DIR, so rm -rf
+    # races and the final rmdir fails with "Directory not empty".
+    for _ in $(seq 1 10); do
+        if ! pgrep -f "$INSTALL_DIR" >/dev/null 2>&1 && \
+           ! pgrep -f "commands.cli" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+    done
+    pkill -9 -f "$INSTALL_DIR"  2>/dev/null || true
+    pkill -9 -f "commands.cli"  2>/dev/null || true
 
     # Remove symlinks
     for link in "$HOME/.local/bin/slp" /usr/local/bin/slp; do
@@ -73,7 +87,11 @@ uninstall_smartloop() {
     # Remove install directory
     if [ -d "$INSTALL_DIR" ]; then
         info "Removing ${INSTALL_DIR}..."
-        rm -rf "$INSTALL_DIR"
+        chflags -R nouchg "$INSTALL_DIR" 2>/dev/null || true   # clear macOS immutable (uchg) flags
+        rm -rf "$INSTALL_DIR" 2>/dev/null || true
+        if [ -d "$INSTALL_DIR" ]; then
+            error "Could not fully remove ${INSTALL_DIR} (still contains: $(ls -A "$INSTALL_DIR" 2>/dev/null | tr '\n' ' ')). A process may still be writing to it — run 'pkill -9 -f commands.cli' then 'rm -rf \"${INSTALL_DIR}\"'."
+        fi
     fi
 
     # Remove cache directory
