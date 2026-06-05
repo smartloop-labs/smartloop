@@ -42,7 +42,7 @@ jobs:
           echo "CUDA_HOME=/usr/local/cuda-12.6" >> $GITHUB_ENV
 
       - name: Build relocatable distribution + archive
-        run: make archive CUDA=1
+        run: make archive CUDA=1 LLAMA_BUILD=prebuilt
 
       # Relocate + static GPU-packaging checks. CI has no NVIDIA driver, so we
       # can't actually offload here — instead we assert the build HAS GPU
@@ -160,7 +160,7 @@ jobs:
         run: choco install make -y
 
       - name: Build relocatable distribution + archive
-        run: make archive CUDA=1
+        run: make archive CUDA=1 LLAMA_BUILD=prebuilt
 
       - name: Verify (relocation test)
         run: |

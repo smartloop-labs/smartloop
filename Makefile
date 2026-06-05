@@ -126,14 +126,6 @@ LLAMA_VERSION ?= 0.3.25
 
 # Backend for this host: Apple -> metal, NVIDIA/CUDA -> cu124, else cpu.
 LLAMA_HAS_NVIDIA := $(shell command -v nvidia-smi >/dev/null 2>&1 && echo yes || echo no)
-# Does this x86 host support AVX-512? abetlen's prebuilt wheels are AVX-512, so
-# on a host without it (Meteor Lake / consumer Intel 12th-gen+) they install but
-# SIGILL at runtime — we must source-build (GGML_NATIVE=OFF) instead.
-ifeq ($(ARCH),amd64)
-    HOST_AVX512 := $(shell grep -qm1 avx512 /proc/cpuinfo 2>/dev/null && echo yes || echo no)
-else
-    HOST_AVX512 := yes
-endif
 ifeq ($(PLATFORM),darwin)
     LLAMA_VARIANT := metal
 else ifeq ($(CUDA),1)
@@ -178,9 +170,10 @@ else
     LLAMA_SPEC       = llama-cpp-python==$(LLAMA_VERSION)
 endif
 
-# Install strategy: auto = try prebuilt, else source-build (GGML_NATIVE=OFF, the
-# end user never compiles — this runs at `make dist` time). Force with
-# LLAMA_BUILD=prebuilt|source.
+# Install strategy: auto = prebuilt wheel, falling back to a source build only
+# if no wheel exists for this platform. abetlen's current wheels are portable
+# (GGML_NATIVE=OFF, no AVX-512), so a prebuilt CUDA wheel runs on any x86-64-v2+
+# CPU — no need to compile for non-AVX-512 hosts. Force with LLAMA_BUILD=prebuilt|source.
 LLAMA_BUILD ?= auto
 LLAMA_PREBUILT_CMD = uv pip install --python "$(APP_PY)" --reinstall-package llama-cpp-python \
                      --only-binary llama-cpp-python --index-url="$(LLAMA_INDEX_URL)" \
@@ -193,10 +186,6 @@ ifeq ($(LLAMA_BUILD),source)
     LLAMA_DIST_CMD = $(LLAMA_SOURCE_CMD)
 else ifeq ($(LLAMA_BUILD),prebuilt)
     LLAMA_DIST_CMD = $(LLAMA_PREBUILT_CMD)
-else ifeq ($(LLAMA_PREBUILT)-$(HOST_AVX512),abetlen-no)
-    # abetlen wheels are AVX-512 but this host has none — they'd SIGILL here.
-    # Source-build (GGML_NATIVE=OFF, gcc-13 for CUDA) so it runs on this CPU.
-    LLAMA_DIST_CMD = $(LLAMA_SOURCE_CMD)
 else
     LLAMA_DIST_CMD = $(LLAMA_PREBUILT_CMD) || { echo ">> prebuilt llama wheel unavailable for $(PLATFORM)/$(ARCH) — building from source"; $(LLAMA_SOURCE_CMD); }
 endif
