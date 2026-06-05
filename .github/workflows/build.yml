@@ -1,0 +1,213 @@
+name: Build & Publish
+
+# Produces a relocatable standalone-CPython distribution per platform via
+# `make archive`. The exact same target runs locally:
+#     make archive            # CPU
+#     make archive CUDA=1     # GPU
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (e.g. v1.0.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      # uv fetches the standalone CPython and drives the installs. No system
+      # Python needed — the interpreter is bundled into the artifact.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install CUDA toolkit
+        run: |
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-12-6
+
+      - name: Set CUDA environment
+        run: |
+          echo "/usr/local/cuda-12.6/bin" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "CUDA_HOME=/usr/local/cuda-12.6" >> $GITHUB_ENV
+
+      - name: Build relocatable distribution + archive
+        run: make archive CUDA=1
+
+      - name: Verify (relocation test)
+        run: |
+          mkdir -p /tmp/relocate && tar -xzf linux-amd64-slp.tar.gz -C /tmp/relocate
+          /tmp/relocate/slp-app/bin/slp --version
+
+      - name: Compute SHA256
+        run: sha256sum linux-amd64-slp.tar.gz | tee linux-amd64-sha256.txt
+
+      # GitHub release assets are capped at 2 GB; the CUDA build is larger, so
+      # split into parts (install.sh reassembles). Hosting on GCS removes this.
+      - name: Split archive into parts
+        run: |
+          split -b 1900m linux-amd64-slp.tar.gz linux-amd64-slp.tar.gz.part-
+          ls -lh linux-amd64-slp.tar.gz.part-*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64-slp
+          path: |
+            linux-amd64-slp.tar.gz.part-*
+            linux-amd64-sha256.txt
+
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Import Apple certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security import $CERTIFICATE_PATH -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+      # `release` = dist + sign + notarize + archive (macOS uses Metal; no CUDA).
+      - name: Build, sign, notarize, archive
+        env:
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: make release
+
+      - name: Verify (relocation test)
+        run: |
+          mkdir -p /tmp/relocate && tar -xzf darwin-arm64-slp.tar.gz -C /tmp/relocate
+          /tmp/relocate/slp-app/bin/slp --version
+
+      - name: Compute SHA256
+        run: shasum -a 256 darwin-arm64-slp.tar.gz | tee darwin-arm64-sha256.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-arm64-slp
+          path: |
+            darwin-arm64-slp.tar.gz
+            darwin-arm64-sha256.txt
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash          # Git Bash: provides tar/split/sha256sum + the make recipe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.6.0'
+
+      - name: Install make
+        run: choco install make -y
+
+      - name: Build relocatable distribution + archive
+        run: make archive CUDA=1
+
+      - name: Verify (relocation test)
+        run: |
+          mkdir -p /tmp/relocate && tar -xzf windows-amd64-slp.tar.gz -C /tmp/relocate
+          /tmp/relocate/slp-app/python/python.exe -m commands.cli --version
+
+      - name: Compute SHA256
+        run: sha256sum windows-amd64-slp.tar.gz | tee windows-amd64-sha256.txt
+
+      - name: Split archive into parts
+        run: |
+          split -b 1900m windows-amd64-slp.tar.gz windows-amd64-slp.tar.gz.part-
+          ls -lh windows-amd64-slp.tar.gz.part-*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-amd64-slp
+          path: |
+            windows-amd64-slp.tar.gz.part-*
+            windows-amd64-sha256.txt
+
+  publish:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64-slp
+          path: artifacts/linux-amd64
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: darwin-arm64-slp
+          path: artifacts/darwin-arm64
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-amd64-slp
+          path: artifacts/windows-amd64
+
+      - name: Prepare release assets
+        run: |
+          mv artifacts/linux-amd64/linux-amd64-slp.tar.gz.part-* .
+          mv artifacts/darwin-arm64/darwin-arm64-slp.tar.gz .
+          mv artifacts/windows-amd64/windows-amd64-slp.tar.gz.part-* .
+          ls -lh *-slp.tar.gz*
+
+      - name: Generate checksums
+        run: sha256sum *-slp.tar.gz* > checksums-sha256.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.tag }}" \
+            --repo smartloop-ai/smartloop \
+            --title "${{ inputs.tag }}" \
+            --generate-notes \
+            linux-amd64-slp.tar.gz.part-* \
+            darwin-arm64-slp.tar.gz \
+            windows-amd64-slp.tar.gz.part-* \
+            checksums-sha256.txt
