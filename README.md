@@ -9,7 +9,7 @@
 </p>
 <p align="center">Local agent harness for your documents. Extract information, generate content on your device</p>
 <p align="center">
-  <img src="https://img.shields.io/github/actions/workflow/status/smartloop-ai/smartloop-tui/release.yml"/>
+  <img src="https://img.shields.io/github/actions/workflow/status/smartloop-ai/smartloop/release.yml"/>
 </p>
 
 <img alt="Smartloop Demo" src="demo.gif" />
@@ -72,8 +72,6 @@ options:
 > [!TIP]
 > You can generate a developer token from the [Console](https://app.smartloop.ai/).
 
-
-### Usage
 
 Use it to extract information from your personal documents and do tasks for you, like writing guidelines, creating recipes, etc. Build up skills for more specialized tasks like creating events, tickets, connecting external systems, or summarizing a blog post.
 
