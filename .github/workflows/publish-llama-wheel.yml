@@ -1,0 +1,52 @@
+name: Publish portable llama-cpp wheel
+
+# Builds the AVX-512-free CUDA llama-cpp-python wheel from source and publishes it
+# to our private Artifact Registry, so the release build (build.yml) pulls it
+# instead of recompiling (~30 min) on every run.
+#
+# Runs on ubuntu-22.04 for a glibc 2.35 floor — the wheel then runs on any distro
+# with glibc >= 2.35 (Ubuntu 22.04+, Debian 12+, RHEL/Alma 9+). No Docker/manylinux
+# needed. If you must support older glibc (e.g. RHEL 8 / 2.28), build in a
+# manylinux_2_28 CUDA container instead. Building on the dev box does NOT work:
+# its glibc (2.43) is newer than the runners and most user machines.
+on:
+  workflow_dispatch:
+    inputs:
+      llama_version:
+        description: 'llama-cpp-python version to build'
+        required: false
+        default: '0.3.25'
+
+permissions:
+  contents: read
+  id-token: write   # for google-github-actions/auth Workload Identity Federation
+
+jobs:
+  publish-linux-cuda:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.6.0'
+          method: 'network'
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_PUBLISH_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      # make llama-wheel builds GGML_NATIVE=OFF / GGML_AVX512=OFF (portable CPU
+      # backend) with CUDA on; PUBLISH=1 twine-uploads to the gcp repo using the
+      # gcloud access token from the auth step above.
+      - name: Build + publish portable wheel
+        run: make llama-wheel CUDA=1 PUBLISH=1 LLAMA_VERSION=${{ inputs.llama_version }}
