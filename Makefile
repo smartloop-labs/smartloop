@@ -299,7 +299,10 @@ publish-wheel:
 	echo "=== Publishing $(WHEEL_DIR)/*.whl -> $(LLAMA_REPO) ==="; \
 	uvx twine upload --repository-url $(LLAMA_REPO) \
 	  --username oauth2accesstoken --password "$$(gcloud auth print-access-token)" \
-	  --skip-existing $(WHEEL_DIR)/*.whl
+	  $(WHEEL_DIR)/*.whl
+	@echo "NOTE: Artifact Registry rejects re-uploading an existing version (no"
+	@echo "      --skip-existing support). Bump LLAMA_VERSION or delete the old"
+	@echo "      version first if you need to republish."
 
 venv:
 	@if [ ! -d "$(VENV)" ]; then \
