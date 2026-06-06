@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write   # for google-github-actions/auth Workload Identity Federation
 
 jobs:
   build-linux:
@@ -41,8 +42,24 @@ jobs:
           echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "CUDA_HOME=/usr/local/cuda-12.6" >> $GITHUB_ENV
 
+      # Pull our portable CUDA wheel (GGML_NATIVE=OFF, AVX512=OFF) from the private
+      # Artifact Registry instead of source-building (~30-min CUDA compile). The
+      # wheel runs on any x86-64-v2+ CPU. Publish/refresh it with:
+      #     make llama-wheel CUDA=1 PUBLISH=1
+      # The CUDA toolkit steps above are still required: `dist` bundles the CUDA 12
+      # runtime (libcudart/libcublas/libcublasLt) by resolving them from the system
+      # via ldd — our wheel links CUDA dynamically and does not vendor those libs.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
       - name: Build relocatable distribution + archive
-        run: make archive CUDA=1 LLAMA_BUILD=prebuilt
+        run: make archive CUDA=1 LLAMA_PREBUILT=gcp LLAMA_BUILD=prebuilt
 
       # Relocate + static GPU-packaging checks. CI has no NVIDIA driver, so we
       # can't actually offload here — instead we assert the build HAS GPU
@@ -159,8 +176,12 @@ jobs:
       - name: Install make
         run: choco install make -y
 
+      # Stays on source build: only a linux cu124 wheel is published to gcp so far.
+      # To move this job to gcp too, publish a Windows wheel (`make llama-wheel
+      # CUDA=1 PUBLISH=1` on a Windows+CUDA host), then mirror the auth + setup-gcloud
+      # steps from build-linux and switch this to LLAMA_PREBUILT=gcp LLAMA_BUILD=prebuilt.
       - name: Build relocatable distribution + archive
-        run: make archive CUDA=1 LLAMA_BUILD=prebuilt
+        run: make archive CUDA=1 LLAMA_BUILD=source
 
       - name: Verify (relocation test)
         run: |

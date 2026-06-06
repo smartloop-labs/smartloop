@@ -171,9 +171,10 @@ else
 endif
 
 # Install strategy: auto = prebuilt wheel, falling back to a source build only
-# if no wheel exists for this platform. abetlen's current wheels are portable
-# (GGML_NATIVE=OFF, no AVX-512), so a prebuilt CUDA wheel runs on any x86-64-v2+
-# CPU — no need to compile for non-AVX-512 hosts. Force with LLAMA_BUILD=prebuilt|source.
+# if no wheel exists for this platform. NOTE: abetlen's cu124 wheels are built
+# WITH AVX-512 (verified: EVEX ops in ggml_cpu_init) and SIGILL on CPUs without
+# it — so on non-AVX-512 hosts use LLAMA_PREBUILT=gcp (our portable wheel) or
+# LLAMA_BUILD=source. Force the path with LLAMA_BUILD=prebuilt|source.
 LLAMA_BUILD ?= auto
 LLAMA_PREBUILT_CMD = uv pip install --python "$(APP_PY)" --reinstall-package llama-cpp-python \
                      --only-binary llama-cpp-python --index-url="$(LLAMA_INDEX_URL)" \
