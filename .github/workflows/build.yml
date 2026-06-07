@@ -28,26 +28,43 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Install CUDA toolkit
+      - name: Install CUDA runtime libraries
         run: |
           wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y cuda-toolkit-12-6
+          sudo apt-get install -y libcudart-12-4 libcublas-12-4
 
       - name: Set CUDA environment
         run: |
-          echo "/usr/local/cuda-12.6/bin" >> $GITHUB_PATH
-          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-          echo "CUDA_HOME=/usr/local/cuda-12.6" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-      # Source-build the llama-cpp wheel on the runner with GGML_NATIVE=OFF /
-      # GGML_AVX512=OFF, so the archive runs on any x86-64-v2+ CPU (no SIGILL on
-      # non-AVX-512 CPUs) and against the runner's glibc (2.39). ~30-min CUDA
-      # compile. The CUDA toolkit steps above are required: `dist` bundles the
-      # CUDA 12 runtime (libcudart/libcublas/libcublasLt) resolved via ldd.
-      - name: Build relocatable distribution + archive
-        run: make archive CUDA=1 LLAMA_BUILD=source
+      - name: Build distribution (standalone Python + requirements)
+        run: make dist CUDA=1 LLAMA_BUILD=skip
+
+      - name: Install llama-cpp-python (abetlen cu124 prebuilt wheel)
+        run: |
+          LLAMA_VERSION=$(grep '^LLAMA_VERSION' Makefile | cut -d= -f2 | tr -d ' ?=')
+          uv pip install \
+            --python dist/slp-app/python/bin/python3 \
+            --only-binary llama-cpp-python \
+            --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
+            --extra-index-url https://pypi.org/simple \
+            "llama-cpp-python==${LLAMA_VERSION}"
+
+      - name: Bundle CUDA 12 runtime + archive
+        run: |
+          set -euo pipefail
+          APP_PY=dist/slp-app/python/bin/python3
+          LLAMA_LIB="$($APP_PY -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')"
+          [ -f "$LLAMA_LIB/libggml-cuda.so" ] || { echo "FAIL: libggml-cuda.so missing — CPU-only build"; exit 1; }
+          for soname in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+            src="$(ldd "$LLAMA_LIB/libggml-cuda.so" | awk -v s="$soname" '$1==s{print $3}')"
+            [ -n "$src" ] && [ -e "$src" ] || { echo "FAIL: $soname not resolvable — install CUDA 12 runtime"; exit 1; }
+            cp -aL "$src" "$LLAMA_LIB/$soname"
+            echo "  bundled $soname <- $src"
+          done
+          tar -czf linux-amd64-slp.tar.gz -C dist slp-app
 
       # Relocate + static GPU-packaging checks. CI has no NVIDIA driver, so we
       # can't actually offload here — instead we assert the build HAS GPU
@@ -159,17 +176,26 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.21
         with:
-          cuda: '12.6.0'
+          cuda: '12.4.0'
 
       - name: Install make
         run: choco install make -y
 
-      # Stays on source build: only a linux cu124 wheel is published to gcp so far.
-      # To move this job to gcp too, publish a Windows wheel (`make llama-wheel
-      # CUDA=1 PUBLISH=1` on a Windows+CUDA host), then mirror the auth + setup-gcloud
-      # steps from build-linux and switch this to LLAMA_PREBUILT=gcp LLAMA_BUILD=prebuilt.
-      - name: Build relocatable distribution + archive
-        run: make archive CUDA=1 LLAMA_BUILD=source
+      - name: Build distribution (standalone Python + requirements)
+        run: make dist CUDA=1 LLAMA_BUILD=skip
+
+      - name: Install llama-cpp-python (abetlen cu124 prebuilt wheel)
+        run: |
+          LLAMA_VERSION=$(grep '^LLAMA_VERSION' Makefile | cut -d= -f2 | tr -d ' ?=')
+          uv pip install \
+            --python dist/slp-app/python/python.exe \
+            --only-binary llama-cpp-python \
+            --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
+            --extra-index-url https://pypi.org/simple \
+            "llama-cpp-python==${LLAMA_VERSION}"
+
+      - name: Archive
+        run: tar -czf windows-amd64-slp.tar.gz -C dist slp-app
 
       - name: Verify (relocation test)
         run: |

@@ -187,6 +187,8 @@ ifeq ($(LLAMA_BUILD),source)
     LLAMA_DIST_CMD = $(LLAMA_SOURCE_CMD)
 else ifeq ($(LLAMA_BUILD),prebuilt)
     LLAMA_DIST_CMD = $(LLAMA_PREBUILT_CMD)
+else ifeq ($(LLAMA_BUILD),skip)
+    LLAMA_DIST_CMD = :
 else
     LLAMA_DIST_CMD = $(LLAMA_PREBUILT_CMD) || { echo ">> prebuilt llama wheel unavailable for $(PLATFORM)/$(ARCH) — building from source"; $(LLAMA_SOURCE_CMD); }
 endif
@@ -243,7 +245,7 @@ dist: ensure-uv
 	echo "=== [3/5] Installing llama-cpp-python ==="; \
 	$(LLAMA_DIST_CMD); \
 	echo "--- Bundling CUDA runtime libraries (GPU build) ---"; \
-	if [ "$(LLAMA_IS_CUDA)" = "yes" ] && [ "$(PLATFORM)" = "linux" ]; then \
+	if [ "$(LLAMA_IS_CUDA)" = "yes" ] && [ "$(PLATFORM)" = "linux" ] && [ "$(LLAMA_BUILD)" != "skip" ]; then \
 	  LLAMA_LIB="$$("$(APP_PY)" -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')"; \
 	  CUDA_SO="$$LLAMA_LIB/libggml-cuda.so"; \
 	  [ -f "$$CUDA_SO" ] || { echo "ERROR: $$CUDA_SO missing — llama-cpp was built CPU-only (no GPU bindings)"; exit 1; }; \
