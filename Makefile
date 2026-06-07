@@ -255,7 +255,7 @@ dist: ensure-uv
 	    cp -aL "$$src" "$$LLAMA_LIB/$$soname"; \
 	    echo "  bundled $$soname  <-  $$src"; \
 	  done; \
-	elif [ "$(LLAMA_IS_CUDA)" = "yes" ] && [ "$(PLATFORM)" = "windows" ]; then \
+	elif [ "$(LLAMA_IS_CUDA)" = "yes" ] && [ "$(PLATFORM)" = "windows" ] && [ "$(LLAMA_BUILD)" != "skip" ]; then \
 	  LLAMA_LIB="$$(cygpath -u "$$("$(APP_PY)" -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')")"; \
 	  [ -f "$$LLAMA_LIB/ggml-cuda.dll" ] || { echo "ERROR: $$LLAMA_LIB/ggml-cuda.dll missing — llama-cpp was built CPU-only (no GPU bindings)"; exit 1; }; \
 	  CUDA_BIN="$$(cygpath -u "$${CUDA_PATH:-$$CUDA_HOME}")/bin"; \
