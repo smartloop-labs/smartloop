@@ -18,6 +18,10 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+# Render the UTF-8 box-drawing banner correctly. Windows PowerShell 5.1 defaults
+# the console to the OEM code page, which mojibakes the block glyphs.
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
 $Version    = '1.0.1'
 $BaseUrl    = "https://github.com/smartloop-ai/smartloop/releases/download/v$Version"
 $BaseDir    = Join-Path $HOME '.smartloop'
@@ -253,9 +257,18 @@ function Add-ToUserPath {
 # agent on first run if it isn't already running (see commands/cli.py).
 
 function Show-Banner {
+    # Build the block glyphs from code points so the source stays pure ASCII —
+    # `irm | iex` on PS 5.1 decodes the script as Latin-1 and would otherwise
+    # corrupt any raw UTF-8 characters baked into the file.
+    $f = [char]0x2588  # full block  (█)
+    $t = [char]0x2580  # upper half  (▀)
+    $b = [char]0x2584  # lower half  (▄)
+    $line1 = 'FT FTBTF BTF FTF TFT F   FTF FTF FTF'.Replace('F', $f).Replace('T', $t).Replace('B', $b)
+    $line2 = 'BF F T F FTF FTB  F  FBB FBF FBF FTT'.Replace('F', $f).Replace('T', $t).Replace('B', $b)
+
     Write-Host ''
-    Write-Host '█▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█' -ForegroundColor Magenta
-    Write-Host '▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀' -ForegroundColor Magenta
+    Write-Host $line1 -ForegroundColor Magenta
+    Write-Host $line2 -ForegroundColor Magenta
     Write-Host ''
     Write-Muted "Version: $Version"
     Write-Host ''
