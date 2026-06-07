@@ -18,8 +18,16 @@
 
 In your terminal, type in the following command to install the agent harness:
 
+**macOS / Linux:**
+
 ```bash
 curl -fsSL https://smartloop.ai/install | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://smartloop.ai/install.ps1 | iex
 ```
 
 **From source:**
