@@ -255,8 +255,19 @@ dist: ensure-uv
 	    cp -aL "$$src" "$$LLAMA_LIB/$$soname"; \
 	    echo "  bundled $$soname  <-  $$src"; \
 	  done; \
+	elif [ "$(LLAMA_IS_CUDA)" = "yes" ] && [ "$(PLATFORM)" = "windows" ]; then \
+	  LLAMA_LIB="$$(cygpath -u "$$("$(APP_PY)" -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')")"; \
+	  [ -f "$$LLAMA_LIB/ggml-cuda.dll" ] || { echo "ERROR: $$LLAMA_LIB/ggml-cuda.dll missing — llama-cpp was built CPU-only (no GPU bindings)"; exit 1; }; \
+	  CUDA_BIN="$$(cygpath -u "$${CUDA_PATH:-$$CUDA_HOME}")/bin"; \
+	  [ -d "$$CUDA_BIN" ] || { echo "ERROR: CUDA bin dir not found (CUDA_PATH=$$CUDA_PATH CUDA_HOME=$$CUDA_HOME)"; exit 1; }; \
+	  for pat in cudart64 cublas64 cublasLt64; do \
+	    src="$$(ls "$$CUDA_BIN"/$${pat}_*.dll 2>/dev/null | head -1)"; \
+	    [ -n "$$src" ] || { echo "ERROR: $${pat}_*.dll not found in $$CUDA_BIN — install the CUDA toolkit"; exit 1; }; \
+	    cp "$$src" "$$LLAMA_LIB/"; \
+	    echo "  bundled $$(basename "$$src")  <-  $$src"; \
+	  done; \
 	else \
-	  echo "  skip (non-CUDA or non-Linux build)"; \
+	  echo "  skip (non-CUDA build)"; \
 	fi; \
 	echo "=== [4/5] Installing slp (non-editable) ==="; \
 	uv pip install --python "$(APP_PY)" --no-deps . ; \

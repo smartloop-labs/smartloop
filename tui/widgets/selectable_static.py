@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+from urllib.parse import unquote, urlsplit
 
 from rich.console import Console
 from rich.text import Text
@@ -16,8 +17,28 @@ _FILE_PATH_RE = re.compile(r'(?:~|\.\.?)?/[\w.+\-/]+(?::\d+)?')
 _CLICK_TAG_RE = re.compile(r'\[@click=[^\]]*\]|\[/\]')
 
 
+_WEB_SCHEMES = {"http", "https", "ftp", "mailto", "tel"}
+
+
+def _normalize_target(target: str) -> str:
+    """Decode local file paths that arrived percent-encoded from markdown.
+
+    MarkdownIt percent-encodes link hrefs (e.g. Windows backslashes become
+    ``%5C``). Web URLs must be left untouched, but a local path needs to be
+    decoded back into something the OS file handler can open.
+    """
+    scheme = urlsplit(target).scheme.lower()
+    if scheme in _WEB_SCHEMES:
+        return target
+    if scheme == "file":
+        return target
+    # Treat everything else as a local filesystem path.
+    return os.path.normpath(unquote(target))
+
+
 def _open_resource(target: str) -> None:
     """Open a URL or file path with the system default handler."""
+    target = _normalize_target(target)
     if sys.platform == "darwin":
         subprocess.Popen(
             ["open", target],
