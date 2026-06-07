@@ -266,9 +266,15 @@ function Show-Banner {
     $line1 = 'FT FTBTF BTF FTF TFT F   FTF FTF FTF'.Replace('F', $f).Replace('T', $t).Replace('B', $b)
     $line2 = 'BF F T F FTF FTB  F  FBB FBF FBF FTT'.Replace('F', $f).Replace('T', $t).Replace('B', $b)
 
+    # Brand pink (256-color 205) via ANSI — brighter than the console's dull
+    # "Magenta". Matches PINK in install.sh.
+    $esc   = [char]0x1b
+    $pink  = "$esc[38;5;205m"
+    $reset = "$esc[0m"
+
     Write-Host ''
-    Write-Host $line1 -ForegroundColor Magenta
-    Write-Host $line2 -ForegroundColor Magenta
+    Write-Host "$pink$line1$reset"
+    Write-Host "$pink$line2$reset"
     Write-Host ''
     Write-Muted "Version: $Version"
     Write-Host ''
