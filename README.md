@@ -106,32 +106,11 @@ You projects live inside `~/smartloop/<slug>` directory and this is where skills
 > [!NOTE]
 > The `curl` installer uses a `uv`-based binary, so it works almost seamlessly on Apple Silicon devices. For Windows and Linux systems, you will need the `CUDA` toolkit to take advantage of GPU acceleration.
 
-### Troubleshooting
-
-#### GPU not detected / Falls back to CPU
-
-If the app falls back to CPU on a GPU-enabled system:
-
-1. **Enable persistence mode:**
-   ```bash
-   sudo nvidia-smi -pm ENABLED
-   ```
-
-2. **Verify GPU detection:**
-   ```bash
-   nvidia-smi
-   ```
-
-If issues persist, ensure NVIDIA drivers are properly installed.
-
-#### Windows: `Failed to load shared library 'llama.dll' ... (or one of its dependencies)`
-
-The Windows build is GPU-accelerated and links llama.cpp's CUDA backend
+While it works seamlessly on macs, on windows / linux , we need to confirm that proper `nvidia` cuda-toolkit is installed. The build is GPU-accelerated and links llama.cpp's CUDA backend
 (`ggml-cuda.dll`), which needs the CUDA runtime; the NVIDIA driver alone only
 provides `nvcuda.dll`. If `llama.dll` fails to load at model bootstrap, make
 sure you have the correct CUDA Toolkit installed (see [Requirements](#requirements)),
 then upgrade to the latest release.
-
 
 ### License
 
