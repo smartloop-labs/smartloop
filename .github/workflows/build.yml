@@ -44,13 +44,14 @@ jobs:
 
       - name: Install llama-cpp-python (abetlen cu124 prebuilt wheel)
         run: |
-          LLAMA_VERSION=$(grep '^LLAMA_VERSION' Makefile | cut -d= -f2 | tr -d ' ?=')
           uv pip install \
             --python dist/slp-app/python/bin/python3 \
+            --reinstall-package llama-cpp-python \
             --only-binary llama-cpp-python \
             --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
             --extra-index-url https://pypi.org/simple \
-            "llama-cpp-python==${LLAMA_VERSION}"
+            --index-strategy unsafe-best-match \
+            llama-cpp-python
 
       - name: Bundle CUDA 12 runtime + archive
         run: |
@@ -186,13 +187,14 @@ jobs:
 
       - name: Install llama-cpp-python (abetlen cu124 prebuilt wheel)
         run: |
-          LLAMA_VERSION=$(grep '^LLAMA_VERSION' Makefile | cut -d= -f2 | tr -d ' ?=')
           uv pip install \
             --python dist/slp-app/python/python.exe \
+            --reinstall-package llama-cpp-python \
             --only-binary llama-cpp-python \
             --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
             --extra-index-url https://pypi.org/simple \
-            "llama-cpp-python==${LLAMA_VERSION}"
+            --index-strategy unsafe-best-match \
+            llama-cpp-python
 
       - name: Archive
         run: tar -czf windows-amd64-slp.tar.gz -C dist slp-app
