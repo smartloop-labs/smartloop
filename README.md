@@ -33,7 +33,7 @@ irm https://smartloop.ai/install.ps1 | iex
 **From source:**
 
 > [!NOTE]
-> Requires `CUDA` toolkiit For NVIDIA GPU acceleration on Linux/Windows, install [CUDA 12.4](https://developer.nvidia.com/cuda-12-4-0-download-archive) before proceeding. The build step auto-creates and activates a virtual environment, then detects your GPU backend — Metal on macOS, CUDA on Linux/Windows with NVIDIA.
+> Requires the `CUDA` toolkit. For NVIDIA GPU acceleration on Linux/Windows, install [CUDA 12.4](https://developer.nvidia.com/cuda-12-4-0-download-archive) before proceeding. The build step auto-creates and activates a virtual environment, then detects your GPU backend — Metal on macOS, CUDA on Linux/Windows with NVIDIA.
 
 ```bash
 git clone https://github.com/smartloop-ai/smartloop.git
@@ -123,6 +123,14 @@ If the app falls back to CPU on a GPU-enabled system:
    ```
 
 If issues persist, ensure NVIDIA drivers are properly installed.
+
+#### Windows: `Failed to load shared library 'llama.dll' ... (or one of its dependencies)`
+
+The Windows build is GPU-accelerated and links llama.cpp's CUDA backend
+(`ggml-cuda.dll`), which needs the CUDA runtime; the NVIDIA driver alone only
+provides `nvcuda.dll`. If `llama.dll` fails to load at model bootstrap, make
+sure you have the correct CUDA Toolkit installed (see [Requirements](#requirements)),
+then upgrade to the latest release.
 
 
 ### License

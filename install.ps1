@@ -57,6 +57,24 @@ function Test-Platform {
 }
 
 # ---------------------------------------------------------------------------
+# CUDA runtime requirements.
+#
+# The Windows build links llama.cpp's CUDA backend (ggml-cuda.dll), which
+# imports version-specific CUDA runtime libraries (e.g. cudart64_12.dll,
+# cublas64_12.dll, cublasLt64_12.dll). The NVIDIA *driver* only provides
+# nvcuda.dll. The runtime libraries are bundled into the release archive next
+# to ggml-cuda.dll at build time (see `dist` in the Makefile and the Windows
+# GPU-packaging check in .github/workflows/build.yml) -- the installer does not
+# provision them. All we do here is detect an NVIDIA GPU up front, since the
+# build is GPU-accelerated and needs one.
+# ---------------------------------------------------------------------------
+function Test-NvidiaGpu {
+    if (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue) { return $true }
+    if (Test-Path (Join-Path $env:WINDIR 'System32\nvcuda.dll')) { return $true }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
 # Checksums — fetched from the release at install time.
 # File format (one per line): "<sha256>  <filename>"
 # ---------------------------------------------------------------------------
@@ -293,6 +311,15 @@ function Install-Smartloop {
     Write-Muted 'Reading package lists... '
     Test-Platform
     Write-Muted 'Reading package lists... Done'
+
+    # Preflight: report GPU status. The published build is GPU-accelerated, so
+    # flag a missing NVIDIA GPU up front; the matching CUDA runtime itself is
+    # verified and provisioned after extraction (see Resolve-CudaRuntime).
+    if (Test-NvidiaGpu) {
+        Write-Muted 'NVIDIA GPU detected; CUDA runtime will be verified after download.'
+    } else {
+        Write-Host 'Note: no NVIDIA GPU detected. This build is GPU-accelerated and needs an NVIDIA GPU + driver.' -ForegroundColor Yellow
+    }
 
     $slpExisting = Join-Path $InstallDir 'bin\slp.cmd'
 

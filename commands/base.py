@@ -92,7 +92,7 @@ class Command:
             home_dir = Path(settings.home_dir)
             log_file = home_dir / "server.log"
             os.makedirs(home_dir, exist_ok=True)
-            with open(log_file, "a") as lf:
+            with open(log_file, "a", encoding="utf-8") as lf:
                 if getattr(sys, "frozen", False):
                     cmd = [sys.executable, "agent", "start"]
                 else:
@@ -105,10 +105,17 @@ class Command:
                 # the same address the CLI is polling (e.g. when 'run -p' overrides
                 # the default port).
                 cmd += ["--host", str(self.host), "--port", str(self.port)]
+                # Force UTF-8 for the child's stdout/stderr. Otherwise on Windows
+                # the agent's streams default to the locale codec (cp1252) and
+                # printing non-Latin-1 characters (e.g. '→') during bootstrap
+                # raises UnicodeEncodeError, which surfaces as "Bootstrap failed".
+                env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
                 # start_new_session detaches the agent into its own session so it
                 # outlives the CLI and is shared by multiple CLI instances (the
                 # model stays warm). Stop it explicitly with 'slp agent stop'.
-                proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, start_new_session=True)
+                proc = subprocess.Popen(
+                    cmd, stdout=lf, stderr=lf, start_new_session=True, env=env
+                )
 
             # The server only answers /health once its lifespan finishes the
             # (blocking) model preload, which can take well over 30s on a cold

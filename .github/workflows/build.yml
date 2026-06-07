@@ -171,10 +171,22 @@ jobs:
       - name: Build relocatable distribution + archive
         run: make archive CUDA=1 LLAMA_BUILD=source
 
-      - name: Verify (relocation test)
+      - name: Verify (relocation + GPU packaging)
         run: |
+          set -euo pipefail
           mkdir -p /tmp/relocate && tar -xzf windows-amd64-slp.tar.gz -C /tmp/relocate
-          /tmp/relocate/slp-app/python/python.exe -m commands.cli --version
+          APP=/tmp/relocate/slp-app
+          "$APP/python/python.exe" -m commands.cli --version
+          LIBDIR="$(cygpath -u "$("$APP/python/python.exe" -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')")"
+          echo "llama lib dir: $LIBDIR"
+          # 1. GPU backend compiled in (else the build silently went CPU-only)
+          test -f "$LIBDIR/ggml-cuda.dll" || { echo "FAIL: ggml-cuda.dll missing — CPU-only build"; exit 1; }
+          # 2. CUDA runtime bundled next to it (found via Windows' DLL search, which
+          #    includes the directory of the importing DLL — so no PATH/toolkit needed)
+          for dll in cudart64 cublas64 cublasLt64; do
+            ls "$LIBDIR"/${dll}_*.dll >/dev/null 2>&1 || { echo "FAIL: ${dll}_*.dll not bundled into the archive"; exit 1; }
+          done
+          echo "OK: GPU bindings present, CUDA runtime bundled."
 
       - name: Compute SHA256
         run: sha256sum windows-amd64-slp.tar.gz | tee windows-amd64-sha256.txt
