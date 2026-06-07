@@ -44,11 +44,18 @@ make test    # verifies CLI and GPU offload support
 
 ### Uninstall
 
-Use the following command to uninstall the agent harness
+Use the following command to uninstall the agent harness:
+
+**macOS / Linux:**
 
 ```bash
 curl -fsSL https://smartloop.ai/uninstall | bash
+```
 
+**Windows (PowerShell):**
+
+```powershell
+irm https://smartloop.ai/uninstall.ps1 | iex
 ```
 
 ### Usage
