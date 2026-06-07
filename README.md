@@ -9,7 +9,7 @@
 </p>
 <p align="center">Local agent harness for your documents. Extract information, generate content on your device</p>
 <p align="center">
-  <img src="https://img.shields.io/github/actions/workflow/status/smartloop-ai/smartloop/release.yml"/>
+  <img src="https://img.shields.io/github/actions/workflow/status/smartloop-ai/smartloop/build.yml"/>
 </p>
 
 <img alt="Smartloop Demo" src="demo.gif" />
@@ -97,20 +97,13 @@ You projects live inside `~/smartloop/<slug>` directory and this is where skills
 
 ### Requirements
 
-| Requirement | Description | Required |
-|-------------|-------------|----------|
-| OS | macOS (Apple Silicon) or Linux (x86_64) or WSL | Yes |
-| CUDA | 12.6+ (NVIDIA GPU acceleration) | No (defaults to CPU) |
-| Metal| Bespoke on mac | yes |
+| Requirement | Description |
+|-------------|-------------|
+| OS | macOS (Apple Silicon), Linux (x86_64), or Windows (x86_64) |
+| CUDA | 12.4+ (optional — NVIDIA GPU acceleration on Linux/Windows, defaults to CPU) |
 
 > [!NOTE]
-> The `curl` installer uses a `uv`-based binary, so it works almost seamlessly on Apple Silicon devices. For Windows and Linux systems, you will need the `CUDA` toolkit to take advantage of GPU acceleration.
-
-While it works seamlessly on macs, on windows / linux , we need to confirm that proper `nvidia` cuda-toolkit is installed. The build is GPU-accelerated and links llama.cpp's CUDA backend
-(`ggml-cuda.dll`), which needs the CUDA runtime; the NVIDIA driver alone only
-provides `nvcuda.dll`. If `llama.dll` fails to load at model bootstrap, make
-sure you have the correct CUDA Toolkit installed (see [Requirements](#requirements)),
-then upgrade to the latest release.
+> macOS uses Metal for GPU acceleration automatically. On Windows and Linux, the pre-built release bundles the CUDA runtime, so only the NVIDIA driver is required. To build from source with GPU support, install the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads).
 
 ### License
 
