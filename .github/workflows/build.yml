@@ -33,11 +33,11 @@ jobs:
           wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y libcudart-12-4 libcublas-12-4
+          sudo apt-get install -y libcudart-12-6 libcublas-12-6
 
       - name: Set CUDA environment
         run: |
-          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: Build distribution (standalone Python + requirements)
         run: make dist CUDA=1 LLAMA_BUILD=skip
