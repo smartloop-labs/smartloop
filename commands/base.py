@@ -92,42 +92,32 @@ class Command:
             home_dir = Path(settings.home_dir)
             log_file = home_dir / "server.log"
             os.makedirs(home_dir, exist_ok=True)
-            with open(log_file, "a", encoding="utf-8") as lf:
-                if getattr(sys, "frozen", False):
-                    cmd = [sys.executable, "agent", "start"]
-                else:
-                    # Launch via -m, NOT the script path: running
-                    # ".../site-packages/commands/cli.py" puts commands/ on
-                    # sys.path[0], where commands/token.py shadows the stdlib
-                    # `token` module and breaks inspect/numpy imports.
-                    cmd = [sys.executable, "-m", "commands.cli", "agent", "start"]
-                # Propagate the resolved host/port so the auto-started agent binds
-                # the same address the CLI is polling (e.g. when 'run -p' overrides
-                # the default port).
-                cmd += ["--host", str(self.host), "--port", str(self.port)]
-                # Force UTF-8 for the child's stdout/stderr. Otherwise on Windows
-                # the agent's streams default to the locale codec (cp1252) and
-                # printing non-Latin-1 characters (e.g. '→') during bootstrap
-                # raises UnicodeEncodeError, which surfaces as "Bootstrap failed".
-                env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-                # start_new_session detaches the agent into its own session so it
-                # outlives the CLI and is shared by multiple CLI instances (the
-                # model stays warm). Stop it explicitly with 'slp agent stop'.
-                proc = subprocess.Popen(
-                    cmd, stdout=lf, stderr=lf, start_new_session=True, env=env
-                )
 
-            # The server only answers /health once its lifespan finishes the
-            # (blocking) model preload, which can take well over 30s on a cold
-            # GPU load. Poll up to SERVER_START_TIMEOUT, but bail out immediately
-            # if the spawned process dies so a crash surfaces fast instead of
-            # waiting out the whole window.
+            if getattr(sys, "frozen", False):
+                with open(log_file, "a", encoding="utf-8") as lf:
+                    cmd = [sys.executable, "agent", "start"]
+                    cmd += ["--host", str(self.host), "--port", str(self.port)]
+                    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+                    proc = subprocess.Popen(
+                        cmd, stdout=lf, stderr=lf, start_new_session=True, env=env
+                    )
+            else:
+                import threading
+                from smartloop.server import start_server
+                thread = threading.Thread(
+                    target=start_server,
+                    args=(self.host, self.port),
+                    kwargs={"service": True},
+                    daemon=True,
+                )
+                thread.start()
+
             with console.status("Please wait while agent is heating up...", spinner="dots") as status:
                 for i in range(self._SERVER_START_TIMEOUT):
                     time.sleep(1)
                     if is_server_running(self.host, self.port):
                         return True
-                    if proc.poll() is not None:
+                    if getattr(sys, "frozen", False) and proc.poll() is not None:
                         logger.error(
                             f"Agent process exited (code {proc.returncode}) before "
                             f"becoming ready."
