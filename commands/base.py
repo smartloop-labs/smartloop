@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -93,31 +94,23 @@ class Command:
             log_file = home_dir / "server.log"
             os.makedirs(home_dir, exist_ok=True)
 
-            if getattr(sys, "frozen", False):
-                with open(log_file, "a", encoding="utf-8") as lf:
+            with open(log_file, "a", encoding="utf-8") as lf:
+                if getattr(sys, "frozen", False):
                     cmd = [sys.executable, "agent", "start"]
-                    cmd += ["--host", str(self.host), "--port", str(self.port)]
-                    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-                    proc = subprocess.Popen(
-                        cmd, stdout=lf, stderr=lf, start_new_session=True, env=env
-                    )
-            else:
-                import threading
-                from smartloop.server import start_server
-                thread = threading.Thread(
-                    target=start_server,
-                    args=(self.host, self.port),
-                    kwargs={"service": True},
-                    daemon=True,
+                else:
+                    cmd = [sys.executable, "-m", "commands.cli", "agent", "start"]
+                cmd += ["--host", str(self.host), "--port", str(self.port)]
+                env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+                proc = subprocess.Popen(
+                    cmd, stdout=lf, stderr=lf, start_new_session=True, env=env
                 )
-                thread.start()
 
             with console.status("Please wait while agent is heating up...", spinner="dots") as status:
                 for i in range(self._SERVER_START_TIMEOUT):
                     time.sleep(1)
                     if is_server_running(self.host, self.port):
                         return True
-                    if getattr(sys, "frozen", False) and proc.poll() is not None:
+                    if proc.poll() is not None:
                         logger.error(
                             f"Agent process exited (code {proc.returncode}) before "
                             f"becoming ready."
@@ -136,6 +129,18 @@ class Command:
         except Exception as e:
             logger.error(f"Failed to start agent: {e}")
             return False
+
+    @staticmethod
+    def _configure_server_logging(log_file: Path) -> None:
+        """Redirect all logging output to the server log file."""
+        root = logging.getLogger()
+        root.handlers.clear()
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
 
     @staticmethod
     def _print_server_log_tail(log_file: Path, lines: int = 15) -> None:
