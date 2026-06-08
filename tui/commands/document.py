@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -11,6 +12,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from tui.theme import SLP_PRIMARY
+
 
 class Document:
     """Command handler for _handle_document_command and all _document_* helpers."""
@@ -45,14 +47,23 @@ class Document:
         """Add a document to the project."""
         self._set_loading("Processing document...")
         try:
+            documents = []
             async with httpx.AsyncClient(timeout=300) as client:
-                resp = await client.post(
+                async with client.stream(
+                    "POST",
                     f"{self.server_url}/v1/projects/{self.project_id}/documents",
                     json={"source": source},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                documents = data.get("documents", [])
+                    headers={"Accept": "text/event-stream"},
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data: "):
+                            try:
+                                payload = json.loads(line[6:])
+                                if payload.get("documents"):
+                                    documents = payload["documents"]
+                            except (json.JSONDecodeError, KeyError):
+                                pass
             if documents:
                 for doc in documents:
                     name = Path(doc["path"]).name

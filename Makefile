@@ -328,8 +328,6 @@ build: venv
 	$(PIP) install -r requirements.txt --index-url=https://pypi.org/simple
 	@echo "=== Installing llama-cpp-python with GPU support ==="
 	$(LLAMA_INSTALL_CMD)
-	@echo "=== Installing project in editable mode ==="
-	$(PIP) install -e . --index-url=https://pypi.org/simple
 ifeq ($(PLATFORM),windows)
 	@echo "=== Build complete ==="
 else

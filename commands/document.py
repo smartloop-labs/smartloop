@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import requests
@@ -34,15 +35,24 @@ class DocumentCommand(Command):
             console.print("[red]No current project. Create or switch to a project first.[/red]")
             return
         try:
+            documents = []
             with console.status("[bold cyan]Processing document...", spinner="dots"):
                 resp = requests.post(
                     f"{self._base_url()}/v1/projects/{project_id}/documents",
                     json={"source": self.args.file_path},
+                    headers={"Accept": "text/event-stream"},
+                    stream=True,
                     timeout=300,
                 )
                 resp.raise_for_status()
-                data = resp.json()
-                documents = data.get("documents", [])
+                for line in resp.iter_lines(decode_unicode=True):
+                    if line and line.startswith("data: "):
+                        try:
+                            payload = json.loads(line[6:])
+                            if payload.get("documents"):
+                                documents = payload["documents"]
+                        except (json.JSONDecodeError, KeyError):
+                            pass
             for doc in documents:
                 console.print(f"[{SLP_PRIMARY}]Added: {Path(doc['path']).name} (id={doc['id']})[/{SLP_PRIMARY}]")
             if documents:
