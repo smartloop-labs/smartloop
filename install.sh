@@ -5,7 +5,7 @@ set -euo pipefail
 trap 'printf "\033[?25h" 2>/dev/null' EXIT
 
 VERSION="1.0.1"
-BASE_URL="https://github.com/smartloop-ai/smartloop/releases/download/v${VERSION}"
+BASE_URL="https://storage.googleapis.com/smartloop-releases/builds/v${VERSION}"
 BASE_DIR="$HOME/.smartloop"
 INSTALL_DIR="${BASE_DIR}/${VERSION}"
 
@@ -286,9 +286,10 @@ download_archive() {
 
     CACHED_ARCHIVE="${CACHE_DIR}/slp-${VERSION}-${OS}-${ARCH}.tar.gz"
 
+    local archive_name="${OS}-${ARCH}-slp.tar.gz"
+
     # Use cached archive if it exists and checksum matches
     if [ -f "$CACHED_ARCHIVE" ]; then
-        local archive_name="${OS}-${ARCH}-slp.tar.gz"
         local expected_sha256
         expected_sha256="$(get_expected_sha256 "$archive_name")"
 
@@ -298,76 +299,12 @@ download_archive() {
         fi
     fi
 
-    if [ "$OS" = "darwin" ]; then
-        local archive_name="darwin-${ARCH}-slp.tar.gz"
+    download_with_progress "${BASE_URL}/${archive_name}" "$CACHED_ARCHIVE" "Get:1 smartloop ${VERSION}"
 
-        download_with_progress "${BASE_URL}/${archive_name}" "$CACHED_ARCHIVE" "Get:1 smartloop ${VERSION}"
-
-        local expected_sha256
-        expected_sha256="$(get_expected_sha256 "$archive_name")"
-        if [ -n "$expected_sha256" ]; then
-            verify_checksum "$CACHED_ARCHIVE" "$expected_sha256"
-        fi
-
-    elif [ "$OS" = "linux" ] || [ "$OS" = "windows" ]; then
-        # Large CUDA archives are split into parts (GitHub Releases 2GB limit)
-        local parts_dir
-        parts_dir="$(mktemp -d)"
-        local part_prefix="${OS}-${ARCH}-slp.tar.gz.part-"
-        local dl_label="Get:1 smartloop ${VERSION}"
-
-        # Discover available parts and compute total size
-        local available_parts=()
-        local total_size=0
-        for suffix in aa ab ac ad ae af ag ah; do
-            local part_url="${BASE_URL}/${part_prefix}${suffix}"
-            if curl -sfI -L "$part_url" >/dev/null 2>&1; then
-                available_parts+=("$suffix")
-                local part_len
-                part_len=$(curl -sI -L "$part_url" | grep -i content-length | tail -1 | awk '{print $2}' | tr -d '\r')
-                total_size=$(( total_size + ${part_len:-0} ))
-            else
-                break
-            fi
-        done
-
-        # Download all parts with a single combined progress bar
-        local downloaded_so_far=0
-        printf "\033[?25l\n"
-        for suffix in "${available_parts[@]}"; do
-            local part_url="${BASE_URL}/${part_prefix}${suffix}"
-            local part_file="${parts_dir}/${part_prefix}${suffix}"
-            local expected_part_sha256
-            expected_part_sha256="$(get_expected_sha256 "${part_prefix}${suffix}")"
-
-            curl -sL "$part_url" -o "$part_file" &
-            local curl_pid=$!
-
-            while kill -0 "$curl_pid" 2>/dev/null; do
-                if [ -f "$part_file" ]; then
-                    local current_bytes
-                    current_bytes=$(wc -c < "$part_file" 2>/dev/null | tr -d ' ') || true
-                    current_bytes=${current_bytes:-0}
-                    progress_bar $(( downloaded_so_far + current_bytes )) "$total_size" "$dl_label"
-                fi
-                sleep 0.1
-            done
-            wait "$curl_pid" || error "Failed to download part ${suffix}"
-
-            local part_size
-            part_size=$(wc -c < "$part_file" | tr -d ' ')
-            downloaded_so_far=$(( downloaded_so_far + part_size ))
-            progress_bar "$downloaded_so_far" "$total_size" "$dl_label"
-
-            if [ -n "$expected_part_sha256" ]; then
-                verify_checksum "$part_file" "$expected_part_sha256"
-            fi
-        done
-        progress_bar "$total_size" "$total_size" "$dl_label"
-        end_progress
-
-        cat "${parts_dir}/${part_prefix}"* > "$CACHED_ARCHIVE"
-        rm -rf "$parts_dir"
+    local expected_sha256
+    expected_sha256="$(get_expected_sha256 "$archive_name")"
+    if [ -n "$expected_sha256" ]; then
+        verify_checksum "$CACHED_ARCHIVE" "$expected_sha256"
     fi
 }
 

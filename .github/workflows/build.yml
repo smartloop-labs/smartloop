@@ -13,7 +13,8 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
+  id-token: write
 
 jobs:
   build-linux:
@@ -93,19 +94,12 @@ jobs:
       - name: Compute SHA256
         run: sha256sum linux-amd64-slp.tar.gz | tee linux-amd64-sha256.txt
 
-      # GitHub release assets are capped at 2 GB; the CUDA build is larger, so
-      # split into parts (install.sh reassembles). Hosting on GCS removes this.
-      - name: Split archive into parts
-        run: |
-          split -b 1900m linux-amd64-slp.tar.gz linux-amd64-slp.tar.gz.part-
-          ls -lh linux-amd64-slp.tar.gz.part-*
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-amd64-slp
           path: |
-            linux-amd64-slp.tar.gz.part-*
+            linux-amd64-slp.tar.gz
             linux-amd64-sha256.txt
 
   build-macos:
@@ -234,25 +228,18 @@ jobs:
       - name: Compute SHA256
         run: sha256sum windows-amd64-slp.tar.gz | tee windows-amd64-sha256.txt
 
-      - name: Split archive into parts
-        run: |
-          split -b 1900m windows-amd64-slp.tar.gz windows-amd64-slp.tar.gz.part-
-          ls -lh windows-amd64-slp.tar.gz.part-*
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-amd64-slp
           path: |
-            windows-amd64-slp.tar.gz.part-*
+            windows-amd64-slp.tar.gz
             windows-amd64-sha256.txt
 
   publish:
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
         with:
@@ -273,23 +260,31 @@ jobs:
 
       - name: Prepare release assets
         run: |
-          mv artifacts/linux-amd64/linux-amd64-slp.tar.gz.part-* .
+          mv artifacts/linux-amd64/linux-amd64-slp.tar.gz .
           mv artifacts/darwin-arm64/darwin-arm64-slp.tar.gz .
-          mv artifacts/windows-amd64/windows-amd64-slp.tar.gz.part-* .
-          ls -lh *-slp.tar.gz*
+          mv artifacts/windows-amd64/windows-amd64-slp.tar.gz .
+          ls -lh *-slp.tar.gz
 
       - name: Generate checksums
-        run: sha256sum *-slp.tar.gz* > checksums-sha256.txt
+        run: sha256sum *-slp.tar.gz > checksums-sha256.txt
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload to GCS
         run: |
-          gh release create "${{ inputs.tag }}" \
-            --repo smartloop-ai/smartloop \
-            --title "${{ inputs.tag }}" \
-            --generate-notes \
-            linux-amd64-slp.tar.gz.part-* \
+          DEST="gs://smartloop-releases/builds/${{ inputs.tag }}"
+          gsutil -m cp \
+            linux-amd64-slp.tar.gz \
             darwin-arm64-slp.tar.gz \
-            windows-amd64-slp.tar.gz.part-* \
-            checksums-sha256.txt
+            windows-amd64-slp.tar.gz \
+            checksums-sha256.txt \
+            "$DEST/"
+          echo "Uploaded to $DEST"
+          gsutil ls -l "$DEST/"
