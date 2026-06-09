@@ -22,22 +22,6 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
-          sudo apt-get purge -y 'php*' 'mono*' 'dotnet*' 'mysql*' 'postgresql*' 'firefox*' || true
-          sudo apt-get autoremove -y
-          df -h /
-
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
-
-      # The CUDA runtime (libcublas alone is ~500MB installed), the abetlen
-      # cu124 wheel, the standalone CPython and the output tarball together
-      # overflow the default ubuntu-latest disk — archiving failed with ENOSPC
-      # ("tar: Wrote only 8192 of 10240 bytes"). Reclaim the tens of GB of
-      # preinstalled toolchains we don't use.
-      - name: Free disk space
-        run: |
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -48,6 +32,10 @@ jobs:
             "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force || true
           df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       # uv fetches the standalone CPython and drives the installs. No system
       # Python needed — the interpreter is bundled into the artifact.
