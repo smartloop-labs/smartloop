@@ -1,10 +1,9 @@
 name: Build & Publish
 
-# Produces a relocatable standalone-CPython distribution per platform via
-# `make archive`. The exact same target runs locally:
-#     make archive            # CPU
-#     make archive CUDA=1     # GPU
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -13,8 +12,11 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
+
+env:
+  GCS_BUCKET: gs://smartloop-gcp-us-east-releases
 
 jobs:
   build-linux:
@@ -35,12 +37,12 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.tag || github.ref_name }}
 
-      # uv fetches the standalone CPython and drives the installs. No system
-      # Python needed — the interpreter is bundled into the artifact.
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Install CUDA runtime libraries
         run: |
@@ -53,66 +55,27 @@ jobs:
         run: |
           echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-      - name: Build distribution (standalone Python + requirements)
-        run: make dist CUDA=1 LLAMA_BUILD=skip
+      - name: Install dependencies
+        run: make build CUDA=1
 
-      - name: Install llama-cpp-python (abetlen cu124 prebuilt wheel)
-        run: |
-          uv pip install \
-            --python dist/slp-app/python/bin/python3 \
-            --reinstall-package llama-cpp-python \
-            --only-binary llama-cpp-python \
-            --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
-            --extra-index-url https://pypi.org/simple \
-            --index-strategy unsafe-best-match \
-            llama-cpp-python
+      - name: Build slp binary
+        run: make build-binary
 
-      - name: Bundle CUDA 12 runtime + archive
-        run: |
-          set -euo pipefail
-          APP_PY=dist/slp-app/python/bin/python3
-          LLAMA_LIB="$($APP_PY -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')"
-          [ -f "$LLAMA_LIB/libggml-cuda.so" ] || { echo "FAIL: libggml-cuda.so missing — CPU-only build"; exit 1; }
-          for soname in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
-            src="$(ldd "$LLAMA_LIB/libggml-cuda.so" | awk -v s="$soname" '$1==s{print $3}')"
-            [ -n "$src" ] && [ -e "$src" ] || { echo "FAIL: $soname not resolvable — install CUDA 12 runtime"; exit 1; }
-            cp -aL "$src" "$LLAMA_LIB/$soname"
-            echo "  bundled $soname <- $src"
-          done
-          tar -czf linux-amd64-slp.tar.gz -C dist slp-app
+      - name: Verify build
+        run: dist/slp/slp --version
 
-      # Relocate + static GPU-packaging checks. CI has no NVIDIA driver, so we
-      # can't actually offload here — instead we assert the build HAS GPU
-      # bindings and the CUDA 12 runtime is bundled, so it works on a real GPU.
-      - name: Verify (relocation + GPU packaging)
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/relocate && tar -xzf linux-amd64-slp.tar.gz -C /tmp/relocate
-          APP=/tmp/relocate/slp-app
-          "$APP/bin/slp" --version
-          LIBDIR="$("$APP/python/bin/python3" -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')"
-          echo "llama lib dir: $LIBDIR"
-          # 1. GPU backend compiled in (else the build silently went CPU-only)
-          test -f "$LIBDIR/libggml-cuda.so" || { echo "FAIL: libggml-cuda.so missing — CPU-only build"; exit 1; }
-          # 2. CUDA 12 runtime bundled next to it ($ORIGIN-discoverable on the user's box)
-          for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
-            test -e "$LIBDIR/$so" || { echo "FAIL: $so not bundled into the archive"; exit 1; }
-          done
-          # 3. Resolved against the bundle alone, only the GPU *driver* (libcuda.so.1,
-          #    always present on the user's GPU box) may be unresolved — nothing else.
-          missing="$(LD_LIBRARY_PATH="$LIBDIR" ldd "$LIBDIR/libggml-cuda.so" | awk '/not found/{print $1}' | grep -vxF 'libcuda.so.1' || true)"
-          if [ -n "$missing" ]; then echo "FAIL: unresolved non-driver deps:"; echo "$missing"; exit 1; fi
-          echo "OK: GPU bindings present, CUDA runtime bundled; only the driver is external."
+      - name: Archive
+        run: make archive
 
       - name: Compute SHA256
-        run: sha256sum linux-amd64-slp.tar.gz | tee linux-amd64-sha256.txt
+        run: sha256sum *-slp.tar.gz | tee linux-amd64-sha256.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-amd64-slp
           path: |
-            linux-amd64-slp.tar.gz
+            *-slp.tar.gz
             linux-amd64-sha256.txt
 
   build-macos:
@@ -120,10 +83,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.tag || github.ref_name }}
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-macos-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-macos-
 
       - name: Import Apple certificate
         env:
@@ -143,43 +116,55 @@ jobs:
             -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH
 
-      # `release` = dist + sign + notarize + archive (macOS uses Metal; no CUDA).
-      - name: Build, sign, notarize, archive
+      - name: Install dependencies
+        run: make build
+
+      - name: Build slp binary
+        run: make build-binary
+
+      - name: Verify build
+        run: dist/slp/slp --version
+
+      - name: Sign
         env:
           APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+        run: make sign
+
+      - name: Notarize
+        env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: make release
+        run: make notarize
 
-      - name: Verify (relocation test)
-        run: |
-          mkdir -p /tmp/relocate && tar -xzf darwin-arm64-slp.tar.gz -C /tmp/relocate
-          /tmp/relocate/slp-app/bin/slp --version
+      - name: Archive
+        run: make archive
 
       - name: Compute SHA256
-        run: shasum -a 256 darwin-arm64-slp.tar.gz | tee darwin-arm64-sha256.txt
+        run: shasum -a 256 *-slp.tar.gz | tee darwin-arm64-sha256.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: darwin-arm64-slp
           path: |
-            darwin-arm64-slp.tar.gz
+            *-slp.tar.gz
             darwin-arm64-sha256.txt
 
   build-windows:
     runs-on: windows-latest
     defaults:
       run:
-        shell: bash          # Git Bash: provides tar/split/sha256sum + the make recipe
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.tag || github.ref_name }}
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.21
@@ -189,70 +174,35 @@ jobs:
       - name: Install make
         run: choco install make -y
 
-      - name: Build distribution (standalone Python + requirements)
-        run: make dist CUDA=1 LLAMA_BUILD=skip
+      - name: Install dependencies
+        run: make build CUDA=1
 
-      - name: Install llama-cpp-python (abetlen cu124 prebuilt wheel)
-        run: |
-          uv pip install \
-            --python dist/slp-app/python/python.exe \
-            --reinstall-package llama-cpp-python \
-            --only-binary llama-cpp-python \
-            --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
-            --extra-index-url https://pypi.org/simple \
-            --index-strategy unsafe-best-match \
-            llama-cpp-python
+      - name: Build slp binary
+        run: make build-binary
 
-      - name: Bundle CUDA runtime
-        run: |
-          set -euo pipefail
-          APP_PY=dist/slp-app/python/python.exe
-          LLAMA_LIB="$(cygpath -u "$("$APP_PY" -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')")"
-          [ -f "$LLAMA_LIB/ggml-cuda.dll" ] || { echo "FAIL: ggml-cuda.dll missing — CPU-only build"; exit 1; }
-          CUDA_BIN="$(cygpath -u "${CUDA_PATH:-$CUDA_HOME}")/bin"
-          [ -d "$CUDA_BIN" ] || { echo "FAIL: CUDA bin dir not found (CUDA_PATH=$CUDA_PATH CUDA_HOME=$CUDA_HOME)"; exit 1; }
-          for pat in cudart64 cublas64 cublasLt64; do
-            src="$(ls "$CUDA_BIN"/${pat}_*.dll 2>/dev/null | head -1)"
-            [ -n "$src" ] || { echo "FAIL: ${pat}_*.dll not found in $CUDA_BIN — install the CUDA toolkit"; exit 1; }
-            cp "$src" "$LLAMA_LIB/"
-            echo "  bundled $(basename "$src") <- $src"
-          done
+      - name: Verify build
+        run: dist/slp/slp --version
 
       - name: Archive
-        run: tar -czf windows-amd64-slp.tar.gz -C dist slp-app
-
-      - name: Verify (relocation + GPU packaging)
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/relocate && tar -xzf windows-amd64-slp.tar.gz -C /tmp/relocate
-          APP=/tmp/relocate/slp-app
-          "$APP/python/python.exe" -m commands.cli --version
-          LIBDIR="$(cygpath -u "$("$APP/python/python.exe" -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')")"
-          echo "llama lib dir: $LIBDIR"
-          # 1. GPU backend compiled in (else the build silently went CPU-only)
-          test -f "$LIBDIR/ggml-cuda.dll" || { echo "FAIL: ggml-cuda.dll missing — CPU-only build"; exit 1; }
-          # 2. CUDA runtime bundled next to it (found via Windows' DLL search, which
-          #    includes the directory of the importing DLL — so no PATH/toolkit needed)
-          for dll in cudart64 cublas64 cublasLt64; do
-            ls "$LIBDIR"/${dll}_*.dll >/dev/null 2>&1 || { echo "FAIL: ${dll}_*.dll not bundled into the archive"; exit 1; }
-          done
-          echo "OK: GPU bindings present, CUDA runtime bundled."
+        run: make archive-zip
 
       - name: Compute SHA256
-        run: sha256sum windows-amd64-slp.tar.gz | tee windows-amd64-sha256.txt
+        run: sha256sum windows-amd64-slp.zip | tee windows-amd64-sha256.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-amd64-slp
           path: |
-            windows-amd64-slp.tar.gz
+            windows-amd64-slp.zip
             windows-amd64-sha256.txt
 
   publish:
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
         with:
@@ -273,13 +223,13 @@ jobs:
 
       - name: Prepare release assets
         run: |
-          mv artifacts/linux-amd64/linux-amd64-slp.tar.gz .
-          mv artifacts/darwin-arm64/darwin-arm64-slp.tar.gz .
-          mv artifacts/windows-amd64/windows-amd64-slp.tar.gz .
-          ls -lh *-slp.tar.gz
+          mv artifacts/linux-amd64/*-slp.tar.gz linux-amd64-slp.tar.gz
+          mv artifacts/darwin-arm64/*-slp.tar.gz darwin-arm64-slp.tar.gz
+          mv artifacts/windows-amd64/windows-amd64-slp.zip .
+          ls -lh *-slp.*
 
       - name: Generate checksums
-        run: sha256sum *-slp.tar.gz > checksums-sha256.txt
+        run: sha256sum *-slp.* > checksums-sha256.txt
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -292,14 +242,23 @@ jobs:
 
       - name: Upload to GCS
         run: |
-          VERSION="${{ inputs.tag }}"
-          VERSION="${VERSION#v}"
-          DEST="gs://smartloop-gcp-us-east-releases/slp/${VERSION}"
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          DEST="$GCS_BUCKET/slp/${VERSION}"
           gsutil -m cp \
             linux-amd64-slp.tar.gz \
             darwin-arm64-slp.tar.gz \
-            windows-amd64-slp.tar.gz \
+            windows-amd64-slp.zip \
             checksums-sha256.txt \
             "$DEST/"
           echo "Uploaded to $DEST"
           gsutil ls -l "$DEST/"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes

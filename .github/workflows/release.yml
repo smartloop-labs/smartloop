@@ -47,9 +47,11 @@ jobs:
         run: |
           VERSION="${{ steps.next.outputs.version }}"
           sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+          sed -i "s/^__version__ = .*/__version__ = \"${VERSION}\"/" smartloop/__init__.py
           sed -i "s/^VERSION=\".*\"/VERSION=\"${VERSION}\"/" install.sh
           echo "Updated to v${VERSION}"
           grep '^version' pyproject.toml
+          grep '__version__' smartloop/__init__.py
           head -4 install.sh | tail -1
 
       - name: Create pull request
@@ -59,7 +61,7 @@ jobs:
           VERSION="${{ steps.next.outputs.version }}"
           BRANCH="release/v${VERSION}"
           git checkout -b "$BRANCH"
-          git add pyproject.toml install.sh
+          git add pyproject.toml smartloop/__init__.py install.sh
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "Bump version to ${VERSION}"

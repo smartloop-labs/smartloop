@@ -1,0 +1,196 @@
+"""Models management router"""
+
+import asyncio
+import enum
+import json
+import logging
+from queue import Queue, Empty
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from smartloop.api.services import ModelService, get_model_service
+from smartloop.config.app_settings import AppSettings
+from smartloop.platform.client import SLPPlatformClient
+
+try:
+    from smartloop.trainer import BuildProgress, TrainingProgress
+except ImportError:
+    BuildProgress = None
+    TrainingProgress = None
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/v1", tags=["models"])
+
+
+def _sse_event(data: dict, event: str = "progress") -> str:
+    """Format a dict as an SSE event string."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+class Mode(str, enum.Enum):
+    inference = "inference"
+    train = "train"
+    build = "build"
+
+class _ModelLoadRequest(BaseModel):
+    mode: Mode = Mode.inference  # "inference" | "train" | "build"
+    project_id: str | None = None
+    quantize: str | None = None
+    model_name: str | None = None
+    developer_token: str | None = None
+
+
+@router.post("/models/load")
+async def load_model(
+    request: _ModelLoadRequest = _ModelLoadRequest(),
+    model_service: ModelService = Depends(get_model_service),
+):
+    """
+    Load the model.
+
+    - **mode=inference** (default): loads the GGUF/quantised model for serving
+      and keeps it in memory until `/v1/models/unload` is called.
+    - **mode=train**: unloads any running inference model, runs the full training
+      pipeline (downloads artefacts + LoRA fine-tuning), then clears the model
+      from memory so the next inference load picks up fresh weights.
+    """
+    mode = request.mode.value if isinstance(request.mode, Mode) else request.mode.strip().lower()
+    if mode not in {m.value for m in Mode}:
+        raise HTTPException(status_code=400, detail="mode must be 'inference', 'train', or 'build'")
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Switch to the requested project, or load current project's model
+        if request.project_id:
+            try:
+                model_service.set_current_project(request.project_id)
+            except (ValueError, RuntimeError) as e:
+                logger.warning(f"Project not found: {request.project_id}, using current project")
+
+        if mode == "train":
+            train_queue: Queue[dict] = Queue()
+
+            def on_train_progress(progress: TrainingProgress):
+                train_queue.put(progress.to_dict())
+
+            async def train_event_stream():
+                loop = asyncio.get_event_loop()
+                train_task = loop.run_in_executor(
+                    None,
+                    lambda: model_service.train_model(
+                        request.model_name,
+                        progress_callback=on_train_progress,
+                    ),
+                )
+
+                yield _sse_event({"stage": "preparing", "current": 0, "total": 0, "message": "Starting training..."})
+
+                while not train_task.done():
+                    try:
+                        item = train_queue.get_nowait()
+                        yield _sse_event(item)
+                    except Empty:
+                        await asyncio.sleep(0.1)
+
+                # Drain remaining events
+                while not train_queue.empty():
+                    yield _sse_event(train_queue.get_nowait())
+
+                # Check for exceptions
+                try:
+                    train_task.result()
+                except Exception as exc:
+                    logger.exception("Model training failed")
+                    yield _sse_event({"status": "error", "message": str(exc)}, event="error")
+                    return
+
+                yield _sse_event({"status": "completed", "message": "Training complete. Model unloaded – call /v1/models/load to load for inference."}, event="complete")
+
+            return StreamingResponse(train_event_stream(), media_type="text/event-stream")
+        elif mode == "build":
+            progress_queue: Queue[dict] = Queue()
+
+            def on_progress(progress: BuildProgress):
+                progress_queue.put(progress.to_dict())
+
+            async def build_event_stream():
+                loop = asyncio.get_event_loop()
+                build_task = loop.run_in_executor(
+                    None,
+                    lambda: model_service.build_model(
+                        request.model_name,
+                        request.quantize,
+                        request.developer_token,
+                        progress_callback=on_progress,
+                    ),
+                )
+
+                yield _sse_event({"stage": "preparing", "current": 0, "total": 0, "message": "Starting build..."})
+
+                while not build_task.done():
+                    try:
+                        item = progress_queue.get_nowait()
+                        yield _sse_event(item)
+                    except Empty:
+                        await asyncio.sleep(0.1)
+
+                # Drain remaining events
+                while not progress_queue.empty():
+                    yield _sse_event(progress_queue.get_nowait())
+
+                # Check for exceptions
+                try:
+                    build_task.result()
+                except Exception as exc:
+                    logger.exception("Model build failed")
+                    yield _sse_event({"status": "error", "message": str(exc)}, event="error")
+                    return
+
+                yield _sse_event({"status": "completed", "message": "Build complete."}, event="complete")
+
+            return StreamingResponse(build_event_stream(), media_type="text/event-stream")
+        else:
+            # load_model resolves model from the current project
+            await loop.run_in_executor(None, model_service.load_model)
+            project_name = model_service.get_current_project_name() or "default"
+            return {"status": "ok", "message": f"Model loaded for inference (project: {project_name})."}
+    except PermissionError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except (EnvironmentError, ConnectionError) as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("Error in /models/load (mode=%s)", mode)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/models/unload")
+async def unload_model(model_service: ModelService = Depends(get_model_service)):
+    """Unload the model from memory to free resources."""
+    project_name = model_service.get_current_project_name() or "default"
+    model_service.unload_model()
+    return {"status": "ok", "message": f"Model unloaded (project: {project_name})."}
+
+
+class ModelEntry(BaseModel):
+    name: str
+    model_id: str
+    size: str | None = None
+    description: str | None = None
+    access_level: str | None = None
+    is_accessible: bool = False
+
+
+@router.get("/models", response_model=list[ModelEntry])
+async def list_models():
+    """List available models from the cloud API."""
+    settings = AppSettings()
+    client = SLPPlatformClient(settings.slp_api_base)
+
+    try:
+        return client.list_models()
+    except ConnectionError:
+        raise HTTPException(status_code=502, detail="Platform API unavailable")
