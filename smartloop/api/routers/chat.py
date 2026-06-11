@@ -1,0 +1,728 @@
+"""Chat completion router with OpenAI-compatible endpoints"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import threading
+import uuid
+
+from datetime import date
+from concurrent.futures import ThreadPoolExecutor
+from typing import AsyncIterator, List
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+
+from smartloop.workspace import Skill
+
+from smartloop.api.model import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionChunk,
+    ChatMessage,
+    Citation,
+    Choice,
+    ChunkChoice,
+    DeltaContent,
+    Usage,
+)
+from smartloop.api.services import ModelService, get_model_service, get_api_client
+from smartloop.constants import SYSTEM_PROMPT
+
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/v1", tags=["chat"])
+
+def _status_event(step: str, status: str, message: str) -> str:
+    """Format a status event as a raw SSE data line.
+
+    Uses ``object: "chat.status"`` so clients can distinguish these from
+    OpenAI-compatible ``chat.completion.chunk`` content lines.
+    """
+    payload = json.dumps({
+        "object": "chat.status",
+        "step": step,
+        "status": status,
+        "message": message,
+    })
+    return f"data: {payload}\n\n"
+
+# Thread pool for running sync LLM operations
+_executor = ThreadPoolExecutor(max_workers=1)
+
+
+def format_messages_to_prompt(
+    messages: List[ChatMessage],
+    context: str | None = None,
+    project_skills: List[Skill] | None = None,
+    cwd: str | None = None,
+    project_info: str | None = None,
+) -> str:
+    """Convert OpenAI-style messages to the prompt format expected by the LLM.
+
+    When *context* is provided (pre-formatted by the orchestrator), it is
+    injected into the first user message as-is.  When no orchestrator context
+    is available, lightweight auxiliary context (cwd, project_info, skills) is
+    injected instead.
+    """
+    prompt_parts = []
+
+    system_content = SYSTEM_PROMPT.format(current_date=date.today().strftime("%B %d, %Y"))
+    for msg in messages:
+        if msg.role == "system" and msg.content:
+            system_content += "\n" + msg.content
+    prompt_parts.append(f"<system>{system_content}</system>")
+
+    context_injected = False
+
+    for msg in messages:
+        if msg.role == "system":
+            continue
+        elif msg.role == "assistant":
+            prompt_parts.append(f"<assistant>{msg.content}</assistant>")
+        elif msg.role == "user":
+            user_parts = []
+
+            if not context_injected:
+                if context:
+                    user_parts.append(context)
+                else:
+                    if cwd:
+                        try:
+                            entries = sorted(os.listdir(cwd))[:50]
+                            listing = "\n".join(f"  {e}" for e in entries)
+                            user_parts.append(f"WORKING DIRECTORY ({cwd}):\n{listing}")
+                        except Exception:
+                            pass
+                    if project_info:
+                        user_parts.append(f"PROJECT INFO:\n{project_info}")
+                    if project_skills:
+                        skills_text = "\n".join(
+                            f"- {skill.name}: {skill.description}"
+                            for skill in project_skills if skill.description
+                        )
+                        if skills_text:
+                            user_parts.append(f"AVAILABLE SKILLS:\n{skills_text}")
+                context_injected = True
+
+            if msg.content:
+                user_parts.append(msg.content)
+
+            user_content = "\n\n".join(user_parts)
+            prompt_parts.append(f"<user>{user_content}</user>")
+
+    return "\n".join(prompt_parts)
+
+
+def _resolve_message_attachments(
+    messages: List[ChatMessage],
+    model_service: ModelService,
+) -> List[ChatMessage]:
+    """Return a new message list where attachment asset IDs are resolved to markdown.
+
+    For each user message containing ``attachments``, the markdown content of
+    each referenced asset is prepended to the message text so the model can
+    see the full document context inline.
+    """
+    resolved = []
+    for msg in messages:
+        if msg.role == "user" and msg.attachments:
+            attachment_md = model_service.resolve_attachment_context(msg.attachments)
+            if attachment_md:
+                combined = "\n\n".join(filter(None, [attachment_md, msg.content]))
+                resolved.append(ChatMessage(role=msg.role, content=combined))
+            else:
+                resolved.append(msg)
+        else:
+            resolved.append(msg)
+    return resolved
+
+
+def _compact_messages(
+    messages: List[ChatMessage],
+    model_service: ModelService,
+    reserved_tokens: int = 2048,
+    context_tokens: int = 0,
+) -> List[ChatMessage]:
+    """Trim oldest conversation turns when the message list exceeds the context window.
+
+    Always keeps the first user message (original context) and the last user
+    message (the current question).  Removes the oldest assistant+user pairs
+    working forward from index 1 until the token count fits within
+    ``max_context - reserved_tokens - context_tokens``.
+
+    ``context_tokens`` accounts for document_context, project_skills, and
+    mcp_context that will be injected into the final prompt.
+    """
+    max_context = model_service.get_max_context_tokens()
+    if max_context <= 0:
+        return messages
+
+    budget = max_context - reserved_tokens - context_tokens
+    if budget <= 0:
+        return messages
+
+    # Quick check — if we're already within budget, return as-is
+    full_text = "\n".join(m.content or "" for m in messages)
+    used_tokens = model_service.count_tokens(full_text)
+
+    if used_tokens <= budget:
+        logger.info(
+            f"Context window: {used_tokens}/{max_context} tokens used "
+            f"({budget} budget, {reserved_tokens} reserved) — no compaction needed"
+        )
+        return messages
+
+    original_count = len(messages)
+
+    # Build a mutable copy
+    compacted = list(messages)
+
+    # Remove oldest turns in pairs (assistant+user or user+assistant) starting
+    # from index 1 so that roles keep alternating.  Index 0 (first user message
+    # with context) and the last message are always kept.
+    while len(compacted) > 2:
+        # Pop two messages at index 1 to remove a full turn pair
+        compacted.pop(1)
+        if len(compacted) > 2:
+            compacted.pop(1)
+
+        text = "\n".join(m.content or "" for m in compacted)
+        if model_service.count_tokens(text) <= budget:
+            break
+
+    # Safety: ensure roles alternate after compaction.  If two consecutive
+    # messages share the same role, merge them so the model never sees an
+    # invalid sequence.
+    merged: List[ChatMessage] = [compacted[0]]
+    for msg in compacted[1:]:
+        if msg.role == merged[-1].role:
+            merged[-1] = ChatMessage(
+                role=msg.role,
+                content="\n".join(filter(None, [merged[-1].content, msg.content])),
+            )
+        else:
+            merged.append(msg)
+    compacted = merged
+
+    compacted_text = "\n".join(m.content or "" for m in compacted)
+    compacted_tokens = model_service.count_tokens(compacted_text)
+    removed = original_count - len(compacted)
+    logger.info(
+        f"Context window: {used_tokens}/{max_context} tokens exceeded budget ({budget}), "
+        f"compacted {removed} messages — now {compacted_tokens}/{max_context} tokens"
+    )
+
+    return compacted
+
+
+def _build_messages_with_history(
+    request: ChatCompletionRequest,
+    model_service: ModelService,
+) -> List[ChatMessage]:
+    """Build the message list with relevant conversation history prepended.
+
+    Uses TF-IDF relevance filtering via ``ConversationStore.query_relevant``
+    to select the most relevant prior turns, then prepends them before the
+    current request messages so the LLM can reference earlier context
+    (e.g. "create a table from that").
+    """
+    if not request.session_id:
+        return request.messages
+
+    last_user_msg = next(
+        (m.content for m in reversed(request.messages) if m.role == "user"),
+        None,
+    )
+    if not last_user_msg:
+        return request.messages
+
+    history = model_service.get_relevant_history(
+        request.session_id, last_user_msg,
+    )
+    if not history:
+        return request.messages
+
+    history_messages = [
+        ChatMessage(role=h["role"], content=h["content"])
+        for h in history
+    ]
+    return history_messages + request.messages
+
+
+async def stream_chunks(
+    request: ChatCompletionRequest,
+    model_service: ModelService,
+) -> AsyncIterator[str]:
+    """
+    Convert sync LLM streaming to async SSE.
+
+    Uses a queue and thread pool to bridge sync iterator to async generator.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    # Switch project if specified
+    if request.project_id:
+        try:
+            model_service.set_current_project(request.project_id)
+        except ValueError:
+            logger.warning(f"Project not found: {request.project_id}, using current project")
+
+    messages = _build_messages_with_history(request, model_service)
+
+    # Resolve attachments (with status events if attachments exist)
+    has_attachments = any(m.attachments for m in messages if m.role == "user")
+    if has_attachments:
+        yield _status_event("attachments", "processing", "Resolving attachments...")
+    messages = _resolve_message_attachments(messages, model_service)
+    if has_attachments:
+        yield _status_event("attachments", "completed", "Attachments resolved")
+
+    # Get project skills and document context separately
+    last_user_msg = next(
+        (m.content for m in reversed(messages) if m.role == "user"), None
+    )
+
+    project_skills = [s for s in model_service.get_project_skills() if not s.system]
+
+    # Orchestrator handles vector search, MCP tools, and explore in one step
+    orchestrator_context = None
+    citations = None
+    skill_instruction = None
+    is_mutation = False
+    conversation_history = model_service.get_relevant_history(
+        request.session_id, last_user_msg or "",
+    ) if request.session_id and last_user_msg else []
+    if last_user_msg:
+        yield _status_event("tools", "processing", "Processing...")
+        orchestrator_context, _, tool_error, citations, skill_instruction, is_mutation = await loop.run_in_executor(
+            None,
+            lambda: model_service.try_mcp_tool_call(
+                last_user_msg, skills=project_skills, cwd=request.cwd,
+                conversation_history=conversation_history,
+                has_attachments=has_attachments,
+            ),
+        )
+        if tool_error:
+            yield _status_event("tools", "error", tool_error)
+        else:
+            yield _status_event("tools", "completed", "Tools completed")
+
+    # For mutation operations (save, create, delete, etc.) return the
+    # success message directly without running it through the LLM.
+    if is_mutation and orchestrator_context:
+        message_id = request.message_id or f"msg-{uuid.uuid4().hex[:8]}"
+        yield _status_event("streaming", "processing", "Generating response...")
+        initial_chunk = ChatCompletionChunk(
+            model=request.model,
+            choices=[ChunkChoice(
+                index=0,
+                delta=DeltaContent(role="assistant"),
+                finish_reason=None,
+            )]
+        )
+        yield f"data: {initial_chunk.model_dump_json()}\n\n"
+        yield f"data: {json.dumps({'object': 'chat.message_id', 'message_id': message_id})}\n\n"
+        # Stream synthesized content in small chunks for progressive rendering
+        _STREAM_CHUNK_SIZE = 12
+        for i in range(0, len(orchestrator_context), _STREAM_CHUNK_SIZE):
+            content_chunk = ChatCompletionChunk(
+                model=request.model,
+                choices=[ChunkChoice(
+                    index=0,
+                    delta=DeltaContent(content=orchestrator_context[i:i + _STREAM_CHUNK_SIZE]),
+                    finish_reason=None,
+                )]
+            )
+            yield f"data: {content_chunk.model_dump_json()}\n\n"
+            await asyncio.sleep(0.01)
+        done_chunk = ChatCompletionChunk(
+            model=request.model,
+            choices=[ChunkChoice(
+                index=0,
+                delta=DeltaContent(),
+                finish_reason="stop",
+            )]
+        )
+        yield f"data: {done_chunk.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+        if request.session_id:
+            if last_user_msg:
+                model_service.append_to_session(request.session_id, "user", last_user_msg)
+            model_service.append_to_session(request.session_id, "assistant", orchestrator_context, message_id=message_id)
+        return
+
+    project_id = model_service.get_project_id()
+    project_info = model_service.get_project_info()
+
+    yield _status_event("preparing", "processing", "Preparing response...")
+
+    effective_skills = [] if orchestrator_context else project_skills
+    messages = _compact_messages(messages, model_service,
+                                context_tokens=model_service.count_tokens(orchestrator_context or ""))
+
+    prompt = format_messages_to_prompt(
+        messages,
+        context=orchestrator_context,
+        project_skills=effective_skills,
+        cwd=request.cwd,
+        project_info=project_info,
+    )
+
+    yield _status_event("preparing", "completed", "Preparing response...")
+
+    # Store the user message in session history
+    if request.session_id and last_user_msg:
+        model_service.append_to_session(request.session_id, "user", last_user_msg)
+
+    cancelled = threading.Event()
+
+    def run_sync_stream():
+        """Run the sync stream in a thread and put chunks in queue"""
+        try:
+            for chunk in model_service.stream_completion(prompt, request.model, cancelled=cancelled):
+                if cancelled.is_set():
+                    break
+                text = chunk.text if hasattr(chunk, 'text') else str(chunk)
+                if text:
+                    loop.call_soon_threadsafe(queue.put_nowait, text)
+        except Exception as e:
+            logger.error(f"Error in sync stream: {e}")
+            loop.call_soon_threadsafe(queue.put_nowait, Exception(str(e)))
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)  # Signal completion
+
+    # Start the sync stream in thread pool
+    _executor.submit(run_sync_stream)
+
+    # Signal that streaming has started
+    yield _status_event("streaming", "processing", "Generating response...")
+
+    # Initial chunk with role (OpenAI-compatible raw data format)
+    message_id = request.message_id or f"msg-{uuid.uuid4().hex[:8]}"
+    initial_chunk = ChatCompletionChunk(
+        model=request.model,
+        choices=[ChunkChoice(
+            index=0,
+            delta=DeltaContent(role="assistant"),
+            finish_reason=None,
+        )]
+    )
+    yield f"data: {initial_chunk.model_dump_json()}\n\n"
+
+    yield f"data: {json.dumps({'object': 'chat.message_id', 'message_id': message_id})}\n\n"
+
+    # Stream content chunks and collect full response for session history
+    full_response_parts = []
+    try:
+        while True:
+            item = await queue.get()
+
+            if item is None:
+                # Stream complete
+                break
+
+            if isinstance(item, Exception):
+                error_msg = str(item)
+                logger.error(f"Stream error: {error_msg}")
+                yield _status_event("error", "error", error_msg)
+                # Surface the error as a visible content chunk so the user sees it
+                error_chunk = ChatCompletionChunk(
+                    model=request.model,
+                    choices=[ChunkChoice(
+                        index=0,
+                        delta=DeltaContent(content=f"\n\n**Error:** {error_msg}"),
+                        finish_reason=None,
+                    )]
+                )
+                yield f"data: {error_chunk.model_dump_json()}\n\n"
+                break
+
+            full_response_parts.append(item)
+            chunk = ChatCompletionChunk(
+                model=request.model,
+                choices=[ChunkChoice(
+                    index=0,
+                    delta=DeltaContent(content=item),
+                    finish_reason=None,
+                )]
+            )
+            yield f"data: {chunk.model_dump_json()}\n\n"
+    finally:
+        # Signal cancellation so the background thread stops producing chunks
+        cancelled.set()
+
+        # Save partial (or full) response to session history
+        full_response = "".join(full_response_parts)
+        if request.session_id and full_response:
+            model_service.append_to_session(request.session_id, "assistant", full_response, citations=citations, message_id=message_id)
+
+    # Auto file-write: if user asked to create/generate/write, save LLM response to file
+    if full_response_parts and last_user_msg and request.cwd:
+        full_response = "".join(full_response_parts)
+        written_path = model_service.maybe_write_output(last_user_msg, full_response, request.cwd, session_id=request.session_id)
+        if written_path:
+            yield _status_event("file-write", "completed", written_path)
+            # Surface the file path as visible content so the user can click it
+            file_link = f"\n\n[{os.path.basename(written_path)}]({written_path})"
+            write_chunk = ChatCompletionChunk(
+                model=request.model,
+                choices=[ChunkChoice(
+                    index=0,
+                    delta=DeltaContent(content=file_link),
+                    finish_reason=None,
+                )]
+            )
+            yield f"data: {write_chunk.model_dump_json()}\n\n"
+            # Persist the file link in session history
+            if request.session_id:
+                model_service.append_to_session(request.session_id, "assistant", file_link)
+
+    # Compute and emit usage info after streaming
+    if full_response_parts:
+        full_response = "".join(full_response_parts)
+        prompt_tokens = model_service.count_tokens(prompt)
+        completion_tokens = model_service.count_tokens(full_response)
+        max_context = model_service.get_max_context_tokens()
+        total_tokens = prompt_tokens + completion_tokens
+
+        # Push token usage telemetry (non-blocking)
+        api_client = get_api_client()
+        api_client.push_token_usage(
+            project_id=project_id,
+            model=request.model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+        # Emit usage info so the TUI can display context utilisation
+        usage_payload = json.dumps({
+            "object": "chat.usage",
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "max_context_tokens": max_context,
+        })
+        yield f"data: {usage_payload}\n\n"
+
+    if citations:
+        # Deduplicate citations by document_id.  All cited documents
+        # passed semantic relevance filtering in the discovery step,
+        # so they are legitimate sources.  Previous revalidation
+        # checked whether the filename appeared in the LLM response,
+        # but that silently dropped documents whose filenames differ
+        # from their content (e.g. "sp46.pdf" for a Vanguard fund).
+        seen_ids: set = set()
+        unique_citations = []
+        for c in citations:
+            if c["document_id"] in seen_ids:
+                continue
+            seen_ids.add(c["document_id"])
+            unique_citations.append(c)
+        if unique_citations:
+            citations_payload = json.dumps({
+                "object": "chat.citations",
+                "citations": unique_citations,
+            })
+            yield f"data: {citations_payload}\n\n"
+
+    yield _status_event("streaming", "completed", "Response complete")
+
+    # Final chunk with finish_reason (OpenAI-compatible raw data format)
+    final_chunk = ChatCompletionChunk(
+        model=request.model,
+        choices=[ChunkChoice(
+            index=0,
+            delta=DeltaContent(),
+            finish_reason="stop",
+        )]
+    )
+    yield f"data: {final_chunk.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@router.post("/chat/completions")
+async def create_chat_completion(
+    request: ChatCompletionRequest,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """
+    Create a chat completion (OpenAI-compatible).
+
+    Supports both streaming and non-streaming modes.
+    """
+    try:
+        if not model_service.is_loaded():
+            logger.info("Model not loaded, attempting automatic reload...")
+            try:
+                model_service.load_model()
+            except Exception as e:
+                logger.error(f"Failed to auto-reload model: {e}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="No model loaded and auto-reload failed. Call /v1/models/load first.",
+                )
+
+        if request.stream:
+            return StreamingResponse(
+                stream_chunks(request, model_service),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        # Non-streaming response
+        # Switch project if specified
+        if request.project_id:
+            try:
+                model_service.set_current_project(request.project_id)
+            except ValueError:
+                logger.warning(f"Project not found: {request.project_id}, using current project")
+
+        if not model_service.is_loaded():
+            logger.info("Model not loaded (non-streaming), attempting automatic reload...")
+            try:
+                model_service.load_model()
+            except Exception as e:
+                logger.error(f"Failed to auto-reload model: {e}")
+                raise RuntimeError(f"No model loaded and auto-reload failed: {e}")
+
+        messages = _build_messages_with_history(request, model_service)
+        messages = _resolve_message_attachments(messages, model_service)
+
+        last_user_msg = next(
+            (m.content for m in reversed(messages) if m.role == "user"), None
+        )
+
+        project_skills = [s for s in model_service.get_project_skills() if not s.system]
+        loop = asyncio.get_event_loop()
+
+        # Orchestrator handles vector search, MCP tools, and explore in one step
+        orchestrator_context = None
+        tool_error = None
+        citations = None
+        is_mutation = False
+        conversation_history = model_service.get_relevant_history(
+            request.session_id, last_user_msg or "",
+        ) if request.session_id and last_user_msg else []
+        if last_user_msg:
+            orchestrator_context, _, tool_error, citations, _, is_mutation = await loop.run_in_executor(
+                _executor,
+                lambda: model_service.try_mcp_tool_call(
+                    last_user_msg, skills=project_skills, cwd=request.cwd,
+                    conversation_history=conversation_history,
+                ),
+            )
+
+        if tool_error:
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=[Choice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=tool_error),
+                    finish_reason="stop",
+                )],
+                usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+            )
+        # For mutation operations return the success message directly.
+        if is_mutation and orchestrator_context:
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=[Choice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=orchestrator_context),
+                    finish_reason="stop",
+                )],
+                usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+            )
+
+        project_id = model_service.get_project_id()
+        project_info = model_service.get_project_info()
+
+        effective_skills = [] if orchestrator_context else project_skills
+        messages = _compact_messages(messages, model_service,
+                                     context_tokens=model_service.count_tokens(orchestrator_context or ""))
+
+        prompt = format_messages_to_prompt(
+            messages,
+            context=orchestrator_context,
+            project_skills=effective_skills,
+            cwd=request.cwd,
+            project_info=project_info,
+        )
+
+        # Store user message in session history
+        if request.session_id and last_user_msg:
+            model_service.append_to_session(request.session_id, "user", last_user_msg)
+
+        # Run sync completion in thread pool
+        response_text = await loop.run_in_executor(
+            _executor,
+            model_service.generate_completion,
+            prompt,
+            request.model,
+        )
+
+        # Auto file-write: if user asked to create/generate/write, save LLM response to file
+        if last_user_msg and request.cwd and response_text:
+            written_path = model_service.maybe_write_output(last_user_msg, response_text, request.cwd, session_id=request.session_id)
+            if written_path:
+                response_text = f"{response_text}\n\n[{os.path.basename(written_path)}]({written_path})"
+
+        # Store assistant response in session history (after auto-write so the link is included)
+        message_id = request.message_id or f"msg-{uuid.uuid4().hex[:8]}"
+        if request.session_id and response_text:
+            model_service.append_to_session(request.session_id, "assistant", response_text, citations=citations, message_id=message_id)
+
+        prompt_tokens = model_service.count_tokens(prompt)
+        completion_tokens = model_service.count_tokens(response_text)
+
+        # Push telemetry (non-blocking)
+        api_client = get_api_client()
+        api_client.push_token_usage(
+            project_id=project_id,
+            model=request.model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+        citation_models = None
+        if citations:
+            seen_ids: set = set()
+            unique_citations = []
+            for c in citations:
+                if c["document_id"] in seen_ids:
+                    continue
+                seen_ids.add(c["document_id"])
+                unique_citations.append(c)
+            if unique_citations:
+                citation_models = [
+                    Citation(document_id=c["document_id"], document_name=c.get("document_name"))
+                    for c in unique_citations
+                ]
+
+        return ChatCompletionResponse(
+            model=request.model,
+            message_id=message_id,
+            choices=[Choice(
+                index=0,
+                message=ChatMessage(role="assistant", content=response_text),
+                finish_reason="stop",
+            )],
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+            citations=citation_models,
+        )
+
+    except Exception as e:
+        logger.exception("Error in chat completion")
+        raise HTTPException(status_code=500, detail=str(e))

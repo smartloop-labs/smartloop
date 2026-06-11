@@ -320,8 +320,8 @@ install_smartloop() {
     export TMPDIR="$WORK_DIR"
 
     # Skip download + extract if this version is already installed
-    local slp_existing="${INSTALL_DIR}/bin/slp"
-    [ "$OS" = "windows" ] && slp_existing="${INSTALL_DIR}/bin/slp.cmd"
+    local slp_existing="${INSTALL_DIR}/slp"
+    [ "$OS" = "windows" ] && slp_existing="${INSTALL_DIR}/slp.exe"
 
     if [ -x "$slp_existing" ]; then
         echo -e "${MUTED}smartloop is already the newest version (${VERSION}).${NC}"
@@ -347,7 +347,7 @@ install_smartloop() {
         echo -e "${MUTED}[3/3] Setting up smartloop (${VERSION})${NC}"
         mkdir -p "$INSTALL_DIR"
         rm -rf "${INSTALL_DIR:?}/"*
-        cp -r "${tmpdir}/slp-app/"* "$INSTALL_DIR/"
+        cp -r "${tmpdir}/slp/"* "$INSTALL_DIR/"
     fi
 
     # Track installed version
@@ -360,30 +360,10 @@ install_smartloop() {
         echo "$VERSION" >> "$installed_file"
     fi
 
-    local slp_bin="${INSTALL_DIR}/bin/slp"
-    [ "$OS" = "windows" ] && slp_bin="${INSTALL_DIR}/bin/slp.cmd"
-
-    # Write a symlink-safe launcher — the archive may contain an older
-    # launcher that breaks when invoked via the ~/.smartloop/slp symlink.
-    if [ "$OS" != "windows" ] && [ -f "$slp_bin" ]; then
-        cat > "$slp_bin" <<'LAUNCHER'
-#!/bin/sh
-set -e
-SELF="$0"
-while [ -L "$SELF" ]; do
-    link_dir="$(CDPATH= cd "$(dirname "$SELF")" && pwd)"
-    SELF="$(readlink "$SELF")"
-    case "$SELF" in /*) ;; *) SELF="$link_dir/$SELF" ;; esac
-done
-DIR="$(CDPATH= cd "$(dirname "$SELF")" && pwd)"
-PY="$DIR/../python/bin/python3"
-SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-NVLIBS="$(ls -d "$SITE"/nvidia/*/lib 2>/dev/null | tr '\n' ':')"
-export LD_LIBRARY_PATH="${NVLIBS}${SITE}/torch/lib:${LD_LIBRARY_PATH}"
-exec "$PY" -m commands.cli "$@"
-LAUNCHER
-        chmod +x "$slp_bin"
-    fi
+    # The PyInstaller distribution is self-contained: the `slp` executable sits
+    # at the top of the install dir next to its _internal/ payload.
+    local slp_bin="${INSTALL_DIR}/slp"
+    [ "$OS" = "windows" ] && slp_bin="${INSTALL_DIR}/slp.exe"
 
     if ! "$slp_bin" --help &>/dev/null; then
         error "Installation verification failed: 'slp --help' did not succeed"

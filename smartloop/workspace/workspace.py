@@ -1,0 +1,472 @@
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+from enum import Enum
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Set, List
+from pathlib import Path
+
+from uuid import uuid4
+from pydantic import BaseModel, computed_field, ConfigDict, Field
+from smartloop.config import ModelConfig
+from smartloop.config.app_settings import AppSettings
+
+_settings = AppSettings()
+
+if TYPE_CHECKING:
+    from smartloop.model import SLPModel
+
+class DocumentStatus(Enum):
+    PENDING = "pending"
+    CONVERTING = "converting"
+    INDEXING = "indexing"
+    FAILED = "failed"
+    INDEXED = "indexed"
+    DELETED = "deleted"
+    PROCESSED = "processed"
+
+class Document(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"exclude_none": True})
+
+    id: str
+    path: str
+    name: Optional[str] = None  # original filename — set once, never overwritten by indexer
+    summary: Optional[str] = None
+    status: DocumentStatus = DocumentStatus.PENDING
+
+    def to_info(self) -> "DocumentInfo":
+        """Return a serialization-ready view of this document."""
+        from pathlib import Path as _Path
+        return DocumentInfo(
+            id=self.id,
+            path=self.path,
+            status=self.status.value,
+            summary=self.summary,
+            filename=self.name or (_Path(self.path).name if self.path else None),
+        )
+
+
+class DocumentInfo(BaseModel):
+    """Serialization-ready view of a Document, suitable for API responses and SSE events.
+
+    Uses a plain string for ``status`` so callers never need to call ``.value``
+    on the enum directly.
+    ``id`` is None for files that have been dropped into the inbox but not yet
+    registered by the indexer.
+    """
+    id: Optional[str] = None
+    path: Optional[str] = None
+    status: str = "pending"
+    summary: Optional[str] = None
+    filename: Optional[str] = None
+
+
+class MCPToolDefinition(BaseModel):
+    """Tool definition discovered from an MCP server."""
+    name: str
+    description: Optional[str] = None
+    input_schema: Optional[dict] = None
+
+
+class MCPServerConfig(BaseModel):
+    """Configuration for launching a local MCP server process."""
+    command: str  # e.g. "npx", "uvx"
+    args: List[str] = []
+    env: Dict[str, str] = {}
+    cwd: Optional[str] = None  # working directory; supports ~/
+
+
+class MCPServerType(str, Enum):
+    LOCAL = "local"
+    REMOTE = "remote"
+
+
+class MCPAuthType(str, Enum):
+    OAUTH = "oauth"
+    TOKEN_URL = "token_url"
+    TOKEN = "token"
+    NONE = "none"
+
+
+class RemoteMCPServerConfig(BaseModel):
+    """Configuration for a remote MCP server."""
+    server_url: str
+    auth_type: MCPAuthType = MCPAuthType.NONE
+    token_endpoint: Optional[str] = None
+    authorization_endpoint: Optional[str] = None
+    token: Optional[str] = None
+
+
+class MCPOAuthCredentials(BaseModel):
+    """OAuth credentials for a remote MCP server."""
+    client_id: str
+    client_secret: Optional[str] = None
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    expires_at: Optional[float] = None
+    token_type: str = "Bearer"
+
+
+class MCPServer(BaseModel):
+    """An MCP server registered to a project, persisted in config.json."""
+    id: str
+    name: str
+    pkg: Optional[str] = None
+    description: Optional[str] = None
+    summary: Optional[str] = None
+    config: Optional[MCPServerConfig] = None
+    server_type: MCPServerType = MCPServerType.LOCAL
+    remote_config: Optional[RemoteMCPServerConfig] = None
+    oauth_credentials: Optional[MCPOAuthCredentials] = None
+    enabled: bool = True
+    system: bool = False
+    tools: List[MCPToolDefinition] = []
+    server_info: Optional[Dict[str, Any]] = None
+
+
+class WorkspaceModel(BaseModel):
+    """A model registered in the workspace."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    model_name: str        # key name e.g. "gemma3_it_text"
+    model_id: str          # HF id e.g. "google/gemma-3-1b-it"
+    downloaded: bool = False
+    is_active: bool = False
+    config: Optional[ModelConfig] = None
+    models_dir: str = Field(default="", exclude=True)
+
+    @property
+    def model_dir(self) -> str:
+        return os.path.join(self.models_dir, self.model_id) if self.models_dir else ""
+
+    @property
+    def model_path(self) -> str:
+        if not self.models_dir:
+            return ""
+        return os.path.join(self.models_dir, self.model_id, f"{Path(self.model_id).name}.gguf")
+
+    @property
+    def bin_dir(self) -> str:
+        """Directory where the built GGUF is written for this model."""
+        return os.path.join(self.model_dir, "bin") if self.models_dir else ""
+
+    def gguf_path(self) -> str:
+        """GGUF file path under the model's bin directory."""
+        if not self.models_dir:
+            return ""
+        return os.path.join(self.bin_dir, f"{Path(self.model_id).name}.gguf")
+
+class Skill(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    content: str
+    system: bool = False
+
+class Project (BaseModel):
+    id: str
+    project_dir: str
+    current: bool
+    name: Optional[str] = None
+    description: Optional[str] = None
+    system: bool = False
+    cwd: Optional[str] = None
+    documents: List[Document] = []
+    skills: List[Skill] = []
+    mcp_servers: List[MCPServer] = []
+    adapters: Set[str] = set()
+    sessions: List[str] = []
+
+    @property
+    def visible_dir(self) -> str:
+        """Return the user-visible project directory.
+
+        Uses ``cwd`` (always set on new projects).  Falls back to
+        ``~/smartloop/<name>`` for legacy projects created before
+        ``cwd`` was persisted unconditionally.
+        """
+        if self.cwd:
+            return os.path.expanduser(self.cwd)
+        return os.path.expanduser(
+            os.path.join("~/smartloop", self.name or self.id)
+        )
+
+    @property
+    def folder_name(self) -> str:
+        """Basename of the visible directory on disk."""
+        return os.path.basename(self.visible_dir)
+
+    def model_build_dir(self) -> str:
+        """Per-project directory where the built GGUF is written."""
+        return os.path.join(self.project_dir, "model")
+
+    def model_gguf_path(self, model_id: str) -> str:
+        """Per-project GGUF file path (produced by build)."""
+        return os.path.join(self.project_dir, "model", f"{Path(model_id).name}.gguf")
+
+class Workspace(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra='ignore')
+
+    _instance: ClassVar[Optional['Workspace']] = None
+    _lock: ClassVar[threading.Lock] = threading.Lock()
+    config_file: ClassVar[str] = os.path.join(_settings.home_dir, "config.json")
+
+    id: str
+    projects: List[Project] = []
+    models: List[WorkspaceModel] = []
+    adapters: List = []
+    models_dir: str = ""
+    workspace_dir: str = ""
+    merge_model_dir: Optional[str] = None
+
+    def __init__(self, id: str, *,
+                 projects: List[Project] = None,
+                 workspace_dir: str = "",
+                 merge_model_dir: Optional[str] = None,
+                 models_dir: str = "",
+                 models: Optional[List[WorkspaceModel]] = None,
+                 adapters: Optional[List] = None,
+                 config: Optional[dict] = None,
+        ):
+        super().__init__(id=id, projects=projects or [], merge_model_dir=merge_model_dir, workspace_dir=workspace_dir, models_dir=models_dir, models=models or [], adapters=adapters or [])
+
+    @property
+    def active_model(self) -> Optional[WorkspaceModel]:
+        """Return the currently active WorkspaceModel, or None."""
+        return self.get_model()
+
+    def set_active_model(self, model_name: str) -> None:
+        """Mark the given model as active, deactivating all others."""
+        for m in self.models:
+            m.is_active = (m.model_name == model_name)
+
+    def get_model(self, model_name: Optional[str] = None) -> Optional[WorkspaceModel]:
+        """Look up a registered model by its short name.
+
+        If *model_name* is ``None``, returns the active model.
+        """
+        result = None
+        if model_name is None:
+            for m in self.models:
+                if m.is_active:
+                    result = m
+                    break
+        else:
+            for m in self.models:
+                if m.model_name == model_name:
+                    result = m
+                    break
+        if result is not None:
+            result.models_dir = self.models_dir
+        return result
+
+    def add_model(self, model_name: str, model_id: str, config: Optional[ModelConfig] = None) -> WorkspaceModel:
+        """Register a model if not already present and mark it as active."""
+        existing = self.get_model(model_name)
+        if existing is not None:
+            if config is not None:
+                if existing.config:
+                    # Merge: preserve existing values (e.g. developer_token)
+                    # when the incoming config has None for those fields.
+                    merged = existing.config.model_dump()
+                    for key, value in config.model_dump().items():
+                        if value is not None:
+                            merged[key] = value
+                    existing.config = ModelConfig.model_validate(merged)
+                else:
+                    existing.config = config
+            self.set_active_model(model_name)
+            return existing
+        # Deactivate all other models before appending
+        for m in self.models:
+            m.is_active = False
+        entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, is_active=True, models_dir=self.models_dir)
+        self.models.append(entry)
+        return entry
+
+    def model_dir_for(self, model_id: str) -> str:
+        """Return the workspace-level directory for a given model_id."""
+        return os.path.join(self.models_dir, model_id)
+
+    def model_path_for(self, model_id: str) -> str:
+        """Return the workspace-level GGUF file path for a given model_id."""
+        return os.path.join(self.models_dir, model_id, f"{Path(model_id).name}.gguf")
+
+    def resolve_gguf_path(self, model_id: str) -> str:
+        """Cascade: quantize-matched bin GGUF → exact bin GGUF → exact workspace GGUF → first GGUF in model dir."""
+        ws_model = self.get_model()
+        if ws_model and ws_model.bin_dir and os.path.isdir(ws_model.bin_dir):
+            quantize = (ws_model.config.quantize if ws_model.config else "").upper()
+            gguf_files = [f for f in os.listdir(ws_model.bin_dir) if f.endswith(".gguf")]
+            if quantize:
+                for f in gguf_files:
+                    if f.upper().endswith(f"-{quantize}.GGUF"):
+                        return os.path.join(ws_model.bin_dir, f)
+            if gguf_files:
+                return os.path.join(ws_model.bin_dir, gguf_files[0])
+        exact = self.model_path_for(model_id)
+        if os.path.exists(exact):
+            return exact
+        # Fallback: find any .gguf file in the model directory
+        model_dir = self.model_dir_for(model_id)
+        if os.path.isdir(model_dir):
+            for f in os.listdir(model_dir):
+                if f.endswith(".gguf"):
+                    return os.path.join(model_dir, f)
+        return exact
+
+    def save(self) -> None:
+        """Persist workspace state to config.json."""
+        ws_data = self.model_dump(mode="json")
+        ws_data.pop("model_dir", None)
+        ws_data.pop("model_path", None)
+        ws_data.pop("current_project", None)
+        ws_data.pop("model_id", None)
+        active = self.active_model
+        data = {"id": active.model_id if active else "", "workspace": ws_data}
+        with open(self.config_file, "w") as f:
+            json.dump(data, f, indent=4)
+    
+    @classmethod
+    def _create_new_workspace(cls, config: ModelConfig) -> 'Workspace':
+        workspace_id = str(uuid4())
+        workspace_dir = os.path.join(_settings.home_dir, workspace_id)
+        models_dir = os.path.join(workspace_dir, "models")
+
+        os.makedirs(models_dir, exist_ok=True)
+
+        workspace = Workspace(
+            id=workspace_id,
+            workspace_dir=workspace_dir,
+            models_dir=models_dir,
+            projects=[],
+            merge_model_dir=None,
+        )
+        return workspace
+
+    @classmethod
+    def init(cls, config: ModelConfig) -> 'Workspace':
+        """Load the workspace singleton from config.json on disk.
+
+        Returns the cached instance if already loaded, otherwise reads
+        from ``<base_dir>/config.json``.  Returns ``None`` when no
+        config file exists yet (workspace not initialized).
+        """
+        with cls._lock:
+            if cls._instance is not None:
+                return cls._instance
+
+            if not os.path.exists(cls.config_file):
+                cls._instance = cls._create_new_workspace(config)
+                return cls._instance
+
+            try:
+                with open(cls.config_file, "r") as f:
+                    content = f.read().strip()
+                    if not content:
+                        cls._instance = cls._create_new_workspace(config)
+                        return cls._instance
+                    data = json.loads(content)
+
+                ws_data = data.get("workspace", {})
+                # Strip computed/runtime fields that shouldn't be in __init__
+                ws_data.pop("model_dir", None)
+                ws_data.pop("model_path", None)
+                ws_data.pop("current_project", None)
+                ws_data.pop("model_id", None)
+
+                workspace = Workspace.model_validate(ws_data)
+
+                # Re-resolve paths against current base_dir
+                workspace.workspace_dir = os.path.join(_settings.home_dir, workspace.id)
+                workspace.models_dir = os.path.join(workspace.workspace_dir, "models")
+
+                # Merge config into the requested WorkspaceModel (without changing active)
+                ws_model = workspace.get_model(config.model_name)
+                if ws_model:
+                    if ws_model.config:
+                        merged = ws_model.config.model_dump()
+                        for key, value in config.model_dump().items():
+                            if value is not None:
+                                merged[key] = value
+                        ws_model.config = ModelConfig.model_validate(merged)
+                    else:
+                        ws_model.config = config
+
+                cls._instance = workspace
+                return cls._instance
+            except (json.JSONDecodeError, ValueError) as e:
+                logging.getLogger(__name__).warning(f"Workspace.init: failed to load config.json, creating new workspace: {e}")
+                cls._instance = cls._create_new_workspace(config)
+                return cls._instance
+    @classmethod
+    def load(cls) -> Optional['Workspace']:
+        """Load the workspace directly from config.json on disk.
+
+        Unlike :py:meth:`init`, this method does *not* require a
+        :class:`~smartloop.config.ModelConfig` and does not merge any model
+        config into the returned workspace.  It also does *not* update the
+        singleton cache.
+
+        Returns ``None`` when the config file is missing, empty, or invalid.
+        """
+        if not os.path.exists(cls.config_file):
+            return None
+        try:
+            with open(cls.config_file, "r") as f:
+                content = f.read().strip()
+                if not content:
+                    return None
+                data = json.loads(content)
+
+            ws_data = data.get("workspace", {})
+            ws_data.pop("model_dir", None)
+            ws_data.pop("model_path", None)
+            ws_data.pop("current_project", None)
+            ws_data.pop("model_id", None)
+
+            workspace = Workspace.model_validate(ws_data)
+
+            # Re-resolve paths against home_dir
+            workspace.workspace_dir = os.path.join(_settings.home_dir, workspace.id)
+            workspace.models_dir = os.path.join(workspace.workspace_dir, "models")
+
+            return workspace
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def reload(self) -> None:
+        """Re-read workspace state from disk into this instance.
+
+        Refreshes project list and document statuses so queries see
+        documents that were indexed by background workers since the
+        last load.
+        """
+        fresh = Workspace.load()
+        if fresh is None:
+            return
+        # Update projects in-place so references stay valid
+        self.projects = fresh.projects
+
+    @classmethod
+    def reset(cls) -> None:
+        """Clear the cached singleton (useful after model switch or tests)."""
+        with cls._lock:
+            cls._instance = None
+
+    @classmethod
+    def get_instance(cls) -> Optional['Workspace']:
+        """Return the current singleton instance, or None."""
+        return cls._instance
+
+    @computed_field(repr=False)
+    @property
+    def current_project(self) -> Optional['Project']:
+        """Get the current active project"""
+        for project in self.projects:
+            if project.current:
+                return project
+        return None

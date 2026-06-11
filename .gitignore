@@ -164,7 +164,7 @@ documents/
 .vscode
 
 user.yaml
-.out/.uv-python/
+.uv-python/
 .build-tmp/
 dist-wheels/
 .wheel-build-env/
