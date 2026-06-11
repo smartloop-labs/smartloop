@@ -136,11 +136,16 @@ build-binary:
 sign:
 ifeq ($(PLATFORM),darwin)
 	@echo "=== Signing binary ==="
-	@find $(DIST_DIR) -name "*.so" -o -name "*.dylib" | xargs -I {} \
-		codesign --force --options runtime \
+	@# Notarization rejects the bundle if ANY Mach-O inside lacks a Developer ID
+	@# signature with hardened runtime, so detect binaries by content — matching
+	@# by extension misses Python.framework/Versions/*/Python and torch/bin/*.
+	@find $(DIST_DIR) -type f ! -path "$(DIST_DIR)/slp" -print0 | xargs -0 file | \
+		grep 'Mach-O' | cut -d: -f1 | while read -r bin; do \
+		codesign --force --options runtime --timestamp \
 			--entitlements packaging/macos/entitlements.mac.plist \
-			--sign "$(APPLE_DEVELOPER_ID)" {}
-	codesign --force --options runtime \
+			--sign "$(APPLE_DEVELOPER_ID)" "$$bin" || exit 1; \
+	done
+	codesign --force --options runtime --timestamp \
 		--entitlements packaging/macos/entitlements.mac.plist \
 		--sign "$(APPLE_DEVELOPER_ID)" \
 		$(DIST_DIR)/slp
@@ -154,12 +159,25 @@ notarize:
 ifeq ($(PLATFORM),darwin)
 	@echo "=== Notarizing binary ==="
 	ditto -c -k --keepParent $(DIST_DIR) slp-notarize.zip
+	@# notarytool exits 0 even on an Invalid verdict — check the status
+	@# ourselves and surface Apple's per-file log before failing.
+	@set -e; \
 	xcrun notarytool submit slp-notarize.zip \
 		--apple-id "$(APPLE_ID)" \
 		--password "$(APPLE_APP_PASSWORD)" \
 		--team-id "$(APPLE_TEAM_ID)" \
-		--wait
-	@rm -f slp-notarize.zip
+		--wait --output-format json | tee notarize-result.json; \
+	ID=$$($(PYTHON) -c "import json; print(json.load(open('notarize-result.json'))['id'])"); \
+	STATUS=$$($(PYTHON) -c "import json; print(json.load(open('notarize-result.json'))['status'])"); \
+	if [ "$$STATUS" != "Accepted" ]; then \
+		echo "Notarization failed with status: $$STATUS"; \
+		xcrun notarytool log "$$ID" \
+			--apple-id "$(APPLE_ID)" \
+			--password "$(APPLE_APP_PASSWORD)" \
+			--team-id "$(APPLE_TEAM_ID)"; \
+		exit 1; \
+	fi
+	@rm -f slp-notarize.zip notarize-result.json
 	@echo "Notarization complete"
 else
 	@echo "Skipping notarization (not macOS)"
