@@ -61,8 +61,26 @@ jobs:
       - name: Build slp binary
         run: make build-binary
 
+      # CI has no NVIDIA driver, so we can't offload here — instead assert the
+      # bundle is correct: right version, GPU backend compiled in, CUDA 12
+      # runtime bundled, and everything resolvable without the system CUDA.
       - name: Verify build
-        run: dist/slp/slp --version
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VER="$(dist/slp/slp --version | awk '{print $NF}')"
+          [ "$VER" = "${TAG#v}" ] || { echo "FAIL: binary reports version $VER, tag says ${TAG#v}"; exit 1; }
+          CUDA_SO="$(find dist/slp/_internal -name libggml-cuda.so | head -1)"
+          [ -n "$CUDA_SO" ] || { echo "FAIL: libggml-cuda.so missing — CPU-only build"; exit 1; }
+          for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+            test -e "dist/slp/_internal/$so" || { echo "FAIL: $so not bundled into the dist"; exit 1; }
+          done
+          # Resolved against the bundle alone (the PyInstaller bootloader sets
+          # LD_LIBRARY_PATH to _internal at runtime), only the GPU *driver*
+          # (libcuda.so.1, provided by the user's NVIDIA driver) may be unresolved.
+          missing="$(LD_LIBRARY_PATH="$PWD/dist/slp/_internal" ldd "$CUDA_SO" | awk '/not found/{print $1}' | grep -vxF 'libcuda.so.1' || true)"
+          [ -z "$missing" ] || { echo "FAIL: unresolved non-driver deps:"; echo "$missing"; exit 1; }
+          echo "OK: slp $VER, GPU bindings present, CUDA 12 runtime bundled."
 
       - name: Archive
         run: make archive
@@ -123,7 +141,12 @@ jobs:
         run: make build-binary
 
       - name: Verify build
-        run: dist/slp/slp --version
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VER="$(dist/slp/slp --version | awk '{print $NF}')"
+          [ "$VER" = "${TAG#v}" ] || { echo "FAIL: binary reports version $VER, tag says ${TAG#v}"; exit 1; }
+          echo "OK: slp $VER"
 
       - name: Sign
         env:
@@ -177,11 +200,39 @@ jobs:
       - name: Install dependencies
         run: make build CUDA=1
 
+      # The cu124 wheel does not vendor the CUDA runtime DLLs. Copy them from
+      # the toolkit into llama_cpp/lib so the PyInstaller spec bundles them
+      # next to ggml-cuda.dll (found via the loader's add_dll_directory).
+      - name: Bundle CUDA runtime into llama_cpp
+        run: |
+          set -euo pipefail
+          LLAMA_LIB="$(cygpath -u "$(.venv/Scripts/python -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')")"
+          [ -f "$LLAMA_LIB/ggml-cuda.dll" ] || { echo "FAIL: ggml-cuda.dll missing — CPU-only wheel"; exit 1; }
+          CUDA_BIN="$(cygpath -u "${CUDA_PATH:-$CUDA_HOME}")/bin"
+          [ -d "$CUDA_BIN" ] || { echo "FAIL: CUDA bin dir not found (CUDA_PATH=$CUDA_PATH CUDA_HOME=$CUDA_HOME)"; exit 1; }
+          for pat in cudart64 cublas64 cublasLt64; do
+            src="$(ls "$CUDA_BIN"/${pat}_*.dll 2>/dev/null | head -1)"
+            [ -n "$src" ] || { echo "FAIL: ${pat}_*.dll not found in $CUDA_BIN — toolkit install incomplete"; exit 1; }
+            cp "$src" "$LLAMA_LIB/"
+            echo "  bundled $(basename "$src") <- $src"
+          done
+
       - name: Build slp binary
         run: make build-binary
 
       - name: Verify build
-        run: dist/slp/slp --version
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VER="$(dist/slp/slp --version | awk '{print $NF}')"
+          [ "$VER" = "${TAG#v}" ] || { echo "FAIL: binary reports version $VER, tag says ${TAG#v}"; exit 1; }
+          GGML_CUDA="$(find dist/slp/_internal -name ggml-cuda.dll | head -1)"
+          [ -n "$GGML_CUDA" ] || { echo "FAIL: ggml-cuda.dll missing — CPU-only build"; exit 1; }
+          LIBDIR="$(dirname "$GGML_CUDA")"
+          for pat in cudart64 cublas64 cublasLt64; do
+            ls "$LIBDIR"/${pat}_*.dll >/dev/null 2>&1 || { echo "FAIL: ${pat}_*.dll not bundled next to ggml-cuda.dll"; exit 1; }
+          done
+          echo "OK: slp $VER, GPU bindings present, CUDA runtime bundled."
 
       - name: Archive
         run: make archive-zip
@@ -259,6 +310,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
+          # Idempotent for retags: replace any existing release for this tag.
+          gh release delete "$TAG" --yes 2>/dev/null || true
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes

@@ -3,8 +3,8 @@
     Smartloop installer for Windows (PowerShell).
 
 .DESCRIPTION
-    One-click install. Downloads the pre-baked relocatable distribution from the
-    GitHub release, verifies SHA256 checksums, extracts it to
+    One-click install. Downloads the pre-baked relocatable distribution from
+    dl.smartloop.ai, verifies SHA256 checksums, extracts it to
     %USERPROFILE%\.smartloop\<version>, writes a `slp` launcher shim on PATH, and
     registers a per-user scheduled task that keeps the agent running.
 
@@ -23,7 +23,7 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $Version    = '1.0.1'
-$BaseUrl    = "https://github.com/smartloop-ai/smartloop/releases/download/v$Version"
+$BaseUrl    = "https://dl.smartloop.ai/slp/$Version"
 $BaseDir    = Join-Path $HOME '.smartloop'
 $InstallDir = Join-Path $BaseDir $Version
 $CacheDir   = Join-Path $HOME '.cache\smartloop'
@@ -181,13 +181,13 @@ function Get-UrlContentLength {
 }
 
 # ---------------------------------------------------------------------------
-# Download the (possibly split) release archive into the cache.
-# Large CUDA archives are split into parts to dodge GitHub's 2GB asset limit.
+# Download the release archive into the cache. Hosted on GCS (dl.smartloop.ai),
+# so there is no asset size limit and no split parts.
 # ---------------------------------------------------------------------------
 function Get-Archive {
     New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
-    $cached = Join-Path $CacheDir "slp-$Version-windows-amd64.tar.gz"
-    $archiveName = 'windows-amd64-slp.tar.gz'
+    $cached = Join-Path $CacheDir "slp-$Version-windows-amd64.zip"
+    $archiveName = 'windows-amd64-slp.zip'
 
     # Reuse a valid cached archive.
     if (Test-Path $cached) {
@@ -198,58 +198,12 @@ function Get-Archive {
         }
     }
 
-    $partPrefix = 'windows-amd64-slp.tar.gz.part-'
-    $suffixes   = 'aa','ab','ac','ad','ae','af','ag','ah'
-
-    # Discover which parts exist.
-    $available = @()
-    foreach ($s in $suffixes) {
-        $len = Get-UrlContentLength "$BaseUrl/$partPrefix$s"
-        if ($len -ge 0) { $available += $s } else { break }
+    Save-Url -Url "$BaseUrl/$archiveName" -OutFile $cached -Activity "Get:1 smartloop $Version"
+    $expected = Get-ExpectedSha256 $archiveName
+    if (-not (Test-Checksum -Path $cached -Expected $expected)) {
+        Die 'Checksum verification failed.'
     }
-
-    $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("slp-" + [System.Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-
-    try {
-        if ($available.Count -eq 0) {
-            # Not split — single archive asset.
-            Save-Url -Url "$BaseUrl/$archiveName" -OutFile $cached -Activity "Get:1 smartloop $Version"
-            $expected = Get-ExpectedSha256 $archiveName
-            if (-not (Test-Checksum -Path $cached -Expected $expected)) {
-                Die 'Checksum verification failed.'
-            }
-            return $cached
-        }
-
-        $partFiles = @()
-        $i = 0
-        foreach ($s in $available) {
-            $i++
-            $partFile = Join-Path $tmpDir "$partPrefix$s"
-            Save-Url -Url "$BaseUrl/$partPrefix$s" -OutFile $partFile `
-                     -Activity "Get:1 smartloop $Version (part $i/$($available.Count))"
-            $expected = Get-ExpectedSha256 "$partPrefix$s"
-            if (-not (Test-Checksum -Path $partFile -Expected $expected)) {
-                Die "Checksum verification failed for part $s."
-            }
-            $partFiles += $partFile
-        }
-
-        # Concatenate parts into the cached archive.
-        $out = [System.IO.File]::Create($cached)
-        try {
-            foreach ($pf in $partFiles) {
-                $bytes = [System.IO.File]::OpenRead($pf)
-                try { $bytes.CopyTo($out) } finally { $bytes.Close() }
-            }
-        } finally {
-            $out.Close()
-        }
-        return $cached
-    } finally {
-        Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
-    }
+    return $cached
 }
 
 # ---------------------------------------------------------------------------
@@ -338,14 +292,15 @@ function Install-Smartloop {
         $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("slp-x-" + [System.Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
         try {
-            & tar.exe -xzf $archive -C $tmpDir
+            # bsdtar (Windows 10 1803+) auto-detects and extracts zip archives.
+            & tar.exe -xf $archive -C $tmpDir
             if ($LASTEXITCODE -ne 0) { Die 'Failed to extract archive' }
 
             Write-Muted "[3/3] Setting up smartloop ($Version)"
             New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
             Get-ChildItem -Path $InstallDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-            $appDir = Join-Path $tmpDir 'slp-app'
+            $appDir = Join-Path $tmpDir 'slp'
             if (-not (Test-Path $appDir)) { Die "Unexpected archive layout: $appDir not found" }
             Copy-Item -Path (Join-Path $appDir '*') -Destination $InstallDir -Recurse -Force
         } finally {
@@ -359,8 +314,10 @@ function Install-Smartloop {
     $alreadyListed = (Test-Path $installedFile) -and ((Get-Content $installedFile) -contains $Version)
     if (-not $alreadyListed) { Add-Content -Path $installedFile -Value $Version }
 
-    $slpBin = Join-Path $InstallDir 'bin\slp.cmd'
-    if (-not (Test-Path $slpBin)) { Die "Launcher not found at $slpBin" }
+    # The PyInstaller distribution is self-contained: slp.exe sits at the top
+    # of the install dir next to its _internal\ payload.
+    $slpBin = Join-Path $InstallDir 'slp.exe'
+    if (-not (Test-Path $slpBin)) { Die "Executable not found at $slpBin" }
 
     # Write a stable shim on PATH that forwards to the versioned launcher
     # (Windows equivalent of the ~/.smartloop/slp symlink on Unix).

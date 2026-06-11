@@ -5,5 +5,6 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("slp")
 except PackageNotFoundError:
-    # Running from a source checkout without an installed dist.
-    __version__ = "1.0.0"
+    # Frozen binary (PyInstaller) or source checkout without an installed
+    # dist — no package metadata, so fall back to the package version.
+    from smartloop import __version__

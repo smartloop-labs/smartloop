@@ -131,7 +131,7 @@ build-binary:
 	@$(DIST_DIR)/slp --version || (echo "ERROR: slp binary verification failed" && exit 1)
 	@echo "Binary verified successfully."
 	@echo "Compiling .pyc files for faster startup..."
-	@python -m compileall -q -b $(DIST_DIR)
+	@$(PYTHON) -m compileall -q -b $(DIST_DIR)
 
 sign:
 ifeq ($(PLATFORM),darwin)
