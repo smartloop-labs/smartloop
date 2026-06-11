@@ -134,8 +134,8 @@ class AppSettings(BaseSettings):
     #   "sqlite" — SQLite-stored embeddings + numpy cosine (default; no extra
     #              deps, falls back to TF-IDF only if the embedding model can't
     #              load).
-    #   "chroma" — embedded ChromaDB (HNSW index; requires
-    #              `pip install "smartloop[chroma]"`).
+    #   "chroma" — embedded ChromaDB (HNSW index; requires the chromadb
+    #              package).
     vector_store_backend: str = Field(
         default="sqlite", validation_alias="slp_vector_store_backend",
         description='Vector store backend: "sqlite" or "chroma" (both dense).',

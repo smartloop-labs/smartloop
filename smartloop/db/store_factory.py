@@ -68,9 +68,8 @@ class StoreFactory:
                 from smartloop.db.chroma_store import ChromaStore
             except ImportError as exc:
                 raise ImportError(
-                    "The 'chroma' vector store backend requires extra "
-                    "dependencies. Install them with: "
-                    'pip install "smartloop[chroma]"'
+                    "The 'chroma' vector store backend requires the "
+                    "chromadb package. Install it with: pip install chromadb"
                 ) from exc
             return ChromaStore(
                 project_dir=project_dir,
