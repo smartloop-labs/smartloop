@@ -20,7 +20,13 @@ env:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    # Pin to an older Ubuntu (glibc 2.35) rather than ubuntu-latest (24.04,
+    # glibc 2.39). PyInstaller does not bundle glibc, and glibc is only
+    # forward-compatible, so a binary built on a newer glibc fails to load on
+    # older distros ("version `GLIBC_2.xx' not found"). This is the Linux
+    # analog of pinning macos-14 — it sets a defined, portable compatibility
+    # floor (Ubuntu 22.04+, Debian 12+, etc.).
+    runs-on: ubuntu-22.04
     steps:
       - name: Free disk space
         run: |
@@ -46,7 +52,7 @@ jobs:
 
       - name: Install CUDA runtime libraries
         run: |
-          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
           sudo apt-get install -y cuda-cudart-12-6 libcublas-12-6
@@ -200,14 +206,16 @@ jobs:
       - name: Install dependencies
         run: make build CUDA=1
 
-      # The cu124 wheel does not vendor the CUDA runtime DLLs. Copy them from
-      # the toolkit into llama_cpp/lib so the PyInstaller spec bundles them
-      # next to ggml-cuda.dll (found via the loader's add_dll_directory).
+      # llama_cpp's ggml-cuda.dll (from the prebuilt GCS wheel or the source
+      # fallback) links against the toolkit's CUDA runtime but does not vendor
+      # those DLLs. Copy them from the toolkit into llama_cpp/lib so the
+      # PyInstaller spec bundles them next to ggml-cuda.dll (found via the
+      # loader's add_dll_directory).
       - name: Bundle CUDA runtime into llama_cpp
         run: |
           set -euo pipefail
           LLAMA_LIB="$(cygpath -u "$(.venv/Scripts/python -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')")"
-          [ -f "$LLAMA_LIB/ggml-cuda.dll" ] || { echo "FAIL: ggml-cuda.dll missing — CPU-only wheel"; exit 1; }
+          [ -f "$LLAMA_LIB/ggml-cuda.dll" ] || { echo "FAIL: ggml-cuda.dll missing — CPU-only build (GGML_CUDA=ON not honored?)"; exit 1; }
           CUDA_BIN="$(cygpath -u "${CUDA_PATH:-$CUDA_HOME}")/bin"
           [ -d "$CUDA_BIN" ] || { echo "FAIL: CUDA bin dir not found (CUDA_PATH=$CUDA_PATH CUDA_HOME=$CUDA_HOME)"; exit 1; }
           for pat in cudart64 cublas64 cublasLt64; do
