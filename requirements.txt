@@ -38,7 +38,7 @@ certifi
 # Data Processing
 pandas>=1.5.0
 scikit-learn>=1.3.0
-numpy>=1.24.0
+numpy>=1.24.0,<2.4
 
 # Progress Bars
 tqdm>=4.66.0
