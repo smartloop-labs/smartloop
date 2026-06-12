@@ -44,27 +44,18 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.21
-        with:
-          cuda: '12.4.0'
+      - name: Install CUDA runtime libraries
+        run: |
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-cudart-12-6 libcublas-12-6
+
+      - name: Set CUDA environment
+        run: echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: Install dependencies
         run: make build CUDA=1
-
-      - name: Bundle CUDA runtime into llama_cpp
-        run: |
-          set -euo pipefail
-          LLAMA_LIB="$(.venv/bin/python -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')"
-          [ -f "$LLAMA_LIB/libggml-cuda.so" ] || { echo "FAIL: libggml-cuda.so missing — CPU-only build"; exit 1; }
-          CUDA_LIB="${CUDA_PATH:-${CUDA_HOME:-/usr/local/cuda}}/lib64"
-          [ -d "$CUDA_LIB" ] || { echo "FAIL: CUDA lib64 dir not found"; exit 1; }
-          for pat in libcudart.so libcublas.so libcublasLt.so; do
-            src="$(ls "$CUDA_LIB"/${pat}* 2>/dev/null | head -1)"
-            [ -n "$src" ] || { echo "FAIL: ${pat}* not found in $CUDA_LIB"; exit 1; }
-            cp "$src" "$LLAMA_LIB/"
-            echo "  bundled $(basename "$src") <- $src"
-          done
 
       - name: Build slp binary
         run: make build-binary
