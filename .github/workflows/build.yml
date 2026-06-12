@@ -193,11 +193,9 @@ jobs:
       - name: Install dependencies
         run: make build CUDA=1
 
-      # llama_cpp's ggml-cuda.dll (from the prebuilt GCS wheel or the source
-      # fallback) links against the toolkit's CUDA runtime but does not vendor
-      # those DLLs. Copy them from the toolkit into llama_cpp/lib so the
-      # PyInstaller spec bundles them next to ggml-cuda.dll (found via the
-      # loader's add_dll_directory).
+      # The abetlen wheel's ggml-cuda.dll links against the CUDA runtime but
+      # does not vendor those DLLs. Copy them from the toolkit into llama_cpp/lib
+      # so PyInstaller bundles them next to ggml-cuda.dll.
       - name: Bundle CUDA runtime into llama_cpp
         run: |
           set -euo pipefail
