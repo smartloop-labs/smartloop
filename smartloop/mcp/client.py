@@ -26,6 +26,11 @@ class MCPProtocolError(MCPClientError):
     pass
 
 
+class MCPLaunchError(MCPClientError):
+    """Raised when the MCP subprocess fails to start or exits before the handshake."""
+    pass
+
+
 @dataclass
 class MCPServerInfo:
     name: Optional[str] = None

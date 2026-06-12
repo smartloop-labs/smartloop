@@ -19,6 +19,7 @@ from .client import (
     MCPConnectResult,
     MCPServerInfo,
     MCPToolCallResult,
+    MCPLaunchError,
     MCPProtocolError,
 )
 
@@ -132,11 +133,35 @@ class LocalMCPClient:
         self._request_id += 1
         return self._request_id
 
+    def _read_stderr_nonblocking(self, max_bytes: int = 500) -> str:
+        """Read up to *max_bytes* from stderr without blocking."""
+        try:
+            readable, _, _ = select.select([self._process.stderr], [], [], 0.5)
+            if readable:
+                return self._process.stderr.read(max_bytes)
+        except Exception:
+            pass
+        return ""
+
     def _send(self, message: dict) -> None:
         assert self._process is not None, "StdioMCPClient not started"
+        # Check if the process has already exited before trying to write.
+        if self._process.poll() is not None:
+            stderr = self._read_stderr_nonblocking()
+            raise MCPLaunchError(
+                f"MCP process exited (code {self._process.returncode}) before message could be sent."
+                + (f" stderr: {stderr}" if stderr else "")
+            )
         line = json.dumps(message) + "\n"
-        self._process.stdin.write(line)
-        self._process.stdin.flush()
+        try:
+            self._process.stdin.write(line)
+            self._process.stdin.flush()
+        except BrokenPipeError:
+            stderr = self._read_stderr_nonblocking()
+            raise MCPLaunchError(
+                "MCP process closed its stdin unexpectedly (broken pipe)."
+                + (f" stderr: {stderr}" if stderr else "")
+            )
 
     def _recv(self, expected_id: int) -> dict:
         """Read lines from stdout until we get a response matching expected_id."""
@@ -157,13 +182,10 @@ class LocalMCPClient:
                 )
             line = self._process.stdout.readline()
             if not line:
-                stderr = ""
-                try:
-                    stderr = self._process.stderr.read(500)
-                except Exception:
-                    pass
+                stderr = self._read_stderr_nonblocking()
                 raise MCPProtocolError(
-                    f"MCP process closed its stdout unexpectedly. stderr: {stderr}"
+                    "MCP process closed its stdout unexpectedly."
+                    + (f" stderr: {stderr}" if stderr else "")
                 )
             line = line.strip()
             if not line:
@@ -258,6 +280,8 @@ class LocalMCPClient:
             ]
             return MCPConnectResult(success=True, tools=tools, server_info=server_info)
 
+        except MCPLaunchError as e:
+            raise e
         except MCPProtocolError as e:
             return MCPConnectResult(success=False, error=str(e))
         except Exception as e:

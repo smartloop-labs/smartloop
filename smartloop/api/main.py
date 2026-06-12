@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import sys
 import json
 import uvicorn
 import psutil
@@ -296,15 +297,12 @@ class _PortCapturingServer(uvicorn.Server):
 
 
 def _setup_file_logging():
-    """Redirect all logs to server.log — keeps the CLI output clean."""
-    log_file = Path(_app_settings.home_dir) / "server.log"
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    )
-    logging.getLogger().addHandler(file_handler)
+    """Send INFO logs to stdout — callers are responsible for redirecting to a file."""
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(formatter)
+    logging.getLogger().addHandler(stream_handler)
 
 
 def run_server():
