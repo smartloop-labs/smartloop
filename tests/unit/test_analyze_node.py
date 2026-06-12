@@ -91,8 +91,8 @@ class TestAnalyzeHandler:
         """ANALYZE handler should call the LLM with the explore output."""
         mock_llm.invoke.return_value = "The document contains a summary of Q3 results."
 
-        handler = orchestrator._make_skill_step_handler(
-            ctx, analyze_step, matched_skills=[], search_ctx=search_ctx,
+        handler = orchestrator._make_step_handler(
+            ctx, analyze_step, search_ctx=search_ctx,
         )
         deps = _make_deps("Q3 financial results: revenue up 15%.")
         result = handler(deps)
@@ -110,8 +110,8 @@ class TestAnalyzeHandler:
         """When the LLM deems context irrelevant, handler passes through raw explore data."""
         mock_llm.invoke.return_value = "NOT_RELEVANT"
 
-        handler = orchestrator._make_skill_step_handler(
-            ctx, analyze_step, matched_skills=[], search_ctx=search_ctx,
+        handler = orchestrator._make_step_handler(
+            ctx, analyze_step, search_ctx=search_ctx,
         )
         deps = _make_deps("Unrelated cooking recipe data.")
         result = handler(deps)
@@ -128,8 +128,8 @@ class TestAnalyzeHandler:
         analysis = "The document has several grammatical errors in paragraphs 2 and 5."
         mock_llm.invoke.return_value = analysis
 
-        handler = orchestrator._make_skill_step_handler(
-            ctx, analyze_step, matched_skills=[], search_ctx=search_ctx,
+        handler = orchestrator._make_step_handler(
+            ctx, analyze_step, search_ctx=search_ctx,
         )
         deps = _make_deps("Draft document with typos and grammar issues.")
         result = handler(deps)
@@ -142,8 +142,8 @@ class TestAnalyzeHandler:
         self, orchestrator, mock_llm, analyze_step, ctx, search_ctx
     ):
         """When explore produced no content, ANALYZE should skip the LLM call."""
-        handler = orchestrator._make_skill_step_handler(
-            ctx, analyze_step, matched_skills=[], search_ctx=search_ctx,
+        handler = orchestrator._make_step_handler(
+            ctx, analyze_step, search_ctx=search_ctx,
         )
         deps = _make_deps("")
         result = handler(deps)
@@ -157,8 +157,8 @@ class TestAnalyzeHandler:
         """If the LLM raises an exception, ANALYZE passes through raw explore data."""
         mock_llm.invoke.side_effect = RuntimeError("model error")
 
-        handler = orchestrator._make_skill_step_handler(
-            ctx, analyze_step, matched_skills=[], search_ctx=search_ctx,
+        handler = orchestrator._make_step_handler(
+            ctx, analyze_step, search_ctx=search_ctx,
         )
         deps = _make_deps("Some explore content.")
         result = handler(deps)

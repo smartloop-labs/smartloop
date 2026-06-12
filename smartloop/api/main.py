@@ -34,8 +34,7 @@ _app_settings.version = __version__
 # Port file for persisting actual bound port (shared in home directory)
 PORT_FILE = os.path.join(_app_settings.home_dir, "server.port")
 
-# Configure logging — all application logs go to the file handler added at
-# startup; no console handler so nothing bleeds into the CLI.
+# Configure logging — INFO level; handlers are added by _setup_file_logging at startup.
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -328,6 +327,7 @@ def run_server():
             host=api_settings.api_host,
             port=api_settings.api_port,
             log_level="info",
+            log_config=None,
         )
         server = _PortCapturingServer(config)
         server.run()
@@ -374,7 +374,7 @@ def start_server_foreground(host: str, port: int, service: bool = True) -> None:
         while True:
             start_ts = _time.monotonic()
             try:
-                config = uvicorn.Config(app, host=host, port=port, log_level="info")
+                config = uvicorn.Config(app, host=host, port=port, log_level="info", log_config=None)
                 server = _PortCapturingServer(config)
                 server.run()
             except Exception:

@@ -31,7 +31,7 @@ class ResultFormatter:
                     try:
                         data = json.loads(text)
                         data = self.compact_json(data)
-                        parts.append(self.json_to_markdown(data))
+                        parts.append(self.flatten_to_text(data))
                     except (json.JSONDecodeError, TypeError):
                         parts.append(text)
                 else:
@@ -102,6 +102,52 @@ class ResultFormatter:
                     return cls.compact_json(only_value)
             return compacted
         return data
+
+    @staticmethod
+    def _humanize_key(key: str) -> str:
+        """Convert camelCase / snake_case keys to readable words.
+
+        regularMarketPrice  →  regular market price
+        fifty_two_week_high →  fifty two week high
+        """
+        import re
+        # camelCase → insert space before each uppercase run
+        key = re.sub(r'([a-z])([A-Z])', r'\1 \2', key)
+        key = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', key)
+        return key.replace("_", " ").lower()
+
+    @staticmethod
+    def flatten_to_text(data, _prefix: str = "") -> str:
+        """Convert a compacted dict/list to plain key: value lines.
+
+        Produces output like:
+            symbol: AAPL
+            regular market price: 290.64
+            volume: 25520114
+        so the LLM never sees raw JSON syntax and can answer naturally.
+        """
+        if isinstance(data, dict):
+            lines = []
+            for key, value in data.items():
+                label = ResultFormatter._humanize_key(key)
+                if _prefix:
+                    label = _prefix + label
+                if isinstance(value, (dict, list)):
+                    nested = ResultFormatter.flatten_to_text(value, _prefix=label + " / ")
+                    if nested:
+                        lines.append(nested)
+                else:
+                    lines.append(f"{label}: {value}")
+            return "\n".join(lines)
+        if isinstance(data, list):
+            chunks = []
+            for item in data:
+                if isinstance(item, (dict, list)):
+                    chunks.append(ResultFormatter.flatten_to_text(item, _prefix=_prefix))
+                else:
+                    chunks.append(f"{_prefix}{item}" if _prefix else str(item))
+            return "\n".join(chunks)
+        return f"{_prefix}{data}" if _prefix else str(data)
 
     @staticmethod
     def json_to_markdown(data) -> str:

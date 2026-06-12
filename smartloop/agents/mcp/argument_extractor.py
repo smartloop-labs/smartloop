@@ -162,6 +162,9 @@ class MCPArgumentExtractor:
         (e.g. "Content as Markdown. Do not escape the string ...") into the
         value instead of producing a real value.  Such values are not real
         data and must be dropped so the param is treated as missing.
+
+        Short values (e.g. ticker symbols, codes) are never considered echoes
+        regardless of whether they appear in the description as examples.
         """
         if not isinstance(value, str):
             return False
@@ -169,10 +172,17 @@ class MCPArgumentExtractor:
         if not desc:
             return False
         nv, nd = self._normalize_text(value), self._normalize_text(desc)
-        # Require a substantial description to avoid dropping legit short values.
-        if len(nd) < 12:
+        # Short values are almost certainly real data, not echoed descriptions.
+        # A ticker like "AAPL" or a country code "US" should never be dropped.
+        if len(nv) < 20:
             return False
-        if nv == nd or nv in nd or nd in nv:
+        # Require a substantial description to avoid dropping legit short values.
+        if len(nd) < 20:
+            return False
+        # Only treat as echo when the value matches the whole description or
+        # contains most of it — not the reverse (value appearing as an example
+        # in the description is fine).
+        if nv == nd or nd in nv:
             logger.warning(
                 "Dropping echoed schema description as value: %r", value[:80]
             )
