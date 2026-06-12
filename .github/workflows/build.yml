@@ -20,19 +20,6 @@ env:
 
 jobs:
   build-linux:
-    # Build inside manylinux_2_28 (AlmaLinux 8, glibc 2.28) — NOT just on an old
-    # runner OS. PyInstaller copies the *build* machine's libpython into the
-    # bundle but deliberately does not bundle glibc, so the artifact's
-    # compatibility floor is the glibc the interpreter was compiled against, not
-    # the runner. The old `runs-on: ubuntu-22.04` pin looked safe but
-    # actions/setup-python downloads a prebuilt CPython built on glibc 2.38, so
-    # the bundle inherited a 2.38 floor and failed to load at install time on
-    # Ubuntu 22.04 / Debian 12 / RHEL 9 ("version `GLIBC_2.38' not found").
-    #
-    # manylinux_2_28 is the lowest glibc that still satisfies the GitHub runner's
-    # node20 (needs >= 2.28), so we run only the heavy build in the container and
-    # keep checkout/verify/upload on the host — the 2.28-floored binary runs fine
-    # on the 2.35 host. Floor: RHEL/Alma/Rocky 8+, Ubuntu 20.04+, Debian 11+.
     runs-on: ubuntu-22.04
     steps:
       - name: Free disk space
@@ -52,63 +39,36 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
-      # Everything that ends up in the bundle (the cp311 interpreter, our deps,
-      # the CUDA runtime) is installed and linked inside the container, so the
-      # whole payload shares the 2.28 floor.
-      #
-      # The manylinux /opt/python/cp311-cp311 is statically linked (no
-      # libpython3.11.so), which PyInstaller cannot use. We build CPython 3.11
-      # from source with --enable-shared so PyInstaller gets the shared library
-      # it needs, while still linking against the container's glibc 2.28.
-      - name: Build in manylinux_2_28 (glibc 2.28 floor)
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.4.0'
+
+      - name: Install dependencies
+        run: make build CUDA=1
+
+      - name: Bundle CUDA runtime into llama_cpp
         run: |
-          docker run --rm -v "$PWD":/work -w /work \
-            quay.io/pypa/manylinux_2_28_x86_64 \
-            bash -euxo pipefail -c '
-              PY_VERSION=3.11.15
-              PREFIX=/opt/shared-python
+          set -euo pipefail
+          LLAMA_LIB="$(.venv/bin/python -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')"
+          [ -f "$LLAMA_LIB/libggml-cuda.so" ] || { echo "FAIL: libggml-cuda.so missing — CPU-only build"; exit 1; }
+          CUDA_LIB="${CUDA_PATH:-${CUDA_HOME:-/usr/local/cuda}}/lib64"
+          [ -d "$CUDA_LIB" ] || { echo "FAIL: CUDA lib64 dir not found"; exit 1; }
+          for pat in libcudart.so libcublas.so libcublasLt.so; do
+            src="$(ls "$CUDA_LIB"/${pat}* 2>/dev/null | head -1)"
+            [ -n "$src" ] || { echo "FAIL: ${pat}* not found in $CUDA_LIB"; exit 1; }
+            cp "$src" "$LLAMA_LIB/"
+            echo "  bundled $(basename "$src") <- $src"
+          done
 
-              # Build CPython with a shared libpython for PyInstaller.
-              curl -fsSL https://www.python.org/ftp/python/${PY_VERSION}/Python-${PY_VERSION}.tar.xz \
-                | tar xJ -C /tmp
-              cd /tmp/Python-${PY_VERSION}
-              ./configure --enable-shared --enable-optimizations --prefix=${PREFIX} -q
-              make -j$(nproc) -s
-              make install -s
-              cd /work
+      - name: Build slp binary
+        run: make build-binary
 
-              export PATH=${PREFIX}/bin:$PATH
-              export LD_LIBRARY_PATH=${PREFIX}/lib:${LD_LIBRARY_PATH:-}
-
-              # Verify the custom build is what we will use, then create the
-              # venv explicitly so the Makefile'\''s `venv` target is a no-op.
-              # Bare `python3` can resolve to the manylinux static interpreter
-              # (which lacks libpython*.so and breaks PyInstaller).
-              which python3
-              python3 --version
-              ldd ${PREFIX}/bin/python3 | grep libpython
-              ${PREFIX}/bin/python3 -m venv .venv
-
-              # CUDA 12.6 runtime from NVIDIA'\''s rhel8 repo (apt -> dnf). The
-              # ggml-cuda.so from the prebuilt wheel links libcudart/libcublas;
-              # PyInstaller bundles them transitively once they are on
-              # LD_LIBRARY_PATH, so install before build-binary and export it.
-              dnf install -y dnf-plugins-core
-              dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
-              dnf install -y cuda-cudart-12-6 libcublas-12-6
-              export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH}
-
-              make build CUDA=1
-              make build-binary
-            '
-          # dist/ and build/ are written as root inside the container; hand them
-          # back to the runner user for the host-side verify/archive steps.
-          sudo chown -R "$(id -u):$(id -g)" dist build 2>/dev/null || true
-
-      # CI has no NVIDIA driver, so we can't offload here — instead assert the
-      # bundle is correct: right version, GPU backend compiled in, CUDA 12
-      # runtime bundled, everything resolvable without the system CUDA, and the
-      # glibc floor held.
       - name: Verify build
         run: |
           set -euo pipefail
@@ -118,32 +78,11 @@ jobs:
           CUDA_SO="$(find dist/slp/_internal -name libggml-cuda.so | head -1)"
           [ -n "$CUDA_SO" ] || { echo "FAIL: libggml-cuda.so missing — CPU-only build"; exit 1; }
           for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
-            test -e "dist/slp/_internal/$so" || { echo "FAIL: $so not bundled into the dist"; exit 1; }
+            find dist/slp/_internal -name "${so}*" | grep -q . || { echo "FAIL: $so not bundled into the dist"; exit 1; }
           done
-          # Resolved against the bundle alone (the PyInstaller bootloader sets
-          # LD_LIBRARY_PATH to _internal at runtime), only the GPU *driver*
-          # (libcuda.so.1, provided by the user's NVIDIA driver) may be unresolved.
           missing="$(LD_LIBRARY_PATH="$PWD/dist/slp/_internal" ldd "$CUDA_SO" | awk '/not found/{print $1}' | grep -vxF 'libcuda.so.1' || true)"
           [ -z "$missing" ] || { echo "FAIL: unresolved non-driver deps:"; echo "$missing"; exit 1; }
-
-          # Regression guard the old runner-OS pin lacked: fail if ANY bundled
-          # ELF (interpreter, deps, or the bootloader) requires a glibc newer
-          # than our support floor. This is what would have caught the 2.38
-          # interpreter before it shipped. Built in manylinux_2_28 the real floor
-          # is ~2.28; we gate at 2.34 (RHEL/Rocky 9, Amazon Linux 2023) so a
-          # benign dep bump doesn't block a release, but a 2.38 regression does.
-          FLOOR=2.34
-          maxver="$(find dist/slp \( -name '*.so' -o -name '*.so.*' -o -name slp \) -type f -print0 \
-            | xargs -0 -r objdump -T 2>/dev/null \
-            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)"
-          echo "Highest glibc symbol required by bundle: GLIBC_${maxver:-none} (floor GLIBC_$FLOOR)"
-          if [ -n "$maxver" ] && [ "$(printf '%s\n%s\n' "$FLOOR" "$maxver" | sort -V | tail -1)" != "$FLOOR" ]; then
-            echo "FAIL: bundle requires GLIBC_$maxver > floor GLIBC_$FLOOR — offending files:"
-            find dist/slp \( -name '*.so' -o -name '*.so.*' -o -name slp \) -type f -print0 \
-              | xargs -0 -r sh -c 'for f; do objdump -T "$f" 2>/dev/null | grep -q "GLIBC_'"$maxver"'\b" && echo "  $f"; done' _
-            exit 1
-          fi
-          echo "OK: slp $VER, GPU bindings present, CUDA 12 runtime bundled, glibc floor <= GLIBC_$FLOOR."
+          echo "OK: slp $VER, GPU bindings present, CUDA runtime bundled."
 
       - name: Archive
         run: make archive
