@@ -75,14 +75,17 @@ async def _register_local_mcp_server(
     """
     if not request.command:
         raise HTTPException(status_code=400, detail="'command' is required for local servers")
-    result = model_service.add_local_mcp_server(
-        command=request.command,
-        args=request.args or [],
-        name=request.name,
-        env=request.env or {},
-        cwd=request.cwd,
-        project_id=project_id,
-    )
+    try:
+        result = model_service.add_local_mcp_server(
+            command=request.command,
+            args=request.args or [],
+            name=request.name,
+            env=request.env or {},
+            cwd=request.cwd,
+            project_id=project_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     server_resp = _build_server_response(result)
     return MCPRegisterResponse(auth_type="none", server=server_resp)
 

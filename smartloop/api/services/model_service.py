@@ -37,6 +37,7 @@ from docling.datamodel.settings import settings as docling_settings
 from docling.utils.model_downloader import download_models as download_docling_models
 from smartloop.model import Model
 from smartloop.mcp.local_client import LocalMCPClient
+from smartloop.mcp.client import MCPLaunchError
 from smartloop.agents.orchestrator import SLPOrchestrator
 from smartloop.agents.mcp.skill_generator import MCPSkillGenerator
 
@@ -2545,6 +2546,28 @@ User input:
         try:
             with LocalMCPClient(command=command, args=args, env=resolved_env, cwd=resolved_cwd) as client:
                 result = client.connect_and_discover_tools()
+        except MCPLaunchError as exc:
+            # uvx prints hints like "Use `uvx --from <pkg> <exec>` instead" when
+            # the package name and executable name differ.  Parse and auto-retry.
+            import re
+            hint = re.search(r"Use `uvx (.*?)` instead", str(exc))
+            if command == "uvx" and hint:
+                fixed_args = hint.group(1).split()
+                logger.info(
+                    "Retrying uvx with corrected args %s (original: %s)", fixed_args, args
+                )
+                args = fixed_args
+                server.config = MCPServerConfig(command=command, args=args, env=resolved_env, cwd=resolved_cwd)
+                try:
+                    with LocalMCPClient(command=command, args=args, env=resolved_env, cwd=resolved_cwd) as client:
+                        result = client.connect_and_discover_tools()
+                except Exception as retry_exc:
+                    result = None
+                    logger.warning(
+                        "Could not discover tools from local MCP server '%s' after retry: %s", name, retry_exc
+                    )
+            else:
+                raise ValueError(str(exc)) from exc
         except Exception as exc:
             result = None
             logger.warning(
