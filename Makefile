@@ -1,4 +1,4 @@
-.PHONY: help venv build llama-wheel release-llama-wheel test test-unit test-cov build-binary sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
+.PHONY: help venv build test test-unit test-cov build-binary sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
 
 UNAME_S := $(shell uname -s)
 DIST_DIR := dist/slp
@@ -38,73 +38,29 @@ else
     PYTHON := $(VENV)/bin/python
 endif
 
-# llama-cpp-python version. Default for Linux/macOS; the windows branch below
-# overrides it to LLAMA_WIN_VERSION.
-LLAMA_VERSION := 0.3.16
+LLAMA_VERSION := 0.3.14
 
-# Windows pins to abetlen's prebuilt CUDA wheel, which tops out at 0.3.4 — no
-# win_amd64 wheel exists for 0.3.16, and the from-source CUDA build fails on the
-# runner (CMake 4.x can't configure nvcc). gemma3 support is therefore
-# Linux/macOS-only on this release.
-LLAMA_WIN_VERSION := 0.3.4
-
-# Portable CPU baseline for any from-source llama.cpp build.
-#
-# llama.cpp's CMake defaults GGML_NATIVE=ON (i.e. -march=native), which bakes
-# the *build* machine's instruction set into the ggml-cpu backend with no
-# runtime fallback. A binary compiled on a CI runner that has AVX-512 then
-# faults with STATUS_ILLEGAL_INSTRUCTION (0xC000001D) on any CPU that lacks it
-# — e.g. Intel Meteor Lake / Core Ultra, which has AVX2 but no AVX-512.
-# Pin an explicit, portable x86-64-v3 (AVX2) baseline instead.
+# Portable x86-64-v3 (AVX2) baseline for the CPU-only from-source fallback.
 GGML_PORTABLE := -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF
 
-# Prebuilt CUDA wheel from the abetlen index (Linux fallback; has our version).
+# Prebuilt CUDA wheel from the abetlen index (Linux and Windows).
 LLAMA_ABETLEN_WHEEL = $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --prefer-binary --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --extra-index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
 
-# Self-hosted portable llama-cpp-python wheels on GCS, served at
-# dl.smartloop.ai/wheels. abetlen has no Windows CUDA wheel for our version (its
-# Windows wheels stop at 0.3.4, too old for gemma3), and self-hosting lets us
-# control the portable (GGML_NATIVE=OFF / AVX2) build per platform. Build and
-# publish with `make release-llama-wheel` on the matching OS (the wheel's
-# platform tag — win_amd64 / linux_x86_64 — comes from where you build it; a
-# Windows wheel can only be built on Windows, a Linux wheel only on Linux).
-LLAMA_WHEEL_GCS := $(SLP_GCS_BUCKET)/wheels
-LLAMA_WHEELHOUSE := wheelhouse
+# From-source build (macOS Metal).
+LLAMA_SOURCE_BUILD = CMAKE_ARGS="-DGGML_METAL=ON" $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
 
-ifeq ($(PLATFORM),windows)
-    LLAMA_VERSION := $(LLAMA_WIN_VERSION)
-    LLAMA_WHEEL_PLAT := win_amd64
-    LLAMA_WHEEL_CMAKE := -DGGML_CUDA=ON $(GGML_PORTABLE)
-else ifeq ($(PLATFORM),darwin)
-    LLAMA_WHEEL_PLAT := macosx
-    LLAMA_WHEEL_CMAKE := -DGGML_METAL=ON
-else
-    LLAMA_WHEEL_PLAT := linux_x86_64
-    LLAMA_WHEEL_CMAKE := -DGGML_CUDA=ON $(GGML_PORTABLE)
-endif
-LLAMA_WHEEL_NAME := llama_cpp_python-$(LLAMA_VERSION)-cp311-cp311-$(LLAMA_WHEEL_PLAT).whl
-LLAMA_WHEEL_URL := https://dl.smartloop.ai/wheels/$(LLAMA_WHEEL_NAME)
-
-# From-source portable build fallback (needs the CUDA toolkit / nvcc on PATH).
-LLAMA_SOURCE_BUILD = CMAKE_ARGS="$(LLAMA_WHEEL_CMAKE)" $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
-
-# GPU-accelerated llama-cpp-python install: prefer our self-hosted GCS wheel,
-# then fall back (abetlen wheel on Linux, from-source build elsewhere).
 ifeq ($(PLATFORM),darwin)
     LLAMA_INSTALL_CMD = $(LLAMA_SOURCE_BUILD)
 else ifeq ($(PLATFORM),linux)
     HAS_NVIDIA := $(shell command -v nvidia-smi >/dev/null 2>&1 && echo yes || echo no)
     ifeq ($(CUDA),1)
-        LLAMA_INSTALL_CMD = $(PIP) install "$(LLAMA_WHEEL_URL)" --force-reinstall --no-cache-dir || $(LLAMA_ABETLEN_WHEEL)
+        LLAMA_INSTALL_CMD = $(LLAMA_ABETLEN_WHEEL)
     else ifeq ($(HAS_NVIDIA),yes)
-        LLAMA_INSTALL_CMD = $(PIP) install "$(LLAMA_WHEEL_URL)" --force-reinstall --no-cache-dir || $(LLAMA_ABETLEN_WHEEL)
+        LLAMA_INSTALL_CMD = $(LLAMA_ABETLEN_WHEEL)
     else
         LLAMA_INSTALL_CMD = CMAKE_ARGS="$(GGML_PORTABLE)" $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
     endif
 else
-    # Windows: abetlen's prebuilt cu124 wheel (self-contained, version 0.3.4).
-    # No self-hosted GCS wheel or from-source CUDA build — CMake 4.x can't
-    # configure nvcc on the runner and abetlen has no win_amd64 wheel past 0.3.4.
     LLAMA_INSTALL_CMD = $(LLAMA_ABETLEN_WHEEL)
 endif
 
@@ -127,8 +83,6 @@ help:
 	@echo "  notarize        - Notarize the binary with Apple (macOS only)"
 	@echo "  archive         - Create slp tar.gz from dist/slp"
 	@echo "  archive-zip     - Create windows-amd64-slp.zip from dist/slp"
-	@echo "  llama-wheel        - Build the portable CUDA llama-cpp-python wheel (Windows)"
-	@echo "  release-llama-wheel - Upload the prebuilt llama wheel to the release bucket"
 	@echo "  publish-binary  - Build, sign, notarize, archive, and upload slp to GCS"
 	@echo "  release-linux   - Build, archive, and upload linux-amd64-slp.tar.gz to the release bucket"
 	@echo "  release-windows - Build, zip, and upload windows-amd64-slp.zip to the release bucket"
@@ -151,23 +105,6 @@ build: venv
 	@echo "=== Pre-downloading docling and EasyOCR models ==="
 	$(PYTHON) -c "from docling.utils.model_downloader import download_models; download_models(with_easyocr=True)"
 	@echo "=== Build complete ==="
-
-# Build the portable CUDA llama-cpp-python wheel for the current OS. Requires the
-# CUDA toolkit (nvcc) on PATH (Metal on macOS). GGML_NATIVE=OFF keeps the
-# ggml-cpu backend at an AVX2 baseline so the wheel runs on any x86-64-v3 CPU,
-# not just the builder's. Build Linux wheels on an old glibc (e.g. Ubuntu 22.04)
-# so they load on older distros.
-llama-wheel: venv
-	@echo "=== Building portable llama-cpp-python $(LLAMA_VERSION) wheel for $(PLATFORM) ==="
-	$(PYTHON) -m pip install --upgrade pip wheel --index-url=https://pypi.org/simple
-	CMAKE_ARGS="$(LLAMA_WHEEL_CMAKE)" $(PIP) wheel llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --no-deps --no-cache-dir --index-url=https://pypi.org/simple -w $(LLAMA_WHEELHOUSE)
-	@ls -lh $(LLAMA_WHEELHOUSE)/$(LLAMA_WHEEL_NAME)
-
-# Upload the prebuilt wheel to the release bucket (served at dl.smartloop.ai/wheels).
-release-llama-wheel:
-	@echo "=== Uploading $(LLAMA_WHEEL_NAME) to $(LLAMA_WHEEL_GCS) ==="
-	gsutil cp $(LLAMA_WHEELHOUSE)/$(LLAMA_WHEEL_NAME) "$(LLAMA_WHEEL_GCS)/$(LLAMA_WHEEL_NAME)"
-	gsutil ls -l "$(LLAMA_WHEEL_GCS)/"
 
 test-deps:
 	$(PIP) install -q -e ".[dev]"
