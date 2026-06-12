@@ -54,14 +54,31 @@ jobs:
 
       # Everything that ends up in the bundle (the cp311 interpreter, our deps,
       # the CUDA runtime) is installed and linked inside the container, so the
-      # whole payload shares the 2.28 floor. Prepending the manylinux cp311
-      # python to PATH makes `make`'s `python3 -m venv` use it unchanged.
+      # whole payload shares the 2.28 floor.
+      #
+      # The manylinux /opt/python/cp311-cp311 is statically linked (no
+      # libpython3.11.so), which PyInstaller cannot use. We build CPython 3.11
+      # from source with --enable-shared so PyInstaller gets the shared library
+      # it needs, while still linking against the container's glibc 2.28.
       - name: Build in manylinux_2_28 (glibc 2.28 floor)
         run: |
           docker run --rm -v "$PWD":/work -w /work \
             quay.io/pypa/manylinux_2_28_x86_64 \
             bash -euxo pipefail -c '
-              export PATH=/opt/python/cp311-cp311/bin:$PATH
+              PY_VERSION=3.11.15
+              PREFIX=/opt/shared-python
+
+              # Build CPython with a shared libpython for PyInstaller.
+              curl -fsSL https://www.python.org/ftp/python/${PY_VERSION}/Python-${PY_VERSION}.tar.xz \
+                | tar xJ -C /tmp
+              cd /tmp/Python-${PY_VERSION}
+              ./configure --enable-shared --enable-optimizations --prefix=${PREFIX} -q
+              make -j$(nproc) -s
+              make install -s
+              cd /work
+
+              export PATH=${PREFIX}/bin:$PATH
+              export LD_LIBRARY_PATH=${PREFIX}/lib:${LD_LIBRARY_PATH:-}
               python3 --version
 
               # CUDA 12.6 runtime from NVIDIA'\''s rhel8 repo (apt -> dnf). The
@@ -71,7 +88,7 @@ jobs:
               dnf install -y dnf-plugins-core
               dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
               dnf install -y cuda-cudart-12-6 libcublas-12-6
-              export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-}
+              export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH}
 
               make build CUDA=1
               make build-binary
