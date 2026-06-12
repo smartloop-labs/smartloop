@@ -22,26 +22,38 @@ class MCP:
 
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_url(token: str) -> bool:
+        """True when token is a full http(s) URL (scheme + host)."""
+        parsed = urlparse(token)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
     def _handle_mcp_command(self, args: str) -> None:
         """Dispatch /mcp sub-commands."""
         if not self.project_id:
             self._append_system("No current project. Create or switch to a project first.")
             return
         if args.startswith("add local "):
-            rest = args[10:].strip()
-            parts = rest.split()
+            # Explicit local: force stdio registration regardless of how the
+            # first token looks.
+            parts = args[len("add local "):].split()
             if parts:
-                name = parts[0]
-                cmd_args = parts[1:] if len(parts) > 1 else []
-                self._current_worker = self._mcp_add_local(name, cmd_args)
+                self._current_worker = self._mcp_add_local(parts[0], parts[1:])
             else:
-                self._append_system("Usage: /mcp add local <name> [args...]")
+                self._append_system("Usage: /mcp add local <command> [args...]")
         elif args.startswith("add "):
-            url = args[4:].strip()
-            if url:
-                self._current_worker = self._mcp_add(url)
+            rest = args[4:].strip()
+            if not rest:
+                self._append_system("Usage: /mcp add <url> | <command> [args...]")
+                return
+            parts = rest.split()
+            if self._is_url(parts[0]):
+                # Remote server — pass the URL untouched (may carry query params).
+                self._current_worker = self._mcp_add(rest)
             else:
-                self._append_system("Usage: /mcp add <url>")
+                # Local stdio server: first token is the command (uvx, npx, ...),
+                # the rest are its arguments (e.g. the package name).
+                self._current_worker = self._mcp_add_local(parts[0], parts[1:])
         elif args == "list":
             self._mcp_list()
         elif args.startswith("remove "):
@@ -109,11 +121,17 @@ class MCP:
             self._clear_loading()
 
     @work(exclusive=True)
-    async def _mcp_add_local(self, name: str, args: list[str] = []) -> None:
-        """Register a local MCP server via the unified register endpoint."""
-        self._set_loading(f"Registering local MCP server '{name}'...")
+    async def _mcp_add_local(self, command: str, args: list[str] = []) -> None:
+        """Register a local (stdio) MCP server via the unified register endpoint.
+
+        ``command`` is the executable on PATH (e.g. ``uvx``, ``npx``) and
+        ``args`` are passed to it (e.g. the package name). The display name is
+        derived server-side from the args when omitted.
+        """
+        full_cmd = " ".join([command, *args])
+        self._set_loading(f"Registering local MCP server '{full_cmd}'...")
         try:
-            payload: dict = {"server_type": "local", "name": name}
+            payload: dict = {"server_type": "local", "command": command}
             if args:
                 payload["args"] = args
             async with httpx.AsyncClient(timeout=30) as client:
@@ -126,7 +144,7 @@ class MCP:
                 server = data.get("server", {})
                 tool_count = len(server.get("tools", []))
                 self._append_system(
-                    f"MCP server registered: {server.get('name', name)} ({tool_count} tools)"
+                    f"MCP server registered: {server.get('name', full_cmd)} ({tool_count} tools)"
                 )
         except httpx.HTTPStatusError as e:
             detail = ""
