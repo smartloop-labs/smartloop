@@ -101,16 +101,6 @@ try:
 except ImportError:
     pass
 
-# Collect trl chat templates (jinja files loaded at import time by trl.chat_template_utils)
-try:
-    import trl
-    trl_dir = Path(trl.__file__).parent
-    chat_templates_dir = trl_dir / 'chat_templates'
-    if chat_templates_dir.exists():
-        datas.append((str(chat_templates_dir), 'trl/chat_templates'))
-except ImportError:
-    pass
-
 # Collect EasyOCR models and data (OCR engine for docling)
 try:
     import easyocr
