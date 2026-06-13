@@ -64,13 +64,19 @@ for sp in site.getsitepackages():
 # Bundle CUDA runtime libraries so the binary runs on machines that have the
 # NVIDIA driver but not the full CUDA toolkit. libcuda.so.1 is intentionally
 # excluded — it is the driver stub and must come from the host driver.
+#
+# These go next to their only consumer, libggml-cuda.so in llama_cpp/lib, NOT
+# into the _internal root. Dropping cuBLAS/cudart into the root pollutes the
+# loader's primary search directory and breaks numpy's bundled OpenBLAS stack
+# at import time (surfacing as the misleading numpy "import from source
+# directory" error) — a Linux-only failure, since macOS numpy uses Accelerate.
+# This mirrors the Windows job, which bundles the CUDA DLLs into llama_cpp/lib.
 if sys.platform != 'win32':
     _cuda_runtime_libs = [
         'libcudart.so.12',
         'libcublas.so.12',
         'libcublasLt.so.12',
     ]
-    import ctypes.util, subprocess
     _cuda_search_dirs = [
         '/usr/lib/x86_64-linux-gnu',
         '/usr/local/cuda/lib64',
@@ -80,7 +86,7 @@ if sys.platform != 'win32':
         for _d in _cuda_search_dirs:
             _p = Path(_d) / _lib
             if _p.exists():
-                binaries.append((str(_p), '.'))
+                binaries.append((str(_p), 'llama_cpp/lib'))
                 break
 
 try:
@@ -189,6 +195,14 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# Do NOT strip on Linux. numpy 2.x ships libscipy_openblas64_*.so built with a
+# large ELF max-page-size; GNU strip on the build host rewrites it with
+# non-page-aligned load segments, so the loader rejects it at runtime with
+# "ELF load command address/offset not page-aligned" — which numpy rewraps as
+# the misleading "import numpy from its source directory" ImportError. Stripping
+# stays enabled on macOS (Accelerate-backed numpy, no OpenBLAS) to keep size down.
+_strip = sys.platform == 'darwin'
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -197,7 +211,7 @@ exe = EXE(
     name='slp',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=sys.platform != 'win32',
+    strip=_strip,
     upx=True,
     console=True,
     disable_windowed_traceback=False,
@@ -210,7 +224,7 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
-    strip=sys.platform != 'win32',
+    strip=_strip,
     upx=True,
     upx_exclude=[],
     name='slp',
