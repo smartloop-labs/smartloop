@@ -38,7 +38,7 @@ else
     PYTHON := $(VENV)/bin/python
 endif
 
-LLAMA_VERSION := 0.3.14
+LLAMA_VERSION := 0.3.22
 
 # Portable x86-64-v3 (AVX2) baseline for the CPU-only from-source fallback.
 GGML_PORTABLE := -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF
