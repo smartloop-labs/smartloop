@@ -9,6 +9,8 @@ SLP_GCS_BUCKET := gs://smartloop-gcp-us-east-releases
 DL_GCS_BUCKET := gs://dl.smartloop.ai
 SERVER_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 RAW_ARCH := $(shell uname -m)
+LLAMA_VERSION := 0.3.19
+
 ifeq ($(RAW_ARCH),x86_64)
     SERVER_ARCH := amd64
 else
@@ -38,16 +40,21 @@ else
     PYTHON := $(VENV)/bin/python
 endif
 
-LLAMA_VERSION := 0.3.22
-
 # Portable x86-64-v3 (AVX2) baseline for the CPU-only from-source fallback.
-GGML_PORTABLE := -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF
+GGML_PORTABLE := -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS
 
-# Prebuilt CUDA wheel from the abetlen index (Linux and Windows).
-LLAMA_ABETLEN_WHEEL = $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --prefer-binary --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --extra-index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
+# abetlen prebuilt CUDA wheels switched from cpython-specific (cp311-cp311) to
+# universal py3-none at v0.3.20, which introduced AVX-512 and causes SIGILL on
+# CPUs that lack it. Pin to the last safe version.
+LLAMA_ABETLEN_VERSION := 0.3.19
 
-# From-source build (macOS Metal).
-LLAMA_SOURCE_BUILD = CMAKE_ARGS="-DGGML_METAL=ON" $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
+# Prebuilt CUDA wheel from the abetlen index (Linux NVIDIA and Windows).
+LLAMA_ABETLEN_WHEEL = $(PIP) install llama-cpp-python==$(LLAMA_ABETLEN_VERSION) --extra-index-url=https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
+
+# From-source build (macOS Metal, CPU fallback). CMAKE_BUILD_PARALLEL_LEVEL
+# parallelises the ninja/make invocation that pip drives internally.
+JOBS := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
+LLAMA_SOURCE_BUILD = CMAKE_ARGS="-DGGML_METAL=ON" CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
 
 ifeq ($(PLATFORM),darwin)
     LLAMA_INSTALL_CMD = $(LLAMA_SOURCE_BUILD)
@@ -58,7 +65,7 @@ else ifeq ($(PLATFORM),linux)
     else ifeq ($(HAS_NVIDIA),yes)
         LLAMA_INSTALL_CMD = $(LLAMA_ABETLEN_WHEEL)
     else
-        LLAMA_INSTALL_CMD = CMAKE_ARGS="$(GGML_PORTABLE)" $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
+        LLAMA_INSTALL_CMD = CMAKE_ARGS="$(GGML_PORTABLE)" CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
     endif
 else
     LLAMA_INSTALL_CMD = $(LLAMA_ABETLEN_WHEEL)
@@ -117,7 +124,7 @@ test: test-deps
 	@$(PYTHON) main.py --help
 	@echo ""
 	@echo "Checking llama-cpp-python GPU support..."
-	@$(PYTHON) -c "from llama_cpp import llama_cpp; gpu=llama_cpp.llama_supports_gpu_offload(); print('GPU offload:', 'yes' if gpu else 'no (CPU-only)')"
+	@$(PYTHON) -c "from llama_cpp import llama_cpp; gpu=llama_cpp.llama_supports_gpu_offload(); print('GPU offload:', 'yes' if gpu else 'no (CPU-only)')" || echo "WARNING: llama-cpp-python GPU check crashed (binary incompatibility?)"
 	@echo ""
 	$(PYTHON) -m pytest tests/unit -v
 	$(PYTHON) -m pytest tests/api -v
