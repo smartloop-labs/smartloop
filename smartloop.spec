@@ -195,6 +195,14 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# Do NOT strip on Linux. numpy 2.x ships libscipy_openblas64_*.so built with a
+# large ELF max-page-size; GNU strip on the build host rewrites it with
+# non-page-aligned load segments, so the loader rejects it at runtime with
+# "ELF load command address/offset not page-aligned" — which numpy rewraps as
+# the misleading "import numpy from its source directory" ImportError. Stripping
+# stays enabled on macOS (Accelerate-backed numpy, no OpenBLAS) to keep size down.
+_strip = sys.platform == 'darwin'
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -203,7 +211,7 @@ exe = EXE(
     name='slp',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=sys.platform != 'win32',
+    strip=_strip,
     upx=True,
     console=True,
     disable_windowed_traceback=False,
@@ -216,7 +224,7 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
-    strip=sys.platform != 'win32',
+    strip=_strip,
     upx=True,
     upx_exclude=[],
     name='slp',
