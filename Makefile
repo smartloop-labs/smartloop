@@ -100,6 +100,8 @@ build: venv
 	$(PIP) install -r requirements.txt --index-url=https://pypi.org/simple
 	@echo "=== Installing llama-cpp-python with GPU support ==="
 	$(LLAMA_INSTALL_CMD)
+	@echo "=== Pinning numpy<2.4 (OpenBLAS ELF alignment crash with PyInstaller) ==="
+	$(PIP) install "numpy>=1.24.0,<2.4" --force-reinstall --index-url=https://pypi.org/simple
 	@echo "=== Installing PyInstaller ==="
 	$(PIP) install pyinstaller --index-url=https://pypi.org/simple
 	@echo "=== Pre-downloading docling and EasyOCR models ==="
