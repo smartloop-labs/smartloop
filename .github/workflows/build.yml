@@ -71,7 +71,7 @@ jobs:
           for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
             find dist/slp/_internal -name "${so}*" | grep -q . || { echo "FAIL: $so not bundled into the dist"; exit 1; }
           done
-          missing="$(LD_LIBRARY_PATH="$PWD/dist/slp/_internal" ldd "$CUDA_SO" | awk '/not found/{print $1}' | grep -vxF 'libcuda.so.1' || true)"
+          missing="$(LD_LIBRARY_PATH="$PWD/dist/slp/_internal:$PWD/dist/slp/_internal/llama_cpp/lib" ldd "$CUDA_SO" | awk '/not found/{print $1}' | grep -vxF 'libcuda.so.1' || true)"
           [ -z "$missing" ] || { echo "FAIL: unresolved non-driver deps:"; echo "$missing"; exit 1; }
           echo "OK: slp $VER, GPU bindings present, CUDA runtime bundled."
 
