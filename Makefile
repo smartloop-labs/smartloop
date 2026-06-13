@@ -38,8 +38,15 @@ else
     PYTHON := $(VENV)/bin/python
 endif
 
-# Single source of truth for the llama-cpp-python version across all platforms.
+# llama-cpp-python version. Default for Linux/macOS; the windows branch below
+# overrides it to LLAMA_WIN_VERSION.
 LLAMA_VERSION := 0.3.16
+
+# Windows pins to abetlen's prebuilt CUDA wheel, which tops out at 0.3.4 — no
+# win_amd64 wheel exists for 0.3.16, and the from-source CUDA build fails on the
+# runner (CMake 4.x can't configure nvcc). gemma3 support is therefore
+# Linux/macOS-only on this release.
+LLAMA_WIN_VERSION := 0.3.4
 
 # Portable CPU baseline for any from-source llama.cpp build.
 #
@@ -65,6 +72,7 @@ LLAMA_WHEEL_GCS := $(SLP_GCS_BUCKET)/wheels
 LLAMA_WHEELHOUSE := wheelhouse
 
 ifeq ($(PLATFORM),windows)
+    LLAMA_VERSION := $(LLAMA_WIN_VERSION)
     LLAMA_WHEEL_PLAT := win_amd64
     LLAMA_WHEEL_CMAKE := -DGGML_CUDA=ON $(GGML_PORTABLE)
 else ifeq ($(PLATFORM),darwin)
@@ -94,7 +102,10 @@ else ifeq ($(PLATFORM),linux)
         LLAMA_INSTALL_CMD = CMAKE_ARGS="$(GGML_PORTABLE)" $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
     endif
 else
-    LLAMA_INSTALL_CMD = $(PIP) install "$(LLAMA_WHEEL_URL)" --force-reinstall --no-cache-dir || $(LLAMA_SOURCE_BUILD)
+    # Windows: abetlen's prebuilt cu124 wheel (self-contained, version 0.3.4).
+    # No self-hosted GCS wheel or from-source CUDA build — CMake 4.x can't
+    # configure nvcc on the runner and abetlen has no win_amd64 wheel past 0.3.4.
+    LLAMA_INSTALL_CMD = $(LLAMA_ABETLEN_WHEEL)
 endif
 
 
