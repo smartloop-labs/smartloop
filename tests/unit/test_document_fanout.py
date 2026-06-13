@@ -153,7 +153,7 @@ class TestFanoutHandlers:
         ctx = _ctx(orch)
 
         parent = RouteNode()
-        nodes_and_handlers, reduce_node = orch._build_doc_fanout_nodes(ctx, sctx, None, parent)
+        nodes_and_handlers, reduce_node = orch._build_doc_fanout_nodes(ctx, sctx, parent)
         assert isinstance(reduce_node, TransformNode)
 
         results = {}
@@ -187,7 +187,7 @@ class TestFanoutHandlers:
         )
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, None, parent)
+        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
 
         results = {}
         reduce_handler = None
@@ -225,7 +225,7 @@ class TestFanoutHandlers:
         sctx = SearchContext(documents=_docs(3))
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, None, parent)
+        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
 
         batch_nodes = [n for n, _ in nodes_and_handlers if isinstance(n, LLMDecisionNode)]
         assert all(n.parallel_inference for n in batch_nodes)
@@ -243,7 +243,7 @@ class TestFanoutHandlers:
         sctx = SearchContext(documents=_docs(2))
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, None, parent)
+        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
 
         batch_node, batch_handler = nodes_and_handlers[0]
         result = batch_handler({})
@@ -257,7 +257,7 @@ class TestFanoutHandlers:
         sctx = SearchContext(documents=_docs(2))
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, None, parent)
+        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
 
         batch_node, batch_handler = nodes_and_handlers[0]
         result = batch_handler({})

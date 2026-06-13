@@ -102,7 +102,11 @@ class TestAddSkillCreatesFile:
     def _make_service(self):
         """Return a ModelService with its internal state mocked just enough."""
         svc = object.__new__(ModelService)
-        svc._llm = None
+        mock_llm = MagicMock()
+        mock_llm.invoke = MagicMock(return_value='{"name": "greet", "body": "Greet the user politely."}')
+        mock_llm.get_max_tokens = MagicMock(return_value=4096)
+        mock_llm.get_num_tokens = MagicMock(return_value=100)
+        svc._llm = mock_llm
         svc._model = MagicMock()
         svc._inference_lock = __import__("threading").Lock()
         project = Project(

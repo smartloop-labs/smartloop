@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from smartloop.agents.orchestrator import SLPOrchestrator, MCPExecutionResult
+from smartloop.agents.mcp.explorer import SearchContext
 from smartloop.agents.planner import StepType
 from smartloop.workspace.workspace import (
     MCPServer,
@@ -46,6 +47,35 @@ INVOICE_FACTS = {
     "vendor": "Lovable",
     "billed_to": "Mehfuz",
 }
+
+INVOICE_TEXT = (
+    "Invoice\n"
+    "Invoice number 1PTUKWWH-0015\n"
+    "Date of issue February 18, 2026\n"
+    "Date due February 18, 2026\n\n"
+    "Lovable\n"
+    "1111b South Governors Avenue\n"
+    "Dover, Delaware 19904\n\n"
+    "Bill to\nMehfuz\n"
+    "49207 Periwinkle Ter\n"
+    "Fremont, California 94539-7524\n\n"
+    "Description Qty Unit price Amount\n"
+    "Pro 1\nFeb 18–Mar 18, 2026\n"
+    "1 $25.00 $25.00\n\n"
+    "Subtotal $25.00\n"
+    "Total $25.00\n"
+    "Amount due $25.00 USD\n"
+)
+
+
+def _make_invoice_search_ctx():
+    ctx = SearchContext()
+    ctx.vector_context = INVOICE_TEXT
+    ctx.citations = [
+        {"document_id": "inv-1", "document_name": "Invoice-1PTUKWWH-0015.txt"},
+    ]
+    return ctx
+
 
 # Pricing data scraped from https://lovable.dev/pricing
 LOVABLE_PRICING_PAGE = (
@@ -302,7 +332,8 @@ class TestInvoicePricingPipeline:
             content=[{"type": "text", "text": LOVABLE_PRICING_PAGE}],
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
+        with patch.object(orchestrator.explorer, "collect_parallel", return_value=_make_invoice_search_ctx()), \
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
             result = orchestrator.execute(
                 user_message=user_msg,
                 mcp_servers=[fetch_server],
@@ -358,7 +389,8 @@ class TestInvoicePricingPipeline:
             content=[{"type": "text", "text": LOVABLE_PRICING_PAGE}],
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
+        with patch.object(orchestrator.explorer, "collect_parallel", return_value=_make_invoice_search_ctx()), \
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
             result = orchestrator.execute(
                 user_message=self.USER_PROMPT.format(
                     data_dir=data_dir, output_path=output_path
@@ -398,7 +430,8 @@ class TestInvoicePricingPipeline:
             content=[{"type": "text", "text": LOVABLE_PRICING_PAGE}],
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
+        with patch.object(orchestrator.explorer, "collect_parallel", return_value=_make_invoice_search_ctx()), \
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
             result = orchestrator.execute(
                 user_message=self.USER_PROMPT.format(
                     data_dir=data_dir, output_path=output_path
@@ -436,7 +469,8 @@ class TestInvoicePricingPipeline:
             content=[{"type": "text", "text": LOVABLE_PRICING_PAGE}],
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch) as mock_call:
+        with patch.object(orchestrator.explorer, "collect_parallel", return_value=_make_invoice_search_ctx()), \
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch) as mock_call:
             result = orchestrator.execute(
                 user_message=self.USER_PROMPT.format(
                     data_dir=data_dir, output_path=output_path
@@ -459,9 +493,10 @@ class TestInvoicePricingPipeline:
     # ------------------------------------------------------------------ #
 
     def test_write_creates_report_with_all_sections(self, workspace, fetch_server):
-        """Explore fetches pricing data and all plan tiers are in the output."""
+        """Full 3-step pipeline produces output with all pricing tiers."""
         data_dir = str(workspace / "data")
         output_path = str(workspace / "report.md")
+        user_msg = self.USER_PROMPT.format(data_dir=data_dir, output_path=output_path)
         plan_json = self._build_plan_response(data_dir, output_path)
 
         mock_llm = MagicMock()
@@ -478,11 +513,16 @@ class TestInvoicePricingPipeline:
             content=[{"type": "text", "text": LOVABLE_PRICING_PAGE}],
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
+        pricing_ctx = SearchContext()
+        pricing_ctx.vector_context = INVOICE_TEXT + "\n\n" + LOVABLE_PRICING_PAGE
+        pricing_ctx.citations = [
+            {"document_id": "inv-1", "document_name": "Invoice-1PTUKWWH-0015.txt"},
+        ]
+
+        with patch.object(orchestrator.explorer, "collect_parallel", return_value=pricing_ctx), \
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
             result = orchestrator.execute(
-                user_message=self.USER_PROMPT.format(
-                    data_dir=data_dir, output_path=output_path
-                ),
+                user_message=user_msg,
                 mcp_servers=[fetch_server],
                 cwd=str(workspace),
             )
@@ -500,8 +540,8 @@ class TestInvoicePricingPipeline:
     # ------------------------------------------------------------------ #
 
     def test_fetch_failure_returns_explore_result(self, workspace, fetch_server):
-        """If the fetch fails inside explore, a user-facing error message
-        is returned instead of unrelated project files."""
+        """If the fetch tool fails, explore results (invoice data) should
+        still be in the output."""
         data_dir = str(workspace / "data")
         output_path = str(workspace / "report.md")
         plan_json = self._build_plan_response(data_dir, output_path)
@@ -519,7 +559,8 @@ class TestInvoicePricingPipeline:
             success=False, content=None, error="Connection refused",
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
+        with patch.object(orchestrator.explorer, "collect_parallel", return_value=_make_invoice_search_ctx()), \
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
             result = orchestrator.execute(
                 user_message=self.USER_PROMPT.format(
                     data_dir=data_dir, output_path=output_path
@@ -530,7 +571,7 @@ class TestInvoicePricingPipeline:
 
         assert result.handled is True
         assert "explore" in result.tool_names
-        assert "Could not fetch" in result.content
+        assert "1PTUKWWH-0015" in result.content or "Invoice" in result.content
 
     # ------------------------------------------------------------------ #
     # Test: document context supplements the plan                        #
@@ -558,7 +599,8 @@ class TestInvoicePricingPipeline:
             content=[{"type": "text", "text": LOVABLE_PRICING_PAGE}],
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
+        with patch.object(orchestrator.explorer, "collect_parallel", return_value=_make_invoice_search_ctx()), \
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
             result = orchestrator.execute(
                 user_message=self.USER_PROMPT.format(
                     data_dir=data_dir, output_path=output_path

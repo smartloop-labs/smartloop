@@ -61,6 +61,28 @@ for sp in site.getsitepackages():
             binaries.append((str(lib_file), 'llama_cpp/lib'))
         break
 
+# Bundle CUDA runtime libraries so the binary runs on machines that have the
+# NVIDIA driver but not the full CUDA toolkit. libcuda.so.1 is intentionally
+# excluded — it is the driver stub and must come from the host driver.
+if sys.platform != 'win32':
+    _cuda_runtime_libs = [
+        'libcudart.so.12',
+        'libcublas.so.12',
+        'libcublasLt.so.12',
+    ]
+    import ctypes.util, subprocess
+    _cuda_search_dirs = [
+        '/usr/lib/x86_64-linux-gnu',
+        '/usr/local/cuda/lib64',
+        '/usr/local/cuda-12/lib64',
+    ]
+    for _lib in _cuda_runtime_libs:
+        for _d in _cuda_search_dirs:
+            _p = Path(_d) / _lib
+            if _p.exists():
+                binaries.append((str(_p), '.'))
+                break
+
 try:
     import chromadb
     chromadb_dir = Path(chromadb.__file__).parent

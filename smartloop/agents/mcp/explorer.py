@@ -540,9 +540,14 @@ class Explorer:
         own_pool = executor is None
 
         try:
+            # When a skill matched, the pipeline is self-contained — do not
+            # bias the vector search with previous conversation turns.  The
+            # current user message is the only input that matters.
+            history_for_search = None if matched_skills else conversation_history
+
             f_vec = pool.submit(
                 self._search_vector, query, model_service,
-                None, conversation_history,
+                None, history_for_search,
             )
             f_fb = pool.submit(self._search_feedback, query, model_service)
             f_ws = pool.submit(
@@ -565,16 +570,9 @@ class Explorer:
             if own_pool:
                 pool.shutdown(wait=False)
 
-        # Skill tool execution (sequential — may depend on search results)
-        if matched_skills and mcp_tool_contexts and mcp_servers:
-            skill_tool_names = self.extract_tool_names(matched_skills, mcp_tool_contexts)
-            for tool_name in skill_tool_names:
-                result = self._execute_skill_tool(
-                    tool_name, query, mcp_servers, mcp_tool_contexts,
-                    enriched=enriched,
-                )
-                if result:
-                    ctx.skill_tool_results.append(result)
+        # Skill tool execution runs in the DAG step nodes — do NOT run them
+        # here during collection.  Eager execution here would bypass argument
+        # extraction, validation, and result accumulation in reason().
 
         return ctx
 

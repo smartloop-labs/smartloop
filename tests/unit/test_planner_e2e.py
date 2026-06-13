@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import pytest
 
 from smartloop.agents.orchestrator import SLPOrchestrator, MCPExecutionResult
+from smartloop.agents.mcp.explorer import SearchContext
 from smartloop.agents.planner import StepType, PlanStep, ExecutionPlan
 from smartloop.workspace.workspace import (
     MCPServer,
@@ -233,7 +234,11 @@ class TestClassifyPlanExecutePipeline:
             content=[{"type": "text", "text": JOB_DESCRIPTION_HTML}],
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch_result):
+        job_ctx = SearchContext()
+        job_ctx.vector_context = JOB_DESCRIPTION_HTML
+
+        with patch.object(orchestrator.explorer, "collect_parallel", return_value=job_ctx), \
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch_result):
             result = orchestrator.execute(
                 user_message="Fetch https://example.com/job and summarize",
                 mcp_servers=[fetch_server],
@@ -341,7 +346,11 @@ class TestClassifyPlanExecutePipeline:
             content=[{"type": "text", "text": JOB_DESCRIPTION_HTML}],
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch_result):
+        doc_ctx = SearchContext()
+        doc_ctx.vector_context = doc_context
+
+        with patch.object(orchestrator.explorer, "collect_parallel", return_value=doc_ctx), \
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch_result):
             result = orchestrator.execute(
                 user_message="Check the job at https://example.com/job",
                 mcp_servers=[fetch_server],

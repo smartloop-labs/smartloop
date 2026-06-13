@@ -476,13 +476,18 @@ class TestDiscrepancySkillPipeline:
             if "list the execution steps" in p and "json array" in p:
                 return self.DERIVED_STEPS_WITH_TOOL
 
-            # Capture synthesis prompts (ANALYZE step)
+            # Capture synthesis prompts (ANALYZE step or final synthesis)
             if "produce a structured analysis report" in p:
                 synthesis_prompts.append(str(prompt))
                 return DISCREPANCY_REPORT
 
             # ANALYZE node: relevance assessment
             if "relevance assessment" in p:
+                synthesis_prompts.append(str(prompt))
+                return DISCREPANCY_REPORT
+
+            # Final synthesis (merge step outputs into coherent document)
+            if "data synthesis assistant" in p and "merge them into a single" in p:
                 synthesis_prompts.append(str(prompt))
                 return DISCREPANCY_REPORT
 
@@ -744,17 +749,27 @@ class TestCitationFormatting:
         assert "MUST reference" in result
         assert "may not describe the contents" in result
 
-    def test_no_citations_uses_tool_context(self):
-        """Without citations, context is labelled as TOOL CONTEXT."""
+    def test_no_citations_uses_tool_results(self):
+        """Without citations, tool output is labelled as TOOL RESULTS."""
+        result = SLPOrchestrator._format_ready_context(
+            "Some tool output", skill_instruction=None, citations=None, cwd="/tmp",
+            has_tool_results=True,
+        )
+        assert "TOOL RESULTS" in result
+        assert "DOCUMENT CONTEXT" not in result
+
+    def test_no_citations_no_tool_results_passes_through(self):
+        """Without citations or tool results flag, context passes through plain."""
         result = SLPOrchestrator._format_ready_context(
             "Some tool output", skill_instruction=None, citations=None, cwd="/tmp",
         )
-        assert "TOOL CONTEXT" in result
+        assert "Some tool output" in result
         assert "DOCUMENT CONTEXT" not in result
 
-    def test_empty_citations_list_uses_tool_context(self):
-        """An empty citations list should fall through to TOOL CONTEXT."""
+    def test_empty_citations_list_uses_tool_results(self):
+        """An empty citations list with tool results flag should use TOOL RESULTS."""
         result = SLPOrchestrator._format_ready_context(
             "Some tool output", skill_instruction=None, citations=[], cwd="/tmp",
+            has_tool_results=True,
         )
-        assert "TOOL CONTEXT" in result
+        assert "TOOL RESULTS" in result

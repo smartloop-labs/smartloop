@@ -125,6 +125,11 @@ class PlanStep(BaseModel):
         default=None,
         description="Argument names to extract via LLM (from mcp block syntax)",
     )
+    # Iterative tool calling — call the tool once per item from upstream results
+    for_each: Optional[bool] = Field(
+        default=None,
+        description="When True, call the tool once per item extracted from upstream results",
+    )
 
 
 class ExecutionPlan(BaseModel):
