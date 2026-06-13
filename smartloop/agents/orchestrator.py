@@ -816,16 +816,23 @@ class SLPOrchestrator:
             group_nodes: List[AgentNode] = []
             for step in group:
                 if step.step_type == StepType.TOOL:
-                    resolve_node = LLMDecisionNode(depends_on=list(prev_nodes))
-                    resolve_handler = self._make_resolve_handler(ctx, step, search_ctx)
-                    nodes_and_handlers.append((resolve_node, resolve_handler))
+                    if step.for_each:
+                        fanout_node = LLMDecisionNode(depends_on=list(prev_nodes))
+                        fanout_handler = self._make_fanout_handler(ctx, step, search_ctx)
+                        nodes_and_handlers.append((fanout_node, fanout_handler))
+                        group_nodes.append(fanout_node)
+                        pre_step_nodes.append(fanout_node)
+                    else:
+                        resolve_node = LLMDecisionNode(depends_on=list(prev_nodes))
+                        resolve_handler = self._make_resolve_handler(ctx, step, search_ctx)
+                        nodes_and_handlers.append((resolve_node, resolve_handler))
 
-                    execute_node = ToolCallNode(depends_on=[resolve_node])
-                    execute_handler = self._make_execute_handler(ctx, step)
-                    nodes_and_handlers.append((execute_node, execute_handler))
+                        execute_node = ToolCallNode(depends_on=[resolve_node])
+                        execute_handler = self._make_execute_handler(ctx, step)
+                        nodes_and_handlers.append((execute_node, execute_handler))
 
-                    group_nodes.append(execute_node)
-                    pre_step_nodes.append(execute_node)
+                        group_nodes.append(execute_node)
+                        pre_step_nodes.append(execute_node)
                 else:
                     if step.step_type == StepType.EXPLORE:
                         node = SearchNode(depends_on=list(prev_nodes))
@@ -1078,6 +1085,201 @@ Assess whether these search results are relevant to the user's request. If relev
             return self._step_result(node_id, step, formatted, raw)
 
         return handler
+
+    _FANOUT_MAX_ITEMS = 20
+
+    def _make_fanout_handler(
+        self,
+        ctx: _OrchestratorContext,
+        step: PlanStep,
+        search_ctx: SearchContext,
+    ) -> Callable:
+        """Create a handler that extracts items and calls a tool once per item.
+
+        Three phases: extract item list, resolve+execute per item, aggregate.
+
+        When all arguments are pre-filled (common case: single inferred arg
+        like ``symbol``), the tool is called directly — no LLM-based
+        dependency analysis or argument extraction per item.
+        """
+        def handler(deps: Dict) -> NodeResult:
+            node_id = f"step_{step.step}_{step.tool_name}_fanout"
+            prev_results = self._collect_raw_from_deps(deps)
+
+            items = self._extract_fanout_items(ctx, step, prev_results, search_ctx)
+            if not items:
+                logger.warning(f"[fanout] No items extracted for {step.tool_name}")
+                return self._step_result(node_id, step, "")
+
+            logger.info(f"[fanout] Extracted {len(items)} item(s) for {step.tool_name}")
+
+            server = self._find_fanout_server(step, ctx.mcp_servers, ctx.available_servers)
+            if not server:
+                logger.warning(f"[fanout] Server not found for {step.tool_name}")
+                return self._step_result(node_id, step, "")
+
+            tool_name = step.tool_name or ""
+
+            all_results: List[Dict[str, Any]] = []
+            for i, item_value in enumerate(items):
+                arguments = dict(step.default_args or {})
+
+                if isinstance(item_value, dict):
+                    arguments.update(item_value)
+                elif isinstance(item_value, str) and step.inferred_args and len(step.inferred_args) == 1:
+                    arguments[step.inferred_args[0]] = item_value
+
+                logger.info(f"[fanout] Calling {tool_name} [{i+1}/{len(items)}]: {arguments}")
+
+                result = self._call_tool(server, tool_name, arguments)
+                if result:
+                    formatted, raw = result
+                    all_results.append({
+                        "item": item_value,
+                        "tool_name": tool_name,
+                        "content": formatted,
+                        "raw": raw,
+                    })
+
+            if not all_results:
+                return self._step_result(node_id, step, "")
+
+            combined_content = "\n\n---\n\n".join(
+                f"[{r['tool_name']} for {r['item']}]:\n{r['content']}"
+                for r in all_results
+            )
+            combined_raw = "\n\n---\n\n".join(
+                f"[{r['tool_name']} for {r['item']}]:\n{r['raw']}"
+                for r in all_results
+            )
+
+            logger.info(
+                f"[fanout] {step.tool_name} completed {len(all_results)}/{len(items)} calls"
+            )
+            return self._step_result(node_id, step, combined_content, combined_raw)
+
+        return handler
+
+    def _find_fanout_server(
+        self,
+        step: PlanStep,
+        mcp_servers: List[MCPServer],
+        available_servers: List[Dict[str, Any]],
+    ) -> Optional[MCPServer]:
+        """Locate the MCP server for a fan-out step."""
+        tool_name = step.tool_name or ""
+        if step.server_id:
+            server = self.tool_caller.find_server(mcp_servers, step.server_id, step.server_name)
+            if server:
+                return server
+        for srv in mcp_servers:
+            if not srv.enabled or not srv.tools:
+                continue
+            for t in srv.tools:
+                t_name = t.name if hasattr(t, "name") else t.get("name", "")
+                if t_name == tool_name:
+                    return srv
+        return None
+
+    def _extract_fanout_items(
+        self,
+        ctx: _OrchestratorContext,
+        step: PlanStep,
+        prev_results: List[Dict[str, Any]],
+        search_ctx: SearchContext,
+    ) -> List[Any]:
+        """Extract iteration items from upstream context.
+
+        Uses a structured LLM prompt that asks for one value per line
+        (more reliable with small models than asking for JSON arrays).
+        Previous step results are included so the LLM can see the
+        already-extracted data.
+        """
+        context_parts: List[str] = []
+        for r in prev_results:
+            result_text = str(r.get("result", ""))[:4000]
+            if result_text:
+                context_parts.append(result_text)
+        if search_ctx.vector_context:
+            context_parts.append(search_ctx.vector_context[:6000])
+
+        context = "\n\n".join(context_parts)
+        if not context:
+            return []
+
+        arg_name = ""
+        if step.inferred_args:
+            arg_name = step.inferred_args[0]
+
+        skill_hint = ""
+        if ctx.skill_context:
+            skill_hint = f"Skill instruction: {ctx.skill_context[:500]}\n\n"
+
+        prompt = (
+            "<system>\n"
+            f"Your task: read the context and list every distinct '{arg_name or 'item'}' "
+            f"value that should be passed to the tool '{step.tool_name}'.\n\n"
+            "Output format: one value per line, nothing else.\n"
+            "Do not add numbering, bullets, or explanation.\n"
+            "Do not skip any values — list ALL of them.\n"
+            "</system>\n"
+            "<user>\n"
+            f"{skill_hint}"
+            f"Context:\n{context[:8000]}\n\n"
+            f"List every '{arg_name or 'item'}' value, one per line:\n"
+            "</user>"
+        )
+
+        try:
+            response = str(self.agent_llm.invoke(prompt)).strip()
+            logger.info(f"[fanout-extract] LLM response: {response[:300]}")
+
+            items = self._parse_fanout_response(response)
+            if items:
+                if len(items) > self._FANOUT_MAX_ITEMS:
+                    logger.warning(
+                        f"[fanout-extract] Truncated {len(items)} items "
+                        f"to {self._FANOUT_MAX_ITEMS}"
+                    )
+                return items[:self._FANOUT_MAX_ITEMS]
+        except Exception as e:
+            logger.warning(f"[fanout-extract] extraction failed: {e}")
+
+        return []
+
+    @staticmethod
+    def _parse_fanout_response(response: str) -> List[str]:
+        """Parse fan-out extraction response: one value per line or JSON array."""
+        import json as _json
+        text = response.strip()
+        if not text:
+            return []
+
+        # Try JSON array first (in case the LLM returns one)
+        json_match = re.search(r'\[.*\]', text, re.DOTALL)
+        if json_match:
+            try:
+                items = _json.loads(json_match.group())
+                if isinstance(items, list) and items:
+                    return [
+                        str(v) if not isinstance(v, str) else v
+                        for v in items if v
+                    ]
+            except (ValueError, TypeError):
+                pass
+
+        # Parse one-value-per-line format
+        items: List[str] = []
+        for line in text.splitlines():
+            val = line.strip().strip("-•*").strip()
+            val = re.sub(r'^\d+[\.\)]\s*', '', val).strip()
+            if not val or len(val) > 200:
+                continue
+            if val.lower().startswith(("here ", "the ", "these ", "below", "value")):
+                continue
+            items.append(val)
+
+        return items
 
     def _step_result(
         self,
@@ -1525,11 +1727,13 @@ Is this context relevant to the user's request?
             "  tool: tool name (use exact names from the tools list)\n"
             "  instruction: what this step does\n"
             "  default_args: (optional) if the skill specifies fixed/default values "
-            "for tool arguments, include them as a flat JSON object\n\n"
+            "for tool arguments, include them as a flat JSON object\n"
+            "  for_each: (optional boolean) true if this tool should be called once per item "
+            "extracted from upstream results (e.g. 'for each ticker, call get_info')\n\n"
             "Example output:\n"
             '[{"step_type":"explore","tool":"explore","instruction":"Gather relevant data"},'
             '{"step_type":"tool","tool":"create_item","instruction":"Create item with results",'
-            '"default_args":{"category":"bugs"}}]\n'
+            '"default_args":{"category":"bugs"},"for_each":true}]\n'
             "</system>\n"
             "<user>\n"
             f"Skill instructions:\n{skill_content}\n\n"
@@ -1613,6 +1817,7 @@ Is this context relevant to the user's request?
                         instruction=s.get("instruction", ""),
                         condition=s.get("condition"),
                         default_args=step_defaults,
+                        for_each=s.get("for_each") or None,
                     ))
                 # Renumber
                 for idx, s in enumerate(steps):
@@ -1694,12 +1899,25 @@ Is this context relevant to the user's request?
 
     @staticmethod
     def _ensure_explore_and_analyze(steps: List[PlanStep]) -> List[PlanStep]:
-        """Return steps unchanged — collect_parallel already runs explore.
+        """Prepend an EXPLORE step when TOOL steps need upstream document data.
 
-        Previously this prepended an EXPLORE step; now the unified
-        pipeline relies on the search context gathered by
-        collect_parallel, so no extra EXPLORE node is needed.
+        Skill steps form a linked list — each step sees the previous
+        step's output.  TOOL steps need the document context as an
+        explicit predecessor so their handlers receive it via
+        ``prev_results``.
         """
+        has_tool = any(s.step_type == StepType.TOOL for s in steps)
+        has_explore = any(s.step_type == StepType.EXPLORE for s in steps)
+        if has_tool and not has_explore:
+            explore = PlanStep(
+                step=0,
+                step_type=StepType.EXPLORE,
+                tool_name=EXPLORE_TOOL,
+                instruction="Gather document data for downstream tool calls",
+            )
+            steps = [explore] + steps
+            for i, s in enumerate(steps):
+                s.step = i + 1
         return steps
 
     def _extract_tool_condition_from_text(
@@ -1971,6 +2189,7 @@ Is this context relevant to the user's request?
     _MCP_BLOCK_RE = re.compile(r'```mcp\s*\n(.+?)```', re.DOTALL)
     # Allow hyphens in server/tool names (e.g. mcp-server-yfinance.get-stock-quote)
     _MCP_CALL_RE = re.compile(r'^\s*([\w-]+)\.([\w-]+)\(([^)]*)\)\s*$', re.MULTILINE)
+    _FOR_EACH_RE = re.compile(r'(?:for\s+each|for\s+every|for\s+all)\b', re.IGNORECASE)
     _TOOL_CODE_FENCE_RE = re.compile(
         r'```(?:tool_code|mcp)\s*\n.*?```', re.DOTALL,
     )
@@ -1998,6 +2217,9 @@ Is this context relevant to the user's request?
         """
         results: List[Dict] = []
         for block_match in SLPOrchestrator._MCP_BLOCK_RE.finditer(content):
+            preceding = content[max(0, block_match.start() - 300):block_match.start()]
+            is_for_each = bool(SLPOrchestrator._FOR_EACH_RE.search(preceding))
+
             block_text = block_match.group(1)
             for call_match in SLPOrchestrator._MCP_CALL_RE.finditer(block_text):
                 server_name = call_match.group(1)
@@ -2023,6 +2245,7 @@ Is this context relevant to the user's request?
                     "tool_name": tool_name,
                     "inferred_args": inferred_args,
                     "default_args": default_args,
+                    "for_each": is_for_each,
                 })
         return results
 
@@ -2318,6 +2541,7 @@ Is this context relevant to the user's request?
                 skill_name=skill_name,
                 default_args=validated_defaults if validated_defaults else None,
                 inferred_args=block["inferred_args"] if block["inferred_args"] else None,
+                for_each=block.get("for_each") or None,
             ))
 
         return steps
