@@ -148,7 +148,7 @@ build: venv
 # so they load on older distros.
 llama-wheel: venv
 	@echo "=== Building portable llama-cpp-python $(LLAMA_VERSION) wheel for $(PLATFORM) ==="
-	$(PIP) install --upgrade pip wheel --index-url=https://pypi.org/simple
+	$(PYTHON) -m pip install --upgrade pip wheel --index-url=https://pypi.org/simple
 	CMAKE_ARGS="$(LLAMA_WHEEL_CMAKE)" $(PIP) wheel llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --no-deps --no-cache-dir --index-url=https://pypi.org/simple -w $(LLAMA_WHEELHOUSE)
 	@ls -lh $(LLAMA_WHEELHOUSE)/$(LLAMA_WHEEL_NAME)
 
