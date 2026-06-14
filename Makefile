@@ -68,7 +68,11 @@ else ifeq ($(PLATFORM),linux)
         LLAMA_INSTALL_CMD = CMAKE_ARGS="$(GGML_PORTABLE)" CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
     endif
 else
-    LLAMA_INSTALL_CMD = $(LLAMA_ABETLEN_WHEEL)
+    # Windows: prefer a locally cached wheel (wheelhouse/, populated by CI's
+    # actions/cache) so we don't recompile the ~1h CUDA source build on every
+    # run. When wheelhouse/ is absent or has no matching wheel, --find-links is
+    # a no-op and pip falls back to the abetlen index / source build as before.
+    LLAMA_INSTALL_CMD = $(PIP) install llama-cpp-python==$(LLAMA_ABETLEN_VERSION) --find-links wheelhouse --extra-index-url=https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
 endif
 
 

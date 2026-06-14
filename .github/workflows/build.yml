@@ -190,6 +190,38 @@ jobs:
       - name: Install make
         run: choco install make -y
 
+      # Resolve the pinned llama-cpp-python version from the Makefile so the
+      # cache key tracks it automatically — bumping LLAMA_ABETLEN_VERSION
+      # invalidates the stale wheel instead of silently reusing it.
+      - name: Resolve llama-cpp-python version
+        id: llama-ver
+        run: echo "version=$(grep '^LLAMA_ABETLEN_VERSION' Makefile | sed 's/.*:= *//')" >> "$GITHUB_OUTPUT"
+
+      # The CUDA source build of llama-cpp-python takes ~1h. It's deterministic
+      # for a fixed (llama version, CUDA 12.4, py3.11, runner) tuple, so cache
+      # the compiled wheel and only recompile when one of those changes.
+      - name: Cache llama-cpp-python CUDA wheel
+        id: llama-wheel-cache
+        uses: actions/cache@v4
+        with:
+          path: wheelhouse
+          key: llama-cpp-${{ steps.llama-ver.outputs.version }}-cu124-py311-windows-2022
+
+      - name: Pre-build llama-cpp-python CUDA wheel
+        if: steps.llama-wheel-cache.outputs.cache-hit != 'true'
+        env:
+          CMAKE_ARGS: "-DGGML_CUDA=ON"
+          CMAKE_BUILD_PARALLEL_LEVEL: ${{ env.NUMBER_OF_PROCESSORS }}
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip wheel "llama-cpp-python==${{ steps.llama-ver.outputs.version }}" \
+            --no-binary llama-cpp-python --no-deps \
+            --index-url=https://pypi.org/simple \
+            -w wheelhouse --no-cache-dir
+
+      # On a cache hit `make build` installs the prebuilt wheel from wheelhouse/
+      # via --find-links (Makefile); CMAKE_ARGS only matters for the rare
+      # source-build fallback when no cached wheel matches.
       - name: Install dependencies
         env:
           CMAKE_ARGS: "-DGGML_CUDA=ON"

@@ -168,4 +168,5 @@ user.yaml
 .build-tmp/
 dist-wheels/
 .wheel-build-env/
+wheelhouse/
 slp
