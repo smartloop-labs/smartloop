@@ -169,4 +169,5 @@ user.yaml
 dist-wheels/
 .wheel-build-env/
 wheelhouse/
+.model-cache/
 slp
