@@ -240,22 +240,16 @@ def cmd_run(args, host: str, port: int, model_name: str, project_dir: str) -> No
 
     from tui.chat import SLPChat
 
-    try:
-        resume_id = getattr(args, "resume", None)
-        app = SLPChat(
-            server_url=_base_url(host, port),
-            model_name=model_name or "",
-            session_id=resume_id or "",
-            project_dir=project_dir,
-        )
-        app.run()
-    finally:
-        try:
-            requests.post(f"{_base_url(host, port)}/v1/models/unload", timeout=30)
-            console.print("\n[bold blue]Bye![/bold blue]")
-            console.print(f"Resume conversation with:\n[dim]slp --resume={app.session_id}[/dim]")
-        except Exception:
-            pass
+    resume_id = getattr(args, "resume", None)
+    app = SLPChat(
+        server_url=_base_url(host, port),
+        model_name=model_name or "",
+        session_id=resume_id or "",
+        project_dir=project_dir,
+    )
+    app.run()
+    console.print("\n[bold blue]Bye![/bold blue]")
+    console.print(f"Resume conversation with:\n[dim]slp --resume={app.session_id}[/dim]")
 
 
 def cmd_status(host: str, port: int) -> None:
