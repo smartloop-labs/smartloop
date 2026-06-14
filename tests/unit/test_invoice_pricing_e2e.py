@@ -226,7 +226,7 @@ class TestInvoicePricingPipeline:
                 "step_type": "explore",
                 "tool_name": "explore",
                 "server_id": "__system_tools__",
-                "server_name": "System Tools",
+                "server_name": "smartloop",
                 "instruction": f"Explore the directory {data_dir} and read the invoice PDF to extract invoice details (plan name, amount, billing period, vendor).",
             },
             {
@@ -243,7 +243,7 @@ class TestInvoicePricingPipeline:
                 "action_kind": "write",
                 "tool_name": "file-write",
                 "server_id": "__system_tools__",
-                "server_name": "System Tools",
+                "server_name": "smartloop",
                 "instruction": f"Write a detailed verification report to {output_path} comparing the invoice to the published pricing and listing all Pro plan features.",
             },
         ])

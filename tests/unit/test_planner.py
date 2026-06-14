@@ -96,7 +96,7 @@ def test_build_context(planner, sample_servers):
 
 def test_build_context_filters_system_tools(planner):
     servers = [
-        {"id": "__system_tools__", "name": "System Tools", "tools": [{"name": "explore"}]},
+        {"id": "__system_tools__", "name": "smartloop", "tools": [{"name": "explore"}]},
         {"id": "ext-1", "name": "External", "tools": [{"name": "foo"}]},
     ]
     ctx = planner.build_context("test", servers)
@@ -388,7 +388,7 @@ def test_create_plan_multi_step_from_llm(planner, mock_llm, sample_servers):
             "action_kind": "write",
             "tool_name": "file-write",
             "server_id": "__system_tools__",
-            "server_name": "System Tools",
+            "server_name": "smartloop",
             "instruction": "Write to output.md",
         },
     ])
@@ -477,7 +477,7 @@ def test_action_kind_inferred_from_old_step_type(planner):
     plan = planner._parse_plan_response(json.dumps([
         {
             "step": 1, "step_type": "read", "tool_name": "file-read",
-            "server_id": "__system_tools__", "server_name": "System Tools",
+            "server_id": "__system_tools__", "server_name": "smartloop",
             "instruction": "Read main.py",
         }
     ]), "show me main.py")

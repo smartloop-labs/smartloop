@@ -1,7 +1,5 @@
 """Singleton model service for managing LLM lifecycle"""
 
-import glob
-import hashlib
 import json
 import logging
 import mimetypes
@@ -39,6 +37,7 @@ from smartloop.model import Model
 from smartloop.mcp.local_client import LocalMCPClient
 from smartloop.mcp.client import MCPLaunchError
 from smartloop.agents.orchestrator import SLPOrchestrator
+from smartloop.agents.planner import SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME, FETCH_SERVER_ID
 from smartloop.agents.mcp.skill_generator import MCPSkillGenerator
 
 from smartloop.parsers.parser_factory import ParserFactory
@@ -307,9 +306,7 @@ class ModelService:
 
         current_project = workspace.current_project
         if current_project:
-            # Auto-register system MCP servers if not present
-            self.install_system_tools_server(current_project.id)
-            self.install_fetch_server(current_project.id)
+            self._setup_project_tools(current_project)
 
         self._llm = self._model.get_instance(debug=api_settings.debug_mode)
         self._model_name = target_model
@@ -333,6 +330,7 @@ class ModelService:
             self._load_decision_model(_settings.decision_model)
 
         self._warmup_embeddings()
+        self._warmup_inference()
 
         return self._llm
 
@@ -372,6 +370,16 @@ class ModelService:
                 logger.warning(f"[embeddings] Warmup failed: {e}")
 
         threading.Thread(target=_load, name="embedding-warmup", daemon=True).start()
+
+    def _warmup_inference(self) -> None:
+        """Run a trivial inference to prime the KV cache after model load."""
+        if self._llm is None:
+            return
+        try:
+            self._llm.invoke("<system>Reply OK</system><user>hi</user>")
+            logger.info("[warmup] Inference warmup completed")
+        except Exception as e:
+            logger.warning(f"[warmup] Inference warmup failed: {e}")
 
     @property
     def decision_llm(self) -> Optional[BaseLLM]:
@@ -656,28 +664,6 @@ class ModelService:
         except Exception:
             return None
 
-    def _load_system_skills(self) -> List[Skill]:
-        """Load system skills from .md files in the workspace skills/ directory."""
-        workspace = self._model.workspace if self._model else self._ensure_workspace()
-        if workspace is None:
-            return []
-        skills_dir = os.path.join(workspace.workspace_dir, "skills")
-        if not os.path.isdir(skills_dir):
-            return []
-        skills = []
-        for filepath in sorted(glob.glob(os.path.join(skills_dir, "*.md"))):
-            name = Path(filepath).stem
-            try:
-                content = Path(filepath).read_text(encoding="utf-8")
-            except Exception as e:
-                logger.warning(f"Could not read system skill {filepath}: {e}")
-                continue
-            skill_id = hashlib.md5(content.encode()).hexdigest()[:8]
-            skills.append(Skill(id=skill_id, name=name, content=content, system=True))
-        return skills
-
-    SYSTEM_TOOLS_SERVER_NAME = "Smartloop"
-
     _SYSTEM_TOOL_DEFS = [
         MCPToolDefinition(
             name="bash",
@@ -704,13 +690,13 @@ class ModelService:
     def install_system_tools_server(self, project_id: str) -> None:
         """Register the System Tools MCP server on a project if not already present."""
         project = self._get_project(project_id)
-        if any(s.name == self.SYSTEM_TOOLS_SERVER_NAME for s in project.mcp_servers):
+        if any(s.name == SYSTEM_TOOLS_SERVER_NAME for s in project.mcp_servers):
             logger.info("System Tools server already registered")
             return
 
         server = MCPServer(
-            id="__system_tools__",
-            name=self.SYSTEM_TOOLS_SERVER_NAME,
+            id=SYSTEM_TOOLS_SERVER_ID,
+            name=SYSTEM_TOOLS_SERVER_NAME,
             description="Built-in tools for file operations, search, and shell commands",
             server_type=MCPServerType.LOCAL,
             config=MCPServerConfig(
@@ -752,7 +738,7 @@ class ModelService:
             return
 
         server = MCPServer(
-            id="__fetch__",
+            id=FETCH_SERVER_ID,
             name=self.FETCH_SERVER_NAME,
             pkg="mcp-server-fetch",
             description="Fetches URLs from the internet and extracts content as markdown",
@@ -762,35 +748,18 @@ class ModelService:
                 args=["-m", "smartloop.api.mcp.fetch_server"],
             ),
             enabled=True,
-            system=True,
+            system=False,
             tools=list(self._FETCH_TOOL_DEFS),
         )
         project.mcp_servers.append(server)
         self._model.save()
         logger.info(f"Registered fetch server on project {project_id}")
 
-    def ensure_project_servers(self, project_id: str) -> None:
-        """Ensure system MCP servers and workspace docs exist on a project.
-
-        Idempotent — skips servers/docs that are already present.
-        Uses LLM to generate docs only when they are missing.
-        Migrates legacy REMOTE servers to LOCAL (stdio subprocess).
-        """
-        project = self._get_project(project_id)
-        self._migrate_servers_to_local(project)
-        self.install_system_tools_server(project_id)
-        self.install_fetch_server(project_id)
-
-        for server in project.mcp_servers:
-            if not server.tools:
-                continue
-            self._generate_mcp_workspace_doc(project, server)
-
     def _migrate_servers_to_local(self, project: "Project") -> None:
         """Migrate legacy REMOTE system servers to LOCAL (stdio subprocess)."""
         migrated = False
         for server in project.mcp_servers:
-            if server.id == "__fetch__" and server.server_type == MCPServerType.REMOTE:
+            if server.id == FETCH_SERVER_ID and server.server_type == MCPServerType.REMOTE:
                 server.server_type = MCPServerType.LOCAL
                 server.config = MCPServerConfig(
                     command=sys.executable,
@@ -799,7 +768,7 @@ class ModelService:
                 server.remote_config = None
                 migrated = True
                 logger.info(f"Migrated fetch server to LOCAL on project {project.id}")
-            if server.id == "__system_tools__" and server.server_type == MCPServerType.REMOTE:
+            if server.id == SYSTEM_TOOLS_SERVER_ID and server.server_type == MCPServerType.REMOTE:
                 server.server_type = MCPServerType.LOCAL
                 server.config = MCPServerConfig(
                     command=sys.executable,
@@ -811,8 +780,35 @@ class ModelService:
         if migrated:
             self._model.save()
 
+    _DEFAULT_SKILLS = [
+        Skill(
+            id="fetch-url",
+            name="fetch-url",
+            description="Use when the user requests to find information from a URL — extracts data from the provided URL and returns it.",
+            content="when user requests information from an url use fetch tool extract information from the URL\n\n```mcp\nfetch.fetch(url)\n```",
+        ),
+        Skill(
+            id="file-read",
+            name="file-read",
+            description="Use when the user wants to read, view, or inspect the contents of a file.",
+            content="read the file at the given path and return its content\n\n```mcp\nsmartloop.file-read(path)\n```",
+        ),
+        Skill(
+            id="file-write",
+            name="file-write",
+            description="Use when the user wants to write, save, or create a file with specific content.",
+            content="write content to a file at the given path\n\n```mcp\nsmartloop.file-write(path, content)\n```",
+        ),
+        Skill(
+            id="bash",
+            name="bash",
+            description="Use when the user wants to run a shell command, execute a script, or perform system operations.",
+            content="execute the shell command on the host machine\n\n```mcp\nsmartloop.bash(command)\n```",
+        ),
+    ]
+
     def _setup_project_tools(self, project: "Project") -> None:
-        """Install system MCP servers and generate workspace docs."""
+        """Install system MCP servers, generate workspace docs, and register default skills."""
         project_id = project.id
         self._migrate_servers_to_local(project)
         self.install_system_tools_server(project_id)
@@ -824,6 +820,15 @@ class ModelService:
             if not server.tools:
                 continue
             self._generate_mcp_workspace_doc(project, server)
+        self._install_default_skills(project)
+
+    def _install_default_skills(self, project: "Project") -> None:
+        """Write default skill SKILL.md files if they don't already exist."""
+        existing = {s.name for s in self._read_skills_from_disk(project)}
+        for skill in self._DEFAULT_SKILLS:
+            if skill.name not in existing:
+                self._write_skill_md(project, skill)
+                logger.info(f"Installed default skill '{skill.name}' on project {project.id}")
 
     def _get_system_project(self) -> Optional["Project"]:
         """Return the system project (general_chat), if it exists."""
@@ -1024,7 +1029,7 @@ class ModelService:
         # Build index: (server_name, tool_name, schema)
         server_tools: list[tuple[str, str, dict]] = []
         for server in project.mcp_servers:
-            if not server.tools or server.id == "__system_tools__":
+            if not server.tools or server.id == SYSTEM_TOOLS_SERVER_ID:
                 continue
             for tool in server.tools:
                 server_tools.append((server.name, tool.name, tool.input_schema or {}))
@@ -1124,7 +1129,7 @@ class ModelService:
         for server in project.mcp_servers:
             # Exclude the internal Smartloop system tools (bash, file-ops, explore)
             # but include fetch and all user-registered servers.
-            if not server.tools or server.id == "__system_tools__":
+            if not server.tools or server.id == SYSTEM_TOOLS_SERVER_ID:
                 continue
             for tool in server.tools:
                 desc = tool.description or ""
@@ -2620,8 +2625,8 @@ User input:
     # (relative to smartloop/skills/).  These ship with pre-written
     # files so we skip the LLM-based auto-generation for them.
     _KNOWN_MCP_DOCS: dict[str, str] = {
-        "__system_tools__": "__system_mcp__.md",
-        "__fetch__": "fetch-mcp.md",
+        SYSTEM_TOOLS_SERVER_ID: "__system_mcp__.md",
+        FETCH_SERVER_ID: "fetch-mcp.md",
     }
 
     def _generate_mcp_workspace_doc(self, project: "Project", server: "MCPServer") -> None:

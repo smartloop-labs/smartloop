@@ -157,8 +157,8 @@ class MCPServerSelector:
                 cwd_section = (
                     f"Working directory: {cwd}\n"
                     "IMPORTANT: When the user refers to local files, directories, "
-                    "README, codebase, or project structure, use the System Tools "
-                    "(file-read, grep, explore) — NOT fetch or web tools. "
+                    "README, codebase, or project structure, use the smartloop "
+                    "tools (file-read, grep, explore) — NOT fetch or web tools. "
                     "Only use fetch/web tools for URLs (http/https).\n\n"
                 )
 

@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------- #
 
 SYSTEM_TOOLS_SERVER_ID = "__system_tools__"
-SYSTEM_TOOLS_SERVER_NAME = "System Tools"
+SYSTEM_TOOLS_SERVER_NAME = "smartloop"
 FETCH_SERVER_ID = "__fetch__"
 
 

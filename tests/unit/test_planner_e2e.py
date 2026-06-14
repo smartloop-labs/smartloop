@@ -161,7 +161,7 @@ class TestClassifyPlanExecutePipeline:
                 "action_kind": "read",
                 "tool_name": "file-read",
                 "server_id": "__system_tools__",
-                "server_name": "System Tools",
+                "server_name": "smartloop",
                 "instruction": f"Read the resume file at {resume_path}",
             },
             {
@@ -178,7 +178,7 @@ class TestClassifyPlanExecutePipeline:
                 "action_kind": "write",
                 "tool_name": "file-write",
                 "server_id": "__system_tools__",
-                "server_name": "System Tools",
+                "server_name": "smartloop",
                 "instruction": f"Write the tailored requirements to {output_path}",
             },
         ])

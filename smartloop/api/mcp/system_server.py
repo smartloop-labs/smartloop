@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("system")
+mcp = FastMCP("smartloop")
 
 
 @mcp.tool(name="bash")

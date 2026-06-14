@@ -107,6 +107,8 @@ async def _load_model_and_stream(model_service, model, model_name: str):
 
     model_service._llm = load_task.result()
     model_service._model_name = model_name
+    model_service._warmup_embeddings()
+    model_service._warmup_inference()
     yield _sse_event({"status": "model_loaded", "message": f"Model {model_name} loaded."})
 
 
