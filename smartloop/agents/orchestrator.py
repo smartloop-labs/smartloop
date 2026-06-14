@@ -1751,9 +1751,13 @@ Is this context relevant to the user's request?
 
             # Parse JSON from response
             import json as _json
+            from json_repair import repair_json
             json_match = re.search(r'\[.*\]', response, re.DOTALL)
             if json_match:
-                raw_steps = _json.loads(json_match.group())
+                # Small local models routinely emit slightly malformed JSON
+                # (missing comma/quote). Always repair before parsing so we
+                # keep the skill-derived steps instead of dropping to fallback.
+                raw_steps = _json.loads(repair_json(json_match.group()))
                 # Skip if the LLM returned a list of strings instead of objects
                 if raw_steps and not isinstance(raw_steps[0], dict):
                     logger.info("[skill] LLM returned non-object steps, falling back")
