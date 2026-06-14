@@ -190,8 +190,11 @@ class SLPOrchestrator:
 
         mcp_tool_contexts: List[MCPToolContext] = []
         for srv in available_servers:
-            if srv.get("id") == SYSTEM_TOOLS_SERVER_ID:
-                continue
+            # Include the system tools server ("smartloop") here so its
+            # built-in tools (file-read, file-write, bash, …) resolve through
+            # the same ```mcp-block path as third-party servers like fetch.
+            # Execution is server-agnostic: find_server/_call_tool dispatch
+            # against the full mcp_servers list regardless of server type.
             mcp_tool_contexts.append(MCPToolContext(
                 server_id=srv.get("id", ""),
                 server_name=srv.get("name", "Unknown"),
