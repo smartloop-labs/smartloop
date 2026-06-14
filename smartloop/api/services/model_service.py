@@ -681,6 +681,11 @@ class ModelService:
             input_schema={"type": "object", "properties": {"path": {"type": "string", "description": "File path to write"}, "content": {"type": "string", "description": "Content to write"}}, "required": ["path", "content"]},
         ),
         MCPToolDefinition(
+            name="grep",
+            description="Recursively search files in the working directory for a text pattern or regex",
+            input_schema={"type": "object", "properties": {"pattern": {"type": "string", "description": "Text or regex to search for"}, "glob": {"type": "string", "description": "Optional filename filter, e.g. '*.py'"}}, "required": ["pattern"]},
+        ),
+        MCPToolDefinition(
             name="explore",
             description="Explore the local project directory, read files, and produce an LLM-enriched summary of the codebase",
             input_schema={"type": "object", "properties": {"query": {"type": "string", "description": "What to look for in the codebase"}}, "required": ["query"]},
@@ -690,8 +695,20 @@ class ModelService:
     def install_system_tools_server(self, project_id: str) -> None:
         """Register the System Tools MCP server on a project if not already present."""
         project = self._get_project(project_id)
-        if any(s.name == SYSTEM_TOOLS_SERVER_NAME for s in project.mcp_servers):
-            logger.info("System Tools server already registered")
+        existing = next(
+            (s for s in project.mcp_servers if s.name == SYSTEM_TOOLS_SERVER_NAME), None,
+        )
+        if existing is not None:
+            # Refresh the advertised tool list so projects created before a
+            # tool was added (e.g. grep) pick it up on next load.
+            current = [t.name for t in (existing.tools or [])]
+            wanted = [t.name for t in self._SYSTEM_TOOL_DEFS]
+            if current != wanted:
+                existing.tools = list(self._SYSTEM_TOOL_DEFS)
+                self._model.save()
+                logger.info(f"Refreshed System Tools server tools: {wanted}")
+            else:
+                logger.info("System Tools server already registered")
             return
 
         server = MCPServer(

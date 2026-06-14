@@ -18,6 +18,10 @@ from smartloop.agents.planner import (
     MatchedTool,
     SYSTEM_TOOLS_SERVER_ID,
     SYSTEM_TOOLS_SERVER_NAME,
+    BASH_TOOL,
+    FILE_READ_TOOL,
+    FILE_WRITE_TOOL,
+    GREP_TOOL,
     _extract_paths,
 )
 
@@ -306,8 +310,11 @@ def test_create_plan_action_bash(planner):
     ctx = PlanContext(user_message='Run:\n```bash\necho hello\n```')
     plan = planner.create_plan(classification, ctx)
     assert len(plan.steps) == 1
-    assert plan.steps[0].step_type == StepType.ACTION
-    assert plan.steps[0].action_kind == "bash"
+    # System tools now run as TOOL steps against the smartloop MCP server.
+    assert plan.steps[0].step_type == StepType.TOOL
+    assert plan.steps[0].tool_name == BASH_TOOL
+    assert plan.steps[0].server_id == SYSTEM_TOOLS_SERVER_ID
+    assert plan.steps[0].default_args == {"command": "echo hello"}
     assert "echo hello" in plan.steps[0].instruction
 
 
@@ -322,8 +329,10 @@ def test_create_plan_action_read(planner, tmp_path):
     ctx = PlanContext(user_message=f"Read {test_file}", cwd=str(tmp_path))
     plan = planner.create_plan(classification, ctx)
     assert len(plan.steps) == 1
-    assert plan.steps[0].step_type == StepType.ACTION
-    assert plan.steps[0].action_kind == "read"
+    assert plan.steps[0].step_type == StepType.TOOL
+    assert plan.steps[0].tool_name == FILE_READ_TOOL
+    assert plan.steps[0].server_id == SYSTEM_TOOLS_SERVER_ID
+    assert plan.steps[0].default_args == {"path": str(test_file)}
 
 
 def test_create_plan_action_grep(planner):
@@ -335,8 +344,9 @@ def test_create_plan_action_grep(planner):
     ctx = PlanContext(user_message="search for TODO")
     plan = planner.create_plan(classification, ctx)
     assert len(plan.steps) == 1
-    assert plan.steps[0].step_type == StepType.ACTION
-    assert plan.steps[0].action_kind == "grep"
+    assert plan.steps[0].step_type == StepType.TOOL
+    assert plan.steps[0].tool_name == GREP_TOOL
+    assert plan.steps[0].server_id == SYSTEM_TOOLS_SERVER_ID
 
 
 def test_create_plan_explore(planner, tmp_path):
@@ -404,7 +414,9 @@ def test_create_plan_multi_step_from_llm(planner, mock_llm, sample_servers):
     plan = planner.create_plan(classification, ctx)
     assert len(plan.steps) == 2
     assert plan.steps[0].step_type == StepType.TOOL
-    assert plan.steps[1].step_type == StepType.ACTION
+    # file-write now runs as a TOOL step against the smartloop MCP server.
+    assert plan.steps[1].step_type == StepType.TOOL
+    assert plan.steps[1].tool_name == FILE_WRITE_TOOL
 
 
 # ------------------------------------------------------------------ #
@@ -473,7 +485,9 @@ def test_action_step_type_corrected_to_tool_for_external_server(planner):
     assert plan.steps[0].server_id == "srv-1"
 
 
-def test_action_kind_inferred_from_old_step_type(planner):
+def test_system_tool_step_type_is_tool(planner):
+    """Legacy ``read``/``write``/``grep``/``bash`` step_types now map to TOOL
+    steps pinned to the smartloop MCP server."""
     plan = planner._parse_plan_response(json.dumps([
         {
             "step": 1, "step_type": "read", "tool_name": "file-read",
@@ -481,8 +495,9 @@ def test_action_kind_inferred_from_old_step_type(planner):
             "instruction": "Read main.py",
         }
     ]), "show me main.py")
-    assert plan.steps[0].step_type == StepType.ACTION
-    assert plan.steps[0].action_kind == "read"
+    assert plan.steps[0].step_type == StepType.TOOL
+    assert plan.steps[0].tool_name == FILE_READ_TOOL
+    assert plan.steps[0].server_id == SYSTEM_TOOLS_SERVER_ID
 
 
 # ------------------------------------------------------------------ #

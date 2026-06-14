@@ -8,6 +8,7 @@ files so the full dispatch path is verified.
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -16,13 +17,65 @@ import pytest
 
 from smartloop.agents.orchestrator import SLPOrchestrator, MCPExecutionResult
 from smartloop.agents.mcp.explorer import SearchContext
-from smartloop.agents.planner import StepType, PlanStep, ExecutionPlan
+from smartloop.agents.planner import (
+    StepType, PlanStep, ExecutionPlan,
+    SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
+)
 from smartloop.workspace.workspace import (
     MCPServer,
+    MCPServerConfig,
     MCPServerType,
     MCPToolDefinition,
     RemoteMCPServerConfig,
 )
+
+
+def _system_tools_server() -> MCPServer:
+    """The local smartloop system-tools MCP server (real stdio subprocess).
+
+    Built-in file/grep/bash tools now execute through this server, like
+    fetch — so e2e tests register it and let ``call_tool`` run it for real
+    against temp files.
+    """
+    def _tool(name, props, required):
+        return MCPToolDefinition(
+            name=name,
+            description=name,
+            input_schema={"type": "object", "properties": props, "required": required},
+        )
+
+    return MCPServer(
+        id=SYSTEM_TOOLS_SERVER_ID,
+        name=SYSTEM_TOOLS_SERVER_NAME,
+        description="Built-in tools for file operations, search, and shell commands",
+        server_type=MCPServerType.LOCAL,
+        config=MCPServerConfig(
+            command=sys.executable,
+            args=["-m", "smartloop.api.mcp.system_server"],
+        ),
+        enabled=True,
+        system=True,
+        tools=[
+            _tool("file-read", {"path": {"type": "string"}, "query": {"type": "string"}}, ["path"]),
+            _tool("file-write", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
+            _tool("grep", {"pattern": {"type": "string"}, "glob": {"type": "string"}}, ["pattern"]),
+        ],
+    )
+
+
+def _delegating_call_tool(orchestrator, fetch_result):
+    """call_tool side_effect: fake the (remote) fetch tool, run everything
+    else (the local system tools) through the real client/subprocess."""
+    real = orchestrator.tool_caller.call_tool
+
+    def side_effect(server=None, tool_name=None, arguments=None,
+                    access_token=None, cwd=None, **kwargs):
+        if tool_name == "fetch":
+            return fetch_result
+        return real(server=server, tool_name=tool_name, arguments=arguments,
+                    access_token=access_token, cwd=cwd)
+
+    return side_effect
 
 
 # ------------------------------------------------------------------ #
@@ -120,9 +173,15 @@ def _make_llm_side_effect(read_args: dict, write_args: dict, generated_text: str
         if "task planner" in prompt_str.lower() or "json array" in prompt_str.lower():
             return plan_json
 
-        # Arg extraction prompts (contain "Reply with ONLY a JSON object")
-        if "reply with only a json object" in prompt_str.lower():
-            if "file-write" in prompt_str.lower() or '"content"' in prompt_str.lower():
+        # Arg extraction prompts. Old direct path used "Reply with ONLY a
+        # JSON object"; the unified MCP path uses the MCPArgumentExtractor
+        # prompt ("argument extraction assistant" / "Extract arguments for
+        # tool '<name>'").
+        lowered = prompt_str.lower()
+        if ("reply with only a json object" in lowered
+                or "argument extraction assistant" in lowered
+                or "extract arguments for tool" in lowered):
+            if "file-write" in lowered or "content" in lowered:
                 return json.dumps(write_args)
             return json.dumps(read_args)
 
@@ -200,14 +259,15 @@ class TestClassifyPlanExecutePipeline:
             content=[{"type": "text", "text": JOB_DESCRIPTION_HTML}],
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch_result):
+        with patch.object(orchestrator.tool_caller, "call_tool",
+                          side_effect=_delegating_call_tool(orchestrator, fake_fetch_result)):
             result = orchestrator.execute(
                 user_message=(
                     f"Read my resume at {resume_path}, "
                     "look at the job description at https://job-boards.greenhouse.io/anthropic/jobs/123, "
                     f"and write out the tailored requirements to {output_path}"
                 ),
-                mcp_servers=[fetch_server],
+                mcp_servers=[fetch_server, _system_tools_server()],
                 cwd=str(tmp_workspace),
             )
 
@@ -265,7 +325,7 @@ class TestClassifyPlanExecutePipeline:
 
         result = orchestrator.execute(
             user_message=f"Read {resume_path} and summarize the key skills",
-            mcp_servers=[],
+            mcp_servers=[_system_tools_server()],
             skills=["Be concise"],
             cwd=str(tmp_workspace),
         )
@@ -292,10 +352,11 @@ class TestClassifyPlanExecutePipeline:
             success=False, content=None, error="Connection timeout",
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch_result):
+        with patch.object(orchestrator.tool_caller, "call_tool",
+                          side_effect=_delegating_call_tool(orchestrator, fake_fetch_result)):
             result = orchestrator.execute(
                 user_message=f"Read {resume_path} and fetch https://example.com/job",
-                mcp_servers=[fetch_server],
+                mcp_servers=[fetch_server, _system_tools_server()],
                 cwd=str(tmp_workspace),
             )
 

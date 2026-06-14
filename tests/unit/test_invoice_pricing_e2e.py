@@ -12,6 +12,7 @@ MCP call is mocked with the actual lovable.dev pricing data.
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,13 +22,58 @@ import pytest
 
 from smartloop.agents.orchestrator import SLPOrchestrator, MCPExecutionResult
 from smartloop.agents.mcp.explorer import SearchContext
-from smartloop.agents.planner import StepType
+from smartloop.agents.planner import (
+    StepType, SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
+)
 from smartloop.workspace.workspace import (
     MCPServer,
+    MCPServerConfig,
     MCPServerType,
     MCPToolDefinition,
     RemoteMCPServerConfig,
 )
+
+
+def _system_tools_server() -> MCPServer:
+    """The local smartloop system-tools MCP server (real stdio subprocess)."""
+    def _tool(name, props, required):
+        return MCPToolDefinition(
+            name=name, description=name,
+            input_schema={"type": "object", "properties": props, "required": required},
+        )
+
+    return MCPServer(
+        id=SYSTEM_TOOLS_SERVER_ID,
+        name=SYSTEM_TOOLS_SERVER_NAME,
+        description="Built-in tools for file operations, search, and shell commands",
+        server_type=MCPServerType.LOCAL,
+        config=MCPServerConfig(
+            command=sys.executable,
+            args=["-m", "smartloop.api.mcp.system_server"],
+        ),
+        enabled=True,
+        system=True,
+        tools=[
+            _tool("file-write", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
+            _tool("file-read", {"path": {"type": "string"}}, ["path"]),
+            _tool("grep", {"pattern": {"type": "string"}}, ["pattern"]),
+        ],
+    )
+
+
+def _delegating_call_tool(orchestrator, fetch_result):
+    """call_tool side_effect: fake the remote fetch tool, run the local
+    system tools for real against temp files."""
+    real = orchestrator.tool_caller.call_tool
+
+    def side_effect(server=None, tool_name=None, arguments=None,
+                    access_token=None, cwd=None, **kwargs):
+        if tool_name == "fetch":
+            return fetch_result
+        return real(server=server, tool_name=tool_name, arguments=arguments,
+                    access_token=access_token, cwd=cwd)
+
+    return side_effect
 
 
 # ------------------------------------------------------------------ #
@@ -294,8 +340,11 @@ class TestInvoicePricingPipeline:
                     base += "\nCould not fetch content from the pricing page."
                 return base
 
-            # 4. Arg extraction for file-write
-            if "reply with only a json object" in p_lower:
+            # 4. Arg extraction for file-write (unified MCP path uses the
+            # MCPArgumentExtractor prompt).
+            if ("reply with only a json object" in p_lower
+                    or "argument extraction assistant" in p_lower
+                    or "extract arguments for tool" in p_lower):
                 return json.dumps({
                     "path": output_path,
                     "content": EXPECTED_REPORT,
@@ -333,10 +382,11 @@ class TestInvoicePricingPipeline:
         )
 
         with patch.object(orchestrator.explorer, "collect_parallel", return_value=_make_invoice_search_ctx()), \
-             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
+             patch.object(orchestrator.tool_caller, "call_tool",
+                          side_effect=_delegating_call_tool(orchestrator, fake_fetch)):
             result = orchestrator.execute(
                 user_message=user_msg,
-                mcp_servers=[fetch_server],
+                mcp_servers=[fetch_server, _system_tools_server()],
                 cwd=str(workspace),
             )
 

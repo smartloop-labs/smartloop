@@ -30,13 +30,14 @@ class MCPToolCaller:
         tool_name: str,
         arguments: Optional[Dict[str, Any]] = None,
         access_token: Optional[str] = None,
+        cwd: Optional[str] = None,
     ):
         if server.server_type == MCPServerType.LOCAL and server.config:
             with LocalMCPClient(
                 command=server.config.command,
                 args=server.config.args,
                 env=server.config.env,
-                cwd=server.config.cwd,
+                cwd=cwd or server.config.cwd,
             ) as client:
                 return client.call_tool(tool_name, arguments)
         else:

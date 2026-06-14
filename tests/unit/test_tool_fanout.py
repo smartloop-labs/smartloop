@@ -389,7 +389,7 @@ class TestFanoutHandler:
         mock_server = MagicMock()
 
         call_count = {"n": 0}
-        def fail_second(server, tool_name, arguments):
+        def fail_second(server, tool_name, arguments, cwd=None):
             call_count["n"] += 1
             if call_count["n"] == 2:
                 return None
