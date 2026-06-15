@@ -1,7 +1,8 @@
-"""FastMCP-based system tools server – bash, file-read, file-write."""
+"""FastMCP-based system tools server – bash, file-read, file-write, grep."""
 
 import logging
 import os
+import re
 import subprocess
 from typing import Optional
 
@@ -10,6 +11,15 @@ from mcp.server.fastmcp import FastMCP
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("smartloop")
+
+
+def _extract_fenced_content(text: str) -> str:
+    """Strip a single ```` ``` ```` fence (with optional language tag) that
+    small models often wrap file content in, returning the inner text."""
+    match = re.search(r"```[^\n]*\n(.*?)```", text, re.DOTALL)
+    if match:
+        return match.group(1)
+    return text
 
 
 @mcp.tool(name="bash")
@@ -104,6 +114,8 @@ async def file_write(path: str, content: str) -> str:
     if content is None:
         return "Error: no content provided"
 
+    content = _extract_fenced_content(content)
+
     logger.info(f"[file-write] Writing to '{path}', content_len={len(content)}")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     try:
@@ -116,6 +128,39 @@ async def file_write(path: str, content: str) -> str:
         )
     except Exception as e:
         return f"Error writing file: {e}"
+
+
+@mcp.tool(name="grep")
+async def grep(pattern: str, glob: str = "*", timeout: int = 30) -> str:
+    """Recursively search files in the working directory for a pattern.
+
+    Args:
+        pattern: Text or regex to search for.
+        glob: Optional filename filter (e.g. "*.py"). Defaults to all files.
+        timeout: Timeout in seconds.
+    """
+    if not pattern:
+        return "Error: no search pattern provided"
+
+    logger.info(f"[grep] Searching for '{pattern}' (glob={glob})")
+    cmd = ["grep", "-rn", "--include", glob, pattern, "."]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Search timed out after {timeout}s"
+
+    output = proc.stdout.strip()
+    if not output:
+        return f"No matches found for '{pattern}'"
+    lines = output.split("\n")
+    if len(lines) > 50:
+        output = (
+            "\n".join(lines[:50])
+            + f"\n\n... ({len(lines)} total matches, showing first 50)"
+        )
+    return f"Search results for '{pattern}':\n\n{output}"
 
 
 if __name__ == "__main__":

@@ -16,7 +16,9 @@ from smartloop.workspace.workspace import MCPServerType
 
 from smartloop.agents.planner import PlanStep, StepType, MCPToolContext, SYSTEM_TOOLS_SERVER_ID
 
-from .server_selector import EXPLORE_TOOL, FILE_READ_TOOL
+from .server_selector import (
+    EXPLORE_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL,
+)
 from .mcp_tool_caller import MCPToolCaller
 from .argument_extractor import MCPArgumentExtractor
 
@@ -1238,9 +1240,14 @@ class Explorer:
         available_servers: List[Dict[str, Any]],
         user_message: str,
     ) -> List["PlanStep"]:
+        _SYSTEM_TOOLS = {
+            FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL, EXPLORE_TOOL,
+        }
         resolved = []
         for step in steps:
-            if step.step_type == StepType.TOOL:
+            # Built-in system tools are explicit MCP steps — never rewrite
+            # them into a fetch step even when the request mentions a URL.
+            if step.step_type == StepType.TOOL and step.tool_name not in _SYSTEM_TOOLS:
                 instr_lower = step.instruction.lower()
                 tool_lower = (step.tool_name or "").lower()
                 _FETCH_INTENT_WORDS = {"fetch", "browse", "scrape", "navigate", "retrieve", "get url", "http"}

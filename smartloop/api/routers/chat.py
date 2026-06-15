@@ -15,8 +15,6 @@ from typing import AsyncIterator, List
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
-from smartloop.workspace import Skill
-
 from smartloop.api.model import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -56,7 +54,6 @@ _executor = ThreadPoolExecutor(max_workers=1)
 def format_messages_to_prompt(
     messages: List[ChatMessage],
     context: str | None = None,
-    project_skills: List[Skill] | None = None,
     cwd: str | None = None,
     project_info: str | None = None,
 ) -> str:
@@ -64,7 +61,7 @@ def format_messages_to_prompt(
 
     When *context* is provided (pre-formatted by the orchestrator), it is
     injected into the first user message as-is.  When no orchestrator context
-    is available, lightweight auxiliary context (cwd, project_info, skills) is
+    is available, lightweight auxiliary context (cwd, project_info) is
     injected instead.
     """
     prompt_parts = []
@@ -98,13 +95,6 @@ def format_messages_to_prompt(
                             pass
                     if project_info:
                         user_parts.append(f"PROJECT INFO:\n{project_info}")
-                    if project_skills:
-                        skills_text = "\n".join(
-                            f"- {skill.name}: {skill.description}"
-                            for skill in project_skills if skill.description
-                        )
-                        if skills_text:
-                            user_parts.append(f"AVAILABLE SKILLS:\n{skills_text}")
                 context_injected = True
 
             if msg.content:
@@ -360,14 +350,12 @@ async def stream_chunks(
 
     yield _status_event("preparing", "processing", "Preparing response...")
 
-    effective_skills = [] if orchestrator_context else project_skills
     messages = _compact_messages(messages, model_service,
                                 context_tokens=model_service.count_tokens(orchestrator_context or ""))
 
     prompt = format_messages_to_prompt(
         messages,
         context=orchestrator_context,
-        project_skills=effective_skills,
         cwd=request.cwd,
         project_info=project_info,
     )
@@ -645,14 +633,12 @@ async def create_chat_completion(
         project_id = model_service.get_project_id()
         project_info = model_service.get_project_info()
 
-        effective_skills = [] if orchestrator_context else project_skills
         messages = _compact_messages(messages, model_service,
                                      context_tokens=model_service.count_tokens(orchestrator_context or ""))
 
         prompt = format_messages_to_prompt(
             messages,
             context=orchestrator_context,
-            project_skills=effective_skills,
             cwd=request.cwd,
             project_info=project_info,
         )

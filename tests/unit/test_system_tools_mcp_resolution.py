@@ -143,6 +143,30 @@ def test_mcp_block_resolves_system_tool():
     assert step.server_name == SYSTEM_TOOLS_SERVER_NAME
 
 
+@pytest.mark.parametrize("tool_name", ["file-read", "file-write", "grep", "bash"])
+def test_mcp_block_resolves_all_system_tools(tool_name):
+    """Every built-in tool — file-read/file-write/grep/bash — resolves to a
+    TOOL step on the smartloop server through the unified mcp-block path."""
+    ctx = MCPToolContext(
+        server_id=SYSTEM_TOOLS_SERVER_ID,
+        server_name=SYSTEM_TOOLS_SERVER_NAME,
+        tools=[{"name": tool_name, "description": tool_name, "input_schema": {"type": "object"}}],
+    )
+    block = {
+        "server_name": SYSTEM_TOOLS_SERVER_NAME,
+        "tool_name": tool_name,
+        "inferred_args": [],
+        "default_args": {},
+    }
+    steps = SLPOrchestrator._mcp_blocks_to_plan_steps(
+        [block], skill_name=tool_name, mcp_tool_contexts=[ctx],
+    )
+    assert len(steps) == 1
+    assert steps[0].step_type == StepType.TOOL
+    assert steps[0].tool_name == tool_name
+    assert steps[0].server_id == SYSTEM_TOOLS_SERVER_ID
+
+
 def test_mcp_block_unresolved_without_system_context():
     """Without the system server in the contexts the block cannot resolve
     and is skipped — the regression this fix prevents (the server is now

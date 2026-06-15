@@ -39,7 +39,6 @@ from smartloop.agents.mcp.argument_extractor import MCPArgumentExtractor
 from smartloop.agents.mcp.dependency_analyzer import MCPDependencyAnalyzer
 from smartloop.agents.mcp.result_mapper import MCPResultMapper
 from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
-from smartloop.agents.mcp.file_ops import FileOperations
 from smartloop.utils.mcp_result_formatter import ResultFormatter
 
 from smartloop.agents.mcp.explorer import Explorer, SearchContext, EnrichedContext
@@ -115,7 +114,6 @@ class SLPOrchestrator:
         self.dep_analyzer = MCPDependencyAnalyzer()
         self.result_mapper = MCPResultMapper()
         self.tool_caller = MCPToolCaller(self.arg_extractor, self.result_mapper)
-        self.file_ops = FileOperations(orchestrator_llm)
         self.result_formatter = ResultFormatter(orchestrator_llm)
         self.explorer = Explorer(self.agent_llm, self.tool_caller, self.arg_extractor)
 
@@ -1080,7 +1078,7 @@ Assess whether these search results are relevant to the user's request. If relev
                 logger.warning(f"[execute] Server not found for {tool_name} (id={server_id})")
                 return self._step_result(node_id, step, "")
 
-            result = self._call_tool(server, tool_name, arguments)
+            result = self._call_tool(server, tool_name, arguments, cwd=ctx.effective_cwd)
             if result is None:
                 return self._step_result(node_id, step, "")
 
@@ -1134,7 +1132,7 @@ Assess whether these search results are relevant to the user's request. If relev
 
                 logger.info(f"[fanout] Calling {tool_name} [{i+1}/{len(items)}]: {arguments}")
 
-                result = self._call_tool(server, tool_name, arguments)
+                result = self._call_tool(server, tool_name, arguments, cwd=ctx.effective_cwd)
                 if result:
                     formatted, raw = result
                     all_results.append({
@@ -1796,6 +1794,11 @@ Is this context relevant to the user's request?
                                         break
                     if step_type == StepType.EXPLORE and not tool_name:
                         tool_name = EXPLORE_TOOL
+                    # ``explore`` is an internal pseudo-step, not an MCP call.
+                    if tool_name == EXPLORE_TOOL:
+                        step_type = StepType.EXPLORE
+                        server_id = SYSTEM_TOOLS_SERVER_ID
+                        server_name = SYSTEM_TOOLS_SERVER_NAME
 
                     # A TOOL step must name a real MCP tool. A small local model
                     # otherwise invents symbolic tools (e.g. 'provide_url',
@@ -2409,7 +2412,9 @@ Is this context relevant to the user's request?
                         server_name = srv.server_name
                         break
 
-            # Determine step type
+            # Determine step type. Built-in file/grep/bash tools run as
+            # ordinary TOOL steps against the local smartloop MCP server;
+            # only ``explore`` is an internal pseudo-step.
             step_type = StepType.TOOL
             if raw_step_type == "action":
                 step_type = StepType.ACTION
@@ -2417,10 +2422,20 @@ Is this context relevant to the user's request?
                 step_type = StepType.EXPLORE
             elif raw_step_type == "conversational":
                 step_type = StepType.CONVERSATIONAL
-            elif server_id == SYSTEM_TOOLS_SERVER_ID and tool_name in (
+            elif tool_name == EXPLORE_TOOL:
+                step_type = StepType.EXPLORE
+
+            # The built-in file/grep/bash tools are real MCP tools on the
+            # smartloop server — run them as TOOL steps even if the model
+            # mislabelled the step as "action".
+            if step_type == StepType.ACTION and tool_name in (
                 FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL,
             ):
-                step_type = StepType.ACTION
+                step_type = StepType.TOOL
+                server_id = SYSTEM_TOOLS_SERVER_ID
+                server_name = SYSTEM_TOOLS_SERVER_NAME
+            elif tool_name == EXPLORE_TOOL:
+                step_type = StepType.EXPLORE
 
             steps.append(PlanStep(
                 step=i + 1,
@@ -2662,19 +2677,11 @@ Is this context relevant to the user's request?
             return content, content
 
         # -- ACTION --
+        # Only the internal ``summarize`` kind remains here. The built-in
+        # file/grep/bash tools now run as TOOL steps through the smartloop
+        # MCP server (resolved/executed via the resolve+execute handlers).
         if step_type == StepType.ACTION:
             action_kind = step.action_kind or ""
-
-            if action_kind == "bash":
-                cmd = directive
-                if cmd.startswith("Run: "):
-                    cmd = cmd[5:]
-                try:
-                    content = self.file_ops.execute_bash([cmd], cwd=work_dir)
-                    return content, content
-                except Exception as e:
-                    logger.error(f"[step] bash action failed: {e}")
-                    return None
 
             if action_kind == "summarize":
                 # Collect raw context; the final streaming LLM handles reasoning.
@@ -2688,78 +2695,10 @@ Is this context relevant to the user's request?
                 logger.info(f"[step] summarize collected {len(raw)} chars of raw context")
                 return raw, raw
 
-            if action_kind in ("read", "write", "grep"):
-                args = self.file_ops.extract_builtin_args(tool_name, directive, previous_results=previous_results)
-                if args is None:
-                    return None
-
-                # Skip reading documents that are already vectorized —
-                # PDFs, DOCX, etc. are indexed and available via
-                # document_context (vector search).  Reading them raw
-                # would fail or produce garbled binary output.
-                _VECTORIZED_EXTS = (".pdf", ".docx", ".doc", ".pptx", ".xlsx")
-                if action_kind == "read":
-                    file_path = args.get("path", "") or args.get("file_path", "") or ""
-                    if any(file_path.lower().endswith(ext) for ext in _VECTORIZED_EXTS):
-                        logger.info(
-                            f"[step] Skipping file-read for '{file_path}' — "
-                            f"already vectorized, use document context instead"
-                        )
-                        # Return the document context if available so the
-                        # pipeline isn't starved of content.
-                        if document_context:
-                            return document_context[:3000], document_context[:3000]
-                        return None
-
-                try:
-                    if action_kind == "grep":
-                        content = self.file_ops.grep(args, work_dir)
-                    elif action_kind == "read":
-                        content = self.file_ops.read_file(args, work_dir, directive)
-                    elif action_kind == "write":
-                        content = self.file_ops.write_file(args, work_dir)
-                    else:
-                        return None
-                except Exception as e:
-                    logger.error(f"[step] action '{action_kind}' failed: {e}")
-                    return None
-                if content is None:
-                    return None
-                return content, content
-
             logger.warning(f"[step] Unknown action_kind: {action_kind}")
             return None
 
         # -- TOOL: Call external MCP tool --
-        _SYS_TOOL_TO_ACTION = {
-            FILE_WRITE_TOOL:    ("write",          StepType.ACTION),
-            FILE_READ_TOOL:     ("read",           StepType.ACTION),
-            GREP_TOOL:          ("grep",           StepType.ACTION),
-            BASH_TOOL:          ("bash",           StepType.ACTION),
-            EXPLORE_TOOL:       (None,             StepType.EXPLORE),
-        }
-        if tool_name in _SYS_TOOL_TO_ACTION and step.server_id != SYSTEM_TOOLS_SERVER_ID:
-            action_kind, corrected_type = _SYS_TOOL_TO_ACTION[tool_name]
-            logger.warning(
-                f"[step] '{tool_name}' assigned to MCP server '{step.server_name}' — "
-                f"redirecting to system tool (step_type={corrected_type.value})"
-            )
-            step.step_type = corrected_type
-            step.server_id = SYSTEM_TOOLS_SERVER_ID
-            step.server_name = SYSTEM_TOOLS_SERVER_NAME
-            step.action_kind = action_kind
-            return self._execute_step(
-                step=step,
-                user_message=user_message,
-                mcp_servers=mcp_servers,
-                available_servers=available_servers,
-                cwd=work_dir,
-                document_context=document_context,
-                previous_results=previous_results,
-                project_dir=project_dir,
-                model_service=model_service,
-            )
-
         server = None
         if step.server_id:
             server = self.tool_caller.find_server(mcp_servers, step.server_id, step.server_name)
@@ -3108,15 +3047,19 @@ Is this context relevant to the user's request?
             f"prior_results={len(previous_results or [])}"
         )
 
-        # Redirect system tools back to _execute_step
-        _SYS_TOOL_TO_ACTION = {
+        # Built-in tools live on the smartloop system server. If a plan
+        # mis-assigned one to another server, pin it back to smartloop so it
+        # resolves against the local MCP server like any other tool.
+        _SYSTEM_TOOLS = {
             FILE_WRITE_TOOL, FILE_READ_TOOL, GREP_TOOL, BASH_TOOL, EXPLORE_TOOL,
         }
-        if tool_name in _SYS_TOOL_TO_ACTION and step.server_id != SYSTEM_TOOLS_SERVER_ID:
-            logger.warning(
-                f"[resolve] '{tool_name}' is a system tool — cannot resolve as MCP tool"
+        if tool_name in _SYSTEM_TOOLS and step.server_id != SYSTEM_TOOLS_SERVER_ID:
+            logger.info(
+                f"[resolve] '{tool_name}' is a system tool — pinning to the "
+                f"smartloop server (was '{step.server_name}')"
             )
-            return None
+            step.server_id = SYSTEM_TOOLS_SERVER_ID
+            step.server_name = SYSTEM_TOOLS_SERVER_NAME
 
         # Find server
         server = None
@@ -3407,11 +3350,12 @@ Is this context relevant to the user's request?
                     arguments[dk] = dv
                     logger.info(f"[resolve] '{tool_name}' applying default: {dk}={dv}")
 
-        # Validate arguments
-        missing = arguments.pop('_missing_params', None)
-        if missing:
-            logger.info(f"[resolve] '{tool_name}' missing required params ({', '.join(missing)}); skipping")
-            return None
+        # Drop the extractor's bookkeeping key. The required-params check
+        # below re-derives what is actually missing and can still satisfy
+        # URL params deterministically from the directive — so we don't skip
+        # on the extractor's report alone (e.g. a fetch whose URL is stated
+        # in the instruction but which the LLM failed to extract).
+        arguments.pop('_missing_params', None)
 
         required_params = input_schema.get('required', [])
         properties = input_schema.get('properties', {})
@@ -3485,8 +3429,12 @@ Is this context relevant to the user's request?
         server: MCPServer,
         tool_name: str,
         arguments: Dict[str, Any],
+        cwd: Optional[str] = None,
     ) -> Optional[tuple]:
         """Call an MCP tool with pre-resolved arguments.
+
+        ``cwd`` is forwarded to local (stdio) servers so built-in system
+        tools resolve relative paths against the project work dir.
 
         Returns ``(formatted_content, raw_content)`` or ``None`` on failure.
         """
@@ -3496,7 +3444,7 @@ Is this context relevant to the user's request?
         logger.info(f"[execute] Calling '{tool_name}' with arguments: {arguments}")
         result = self.tool_caller.call_tool(
             server=server, tool_name=tool_name,
-            arguments=arguments, access_token=access_token,
+            arguments=arguments, access_token=access_token, cwd=cwd,
         )
 
         if not result.success and result.error and "401" in result.error and server_url:
@@ -3504,7 +3452,7 @@ Is this context relevant to the user's request?
             if new_token:
                 result = self.tool_caller.call_tool(
                     server=server, tool_name=tool_name,
-                    arguments=arguments, access_token=new_token,
+                    arguments=arguments, access_token=new_token, cwd=cwd,
                 )
 
         if not result.success:

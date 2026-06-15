@@ -562,19 +562,26 @@ class Planner:
     def _plan_action(
         self, classification: ClassificationResult, context: PlanContext,
     ) -> ExecutionPlan:
-        """Single built-in action step."""
+        """Single built-in system tool step.
+
+        System tools run as ordinary TOOL steps against the local
+        ``smartloop`` MCP server (like fetch).  Where the classifier already
+        extracted a concrete value (bash command, file path) it is carried as
+        ``default_args`` so resolution stays deterministic; otherwise the
+        argument extractor fills the args from the user message.
+        """
         action_kind = classification.action_kind or "read"
 
         if action_kind == "bash" and classification.bash_commands:
             cmd = classification.bash_commands[0]
             return ExecutionPlan(
                 steps=[PlanStep(
-                    step=1, step_type=StepType.ACTION,
-                    action_kind="bash",
+                    step=1, step_type=StepType.TOOL,
                     tool_name=BASH_TOOL,
                     server_id=SYSTEM_TOOLS_SERVER_ID,
                     server_name=SYSTEM_TOOLS_SERVER_NAME,
                     instruction=f"Run: {cmd}",
+                    default_args={"command": cmd},
                 )],
                 reasoning="bash command",
             )
@@ -583,12 +590,12 @@ class Planner:
             path = classification.detected_paths[0]
             return ExecutionPlan(
                 steps=[PlanStep(
-                    step=1, step_type=StepType.ACTION,
-                    action_kind="read",
+                    step=1, step_type=StepType.TOOL,
                     tool_name=FILE_READ_TOOL,
                     server_id=SYSTEM_TOOLS_SERVER_ID,
                     server_name=SYSTEM_TOOLS_SERVER_NAME,
                     instruction=f"Read the file {path}",
+                    default_args={"path": path},
                 )],
                 reasoning=f"read file: {path}",
             )
@@ -596,8 +603,7 @@ class Planner:
         if action_kind == "grep":
             return ExecutionPlan(
                 steps=[PlanStep(
-                    step=1, step_type=StepType.ACTION,
-                    action_kind="grep",
+                    step=1, step_type=StepType.TOOL,
                     tool_name=GREP_TOOL,
                     server_id=SYSTEM_TOOLS_SERVER_ID,
                     server_name=SYSTEM_TOOLS_SERVER_NAME,
@@ -606,11 +612,10 @@ class Planner:
                 reasoning="grep search",
             )
 
-        # Generic action fallback
+        # Generic system-tool fallback
         return ExecutionPlan(
             steps=[PlanStep(
-                step=1, step_type=StepType.ACTION,
-                action_kind=action_kind,
+                step=1, step_type=StepType.TOOL,
                 tool_name={
                     "read": FILE_READ_TOOL,
                     "write": FILE_WRITE_TOOL,
@@ -840,32 +845,31 @@ class Planner:
                 ))
             else:
                 steps.append(PlanStep(
-                    step=step_num, step_type=StepType.ACTION,
-                    action_kind="read",
+                    step=step_num, step_type=StepType.TOOL,
                     tool_name=FILE_READ_TOOL,
                     server_id=SYSTEM_TOOLS_SERVER_ID,
                     server_name=SYSTEM_TOOLS_SERVER_NAME,
                     instruction=f"Read the file {path}",
+                    default_args={"path": path},
                 ))
             step_num += 1
 
         # Bash blocks
         for cmd in classification.bash_commands:
             steps.append(PlanStep(
-                step=step_num, step_type=StepType.ACTION,
-                action_kind="bash",
+                step=step_num, step_type=StepType.TOOL,
                 tool_name=BASH_TOOL,
                 server_id=SYSTEM_TOOLS_SERVER_ID,
                 server_name=SYSTEM_TOOLS_SERVER_NAME,
                 instruction=f"Run: {cmd}",
+                default_args={"command": cmd},
             ))
             step_num += 1
 
         # Grep
         if classification.has_grep_intent:
             steps.append(PlanStep(
-                step=step_num, step_type=StepType.ACTION,
-                action_kind="grep",
+                step=step_num, step_type=StepType.TOOL,
                 tool_name=GREP_TOOL,
                 server_id=SYSTEM_TOOLS_SERVER_ID,
                 server_name=SYSTEM_TOOLS_SERVER_NAME,
@@ -884,8 +888,7 @@ class Planner:
             ))
             step_num += 1
             steps.append(PlanStep(
-                step=step_num, step_type=StepType.ACTION,
-                action_kind="write",
+                step=step_num, step_type=StepType.TOOL,
                 tool_name=FILE_WRITE_TOOL,
                 server_id=SYSTEM_TOOLS_SERVER_ID,
                 server_name=SYSTEM_TOOLS_SERVER_NAME,
@@ -946,16 +949,18 @@ class Planner:
                 continue
 
             raw_step_type = s.get("step_type", "")
-            # Backward compatibility: map old step_type values
+            # Backward compatibility: map old step_type values. System tools
+            # (read/write/grep/bash) now run as ordinary TOOL steps against
+            # the local smartloop MCP server, like fetch.
             step_type_map = {
                 "tool_call": StepType.TOOL,
                 "mcp": StepType.TOOL,
                 "conversation": StepType.CONVERSATIONAL,
                 "document": StepType.EXPLORE,
-                "read": StepType.ACTION,
-                "write": StepType.ACTION,
-                "grep": StepType.ACTION,
-                "bash": StepType.ACTION,
+                "read": StepType.TOOL,
+                "write": StepType.TOOL,
+                "grep": StepType.TOOL,
+                "bash": StepType.TOOL,
             }
 
             if raw_step_type in step_type_map:
@@ -978,34 +983,20 @@ class Planner:
                     and s.get("tool_name")):
                 step_type = StepType.TOOL
 
-            # Reverse correction: LLM said "tool" but the tool_name is a
-            # known system tool — correct to ACTION or EXPLORE so execution
-            # doesn't try to route through the MCP caller.
-            _SYS_TOOL_TYPE = {
-                EXPLORE_TOOL: StepType.EXPLORE,
-                FILE_READ_TOOL: StepType.ACTION,
-                FILE_WRITE_TOOL: StepType.ACTION,
-                GREP_TOOL: StepType.ACTION,
-                BASH_TOOL: StepType.ACTION,
-            }
+            # The built-in file/grep/bash tools resolve through the smartloop
+            # MCP server, so they run as TOOL steps pinned to that server —
+            # even if the model mislabelled the step as "action". Only
+            # ``explore`` is an internal pseudo-step.
             t_name = s.get("tool_name", "")
-            if step_type == StepType.TOOL and t_name in _SYS_TOOL_TYPE:
-                step_type = _SYS_TOOL_TYPE[t_name]
+            if t_name == EXPLORE_TOOL:
+                step_type = StepType.EXPLORE
+                t_server_id = SYSTEM_TOOLS_SERVER_ID
+            elif t_name in (FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL):
+                step_type = StepType.TOOL
                 t_server_id = SYSTEM_TOOLS_SERVER_ID
 
-            # Infer action_kind for action steps
+            # Infer action_kind for the remaining ACTION steps (summarize).
             action_kind = s.get("action_kind")
-            if step_type == StepType.ACTION and not action_kind:
-                if raw_step_type in ("read", "write", "grep", "bash"):
-                    action_kind = raw_step_type
-                else:
-                    tool_name = s.get("tool_name", "")
-                    action_kind = {
-                        FILE_READ_TOOL: "read",
-                        FILE_WRITE_TOOL: "write",
-                        GREP_TOOL: "grep",
-                        BASH_TOOL: "bash",
-                    }.get(tool_name, "summarize")
 
             steps.append(PlanStep(
                 step=s.get("step", i + 1),
@@ -1027,16 +1018,15 @@ class Planner:
 
     @staticmethod
     def _infer_step_type(tool_name: str, server_id: str) -> StepType:
-        """Derive ``StepType`` from ``tool_name`` and ``server_id``."""
-        if server_id != SYSTEM_TOOLS_SERVER_ID:
-            return StepType.TOOL
-        return {
-            "explore": StepType.EXPLORE,
-            FILE_READ_TOOL: StepType.ACTION,
-            FILE_WRITE_TOOL: StepType.ACTION,
-            GREP_TOOL: StepType.ACTION,
-            BASH_TOOL: StepType.ACTION,
-        }.get(tool_name, StepType.TOOL)
+        """Derive ``StepType`` from ``tool_name`` and ``server_id``.
+
+        ``explore`` is the only internal pseudo-step; the other built-in
+        tools (file/grep/bash) run as ordinary TOOL steps against the local
+        smartloop MCP server.
+        """
+        if tool_name == EXPLORE_TOOL:
+            return StepType.EXPLORE
+        return StepType.TOOL
 
 
 # ---------------------------------------------------------------------- #
