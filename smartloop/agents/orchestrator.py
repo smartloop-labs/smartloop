@@ -1551,7 +1551,7 @@ Is this context relevant to the user's request?
             tool_name=all_tool_names[-1],
             server_name=SYSTEM_TOOLS_SERVER_NAME,
             tool_names=all_tool_names,
-            citations=explore_citations,
+            citations=doc_citations,
         )
 
     @staticmethod
