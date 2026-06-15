@@ -66,8 +66,12 @@ class _OrchestratorContext(BaseModel):
     # Populated by handlers as they run:
     mcp_tool_contexts: list = Field(default_factory=list)
     parsed_skills: list = Field(default_factory=list)
-    # Stripped skill body text (set by route handler when skills match)
+    # Stripped skill body text (set by route handler when skills match).
+    # ``skill_context`` is the joined form (used downstream for instruction
+    # enrichment); ``skill_bodies`` keeps each matched skill separate so the
+    # planner can plan across multiple matched skills.
     skill_context: Optional[str] = None
+    skill_bodies: List[str] = Field(default_factory=list)
 
 class MCPExecutionResult(BaseModel):
     """Result of MCP tool orchestration."""
@@ -424,9 +428,10 @@ class SLPOrchestrator:
         enrich_ctx = deps[enrich_node.node_id].data.get("enrich_ctx")
 
         if matched_skills:
-            ctx.skill_context = "\n\n".join(
+            ctx.skill_bodies = [
                 self._strip_skill_frontmatter(s["content"]) for s in matched_skills
-            )
+            ]
+            ctx.skill_context = "\n\n".join(ctx.skill_bodies)
 
         extend_dag: List[tuple] = []
         parent: AgentNode = node
@@ -693,33 +698,48 @@ class SLPOrchestrator:
         Both paths produce a uniform ``List[PlanStep]`` that feeds into
         the same node builders and handlers — no branching downstream.
         """
+        plan_steps = self._derive_steps(ctx, search_ctx, enrich_ctx)
         if matched_skills:
-            plan_steps = self._derive_skill_steps(
-                matched_skills, ctx.mcp_tool_contexts, ctx.user_message,
-            )
             logger.info(
-                f"[skill] derived {len(plan_steps)} step(s): "
+                f"[skill] planned {len(plan_steps)} step(s): "
                 + " → ".join(f"{s.step_type.value}:{s.tool_name}" for s in plan_steps)
             )
-        else:
-            plan_steps = self._derive_prompt_steps(ctx, search_ctx, enrich_ctx)
 
         return self._build_step_nodes(
             ctx, plan_steps, search_ctx, parent=parent,
         )
 
-    def _derive_prompt_steps(
+    def _derive_steps(
         self,
         ctx: _OrchestratorContext,
         search_ctx: SearchContext,
         enrich_ctx: EnrichedContext,
     ) -> List[PlanStep]:
-        """Derive execution steps from the user prompt (no skill matched)."""
+        """Derive execution steps for any request through one pipeline.
+
+        Whether or not the prompt matched a skill, the request runs the
+        same classify → create_plan flow.  An LLM-matched skill is injected
+        as planning context — its instructions guide step generation — so
+        the planner produces and executes the skill's procedure, instead of
+        taking a separate derivation path.
+        """
         vector_context = search_ctx.vector_context
+
+        # The LLM skill-match already decided which skills (if any) the prompt
+        # maps to.  Feed each matched skill's stripped instructions to the
+        # planner as a distinct entry so it can plan across multiple matched
+        # skills and accumulate their outputs into the final result.  If
+        # nothing matched, plan from the user prompt alone — do NOT dump every
+        # workspace skill back in.
+        planner_skills = ctx.skill_bodies or None
+
+        # Planning is always driven by the user prompt's own classification.
+        # A matched skill only contributes guiding context (planner_skills) —
+        # it does not change the control flow.
         classification = self.planner.classify(
             ctx.user_message,
             mcp_tools=ctx.mcp_tool_contexts,
-            skills=ctx.skills,
+            skills=planner_skills,
             document_context=vector_context or ctx.document_context,
             has_attachments=ctx.has_attachments,
             history=enrich_ctx.history_insight,
@@ -757,7 +777,7 @@ class SLPOrchestrator:
         plan_context = self.planner.build_context(
             ctx.user_message, ctx.available_servers,
             cwd=ctx.effective_cwd,
-            skills=ctx.skills,
+            skills=planner_skills,
             document_context=vector_context or ctx.document_context,
         )
         plan = self.planner.create_plan(classification, plan_context)
@@ -1636,300 +1656,6 @@ Is this context relevant to the user's request?
             parts.append(f"WORKING DIRECTORY: {cwd}")
         return "\n\n".join(parts)
 
-    # ================================================================== #
-    # Skill pipeline helpers (kept for derive/fallback logic)             #
-    # ================================================================== #
-
-    def _derive_skill_steps(
-        self,
-        matched_skills: List[Dict[str, str]],
-        mcp_tool_contexts: List["MCPToolContext"],
-        user_message: str,
-    ) -> List[PlanStep]:
-        """Derive execution steps from skill content.
-
-        Priority order:
-        1. Explicit ``## skill_map`` section → parse directly
-        2. ``\u0060\u0060\u0060mcp`` blocks → deterministic tool steps
-        3. Natural language → LLM extracts steps
-
-        Always prepends an EXPLORE step (to gather document data) before
-        any tool steps, unless the skill_map already includes one.
-        ANALYZE is no longer a separate step — reasoning happens in
-        the reason node.
-        """
-        # Try explicit skill_map first
-        for sk in matched_skills:
-            skill_map = sk.get("skill_map", [])
-            if skill_map:
-                steps = self._skill_map_to_plan_steps(
-                    skill_map, sk["name"], mcp_tool_contexts,
-                )
-                if steps:
-                    logger.info(
-                        f"[skill] using explicit skill_map from '{sk['name']}' "
-                        f"({len(steps)} steps)"
-                    )
-                    return self._ensure_explore_and_analyze(steps)
-
-        # Try ```mcp blocks
-        for sk in matched_skills:
-            mcp_blocks = sk.get("mcp_blocks", [])
-            logger.info(
-                f"[skill] '{sk['name']}' has {len(mcp_blocks)} mcp_block(s)"
-            )
-            if mcp_blocks:
-                steps = self._mcp_blocks_to_plan_steps(
-                    mcp_blocks, sk["name"], mcp_tool_contexts,
-                )
-                if steps:
-                    logger.info(
-                        f"[skill] using mcp_blocks from '{sk['name']}' "
-                        f"({len(steps)} steps)"
-                    )
-                    return self._ensure_explore_and_analyze(steps)
-
-        # Fall back: LLM derives steps from skill natural language
-        return self._derive_steps_from_content(
-            matched_skills, mcp_tool_contexts, user_message,
-        )
-
-    def _derive_steps_from_content(
-        self,
-        matched_skills: List[Dict[str, str]],
-        mcp_tool_contexts: List["MCPToolContext"],
-        user_message: str,
-    ) -> List[PlanStep]:
-        """Use the LLM to derive execution steps from skill prose.
-
-        Asks the decision LLM to produce a simple step list, then
-        converts it to ``PlanStep`` objects.
-        """
-        skill_content = "\n\n".join(s["content"] for s in matched_skills)
-
-        # Build available tools list for the LLM
-        available_tools: List[str] = []
-        tool_server: Dict[str, tuple] = {}
-        for srv in mcp_tool_contexts:
-            for tool in srv.tools:
-                t_name = tool.get("name", "")
-                if t_name:
-                    available_tools.append(f"{t_name} (server: {srv.server_name})")
-                    if t_name not in tool_server:
-                        tool_server[t_name] = (srv.server_id, srv.server_name)
-
-        tools_section = "\n".join(f"  - {t}" for t in available_tools)
-
-        prompt = (
-            "<system>\n"
-            "You convert skill instructions into execution steps.\n"
-            "Return ONLY a JSON array. Each element must be an object with these keys:\n"
-            '  step_type: "explore" or "tool"\n'
-            "  tool: tool name (use exact names from the tools list)\n"
-            "  instruction: what this step does\n"
-            "  default_args: (optional) if the skill specifies fixed/default values "
-            "for tool arguments, include them as a flat JSON object\n"
-            "  for_each: (optional boolean) true if this tool should be called once per item "
-            "extracted from upstream results (e.g. 'for each ticker, call get_info')\n\n"
-            "Example output:\n"
-            '[{"step_type":"explore","tool":"explore","instruction":"Gather relevant data"},'
-            '{"step_type":"tool","tool":"create_item","instruction":"Create item with results",'
-            '"default_args":{"category":"bugs"},"for_each":true}]\n'
-            "</system>\n"
-            "<user>\n"
-            f"Skill instructions:\n{skill_content}\n\n"
-            f"Available tools:\n{tools_section}\n\n"
-            f"User request: {user_message}\n"
-            "</user>"
-        )
-
-        try:
-            response = str(self.agent_llm.invoke(prompt)).strip()
-            logger.info(f"[skill] LLM step derivation: {response[:200]}")
-
-            # Parse JSON from response
-            import json as _json
-            from json_repair import repair_json
-            json_match = re.search(r'\[.*\]', response, re.DOTALL)
-            if json_match:
-                # Small local models routinely emit slightly malformed JSON
-                # (missing comma/quote). Always repair before parsing so we
-                # keep the skill-derived steps instead of dropping to fallback.
-                raw_steps = _json.loads(repair_json(json_match.group()))
-                # Skip if the LLM returned a list of strings instead of objects
-                if raw_steps and not isinstance(raw_steps[0], dict):
-                    logger.info("[skill] LLM returned non-object steps, falling back")
-                    return self._fallback_skill_steps(matched_skills, mcp_tool_contexts)
-                steps: List[PlanStep] = []
-                for i, s in enumerate(raw_steps[:6]):
-                    step_type_str = s.get("step_type", "tool")
-                    step_type = {
-                        "explore": StepType.EXPLORE,
-                        "analyze": StepType.ANALYZE,
-                        "tool": StepType.TOOL,
-                        "action": StepType.ACTION,
-                    }.get(step_type_str, StepType.TOOL)
-
-                    tool_name = s.get("tool", "") or ""
-                    server_id = SYSTEM_TOOLS_SERVER_ID
-                    server_name = SYSTEM_TOOLS_SERVER_NAME
-                    if tool_name in tool_server:
-                        server_id, server_name = tool_server[tool_name]
-                    else:
-                        # Case-insensitive fallback
-                        for ts_name, ts_info in tool_server.items():
-                            if ts_name.lower() == tool_name.lower():
-                                tool_name = ts_name  # use canonical name
-                                server_id, server_name = ts_info
-                                break
-                        # LLM may provide server name hint
-                        if server_id == SYSTEM_TOOLS_SERVER_ID:
-                            llm_server = s.get("server", "")
-                            if llm_server:
-                                for srv in mcp_tool_contexts:
-                                    if (llm_server.lower() in srv.server_name.lower()
-                                            or srv.server_name.lower() in llm_server.lower()):
-                                        server_id = srv.server_id
-                                        server_name = srv.server_name
-                                        break
-                    if step_type == StepType.EXPLORE and not tool_name:
-                        tool_name = EXPLORE_TOOL
-                    # ``explore`` is an internal pseudo-step, not an MCP call.
-                    if tool_name == EXPLORE_TOOL:
-                        step_type = StepType.EXPLORE
-                        server_id = SYSTEM_TOOLS_SERVER_ID
-                        server_name = SYSTEM_TOOLS_SERVER_NAME
-
-                    # A TOOL step must name a real MCP tool. A small local model
-                    # otherwise invents symbolic tools (e.g. 'provide_url',
-                    # 'execute_fetch') that map to no MCP server and blow up at
-                    # resolve time. Skip them so we follow the actual skills +
-                    # MCP tools we have. EXPLORE/ANALYZE are internal pseudo-steps
-                    # and are exempt.
-                    if step_type == StepType.TOOL and tool_name not in tool_server:
-                        logger.info(
-                            f"[skill] dropping step with unknown tool '{tool_name}' "
-                            "(not in MCP catalogue)"
-                        )
-                        continue
-
-                    # LLM may provide fixed default args from skill body
-                    step_defaults = s.get("default_args")
-                    if step_defaults and not isinstance(step_defaults, dict):
-                        step_defaults = None
-
-                    steps.append(PlanStep(
-                        step=i + 1,
-                        step_type=step_type,
-                        tool_name=tool_name,
-                        server_id=server_id,
-                        server_name=server_name,
-                        instruction=s.get("instruction", ""),
-                        condition=s.get("condition"),
-                        default_args=step_defaults,
-                        for_each=s.get("for_each") or None,
-                    ))
-                # Renumber
-                for idx, s in enumerate(steps):
-                    s.step = idx + 1
-                if steps:
-                    return steps
-        except Exception as e:
-            logger.warning(f"[skill] LLM step derivation failed: {e}")
-
-        # Fallback: explore → tool calls
-        logger.info("[skill] falling back to default explore → tools")
-        return self._fallback_skill_steps(matched_skills, mcp_tool_contexts)
-
-    def _fallback_skill_steps(
-        self,
-        matched_skills: List[Dict[str, str]],
-        mcp_tool_contexts: List["MCPToolContext"],
-    ) -> List[PlanStep]:
-        """Build default skill steps: explore → tool calls."""
-        steps: List[PlanStep] = [
-            PlanStep(
-                step=1,
-                step_type=StepType.EXPLORE,
-                tool_name=EXPLORE_TOOL,
-                server_id=SYSTEM_TOOLS_SERVER_ID,
-                server_name=SYSTEM_TOOLS_SERVER_NAME,
-                instruction="Gather relevant document data.",
-            ),
-            PlanStep(
-                step=2,
-                step_type=StepType.ANALYZE,
-                tool_name=None,
-                server_id="",
-                server_name="",
-                instruction="Assess relevance of search results to user request.",
-            ),
-        ]
-
-        # Add tool steps — tool names come from the skill front matter
-        # (generated by the LLM at skill creation time) and are read by
-        # explorer.extract_tool_names().
-        tool_names = self.explorer.extract_tool_names(
-            matched_skills, mcp_tool_contexts,
-        )
-        tool_names = [t for t in tool_names if t != "fetch"]
-
-        tool_server: Dict[str, tuple] = {}
-        for srv in mcp_tool_contexts:
-            for tool in srv.tools:
-                t_name = tool.get("name", "")
-                if t_name and t_name not in tool_server:
-                    tool_server[t_name] = (srv.server_id, srv.server_name)
-
-        for i, tool_name in enumerate(tool_names):
-            sid, sname = tool_server.get(tool_name, ("", ""))
-            if not sid:
-                hint = self._find_server_hint_in_skills(matched_skills, tool_name)
-                if hint:
-                    for srv in mcp_tool_contexts:
-                        if (hint.lower() in srv.server_name.lower()
-                                or hint.lower() in srv.server_id.lower()):
-                            sid, sname = srv.server_id, srv.server_name
-                            break
-            # Extract default_args (key=value pairs) from skill text
-            defaults = self._extract_default_args_from_skills(
-                matched_skills, tool_name,
-            )
-            steps.append(PlanStep(
-                step=len(steps) + 1,
-                step_type=StepType.TOOL,
-                tool_name=tool_name,
-                server_id=sid,
-                server_name=sname,
-                instruction=f"Execute {tool_name}",
-                default_args=defaults if defaults else None,
-            ))
-
-        return steps
-
-    @staticmethod
-    def _ensure_explore_and_analyze(steps: List[PlanStep]) -> List[PlanStep]:
-        """Prepend an EXPLORE step when TOOL steps need upstream document data.
-
-        Skill steps form a linked list — each step sees the previous
-        step's output.  TOOL steps need the document context as an
-        explicit predecessor so their handlers receive it via
-        ``prev_results``.
-        """
-        has_tool = any(s.step_type == StepType.TOOL for s in steps)
-        has_explore = any(s.step_type == StepType.EXPLORE for s in steps)
-        if has_tool and not has_explore:
-            explore = PlanStep(
-                step=0,
-                step_type=StepType.EXPLORE,
-                tool_name=EXPLORE_TOOL,
-                instruction="Gather document data for downstream tool calls",
-            )
-            steps = [explore] + steps
-            for i, s in enumerate(steps):
-                s.step = i + 1
-        return steps
-
     def _extract_tool_condition_from_text(
         self,
         skill_text: str,
@@ -2370,203 +2096,6 @@ Is this context relevant to the user's request?
 
         # Unknown format — execute unconditionally
         return True
-
-
-    def _skill_map_to_plan_steps(
-        self,
-        skill_map: List[Dict[str, str]],
-        skill_name: str,
-        mcp_tool_contexts: List["MCPToolContext"],
-    ) -> List[PlanStep]:
-        """Convert a parsed skill_map into ``PlanStep`` objects.
-
-        Resolves tool names to server_ids from available MCP contexts.
-        """
-        # Build tool→server lookup
-        tool_server_map: Dict[str, tuple] = {}
-        for srv in mcp_tool_contexts:
-            for tool in srv.tools:
-                t_name = tool.get("name", "")
-                if t_name and t_name not in tool_server_map:
-                    tool_server_map[t_name] = (srv.server_id, srv.server_name)
-
-        steps: List[PlanStep] = []
-        for i, entry in enumerate(skill_map[:5]):
-            tool_name = entry.get("tool", "")
-            server_hint = entry.get("server", "")
-            instruction = entry.get("instruction", "")
-            condition = entry.get("condition") or None
-            raw_step_type = entry.get("step_type", "tool")
-
-            # Resolve server
-            server_id = SYSTEM_TOOLS_SERVER_ID
-            server_name = SYSTEM_TOOLS_SERVER_NAME
-            if tool_name in tool_server_map:
-                server_id, server_name = tool_server_map[tool_name]
-            elif server_hint:
-                # Try matching server hint against known servers
-                for srv in mcp_tool_contexts:
-                    if (server_hint.lower() in srv.server_name.lower()
-                            or server_hint.lower() in srv.server_id.lower()):
-                        server_id = srv.server_id
-                        server_name = srv.server_name
-                        break
-
-            # Determine step type. Built-in file/grep/bash tools run as
-            # ordinary TOOL steps against the local smartloop MCP server;
-            # only ``explore`` is an internal pseudo-step.
-            step_type = StepType.TOOL
-            if raw_step_type == "action":
-                step_type = StepType.ACTION
-            elif raw_step_type == "explore":
-                step_type = StepType.EXPLORE
-            elif raw_step_type == "conversational":
-                step_type = StepType.CONVERSATIONAL
-            elif tool_name == EXPLORE_TOOL:
-                step_type = StepType.EXPLORE
-
-            # The built-in file/grep/bash tools are real MCP tools on the
-            # smartloop server — run them as TOOL steps even if the model
-            # mislabelled the step as "action".
-            if step_type == StepType.ACTION and tool_name in (
-                FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL,
-            ):
-                step_type = StepType.TOOL
-                server_id = SYSTEM_TOOLS_SERVER_ID
-                server_name = SYSTEM_TOOLS_SERVER_NAME
-            elif tool_name == EXPLORE_TOOL:
-                step_type = StepType.EXPLORE
-
-            steps.append(PlanStep(
-                step=i + 1,
-                step_type=step_type,
-                tool_name=tool_name,
-                server_id=server_id,
-                server_name=server_name,
-                instruction=instruction,
-                condition=condition,
-                skill_name=skill_name,
-            ))
-
-        return steps
-
-    @staticmethod
-    def _mcp_blocks_to_plan_steps(
-        mcp_blocks: List[Dict],
-        skill_name: str,
-        mcp_tool_contexts: List["MCPToolContext"],
-    ) -> List[PlanStep]:
-        """Convert parsed ``\u0060\u0060\u0060mcp`` blocks into ``PlanStep`` objects.
-
-        Resolves each block's ``server_name`` against available MCP
-        servers (case-insensitive).  If the server or tool is not
-        found the block is skipped with a warning — no ``PlanStep``
-        is created.
-        """
-        steps: List[PlanStep] = []
-        for block in mcp_blocks:
-            srv_name = block["server_name"]
-            tool_name = block["tool_name"]
-
-            # Resolve server:
-            # 1. Exact name match
-            # 2. Substring match (skill ref contained in server name or id)
-            # 3. Tool-based fallback — find any server that exposes the tool
-            srv_ctx = None
-            srv_lower = srv_name.lower()
-            for srv in mcp_tool_contexts:
-                if srv.server_name.lower() == srv_lower:
-                    srv_ctx = srv
-                    break
-            if srv_ctx is None:
-                for srv in mcp_tool_contexts:
-                    if (srv_lower in srv.server_name.lower()
-                            or srv_lower in srv.server_id.lower()):
-                        srv_ctx = srv
-                        break
-            if srv_ctx is None:
-                # Fallback: find the server that actually has this tool.
-                # Allows skill authors to use short aliases (e.g. "yfmcp")
-                # regardless of the registered server name.
-                for srv in mcp_tool_contexts:
-                    if any(t.get("name", "") == tool_name for t in srv.tools):
-                        srv_ctx = srv
-                        logger.info(
-                            f"[mcp-block] Server alias '{srv_name}' unresolved — "
-                            f"matched via tool '{tool_name}' on '{srv.server_name}'"
-                        )
-                        break
-            if srv_ctx is None:
-                logger.warning(
-                    f"[mcp-block] Server '{srv_name}' not found and tool "
-                    f"'{tool_name}' not in any server — skipping"
-                )
-                continue
-
-            # Verify the tool exists on this server
-            tool_schema = None
-            for t in srv_ctx.tools:
-                if t.get("name", "") == tool_name:
-                    tool_schema = t
-                    break
-            if tool_schema is None:
-                logger.warning(
-                    f"[mcp-block] Tool '{tool_name}' not found on server "
-                    f"'{srv_ctx.server_name}' — skipping"
-                )
-                continue
-
-            # Validate default_args keys against the tool's input schema.
-            # Fix typos by fuzzy-matching against known property names;
-            # drop keys that don't match anything.
-            raw_defaults = block.get("default_args", {})
-            schema_props = (tool_schema.get("input_schema") or {}).get("properties", {})
-            validated_defaults: Dict[str, str] = {}
-            if raw_defaults and schema_props:
-                import difflib
-                prop_names = list(schema_props.keys())
-                for dk, dv in raw_defaults.items():
-                    if dk in schema_props:
-                        validated_defaults[dk] = dv
-                    else:
-                        matches = difflib.get_close_matches(
-                            dk, prop_names, n=1, cutoff=0.6,
-                        )
-                        if matches:
-                            best = matches[0]
-                            logger.info(
-                                f"[mcp-block] Corrected default arg "
-                                f"'{dk}' → '{best}' for {tool_name}"
-                            )
-                            validated_defaults[best] = dv
-                        else:
-                            logger.warning(
-                                f"[mcp-block] Default arg '{dk}' not in "
-                                f"{tool_name} schema — dropping"
-                            )
-            elif raw_defaults:
-                # No schema properties to validate against — keep as-is
-                validated_defaults = dict(raw_defaults)
-
-            inferred_desc = ", ".join(block["inferred_args"]) if block["inferred_args"] else ""
-            instruction = f"Call {tool_name}"
-            if inferred_desc:
-                instruction += f" (extract: {inferred_desc})"
-
-            steps.append(PlanStep(
-                step=len(steps) + 1,
-                step_type=StepType.TOOL,
-                tool_name=tool_name,
-                server_id=srv_ctx.server_id,
-                server_name=srv_ctx.server_name,
-                instruction=instruction,
-                skill_name=skill_name,
-                default_args=validated_defaults if validated_defaults else None,
-                inferred_args=block["inferred_args"] if block["inferred_args"] else None,
-                for_each=block.get("for_each") or None,
-            ))
-
-        return steps
 
     @staticmethod
     def _group_independent_steps(
@@ -3359,6 +2888,31 @@ Is this context relevant to the user's request?
 
         required_params = input_schema.get('required', [])
         properties = input_schema.get('properties', {})
+
+        # Deterministically fill a missing file-write `content` from the data
+        # accumulated by upstream steps.  The content to write IS the prior
+        # step output (fetched page, generated text, analysis report) — asking
+        # a small model to regurgitate a large blob back into a JSON string is
+        # unreliable and was leaving `content` empty, so the step got skipped.
+        # Passing the accumulated data through directly is the whole point of
+        # the fetch → generate → write chain.
+        if (tool_name == FILE_WRITE_TOOL
+                and 'content' in required_params
+                and not arguments.get('content')
+                and previous_results):
+            accumulated = "\n\n".join(
+                str(r.get('result', '')).strip()
+                for r in previous_results
+                if str(r.get('result', '')).strip()
+            )
+            if accumulated:
+                arguments['content'] = accumulated
+                logger.info(
+                    f"[resolve] '{tool_name}' filled 'content' from "
+                    f"{len(previous_results)} accumulated step result(s) "
+                    f"({len(accumulated)} chars)"
+                )
+
         still_missing = []
         for param_name in required_params:
             val = arguments.get(param_name)
