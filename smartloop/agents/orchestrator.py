@@ -107,7 +107,17 @@ class SLPOrchestrator:
 
     def _llm_for_tier(self, tier: ModelTier) -> BaseLLM:
         if tier == ModelTier.LARGE:
-            return self.large_llm
+            # Resolve (and lazily load) the large model only now that a step
+            # actually needs it.  Cache the instance so repeated LARGE steps
+            # don't re-probe.  Fall back to the small agent model when no large
+            # model is available or it didn't fit in VRAM.
+            if self.large_llm is None and self._large_llm_provider is not None:
+                try:
+                    self.large_llm = self._large_llm_provider()
+                except Exception as e:
+                    logger.warning("[models] large model load failed: %s", e)
+                    self.large_llm = None
+            return self.large_llm or self.agent_llm
         return self.agent_llm
 
     @staticmethod
@@ -127,13 +137,20 @@ class SLPOrchestrator:
         orchestrator_llm: BaseLLM,
         agent_llm: Optional[BaseLLM] = None,
         large_llm: Optional[BaseLLM] = None,
+        large_llm_provider: Optional[Callable[[], Optional[BaseLLM]]] = None,
         model_path: Optional[str] = None,
         project_id: Optional[str] = None,
         executor: Optional[LLMExecutor] = None,
     ):
         self.orchestrator_llm = orchestrator_llm
         self.agent_llm = agent_llm or orchestrator_llm
-        self.large_llm = large_llm or orchestrator_llm
+        # The large (agent) model is loaded lazily — only when a plan step is
+        # tagged ModelTier.LARGE (see _llm_for_tier).  ``large_llm_provider``
+        # loads-and-returns it on demand; ``large_llm`` is an already-resolved
+        # instance (tests / callers that pass one directly).  Either may be
+        # absent, in which case LARGE steps fall back to the small agent model.
+        self.large_llm = large_llm
+        self._large_llm_provider = large_llm_provider
         self.planner = Planner(self.agent_llm)
         self.arg_extractor = MCPArgumentExtractor(self.agent_llm)
         self.dep_analyzer = MCPDependencyAnalyzer()
@@ -179,7 +196,8 @@ class SLPOrchestrator:
             "[models] response=%s  agent=%s  large=%s",
             self._model_label(self.orchestrator_llm),
             self._model_label(self.agent_llm),
-            self._model_label(self.large_llm),
+            self._model_label(self.large_llm) if self.large_llm is not None
+            else "(lazy)" if self._large_llm_provider is not None else "(none)",
         )
         try:
             ctx = self._build_context(

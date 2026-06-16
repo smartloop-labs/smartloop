@@ -353,7 +353,15 @@ class Workspace(BaseModel):
 
     def resolve_gguf_path(self, model_id: str) -> str:
         """Cascade: quantize-matched bin GGUF → exact bin GGUF → exact workspace GGUF → first GGUF in model dir."""
-        ws_model = self.get_model()
+        # Honor the requested model_id for the bin_dir cascade (fall back to the
+        # active model) so resolving a non-active model — e.g. the small
+        # orchestrator model while a larger model is active — returns that
+        # model's GGUF, not the active one's.
+        ws_model = next((m for m in self.models if m.model_id == model_id), None)
+        if ws_model is not None:
+            ws_model.models_dir = self.models_dir
+        else:
+            ws_model = self.get_model()
         if ws_model and ws_model.bin_dir and os.path.isdir(ws_model.bin_dir):
             quantize = (ws_model.config.quantize if ws_model.config else "").upper()
             gguf_files = [f for f in os.listdir(ws_model.bin_dir) if f.endswith(".gguf")]

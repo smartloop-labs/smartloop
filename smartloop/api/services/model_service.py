@@ -95,6 +95,9 @@ class ModelService:
         self._decision_model_name: Optional[str] = None
         self._large_llm: Optional[BaseLLM] = None
         self._large_model_name: Optional[str] = None
+        # Set once the large model has been considered (loaded, skipped for
+        # fit, or absent), so we don't re-probe VRAM on every agent request.
+        self._large_model_attempted: bool = False
         # Shared, long-lived executor whose LLM worker processes load the
         # model once and are reused across requests (used for parallel
         # document fan-out).  Created lazily; reset on model load/unload.
@@ -194,10 +197,12 @@ class ModelService:
             developer_token=developer_token or api_settings.developer_token,
         ))
 
-        # Resolve: explicit arg → workspace active model → api_settings fallback
+        # Resolve: explicit arg → api_settings.default_model.  The orchestrator/
+        # main model is ALWAYS the small base model; the workspace's active
+        # selection only designates the on-demand large model, so we never
+        # resolve the loaded model from the active selection here.
         if not _model_name:
-            active = workspace.get_model()
-            _model_name = active.model_name if active else api_settings.default_model
+            _model_name = api_settings.default_model
 
         model_config = ModelConfig(
             model_name=_model_name,
@@ -276,9 +281,14 @@ class ModelService:
         """
         workspace = self._ensure_workspace()
         current_project = workspace.current_project
-        active = workspace.get_model()
-        target_model = (active.model_name if active else None) or api_settings.default_model
-        logger.info(f"[load_model] target={target_model}")
+        # The routing/main model is always the small base model
+        # (api_settings.default_model), independent of the workspace's active
+        # selection.  A larger active/downloaded model is loaded lazily as the
+        # on-demand LARGE agent model only when a plan step needs it (see
+        # _detect_large_model / _get_large_llm).  This keeps startup VRAM free
+        # for the small orchestrator model + its worker-pool copies.
+        target_model = api_settings.default_model
+        logger.info(f"[load_model] target={target_model} (orchestrator model)")
 
         # Return cached model if already loaded
         if self._llm is not None and self._model_name == target_model:
@@ -315,8 +325,12 @@ class ModelService:
 
         # Cache the GGUF path so the orchestrator can pass it to LLM worker
         # processes (each process needs to load its own model instance).
+        # Resolve the orchestrator model (target_model) explicitly rather than
+        # the workspace-active model, so the worker pool copies the small
+        # orchestrator model — not a larger active model that's meant to load
+        # lazily on demand.
         try:
-            ws_model = self._model.workspace.get_model()
+            ws_model = self._model.workspace.get_model(target_model)
             model_id = ws_model.model_id if ws_model else ""
             self._model_gguf_path = self._model.workspace.resolve_gguf_path(model_id)
         except Exception:
@@ -331,8 +345,14 @@ class ModelService:
         if _settings.decision_model and not self._decision_llm:
             self._load_decision_model(_settings.decision_model)
 
-        # Auto-detect largest downloaded model for skill/synthesis tasks
-        self._detect_large_model()
+        # The larger (e.g. 4B) agent model is loaded lazily on first agent use
+        # (see _get_large_llm) rather than eagerly here — it's only needed for
+        # agent/skill tasks, so deferring it keeps startup VRAM free for the
+        # main model + worker pool.  Reset the per-model attempt flag so the
+        # next agent request re-evaluates against the newly active model.
+        self._large_llm = None
+        self._large_model_name = None
+        self._large_model_attempted = False
 
         self._warmup_embeddings()
         self._warmup_inference()
@@ -362,23 +382,65 @@ class ModelService:
             self._decision_llm = None
             self._decision_model_name = None
 
-    def _detect_large_model(self) -> None:
-        """Auto-detect the largest downloaded model in the workspace.
+    def _get_large_llm(self) -> Optional[BaseLLM]:
+        """Return the large (agent) model, loading it lazily on first use.
 
-        If a model larger than the active one is available, load it for
-        skill execution and synthesis tasks.  The active (smaller) model
-        stays as the agent/routing LLM.
+        Loaded on demand — only when an agent task actually needs it — rather
+        than at startup, so the main model + worker pool own VRAM by default.
+        Attempted at most once per active model (``_large_model_attempted``):
+        if it loads it's cached; if it's absent or skipped for fit we return
+        ``None`` and the caller falls back to the main/decision model.
+        """
+        if self._large_llm is not None:
+            return self._large_llm
+        if self._large_model_attempted:
+            return None
+        self._large_model_attempted = True
+        self._detect_large_model()
+        return self._large_llm
+
+    @staticmethod
+    def _device_free_total_gb() -> Optional[tuple[float, float]]:
+        """Return (free_gb, total_gb) for the active accelerator, or None.
+
+        None on CPU (RAM is plentiful; no fit guard needed) or when the device
+        can't be queried.
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_b, total_b = torch.cuda.mem_get_info()
+                return free_b / 1024**3, total_b / 1024**3
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                import psutil
+                vm = psutil.virtual_memory()
+                return vm.available / 1024**3, vm.total / 1024**3
+        except Exception:
+            pass
+        return None
+
+    def _detect_large_model(self) -> None:
+        """Load the largest downloaded model for agent/skill tasks, if it fits.
+
+        Skips the load when the model's capped footprint won't fit in free
+        VRAM (after a reserve for the main model + worker pool), so loading the
+        large model never OOM-crashes the process or starves the workers.  The
+        active (smaller) model stays as the routing LLM.
         """
         if self._large_llm is not None:
             return
         try:
             workspace = self._model.workspace
-            active = workspace.active_model
-            active_size = active.param_size_b if active else 0
+            # Compare against the orchestrator model (the loaded small model),
+            # not the workspace-active model: the large model is whatever
+            # downloaded model is bigger than the orchestrator model (e.g. the
+            # user's active 4B).
+            orchestrator = workspace.get_model(self._model_name)
+            orchestrator_size = orchestrator.param_size_b if orchestrator else 0
             largest = workspace.largest_downloaded_model()
-            if not largest or largest.param_size_b <= active_size:
+            if not largest or largest.param_size_b <= orchestrator_size:
                 return
-            if largest.model_name == (active.model_name if active else ""):
+            if largest.model_name == self._model_name:
                 return
 
             model_dir = workspace.model_dir_for(largest.model_id)
@@ -392,18 +454,42 @@ class ModelService:
                 logger.info("[large-model] GGUF not found for %s, skipping", largest.model_name)
                 return
 
+            from smartloop.config.app_settings import AppSettings
+            _s = AppSettings()
+            cap = _s.llm_large_n_ctx_cap
+
+            # Fit guard: estimate the large model's capped footprint (weights +
+            # KV @ cap + per-process overhead) and skip if it won't fit in free
+            # VRAM after the reserve.  free VRAM already excludes the resident
+            # main model, so this is the room genuinely left for the agent model.
+            ft = self._device_free_total_gb()
+            if ft is not None:
+                free_gb, total_gb = ft
+                model_gb = os.path.getsize(gguf_path) / 1024**3
+                kv_gb = 0.5 * (cap / 4096)
+                footprint_gb = model_gb + kv_gb + 0.7
+                reserve_gb = _s.llm_large_fit_reserve_gb
+                if footprint_gb + reserve_gb > free_gb:
+                    logger.warning(
+                        "[large-model] %s needs ~%.1fGB (+%.1f reserve) but only "
+                        "%.1fGB free of %.1fGB — skipping; agent work uses the main "
+                        "model. Lower SLP_LLM_LARGE_N_CTX_CAP or free VRAM to enable it.",
+                        largest.model_name, footprint_gb, reserve_gb, free_gb, total_gb,
+                    )
+                    return
+
             logger.info(
-                "[large-model] Detected larger model: %s (%.0fB) > active %s (%.0fB) — %s",
+                "[large-model] Loading larger model on demand: %s (%.0fB) > router "
+                "%s (%.0fB), n_ctx<=%d — %s",
                 largest.model_name, largest.param_size_b,
-                active.model_name if active else "?", active_size,
-                gguf_path,
+                self._model_name or "?", router_size, cap, gguf_path,
             )
             from smartloop.llms.llm_factory import LlmFactory
             self._large_llm = LlmFactory.get_llama_cpp_instance(
-                gguf_path, logger, self.get_project_id() or "",
+                gguf_path, logger, self.get_project_id() or "", max_n_ctx=cap,
             )
             self._large_model_name = largest.model_name
-            logger.info("[large-model] Loaded %s for skill/synthesis tasks", largest.model_name)
+            logger.info("[large-model] Loaded %s for agent/skill tasks", largest.model_name)
         except Exception as e:
             logger.warning("[large-model] Failed to load larger model: %s", e)
             self._large_llm = None
@@ -2829,9 +2915,14 @@ class ModelService:
 
         try:
             orchestrator = SLPOrchestrator(
+                # Small (1B) model drives routing/orchestration and the default
+                # (SMALL-tier) agent work.  The larger model is loaded lazily —
+                # only when a plan step is tagged ModelTier.LARGE — via the
+                # provider below, and falls back to the small model if it's
+                # absent or won't fit in VRAM.
                 orchestrator_llm=self._llm,
                 agent_llm=self._decision_llm or self._llm,
-                large_llm=self._large_llm,
+                large_llm_provider=self._get_large_llm,
                 model_path=getattr(self, '_model_gguf_path', None),
                 project_id=self.get_project_id(),
                 executor=self._get_llm_executor(),
