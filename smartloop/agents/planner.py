@@ -90,6 +90,10 @@ class ClassificationResult(BaseModel):
     action_kind: Optional[str] = None
     has_document_context: bool = False
     reasoning: str = ""
+    capability: Optional[str] = Field(
+        default=None,
+        description="Best-matching model capability for this request (e.g. coding, finance, vision)",
+    )
 
 
 class PlanStep(BaseModel):
@@ -139,6 +143,10 @@ class PlanStep(BaseModel):
     model_tier: ModelTier = Field(
         default=ModelTier.SMALL,
         description="Which model tier this step should run on",
+    )
+    capability: Optional[str] = Field(
+        default=None,
+        description="Requested model capability for this step (e.g. coding, finance, vision)",
     )
 
 
@@ -218,6 +226,7 @@ class Planner:
         has_attachments: bool = False,
         history: Optional[str] = None,
         cwd: Optional[str] = None,
+        available_capabilities: Optional[List[str]] = None,
     ) -> ClassificationResult:
         """Classify user intent into one of the ``IntentType`` categories.
 
@@ -239,12 +248,40 @@ class Planner:
                 f"write={result.has_write_intent}, grep={result.has_grep_intent}, "
                 f"bash={len(result.bash_commands)})"
             )
-            return result
+        else:
+            # Tier 2: LLM fallback
+            result = self._llm_classify(user_message, mcp_tools, skills, history, result)
+            logger.info(f"[classify] LLM → {result.intent.value}: {result.reasoning}")
 
-        # Tier 2: LLM fallback
-        result = self._llm_classify(user_message, mcp_tools, skills, history, result)
-        logger.info(f"[classify] LLM → {result.intent.value}: {result.reasoning}")
+        if available_capabilities:
+            result.capability = self._match_capability(user_message, available_capabilities)
+            if result.capability:
+                logger.info(f"[classify] capability → {result.capability}")
+
         return result
+
+    @staticmethod
+    def _match_capability(user_message: str, capabilities: List[str]) -> Optional[str]:
+        """Match the user message to the best available capability via keyword overlap."""
+        msg_lower = user_message.lower()
+        _CAPABILITY_KEYWORDS: Dict[str, List[str]] = {
+            "coding": ["code", "program", "function", "bug", "debug", "compile", "syntax", "refactor", "implement", "class", "method"],
+            "finance": ["finance", "stock", "price", "invest", "portfolio", "dividend", "revenue", "profit", "budget", "expense", "accounting"],
+            "vision": ["image", "photo", "picture", "visual", "diagram", "screenshot", "chart", "graph", "draw", "render"],
+            "writing": ["write", "essay", "article", "blog", "story", "draft", "edit", "proofread", "summarize", "translate"],
+            "math": ["math", "calculate", "equation", "formula", "algebra", "geometry", "statistics", "probability"],
+            "science": ["science", "physics", "chemistry", "biology", "experiment", "hypothesis", "research"],
+        }
+        best_cap = None
+        best_score = 0
+        for cap in capabilities:
+            cap_lower = cap.lower()
+            keywords = _CAPABILITY_KEYWORDS.get(cap_lower, [cap_lower])
+            score = sum(1 for kw in keywords if kw in msg_lower)
+            if score > best_score:
+                best_score = score
+                best_cap = cap
+        return best_cap if best_score > 0 else None
 
     def _detect_signals(
         self,

@@ -74,6 +74,7 @@ class _OrchestratorContext(BaseModel):
     # planner can plan across multiple matched skills.
     skill_context: Optional[str] = None
     skill_bodies: List[str] = Field(default_factory=list)
+    available_capabilities: List[str] = Field(default_factory=list)
 
 class MCPExecutionResult(BaseModel):
     """Result of MCP tool orchestration."""
@@ -105,12 +106,19 @@ class SLPOrchestrator:
     # nothing is dropped.
     DOC_FANOUT_THRESHOLD = 2
 
-    def _llm_for_tier(self, tier: ModelTier) -> BaseLLM:
+    def _llm_for_tier(self, tier: ModelTier, capability: Optional[str] = None) -> BaseLLM:
         if tier == ModelTier.LARGE:
-            # Resolve (and lazily load) the large model only now that a step
-            # actually needs it.  Cache the instance so repeated LARGE steps
-            # don't re-probe.  Fall back to the small agent model when no large
-            # model is available or it didn't fit in VRAM.
+            if capability and self._capability_llm_provider is not None:
+                cached = self._capability_cache.get(capability)
+                if cached is not None:
+                    return cached
+                try:
+                    llm = self._capability_llm_provider(capability)
+                    if llm is not None:
+                        self._capability_cache[capability] = llm
+                        return llm
+                except Exception as e:
+                    logger.warning("[models] capability model load failed (%s): %s", capability, e)
             if self.large_llm is None and self._large_llm_provider is not None:
                 try:
                     self.large_llm = self._large_llm_provider()
@@ -138,19 +146,17 @@ class SLPOrchestrator:
         agent_llm: Optional[BaseLLM] = None,
         large_llm: Optional[BaseLLM] = None,
         large_llm_provider: Optional[Callable[[], Optional[BaseLLM]]] = None,
+        capability_llm_provider: Optional[Callable[[str], Optional[BaseLLM]]] = None,
         model_path: Optional[str] = None,
         project_id: Optional[str] = None,
         executor: Optional[LLMExecutor] = None,
     ):
         self.orchestrator_llm = orchestrator_llm
         self.agent_llm = agent_llm or orchestrator_llm
-        # The large (agent) model is loaded lazily — only when a plan step is
-        # tagged ModelTier.LARGE (see _llm_for_tier).  ``large_llm_provider``
-        # loads-and-returns it on demand; ``large_llm`` is an already-resolved
-        # instance (tests / callers that pass one directly).  Either may be
-        # absent, in which case LARGE steps fall back to the small agent model.
         self.large_llm = large_llm
         self._large_llm_provider = large_llm_provider
+        self._capability_llm_provider = capability_llm_provider
+        self._capability_cache: Dict[str, BaseLLM] = {}
         self.planner = Planner(self.agent_llm)
         self.arg_extractor = MCPArgumentExtractor(self.agent_llm)
         self.dep_analyzer = MCPDependencyAnalyzer()
@@ -189,6 +195,7 @@ class SLPOrchestrator:
         project_dir: Optional[str] = None,
         model_service: Optional[Any] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        available_capabilities: Optional[List[str]] = None,
     ) -> MCPExecutionResult:
         """Top-level entry point: plan → run → reason."""
         self._skill_report = None
@@ -210,6 +217,7 @@ class SLPOrchestrator:
                 project_dir=project_dir,
                 model_service=model_service,
                 conversation_history=conversation_history,
+                available_capabilities=available_capabilities,
             )
             dag, handlers = self.plan(ctx)
             results = self.run(ctx, dag, handlers)
@@ -230,6 +238,7 @@ class SLPOrchestrator:
         project_dir: Optional[str] = None,
         model_service: Optional[Any] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        available_capabilities: Optional[List[str]] = None,
     ) -> _OrchestratorContext:
         """Build the shared orchestrator context from input parameters."""
         available_servers = self._build_available_servers(mcp_servers)
@@ -266,6 +275,7 @@ class SLPOrchestrator:
             has_attachments=has_attachments,
             mcp_tool_contexts=mcp_tool_contexts,
             enriched=enriched,
+            available_capabilities=list(available_capabilities or []),
         )
 
     def plan(self, ctx: _OrchestratorContext) -> tuple:
@@ -806,6 +816,7 @@ class SLPOrchestrator:
             has_attachments=ctx.has_attachments,
             history=enrich_ctx.history_insight,
             cwd=ctx.effective_cwd,
+            available_capabilities=ctx.available_capabilities or None,
         )
 
         if classification.intent == IntentType.CONVERSATION:
@@ -857,11 +868,15 @@ class SLPOrchestrator:
             if mcp_steps:
                 plan.steps.extend(mcp_steps)
 
+        detected_capability = classification.capability
         for step in plan.steps:
             if has_skill and step.step_type == StepType.TOOL:
                 step.model_tier = ModelTier.LARGE
+                step.capability = detected_capability or "skills"
             else:
                 step.model_tier = ModelTier.SMALL
+                if detected_capability:
+                    step.capability = detected_capability
 
         return plan.steps
 
@@ -1054,7 +1069,7 @@ Assess whether these search results are relevant to the user's request. If relev
 </user>"""
 
                 try:
-                    step_llm = self._llm_for_tier(step.model_tier)
+                    step_llm = self._llm_for_tier(step.model_tier, step.capability)
                     result = str(step_llm.invoke(analyze_prompt)).strip()
                     if result == "NOT_RELEVANT" or len(result) < 20:
                         logger.info("[analyze] context deemed not relevant — passing through raw")
@@ -1125,10 +1140,12 @@ Assess whether these search results are relevant to the user's request. If relev
         Works uniformly for both skill-derived and prompt-derived steps.
         Uses ``ctx.skill_context`` for condition extraction when available.
         """
-        step_llm = self._llm_for_tier(step.model_tier)
+        step_llm = self._llm_for_tier(step.model_tier, step.capability)
         logger.info(
-            "[models] RESOLVE(%s) → %s: %s",
-            step.tool_name, step.model_tier.value, self._model_label(step_llm),
+            "[models] RESOLVE(%s) → %s%s: %s",
+            step.tool_name, step.model_tier.value,
+            f"/{step.capability}" if step.capability else "",
+            self._model_label(step_llm),
         )
         def handler(deps: Dict) -> NodeResult:
             prev_results = self._collect_raw_from_deps(deps)

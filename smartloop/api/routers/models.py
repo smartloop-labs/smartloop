@@ -194,3 +194,70 @@ async def list_models():
         return client.list_models()
     except ConnectionError:
         raise HTTPException(status_code=502, detail="Platform API unavailable")
+
+
+class WorkspaceModelEntry(BaseModel):
+    model_name: str
+    model_id: str
+    downloaded: bool
+    is_active: bool
+    enabled: bool
+    capabilities: list[str] = []
+
+
+@router.get("/models/workspace", response_model=list[WorkspaceModelEntry])
+async def list_workspace_models(
+    model_service: ModelService = Depends(get_model_service),
+):
+    """List models registered in the local workspace."""
+    try:
+        workspace = model_service._ensure_workspace()
+        return [
+            WorkspaceModelEntry(
+                model_name=m.model_name,
+                model_id=m.model_id,
+                downloaded=m.downloaded,
+                is_active=m.is_active,
+                enabled=m.enabled,
+                capabilities=m.effective_capabilities,
+            )
+            for m in workspace.models
+        ]
+    except Exception as e:
+        logger.exception("Error listing workspace models")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class _UpdateWorkspaceModelRequest(BaseModel):
+    enabled: bool | None = None
+    capabilities: list[str] | None = None
+
+
+@router.patch("/models/workspace/{model_name}")
+async def update_workspace_model(
+    model_name: str,
+    request: _UpdateWorkspaceModelRequest,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Update a workspace model's enabled state and/or capabilities."""
+    try:
+        workspace = model_service._ensure_workspace()
+        model = workspace.get_model(model_name)
+        if model is None:
+            raise ValueError(f"Model not found: {model_name}")
+        if request.enabled is not None:
+            model.enabled = request.enabled
+        if request.capabilities is not None:
+            model.capabilities = request.capabilities
+        workspace.save()
+        return {
+            "status": "ok",
+            "model_name": model_name,
+            "enabled": model.enabled,
+            "capabilities": model.capabilities,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error updating workspace model")
+        raise HTTPException(status_code=500, detail=str(e))

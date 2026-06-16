@@ -399,6 +399,61 @@ class ModelService:
         self._detect_large_model()
         return self._large_llm
 
+    def _get_llm_for_capability(self, capability: str) -> Optional[BaseLLM]:
+        """Return a loaded LLM matching the requested capability.
+
+        Uses ``workspace.best_model_for(capability)`` to find the best
+        enabled model that declares the capability.  Loads the GGUF
+        lazily and caches the result.  Returns ``None`` when no matching
+        model is available (caller should fall back to the default large
+        model).
+        """
+        if not self._model or not self._model.workspace:
+            return None
+        workspace = self._model.workspace
+        ws_model = workspace.best_model_for(capability)
+        if not ws_model:
+            return None
+        cap_lower = capability.lower()
+        if cap_lower not in [c.lower() for c in ws_model.effective_capabilities]:
+            return None
+
+        cache_key = f"_cap_llm_{ws_model.model_name}"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            return cached
+
+        try:
+            model_dir = workspace.model_dir_for(ws_model.model_id)
+            gguf_path = None
+            if os.path.isdir(model_dir):
+                for f in os.listdir(model_dir):
+                    if f.endswith(".gguf"):
+                        gguf_path = os.path.join(model_dir, f)
+                        break
+            if not gguf_path:
+                return None
+
+            from smartloop.config.app_settings import AppSettings
+            _s = AppSettings()
+            from smartloop.llms.llm_factory import LlmFactory
+            llm = LlmFactory.get_llama_cpp_instance(
+                gguf_path, logger, self.get_project_id() or "",
+                max_n_ctx=_s.llm_large_n_ctx_cap,
+            )
+            setattr(self, cache_key, llm)
+            logger.info(
+                "[capability-model] Loaded %s for capability '%s'",
+                ws_model.model_name, capability,
+            )
+            return llm
+        except Exception as e:
+            logger.warning(
+                "[capability-model] Failed to load %s for capability '%s': %s",
+                ws_model.model_name, capability, e,
+            )
+            return None
+
     @staticmethod
     def _device_free_total_gb() -> Optional[tuple[float, float]]:
         """Return (free_gb, total_gb) for the active accelerator, or None.
@@ -1313,8 +1368,9 @@ class ModelService:
             "<user>\n"
             "Generate a JSON object with:\n"
             '- "name": 1-2 word lowercase hyphen-separated identifier derived from the input.\n'
-            '- "description": one sentence starting with "Use when the user" that '
-            "describes when this skill should be triggered and what it does.\n"
+            '- "description": one sentence in the format "When the user asks to <action>, '
+            '<what this skill does>." that clearly describes when this skill should be '
+            "selected and what it accomplishes.\n"
             '- "body": expand the input into clear, structured skill instructions. '
             "Preserve all specific values mentioned. Do NOT invent facts.\n"
             + mcp_field
@@ -1322,9 +1378,10 @@ class ModelService:
             "</user>"
         )
 
+        skill_llm = self._get_large_llm() or self._llm
         try:
             with self._inference_lock:
-                raw = str(self._llm.invoke(prompt)).strip()
+                raw = str(skill_llm.invoke(prompt)).strip()
             logger.info("Skill metadata LLM response: %s", raw[:200])
 
             # Strip markdown fences
@@ -2915,18 +2972,21 @@ class ModelService:
 
         try:
             orchestrator = SLPOrchestrator(
-                # Small (1B) model drives routing/orchestration and the default
-                # (SMALL-tier) agent work.  The larger model is loaded lazily —
-                # only when a plan step is tagged ModelTier.LARGE — via the
-                # provider below, and falls back to the small model if it's
-                # absent or won't fit in VRAM.
                 orchestrator_llm=self._llm,
                 agent_llm=self._decision_llm or self._llm,
                 large_llm_provider=self._get_large_llm,
+                capability_llm_provider=self._get_llm_for_capability,
                 model_path=getattr(self, '_model_gguf_path', None),
                 project_id=self.get_project_id(),
                 executor=self._get_llm_executor(),
             )
+            workspace = self._model.workspace
+            caps: list[str] = []
+            for m in workspace.models:
+                if m.enabled and m.downloaded:
+                    caps.extend(m.effective_capabilities)
+            available_capabilities = list(dict.fromkeys(caps))
+
             result = orchestrator.execute(
                 user_message, eligible_servers,
                 skills=skill_contents, cwd=cwd,
@@ -2934,6 +2994,7 @@ class ModelService:
                 project_dir=visible_project_dir,
                 model_service=self,
                 conversation_history=conversation_history,
+                available_capabilities=available_capabilities or None,
             )
 
             # Save workspace in case tokens were refreshed during the call

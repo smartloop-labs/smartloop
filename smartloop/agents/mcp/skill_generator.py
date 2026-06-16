@@ -39,7 +39,7 @@ class MCPSkillGenerator:
 
         skill = GeneratedSkill(
             name=server.name,
-            description=f"Use this skill to identify {server.name} tools for a user request.",
+            description=f"When the user asks to interact with {server.name}, identify and invoke the matching tools.",
             content=content,
         )
 

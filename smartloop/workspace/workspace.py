@@ -135,6 +135,8 @@ class WorkspaceModel(BaseModel):
     model_id: str          # HF id e.g. "google/gemma-3-1b-it"
     downloaded: bool = False
     is_active: bool = False
+    enabled: bool = True
+    capabilities: List[str] = Field(default_factory=list)
     config: Optional[ModelConfig] = None
     models_dir: str = Field(default="", exclude=True)
 
@@ -171,6 +173,33 @@ class WorkspaceModel(BaseModel):
             if m:
                 return float(m.group(1))
         return 0.0
+
+    @property
+    def effective_capabilities(self) -> List[str]:
+        """Return capabilities: user-set if present, otherwise inferred from model metadata."""
+        if self.capabilities:
+            return self.capabilities
+        return self._infer_capabilities()
+
+    def _infer_capabilities(self) -> List[str]:
+        import re
+        combined = f"{self.model_name} {self.model_id}".lower()
+        caps: List[str] = []
+        size = self.param_size_b
+
+        if any(kw in combined for kw in ("code", "coder", "starcoder", "deepseek-coder")):
+            caps.append("coding")
+
+        if any(kw in combined for kw in ("vision", "vlm", "vl")):
+            caps.append("vision")
+        elif not re.search(r"[-_]text", combined) and "gemma" in combined and size >= 4:
+            caps.append("vision")
+
+        if size >= 3:
+            caps.append("skills")
+
+        caps.append("general")
+        return caps
 
 class Skill(BaseModel):
     id: str
@@ -289,6 +318,14 @@ class Workspace(BaseModel):
         for m in self.models:
             m.is_active = (m.model_name == model_name)
 
+    def set_model_enabled(self, model_name: str, enabled: bool) -> None:
+        """Enable or disable a model. Raises ValueError if not found."""
+        for m in self.models:
+            if m.model_name == model_name:
+                m.enabled = enabled
+                return
+        raise ValueError(f"Model not found: {model_name}")
+
     def get_model(self, model_name: Optional[str] = None) -> Optional[WorkspaceModel]:
         """Look up a registered model by its short name.
 
@@ -334,10 +371,30 @@ class Workspace(BaseModel):
         return entry
 
     def largest_downloaded_model(self) -> Optional[WorkspaceModel]:
-        """Return the largest downloaded model by parameter count, or None."""
-        candidates = [m for m in self.models if m.downloaded and m.param_size_b > 0]
+        """Return the largest enabled, downloaded model by parameter count, or None."""
+        candidates = [m for m in self.models if m.enabled and m.downloaded and m.param_size_b > 0]
         if not candidates:
             return None
+        candidates.sort(key=lambda m: m.param_size_b, reverse=True)
+        best = candidates[0]
+        best.models_dir = self.models_dir
+        return best
+
+    def best_model_for(self, capability: str) -> Optional[WorkspaceModel]:
+        """Return the best enabled, downloaded model matching a capability.
+
+        Prefers the largest model that declares the capability (user-set
+        or inferred). Falls back to ``largest_downloaded_model`` when no
+        model matches.
+        """
+        cap = capability.lower()
+        candidates = [
+            m for m in self.models
+            if m.enabled and m.downloaded and m.param_size_b > 0
+            and cap in [c.lower() for c in m.effective_capabilities]
+        ]
+        if not candidates:
+            return self.largest_downloaded_model()
         candidates.sort(key=lambda m: m.param_size_b, reverse=True)
         best = candidates[0]
         best.models_dir = self.models_dir
