@@ -74,7 +74,8 @@ class LlamaCpp(BaseLLM[Llama]):
     ) -> str:
         """Run the LLM on the given input."""
         start_time = time.time()
-        print('Generating Text response', start_time)
+        prompt_tokens = self.get_num_tokens(prompt)
+        self.logger.info(f"Generating response | prompt_tokens={prompt_tokens}")
 
         try:
             messages = self.create_messages_from_prompt(prompt)
@@ -83,17 +84,24 @@ class LlamaCpp(BaseLLM[Llama]):
                 messages=messages,
                 max_tokens=available_tokens,
                 temperature=self.temperature,
-                repeat_penalty=1.2,  # Reduce repetition (correct parameter name)
-                frequency_penalty=0.1,   # Reduce frequency of repeated tokens
-                presence_penalty=0.1,    # Reduce presence of repeated tokens
+                repeat_penalty=1.2,
+                frequency_penalty=0.1,
+                presence_penalty=0.1,
                 stream=False
             )
-            print('Completed', (time.time() - start_time) / 60)
+            elapsed = time.time() - start_time
+            usage = output.get('usage', {})
+            completion_tokens = usage.get('completion_tokens', 0)
+            self.logger.info(
+                f"Completed | completion_tokens={completion_tokens} "
+                f"elapsed={elapsed:.3f}s"
+            )
             return re.sub(r'[\t]+', "", output['choices'][0]['message']['content'].strip())
         except Exception as ex:
-            print(ex)
+            self.logger.error(f"Generation failed: {ex}")
         finally:
-            print('Total Time taken', (time.time() - start_time) / 60)
+            elapsed = time.time() - start_time
+            self.logger.info(f"Total elapsed={elapsed:.3f}s")
 
         return ""
 
@@ -160,9 +168,8 @@ class LlamaCpp(BaseLLM[Llama]):
 
                 yield generation_chunk
 
-        # Debug: print if no chunks were processed
         if chunk_count == 0:
-            print("Warning: No chunks received from stream")
+            self.logger.warning("No chunks received from stream")
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:
@@ -201,7 +208,7 @@ class LlamaCpp(BaseLLM[Llama]):
             return cleaned_response if cleaned_response else "No response generated"
 
         except Exception as e:
-            print(f"Error during LLM invocation: {e}")
+            self.logger.error(f"LLM invocation failed: {e}")
             return f"Error generating response: {str(e)}"
 
     def _apply_chat_template(self, messages: list) -> list:
