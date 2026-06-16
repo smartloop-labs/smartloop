@@ -182,18 +182,38 @@ class ModelEntry(BaseModel):
     description: str | None = None
     access_level: str | None = None
     is_accessible: bool = False
+    enabled: bool = True
+    capabilities: list[str] = []
 
 
 @router.get("/models", response_model=list[ModelEntry])
-async def list_models():
-    """List available models from the cloud API."""
+async def list_models(
+    model_service: ModelService = Depends(get_model_service),
+):
+    """List available models from the cloud API, enriched with workspace state."""
     settings = AppSettings()
     client = SLPPlatformClient(settings.slp_api_base)
 
     try:
-        return client.list_models()
+        models = client.list_models()
     except ConnectionError:
         raise HTTPException(status_code=502, detail="Platform API unavailable")
+
+    try:
+        workspace = model_service._ensure_workspace()
+        ws_lookup = {m.model_name: m for m in workspace.models}
+    except Exception:
+        ws_lookup = {}
+
+    result = []
+    for m in models:
+        entry = ModelEntry(**m) if isinstance(m, dict) else m
+        ws_model = ws_lookup.get(entry.name)
+        if ws_model:
+            entry.enabled = ws_model.enabled
+            entry.capabilities = ws_model.effective_capabilities
+        result.append(entry)
+    return result
 
 
 class WorkspaceModelEntry(BaseModel):
