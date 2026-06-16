@@ -1070,6 +1070,12 @@ Assess whether these search results are relevant to the user's request. If relev
 
                 try:
                     step_llm = self._llm_for_tier(step.model_tier, step.capability)
+                    logger.info(
+                        "[models] ANALYZE(%s) → %s%s: %s",
+                        step.step, step.model_tier.value,
+                        f"/{step.capability}" if step.capability else "",
+                        self._model_label(step_llm),
+                    )
                     result = str(step_llm.invoke(analyze_prompt)).strip()
                     if result == "NOT_RELEVANT" or len(result) < 20:
                         logger.info("[analyze] context deemed not relevant — passing through raw")
@@ -1103,9 +1109,13 @@ Assess whether these search results are relevant to the user's request. If relev
                     condition=step.condition,
                 )
 
+            exec_llm = self._llm_for_tier(step.model_tier, step.capability)
             logger.info(
-                f"[step] {step.step} [{step.step_type.value}] "
-                f"{step.server_name}/{step.tool_name}: {step.instruction}"
+                "[models] EXEC(%s/%s) → %s%s: %s",
+                step.step, step.step_type.value,
+                step.model_tier.value,
+                f"/{step.capability}" if step.capability else "",
+                self._model_label(exec_llm),
             )
 
             result = self._execute_step(
@@ -1118,6 +1128,7 @@ Assess whether these search results are relevant to the user's request. If relev
                 document_context=ctx.document_context,
                 project_dir=ctx.project_dir,
                 model_service=ctx.model_service,
+                llm=exec_llm,
             )
 
             if result:
@@ -1182,6 +1193,7 @@ Assess whether these search results are relevant to the user's request. If relev
                 available_servers=ctx.available_servers,
                 cwd=ctx.effective_cwd,
                 previous_results=prev_results if prev_results else None,
+                llm=step_llm,
             )
 
             if resolved is None:
@@ -2308,6 +2320,7 @@ Is this context relevant to the user's request?
         document_context: Optional[str] = None,
         project_dir: Optional[str] = None,
         model_service: Optional[Any] = None,
+        llm: Optional[BaseLLM] = None,
     ) -> Optional[tuple]:
         tool_name = step.tool_name or ""
         has_explicit_tool = bool(step.tool_name)
@@ -2589,6 +2602,7 @@ Is this context relevant to the user's request?
                 tool_name=tool_name,
                 input_schema=input_schema,
                 resolved_ids=resolved_ids,
+                llm=llm,
             )
         else:
             arguments = self.arg_extractor.invoke(
@@ -2596,6 +2610,7 @@ Is this context relevant to the user's request?
                 tool_name=tool_name,
                 input_schema=input_schema,
                 previous_tool_results=previous_results,
+                llm=llm,
             )
 
         missing = arguments.pop('_missing_params', None)
@@ -2716,6 +2731,7 @@ Is this context relevant to the user's request?
         available_servers: List[Dict[str, Any]],
         cwd: Optional[str],
         previous_results: Optional[List[Dict[str, Any]]] = None,
+        llm: Optional[BaseLLM] = None,
     ) -> Optional[tuple]:
         """Resolve tool arguments: find server, run deps, extract args.
 
@@ -3042,6 +3058,7 @@ Is this context relevant to the user's request?
                 tool_name=tool_name,
                 input_schema=input_schema,
                 resolved_ids=resolved_ids,
+                llm=llm,
             )
         else:
             arguments = self.arg_extractor.invoke(
@@ -3049,6 +3066,7 @@ Is this context relevant to the user's request?
                 tool_name=tool_name,
                 input_schema=input_schema,
                 previous_tool_results=previous_results,
+                llm=llm,
             )
 
         # Merge skill-level default args.  When the step originates from

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Set, List
@@ -182,10 +183,11 @@ class WorkspaceModel(BaseModel):
         return self._infer_capabilities()
 
     def _infer_capabilities(self) -> List[str]:
-        import re
         combined = f"{self.model_name} {self.model_id}".lower()
         caps: List[str] = []
         size = self.param_size_b
+
+        caps.append("general")
 
         if any(kw in combined for kw in ("code", "coder", "starcoder", "deepseek-coder")):
             caps.append("coding")
@@ -198,7 +200,6 @@ class WorkspaceModel(BaseModel):
         if size >= 3:
             caps.append("skills")
 
-        caps.append("general")
         return caps
 
 class Skill(BaseModel):

@@ -1072,10 +1072,15 @@ class ModelService:
         body, meta = self._parse_skill_content(content)
         final_description = description or meta.get("description")
 
-        if self._llm is None:
-            self.load_model()
+        resolved_name = name or meta.get("name")
+        already_complete = resolved_name and final_description
 
-        generated = self._generate_skill_metadata(body, project)
+        if already_complete:
+            generated = {}
+        else:
+            if self._llm is None:
+                self.load_model()
+            generated = self._generate_skill_metadata(body, project)
 
         if generated.get("body"):
             body = generated["body"]
@@ -1084,7 +1089,7 @@ class ModelService:
         if mcp_block and "```mcp" not in body:
             body = body.rstrip() + "\n\n" + mcp_block
 
-        raw_name = name or meta.get("name") or generated.get("name") or self._extract_skill_name(body)
+        raw_name = resolved_name or generated.get("name") or self._extract_skill_name(body)
         sanitized_name = re.sub(r"[^a-z0-9]+", "-", raw_name.lower()).strip("-") or f"skill-{str(uuid4())[:8]}"
 
         skill = Skill(
