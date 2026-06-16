@@ -537,7 +537,7 @@ class ModelService:
                 "[large-model] Loading larger model on demand: %s (%.0fB) > router "
                 "%s (%.0fB), n_ctx<=%d — %s",
                 largest.model_name, largest.param_size_b,
-                self._model_name or "?", router_size, cap, gguf_path,
+                self._model_name or "?", orchestrator_size, cap, gguf_path,
             )
             from smartloop.llms.llm_factory import LlmFactory
             self._large_llm = LlmFactory.get_llama_cpp_instance(
