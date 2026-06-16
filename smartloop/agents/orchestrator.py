@@ -24,11 +24,11 @@ from smartloop.agents.dag_executor import DAGExecutor
 from smartloop.agents.nodes import (
     DAG, AgentNode, AgentNodeName, NodeResult,
     LLMDecisionNode, TransformNode, SearchNode, ToolCallNode,
-    EnrichNode, SkillMatchNode, CollectNode, RouteNode,
+    SkillMatchNode, CollectNode, RouteNode,
 )
 
 from smartloop.agents.planner import (
-    Planner, StepType, PlanStep,
+    Planner, StepType, PlanStep, ModelTier,
     IntentType, MCPToolContext,
     SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
 )
@@ -63,6 +63,8 @@ class _OrchestratorContext(BaseModel):
     model_service: Any = None
     conversation_history: Optional[list] = None
     has_attachments: bool = False
+    # Built once during context construction:
+    enriched: Optional[Any] = None
     # Populated by handlers as they run:
     mcp_tool_contexts: list = Field(default_factory=list)
     parsed_skills: list = Field(default_factory=list)
@@ -103,16 +105,35 @@ class SLPOrchestrator:
     # nothing is dropped.
     DOC_FANOUT_THRESHOLD = 2
 
+    def _llm_for_tier(self, tier: ModelTier) -> BaseLLM:
+        if tier == ModelTier.LARGE:
+            return self.large_llm
+        return self.agent_llm
+
+    @staticmethod
+    def _model_label(llm: BaseLLM) -> str:
+        try:
+            meta = llm.model.metadata
+            name = meta.get("general.name", "")
+            size = meta.get("general.size_label", "")
+            if name:
+                return f"{name} ({size})" if size else name
+        except Exception:
+            pass
+        return type(llm).__name__
+
     def __init__(
         self,
         orchestrator_llm: BaseLLM,
         agent_llm: Optional[BaseLLM] = None,
+        large_llm: Optional[BaseLLM] = None,
         model_path: Optional[str] = None,
         project_id: Optional[str] = None,
         executor: Optional[LLMExecutor] = None,
     ):
         self.orchestrator_llm = orchestrator_llm
         self.agent_llm = agent_llm or orchestrator_llm
+        self.large_llm = large_llm or orchestrator_llm
         self.planner = Planner(self.agent_llm)
         self.arg_extractor = MCPArgumentExtractor(self.agent_llm)
         self.dep_analyzer = MCPDependencyAnalyzer()
@@ -154,6 +175,12 @@ class SLPOrchestrator:
     ) -> MCPExecutionResult:
         """Top-level entry point: plan → run → reason."""
         self._skill_report = None
+        logger.info(
+            "[models] response=%s  agent=%s  large=%s",
+            self._model_label(self.orchestrator_llm),
+            self._model_label(self.agent_llm),
+            self._model_label(self.large_llm),
+        )
         try:
             ctx = self._build_context(
                 user_message=user_message,
@@ -203,6 +230,11 @@ class SLPOrchestrator:
                 tools=srv.get("tools", []),
             ))
 
+        enriched = self.explorer.enrich(
+            available_mcp_servers=available_servers,
+            conversation_history=conversation_history,
+        )
+
         return _OrchestratorContext(
             user_message=user_message,
             mcp_servers=mcp_servers,
@@ -215,29 +247,26 @@ class SLPOrchestrator:
             conversation_history=conversation_history,
             has_attachments=has_attachments,
             mcp_tool_contexts=mcp_tool_contexts,
+            enriched=enriched,
         )
 
     def plan(self, ctx: _OrchestratorContext) -> tuple:
         """Phase 1: Build the execution DAG from skills, tools, and sources."""
         dag = DAG()
 
-        enrich_node = EnrichNode()
-        dag.add_node(enrich_node)
-
-        skill_match_node = SkillMatchNode(depends_on=[enrich_node])
+        skill_match_node = SkillMatchNode()
         dag.add_node(skill_match_node)
 
-        collect_node = CollectNode(depends_on=[skill_match_node, enrich_node])
+        collect_node = CollectNode(depends_on=[skill_match_node])
         dag.add_node(collect_node)
 
         route_node = RouteNode(
-            depends_on=[skill_match_node, collect_node, enrich_node],
+            depends_on=[skill_match_node, collect_node],
         )
         dag.add_node(route_node)
 
         handlers = self._build_handlers(
             ctx,
-            enrich_node=enrich_node,
             skill_match_node=skill_match_node,
             collect_node=collect_node,
             route_node=route_node,
@@ -279,6 +308,18 @@ class SLPOrchestrator:
                 if c.get("document_name") in allowed or not c.get("document_name")
             ]
 
+        non_explore = [r["content"] for r in accumulated if r["tool_name"] != EXPLORE_TOOL]
+        has_tool_output = any(c for c in non_explore)
+        explore_parts = [r["content"] for r in accumulated if r["tool_name"] == EXPLORE_TOOL]
+        has_explore_output = any(c for c in explore_parts)
+
+        # Citations track which indexed documents contributed to the
+        # response.  Include them when the explore step produced content
+        # (documents were read and fed into the answer).  Suppress them
+        # only when tool output is the sole data source and no documents
+        # were part of the pipeline.
+        keep_citations = has_explore_output
+
         if synthesized:
             return self._build_final_result(
                 ctx=ctx,
@@ -286,19 +327,25 @@ class SLPOrchestrator:
                 tool_names_used=tool_names_used,
                 vector_context=None,
                 tool_context=synthesized,
-                explore_citations=explore_citations,
+                explore_citations=explore_citations if keep_citations else None,
                 is_conversation=is_conversation,
                 is_synthesized=True,
             )
 
+        tool_context = "\n\n---\n\n".join(non_explore) if non_explore else ""
+
+        if tool_context:
+            return self._build_final_result(
+                ctx=ctx,
+                search_ctx=search_ctx,
+                tool_names_used=tool_names_used,
+                vector_context=None,
+                tool_context=tool_context,
+                explore_citations=None,
+                is_conversation=is_conversation,
+            )
+
         vector_context = search_ctx.vector_context
-        tool_context = ""
-
-        non_explore = [r["content"] for r in accumulated if r["tool_name"] != EXPLORE_TOOL]
-        if non_explore:
-            tool_context = "\n\n---\n\n".join(non_explore)
-
-        explore_parts = [r["content"] for r in accumulated if r["tool_name"] == EXPLORE_TOOL]
         if explore_parts and not vector_context:
             vector_context = "\n\n---\n\n".join(explore_parts)
 
@@ -319,39 +366,26 @@ class SLPOrchestrator:
     def _build_handlers(
         self,
         ctx: _OrchestratorContext,
-        enrich_node: EnrichNode,
         skill_match_node: SkillMatchNode,
         collect_node: CollectNode,
         route_node: RouteNode,
     ) -> Dict[str, Callable]:
         """Build the handler map for the initial DAG nodes."""
         return {
-            enrich_node.node_id: lambda deps: self._handle_enrich(ctx, enrich_node),
             skill_match_node.node_id: lambda deps: self._handle_skill_match(ctx, skill_match_node),
             collect_node.node_id: lambda deps: self._handle_collect(
-                ctx, deps, collect_node, skill_match_node, enrich_node,
+                ctx, deps, collect_node, skill_match_node,
             ),
             route_node.node_id: lambda deps: self._handle_route(
-                ctx, deps, route_node, skill_match_node, enrich_node, collect_node,
+                ctx, deps, route_node, skill_match_node, collect_node,
             ),
         }
 
     # ── Individual handlers ──
 
-    def _handle_enrich(self, ctx: _OrchestratorContext, node: EnrichNode) -> NodeResult:
-        """Enrich context with MCP catalogue and conversation history."""
-        enriched = self.explorer.enrich(
-            available_mcp_servers=ctx.available_servers,
-            conversation_history=ctx.conversation_history,
-        )
-
-        if enriched.exploration_steps:
-            logger.info("[explore] enrich: " + " → ".join(enriched.exploration_steps))
-
-        return NodeResult(node_id=node.node_id, success=True, data={"enrich_ctx": enriched})
-
     def _handle_skill_match(self, ctx: _OrchestratorContext, node: SkillMatchNode) -> NodeResult:
         """Parse skill front matter then LLM-match against the user query."""
+        logger.info("[models] SKILL_MATCH → agent_llm: %s", self._model_label(self.agent_llm))
         parsed_skills: List[Dict[str, str]] = []
         for sc in ctx.skills:
             name, desc = "", ""
@@ -378,11 +412,17 @@ class SLPOrchestrator:
                 })
         ctx.parsed_skills = parsed_skills
 
+        _SYSTEM_TOOL_NAMES = {
+            FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL, EXPLORE_TOOL,
+        }
         _has_url = bool(re.search(r'https?://[^\s<>\'")\]]+', ctx.user_message))
-        skills_for_matching = parsed_skills
+        skills_for_matching = [
+            s for s in parsed_skills
+            if s.get("name", "") not in _SYSTEM_TOOL_NAMES
+        ]
         if not _has_url:
             skills_for_matching = [
-                s for s in parsed_skills
+                s for s in skills_for_matching
                 if not any(kw in s.get("name", "").lower() for kw in ("fetch", "browse", "scrape"))
             ]
         matched_skills = self.explorer.match_skills(
@@ -397,11 +437,11 @@ class SLPOrchestrator:
         deps: Dict,
         node: CollectNode,
         skill_match_node: SkillMatchNode,
-        enrich_node: EnrichNode,
     ) -> NodeResult:
         """Vector + workspace + feedback search."""
+        logger.info("[models] COLLECT → no LLM (vector/feedback/workspace search)")
         matched_skills = deps[skill_match_node.node_id].data.get("matched_skills")
-        enriched = deps[enrich_node.node_id].data.get("enrich_ctx")
+        enriched = ctx.enriched
         search_ctx = self.explorer.collect_parallel(
             ctx.user_message, ctx.model_service, ctx.effective_cwd,
             enriched=enriched,
@@ -419,13 +459,13 @@ class SLPOrchestrator:
         deps: Dict,
         node: RouteNode,
         skill_match_node: SkillMatchNode,
-        enrich_node: EnrichNode,
         collect_node: CollectNode,
     ) -> NodeResult:
         """Decision: build the unified pipeline. Dynamically adds downstream nodes."""
+        logger.info("[models] ROUTE (classify+plan) → agent_llm: %s", self._model_label(self.agent_llm))
         matched_skills = deps[skill_match_node.node_id].data.get("matched_skills")
         search_ctx = deps[collect_node.node_id].data.get("search_ctx")
-        enrich_ctx = deps[enrich_node.node_id].data.get("enrich_ctx")
+        enrich_ctx = ctx.enriched
 
         if matched_skills:
             ctx.skill_bodies = [
@@ -699,10 +739,14 @@ class SLPOrchestrator:
         the same node builders and handlers — no branching downstream.
         """
         plan_steps = self._derive_steps(ctx, search_ctx, enrich_ctx)
-        if matched_skills:
+        if plan_steps:
             logger.info(
-                f"[skill] planned {len(plan_steps)} step(s): "
-                + " → ".join(f"{s.step_type.value}:{s.tool_name}" for s in plan_steps)
+                "[plan] %d step(s): %s",
+                len(plan_steps),
+                " → ".join(
+                    f"{s.step_type.value}:{s.tool_name}[{s.model_tier.value}]"
+                    for s in plan_steps
+                ),
             )
 
         return self._build_step_nodes(
@@ -761,10 +805,9 @@ class SLPOrchestrator:
                     f"indexed context available ({', '.join(sources)}) — exploring"
                 )
 
-        if classification.detected_urls and classification.intent != IntentType.MULTI_STEP:
-            if classification.intent in (IntentType.CONVERSATION, IntentType.TOOL_CALL):
-                classification.intent = IntentType.EXPLORE
-                classification.reasoning = "URL detected — explore handles fetch"
+        if classification.detected_urls and classification.intent == IntentType.CONVERSATION:
+            classification.intent = IntentType.TOOL_CALL
+            classification.reasoning = f"URL detected — deterministic fetch: {classification.detected_urls[0]}"
 
         logger.info(
             f"[classify] {classification.intent.value}: "
@@ -785,7 +828,62 @@ class SLPOrchestrator:
             plan.steps = self.explorer.resolve_fetch_steps(
                 plan.steps, ctx.available_servers, ctx.user_message
             )
+
+        # When a matched skill has ```mcp blocks, inject those as explicit
+        # TOOL steps so the skill's tool calls actually execute.
+        has_skill = bool(ctx.skill_context)
+        if has_skill and hasattr(self, '_matched_skills') and self._matched_skills:
+            mcp_steps = self._steps_from_skill_mcp_blocks(
+                self._matched_skills, plan.steps, ctx.user_message,
+            )
+            if mcp_steps:
+                plan.steps.extend(mcp_steps)
+
+        for step in plan.steps:
+            if has_skill and step.step_type == StepType.TOOL:
+                step.model_tier = ModelTier.LARGE
+            else:
+                step.model_tier = ModelTier.SMALL
+
         return plan.steps
+
+    def _steps_from_skill_mcp_blocks(
+        self,
+        matched_skills: List[Dict],
+        existing_steps: List[PlanStep],
+        user_message: str,
+    ) -> List[PlanStep]:
+        """Convert ```mcp blocks from matched skills into PlanStep objects."""
+        existing_tools = {s.tool_name for s in existing_steps if s.tool_name}
+        steps: List[PlanStep] = []
+        step_num = max((s.step for s in existing_steps), default=0)
+
+        for sk in matched_skills:
+            for block in sk.get("mcp_blocks", []):
+                tool_name = block["tool_name"]
+                if tool_name in existing_tools:
+                    continue
+                step_num += 1
+                steps.append(PlanStep(
+                    step=step_num,
+                    step_type=StepType.TOOL,
+                    tool_name=tool_name,
+                    server_id="",
+                    server_name=block["server_name"],
+                    instruction=f"Call {block['server_name']}.{tool_name} as specified by the skill.",
+                    default_args=block.get("default_args"),
+                    inferred_args=block.get("inferred_args"),
+                    for_each=block.get("for_each"),
+                    skill_name=sk.get("name"),
+                ))
+                existing_tools.add(tool_name)
+                logger.info(
+                    "[skill-mcp] Injected step %d: %s.%s (inferred=%s, default=%s, for_each=%s)",
+                    step_num, block["server_name"], tool_name,
+                    block.get("inferred_args"), block.get("default_args"),
+                    block.get("for_each"),
+                )
+        return steps
 
     def _build_step_nodes(
         self,
@@ -938,7 +1036,8 @@ Assess whether these search results are relevant to the user's request. If relev
 </user>"""
 
                 try:
-                    result = str(self.agent_llm.invoke(analyze_prompt)).strip()
+                    step_llm = self._llm_for_tier(step.model_tier)
+                    result = str(step_llm.invoke(analyze_prompt)).strip()
                     if result == "NOT_RELEVANT" or len(result) < 20:
                         logger.info("[analyze] context deemed not relevant — passing through raw")
                         return self._step_result(node_id, step, explore_content, explore_content)
@@ -1008,6 +1107,11 @@ Assess whether these search results are relevant to the user's request. If relev
         Works uniformly for both skill-derived and prompt-derived steps.
         Uses ``ctx.skill_context`` for condition extraction when available.
         """
+        step_llm = self._llm_for_tier(step.model_tier)
+        logger.info(
+            "[models] RESOLVE(%s) → %s: %s",
+            step.tool_name, step.model_tier.value, self._model_label(step_llm),
+        )
         def handler(deps: Dict) -> NodeResult:
             prev_results = self._collect_raw_from_deps(deps)
             node_id = f"step_{step.step}_{step.tool_name or step.step_type.value}_resolve"
@@ -1074,6 +1178,7 @@ Assess whether these search results are relevant to the user's request. If relev
         Reads resolved arguments from the resolve node and calls the tool.
         No LLM needed — just an API call.
         """
+        logger.info("[models] EXECUTE(%s) → no LLM (MCP tool call)", step.tool_name)
         def handler(deps: Dict) -> NodeResult:
             node_id = f"step_{step.step}_{step.tool_name or step.step_type.value}_execute"
 
@@ -1086,7 +1191,8 @@ Assess whether these search results are relevant to the user's request. If relev
 
             if not resolve_data or resolve_data.get("skip"):
                 tool_name = resolve_data.get("tool_name", step.tool_name or step.step_type.value) if resolve_data else (step.tool_name or step.step_type.value)
-                return self._step_result(node_id, step, "")
+                fail_msg = f"Tool '{tool_name}' skipped — could not resolve arguments." if step.skill_name else ""
+                return self._step_result(node_id, step, fail_msg)
 
             tool_name = resolve_data["tool_name"]
             server_id = resolve_data["server_id"]
@@ -1096,11 +1202,13 @@ Assess whether these search results are relevant to the user's request. If relev
             server = self.tool_caller.find_server(ctx.mcp_servers, server_id, server_id)
             if not server:
                 logger.warning(f"[execute] Server not found for {tool_name} (id={server_id})")
-                return self._step_result(node_id, step, "")
+                fail_msg = f"Tool '{tool_name}' failed: server not found." if step.skill_name else ""
+                return self._step_result(node_id, step, fail_msg)
 
             result = self._call_tool(server, tool_name, arguments, cwd=ctx.effective_cwd)
             if result is None:
-                return self._step_result(node_id, step, "")
+                fail_msg = f"Tool '{tool_name}' call failed — no result returned." if step.skill_name else ""
+                return self._step_result(node_id, step, fail_msg)
 
             formatted, raw = result
             return self._step_result(node_id, step, formatted, raw)
@@ -1334,6 +1442,7 @@ Assess whether these search results are relevant to the user's request. If relev
         Collects all upstream step outputs.  When skill context is
         available, synthesizes them into one coherent document.
         """
+        logger.info("[models] REASON → agent_llm: %s", self._model_label(self.agent_llm))
         def handler(deps: Dict) -> NodeResult:
             all_accumulated: List[Dict[str, Any]] = []
             tool_results: List[Dict[str, Any]] = []
@@ -1465,7 +1574,7 @@ Is this context relevant to the user's request?
         tool_context = self._strip_tool_code_blocks(tool_context)
 
         if tool_context:
-            context_parts.append(f"TOOL RESULTS:\n{tool_context}")
+            context_parts.append(tool_context)
             logger.info(f"[collect] tool results: {len(tool_context)} chars")
 
         # Skill tool results are already in EXPLORE output when skill_context
@@ -1492,24 +1601,29 @@ Is this context relevant to the user's request?
                 f"[collect] analysis findings: {len(clean_report)} chars"
             )
 
-        feedback_context = search_ctx.feedback_context
-        workspace_context = search_ctx.workspace_context
+        # When live tool results exist, they are authoritative — suppress
+        # pre-plan search context (vector, feedback, workspace) so stale
+        # indexed content and internal metadata (tool names, skill bodies)
+        # don't leak into the response.
+        if not tool_context:
+            feedback_context = search_ctx.feedback_context
+            workspace_context = search_ctx.workspace_context
 
-        if vector_context and not is_conversation:
-            if not tool_context or vector_context not in tool_context:
-                context_parts.append(vector_context)
-                logger.info(f"[collect] documents: {len(vector_context)} chars")
+            if vector_context and not is_conversation:
+                if not tool_context or vector_context not in tool_context:
+                    context_parts.append(vector_context)
+                    logger.info(f"[collect] documents: {len(vector_context)} chars")
 
-        # Feedback/workspace are bundled in EXPLORE output when skill_context
-        # is set; only add separately for the prompt-derived path.
-        if not has_skill:
-            if feedback_context and not is_conversation:
-                context_parts.append(f"FEEDBACK Q&A:\n{feedback_context}")
-                logger.info(f"[collect] feedback: {len(feedback_context)} chars")
+            # Feedback/workspace are bundled in EXPLORE output when skill_context
+            # is set; only add separately for the prompt-derived path.
+            if not has_skill:
+                if feedback_context and not is_conversation:
+                    context_parts.append(f"FEEDBACK Q&A:\n{feedback_context}")
+                    logger.info(f"[collect] feedback: {len(feedback_context)} chars")
 
-            if workspace_context and not is_conversation:
-                context_parts.append(f"WORKSPACE FILES:\n{workspace_context}")
-                logger.info(f"[collect] workspace: {len(workspace_context)} chars")
+                if workspace_context and not is_conversation:
+                    context_parts.append(f"WORKSPACE FILES:\n{workspace_context}")
+                    logger.info(f"[collect] workspace: {len(workspace_context)} chars")
 
         if not context_parts and not has_skill:
             logger.info("[collect] No context gathered — conversation only")
@@ -1865,7 +1979,9 @@ Is this context relevant to the user's request?
         )
 
         try:
-            result = str(self.agent_llm.invoke(prompt)).strip()
+            synth_llm = self._llm_for_tier(ModelTier.LARGE)
+            logger.info("[models] SYNTHESIZE → %s: %s", ModelTier.LARGE.value, self._model_label(synth_llm))
+            result = str(synth_llm.invoke(prompt)).strip()
             if result:
                 logger.info(
                     f"[synthesize] produced {len(result)} chars "
@@ -1972,7 +2088,11 @@ Is this context relevant to the user's request?
                             continue
                         if "=" in token:
                             key, _, value = token.partition("=")
-                            default_args[key.strip()] = value.strip()
+                            value = value.strip()
+                            if value.startswith("<") and value.endswith(">"):
+                                inferred_args.append(key.strip())
+                            else:
+                                default_args[key.strip()] = value
                         else:
                             inferred_args.append(token)
 
@@ -2853,7 +2973,35 @@ Is this context relevant to the user's request?
         # parameters are needed; the user message + previous results
         # provide the values.
 
-        if resolved_ids:
+        # Try to fill all required params deterministically before invoking
+        # the LLM.  When every required param is a URL and the URL is in the
+        # user message, skip the LLM extraction entirely.
+        required_params_pre = input_schema.get('required', [])
+        properties_pre = input_schema.get('properties', {})
+        default_keys = set(step.default_args or {})
+        deterministic_args = {}
+        all_deterministic = bool(required_params_pre)
+        for pn in required_params_pre:
+            if pn in default_keys:
+                continue
+            pi = properties_pre.get(pn, {})
+            if self.arg_extractor._is_url_parameter(pn, pi):
+                urls = self.arg_extractor._extract_urls_from_text(user_message)
+                if not urls:
+                    urls = self.arg_extractor._extract_urls_from_text(directive)
+                if urls:
+                    deterministic_args[pn] = urls[0]
+                    continue
+            all_deterministic = False
+            break
+
+        if all_deterministic and deterministic_args:
+            arguments = deterministic_args
+            logger.info(
+                "[resolve] '%s' all required params filled deterministically: %s",
+                tool_name, arguments,
+            )
+        elif resolved_ids:
             arguments = self.arg_extractor.invoke_with_resolved_ids(
                 user_input=extraction_input,
                 tool_name=tool_name,

@@ -372,6 +372,8 @@ class MCPClient:
             )
 
         except (MCPConnectionError, MCPProtocolError) as e:
+            logger.error("[mcp-remote] Tool call '%s' on %s failed: %s", tool_name, server_url, e)
             return MCPToolCallResult(success=False, error=str(e))
         except Exception as e:
+            logger.error("[mcp-remote] Tool call '%s' on %s unexpected error: %s", tool_name, server_url, e, exc_info=True)
             return MCPToolCallResult(success=False, error=f"Unexpected error: {str(e)}")

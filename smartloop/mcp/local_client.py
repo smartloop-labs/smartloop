@@ -93,9 +93,26 @@ class LocalMCPClient:
 
         return self.command
 
+    def _is_builtin_module(self) -> bool:
+        return (
+            len(self.args) >= 2
+            and self.args[0] == "-m"
+            and self.args[1].startswith("smartloop.")
+        )
+
     def __enter__(self) -> "LocalMCPClient":
         merged_env = {**os.environ, **self.env}
         resolved_command = self._resolve_command(merged_env)
+
+        if self._is_builtin_module():
+            import smartloop as _pkg
+            pkg_root = os.path.dirname(os.path.dirname(_pkg.__file__))
+            existing = merged_env.get("PYTHONPATH", "")
+            if pkg_root not in existing.split(os.pathsep):
+                merged_env["PYTHONPATH"] = (
+                    pkg_root + os.pathsep + existing if existing else pkg_root
+                )
+
         self._process = subprocess.Popen(
             [resolved_command, *self.args],
             stdin=subprocess.PIPE,
@@ -305,6 +322,8 @@ class LocalMCPClient:
                 is_error=result.get("isError", False),
             )
         except MCPProtocolError as e:
+            logger.error("[mcp-local] Tool call '%s' failed: %s", tool_name, e)
             return MCPToolCallResult(success=False, error=str(e))
         except Exception as e:
+            logger.error("[mcp-local] Tool call '%s' unexpected error: %s", tool_name, e, exc_info=True)
             return MCPToolCallResult(success=False, error=f"Unexpected error: {e}")

@@ -12,7 +12,7 @@ from smartloop.agents.orchestrator import SLPOrchestrator
 from smartloop.agents.mcp.explorer import SearchContext
 from smartloop.agents.nodes import (
     NodeResult, LLMDecisionNode, TransformNode,
-    EnrichNode, SkillMatchNode, CollectNode, RouteNode,
+    SkillMatchNode, CollectNode, RouteNode,
 )
 
 
@@ -75,13 +75,12 @@ class TestRouteFanout:
         ctx = _ctx(orch)
         captured = {}
 
-        enrich_node = EnrichNode()
-        skill_match_node = SkillMatchNode(depends_on=[enrich_node])
-        collect_node = CollectNode(depends_on=[skill_match_node, enrich_node])
-        route_node = RouteNode(depends_on=[skill_match_node, collect_node, enrich_node])
+        skill_match_node = SkillMatchNode()
+        collect_node = CollectNode(depends_on=[skill_match_node])
+        route_node = RouteNode(depends_on=[skill_match_node, collect_node])
 
         from smartloop.agents.mcp.explorer import EnrichedContext
-        enrich_ctx = EnrichedContext()
+        ctx.enriched = EnrichedContext()
 
         def fake_pipeline(c, ms, sc, ec, parent=None):
             captured["parent"] = parent
@@ -98,13 +97,9 @@ class TestRouteFanout:
                 node_id=collect_node.node_id,
                 data={"search_ctx": sctx},
             ),
-            enrich_node.node_id: NodeResult(
-                node_id=enrich_node.node_id,
-                data={"enrich_ctx": enrich_ctx},
-            ),
         }
         res = orch._handle_route(
-            ctx, deps, route_node, skill_match_node, enrich_node, collect_node,
+            ctx, deps, route_node, skill_match_node, collect_node,
         )
         nodes = {type(n).__name__: n for n, _ in res.data["_extend_dag"]}
         return nodes, captured

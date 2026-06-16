@@ -159,6 +159,19 @@ class WorkspaceModel(BaseModel):
             return ""
         return os.path.join(self.bin_dir, f"{Path(self.model_id).name}.gguf")
 
+    @property
+    def param_size_b(self) -> float:
+        """Parse parameter count in billions from model_name or model_id.
+
+        Examples: 'gemma3-1b' → 1.0, 'google/gemma-3-4b-it' → 4.0
+        """
+        import re
+        for src in (self.model_name, self.model_id):
+            m = re.search(r'(\d+(?:\.\d+)?)\s*[bB]', src)
+            if m:
+                return float(m.group(1))
+        return 0.0
+
 class Skill(BaseModel):
     id: str
     name: str
@@ -193,6 +206,39 @@ class Project (BaseModel):
         return os.path.expanduser(
             os.path.join("~/smartloop", self.name or self.id)
         )
+
+    def get_skills(self) -> List["Skill"]:
+        """Read skills from disk (SKILL.md files), the single source of truth."""
+        skills_dir = os.path.join(self.visible_dir, "skills")
+        if not os.path.isdir(skills_dir):
+            return []
+        result: List[Skill] = []
+        for entry in sorted(os.listdir(skills_dir)):
+            entry_path = os.path.join(skills_dir, entry)
+            if not os.path.isdir(entry_path):
+                continue
+            skill_path = os.path.join(entry_path, "SKILL.md")
+            if not os.path.isfile(skill_path):
+                continue
+            try:
+                raw = open(skill_path, encoding="utf-8").read()
+            except Exception:
+                continue
+            name = entry
+            description = None
+            if raw.startswith("---"):
+                parts = raw.split("---", 2)
+                if len(parts) >= 3:
+                    for line in parts[1].strip().splitlines():
+                        if line.startswith("name:"):
+                            name = line[len("name:"):].strip()
+                        elif line.startswith("description:"):
+                            description = line[len("description:"):].strip()
+            result.append(Skill(
+                id=name, name=name, description=description,
+                content=raw,
+            ))
+        return result
 
     @property
     def folder_name(self) -> str:
@@ -286,6 +332,16 @@ class Workspace(BaseModel):
         entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, is_active=True, models_dir=self.models_dir)
         self.models.append(entry)
         return entry
+
+    def largest_downloaded_model(self) -> Optional[WorkspaceModel]:
+        """Return the largest downloaded model by parameter count, or None."""
+        candidates = [m for m in self.models if m.downloaded and m.param_size_b > 0]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda m: m.param_size_b, reverse=True)
+        best = candidates[0]
+        best.models_dir = self.models_dir
+        return best
 
     def model_dir_for(self, model_id: str) -> str:
         """Return the workspace-level directory for a given model_id."""

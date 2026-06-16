@@ -206,18 +206,38 @@ def test_classify_document_context(planner):
 
 
 def test_classify_document_context_with_tool_signal(planner, sample_mcp_tools):
-    """Document context + MCP tool match → TOOL_CALL (URL not a signal)."""
+    """Document context + MCP tool match + URL → MULTI_STEP (fetch + compare)."""
     result = planner.classify(
         "Fetch https://example.com and compare to our docs",
         mcp_tools=sample_mcp_tools,
         document_context="Some relevant document content here.",
     )
-    assert result.intent == IntentType.TOOL_CALL
+    assert result.intent == IntentType.MULTI_STEP
     assert result.has_document_context
 
 
+def test_classify_url_only_deterministic_fetch(planner, sample_mcp_tools):
+    """Bare URL → deterministic TOOL_CALL (no LLM needed)."""
+    result = planner.classify(
+        "https://example.com/some-page",
+        mcp_tools=sample_mcp_tools,
+    )
+    assert result.intent == IntentType.TOOL_CALL
+    assert result.detected_urls == ["https://example.com/some-page"]
+
+
+def test_classify_url_with_instruction_deterministic_fetch(planner, sample_mcp_tools):
+    """URL with surrounding text → deterministic TOOL_CALL."""
+    result = planner.classify(
+        "summarize https://example.com/article",
+        mcp_tools=[],
+    )
+    assert result.intent == IntentType.TOOL_CALL
+    assert len(result.detected_urls) == 1
+
+
 def test_classify_multi_step_write_intent(planner, sample_mcp_tools):
-    """Write intent alone → MULTI_STEP (URL not a signal, explore handles fetch)."""
+    """URL + write intent → MULTI_STEP (fetch then save)."""
     result = planner.classify(
         "Fetch https://example.com and save it to output.md",
         mcp_tools=sample_mcp_tools,

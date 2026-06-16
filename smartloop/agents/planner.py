@@ -38,6 +38,11 @@ SYSTEM_TOOLS_SERVER_NAME = "smartloop"
 FETCH_SERVER_ID = "__fetch__"
 
 
+class ModelTier(str, Enum):
+    """Which model tier a step should run on."""
+    SMALL = "small"    # Routing, classification, arg extraction (1B)
+    LARGE = "large"    # Skills, synthesis, complex reasoning (4B+)
+
 class StepType(str, Enum):
     """Semantic action categories available in an execution plan."""
     ANALYZE        = "analyze"        # LLM reasons about user intent and context before planning
@@ -63,6 +68,7 @@ class Signal(str, Enum):
     BASH  = "bash"     # Bash code block
     WRITE = "write"    # Write intent keywords
     GREP  = "grep"     # Grep/search keywords
+    URL   = "url"      # HTTP(S) URL detected
 
 
 class MatchedTool(BaseModel):
@@ -129,6 +135,10 @@ class PlanStep(BaseModel):
     for_each: Optional[bool] = Field(
         default=None,
         description="When True, call the tool once per item extracted from upstream results",
+    )
+    model_tier: ModelTier = Field(
+        default=ModelTier.SMALL,
+        description="Which model tier this step should run on",
     )
 
 
@@ -301,6 +311,8 @@ class Planner:
             active.add(Signal.WRITE)
         if result.has_grep_intent:
             active.add(Signal.GREP)
+        if result.detected_urls:
+            active.add(Signal.URL)
 
         if not active:
             # Document context present → treat as EXPLORE so the model
@@ -313,11 +325,16 @@ class Planner:
             return None
 
         # Action signals (exclude modifiers like write/grep)
-        action_signals = active & {Signal.TOOLS, Signal.PATHS, Signal.BASH}
+        action_signals = active & {Signal.TOOLS, Signal.PATHS, Signal.BASH, Signal.URL}
 
         # Multiple action signal types → multi-step
         if len(action_signals) > 1:
             result.reasoning = "multiple action signals detected"
+            return IntentType.MULTI_STEP
+
+        # URL + write modifier → fetch then write
+        if Signal.URL in active and Signal.WRITE in active:
+            result.reasoning = "URL + write intent"
             return IntentType.MULTI_STEP
 
         # Single tool + write/grep modifier → still multi-step
@@ -330,6 +347,10 @@ class Planner:
             return IntentType.MULTI_STEP
 
         # Single signal type
+        if Signal.URL in active:
+            result.reasoning = f"URL detected: {result.detected_urls[0]}"
+            return IntentType.TOOL_CALL
+
         if Signal.TOOLS in active:
             result.reasoning = f"MCP tool keyword match: {result.matched_tools[0].tool_name}"
             return IntentType.TOOL_CALL
