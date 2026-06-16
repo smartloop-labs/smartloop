@@ -854,7 +854,7 @@ class Planner:
         try:
             response = str(self.llm.invoke(prompt)).strip()
             logger.info(f"[plan] Raw LLM plan ({len(response)} chars): {response[:500]}")
-            return self._parse_plan_response(response, context.user_message)
+            return self._parse_plan_response(response, context.user_message, classification)
         except Exception as e:
             logger.warning(f"[plan] LLM plan failed: {e}")
             return ExecutionPlan(steps=[], reasoning=str(e))
@@ -979,7 +979,12 @@ class Planner:
     # Response parsing                                                     #
     # ------------------------------------------------------------------ #
 
-    def _parse_plan_response(self, response: str, user_message: str) -> ExecutionPlan:
+    def _parse_plan_response(
+        self,
+        response: str,
+        user_message: str,
+        classification: Optional[ClassificationResult] = None,
+    ) -> ExecutionPlan:
         """Parse the raw LLM response into an ``ExecutionPlan``."""
         # Strip markdown fences
         if response.startswith("```"):
@@ -1067,6 +1072,21 @@ class Planner:
                 condition=s.get("condition") or None,
                 skill_name=s.get("skill_name") or None,
             ))
+
+        if classification:
+            path_idx = 0
+            cmd_idx = 0
+            for step in steps:
+                if step.default_args:
+                    continue
+                if step.tool_name == FILE_READ_TOOL and classification.detected_paths:
+                    if path_idx < len(classification.detected_paths):
+                        step.default_args = {"path": classification.detected_paths[path_idx]}
+                        path_idx += 1
+                elif step.tool_name == BASH_TOOL and classification.bash_commands:
+                    if cmd_idx < len(classification.bash_commands):
+                        step.default_args = {"command": classification.bash_commands[cmd_idx]}
+                        cmd_idx += 1
 
         logger.info(
             f"[plan] Created {len(steps)}-step plan: "
