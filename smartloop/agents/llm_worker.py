@@ -5,6 +5,7 @@ variable, initialized once via ``init_worker`` (called by
 ``ProcessPoolExecutor(initializer=...)``).
 """
 import logging
+import sys
 from typing import Optional
 
 _llm = None  # Module-global: one Llama model per process
@@ -12,6 +13,18 @@ _llm = None  # Module-global: one Llama model per process
 # Floor for the retry ladder — below this a context is too small to be useful
 # for document extraction, so we stop shrinking and disable the worker instead.
 _MIN_WORKER_N_CTX = 2048
+
+
+def _configure_worker_logging() -> None:
+    """Route worker process logs to stderr so they appear in the parent's output."""
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        ))
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
 
 
 def init_worker(model_path: str, project_id: str) -> None:
@@ -24,6 +37,8 @@ def init_worker(model_path: str, project_id: str) -> None:
     is lost, and ``run_inference`` surfaces a clean error its caller can catch.
     """
     global _llm
+    _configure_worker_logging()
+
     import multiprocessing
     proc = multiprocessing.current_process()
     proc.name = f"smartloop-agent-{proc.pid}"

@@ -38,6 +38,11 @@ SYSTEM_TOOLS_SERVER_NAME = "smartloop"
 FETCH_SERVER_ID = "__fetch__"
 
 
+class ModelTier(str, Enum):
+    """Which model tier a step should run on."""
+    SMALL = "small"    # Routing, classification, arg extraction (1B)
+    LARGE = "large"    # Skills, synthesis, complex reasoning (4B+)
+
 class StepType(str, Enum):
     """Semantic action categories available in an execution plan."""
     ANALYZE        = "analyze"        # LLM reasons about user intent and context before planning
@@ -63,6 +68,7 @@ class Signal(str, Enum):
     BASH  = "bash"     # Bash code block
     WRITE = "write"    # Write intent keywords
     GREP  = "grep"     # Grep/search keywords
+    URL   = "url"      # HTTP(S) URL detected
 
 
 class MatchedTool(BaseModel):
@@ -84,6 +90,10 @@ class ClassificationResult(BaseModel):
     action_kind: Optional[str] = None
     has_document_context: bool = False
     reasoning: str = ""
+    capability: Optional[str] = Field(
+        default=None,
+        description="Best-matching model capability for this request (e.g. coding, finance, vision)",
+    )
 
 
 class PlanStep(BaseModel):
@@ -129,6 +139,14 @@ class PlanStep(BaseModel):
     for_each: Optional[bool] = Field(
         default=None,
         description="When True, call the tool once per item extracted from upstream results",
+    )
+    model_tier: ModelTier = Field(
+        default=ModelTier.SMALL,
+        description="Which model tier this step should run on",
+    )
+    capability: Optional[str] = Field(
+        default=None,
+        description="Requested model capability for this step (e.g. coding, finance, vision)",
     )
 
 
@@ -208,6 +226,7 @@ class Planner:
         has_attachments: bool = False,
         history: Optional[str] = None,
         cwd: Optional[str] = None,
+        available_capabilities: Optional[List[str]] = None,
     ) -> ClassificationResult:
         """Classify user intent into one of the ``IntentType`` categories.
 
@@ -229,12 +248,40 @@ class Planner:
                 f"write={result.has_write_intent}, grep={result.has_grep_intent}, "
                 f"bash={len(result.bash_commands)})"
             )
-            return result
+        else:
+            # Tier 2: LLM fallback
+            result = self._llm_classify(user_message, mcp_tools, skills, history, result)
+            logger.info(f"[classify] LLM → {result.intent.value}: {result.reasoning}")
 
-        # Tier 2: LLM fallback
-        result = self._llm_classify(user_message, mcp_tools, skills, history, result)
-        logger.info(f"[classify] LLM → {result.intent.value}: {result.reasoning}")
+        if available_capabilities:
+            result.capability = self._match_capability(user_message, available_capabilities)
+            if result.capability:
+                logger.info(f"[classify] capability → {result.capability}")
+
         return result
+
+    @staticmethod
+    def _match_capability(user_message: str, capabilities: List[str]) -> Optional[str]:
+        """Match the user message to the best available capability via keyword overlap."""
+        msg_lower = user_message.lower()
+        _CAPABILITY_KEYWORDS: Dict[str, List[str]] = {
+            "coding": ["code", "program", "function", "bug", "debug", "compile", "syntax", "refactor", "implement", "class", "method"],
+            "finance": ["finance", "stock", "price", "invest", "portfolio", "dividend", "revenue", "profit", "budget", "expense", "accounting"],
+            "vision": ["image", "photo", "picture", "visual", "diagram", "screenshot", "chart", "graph", "draw", "render"],
+            "writing": ["write", "essay", "article", "blog", "story", "draft", "edit", "proofread", "summarize", "translate"],
+            "math": ["math", "calculate", "equation", "formula", "algebra", "geometry", "statistics", "probability"],
+            "science": ["science", "physics", "chemistry", "biology", "experiment", "hypothesis", "research"],
+        }
+        best_cap = None
+        best_score = 0
+        for cap in capabilities:
+            cap_lower = cap.lower()
+            keywords = _CAPABILITY_KEYWORDS.get(cap_lower, [cap_lower])
+            score = sum(1 for kw in keywords if kw in msg_lower)
+            if score > best_score:
+                best_score = score
+                best_cap = cap
+        return best_cap if best_score > 0 else None
 
     def _detect_signals(
         self,
@@ -301,6 +348,8 @@ class Planner:
             active.add(Signal.WRITE)
         if result.has_grep_intent:
             active.add(Signal.GREP)
+        if result.detected_urls:
+            active.add(Signal.URL)
 
         if not active:
             # Document context present → treat as EXPLORE so the model
@@ -313,11 +362,16 @@ class Planner:
             return None
 
         # Action signals (exclude modifiers like write/grep)
-        action_signals = active & {Signal.TOOLS, Signal.PATHS, Signal.BASH}
+        action_signals = active & {Signal.TOOLS, Signal.PATHS, Signal.BASH, Signal.URL}
 
         # Multiple action signal types → multi-step
         if len(action_signals) > 1:
             result.reasoning = "multiple action signals detected"
+            return IntentType.MULTI_STEP
+
+        # URL + write modifier → fetch then write
+        if Signal.URL in active and Signal.WRITE in active:
+            result.reasoning = "URL + write intent"
             return IntentType.MULTI_STEP
 
         # Single tool + write/grep modifier → still multi-step
@@ -330,6 +384,10 @@ class Planner:
             return IntentType.MULTI_STEP
 
         # Single signal type
+        if Signal.URL in active:
+            result.reasoning = f"URL detected: {result.detected_urls[0]}"
+            return IntentType.TOOL_CALL
+
         if Signal.TOOLS in active:
             result.reasoning = f"MCP tool keyword match: {result.matched_tools[0].tool_name}"
             return IntentType.TOOL_CALL
@@ -796,7 +854,7 @@ class Planner:
         try:
             response = str(self.llm.invoke(prompt)).strip()
             logger.info(f"[plan] Raw LLM plan ({len(response)} chars): {response[:500]}")
-            return self._parse_plan_response(response, context.user_message)
+            return self._parse_plan_response(response, context.user_message, classification)
         except Exception as e:
             logger.warning(f"[plan] LLM plan failed: {e}")
             return ExecutionPlan(steps=[], reasoning=str(e))
@@ -921,7 +979,12 @@ class Planner:
     # Response parsing                                                     #
     # ------------------------------------------------------------------ #
 
-    def _parse_plan_response(self, response: str, user_message: str) -> ExecutionPlan:
+    def _parse_plan_response(
+        self,
+        response: str,
+        user_message: str,
+        classification: Optional[ClassificationResult] = None,
+    ) -> ExecutionPlan:
         """Parse the raw LLM response into an ``ExecutionPlan``."""
         # Strip markdown fences
         if response.startswith("```"):
@@ -1009,6 +1072,21 @@ class Planner:
                 condition=s.get("condition") or None,
                 skill_name=s.get("skill_name") or None,
             ))
+
+        if classification:
+            path_idx = 0
+            cmd_idx = 0
+            for step in steps:
+                if step.default_args:
+                    continue
+                if step.tool_name == FILE_READ_TOOL and classification.detected_paths:
+                    if path_idx < len(classification.detected_paths):
+                        step.default_args = {"path": classification.detected_paths[path_idx]}
+                        path_idx += 1
+                elif step.tool_name == BASH_TOOL and classification.bash_commands:
+                    if cmd_idx < len(classification.bash_commands):
+                        step.default_args = {"command": classification.bash_commands[cmd_idx]}
+                        cmd_idx += 1
 
         logger.info(
             f"[plan] Created {len(steps)}-step plan: "

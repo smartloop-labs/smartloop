@@ -362,6 +362,8 @@ async def stream_chunks(
 
     yield _status_event("preparing", "completed", "Preparing response...")
 
+    logger.info("[models] RESPONSE → main LLM (model_service._model_name=%s)", getattr(model_service, '_model_name', '?'))
+
     # Store the user message in session history
     if request.session_id and last_user_msg:
         model_service.append_to_session(request.session_id, "user", last_user_msg)

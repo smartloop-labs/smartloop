@@ -93,6 +93,11 @@ class ModelService:
         # Falls back to main model when not configured.
         self._decision_llm: Optional[BaseLLM] = None
         self._decision_model_name: Optional[str] = None
+        self._large_llm: Optional[BaseLLM] = None
+        self._large_model_name: Optional[str] = None
+        # Set once the large model has been considered (loaded, skipped for
+        # fit, or absent), so we don't re-probe VRAM on every agent request.
+        self._large_model_attempted: bool = False
         # Shared, long-lived executor whose LLM worker processes load the
         # model once and are reused across requests (used for parallel
         # document fan-out).  Created lazily; reset on model load/unload.
@@ -192,10 +197,12 @@ class ModelService:
             developer_token=developer_token or api_settings.developer_token,
         ))
 
-        # Resolve: explicit arg → workspace active model → api_settings fallback
+        # Resolve: explicit arg → api_settings.default_model.  The orchestrator/
+        # main model is ALWAYS the small base model; the workspace's active
+        # selection only designates the on-demand large model, so we never
+        # resolve the loaded model from the active selection here.
         if not _model_name:
-            active = workspace.get_model()
-            _model_name = active.model_name if active else api_settings.default_model
+            _model_name = api_settings.default_model
 
         model_config = ModelConfig(
             model_name=_model_name,
@@ -274,9 +281,14 @@ class ModelService:
         """
         workspace = self._ensure_workspace()
         current_project = workspace.current_project
-        active = workspace.get_model()
-        target_model = (active.model_name if active else None) or api_settings.default_model
-        logger.info(f"[load_model] target={target_model}")
+        # The routing/main model is always the small base model
+        # (api_settings.default_model), independent of the workspace's active
+        # selection.  A larger active/downloaded model is loaded lazily as the
+        # on-demand LARGE agent model only when a plan step needs it (see
+        # _detect_large_model / _get_large_llm).  This keeps startup VRAM free
+        # for the small orchestrator model + its worker-pool copies.
+        target_model = api_settings.default_model
+        logger.info(f"[load_model] target={target_model} (orchestrator model)")
 
         # Return cached model if already loaded
         if self._llm is not None and self._model_name == target_model:
@@ -313,8 +325,12 @@ class ModelService:
 
         # Cache the GGUF path so the orchestrator can pass it to LLM worker
         # processes (each process needs to load its own model instance).
+        # Resolve the orchestrator model (target_model) explicitly rather than
+        # the workspace-active model, so the worker pool copies the small
+        # orchestrator model — not a larger active model that's meant to load
+        # lazily on demand.
         try:
-            ws_model = self._model.workspace.get_model()
+            ws_model = self._model.workspace.get_model(target_model)
             model_id = ws_model.model_id if ws_model else ""
             self._model_gguf_path = self._model.workspace.resolve_gguf_path(model_id)
         except Exception:
@@ -328,6 +344,15 @@ class ModelService:
         # Auto-load decision model if configured
         if _settings.decision_model and not self._decision_llm:
             self._load_decision_model(_settings.decision_model)
+
+        # The larger (e.g. 4B) agent model is loaded lazily on first agent use
+        # (see _get_large_llm) rather than eagerly here — it's only needed for
+        # agent/skill tasks, so deferring it keeps startup VRAM free for the
+        # main model + worker pool.  Reset the per-model attempt flag so the
+        # next agent request re-evaluates against the newly active model.
+        self._large_llm = None
+        self._large_model_name = None
+        self._large_model_attempted = False
 
         self._warmup_embeddings()
         self._warmup_inference()
@@ -356,6 +381,200 @@ class ModelService:
             )
             self._decision_llm = None
             self._decision_model_name = None
+
+    def _get_large_llm(self) -> Optional[BaseLLM]:
+        """Return the large (agent) model, loading it lazily on first use.
+
+        Loaded on demand — only when an agent task actually needs it — rather
+        than at startup, so the main model + worker pool own VRAM by default.
+        Attempted at most once per active model (``_large_model_attempted``):
+        if it loads it's cached; if it's absent or skipped for fit we return
+        ``None`` and the caller falls back to the main/decision model.
+        """
+        if self._large_llm is not None:
+            return self._large_llm
+        if self._large_model_attempted:
+            return None
+        self._large_model_attempted = True
+        self._detect_large_model()
+        return self._large_llm
+
+    def _get_llm_for_capability(self, capability: str) -> Optional[BaseLLM]:
+        """Return a loaded LLM matching the requested capability.
+
+        Uses ``workspace.best_model_for(capability)`` to find the best
+        enabled model that declares the capability.  Loads the GGUF
+        lazily and caches the result.  Returns ``None`` when no matching
+        model is available (caller should fall back to the default large
+        model).
+        """
+        if not self._model or not self._model.workspace:
+            return None
+        workspace = self._model.workspace
+        ws_model = workspace.best_model_for(capability)
+        if not ws_model:
+            return None
+        cap_lower = capability.lower()
+        if cap_lower not in [c.lower() for c in ws_model.effective_capabilities]:
+            return None
+
+        cache_key = f"_cap_llm_{ws_model.model_name}"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            return cached
+
+        try:
+            model_dir = workspace.model_dir_for(ws_model.model_id)
+            gguf_path = None
+            if os.path.isdir(model_dir):
+                for f in os.listdir(model_dir):
+                    if f.endswith(".gguf"):
+                        gguf_path = os.path.join(model_dir, f)
+                        break
+            if not gguf_path:
+                return None
+
+            from smartloop.config.app_settings import AppSettings
+            _s = AppSettings()
+            cap = _s.llm_large_n_ctx_cap
+            # Same fit guard as the default large model: skip the capability
+            # (4B) model when it won't fit, so the plan step falls back to the
+            # default routing model instead of OOM-ing.
+            if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
+                return None
+            from smartloop.llms.llm_factory import LlmFactory
+            llm = LlmFactory.get_llama_cpp_instance(
+                gguf_path, logger, self.get_project_id() or "",
+                max_n_ctx=cap,
+            )
+            setattr(self, cache_key, llm)
+            logger.info(
+                "[capability-model] Loaded %s for capability '%s'",
+                ws_model.model_name, capability,
+            )
+            return llm
+        except Exception as e:
+            logger.warning(
+                "[capability-model] Failed to load %s for capability '%s': %s",
+                ws_model.model_name, capability, e,
+            )
+            return None
+
+    @staticmethod
+    def _device_free_total_gb() -> Optional[tuple[float, float]]:
+        """Return (free_gb, total_gb) for the active accelerator, or None.
+
+        None on CPU (RAM is plentiful; no fit guard needed) or when the device
+        can't be queried.
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_b, total_b = torch.cuda.mem_get_info()
+                return free_b / 1024**3, total_b / 1024**3
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                import psutil
+                vm = psutil.virtual_memory()
+                return vm.available / 1024**3, vm.total / 1024**3
+        except Exception:
+            pass
+        return None
+
+    def _large_model_fits(self, gguf_path: str, cap: int, label: str = "") -> bool:
+        """True if a large model's capped footprint fits in free VRAM.
+
+        Estimates the model's footprint (weights + KV cache @ ``cap`` +
+        per-process overhead) and compares it against free device memory after
+        the configured reserve (``llm_large_fit_reserve_gb``).  Always True on
+        CPU (RAM is plentiful) or when the device can't be queried.  When it
+        returns False the caller skips the load and falls back to the default
+        routing model instead of risking an OOM / starving the worker pool.
+        """
+        ft = self._device_free_total_gb()
+        if ft is None:
+            return True
+        free_gb, total_gb = ft
+        try:
+            model_gb = os.path.getsize(gguf_path) / 1024**3
+        except OSError:
+            return True
+        from smartloop.config.app_settings import AppSettings
+        reserve_gb = AppSettings().llm_large_fit_reserve_gb
+        kv_gb = 0.5 * (cap / 4096)
+        footprint_gb = model_gb + kv_gb + 0.7
+        if footprint_gb + reserve_gb > free_gb:
+            logger.warning(
+                "[large-model] %s needs ~%.1fGB (+%.1f reserve) but only %.1fGB "
+                "free of %.1fGB — falling back to the default model. Lower "
+                "SLP_LLM_LARGE_N_CTX_CAP or free VRAM to enable it.",
+                label or os.path.basename(gguf_path),
+                footprint_gb, reserve_gb, free_gb, total_gb,
+            )
+            return False
+        return True
+
+    def _detect_large_model(self) -> None:
+        """Load the largest downloaded model for agent/skill tasks, if it fits.
+
+        Skips the load when the model's capped footprint won't fit in free
+        VRAM (after a reserve for the main model + worker pool), so loading the
+        large model never OOM-crashes the process or starves the workers.  The
+        active (smaller) model stays as the routing LLM.
+        """
+        if self._large_llm is not None:
+            return
+        try:
+            workspace = self._model.workspace
+            # Compare against the orchestrator model (the loaded small model),
+            # not the workspace-active model: the large model is whatever
+            # downloaded model is bigger than the orchestrator model (e.g. the
+            # user's active 4B).
+            orchestrator = workspace.get_model(self._model_name)
+            orchestrator_size = orchestrator.param_size_b if orchestrator else 0
+            largest = workspace.largest_downloaded_model()
+            if not largest or largest.param_size_b <= orchestrator_size:
+                return
+            if largest.model_name == self._model_name:
+                return
+
+            model_dir = workspace.model_dir_for(largest.model_id)
+            gguf_path = None
+            if os.path.isdir(model_dir):
+                for f in os.listdir(model_dir):
+                    if f.endswith(".gguf"):
+                        gguf_path = os.path.join(model_dir, f)
+                        break
+            if not gguf_path:
+                logger.info("[large-model] GGUF not found for %s, skipping", largest.model_name)
+                return
+
+            from smartloop.config.app_settings import AppSettings
+            _s = AppSettings()
+            cap = _s.llm_large_n_ctx_cap
+
+            # Fit guard: skip the load when the large model's capped footprint
+            # won't fit in free VRAM after the reserve.  free VRAM already
+            # excludes the resident main model, so this is the room genuinely
+            # left for the agent model.
+            if not self._large_model_fits(gguf_path, cap, largest.model_name):
+                return
+
+            logger.info(
+                "[large-model] Loading larger model on demand: %s (%.0fB) > router "
+                "%s (%.0fB), n_ctx<=%d — %s",
+                largest.model_name, largest.param_size_b,
+                self._model_name or "?", orchestrator_size, cap, gguf_path,
+            )
+            from smartloop.llms.llm_factory import LlmFactory
+            self._large_llm = LlmFactory.get_llama_cpp_instance(
+                gguf_path, logger, self.get_project_id() or "", max_n_ctx=cap,
+            )
+            self._large_model_name = largest.model_name
+            logger.info("[large-model] Loaded %s for agent/skill tasks", largest.model_name)
+        except Exception as e:
+            logger.warning("[large-model] Failed to load larger model: %s", e)
+            self._large_llm = None
+            self._large_model_name = None
 
     def _warmup_embeddings(self) -> None:
         """Pre-load the embedding model in a background thread."""
@@ -775,6 +994,7 @@ class ModelService:
     def _migrate_servers_to_local(self, project: "Project") -> None:
         """Migrate legacy REMOTE system servers to LOCAL (stdio subprocess)."""
         migrated = False
+        _LAUNCHERS = {"uvx", "npx", "pipx", "deno", "bunx"}
         for server in project.mcp_servers:
             if server.id == FETCH_SERVER_ID and server.server_type == MCPServerType.REMOTE:
                 server.server_type = MCPServerType.LOCAL
@@ -794,6 +1014,23 @@ class ModelService:
                 server.remote_config = None
                 migrated = True
                 logger.info(f"Migrated system tools server to LOCAL on project {project.id}")
+            # Fix stale user-registered local servers saved with empty args
+            # (registered before args validation was enforced). Attempt to
+            # recover using the saved pkg or server name so existing projects
+            # keep working without requiring a manual re-registration.
+            if (
+                server.server_type == MCPServerType.LOCAL
+                and server.config
+                and server.config.command in _LAUNCHERS
+                and not server.config.args
+            ):
+                pkg_name = server.pkg or server.name
+                server.config.args = ["--from", pkg_name, pkg_name]
+                migrated = True
+                logger.info(
+                    "Fixed empty args for local MCP server '%s' → %s %s",
+                    server.name, server.config.command, server.config.args,
+                )
         if migrated:
             self._model.save()
 
@@ -861,7 +1098,7 @@ class ModelService:
         try:
             current_project = self._model.workspace.current_project
             if current_project and current_project.name:
-                return self._read_skills_from_disk(current_project)
+                return current_project.get_skills()
         except Exception as e:
             logger.warning(f"Could not get project skills: {e}")
         return []
@@ -873,67 +1110,40 @@ class ModelService:
         name: Optional[str] = None,
         description: Optional[str] = None,
     ) -> dict:
-        """Add a skill to a project and persist as SKILL.md.
-
-        *description* is always taken directly from user input (or frontmatter)
-        and never generated by the LLM.  The LLM is still used to elaborate the
-        skill body and, when *name* is absent, to derive a short identifier.
-        """
+        """Add a skill to a project and persist as SKILL.md."""
         project = self._get_project(project_id)
 
-        # If content includes frontmatter, extract metadata and strip it.
         body, meta = self._parse_skill_content(content)
-
-        # Resolve the final description from explicit arg or frontmatter — the
-        # LLM must never overwrite what the user stated.
         final_description = description or meta.get("description")
 
-        # Always use the LLM to elaborate the body.  Also generate a name when
-        # neither the caller nor frontmatter supplied one.
-        needs_name = not (name or meta.get("name"))
-        if self._llm is None:
-            self.load_model()
+        resolved_name = name or meta.get("name")
+        already_complete = resolved_name and final_description
 
-        # Eagerly resolve an mcp block from content before asking the LLM,
-        # so the LLM prompt can skip the mcp_call field when already known.
-        eager_mcp_block = None
-        if "```mcp" not in body:
-            eager_mcp_block = self._match_mcp_tool_from_content(body, project)
-            if eager_mcp_block:
-                logger.info("[add_skill] Eager MCP match: %s", eager_mcp_block.split("\n")[1])
+        if already_complete:
+            generated = {}
+        else:
+            if self._llm is None:
+                self.load_model()
+            generated = self._generate_skill_metadata(body, project)
 
-        # Generate elaborated body (and name if needed).  Pass the user's
-        # description so the LLM can use it as context without regenerating it.
-        generated = self._generate_skill_metadata(
-            body, project,
-            skip_mcp_call=eager_mcp_block is not None,
-            user_description=final_description,
-        )
-
-        # LLM elaborated body — always prefer it over the raw input.
         if generated.get("body"):
-            body = generated.pop("body")
+            body = generated["body"]
 
-        # Prefer eager match; fall back to LLM-suggested block.
-        generated_mcp_block = eager_mcp_block or generated.pop("mcp_block", None)
-        if generated_mcp_block and "```mcp" not in body:
-            body = body.rstrip() + "\n\n" + generated_mcp_block
+        mcp_block = generated.get("mcp_block")
+        if mcp_block and "```mcp" not in body:
+            body = body.rstrip() + "\n\n" + mcp_block
 
-        raw_name = name or meta.get("name") or generated.get("name") or self._extract_skill_name(body)
-        sanitized_name = re.sub(r"[^a-z0-9]+", "-", raw_name.lower()).strip("-")
-        if not sanitized_name:
-            sanitized_name = f"skill-{str(uuid4())[:8]}"
+        raw_name = resolved_name or generated.get("name") or self._extract_skill_name(body)
+        sanitized_name = re.sub(r"[^a-z0-9]+", "-", raw_name.lower()).strip("-") or f"skill-{str(uuid4())[:8]}"
 
         skill = Skill(
             id=sanitized_name,
             name=sanitized_name,
-            # Always use the user-supplied description — never the LLM's.
             description=final_description or generated.get("description"),
             content=body,
         )
 
         self._write_skill_md(project, skill)
-
         skill.content = self._render_skill_content(skill)
         return skill.model_dump()
 
@@ -1176,16 +1386,10 @@ class ModelService:
         self,
         content: str,
         project: Optional["Project"] = None,
-        skip_mcp_call: bool = False,
-        user_description: Optional[str] = None,
     ) -> dict:
-        """Evaluate user input and generate skill metadata + formatted body.
+        """Generate skill name, description, elaborated body and optional MCP call block.
 
-        When *user_description* is provided it is injected into the prompt so
-        the LLM uses it as context, but the LLM is NOT asked to generate a new
-        description — the caller will use *user_description* verbatim.
-
-        Returns ``{"name": ..., "description": ..., "body": ..., "mcp_block": ...}``.
+        Returns ``{"name": str, "description": str, "body": str, "mcp_block": str | None}``.
         """
         if self._llm is None:
             logger.warning("No LLM available for skill metadata generation")
@@ -1194,122 +1398,65 @@ class ModelService:
         mcp_catalogue = self._build_mcp_tools_catalogue(project)
         already_has_mcp = "```mcp" in content
 
-        mcp_instruction = ""
-        if mcp_catalogue and not already_has_mcp and not skip_mcp_call:
-            mcp_instruction = f"""
-- "mcp_call": pick the single best matching tool from the list below and return ONLY the \
-bare function call as a plain string value. \
-ONLY include required parameters (shown with their types in the tool list). \
-For parameters whose value is specified in the skill content, use key=value \
-(e.g. "category=bugs"). For parameters whose value must be inferred from the \
-user message at runtime, use the bare parameter name without a value \
-(e.g. "title"). \
-Example: "ServerName.tool_name(title, category=bugs)" — here title is inferred \
-at runtime and category is fixed to "bugs" from the skill content. \
-If no tool clearly matches the skill intent, omit this field entirely. \
-IMPORTANT: match the skill's ACTION — if the skill says "save" or "create", \
-pick a create/save tool, NOT a list/read tool.
+        mcp_field = ""
+        if mcp_catalogue and not already_has_mcp:
+            mcp_field = (
+                '- "mcp_call": the single best matching tool call as a plain string '
+                '(e.g. "ServerName.tool_name(param)"). Use fixed values for params '
+                'known from context; bare param names for runtime values. '
+                'If the skill says "save" or "create", pick a create/save tool, NOT a list/read tool. '
+                'Omit if no tool clearly matches.\n\n'
+                f'{mcp_catalogue}\n'
+            )
 
-{mcp_catalogue}
-"""
+        prompt = (
+            "<system>\n"
+            "You are a skill generator. Given raw user input, output a JSON object.\n"
+            "Reply with ONLY the JSON — no markdown, no explanation.\n"
+            "</system>\n"
+            "<user>\n"
+            "Generate a JSON object with:\n"
+            '- "name": 1-2 word lowercase hyphen-separated identifier derived from the input.\n'
+            '- "description": one sentence in the format "When the user asks to <action>, '
+            '<what this skill does>." that clearly describes when this skill should be '
+            "selected and what it accomplishes.\n"
+            '- "body": expand the input into clear, structured skill instructions. '
+            "Preserve all specific values mentioned. Do NOT invent facts.\n"
+            + mcp_field
+            + f"User input:\n{content[:2000]}\n"
+            "</user>"
+        )
 
-        # Build the prompt skeleton (no content yet) to measure overhead tokens,
-        # then fit skill content into whatever budget remains.
-        _MAX_OUTPUT = 512  # body + metadata JSON
-        _RESERVE = _MAX_OUTPUT + 64   # 64 for chat-template framing
-        n_ctx = self._llm.get_max_tokens() if hasattr(self._llm, "get_max_tokens") else 4096
-        budget = max(512, n_ctx - _RESERVE)
-
-        skeleton = f"""\
-<system>
-You are a skill generator. Evaluate the raw user input, understand what the \
-user wants to accomplish, and output a JSON object with structured skill \
-content and metadata.
-Reply with ONLY the JSON object — no markdown, no explanation.
-
-FORMAT EXAMPLE (do NOT copy — use only to understand the output structure):
-{{"name": "invoice-match", "body": "Compare line items, quantities, and prices between the invoice and purchase order.\\nReport any differences found."}}
-</system>
-<user>
-Evaluate the following user input and generate a JSON object with these fields:
-- "name": 1-2 word lowercase hyphen-separated identifier.
-{"- " + chr(34) + "description" + chr(34) + ": one sentence starting with " + chr(34) + "Use when the user" + chr(34) + " that describes the trigger and action." if not user_description else ""}
-- "body": elaborate the user input into clear, structured skill instructions. \
-Preserve the original intent and all specific values the user mentioned. \
-Expand with helpful steps where appropriate, but do NOT invent facts. \
-{"The skill description is: " + user_description if user_description else ""}
-{mcp_instruction}
-User input:
-</user>"""
-        overhead = self._llm.get_num_tokens(skeleton)
-        content_budget = max(200, budget - overhead)
-        # Truncate at char level first (cheap), then verify token count
-        content_snippet = content[:content_budget * 4]  # ~4 chars/token estimate
-        while self._llm.get_num_tokens(content_snippet) > content_budget and len(content_snippet) > 200:
-            content_snippet = content_snippet[: int(len(content_snippet) * 0.8)]
-
-        prompt = skeleton.replace("User input:\n</user>",
-                                  f"User input:\n{content_snippet}\n</user>")
+        skill_llm = self._get_large_llm() or self._llm
         try:
             with self._inference_lock:
-                raw = str(self._llm.invoke(prompt)).strip()
-            logger.info(f"Skill metadata LLM response: {raw[:200]}")
-            # Strip markdown fences if present
+                raw = str(skill_llm.invoke(prompt)).strip()
+            logger.info("Skill metadata LLM response: %s", raw[:200])
+
+            # Strip markdown fences
             if raw.startswith("```"):
-                raw = "\n".join(
-                    ln for ln in raw.split("\n")
-                    if not ln.strip().startswith("```")
-                ).strip()
-            # Extract JSON object if surrounded by extra text
-            start = raw.find("{")
-            end = raw.rfind("}") + 1
+                raw = "\n".join(ln for ln in raw.split("\n") if not ln.strip().startswith("```")).strip()
+
+            # Extract JSON object
+            start, end = raw.find("{"), raw.rfind("}") + 1
             if start >= 0 and end > start:
                 raw = raw[start:end]
-            # Fix invalid JSON escapes (e.g. \_  \*) that LLMs produce
+
+            # Fix invalid JSON escapes that LLMs produce (e.g. \_ \*)
             raw = re.sub(r'\\([^"\\/bfnrtu])', r'\1', raw)
             meta = json.loads(raw)
 
-            # mcp_call is a bare "server.tool(...)" string; wrap it into a
-            # properly-formed ```mcp fence so the orchestrator can parse it.
+            # Wrap mcp_call string into a fenced ```mcp block
             mcp_call = meta.pop("mcp_call", None)
             if mcp_call:
-                # Strip any accidental fence markers the LLM may have added
                 mcp_call = re.sub(r'```\w*', '', mcp_call).strip()
-                mcp_block = f"```mcp\n{mcp_call}\n```"
-                meta["mcp_block"] = mcp_block
+                meta["mcp_block"] = f"```mcp\n{mcp_call}\n```"
             else:
-                mcp_block = meta.get("mcp_block")
-                if mcp_block:
-                    # Legacy path: model returned full fenced block — normalise
-                    mcp_block = re.sub(r'```\w*', '```', mcp_block).strip()
-                    if not mcp_block.startswith('```mcp'):
-                        mcp_block = '```mcp\n' + mcp_block.lstrip('`').lstrip()
-                    if not mcp_block.endswith('```'):
-                        mcp_block = mcp_block.rstrip() + '\n```'
-                    meta["mcp_block"] = mcp_block
-
-            # Extract tool names from ```mcp blocks (both content and any
-            # newly generated block) and merge into metadata.
-            mcp_sources = [content]
-            if mcp_block:
-                mcp_sources.append(mcp_block)
-            mcp_tool_names = []
-            for src in mcp_sources:
-                for m in re.finditer(r'```mcp\s*\n\s*\w+\.(\w+)\(', src):
-                    mcp_tool_names.append(m.group(1))
-            if mcp_tool_names:
-                existing = meta.get("tools", [])
-                if not isinstance(existing, list):
-                    existing = []
-                merged = list(existing)
-                for t in mcp_tool_names:
-                    if t not in merged:
-                        merged.append(t)
-                meta["tools"] = merged
+                meta.pop("mcp_block", None)
 
             return meta
         except Exception as e:
-            logger.warning(f"Failed to generate skill metadata: {e}")
+            logger.warning("Failed to generate skill metadata: %s", e)
             return {}
 
     @staticmethod
@@ -2546,6 +2693,31 @@ User input:
 
         args = list(args or [])
 
+        # If the caller passed the full command as a single string
+        # (e.g. "uvx yahoo-finance-mcp"), split it into command + args.
+        # Only applies when args is still empty.
+        if not args and " " in command:
+            parts = command.split()
+            command = parts[0]
+            args = parts[1:]
+
+        if not args:
+            raise ValueError(
+                f"'args' is required to register a local MCP server (command='{command}'). "
+                "Provide the package or module name, e.g. args=['yahoo-finance-mcp']."
+            )
+
+        # Normalise bare `uvx <pkg>` → `uvx --from <pkg> <pkg>` so uvx
+        # always knows both the package to install and the executable to run.
+        if (
+            command == "uvx"
+            and len(args) == 1
+            and not args[0].startswith("-")
+            and "--from" not in args
+        ):
+            pkg = args[0]
+            args = ["--from", pkg, pkg]
+
         if name is None:
             # Derive a display name from the package/script, i.e. the first
             # non-flag arg (e.g. "uvx mcp-server-fetch" → "mcp-server-fetch"),
@@ -2580,7 +2752,6 @@ User input:
         except MCPLaunchError as exc:
             # uvx prints hints like "Use `uvx --from <pkg> <exec>` instead" when
             # the package name and executable name differ.  Parse and auto-retry.
-            import re
             hint = re.search(r"Use `uvx (.*?)` instead", str(exc))
             if command == "uvx" and hint:
                 fixed_args = hint.group(1).split()
@@ -2588,6 +2759,15 @@ User input:
                     "Retrying uvx with corrected args %s (original: %s)", fixed_args, args
                 )
                 args = fixed_args
+                if "--from" in fixed_args:
+                    from_idx = fixed_args.index("--from")
+                    fixed_pkg = fixed_args[from_idx + 1] if from_idx + 1 < len(fixed_args) else None
+                else:
+                    fixed_pkg = next((a for a in fixed_args if not a.startswith("-")), None)
+                if fixed_pkg:
+                    server.name = fixed_pkg.split("/")[-1]
+                    server.pkg = server.name
+                    name = server.name
                 server.config = MCPServerConfig(command=command, args=args, env=resolved_env, cwd=resolved_cwd)
                 try:
                     with LocalMCPClient(command=command, args=args, env=resolved_env, cwd=resolved_cwd) as client:
@@ -2598,7 +2778,10 @@ User input:
                         "Could not discover tools from local MCP server '%s' after retry: %s", name, retry_exc
                     )
             else:
-                raise ValueError(str(exc)) from exc
+                result = None
+                logger.warning(
+                    "Could not discover tools from local MCP server '%s': %s", name, exc
+                )
         except Exception as exc:
             result = None
             logger.warning(
@@ -2621,11 +2804,10 @@ User input:
                 "Discovered %d tool(s) from local MCP server '%s'",
                 len(result.tools), name,
             )
-        else:
-            error_msg = result.error if result else "tool discovery failed"
+        elif result is not None:
             logger.warning(
                 "Could not discover tools from local MCP server '%s': %s",
-                name, error_msg,
+                name, result.error or "tool discovery failed",
             )
 
         current_project.mcp_servers.append(server)
@@ -2760,6 +2942,17 @@ User input:
             (s for s in current_project.mcp_servers if s.id == server_id), None
         )
         if server is None:
+            # The server may have been registered by another process since the
+            # last workspace load.  Reload from disk and retry once.
+            self._model.workspace.reload()
+            current_project = next(
+                (p for p in self._model.workspace.projects if p.id == (project_id or (current_project.id if current_project else ""))),
+                current_project,
+            )
+            server = next(
+                (s for s in current_project.mcp_servers if s.id == server_id), None
+            )
+        if server is None:
             raise ValueError(f"MCP server not found: {server_id}")
 
         current_project.mcp_servers = [
@@ -2853,12 +3046,15 @@ User input:
             if s.enabled and s.tools
         ]
 
-        # Extract skill content strings for the orchestrator, including
-        # name/description frontmatter so the explorer can match them.
+        # Always read skills from disk — the single source of truth.
+        # The ``skills`` parameter is accepted for backward compat but
+        # disk takes precedence when available.
+        disk_skills = current_project.get_skills()
+        all_skills = disk_skills or (skills or [])
         skill_contents = None
-        if skills:
+        if all_skills:
             skill_contents = []
-            for s in skills:
+            for s in all_skills:
                 header = f"---\nname: {s.name}\n"
                 if s.description:
                     header += f"description: {s.description}\n"
@@ -2872,11 +3068,20 @@ User input:
         try:
             orchestrator = SLPOrchestrator(
                 orchestrator_llm=self._llm,
-                agent_llm=self._decision_llm,
+                agent_llm=self._decision_llm or self._llm,
+                large_llm_provider=self._get_large_llm,
+                capability_llm_provider=self._get_llm_for_capability,
                 model_path=getattr(self, '_model_gguf_path', None),
                 project_id=self.get_project_id(),
                 executor=self._get_llm_executor(),
             )
+            workspace = self._model.workspace
+            caps: list[str] = []
+            for m in workspace.models:
+                if m.enabled and m.downloaded:
+                    caps.extend(m.effective_capabilities)
+            available_capabilities = list(dict.fromkeys(caps))
+
             result = orchestrator.execute(
                 user_message, eligible_servers,
                 skills=skill_contents, cwd=cwd,
@@ -2884,6 +3089,7 @@ User input:
                 project_dir=visible_project_dir,
                 model_service=self,
                 conversation_history=conversation_history,
+                available_capabilities=available_capabilities or None,
             )
 
             # Save workspace in case tokens were refreshed during the call

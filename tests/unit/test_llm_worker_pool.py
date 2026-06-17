@@ -24,10 +24,11 @@ def _reset_worker_global():
     worker._llm = None
 
 
-def _patch_settings(worker_ctx=8192):
+def _patch_settings(worker_ctx=8192, main_n_ctx_cap=4096):
     s = mock.patch("smartloop.config.app_settings.AppSettings")
     m = s.start()
     m.return_value.llm_worker_n_ctx = worker_ctx
+    m.return_value.llm_main_n_ctx_cap = main_n_ctx_cap
     return s
 
 
@@ -134,9 +135,10 @@ def _patch_cuda(free_gb, total_gb=48.0):
     return patches
 
 
-def _resolve(free_gb, requested, model_gb=2.0, worker_ctx=8192):
-    s = _patch_settings(worker_ctx=worker_ctx)
-    cuda = _patch_cuda(free_gb)
+def _resolve(free_gb, requested, model_gb=2.0, worker_ctx=8192,
+             total_gb=48.0, main_n_ctx_cap=4096):
+    s = _patch_settings(worker_ctx=worker_ctx, main_n_ctx_cap=main_n_ctx_cap)
+    cuda = _patch_cuda(free_gb, total_gb=total_gb)
     size = mock.patch("os.path.getsize", return_value=int(model_gb * 1024 ** 3))
     size.start()
     try:
@@ -170,3 +172,20 @@ def test_resolve_reserve_prevents_packing_all_vram():
     assert _resolve(free_gb=9.0, requested=2) == 2
     # Drop free so usable is just under 2 copies: 8.8 - 1.5 = 7.3 → 1 fits.
     assert _resolve(free_gb=8.8, requested=2) == 1
+
+
+def test_resolve_reserves_main_model_when_not_yet_resident():
+    # Executor built BEFORE the main model loads: total ≈ free, so the main
+    # model's footprint is not yet reflected in usage and must be reserved.
+    # model 0.8GB, main cap 4096 → main_fp = 0.8 + 0.5 + 0.7 = 2.0GB;
+    # per copy = 0.8 + 1.0 + 0.7 = 2.5GB on an 8GB card.
+    # usable = 7.8 - 1.5 reserve - 2.0 main = 4.3 → 1 copy fits.
+    assert _resolve(
+        free_gb=7.8, total_gb=8.0, requested=2, model_gb=0.8
+    ) == 1
+    # Same card AFTER the main model is resident (free dropped by ~2GB): the
+    # footprint is already in `used`, so we don't double-charge it.
+    # usable = 5.8 - 1.5 - 0 = 4.3 → still 1 (not 0); reserve isn't doubled.
+    assert _resolve(
+        free_gb=5.8, total_gb=8.0, requested=2, model_gb=0.8
+    ) == 1

@@ -24,11 +24,11 @@ from smartloop.agents.dag_executor import DAGExecutor
 from smartloop.agents.nodes import (
     DAG, AgentNode, AgentNodeName, NodeResult,
     LLMDecisionNode, TransformNode, SearchNode, ToolCallNode,
-    EnrichNode, SkillMatchNode, CollectNode, RouteNode,
+    SkillMatchNode, CollectNode, RouteNode,
 )
 
 from smartloop.agents.planner import (
-    Planner, StepType, PlanStep,
+    Planner, StepType, PlanStep, ModelTier,
     IntentType, MCPToolContext,
     SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
 )
@@ -63,11 +63,18 @@ class _OrchestratorContext(BaseModel):
     model_service: Any = None
     conversation_history: Optional[list] = None
     has_attachments: bool = False
+    # Built once during context construction:
+    enriched: Optional[Any] = None
     # Populated by handlers as they run:
     mcp_tool_contexts: list = Field(default_factory=list)
     parsed_skills: list = Field(default_factory=list)
-    # Stripped skill body text (set by route handler when skills match)
+    # Stripped skill body text (set by route handler when skills match).
+    # ``skill_context`` is the joined form (used downstream for instruction
+    # enrichment); ``skill_bodies`` keeps each matched skill separate so the
+    # planner can plan across multiple matched skills.
     skill_context: Optional[str] = None
+    skill_bodies: List[str] = Field(default_factory=list)
+    available_capabilities: List[str] = Field(default_factory=list)
 
 class MCPExecutionResult(BaseModel):
     """Result of MCP tool orchestration."""
@@ -99,16 +106,57 @@ class SLPOrchestrator:
     # nothing is dropped.
     DOC_FANOUT_THRESHOLD = 2
 
+    def _llm_for_tier(self, tier: ModelTier, capability: Optional[str] = None) -> BaseLLM:
+        if tier == ModelTier.LARGE:
+            if capability and self._capability_llm_provider is not None:
+                cached = self._capability_cache.get(capability)
+                if cached is not None:
+                    return cached
+                try:
+                    llm = self._capability_llm_provider(capability)
+                    if llm is not None:
+                        self._capability_cache[capability] = llm
+                        return llm
+                except Exception as e:
+                    logger.warning("[models] capability model load failed (%s): %s", capability, e)
+            if self.large_llm is None and self._large_llm_provider is not None:
+                try:
+                    self.large_llm = self._large_llm_provider()
+                except Exception as e:
+                    logger.warning("[models] large model load failed: %s", e)
+                    self.large_llm = None
+            return self.large_llm or self.agent_llm
+        return self.agent_llm
+
+    @staticmethod
+    def _model_label(llm: BaseLLM) -> str:
+        try:
+            meta = llm.model.metadata
+            name = meta.get("general.name", "")
+            size = meta.get("general.size_label", "")
+            if name:
+                return f"{name} ({size})" if size else name
+        except Exception:
+            pass
+        return type(llm).__name__
+
     def __init__(
         self,
         orchestrator_llm: BaseLLM,
         agent_llm: Optional[BaseLLM] = None,
+        large_llm: Optional[BaseLLM] = None,
+        large_llm_provider: Optional[Callable[[], Optional[BaseLLM]]] = None,
+        capability_llm_provider: Optional[Callable[[str], Optional[BaseLLM]]] = None,
         model_path: Optional[str] = None,
         project_id: Optional[str] = None,
         executor: Optional[LLMExecutor] = None,
     ):
         self.orchestrator_llm = orchestrator_llm
         self.agent_llm = agent_llm or orchestrator_llm
+        self.large_llm = large_llm
+        self._large_llm_provider = large_llm_provider
+        self._capability_llm_provider = capability_llm_provider
+        self._capability_cache: Dict[str, BaseLLM] = {}
         self.planner = Planner(self.agent_llm)
         self.arg_extractor = MCPArgumentExtractor(self.agent_llm)
         self.dep_analyzer = MCPDependencyAnalyzer()
@@ -147,9 +195,17 @@ class SLPOrchestrator:
         project_dir: Optional[str] = None,
         model_service: Optional[Any] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        available_capabilities: Optional[List[str]] = None,
     ) -> MCPExecutionResult:
         """Top-level entry point: plan → run → reason."""
         self._skill_report = None
+        logger.info(
+            "[models] response=%s  agent=%s  large=%s",
+            self._model_label(self.orchestrator_llm),
+            self._model_label(self.agent_llm),
+            self._model_label(self.large_llm) if self.large_llm is not None
+            else "(lazy)" if self._large_llm_provider is not None else "(none)",
+        )
         try:
             ctx = self._build_context(
                 user_message=user_message,
@@ -161,6 +217,7 @@ class SLPOrchestrator:
                 project_dir=project_dir,
                 model_service=model_service,
                 conversation_history=conversation_history,
+                available_capabilities=available_capabilities,
             )
             dag, handlers = self.plan(ctx)
             results = self.run(ctx, dag, handlers)
@@ -181,6 +238,7 @@ class SLPOrchestrator:
         project_dir: Optional[str] = None,
         model_service: Optional[Any] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        available_capabilities: Optional[List[str]] = None,
     ) -> _OrchestratorContext:
         """Build the shared orchestrator context from input parameters."""
         available_servers = self._build_available_servers(mcp_servers)
@@ -199,6 +257,11 @@ class SLPOrchestrator:
                 tools=srv.get("tools", []),
             ))
 
+        enriched = self.explorer.enrich(
+            available_mcp_servers=available_servers,
+            conversation_history=conversation_history,
+        )
+
         return _OrchestratorContext(
             user_message=user_message,
             mcp_servers=mcp_servers,
@@ -211,29 +274,27 @@ class SLPOrchestrator:
             conversation_history=conversation_history,
             has_attachments=has_attachments,
             mcp_tool_contexts=mcp_tool_contexts,
+            enriched=enriched,
+            available_capabilities=list(available_capabilities or []),
         )
 
     def plan(self, ctx: _OrchestratorContext) -> tuple:
         """Phase 1: Build the execution DAG from skills, tools, and sources."""
         dag = DAG()
 
-        enrich_node = EnrichNode()
-        dag.add_node(enrich_node)
-
-        skill_match_node = SkillMatchNode(depends_on=[enrich_node])
+        skill_match_node = SkillMatchNode()
         dag.add_node(skill_match_node)
 
-        collect_node = CollectNode(depends_on=[skill_match_node, enrich_node])
+        collect_node = CollectNode(depends_on=[skill_match_node])
         dag.add_node(collect_node)
 
         route_node = RouteNode(
-            depends_on=[skill_match_node, collect_node, enrich_node],
+            depends_on=[skill_match_node, collect_node],
         )
         dag.add_node(route_node)
 
         handlers = self._build_handlers(
             ctx,
-            enrich_node=enrich_node,
             skill_match_node=skill_match_node,
             collect_node=collect_node,
             route_node=route_node,
@@ -275,6 +336,18 @@ class SLPOrchestrator:
                 if c.get("document_name") in allowed or not c.get("document_name")
             ]
 
+        non_explore = [r["content"] for r in accumulated if r["tool_name"] != EXPLORE_TOOL]
+        has_tool_output = any(c for c in non_explore)
+        explore_parts = [r["content"] for r in accumulated if r["tool_name"] == EXPLORE_TOOL]
+        has_explore_output = any(c for c in explore_parts)
+
+        # Citations track which indexed documents contributed to the
+        # response.  Include them when the explore step produced content
+        # (documents were read and fed into the answer).  Suppress them
+        # only when tool output is the sole data source and no documents
+        # were part of the pipeline.
+        keep_citations = has_explore_output
+
         if synthesized:
             return self._build_final_result(
                 ctx=ctx,
@@ -282,19 +355,25 @@ class SLPOrchestrator:
                 tool_names_used=tool_names_used,
                 vector_context=None,
                 tool_context=synthesized,
-                explore_citations=explore_citations,
+                explore_citations=explore_citations if keep_citations else None,
                 is_conversation=is_conversation,
                 is_synthesized=True,
             )
 
+        tool_context = "\n\n---\n\n".join(non_explore) if non_explore else ""
+
+        if tool_context:
+            return self._build_final_result(
+                ctx=ctx,
+                search_ctx=search_ctx,
+                tool_names_used=tool_names_used,
+                vector_context=None,
+                tool_context=tool_context,
+                explore_citations=None,
+                is_conversation=is_conversation,
+            )
+
         vector_context = search_ctx.vector_context
-        tool_context = ""
-
-        non_explore = [r["content"] for r in accumulated if r["tool_name"] != EXPLORE_TOOL]
-        if non_explore:
-            tool_context = "\n\n---\n\n".join(non_explore)
-
-        explore_parts = [r["content"] for r in accumulated if r["tool_name"] == EXPLORE_TOOL]
         if explore_parts and not vector_context:
             vector_context = "\n\n---\n\n".join(explore_parts)
 
@@ -315,39 +394,26 @@ class SLPOrchestrator:
     def _build_handlers(
         self,
         ctx: _OrchestratorContext,
-        enrich_node: EnrichNode,
         skill_match_node: SkillMatchNode,
         collect_node: CollectNode,
         route_node: RouteNode,
     ) -> Dict[str, Callable]:
         """Build the handler map for the initial DAG nodes."""
         return {
-            enrich_node.node_id: lambda deps: self._handle_enrich(ctx, enrich_node),
             skill_match_node.node_id: lambda deps: self._handle_skill_match(ctx, skill_match_node),
             collect_node.node_id: lambda deps: self._handle_collect(
-                ctx, deps, collect_node, skill_match_node, enrich_node,
+                ctx, deps, collect_node, skill_match_node,
             ),
             route_node.node_id: lambda deps: self._handle_route(
-                ctx, deps, route_node, skill_match_node, enrich_node, collect_node,
+                ctx, deps, route_node, skill_match_node, collect_node,
             ),
         }
 
     # ── Individual handlers ──
 
-    def _handle_enrich(self, ctx: _OrchestratorContext, node: EnrichNode) -> NodeResult:
-        """Enrich context with MCP catalogue and conversation history."""
-        enriched = self.explorer.enrich(
-            available_mcp_servers=ctx.available_servers,
-            conversation_history=ctx.conversation_history,
-        )
-
-        if enriched.exploration_steps:
-            logger.info("[explore] enrich: " + " → ".join(enriched.exploration_steps))
-
-        return NodeResult(node_id=node.node_id, success=True, data={"enrich_ctx": enriched})
-
     def _handle_skill_match(self, ctx: _OrchestratorContext, node: SkillMatchNode) -> NodeResult:
         """Parse skill front matter then LLM-match against the user query."""
+        logger.info("[models] SKILL_MATCH → agent_llm: %s", self._model_label(self.agent_llm))
         parsed_skills: List[Dict[str, str]] = []
         for sc in ctx.skills:
             name, desc = "", ""
@@ -374,11 +440,17 @@ class SLPOrchestrator:
                 })
         ctx.parsed_skills = parsed_skills
 
+        _SYSTEM_TOOL_NAMES = {
+            FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL, EXPLORE_TOOL,
+        }
         _has_url = bool(re.search(r'https?://[^\s<>\'")\]]+', ctx.user_message))
-        skills_for_matching = parsed_skills
+        skills_for_matching = [
+            s for s in parsed_skills
+            if s.get("name", "") not in _SYSTEM_TOOL_NAMES
+        ]
         if not _has_url:
             skills_for_matching = [
-                s for s in parsed_skills
+                s for s in skills_for_matching
                 if not any(kw in s.get("name", "").lower() for kw in ("fetch", "browse", "scrape"))
             ]
         matched_skills = self.explorer.match_skills(
@@ -393,11 +465,11 @@ class SLPOrchestrator:
         deps: Dict,
         node: CollectNode,
         skill_match_node: SkillMatchNode,
-        enrich_node: EnrichNode,
     ) -> NodeResult:
         """Vector + workspace + feedback search."""
+        logger.info("[models] COLLECT → no LLM (vector/feedback/workspace search)")
         matched_skills = deps[skill_match_node.node_id].data.get("matched_skills")
-        enriched = deps[enrich_node.node_id].data.get("enrich_ctx")
+        enriched = ctx.enriched
         search_ctx = self.explorer.collect_parallel(
             ctx.user_message, ctx.model_service, ctx.effective_cwd,
             enriched=enriched,
@@ -415,18 +487,19 @@ class SLPOrchestrator:
         deps: Dict,
         node: RouteNode,
         skill_match_node: SkillMatchNode,
-        enrich_node: EnrichNode,
         collect_node: CollectNode,
     ) -> NodeResult:
         """Decision: build the unified pipeline. Dynamically adds downstream nodes."""
+        logger.info("[models] ROUTE (classify+plan) → agent_llm: %s", self._model_label(self.agent_llm))
         matched_skills = deps[skill_match_node.node_id].data.get("matched_skills")
         search_ctx = deps[collect_node.node_id].data.get("search_ctx")
-        enrich_ctx = deps[enrich_node.node_id].data.get("enrich_ctx")
+        enrich_ctx = ctx.enriched
 
         if matched_skills:
-            ctx.skill_context = "\n\n".join(
+            ctx.skill_bodies = [
                 self._strip_skill_frontmatter(s["content"]) for s in matched_skills
-            )
+            ]
+            ctx.skill_context = "\n\n".join(ctx.skill_bodies)
 
         extend_dag: List[tuple] = []
         parent: AgentNode = node
@@ -693,37 +766,57 @@ class SLPOrchestrator:
         Both paths produce a uniform ``List[PlanStep]`` that feeds into
         the same node builders and handlers — no branching downstream.
         """
-        if matched_skills:
-            plan_steps = self._derive_skill_steps(
-                matched_skills, ctx.mcp_tool_contexts, ctx.user_message,
-            )
+        plan_steps = self._derive_steps(ctx, search_ctx, enrich_ctx)
+        if plan_steps:
             logger.info(
-                f"[skill] derived {len(plan_steps)} step(s): "
-                + " → ".join(f"{s.step_type.value}:{s.tool_name}" for s in plan_steps)
+                "[plan] %d step(s): %s",
+                len(plan_steps),
+                " → ".join(
+                    f"{s.step_type.value}:{s.tool_name}[{s.model_tier.value}]"
+                    for s in plan_steps
+                ),
             )
-        else:
-            plan_steps = self._derive_prompt_steps(ctx, search_ctx, enrich_ctx)
 
         return self._build_step_nodes(
             ctx, plan_steps, search_ctx, parent=parent,
         )
 
-    def _derive_prompt_steps(
+    def _derive_steps(
         self,
         ctx: _OrchestratorContext,
         search_ctx: SearchContext,
         enrich_ctx: EnrichedContext,
     ) -> List[PlanStep]:
-        """Derive execution steps from the user prompt (no skill matched)."""
+        """Derive execution steps for any request through one pipeline.
+
+        Whether or not the prompt matched a skill, the request runs the
+        same classify → create_plan flow.  An LLM-matched skill is injected
+        as planning context — its instructions guide step generation — so
+        the planner produces and executes the skill's procedure, instead of
+        taking a separate derivation path.
+        """
         vector_context = search_ctx.vector_context
+
+        # The LLM skill-match already decided which skills (if any) the prompt
+        # maps to.  Feed each matched skill's stripped instructions to the
+        # planner as a distinct entry so it can plan across multiple matched
+        # skills and accumulate their outputs into the final result.  If
+        # nothing matched, plan from the user prompt alone — do NOT dump every
+        # workspace skill back in.
+        planner_skills = ctx.skill_bodies or None
+
+        # Planning is always driven by the user prompt's own classification.
+        # A matched skill only contributes guiding context (planner_skills) —
+        # it does not change the control flow.
         classification = self.planner.classify(
             ctx.user_message,
             mcp_tools=ctx.mcp_tool_contexts,
-            skills=ctx.skills,
+            skills=planner_skills,
             document_context=vector_context or ctx.document_context,
             has_attachments=ctx.has_attachments,
             history=enrich_ctx.history_insight,
             cwd=ctx.effective_cwd,
+            available_capabilities=ctx.available_capabilities or None,
         )
 
         if classification.intent == IntentType.CONVERSATION:
@@ -741,10 +834,9 @@ class SLPOrchestrator:
                     f"indexed context available ({', '.join(sources)}) — exploring"
                 )
 
-        if classification.detected_urls and classification.intent != IntentType.MULTI_STEP:
-            if classification.intent in (IntentType.CONVERSATION, IntentType.TOOL_CALL):
-                classification.intent = IntentType.EXPLORE
-                classification.reasoning = "URL detected — explore handles fetch"
+        if classification.detected_urls and classification.intent == IntentType.CONVERSATION:
+            classification.intent = IntentType.TOOL_CALL
+            classification.reasoning = f"URL detected — deterministic fetch: {classification.detected_urls[0]}"
 
         logger.info(
             f"[classify] {classification.intent.value}: "
@@ -757,7 +849,7 @@ class SLPOrchestrator:
         plan_context = self.planner.build_context(
             ctx.user_message, ctx.available_servers,
             cwd=ctx.effective_cwd,
-            skills=ctx.skills,
+            skills=planner_skills,
             document_context=vector_context or ctx.document_context,
         )
         plan = self.planner.create_plan(classification, plan_context)
@@ -765,7 +857,66 @@ class SLPOrchestrator:
             plan.steps = self.explorer.resolve_fetch_steps(
                 plan.steps, ctx.available_servers, ctx.user_message
             )
+
+        # When a matched skill has ```mcp blocks, inject those as explicit
+        # TOOL steps so the skill's tool calls actually execute.
+        has_skill = bool(ctx.skill_context)
+        if has_skill and hasattr(self, '_matched_skills') and self._matched_skills:
+            mcp_steps = self._steps_from_skill_mcp_blocks(
+                self._matched_skills, plan.steps, ctx.user_message,
+            )
+            if mcp_steps:
+                plan.steps.extend(mcp_steps)
+
+        detected_capability = classification.capability
+        for step in plan.steps:
+            if has_skill and step.step_type == StepType.TOOL:
+                step.model_tier = ModelTier.LARGE
+                step.capability = detected_capability or "skills"
+            else:
+                step.model_tier = ModelTier.SMALL
+                if detected_capability:
+                    step.capability = detected_capability
+
         return plan.steps
+
+    def _steps_from_skill_mcp_blocks(
+        self,
+        matched_skills: List[Dict],
+        existing_steps: List[PlanStep],
+        user_message: str,
+    ) -> List[PlanStep]:
+        """Convert ```mcp blocks from matched skills into PlanStep objects."""
+        existing_tools = {s.tool_name for s in existing_steps if s.tool_name}
+        steps: List[PlanStep] = []
+        step_num = max((s.step for s in existing_steps), default=0)
+
+        for sk in matched_skills:
+            for block in sk.get("mcp_blocks", []):
+                tool_name = block["tool_name"]
+                if tool_name in existing_tools:
+                    continue
+                step_num += 1
+                steps.append(PlanStep(
+                    step=step_num,
+                    step_type=StepType.TOOL,
+                    tool_name=tool_name,
+                    server_id="",
+                    server_name=block["server_name"],
+                    instruction=f"Call {block['server_name']}.{tool_name} as specified by the skill.",
+                    default_args=block.get("default_args"),
+                    inferred_args=block.get("inferred_args"),
+                    for_each=block.get("for_each"),
+                    skill_name=sk.get("name"),
+                ))
+                existing_tools.add(tool_name)
+                logger.info(
+                    "[skill-mcp] Injected step %d: %s.%s (inferred=%s, default=%s, for_each=%s)",
+                    step_num, block["server_name"], tool_name,
+                    block.get("inferred_args"), block.get("default_args"),
+                    block.get("for_each"),
+                )
+        return steps
 
     def _build_step_nodes(
         self,
@@ -918,7 +1069,14 @@ Assess whether these search results are relevant to the user's request. If relev
 </user>"""
 
                 try:
-                    result = str(self.agent_llm.invoke(analyze_prompt)).strip()
+                    step_llm = self._llm_for_tier(step.model_tier, step.capability)
+                    logger.info(
+                        "[models] ANALYZE(%s) → %s%s: %s",
+                        step.step, step.model_tier.value,
+                        f"/{step.capability}" if step.capability else "",
+                        self._model_label(step_llm),
+                    )
+                    result = str(step_llm.invoke(analyze_prompt)).strip()
                     if result == "NOT_RELEVANT" or len(result) < 20:
                         logger.info("[analyze] context deemed not relevant — passing through raw")
                         return self._step_result(node_id, step, explore_content, explore_content)
@@ -951,9 +1109,13 @@ Assess whether these search results are relevant to the user's request. If relev
                     condition=step.condition,
                 )
 
+            exec_llm = self._llm_for_tier(step.model_tier, step.capability)
             logger.info(
-                f"[step] {step.step} [{step.step_type.value}] "
-                f"{step.server_name}/{step.tool_name}: {step.instruction}"
+                "[models] EXEC(%s/%s) → %s%s: %s",
+                step.step, step.step_type.value,
+                step.model_tier.value,
+                f"/{step.capability}" if step.capability else "",
+                self._model_label(exec_llm),
             )
 
             result = self._execute_step(
@@ -966,6 +1128,7 @@ Assess whether these search results are relevant to the user's request. If relev
                 document_context=ctx.document_context,
                 project_dir=ctx.project_dir,
                 model_service=ctx.model_service,
+                llm=exec_llm,
             )
 
             if result:
@@ -988,6 +1151,13 @@ Assess whether these search results are relevant to the user's request. If relev
         Works uniformly for both skill-derived and prompt-derived steps.
         Uses ``ctx.skill_context`` for condition extraction when available.
         """
+        step_llm = self._llm_for_tier(step.model_tier, step.capability)
+        logger.info(
+            "[models] RESOLVE(%s) → %s%s: %s",
+            step.tool_name, step.model_tier.value,
+            f"/{step.capability}" if step.capability else "",
+            self._model_label(step_llm),
+        )
         def handler(deps: Dict) -> NodeResult:
             prev_results = self._collect_raw_from_deps(deps)
             node_id = f"step_{step.step}_{step.tool_name or step.step_type.value}_resolve"
@@ -1023,6 +1193,7 @@ Assess whether these search results are relevant to the user's request. If relev
                 available_servers=ctx.available_servers,
                 cwd=ctx.effective_cwd,
                 previous_results=prev_results if prev_results else None,
+                llm=step_llm,
             )
 
             if resolved is None:
@@ -1054,6 +1225,7 @@ Assess whether these search results are relevant to the user's request. If relev
         Reads resolved arguments from the resolve node and calls the tool.
         No LLM needed — just an API call.
         """
+        logger.info("[models] EXECUTE(%s) → no LLM (MCP tool call)", step.tool_name)
         def handler(deps: Dict) -> NodeResult:
             node_id = f"step_{step.step}_{step.tool_name or step.step_type.value}_execute"
 
@@ -1066,7 +1238,8 @@ Assess whether these search results are relevant to the user's request. If relev
 
             if not resolve_data or resolve_data.get("skip"):
                 tool_name = resolve_data.get("tool_name", step.tool_name or step.step_type.value) if resolve_data else (step.tool_name or step.step_type.value)
-                return self._step_result(node_id, step, "")
+                fail_msg = f"Tool '{tool_name}' skipped — could not resolve arguments." if step.skill_name else ""
+                return self._step_result(node_id, step, fail_msg)
 
             tool_name = resolve_data["tool_name"]
             server_id = resolve_data["server_id"]
@@ -1076,11 +1249,13 @@ Assess whether these search results are relevant to the user's request. If relev
             server = self.tool_caller.find_server(ctx.mcp_servers, server_id, server_id)
             if not server:
                 logger.warning(f"[execute] Server not found for {tool_name} (id={server_id})")
-                return self._step_result(node_id, step, "")
+                fail_msg = f"Tool '{tool_name}' failed: server not found." if step.skill_name else ""
+                return self._step_result(node_id, step, fail_msg)
 
             result = self._call_tool(server, tool_name, arguments, cwd=ctx.effective_cwd)
             if result is None:
-                return self._step_result(node_id, step, "")
+                fail_msg = f"Tool '{tool_name}' call failed — no result returned." if step.skill_name else ""
+                return self._step_result(node_id, step, fail_msg)
 
             formatted, raw = result
             return self._step_result(node_id, step, formatted, raw)
@@ -1314,6 +1489,7 @@ Assess whether these search results are relevant to the user's request. If relev
         Collects all upstream step outputs.  When skill context is
         available, synthesizes them into one coherent document.
         """
+        logger.info("[models] REASON → agent_llm: %s", self._model_label(self.agent_llm))
         def handler(deps: Dict) -> NodeResult:
             all_accumulated: List[Dict[str, Any]] = []
             tool_results: List[Dict[str, Any]] = []
@@ -1445,7 +1621,7 @@ Is this context relevant to the user's request?
         tool_context = self._strip_tool_code_blocks(tool_context)
 
         if tool_context:
-            context_parts.append(f"TOOL RESULTS:\n{tool_context}")
+            context_parts.append(tool_context)
             logger.info(f"[collect] tool results: {len(tool_context)} chars")
 
         # Skill tool results are already in EXPLORE output when skill_context
@@ -1472,24 +1648,29 @@ Is this context relevant to the user's request?
                 f"[collect] analysis findings: {len(clean_report)} chars"
             )
 
-        feedback_context = search_ctx.feedback_context
-        workspace_context = search_ctx.workspace_context
+        # When live tool results exist, they are authoritative — suppress
+        # pre-plan search context (vector, feedback, workspace) so stale
+        # indexed content and internal metadata (tool names, skill bodies)
+        # don't leak into the response.
+        if not tool_context:
+            feedback_context = search_ctx.feedback_context
+            workspace_context = search_ctx.workspace_context
 
-        if vector_context and not is_conversation:
-            if not tool_context or vector_context not in tool_context:
-                context_parts.append(vector_context)
-                logger.info(f"[collect] documents: {len(vector_context)} chars")
+            if vector_context and not is_conversation:
+                if not tool_context or vector_context not in tool_context:
+                    context_parts.append(vector_context)
+                    logger.info(f"[collect] documents: {len(vector_context)} chars")
 
-        # Feedback/workspace are bundled in EXPLORE output when skill_context
-        # is set; only add separately for the prompt-derived path.
-        if not has_skill:
-            if feedback_context and not is_conversation:
-                context_parts.append(f"FEEDBACK Q&A:\n{feedback_context}")
-                logger.info(f"[collect] feedback: {len(feedback_context)} chars")
+            # Feedback/workspace are bundled in EXPLORE output when skill_context
+            # is set; only add separately for the prompt-derived path.
+            if not has_skill:
+                if feedback_context and not is_conversation:
+                    context_parts.append(f"FEEDBACK Q&A:\n{feedback_context}")
+                    logger.info(f"[collect] feedback: {len(feedback_context)} chars")
 
-            if workspace_context and not is_conversation:
-                context_parts.append(f"WORKSPACE FILES:\n{workspace_context}")
-                logger.info(f"[collect] workspace: {len(workspace_context)} chars")
+                if workspace_context and not is_conversation:
+                    context_parts.append(f"WORKSPACE FILES:\n{workspace_context}")
+                    logger.info(f"[collect] workspace: {len(workspace_context)} chars")
 
         if not context_parts and not has_skill:
             logger.info("[collect] No context gathered — conversation only")
@@ -1531,7 +1712,7 @@ Is this context relevant to the user's request?
             tool_name=all_tool_names[-1],
             server_name=SYSTEM_TOOLS_SERVER_NAME,
             tool_names=all_tool_names,
-            citations=explore_citations,
+            citations=doc_citations,
         )
 
     @staticmethod
@@ -1635,300 +1816,6 @@ Is this context relevant to the user's request?
         if cwd:
             parts.append(f"WORKING DIRECTORY: {cwd}")
         return "\n\n".join(parts)
-
-    # ================================================================== #
-    # Skill pipeline helpers (kept for derive/fallback logic)             #
-    # ================================================================== #
-
-    def _derive_skill_steps(
-        self,
-        matched_skills: List[Dict[str, str]],
-        mcp_tool_contexts: List["MCPToolContext"],
-        user_message: str,
-    ) -> List[PlanStep]:
-        """Derive execution steps from skill content.
-
-        Priority order:
-        1. Explicit ``## skill_map`` section → parse directly
-        2. ``\u0060\u0060\u0060mcp`` blocks → deterministic tool steps
-        3. Natural language → LLM extracts steps
-
-        Always prepends an EXPLORE step (to gather document data) before
-        any tool steps, unless the skill_map already includes one.
-        ANALYZE is no longer a separate step — reasoning happens in
-        the reason node.
-        """
-        # Try explicit skill_map first
-        for sk in matched_skills:
-            skill_map = sk.get("skill_map", [])
-            if skill_map:
-                steps = self._skill_map_to_plan_steps(
-                    skill_map, sk["name"], mcp_tool_contexts,
-                )
-                if steps:
-                    logger.info(
-                        f"[skill] using explicit skill_map from '{sk['name']}' "
-                        f"({len(steps)} steps)"
-                    )
-                    return self._ensure_explore_and_analyze(steps)
-
-        # Try ```mcp blocks
-        for sk in matched_skills:
-            mcp_blocks = sk.get("mcp_blocks", [])
-            logger.info(
-                f"[skill] '{sk['name']}' has {len(mcp_blocks)} mcp_block(s)"
-            )
-            if mcp_blocks:
-                steps = self._mcp_blocks_to_plan_steps(
-                    mcp_blocks, sk["name"], mcp_tool_contexts,
-                )
-                if steps:
-                    logger.info(
-                        f"[skill] using mcp_blocks from '{sk['name']}' "
-                        f"({len(steps)} steps)"
-                    )
-                    return self._ensure_explore_and_analyze(steps)
-
-        # Fall back: LLM derives steps from skill natural language
-        return self._derive_steps_from_content(
-            matched_skills, mcp_tool_contexts, user_message,
-        )
-
-    def _derive_steps_from_content(
-        self,
-        matched_skills: List[Dict[str, str]],
-        mcp_tool_contexts: List["MCPToolContext"],
-        user_message: str,
-    ) -> List[PlanStep]:
-        """Use the LLM to derive execution steps from skill prose.
-
-        Asks the decision LLM to produce a simple step list, then
-        converts it to ``PlanStep`` objects.
-        """
-        skill_content = "\n\n".join(s["content"] for s in matched_skills)
-
-        # Build available tools list for the LLM
-        available_tools: List[str] = []
-        tool_server: Dict[str, tuple] = {}
-        for srv in mcp_tool_contexts:
-            for tool in srv.tools:
-                t_name = tool.get("name", "")
-                if t_name:
-                    available_tools.append(f"{t_name} (server: {srv.server_name})")
-                    if t_name not in tool_server:
-                        tool_server[t_name] = (srv.server_id, srv.server_name)
-
-        tools_section = "\n".join(f"  - {t}" for t in available_tools)
-
-        prompt = (
-            "<system>\n"
-            "You convert skill instructions into execution steps.\n"
-            "Return ONLY a JSON array. Each element must be an object with these keys:\n"
-            '  step_type: "explore" or "tool"\n'
-            "  tool: tool name (use exact names from the tools list)\n"
-            "  instruction: what this step does\n"
-            "  default_args: (optional) if the skill specifies fixed/default values "
-            "for tool arguments, include them as a flat JSON object\n"
-            "  for_each: (optional boolean) true if this tool should be called once per item "
-            "extracted from upstream results (e.g. 'for each ticker, call get_info')\n\n"
-            "Example output:\n"
-            '[{"step_type":"explore","tool":"explore","instruction":"Gather relevant data"},'
-            '{"step_type":"tool","tool":"create_item","instruction":"Create item with results",'
-            '"default_args":{"category":"bugs"},"for_each":true}]\n'
-            "</system>\n"
-            "<user>\n"
-            f"Skill instructions:\n{skill_content}\n\n"
-            f"Available tools:\n{tools_section}\n\n"
-            f"User request: {user_message}\n"
-            "</user>"
-        )
-
-        try:
-            response = str(self.agent_llm.invoke(prompt)).strip()
-            logger.info(f"[skill] LLM step derivation: {response[:200]}")
-
-            # Parse JSON from response
-            import json as _json
-            from json_repair import repair_json
-            json_match = re.search(r'\[.*\]', response, re.DOTALL)
-            if json_match:
-                # Small local models routinely emit slightly malformed JSON
-                # (missing comma/quote). Always repair before parsing so we
-                # keep the skill-derived steps instead of dropping to fallback.
-                raw_steps = _json.loads(repair_json(json_match.group()))
-                # Skip if the LLM returned a list of strings instead of objects
-                if raw_steps and not isinstance(raw_steps[0], dict):
-                    logger.info("[skill] LLM returned non-object steps, falling back")
-                    return self._fallback_skill_steps(matched_skills, mcp_tool_contexts)
-                steps: List[PlanStep] = []
-                for i, s in enumerate(raw_steps[:6]):
-                    step_type_str = s.get("step_type", "tool")
-                    step_type = {
-                        "explore": StepType.EXPLORE,
-                        "analyze": StepType.ANALYZE,
-                        "tool": StepType.TOOL,
-                        "action": StepType.ACTION,
-                    }.get(step_type_str, StepType.TOOL)
-
-                    tool_name = s.get("tool", "") or ""
-                    server_id = SYSTEM_TOOLS_SERVER_ID
-                    server_name = SYSTEM_TOOLS_SERVER_NAME
-                    if tool_name in tool_server:
-                        server_id, server_name = tool_server[tool_name]
-                    else:
-                        # Case-insensitive fallback
-                        for ts_name, ts_info in tool_server.items():
-                            if ts_name.lower() == tool_name.lower():
-                                tool_name = ts_name  # use canonical name
-                                server_id, server_name = ts_info
-                                break
-                        # LLM may provide server name hint
-                        if server_id == SYSTEM_TOOLS_SERVER_ID:
-                            llm_server = s.get("server", "")
-                            if llm_server:
-                                for srv in mcp_tool_contexts:
-                                    if (llm_server.lower() in srv.server_name.lower()
-                                            or srv.server_name.lower() in llm_server.lower()):
-                                        server_id = srv.server_id
-                                        server_name = srv.server_name
-                                        break
-                    if step_type == StepType.EXPLORE and not tool_name:
-                        tool_name = EXPLORE_TOOL
-                    # ``explore`` is an internal pseudo-step, not an MCP call.
-                    if tool_name == EXPLORE_TOOL:
-                        step_type = StepType.EXPLORE
-                        server_id = SYSTEM_TOOLS_SERVER_ID
-                        server_name = SYSTEM_TOOLS_SERVER_NAME
-
-                    # A TOOL step must name a real MCP tool. A small local model
-                    # otherwise invents symbolic tools (e.g. 'provide_url',
-                    # 'execute_fetch') that map to no MCP server and blow up at
-                    # resolve time. Skip them so we follow the actual skills +
-                    # MCP tools we have. EXPLORE/ANALYZE are internal pseudo-steps
-                    # and are exempt.
-                    if step_type == StepType.TOOL and tool_name not in tool_server:
-                        logger.info(
-                            f"[skill] dropping step with unknown tool '{tool_name}' "
-                            "(not in MCP catalogue)"
-                        )
-                        continue
-
-                    # LLM may provide fixed default args from skill body
-                    step_defaults = s.get("default_args")
-                    if step_defaults and not isinstance(step_defaults, dict):
-                        step_defaults = None
-
-                    steps.append(PlanStep(
-                        step=i + 1,
-                        step_type=step_type,
-                        tool_name=tool_name,
-                        server_id=server_id,
-                        server_name=server_name,
-                        instruction=s.get("instruction", ""),
-                        condition=s.get("condition"),
-                        default_args=step_defaults,
-                        for_each=s.get("for_each") or None,
-                    ))
-                # Renumber
-                for idx, s in enumerate(steps):
-                    s.step = idx + 1
-                if steps:
-                    return steps
-        except Exception as e:
-            logger.warning(f"[skill] LLM step derivation failed: {e}")
-
-        # Fallback: explore → tool calls
-        logger.info("[skill] falling back to default explore → tools")
-        return self._fallback_skill_steps(matched_skills, mcp_tool_contexts)
-
-    def _fallback_skill_steps(
-        self,
-        matched_skills: List[Dict[str, str]],
-        mcp_tool_contexts: List["MCPToolContext"],
-    ) -> List[PlanStep]:
-        """Build default skill steps: explore → tool calls."""
-        steps: List[PlanStep] = [
-            PlanStep(
-                step=1,
-                step_type=StepType.EXPLORE,
-                tool_name=EXPLORE_TOOL,
-                server_id=SYSTEM_TOOLS_SERVER_ID,
-                server_name=SYSTEM_TOOLS_SERVER_NAME,
-                instruction="Gather relevant document data.",
-            ),
-            PlanStep(
-                step=2,
-                step_type=StepType.ANALYZE,
-                tool_name=None,
-                server_id="",
-                server_name="",
-                instruction="Assess relevance of search results to user request.",
-            ),
-        ]
-
-        # Add tool steps — tool names come from the skill front matter
-        # (generated by the LLM at skill creation time) and are read by
-        # explorer.extract_tool_names().
-        tool_names = self.explorer.extract_tool_names(
-            matched_skills, mcp_tool_contexts,
-        )
-        tool_names = [t for t in tool_names if t != "fetch"]
-
-        tool_server: Dict[str, tuple] = {}
-        for srv in mcp_tool_contexts:
-            for tool in srv.tools:
-                t_name = tool.get("name", "")
-                if t_name and t_name not in tool_server:
-                    tool_server[t_name] = (srv.server_id, srv.server_name)
-
-        for i, tool_name in enumerate(tool_names):
-            sid, sname = tool_server.get(tool_name, ("", ""))
-            if not sid:
-                hint = self._find_server_hint_in_skills(matched_skills, tool_name)
-                if hint:
-                    for srv in mcp_tool_contexts:
-                        if (hint.lower() in srv.server_name.lower()
-                                or hint.lower() in srv.server_id.lower()):
-                            sid, sname = srv.server_id, srv.server_name
-                            break
-            # Extract default_args (key=value pairs) from skill text
-            defaults = self._extract_default_args_from_skills(
-                matched_skills, tool_name,
-            )
-            steps.append(PlanStep(
-                step=len(steps) + 1,
-                step_type=StepType.TOOL,
-                tool_name=tool_name,
-                server_id=sid,
-                server_name=sname,
-                instruction=f"Execute {tool_name}",
-                default_args=defaults if defaults else None,
-            ))
-
-        return steps
-
-    @staticmethod
-    def _ensure_explore_and_analyze(steps: List[PlanStep]) -> List[PlanStep]:
-        """Prepend an EXPLORE step when TOOL steps need upstream document data.
-
-        Skill steps form a linked list — each step sees the previous
-        step's output.  TOOL steps need the document context as an
-        explicit predecessor so their handlers receive it via
-        ``prev_results``.
-        """
-        has_tool = any(s.step_type == StepType.TOOL for s in steps)
-        has_explore = any(s.step_type == StepType.EXPLORE for s in steps)
-        if has_tool and not has_explore:
-            explore = PlanStep(
-                step=0,
-                step_type=StepType.EXPLORE,
-                tool_name=EXPLORE_TOOL,
-                instruction="Gather document data for downstream tool calls",
-            )
-            steps = [explore] + steps
-            for i, s in enumerate(steps):
-                s.step = i + 1
-        return steps
 
     def _extract_tool_condition_from_text(
         self,
@@ -2139,7 +2026,9 @@ Is this context relevant to the user's request?
         )
 
         try:
-            result = str(self.agent_llm.invoke(prompt)).strip()
+            synth_llm = self._llm_for_tier(ModelTier.LARGE)
+            logger.info("[models] SYNTHESIZE → %s: %s", ModelTier.LARGE.value, self._model_label(synth_llm))
+            result = str(synth_llm.invoke(prompt)).strip()
             if result:
                 logger.info(
                     f"[synthesize] produced {len(result)} chars "
@@ -2246,7 +2135,11 @@ Is this context relevant to the user's request?
                             continue
                         if "=" in token:
                             key, _, value = token.partition("=")
-                            default_args[key.strip()] = value.strip()
+                            value = value.strip()
+                            if value.startswith("<") and value.endswith(">"):
+                                inferred_args.append(key.strip())
+                            else:
+                                default_args[key.strip()] = value
                         else:
                             inferred_args.append(token)
 
@@ -2371,203 +2264,6 @@ Is this context relevant to the user's request?
         # Unknown format — execute unconditionally
         return True
 
-
-    def _skill_map_to_plan_steps(
-        self,
-        skill_map: List[Dict[str, str]],
-        skill_name: str,
-        mcp_tool_contexts: List["MCPToolContext"],
-    ) -> List[PlanStep]:
-        """Convert a parsed skill_map into ``PlanStep`` objects.
-
-        Resolves tool names to server_ids from available MCP contexts.
-        """
-        # Build tool→server lookup
-        tool_server_map: Dict[str, tuple] = {}
-        for srv in mcp_tool_contexts:
-            for tool in srv.tools:
-                t_name = tool.get("name", "")
-                if t_name and t_name not in tool_server_map:
-                    tool_server_map[t_name] = (srv.server_id, srv.server_name)
-
-        steps: List[PlanStep] = []
-        for i, entry in enumerate(skill_map[:5]):
-            tool_name = entry.get("tool", "")
-            server_hint = entry.get("server", "")
-            instruction = entry.get("instruction", "")
-            condition = entry.get("condition") or None
-            raw_step_type = entry.get("step_type", "tool")
-
-            # Resolve server
-            server_id = SYSTEM_TOOLS_SERVER_ID
-            server_name = SYSTEM_TOOLS_SERVER_NAME
-            if tool_name in tool_server_map:
-                server_id, server_name = tool_server_map[tool_name]
-            elif server_hint:
-                # Try matching server hint against known servers
-                for srv in mcp_tool_contexts:
-                    if (server_hint.lower() in srv.server_name.lower()
-                            or server_hint.lower() in srv.server_id.lower()):
-                        server_id = srv.server_id
-                        server_name = srv.server_name
-                        break
-
-            # Determine step type. Built-in file/grep/bash tools run as
-            # ordinary TOOL steps against the local smartloop MCP server;
-            # only ``explore`` is an internal pseudo-step.
-            step_type = StepType.TOOL
-            if raw_step_type == "action":
-                step_type = StepType.ACTION
-            elif raw_step_type == "explore":
-                step_type = StepType.EXPLORE
-            elif raw_step_type == "conversational":
-                step_type = StepType.CONVERSATIONAL
-            elif tool_name == EXPLORE_TOOL:
-                step_type = StepType.EXPLORE
-
-            # The built-in file/grep/bash tools are real MCP tools on the
-            # smartloop server — run them as TOOL steps even if the model
-            # mislabelled the step as "action".
-            if step_type == StepType.ACTION and tool_name in (
-                FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL,
-            ):
-                step_type = StepType.TOOL
-                server_id = SYSTEM_TOOLS_SERVER_ID
-                server_name = SYSTEM_TOOLS_SERVER_NAME
-            elif tool_name == EXPLORE_TOOL:
-                step_type = StepType.EXPLORE
-
-            steps.append(PlanStep(
-                step=i + 1,
-                step_type=step_type,
-                tool_name=tool_name,
-                server_id=server_id,
-                server_name=server_name,
-                instruction=instruction,
-                condition=condition,
-                skill_name=skill_name,
-            ))
-
-        return steps
-
-    @staticmethod
-    def _mcp_blocks_to_plan_steps(
-        mcp_blocks: List[Dict],
-        skill_name: str,
-        mcp_tool_contexts: List["MCPToolContext"],
-    ) -> List[PlanStep]:
-        """Convert parsed ``\u0060\u0060\u0060mcp`` blocks into ``PlanStep`` objects.
-
-        Resolves each block's ``server_name`` against available MCP
-        servers (case-insensitive).  If the server or tool is not
-        found the block is skipped with a warning — no ``PlanStep``
-        is created.
-        """
-        steps: List[PlanStep] = []
-        for block in mcp_blocks:
-            srv_name = block["server_name"]
-            tool_name = block["tool_name"]
-
-            # Resolve server:
-            # 1. Exact name match
-            # 2. Substring match (skill ref contained in server name or id)
-            # 3. Tool-based fallback — find any server that exposes the tool
-            srv_ctx = None
-            srv_lower = srv_name.lower()
-            for srv in mcp_tool_contexts:
-                if srv.server_name.lower() == srv_lower:
-                    srv_ctx = srv
-                    break
-            if srv_ctx is None:
-                for srv in mcp_tool_contexts:
-                    if (srv_lower in srv.server_name.lower()
-                            or srv_lower in srv.server_id.lower()):
-                        srv_ctx = srv
-                        break
-            if srv_ctx is None:
-                # Fallback: find the server that actually has this tool.
-                # Allows skill authors to use short aliases (e.g. "yfmcp")
-                # regardless of the registered server name.
-                for srv in mcp_tool_contexts:
-                    if any(t.get("name", "") == tool_name for t in srv.tools):
-                        srv_ctx = srv
-                        logger.info(
-                            f"[mcp-block] Server alias '{srv_name}' unresolved — "
-                            f"matched via tool '{tool_name}' on '{srv.server_name}'"
-                        )
-                        break
-            if srv_ctx is None:
-                logger.warning(
-                    f"[mcp-block] Server '{srv_name}' not found and tool "
-                    f"'{tool_name}' not in any server — skipping"
-                )
-                continue
-
-            # Verify the tool exists on this server
-            tool_schema = None
-            for t in srv_ctx.tools:
-                if t.get("name", "") == tool_name:
-                    tool_schema = t
-                    break
-            if tool_schema is None:
-                logger.warning(
-                    f"[mcp-block] Tool '{tool_name}' not found on server "
-                    f"'{srv_ctx.server_name}' — skipping"
-                )
-                continue
-
-            # Validate default_args keys against the tool's input schema.
-            # Fix typos by fuzzy-matching against known property names;
-            # drop keys that don't match anything.
-            raw_defaults = block.get("default_args", {})
-            schema_props = (tool_schema.get("input_schema") or {}).get("properties", {})
-            validated_defaults: Dict[str, str] = {}
-            if raw_defaults and schema_props:
-                import difflib
-                prop_names = list(schema_props.keys())
-                for dk, dv in raw_defaults.items():
-                    if dk in schema_props:
-                        validated_defaults[dk] = dv
-                    else:
-                        matches = difflib.get_close_matches(
-                            dk, prop_names, n=1, cutoff=0.6,
-                        )
-                        if matches:
-                            best = matches[0]
-                            logger.info(
-                                f"[mcp-block] Corrected default arg "
-                                f"'{dk}' → '{best}' for {tool_name}"
-                            )
-                            validated_defaults[best] = dv
-                        else:
-                            logger.warning(
-                                f"[mcp-block] Default arg '{dk}' not in "
-                                f"{tool_name} schema — dropping"
-                            )
-            elif raw_defaults:
-                # No schema properties to validate against — keep as-is
-                validated_defaults = dict(raw_defaults)
-
-            inferred_desc = ", ".join(block["inferred_args"]) if block["inferred_args"] else ""
-            instruction = f"Call {tool_name}"
-            if inferred_desc:
-                instruction += f" (extract: {inferred_desc})"
-
-            steps.append(PlanStep(
-                step=len(steps) + 1,
-                step_type=StepType.TOOL,
-                tool_name=tool_name,
-                server_id=srv_ctx.server_id,
-                server_name=srv_ctx.server_name,
-                instruction=instruction,
-                skill_name=skill_name,
-                default_args=validated_defaults if validated_defaults else None,
-                inferred_args=block["inferred_args"] if block["inferred_args"] else None,
-                for_each=block.get("for_each") or None,
-            ))
-
-        return steps
-
     @staticmethod
     def _group_independent_steps(
         steps: List[PlanStep],
@@ -2624,6 +2320,7 @@ Is this context relevant to the user's request?
         document_context: Optional[str] = None,
         project_dir: Optional[str] = None,
         model_service: Optional[Any] = None,
+        llm: Optional[BaseLLM] = None,
     ) -> Optional[tuple]:
         tool_name = step.tool_name or ""
         has_explicit_tool = bool(step.tool_name)
@@ -2905,6 +2602,7 @@ Is this context relevant to the user's request?
                 tool_name=tool_name,
                 input_schema=input_schema,
                 resolved_ids=resolved_ids,
+                llm=llm,
             )
         else:
             arguments = self.arg_extractor.invoke(
@@ -2912,6 +2610,7 @@ Is this context relevant to the user's request?
                 tool_name=tool_name,
                 input_schema=input_schema,
                 previous_tool_results=previous_results,
+                llm=llm,
             )
 
         missing = arguments.pop('_missing_params', None)
@@ -3032,6 +2731,7 @@ Is this context relevant to the user's request?
         available_servers: List[Dict[str, Any]],
         cwd: Optional[str],
         previous_results: Optional[List[Dict[str, Any]]] = None,
+        llm: Optional[BaseLLM] = None,
     ) -> Optional[tuple]:
         """Resolve tool arguments: find server, run deps, extract args.
 
@@ -3324,12 +3024,41 @@ Is this context relevant to the user's request?
         # parameters are needed; the user message + previous results
         # provide the values.
 
-        if resolved_ids:
+        # Try to fill all required params deterministically before invoking
+        # the LLM.  When every required param is a URL and the URL is in the
+        # user message, skip the LLM extraction entirely.
+        required_params_pre = input_schema.get('required', [])
+        properties_pre = input_schema.get('properties', {})
+        default_keys = set(step.default_args or {})
+        deterministic_args = {}
+        all_deterministic = bool(required_params_pre)
+        for pn in required_params_pre:
+            if pn in default_keys:
+                continue
+            pi = properties_pre.get(pn, {})
+            if self.arg_extractor._is_url_parameter(pn, pi):
+                urls = self.arg_extractor._extract_urls_from_text(user_message)
+                if not urls:
+                    urls = self.arg_extractor._extract_urls_from_text(directive)
+                if urls:
+                    deterministic_args[pn] = urls[0]
+                    continue
+            all_deterministic = False
+            break
+
+        if all_deterministic and deterministic_args:
+            arguments = deterministic_args
+            logger.info(
+                "[resolve] '%s' all required params filled deterministically: %s",
+                tool_name, arguments,
+            )
+        elif resolved_ids:
             arguments = self.arg_extractor.invoke_with_resolved_ids(
                 user_input=extraction_input,
                 tool_name=tool_name,
                 input_schema=input_schema,
                 resolved_ids=resolved_ids,
+                llm=llm,
             )
         else:
             arguments = self.arg_extractor.invoke(
@@ -3337,6 +3066,7 @@ Is this context relevant to the user's request?
                 tool_name=tool_name,
                 input_schema=input_schema,
                 previous_tool_results=previous_results,
+                llm=llm,
             )
 
         # Merge skill-level default args.  When the step originates from
@@ -3359,6 +3089,31 @@ Is this context relevant to the user's request?
 
         required_params = input_schema.get('required', [])
         properties = input_schema.get('properties', {})
+
+        # Deterministically fill a missing file-write `content` from the data
+        # accumulated by upstream steps.  The content to write IS the prior
+        # step output (fetched page, generated text, analysis report) — asking
+        # a small model to regurgitate a large blob back into a JSON string is
+        # unreliable and was leaving `content` empty, so the step got skipped.
+        # Passing the accumulated data through directly is the whole point of
+        # the fetch → generate → write chain.
+        if (tool_name == FILE_WRITE_TOOL
+                and 'content' in required_params
+                and not arguments.get('content')
+                and previous_results):
+            accumulated = "\n\n".join(
+                str(r.get('result', '')).strip()
+                for r in previous_results
+                if str(r.get('result', '')).strip()
+            )
+            if accumulated:
+                arguments['content'] = accumulated
+                logger.info(
+                    f"[resolve] '{tool_name}' filled 'content' from "
+                    f"{len(previous_results)} accumulated step result(s) "
+                    f"({len(accumulated)} chars)"
+                )
+
         still_missing = []
         for param_name in required_params:
             val = arguments.get(param_name)

@@ -75,10 +75,15 @@ async def _register_local_mcp_server(
     """
     if not request.command:
         raise HTTPException(status_code=400, detail="'command' is required for local servers")
+    if not request.args:
+        raise HTTPException(
+            status_code=400,
+            detail="'args' is required for local servers (e.g. args=['yahoo-finance-mcp'] for uvx, or args=['-m', 'module'] for python)",
+        )
     try:
         result = model_service.add_local_mcp_server(
             command=request.command,
-            args=request.args or [],
+            args=request.args,
             name=request.name,
             env=request.env or {},
             cwd=request.cwd,

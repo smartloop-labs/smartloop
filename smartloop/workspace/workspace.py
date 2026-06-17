@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Set, List
@@ -135,6 +136,8 @@ class WorkspaceModel(BaseModel):
     model_id: str          # HF id e.g. "google/gemma-3-1b-it"
     downloaded: bool = False
     is_active: bool = False
+    enabled: bool = True
+    capabilities: List[str] = Field(default_factory=list)
     config: Optional[ModelConfig] = None
     models_dir: str = Field(default="", exclude=True)
 
@@ -158,6 +161,46 @@ class WorkspaceModel(BaseModel):
         if not self.models_dir:
             return ""
         return os.path.join(self.bin_dir, f"{Path(self.model_id).name}.gguf")
+
+    @property
+    def param_size_b(self) -> float:
+        """Parse parameter count in billions from model_name or model_id.
+
+        Examples: 'gemma3-1b' → 1.0, 'google/gemma-3-4b-it' → 4.0
+        """
+        import re
+        for src in (self.model_name, self.model_id):
+            m = re.search(r'(\d+(?:\.\d+)?)\s*[bB]', src)
+            if m:
+                return float(m.group(1))
+        return 0.0
+
+    @property
+    def effective_capabilities(self) -> List[str]:
+        """Return capabilities: user-set if present, otherwise inferred from model metadata."""
+        if self.capabilities:
+            return self.capabilities
+        return self._infer_capabilities()
+
+    def _infer_capabilities(self) -> List[str]:
+        combined = f"{self.model_name} {self.model_id}".lower()
+        caps: List[str] = []
+        size = self.param_size_b
+
+        caps.append("general")
+
+        if any(kw in combined for kw in ("code", "coder", "starcoder", "deepseek-coder")):
+            caps.append("coding")
+
+        if any(kw in combined for kw in ("vision", "vlm", "vl")):
+            caps.append("vision")
+        elif not re.search(r"[-_]text", combined) and "gemma" in combined and size >= 4:
+            caps.append("vision")
+
+        if size >= 3:
+            caps.append("skills")
+
+        return caps
 
 class Skill(BaseModel):
     id: str
@@ -193,6 +236,39 @@ class Project (BaseModel):
         return os.path.expanduser(
             os.path.join("~/smartloop", self.name or self.id)
         )
+
+    def get_skills(self) -> List["Skill"]:
+        """Read skills from disk (SKILL.md files), the single source of truth."""
+        skills_dir = os.path.join(self.visible_dir, "skills")
+        if not os.path.isdir(skills_dir):
+            return []
+        result: List[Skill] = []
+        for entry in sorted(os.listdir(skills_dir)):
+            entry_path = os.path.join(skills_dir, entry)
+            if not os.path.isdir(entry_path):
+                continue
+            skill_path = os.path.join(entry_path, "SKILL.md")
+            if not os.path.isfile(skill_path):
+                continue
+            try:
+                raw = open(skill_path, encoding="utf-8").read()
+            except Exception:
+                continue
+            name = entry
+            description = None
+            if raw.startswith("---"):
+                parts = raw.split("---", 2)
+                if len(parts) >= 3:
+                    for line in parts[1].strip().splitlines():
+                        if line.startswith("name:"):
+                            name = line[len("name:"):].strip()
+                        elif line.startswith("description:"):
+                            description = line[len("description:"):].strip()
+            result.append(Skill(
+                id=name, name=name, description=description,
+                content=raw,
+            ))
+        return result
 
     @property
     def folder_name(self) -> str:
@@ -243,6 +319,14 @@ class Workspace(BaseModel):
         for m in self.models:
             m.is_active = (m.model_name == model_name)
 
+    def set_model_enabled(self, model_name: str, enabled: bool) -> None:
+        """Enable or disable a model. Raises ValueError if not found."""
+        for m in self.models:
+            if m.model_name == model_name:
+                m.enabled = enabled
+                return
+        raise ValueError(f"Model not found: {model_name}")
+
     def get_model(self, model_name: Optional[str] = None) -> Optional[WorkspaceModel]:
         """Look up a registered model by its short name.
 
@@ -287,6 +371,36 @@ class Workspace(BaseModel):
         self.models.append(entry)
         return entry
 
+    def largest_downloaded_model(self) -> Optional[WorkspaceModel]:
+        """Return the largest enabled, downloaded model by parameter count, or None."""
+        candidates = [m for m in self.models if m.enabled and m.downloaded and m.param_size_b > 0]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda m: m.param_size_b, reverse=True)
+        best = candidates[0]
+        best.models_dir = self.models_dir
+        return best
+
+    def best_model_for(self, capability: str) -> Optional[WorkspaceModel]:
+        """Return the best enabled, downloaded model matching a capability.
+
+        Prefers the largest model that declares the capability (user-set
+        or inferred). Falls back to ``largest_downloaded_model`` when no
+        model matches.
+        """
+        cap = capability.lower()
+        candidates = [
+            m for m in self.models
+            if m.enabled and m.downloaded and m.param_size_b > 0
+            and cap in [c.lower() for c in m.effective_capabilities]
+        ]
+        if not candidates:
+            return self.largest_downloaded_model()
+        candidates.sort(key=lambda m: m.param_size_b, reverse=True)
+        best = candidates[0]
+        best.models_dir = self.models_dir
+        return best
+
     def model_dir_for(self, model_id: str) -> str:
         """Return the workspace-level directory for a given model_id."""
         return os.path.join(self.models_dir, model_id)
@@ -297,7 +411,15 @@ class Workspace(BaseModel):
 
     def resolve_gguf_path(self, model_id: str) -> str:
         """Cascade: quantize-matched bin GGUF → exact bin GGUF → exact workspace GGUF → first GGUF in model dir."""
-        ws_model = self.get_model()
+        # Honor the requested model_id for the bin_dir cascade (fall back to the
+        # active model) so resolving a non-active model — e.g. the small
+        # orchestrator model while a larger model is active — returns that
+        # model's GGUF, not the active one's.
+        ws_model = next((m for m in self.models if m.model_id == model_id), None)
+        if ws_model is not None:
+            ws_model.models_dir = self.models_dir
+        else:
+            ws_model = self.get_model()
         if ws_model and ws_model.bin_dir and os.path.isdir(ws_model.bin_dir):
             quantize = (ws_model.config.quantize if ws_model.config else "").upper()
             gguf_files = [f for f in os.listdir(ws_model.bin_dir) if f.endswith(".gguf")]

@@ -55,7 +55,6 @@ async def fetch(
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
         response = await client.get(url, headers=headers)
         response.raise_for_status()
-
     content_type = response.headers.get("content-type", "")
     text = response.text
 

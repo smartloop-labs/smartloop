@@ -82,9 +82,23 @@ class AppSettings(BaseSettings):
     # whole device; capping it leaves room for the worker copies to share the
     # GPU.  Only caps (never raises) the auto-sized value.
     llm_main_n_ctx_cap: int = Field(
-        default=8192,
+        default=4096,
         validation_alias="slp_llm_main_n_ctx_cap",
         description="Max context for the main model when the worker pool is active.",
+    )
+    # Cap applied to the large (agent) model's auto-sized context, and the
+    # reserve kept free so loading it doesn't starve the main model + worker
+    # pool.  The large model is loaded lazily on first agent use only if its
+    # capped footprint fits in free VRAM after this reserve.
+    llm_large_n_ctx_cap: int = Field(
+        default=8192,
+        validation_alias="slp_llm_large_n_ctx_cap",
+        description="Max context for the large (agent) model when lazily loaded.",
+    )
+    llm_large_fit_reserve_gb: float = Field(
+        default=1.0,
+        validation_alias="slp_llm_large_fit_reserve_gb",
+        description="VRAM (GB) kept free when fit-checking the large agent model.",
     )
     # Optional hard cap on characters fed to the per-document fan-out extractor.
     # 0 (default) = no fixed cap: the budget is derived from the extraction

@@ -39,16 +39,28 @@ class MCPToolCaller:
                 env=server.config.env,
                 cwd=cwd or server.config.cwd,
             ) as client:
-                return client.call_tool(tool_name, arguments)
+                result = client.call_tool(tool_name, arguments)
+                if not result.success:
+                    logger.error(
+                        "[tool_caller] Local tool '%s' on server '%s' failed: %s",
+                        tool_name, server.name, result.error,
+                    )
+                return result
         else:
             server_url = self.get_server_url(server)
             with MCPClient() as client:
-                return client.call_tool(
+                result = client.call_tool(
                     server_url=server_url,
                     tool_name=tool_name,
                     arguments=arguments,
                     access_token=access_token,
                 )
+                if not result.success:
+                    logger.error(
+                        "[tool_caller] Remote tool '%s' on server '%s' (%s) failed: %s",
+                        tool_name, server.name, server_url, result.error,
+                    )
+                return result
 
     def find_server(
         self,

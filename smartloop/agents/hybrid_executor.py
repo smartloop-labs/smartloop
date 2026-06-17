@@ -51,6 +51,22 @@ class LLMExecutor:
             # over-allocating nor leave the GPU underutilized.
             effective_workers = self._resolve_worker_count(model_path, n_llm_workers)
 
+            if effective_workers <= 1:
+                # A single worker copy is just a duplicate of the already-loaded
+                # main model on the same device.  On one GPU those copies don't
+                # run concurrently anyway (the driver serializes kernels across
+                # processes without CUDA MPS), so an extra copy only multiplies
+                # weights + KV memory and load time for no throughput gain.
+                # Skip the pool and reuse the shared model — concurrency still
+                # comes from n_parallel continuous batching within that one
+                # instance, and ``submit_llm`` falls back to it.
+                logger.info(
+                    "Skipping LLM worker pool — reusing the shared model "
+                    "(1 copy is enough on this device; extra copies serialize "
+                    "on a single GPU). Concurrency comes from n_parallel batching."
+                )
+                return
+
             # Use the "spawn" start method, not the Linux default "fork".
             # The parent process has already initialized CUDA (torch), and a
             # forked child cannot re-initialize CUDA ("Cannot re-initialize
@@ -80,12 +96,37 @@ class LLMExecutor:
         workers don't crash on load.  Extra free memory never raises the count
         above ``requested``.  The estimate is deliberately conservative since
         under-counting a worker's footprint crashes the last copy to load.
+
+        On GPUs the count is also capped at one copy per GPU: separate
+        processes can't run GPU kernels concurrently on the same device (the
+        driver serializes them without CUDA MPS), so the parallel ceiling is
+        ``torch.cuda.device_count()`` (1 for MPS).  A single GPU therefore caps
+        at 1 and the caller reuses the shared model.  CPU has no such cap —
+        independent cores give real parallelism, sized by memory below.
         """
         try:
+            # One model copy per GPU is the most that can run in parallel on
+            # CUDA; same-GPU copies serialize.  MPS is a single device.  CPU is
+            # uncapped here (cores parallelize) → memory is the only limit.
+            gpu_cap: int | None = None
+            if torch.cuda.is_available():
+                gpu_cap = max(1, torch.cuda.device_count())
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                gpu_cap = 1
+            if gpu_cap is not None and gpu_cap < requested:
+                logger.info(
+                    "[device] %d GPU(s) — capping worker copies at one per GPU "
+                    "(%d); same-GPU copies serialize. Concurrency within a GPU "
+                    "comes from n_parallel continuous batching.",
+                    gpu_cap, gpu_cap,
+                )
+                requested = gpu_cap
+
             model_gb = os.path.getsize(model_path) / (1024 ** 3)
 
             from smartloop.config.app_settings import AppSettings
-            worker_ctx = AppSettings().llm_worker_n_ctx
+            _settings = AppSettings()
+            worker_ctx = _settings.llm_worker_n_ctx
             # Per-copy footprint: weights + KV cache + per-process overhead.
             # The estimate is deliberately conservative — under-counting any
             # term makes ``fits`` round up to a worker that then fails
@@ -95,6 +136,13 @@ class LLMExecutor:
             # KV estimate scales with worker_ctx (~0.5GB / 4k tokens).
             kv_gb = 0.5 * (worker_ctx / 4096)
             per_copy_gb = model_gb + kv_gb + 0.7
+
+            # The main model is the dominant consumer (weights + a KV cache
+            # sized to ``llm_main_n_ctx_cap``), and a flat reserve badly
+            # under-counts it — that's what let this over-provision workers and
+            # OOM the last copy.  Estimate its footprint the same way as a copy.
+            main_kv_gb = 0.5 * (_settings.llm_main_n_ctx_cap / 4096)
+            main_footprint_gb = model_gb + main_kv_gb + 0.7
 
             # Resolve (device_label, free_gb, total_gb, reserve_gb) for whichever
             # accelerator is active.  reserve keeps memory for the main model,
@@ -120,7 +168,16 @@ class LLMExecutor:
                 device, total_gb = "CPU", vm.total / 1024**3
                 free_gb, reserve_gb = vm.available / 1024**3, 2.0
 
-            usable_gb = max(0.0, free_gb - reserve_gb)
+            # Charge for the main model only to the extent it isn't already
+            # resident.  ``mem_get_info`` is timing-dependent: if the executor
+            # is built *after* the model loads, ``free_gb`` already excludes it
+            # (already_used covers it → unaccounted ≈ 0); if built *before*,
+            # already_used ≈ 0 so we reserve the full footprint.  Either way we
+            # never double-charge and never ignore it.
+            already_used_gb = max(0.0, total_gb - free_gb)
+            unaccounted_main_gb = max(0.0, main_footprint_gb - already_used_gb)
+
+            usable_gb = max(0.0, free_gb - reserve_gb - unaccounted_main_gb)
             fits = int(usable_gb // per_copy_gb) if per_copy_gb > 0 else 0
             # Never spawn more than requested: free VRAM is not a reason to
             # exceed the configured parallelism, and capping here removes the
@@ -130,8 +187,10 @@ class LLMExecutor:
 
             logger.info(
                 f"[device] {device}: {free_gb:.1f}GB free / {total_gb:.1f}GB total "
-                f"(reserve {reserve_gb:.1f}GB). Per worker copy ~{per_copy_gb:.2f}GB "
-                f"(weights {model_gb:.2f} + KV {kv_gb:.2f} @ n_ctx<={worker_ctx} + 0.7). "
+                f"(reserve {reserve_gb:.1f}GB + main ~{unaccounted_main_gb:.2f}GB "
+                f"unaccounted of {main_footprint_gb:.2f}GB). Per worker copy "
+                f"~{per_copy_gb:.2f}GB (weights {model_gb:.2f} + KV {kv_gb:.2f} "
+                f"@ n_ctx<={worker_ctx} + 0.7). "
                 f"Fits ~{fits} copy(ies); requested {requested} → using {effective}."
             )
             if effective != requested:
@@ -160,14 +219,19 @@ class LLMExecutor:
         return self._io_pool.submit(fn, *args, **kwargs)
 
     def submit_llm(self, prompt: str):
-        """Submit LLM inference to the process pool.
+        """Submit LLM inference to the worker process pool.
 
-        Falls back to the thread pool when the process pool is disabled
-        (``n_llm_workers=0``).
+        Only valid when a pool exists — callers must gate on ``has_llm_pool``
+        and otherwise run inference on the shared in-process model.  (The
+        workers' model lives in their own processes; ``run_inference`` has no
+        model to use in the main process, so there is no in-process fallback.)
         """
-        if self._llm_pool is not None:
-            return self._llm_pool.submit(run_inference, prompt)
-        return self._io_pool.submit(run_inference, prompt)
+        if self._llm_pool is None:
+            raise RuntimeError(
+                "submit_llm called without a worker pool; gate on has_llm_pool "
+                "and use the shared in-process model instead."
+            )
+        return self._llm_pool.submit(run_inference, prompt)
 
     # -- Lifecycle ----------------------------------------------------------
 

@@ -90,16 +90,6 @@ def _clear_progress() -> None:
 def _base_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
-
-def _configure_server_logging(log_file: Path) -> None:
-    root = logging.getLogger()
-    root.handlers.clear()
-    handler = logging.FileHandler(log_file, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    root.addHandler(handler)
-    root.setLevel(logging.INFO)
-
-
 def _print_server_log_tail(log_file: Path, lines: int = 15) -> None:
     try:
         tail = log_file.read_text(errors="replace").splitlines()[-lines:]
@@ -109,7 +99,6 @@ def _print_server_log_tail(log_file: Path, lines: int = 15) -> None:
         console.print("[dim]--- server.log (tail) ---[/dim]")
         for line in tail:
             console.print(f"[dim]{line}[/dim]")
-
 
 def _require_server(host: str, port: int) -> bool:
     if port and is_server_running(host, port):
@@ -319,7 +308,6 @@ def cmd_agent(args, host: str, port: int) -> None:
         else:
             home_dir = Path(settings.home_dir)
             home_dir.mkdir(parents=True, exist_ok=True)
-            _configure_server_logging(home_dir / "server.log")
             start_server(host, port, service=not getattr(args, "no_service", False))
     elif sub == "stop":
         stop_server()
@@ -337,7 +325,6 @@ def cmd_agent(args, host: str, port: int) -> None:
         time.sleep(1)
         home_dir = Path(settings.home_dir)
         home_dir.mkdir(parents=True, exist_ok=True)
-        _configure_server_logging(home_dir / "server.log")
         start_server(host, port, service=not getattr(args, "no_service", False))
 
 

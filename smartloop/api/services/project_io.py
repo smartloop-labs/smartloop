@@ -318,7 +318,7 @@ def import_project(zip_path: Path, name: Optional[str] = None) -> dict:
             "description": new_project.description,
             "current": new_project.current,
             "system": new_project.system,
-            "skills": [s.model_dump(mode="json") for s in new_project.skills],
+            "skills": [s.model_dump(mode="json") for s in new_project.get_skills()],
             "mcp": [m.model_dump(mode="json") for m in new_project.mcp_servers],
             "documents": [
                 {"id": d.id, "path": d.path, "status": d.status.value, "summary": d.summary}

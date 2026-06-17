@@ -182,15 +182,102 @@ class ModelEntry(BaseModel):
     description: str | None = None
     access_level: str | None = None
     is_accessible: bool = False
+    enabled: bool = True
+    capabilities: list[str] = []
 
 
 @router.get("/models", response_model=list[ModelEntry])
-async def list_models():
-    """List available models from the cloud API."""
+async def list_models(
+    model_service: ModelService = Depends(get_model_service),
+):
+    """List available models from the cloud API, enriched with workspace state."""
     settings = AppSettings()
     client = SLPPlatformClient(settings.slp_api_base)
 
     try:
-        return client.list_models()
+        models = client.list_models()
     except ConnectionError:
         raise HTTPException(status_code=502, detail="Platform API unavailable")
+
+    try:
+        workspace = model_service._ensure_workspace()
+        ws_lookup = {m.model_name: m for m in workspace.models}
+    except Exception:
+        ws_lookup = {}
+
+    result = []
+    for m in models:
+        entry = ModelEntry(**m) if isinstance(m, dict) else m
+        ws_model = ws_lookup.get(entry.name)
+        if ws_model:
+            entry.enabled = ws_model.enabled
+            entry.capabilities = ws_model.effective_capabilities
+        result.append(entry)
+    return result
+
+
+class WorkspaceModelEntry(BaseModel):
+    model_name: str
+    model_id: str
+    downloaded: bool
+    is_active: bool
+    enabled: bool
+    capabilities: list[str] = []
+
+
+@router.get("/models/workspace", response_model=list[WorkspaceModelEntry])
+async def list_workspace_models(
+    model_service: ModelService = Depends(get_model_service),
+):
+    """List models registered in the local workspace."""
+    try:
+        workspace = model_service._ensure_workspace()
+        return [
+            WorkspaceModelEntry(
+                model_name=m.model_name,
+                model_id=m.model_id,
+                downloaded=m.downloaded,
+                is_active=m.is_active,
+                enabled=m.enabled,
+                capabilities=m.effective_capabilities,
+            )
+            for m in workspace.models
+        ]
+    except Exception as e:
+        logger.exception("Error listing workspace models")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class _UpdateWorkspaceModelRequest(BaseModel):
+    enabled: bool | None = None
+    capabilities: list[str] | None = None
+
+
+@router.patch("/models/workspace/{model_name}")
+async def update_workspace_model(
+    model_name: str,
+    request: _UpdateWorkspaceModelRequest,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Update a workspace model's enabled state and/or capabilities."""
+    try:
+        workspace = model_service._ensure_workspace()
+        model = workspace.get_model(model_name)
+        if model is None:
+            raise ValueError(f"Model not found: {model_name}")
+        if request.enabled is not None:
+            model.enabled = request.enabled
+        if request.capabilities is not None:
+            model.capabilities = request.capabilities
+        workspace.save()
+        return {
+            "status": "ok",
+            "model_name": model_name,
+            "enabled": model.enabled,
+            "capabilities": model.capabilities,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error updating workspace model")
+        raise HTTPException(status_code=500, detail=str(e))

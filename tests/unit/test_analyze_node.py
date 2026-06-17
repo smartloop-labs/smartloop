@@ -166,19 +166,3 @@ class TestAnalyzeHandler:
         assert result.success is True
         # Raw explore content is passed through on failure
         assert result.data["content"] == "Some explore content."
-
-
-class TestFallbackSkillStepsIncludesAnalyze:
-    """Verify that _fallback_skill_steps includes ANALYZE after EXPLORE."""
-
-    def test_fallback_steps_contain_analyze(self, orchestrator):
-        steps = orchestrator._fallback_skill_steps(
-            matched_skills=[],
-            mcp_tool_contexts=[],
-        )
-        step_types = [s.step_type for s in steps]
-        assert StepType.EXPLORE in step_types
-        assert StepType.ANALYZE in step_types
-        explore_idx = step_types.index(StepType.EXPLORE)
-        analyze_idx = step_types.index(StepType.ANALYZE)
-        assert analyze_idx == explore_idx + 1

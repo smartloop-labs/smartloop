@@ -106,56 +106,6 @@ class TestParseMcpBlocksForEach:
 
 
 # ------------------------------------------------------------------ #
-# _mcp_blocks_to_plan_steps: for_each propagation                     #
-# ------------------------------------------------------------------ #
-
-class TestMcpBlocksToPlanStepsForEach:
-    def _tool_contexts(self):
-        from smartloop.agents.planner import MCPToolContext
-        return [MCPToolContext(
-            server_id="yfinance-srv",
-            server_name="yfinance",
-            tools=[{
-                "name": "get_ticker_info",
-                "description": "Get ticker info",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"symbol": {"type": "string"}},
-                    "required": ["symbol"],
-                },
-            }],
-        )]
-
-    def test_for_each_propagated_to_plan_step(self):
-        blocks = [{
-            "server_name": "yfinance",
-            "tool_name": "get_ticker_info",
-            "inferred_args": ["symbol"],
-            "default_args": {},
-            "for_each": True,
-        }]
-        steps = SLPOrchestrator._mcp_blocks_to_plan_steps(
-            blocks, "fund-info", self._tool_contexts(),
-        )
-        assert len(steps) == 1
-        assert steps[0].for_each is True
-
-    def test_for_each_absent_remains_none(self):
-        blocks = [{
-            "server_name": "yfinance",
-            "tool_name": "get_ticker_info",
-            "inferred_args": ["symbol"],
-            "default_args": {},
-            "for_each": False,
-        }]
-        steps = SLPOrchestrator._mcp_blocks_to_plan_steps(
-            blocks, "fund-info", self._tool_contexts(),
-        )
-        assert len(steps) == 1
-        assert steps[0].for_each is None
-
-
-# ------------------------------------------------------------------ #
 # _build_step_nodes: fan-out node creation                            #
 # ------------------------------------------------------------------ #
 

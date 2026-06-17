@@ -281,7 +281,14 @@ class TestClassifyPlanExecutePipeline:
         assert "Tailored Requirements" in written
 
     def test_single_tool_call_fetch(self, tmp_workspace, fetch_server):
-        """URL only → EXPLORE (explore handles fetch internally)."""
+        """URL → deterministic TOOL_CALL via DAG: resolve → execute → reason.
+
+        Verifies:
+        1. The full DAG pipeline runs (plan → run → reason).
+        2. The fetch tool is called with the URL argument.
+        3. Pre-plan search context (vector_context, citations) is suppressed
+           from the final result when live tool output exists.
+        """
         mock_llm = MagicMock()
         mock_llm.get_num_tokens = MagicMock(return_value=100)
         mock_llm.get_max_tokens = MagicMock(return_value=4096)
@@ -294,8 +301,11 @@ class TestClassifyPlanExecutePipeline:
             content=[{"type": "text", "text": JOB_DESCRIPTION_HTML}],
         )
 
+        # Pre-plan search returns document context + citations — these
+        # must NOT appear in the final result when tool output exists.
         job_ctx = SearchContext()
-        job_ctx.vector_context = JOB_DESCRIPTION_HTML
+        job_ctx.vector_context = "Unrelated indexed document content"
+        job_ctx.citations = [{"document_id": "doc-1", "document_name": "old.pdf"}]
 
         with patch.object(orchestrator.explorer, "collect_parallel", return_value=job_ctx), \
              patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch_result):
@@ -306,7 +316,9 @@ class TestClassifyPlanExecutePipeline:
             )
 
         assert result.handled is True
-        assert "explore" in result.tool_names
+        assert "fetch" in result.tool_names
+        assert result.citations is None
+        assert "Unrelated indexed document" not in (result.content or "")
 
     def test_single_action_read(self, tmp_workspace):
         """File path → ACTION(read) → single read step (deterministic)."""
@@ -420,4 +432,4 @@ class TestClassifyPlanExecutePipeline:
             )
 
         assert result.handled is True
-        assert "explore" in result.tool_names
+        assert "fetch" in result.tool_names

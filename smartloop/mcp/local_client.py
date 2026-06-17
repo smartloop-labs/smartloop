@@ -93,9 +93,33 @@ class LocalMCPClient:
 
         return self.command
 
+    def _is_builtin_module(self) -> bool:
+        return (
+            len(self.args) >= 2
+            and self.args[0] == "-m"
+            and self.args[1].startswith("smartloop.")
+        )
+
     def __enter__(self) -> "LocalMCPClient":
+        if not self.args:
+            raise MCPLaunchError(
+                f"Cannot launch MCP server: command '{self.command}' has no arguments. "
+                "Provide at least the module or package name (e.g. args=['-m', 'smartloop.api.mcp.system_server'] "
+                "or args=['yahoo-finance-mcp'])."
+            )
+
         merged_env = {**os.environ, **self.env}
         resolved_command = self._resolve_command(merged_env)
+
+        if self._is_builtin_module():
+            import smartloop as _pkg
+            pkg_root = os.path.dirname(os.path.dirname(_pkg.__file__))
+            existing = merged_env.get("PYTHONPATH", "")
+            if pkg_root not in existing.split(os.pathsep):
+                merged_env["PYTHONPATH"] = (
+                    pkg_root + os.pathsep + existing if existing else pkg_root
+                )
+
         self._process = subprocess.Popen(
             [resolved_command, *self.args],
             stdin=subprocess.PIPE,
@@ -106,6 +130,31 @@ class LocalMCPClient:
             text=True,
             bufsize=1,
         )
+
+        # For external processes (uvx, npx, …) give the launcher a moment to
+        # either start the MCP server or fail visibly.  Built-in modules start
+        # in-process and don't need this guard.
+        if not self._is_builtin_module():
+            # Poll up to 2 s in 50 ms steps waiting for the process to either
+            # become an MCP server (still alive → break) or exit immediately.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+                code = self._process.poll()
+                if code is None:
+                    # Still running — assume the MCP server is ready.
+                    break
+                # Process exited — read all available stderr and raise now so
+                # the caller (model_service's hint-retry logic) can inspect it.
+                try:
+                    stderr = self._process.stderr.read()
+                except Exception:
+                    stderr = ""
+                raise MCPLaunchError(
+                    f"MCP server process exited during startup (exit code {code})."
+                    + (f"\nstderr: {stderr.strip()}" if stderr and stderr.strip() else "")
+                )
+
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -139,8 +188,8 @@ class LocalMCPClient:
             readable, _, _ = select.select([self._process.stderr], [], [], 0.5)
             if readable:
                 return self._process.stderr.read(max_bytes)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Error reading stderr: %s", e, exc_info=True)
         return ""
 
     def _send(self, message: dict) -> None:
@@ -182,6 +231,16 @@ class LocalMCPClient:
                 )
             line = self._process.stdout.readline()
             if not line:
+                exited = self._process.poll() is not None
+                if exited:
+                    try:
+                        stderr = self._process.stderr.read() or ""
+                    except Exception:
+                        stderr = ""
+                    raise MCPLaunchError(
+                        f"MCP process exited (code {self._process.returncode})."
+                        + (f" stderr: {stderr.strip()}" if stderr.strip() else "")
+                    )
                 stderr = self._read_stderr_nonblocking()
                 raise MCPProtocolError(
                     "MCP process closed its stdout unexpectedly."
@@ -305,6 +364,8 @@ class LocalMCPClient:
                 is_error=result.get("isError", False),
             )
         except MCPProtocolError as e:
+            logger.error("[mcp-local] Tool call '%s' failed: %s", tool_name, e)
             return MCPToolCallResult(success=False, error=str(e))
         except Exception as e:
+            logger.error("[mcp-local] Tool call '%s' unexpected error: %s", tool_name, e, exc_info=True)
             return MCPToolCallResult(success=False, error=f"Unexpected error: {e}")

@@ -107,6 +107,8 @@ class TestAddSkillCreatesFile:
         mock_llm.get_max_tokens = MagicMock(return_value=4096)
         mock_llm.get_num_tokens = MagicMock(return_value=100)
         svc._llm = mock_llm
+        svc._large_llm = None
+        svc._large_model_attempted = True
         svc._model = MagicMock()
         svc._inference_lock = __import__("threading").Lock()
         project = Project(

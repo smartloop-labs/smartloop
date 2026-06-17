@@ -7,7 +7,7 @@ Ported from core/core/agents/mcp/argument_extractor.py with simplified dependenc
 import json
 import logging
 import re
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 from langchain_core.utils.json import parse_json_markdown
 
@@ -263,6 +263,7 @@ class MCPArgumentExtractor:
         tool_name: str,
         input_schema: Dict[str, Any],
         previous_tool_results: List[Dict[str, Any]] = None,
+        llm: Optional[BaseLLM] = None,
     ) -> Dict[str, Any]:
         """
         Extract tool arguments from user input based on the tool's input schema.
@@ -283,6 +284,8 @@ class MCPArgumentExtractor:
             if not parameters_desc:
                 logger.info(f"Tool '{tool_name}' has no input parameters")
                 return {}
+
+            effective_llm = llm or self.llm
 
             required_params = input_schema.get('required', [])
 
@@ -346,17 +349,17 @@ Results from steps for context in chained calls:
 Respond with raw JSON only, no markdown.
 </user>"""
 
-            prompt_tokens = self.llm.get_num_tokens(prompt)
+            prompt_tokens = effective_llm.get_num_tokens(prompt)
             logger.info("Argument extraction prompt (%d tokens) for tool '%s'", prompt_tokens, tool_name)
 
-            response = self.llm.invoke(prompt)
+            response = effective_llm.invoke(prompt)
 
             if isinstance(response, dict):
                 response_text = response.get('text', str(response))
             else:
                 response_text = str(response) if response else '{}'
 
-            response_tokens = self.llm.get_num_tokens(response_text)
+            response_tokens = effective_llm.get_num_tokens(response_text)
             logger.info("Argument extraction response (%d tokens): %s", response_tokens, response_text[:200])
 
             try:
@@ -505,6 +508,7 @@ Respond with raw JSON only, no markdown.
         tool_name: str,
         input_schema: Dict[str, Any],
         resolved_ids: Dict[str, str],
+        llm: Optional[BaseLLM] = None,
     ) -> Dict[str, Any]:
         """
         Extract arguments with pre-resolved IDs.
@@ -544,6 +548,7 @@ Respond with raw JSON only, no markdown.
                 user_input=user_input,
                 non_id_params=remaining,
                 properties=properties,
+                llm=llm,
             )
             arguments.update(llm_extracted)
         else:
@@ -566,6 +571,7 @@ Respond with raw JSON only, no markdown.
         user_input: str,
         non_id_params: List[str],
         properties: Dict[str, Any],
+        llm: Optional[BaseLLM] = None,
     ) -> Dict[str, Any]:
         """Extract only non-ID parameters using LLM."""
         if not non_id_params:
@@ -607,17 +613,18 @@ Respond with raw JSON only, no markdown.
 </user>"""
 
         try:
-            prompt_tokens = self.llm.get_num_tokens(prompt)
+            effective_llm = llm or self.llm
+            prompt_tokens = effective_llm.get_num_tokens(prompt)
             logger.info("Content extraction prompt (%d tokens)", prompt_tokens)
 
-            response = self.llm.invoke(prompt)
+            response = effective_llm.invoke(prompt)
 
             if isinstance(response, dict):
                 response_text = response.get('text', str(response))
             else:
                 response_text = str(response) if response else '{}'
 
-            response_tokens = self.llm.get_num_tokens(response_text)
+            response_tokens = effective_llm.get_num_tokens(response_text)
             logger.info("Content extraction response (%d tokens): %s", response_tokens, response_text[:200])
 
             extracted = self._parse_json(response_text)
