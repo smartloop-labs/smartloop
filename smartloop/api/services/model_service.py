@@ -968,6 +968,7 @@ class ModelService:
     def _migrate_servers_to_local(self, project: "Project") -> None:
         """Migrate legacy REMOTE system servers to LOCAL (stdio subprocess)."""
         migrated = False
+        _LAUNCHERS = {"uvx", "npx", "pipx", "deno", "bunx"}
         for server in project.mcp_servers:
             if server.id == FETCH_SERVER_ID and server.server_type == MCPServerType.REMOTE:
                 server.server_type = MCPServerType.LOCAL
@@ -987,6 +988,23 @@ class ModelService:
                 server.remote_config = None
                 migrated = True
                 logger.info(f"Migrated system tools server to LOCAL on project {project.id}")
+            # Fix stale user-registered local servers saved with empty args
+            # (registered before args validation was enforced). Attempt to
+            # recover using the saved pkg or server name so existing projects
+            # keep working without requiring a manual re-registration.
+            if (
+                server.server_type == MCPServerType.LOCAL
+                and server.config
+                and server.config.command in _LAUNCHERS
+                and not server.config.args
+            ):
+                pkg_name = server.pkg or server.name
+                server.config.args = ["--from", pkg_name, pkg_name]
+                migrated = True
+                logger.info(
+                    "Fixed empty args for local MCP server '%s' → %s %s",
+                    server.name, server.config.command, server.config.args,
+                )
         if migrated:
             self._model.save()
 
@@ -2649,6 +2667,31 @@ class ModelService:
 
         args = list(args or [])
 
+        # If the caller passed the full command as a single string
+        # (e.g. "uvx yahoo-finance-mcp"), split it into command + args.
+        # Only applies when args is still empty.
+        if not args and " " in command:
+            parts = command.split()
+            command = parts[0]
+            args = parts[1:]
+
+        if not args:
+            raise ValueError(
+                f"'args' is required to register a local MCP server (command='{command}'). "
+                "Provide the package or module name, e.g. args=['yahoo-finance-mcp']."
+            )
+
+        # Normalise bare `uvx <pkg>` → `uvx --from <pkg> <pkg>` so uvx
+        # always knows both the package to install and the executable to run.
+        if (
+            command == "uvx"
+            and len(args) == 1
+            and not args[0].startswith("-")
+            and "--from" not in args
+        ):
+            pkg = args[0]
+            args = ["--from", pkg, pkg]
+
         if name is None:
             # Derive a display name from the package/script, i.e. the first
             # non-flag arg (e.g. "uvx mcp-server-fetch" → "mcp-server-fetch"),
@@ -2872,6 +2915,17 @@ class ModelService:
         server = next(
             (s for s in current_project.mcp_servers if s.id == server_id), None
         )
+        if server is None:
+            # The server may have been registered by another process since the
+            # last workspace load.  Reload from disk and retry once.
+            self._model.workspace.reload()
+            current_project = next(
+                (p for p in self._model.workspace.projects if p.id == (project_id or (current_project.id if current_project else ""))),
+                current_project,
+            )
+            server = next(
+                (s for s in current_project.mcp_servers if s.id == server_id), None
+            )
         if server is None:
             raise ValueError(f"MCP server not found: {server_id}")
 

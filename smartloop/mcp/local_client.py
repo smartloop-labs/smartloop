@@ -101,6 +101,13 @@ class LocalMCPClient:
         )
 
     def __enter__(self) -> "LocalMCPClient":
+        if not self.args:
+            raise MCPLaunchError(
+                f"Cannot launch MCP server: command '{self.command}' has no arguments. "
+                "Provide at least the module or package name (e.g. args=['-m', 'smartloop.api.mcp.system_server'] "
+                "or args=['yahoo-finance-mcp'])."
+            )
+
         merged_env = {**os.environ, **self.env}
         resolved_command = self._resolve_command(merged_env)
 
@@ -123,6 +130,31 @@ class LocalMCPClient:
             text=True,
             bufsize=1,
         )
+
+        # For external processes (uvx, npx, …) give the launcher a moment to
+        # either start the MCP server or fail visibly.  Built-in modules start
+        # in-process and don't need this guard.
+        if not self._is_builtin_module():
+            # Poll up to 2 s in 50 ms steps waiting for the process to either
+            # become an MCP server (still alive → break) or exit immediately.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+                code = self._process.poll()
+                if code is None:
+                    # Still running — assume the MCP server is ready.
+                    break
+                # Process exited — read all available stderr and raise now so
+                # the caller (model_service's hint-retry logic) can inspect it.
+                try:
+                    stderr = self._process.stderr.read()
+                except Exception:
+                    stderr = ""
+                raise MCPLaunchError(
+                    f"MCP server process exited during startup (exit code {code})."
+                    + (f"\nstderr: {stderr.strip()}" if stderr and stderr.strip() else "")
+                )
+
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
