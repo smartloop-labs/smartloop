@@ -2683,7 +2683,6 @@ class ModelService:
         except MCPLaunchError as exc:
             # uvx prints hints like "Use `uvx --from <pkg> <exec>` instead" when
             # the package name and executable name differ.  Parse and auto-retry.
-            import re
             hint = re.search(r"Use `uvx (.*?)` instead", str(exc))
             if command == "uvx" and hint:
                 fixed_args = hint.group(1).split()

@@ -156,8 +156,8 @@ class LocalMCPClient:
             readable, _, _ = select.select([self._process.stderr], [], [], 0.5)
             if readable:
                 return self._process.stderr.read(max_bytes)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Error reading stderr: %s", e, exc_info=True)
         return ""
 
     def _send(self, message: dict) -> None:
