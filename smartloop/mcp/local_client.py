@@ -199,6 +199,16 @@ class LocalMCPClient:
                 )
             line = self._process.stdout.readline()
             if not line:
+                exited = self._process.poll() is not None
+                if exited:
+                    try:
+                        stderr = self._process.stderr.read() or ""
+                    except Exception:
+                        stderr = ""
+                    raise MCPLaunchError(
+                        f"MCP process exited (code {self._process.returncode})."
+                        + (f" stderr: {stderr.strip()}" if stderr.strip() else "")
+                    )
                 stderr = self._read_stderr_nonblocking()
                 raise MCPProtocolError(
                     "MCP process closed its stdout unexpectedly."

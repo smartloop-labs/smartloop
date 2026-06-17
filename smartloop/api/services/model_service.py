@@ -2691,6 +2691,15 @@ class ModelService:
                     "Retrying uvx with corrected args %s (original: %s)", fixed_args, args
                 )
                 args = fixed_args
+                if "--from" in fixed_args:
+                    from_idx = fixed_args.index("--from")
+                    fixed_pkg = fixed_args[from_idx + 1] if from_idx + 1 < len(fixed_args) else None
+                else:
+                    fixed_pkg = next((a for a in fixed_args if not a.startswith("-")), None)
+                if fixed_pkg:
+                    server.name = fixed_pkg.split("/")[-1]
+                    server.pkg = server.name
+                    name = server.name
                 server.config = MCPServerConfig(command=command, args=args, env=resolved_env, cwd=resolved_cwd)
                 try:
                     with LocalMCPClient(command=command, args=args, env=resolved_env, cwd=resolved_cwd) as client:
@@ -2701,7 +2710,10 @@ class ModelService:
                         "Could not discover tools from local MCP server '%s' after retry: %s", name, retry_exc
                     )
             else:
-                raise ValueError(str(exc)) from exc
+                result = None
+                logger.warning(
+                    "Could not discover tools from local MCP server '%s': %s", name, exc
+                )
         except Exception as exc:
             result = None
             logger.warning(
@@ -2724,11 +2736,10 @@ class ModelService:
                 "Discovered %d tool(s) from local MCP server '%s'",
                 len(result.tools), name,
             )
-        else:
-            error_msg = result.error if result else "tool discovery failed"
+        elif result is not None:
             logger.warning(
                 "Could not discover tools from local MCP server '%s': %s",
-                name, error_msg,
+                name, result.error or "tool discovery failed",
             )
 
         current_project.mcp_servers.append(server)
