@@ -51,6 +51,22 @@ class LLMExecutor:
             # over-allocating nor leave the GPU underutilized.
             effective_workers = self._resolve_worker_count(model_path, n_llm_workers)
 
+            if effective_workers <= 1:
+                # A single worker copy is just a duplicate of the already-loaded
+                # main model on the same device.  On one GPU those copies don't
+                # run concurrently anyway (the driver serializes kernels across
+                # processes without CUDA MPS), so an extra copy only multiplies
+                # weights + KV memory and load time for no throughput gain.
+                # Skip the pool and reuse the shared model — concurrency still
+                # comes from n_parallel continuous batching within that one
+                # instance, and ``submit_llm`` falls back to it.
+                logger.info(
+                    "Skipping LLM worker pool — reusing the shared model "
+                    "(1 copy is enough on this device; extra copies serialize "
+                    "on a single GPU). Concurrency comes from n_parallel batching."
+                )
+                return
+
             # Use the "spawn" start method, not the Linux default "fork".
             # The parent process has already initialized CUDA (torch), and a
             # forked child cannot re-initialize CUDA ("Cannot re-initialize
@@ -80,8 +96,32 @@ class LLMExecutor:
         workers don't crash on load.  Extra free memory never raises the count
         above ``requested``.  The estimate is deliberately conservative since
         under-counting a worker's footprint crashes the last copy to load.
+
+        On GPUs the count is also capped at one copy per GPU: separate
+        processes can't run GPU kernels concurrently on the same device (the
+        driver serializes them without CUDA MPS), so the parallel ceiling is
+        ``torch.cuda.device_count()`` (1 for MPS).  A single GPU therefore caps
+        at 1 and the caller reuses the shared model.  CPU has no such cap —
+        independent cores give real parallelism, sized by memory below.
         """
         try:
+            # One model copy per GPU is the most that can run in parallel on
+            # CUDA; same-GPU copies serialize.  MPS is a single device.  CPU is
+            # uncapped here (cores parallelize) → memory is the only limit.
+            gpu_cap: int | None = None
+            if torch.cuda.is_available():
+                gpu_cap = max(1, torch.cuda.device_count())
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                gpu_cap = 1
+            if gpu_cap is not None and gpu_cap < requested:
+                logger.info(
+                    "[device] %d GPU(s) — capping worker copies at one per GPU "
+                    "(%d); same-GPU copies serialize. Concurrency within a GPU "
+                    "comes from n_parallel continuous batching.",
+                    gpu_cap, gpu_cap,
+                )
+                requested = gpu_cap
+
             model_gb = os.path.getsize(model_path) / (1024 ** 3)
 
             from smartloop.config.app_settings import AppSettings
@@ -179,14 +219,19 @@ class LLMExecutor:
         return self._io_pool.submit(fn, *args, **kwargs)
 
     def submit_llm(self, prompt: str):
-        """Submit LLM inference to the process pool.
+        """Submit LLM inference to the worker process pool.
 
-        Falls back to the thread pool when the process pool is disabled
-        (``n_llm_workers=0``).
+        Only valid when a pool exists — callers must gate on ``has_llm_pool``
+        and otherwise run inference on the shared in-process model.  (The
+        workers' model lives in their own processes; ``run_inference`` has no
+        model to use in the main process, so there is no in-process fallback.)
         """
-        if self._llm_pool is not None:
-            return self._llm_pool.submit(run_inference, prompt)
-        return self._io_pool.submit(run_inference, prompt)
+        if self._llm_pool is None:
+            raise RuntimeError(
+                "submit_llm called without a worker pool; gate on has_llm_pool "
+                "and use the shared in-process model instead."
+            )
+        return self._llm_pool.submit(run_inference, prompt)
 
     # -- Lifecycle ----------------------------------------------------------
 

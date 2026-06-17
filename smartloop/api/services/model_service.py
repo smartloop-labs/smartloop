@@ -436,10 +436,16 @@ class ModelService:
 
             from smartloop.config.app_settings import AppSettings
             _s = AppSettings()
+            cap = _s.llm_large_n_ctx_cap
+            # Same fit guard as the default large model: skip the capability
+            # (4B) model when it won't fit, so the plan step falls back to the
+            # default routing model instead of OOM-ing.
+            if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
+                return None
             from smartloop.llms.llm_factory import LlmFactory
             llm = LlmFactory.get_llama_cpp_instance(
                 gguf_path, logger, self.get_project_id() or "",
-                max_n_ctx=_s.llm_large_n_ctx_cap,
+                max_n_ctx=cap,
             )
             setattr(self, cache_key, llm)
             logger.info(
@@ -473,6 +479,39 @@ class ModelService:
         except Exception:
             pass
         return None
+
+    def _large_model_fits(self, gguf_path: str, cap: int, label: str = "") -> bool:
+        """True if a large model's capped footprint fits in free VRAM.
+
+        Estimates the model's footprint (weights + KV cache @ ``cap`` +
+        per-process overhead) and compares it against free device memory after
+        the configured reserve (``llm_large_fit_reserve_gb``).  Always True on
+        CPU (RAM is plentiful) or when the device can't be queried.  When it
+        returns False the caller skips the load and falls back to the default
+        routing model instead of risking an OOM / starving the worker pool.
+        """
+        ft = self._device_free_total_gb()
+        if ft is None:
+            return True
+        free_gb, total_gb = ft
+        try:
+            model_gb = os.path.getsize(gguf_path) / 1024**3
+        except OSError:
+            return True
+        from smartloop.config.app_settings import AppSettings
+        reserve_gb = AppSettings().llm_large_fit_reserve_gb
+        kv_gb = 0.5 * (cap / 4096)
+        footprint_gb = model_gb + kv_gb + 0.7
+        if footprint_gb + reserve_gb > free_gb:
+            logger.warning(
+                "[large-model] %s needs ~%.1fGB (+%.1f reserve) but only %.1fGB "
+                "free of %.1fGB — falling back to the default model. Lower "
+                "SLP_LLM_LARGE_N_CTX_CAP or free VRAM to enable it.",
+                label or os.path.basename(gguf_path),
+                footprint_gb, reserve_gb, free_gb, total_gb,
+            )
+            return False
+        return True
 
     def _detect_large_model(self) -> None:
         """Load the largest downloaded model for agent/skill tasks, if it fits.
@@ -513,25 +552,12 @@ class ModelService:
             _s = AppSettings()
             cap = _s.llm_large_n_ctx_cap
 
-            # Fit guard: estimate the large model's capped footprint (weights +
-            # KV @ cap + per-process overhead) and skip if it won't fit in free
-            # VRAM after the reserve.  free VRAM already excludes the resident
-            # main model, so this is the room genuinely left for the agent model.
-            ft = self._device_free_total_gb()
-            if ft is not None:
-                free_gb, total_gb = ft
-                model_gb = os.path.getsize(gguf_path) / 1024**3
-                kv_gb = 0.5 * (cap / 4096)
-                footprint_gb = model_gb + kv_gb + 0.7
-                reserve_gb = _s.llm_large_fit_reserve_gb
-                if footprint_gb + reserve_gb > free_gb:
-                    logger.warning(
-                        "[large-model] %s needs ~%.1fGB (+%.1f reserve) but only "
-                        "%.1fGB free of %.1fGB — skipping; agent work uses the main "
-                        "model. Lower SLP_LLM_LARGE_N_CTX_CAP or free VRAM to enable it.",
-                        largest.model_name, footprint_gb, reserve_gb, free_gb, total_gb,
-                    )
-                    return
+            # Fit guard: skip the load when the large model's capped footprint
+            # won't fit in free VRAM after the reserve.  free VRAM already
+            # excludes the resident main model, so this is the room genuinely
+            # left for the agent model.
+            if not self._large_model_fits(gguf_path, cap, largest.model_name):
+                return
 
             logger.info(
                 "[large-model] Loading larger model on demand: %s (%.0fB) > router "
