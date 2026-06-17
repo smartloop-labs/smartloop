@@ -187,14 +187,15 @@ async def init(
         if hasattr(model_cls, 'default_capabilities') and not ws_model.capabilities:
             ws_model.capabilities = model_cls.default_capabilities()
 
-    if not platform_auth.has_credentials():
+    model_dir = ws_model.model_dir or ""
+    needs_download = not _gguf_exists(model_dir)
+
+    if needs_download and not (platform_auth.has_credentials() or request.hf_token):
         raise HTTPException(
             status_code=400,
             detail="Authentication required for model download. "
                    "Set a developer token via 'slp token set' or sign in through the Smartloop app.",
         )
-
-    model_dir = ws_model.model_dir if ws_model else ""
 
     async def event_stream():
         try:
