@@ -12,7 +12,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
+import shlex
+import tempfile
+import webbrowser
+           
 import certifi
 import requests
 from prettytable import PrettyTable
@@ -138,86 +141,6 @@ def _require_server(host: str, port: int) -> bool:
     except Exception as e:
         logger.error(f"Failed to start agent: {e}")
         return False
-
-
-def _consume_sse_stream(resp: requests.Response) -> None:
-    if not resp.ok:
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except Exception:
-            detail = resp.text
-        console.print(f"[red]{detail}[/red]")
-        return
-
-    showing_progress = False
-    current_event_type: str | None = None
-    current_filename: str | None = None
-
-    for raw in resp.iter_lines():
-        if not raw:
-            current_event_type = None
-            continue
-        line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-
-        if line.startswith("event:"):
-            current_event_type = line[6:].strip()
-            continue
-        if not line.startswith("data:"):
-            continue
-        try:
-            data = json.loads(line[5:].strip())
-        except json.JSONDecodeError:
-            continue
-
-        event_type = current_event_type or ""
-        status = data.get("status", "")
-        msg = data.get("message", "")
-
-        if "downloaded" in data and "total" in data:
-            total = data["total"]
-            downloaded = data["downloaded"]
-            filename = data.get("filename", "model")
-            if total:
-                if showing_progress and filename != current_filename:
-                    _clear_progress()
-                    console.print(f"[cyan][+] Downloaded {current_filename}[/cyan]")
-                showing_progress = True
-                current_filename = filename
-                _render_progress(filename, downloaded, total)
-        elif event_type == "complete" or status == "completed":
-            if showing_progress:
-                _clear_progress()
-                console.print(f"[cyan][+] Downloaded {current_filename}[/cyan]")
-                showing_progress = False
-                current_filename = None
-            console.print(f"[cyan][+] {msg}[/cyan]")
-        elif status == "project_created":
-            project = data.get("project", {})
-            console.print(
-                f"[{SLP_PRIMARY}][+] Project created: "
-                f"{project.get('name', '')} (id={project.get('id', '')})[/{SLP_PRIMARY}]"
-            )
-        elif event_type == "error" or status == "error":
-            if showing_progress:
-                _clear_progress()
-                showing_progress = False
-                current_filename = None
-            console.print(f"[red]{msg}[/red]")
-        else:
-            if msg and not msg.lower().startswith("downloading"):
-                if showing_progress:
-                    _clear_progress()
-                    showing_progress = False
-                    current_filename = None
-                console.print(f"[dim]{msg}[/dim]")
-
-        current_event_type = None
-
-    if showing_progress:
-        _clear_progress()
-        if current_filename:
-            console.print(f"[cyan][+] Downloaded {current_filename}[/cyan]")
-
 
 # ---------------------------------------------------------------------------
 # Command handlers
@@ -361,6 +284,407 @@ def cmd_token(args) -> None:
             )
 
 
+def _resolve_current_project(host: str, port: int) -> dict | None:
+    """Return the agent's currently active project, or None."""
+    try:
+        data = requests.get(f"{_base_url(host, port)}/v1/projects", timeout=10).json()
+    except RequestException:
+        return None
+    projects = data.get("projects", [])
+    return next((p for p in projects if p.get("current")), None)
+
+
+def _frontmatter_name(content: str) -> str | None:
+    """Return the `name:` value from a SKILL.md YAML frontmatter, if present."""
+    if not content.startswith("---"):
+        return None
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return None
+    for line in parts[1].strip().splitlines():
+        if line.startswith("name:"):
+            return line[len("name:"):].strip() or None
+    return None
+
+
+def _read_skill_content(args) -> str:
+    """Resolve skill content for `skill add` from (in priority order):
+    inline text arg, --file, piped stdin, or by opening $EDITOR.
+
+    The editor/stdin paths make pasting large skills painless, which the
+    inline TUI form cannot handle well.
+    """
+    if getattr(args, "file", None):
+        return Path(args.file).read_text(encoding="utf-8")
+    if getattr(args, "text", None):
+        return args.text
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+    if not editor:
+        editor = "notepad" if os.name == "nt" else "vi"
+
+    with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False, encoding="utf-8") as tf:
+        tf.write("# Write your skill below, then save and exit.\n")
+        tmp_path = tf.name
+    try:
+        console.print(f"[dim]Opening {editor} to enter skill content...[/dim]")
+        subprocess.call([*shlex.split(editor), tmp_path])
+        content = Path(tmp_path).read_text(encoding="utf-8")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # Drop the helper comment line if the user left it untouched.
+    lines = content.splitlines()
+    if lines and lines[0].startswith("# Write your skill below"):
+        lines = lines[1:]
+    return "\n".join(lines)
+
+
+def cmd_skill(args, host: str, port: int) -> None:
+    """Manage project skills from the CLI (companion to the desktop app).
+
+    Skills target the agent's currently active project, the same one the
+    desktop app and TUI operate on.
+    """
+    if not _require_server(host, port):
+        return
+
+    base = _base_url(host, port)
+    project = _resolve_current_project(host, port)
+    if not project:
+        console.print(
+            "[yellow]No active project.[/yellow] "
+            "Create or switch to a project in the app first."
+        )
+        return
+    project_id = project.get("id")
+    project_name = project.get("name", project_id)
+
+    sub = getattr(args, "skill_command", None)
+
+    if sub == "list":
+        try:
+            resp = requests.get(f"{base}/v1/projects/{project_id}/skills", timeout=10)
+            resp.raise_for_status()
+            skills = resp.json().get("skills", [])
+        except RequestException as e:
+            console.print(f"[red]Request failed: {e}[/red]")
+            return
+        if not skills:
+            console.print(f"[dim]No skills set for project '{project_name}'.[/dim]")
+            return
+        table = PrettyTable()
+        table.field_names = ["#", "Name", "Description"]
+        table.align = "l"
+        for i, s in enumerate(skills, 1):
+            desc = s.get("description") or s.get("content", "")
+            table.add_row([i, s.get("name", ""), desc])
+        console.print(table)
+
+    elif sub == "add":
+        content = _read_skill_content(args)
+        if not content.strip():
+            console.print("[yellow]No skill content provided.[/yellow]")
+            return
+        try:
+            existing = requests.get(
+                f"{base}/v1/projects/{project_id}/skills", timeout=10
+            ).json().get("skills", [])
+        except RequestException:
+            existing = []
+        # Respect a `name:` in the SKILL.md frontmatter; only fall back to an
+        # auto-generated name when neither --name nor frontmatter provides one.
+        name = getattr(args, "name", None)
+        if not name and not _frontmatter_name(content):
+            name = f"skill_{len(existing) + 1}"
+        payload = {"content": content}
+        if name:
+            payload["name"] = name
+        try:
+            resp = requests.post(
+                f"{base}/v1/projects/{project_id}/skills",
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+        except RequestException as e:
+            detail = ""
+            try:
+                detail = e.response.json().get("detail", "")  # type: ignore[union-attr]
+            except Exception:
+                pass
+            console.print(f"[red]Failed to add skill{': ' + detail if detail else ''}[/red]")
+            return
+        added_name = resp.json().get("name", name) or name
+        console.print(f"[green]Skill '{added_name}' added to project '{project_name}'.[/green]")
+
+    elif sub == "remove":
+        try:
+            index = int(args.index)
+        except (TypeError, ValueError):
+            console.print("[yellow]Usage: slp skill remove <#>  (see 'slp skill list')[/yellow]")
+            return
+        try:
+            skills = requests.get(
+                f"{base}/v1/projects/{project_id}/skills", timeout=10
+            ).json().get("skills", [])
+        except RequestException as e:
+            console.print(f"[red]Request failed: {e}[/red]")
+            return
+        if index < 1 or index > len(skills):
+            console.print(f"[yellow]Invalid index {index}. Project has {len(skills)} skill(s).[/yellow]")
+            return
+        skill = skills[index - 1]
+        try:
+            resp = requests.delete(
+                f"{base}/v1/projects/{project_id}/skills/{skill.get('id')}", timeout=30
+            )
+            resp.raise_for_status()
+        except RequestException as e:
+            console.print(f"[red]Failed to remove skill: {e}[/red]")
+            return
+        console.print(f"[green]Removed skill '{skill.get('name', index)}'.[/green]")
+
+    else:
+        console.print("[yellow]Usage: slp skill <add|list|remove>[/yellow]")
+
+
+def cmd_mcp(args, host: str, port: int) -> None:
+    """Manage MCP servers from the CLI (companion to the desktop app).
+
+    Servers are registered against the agent's currently active project. A
+    full http(s) URL is treated as a remote server; anything else is a local
+    (stdio) command such as `uvx <pkg>` or `npx <pkg>`.
+    """
+    if not _require_server(host, port):
+        return
+
+    from urllib.parse import urlparse
+
+    base = _base_url(host, port)
+    project = _resolve_current_project(host, port)
+    if not project:
+        console.print(
+            "[yellow]No active project.[/yellow] "
+            "Create or switch to a project in the app first."
+        )
+        return
+    project_id = project.get("id")
+    project_name = project.get("name", project_id)
+
+    sub = getattr(args, "mcp_command", None)
+
+    if sub == "list":
+        try:
+            resp = requests.get(f"{base}/v1/projects/{project_id}/mcp", timeout=10)
+            resp.raise_for_status()
+            servers = resp.json().get("servers", [])
+        except RequestException as e:
+            console.print(f"[red]Request failed: {e}[/red]")
+            return
+        if not servers:
+            console.print(f"[dim]No MCP servers registered for project '{project_name}'.[/dim]")
+            return
+        table = PrettyTable()
+        table.field_names = ["#", "Name", "Type", "Tools", "Enabled"]
+        table.align = "l"
+        table.align["Tools"] = "r"
+        for i, s in enumerate(servers, 1):
+            tools = s.get("tools", [])
+            table.add_row([
+                i,
+                s.get("name", ""),
+                s.get("server_type", "local"),
+                len(tools),
+                "yes" if s.get("enabled") else "no",
+            ])
+        console.print(table)
+
+    elif sub == "add":
+        tokens = args.target or []
+        force_local = getattr(args, "local", False)
+        force_remote = getattr(args, "remote", False)
+        if not tokens:
+            console.print("[yellow]Usage: slp mcp add <url> | <command> [args...][/yellow]")
+            return
+
+        first = tokens[0]
+        parsed = urlparse(first)
+        is_url = parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+        if force_remote or (is_url and not force_local):
+            if not is_url:
+                console.print("[red]--remote requires a full http(s) URL.[/red]")
+                return
+            payload: dict = {"server_type": "remote", "server_url": first}
+        else:
+            payload = {"server_type": "local", "command": first}
+            if tokens[1:]:
+                payload["args"] = tokens[1:]
+
+        try:
+            resp = requests.post(
+                f"{base}/v1/projects/{project_id}/mcp/register",
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except RequestException as e:
+            detail = ""
+            try:
+                detail = e.response.json().get("detail", "")  # type: ignore[union-attr]
+            except Exception:
+                pass
+            console.print(f"[red]Failed to register MCP server{': ' + detail if detail else ''}[/red]")
+            return
+
+        if data.get("auth_type") == "oauth":
+            auth_url = data.get("auth_url")
+            if not auth_url:
+                console.print("[red]OAuth required but no authorization URL was returned.[/red]")
+                return
+            webbrowser.open(auth_url)
+            console.print(
+                "[cyan]Opening browser for authorization.[/cyan] "
+                "Complete authorization to finish registering the server.\n"
+                f"[dim]If the browser did not open, visit:[/dim] {auth_url}"
+            )
+            return
+
+        server = data.get("server") or {}
+        tool_count = len(server.get("tools", []))
+        console.print(
+            f"[green]MCP server registered: {server.get('name', first)} "
+            f"({tool_count} tools) on project '{project_name}'.[/green]"
+        )
+
+    elif sub == "remove":
+        try:
+            index = int(args.index)
+        except (TypeError, ValueError):
+            console.print("[yellow]Usage: slp mcp remove <#>  (see 'slp mcp list')[/yellow]")
+            return
+        try:
+            servers = requests.get(
+                f"{base}/v1/projects/{project_id}/mcp", timeout=10
+            ).json().get("servers", [])
+        except RequestException as e:
+            console.print(f"[red]Request failed: {e}[/red]")
+            return
+        if index < 1 or index > len(servers):
+            console.print(f"[yellow]Invalid index {index}. Project has {len(servers)} server(s).[/yellow]")
+            return
+        server = servers[index - 1]
+        try:
+            resp = requests.delete(
+                f"{base}/v1/projects/{project_id}/mcp/{server.get('id')}", timeout=30
+            )
+            resp.raise_for_status()
+        except RequestException as e:
+            console.print(f"[red]Failed to remove MCP server: {e}[/red]")
+            return
+        console.print(f"[green]Removed MCP server '{server.get('name', index)}'.[/green]")
+
+    else:
+        console.print("[yellow]Usage: slp mcp <add|list|remove>[/yellow]")
+
+
+def cmd_project(args, host: str, port: int) -> None:
+    """Inspect and switch the agent's current project from the CLI.
+
+    The current project is what `slp skill` and `slp mcp` operate on, so this
+    lets a CLI/desktop user see and change that target without the TUI.
+    """
+    if not _require_server(host, port):
+        return
+
+    base = _base_url(host, port)
+    sub = getattr(args, "project_command", None)
+
+    if sub == "current":
+        project = _resolve_current_project(host, port)
+        if not project:
+            console.print("[dim]No active project.[/dim]")
+            return
+        console.print(
+            f"[green]Current project:[/green] {project.get('name')} "
+            f"(id={project.get('id')})"
+        )
+        return
+
+    if sub in (None, "list"):
+        try:
+            resp = requests.get(f"{base}/v1/projects", timeout=10)
+            resp.raise_for_status()
+            projects = resp.json().get("projects", [])
+        except RequestException as e:
+            console.print(f"[red]Request failed: {e}[/red]")
+            return
+        if not projects:
+            console.print("[dim]No projects found.[/dim]")
+            return
+        table = PrettyTable()
+        table.field_names = ["#", "ID", "Name", "Description", "Model", "Skills", "MCP", "Current"]
+        table.align = "l"
+        for col in ("Skills", "MCP"):
+            table.align[col] = "r"
+        for i, p in enumerate(projects, 1):
+            table.add_row([
+                i,
+                p.get("id", ""),
+                p.get("name", ""),
+                p.get("description") or "-",
+                p.get("model_name") or "default",
+                len(p.get("skills", [])),
+                len(p.get("mcp", [])),
+                "yes" if p.get("current") else "",
+            ])
+        console.print(table)
+        return
+
+    if sub == "switch":
+        try:
+            index = int(args.index)
+        except (TypeError, ValueError):
+            console.print("[yellow]Usage: slp project switch <#>  (see 'slp project list')[/yellow]")
+            return
+        try:
+            projects = requests.get(f"{base}/v1/projects", timeout=10).json().get("projects", [])
+        except RequestException as e:
+            console.print(f"[red]Request failed: {e}[/red]")
+            return
+        if index < 1 or index > len(projects):
+            console.print(f"[yellow]Invalid index {index}. There are {len(projects)} project(s).[/yellow]")
+            return
+        project = projects[index - 1]
+        with console.status(f"Switching to '{project.get('name')}'...", spinner="dots"):
+            try:
+                resp = requests.post(
+                    f"{base}/v1/models/load",
+                    json={"mode": "inference", "project_id": project["id"]},
+                    timeout=300,
+                )
+                resp.raise_for_status()
+            except RequestException as e:
+                detail = ""
+                try:
+                    detail = e.response.json().get("detail", "")  # type: ignore[union-attr]
+                except Exception:
+                    pass
+                console.print(f"[red]Failed to switch project{': ' + detail if detail else ''}[/red]")
+                return
+        console.print(f"[green]Switched to project:[/green] {project.get('name')} (id={project['id']})")
+        return
+
+    console.print("[yellow]Usage: slp project <list|current|switch>[/yellow]")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -423,6 +747,40 @@ def main():
     token_set_parser.add_argument("token_value", nargs="?", default=None, help="Developer token (prompted if omitted)")
     token_subparsers.add_parser("clear", help="Remove stored token")
 
+    # Skill management commands (companion to the desktop app)
+    skill_parser = subparsers.add_parser("skill", help="Manage skills for the active project")
+    skill_subparsers = skill_parser.add_subparsers(dest="skill_command", help="Skill commands")
+    skill_add_parser = skill_subparsers.add_parser(
+        "add", help="Add a skill (large content via --file, piped stdin, or $EDITOR)"
+    )
+    skill_add_parser.add_argument("text", nargs="?", default=None, help="Skill text (omit to use --file, stdin, or an editor)")
+    skill_add_parser.add_argument("--file", "-f", help="Read skill content from a file")
+    skill_add_parser.add_argument("--name", help="Skill name (auto-generated if omitted)")
+    skill_subparsers.add_parser("list", help="List skills for the active project")
+    skill_remove_parser = skill_subparsers.add_parser("remove", help="Remove a skill by index")
+    skill_remove_parser.add_argument("index", help="Skill index from 'slp skill list'")
+
+    # MCP management commands (companion to the desktop app)
+    mcp_parser = subparsers.add_parser("mcp", help="Manage MCP servers for the active project")
+    mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_command", help="MCP commands")
+    mcp_add_parser = mcp_subparsers.add_parser(
+        "add", help="Register an MCP server: a URL (remote) or a command (local stdio)"
+    )
+    mcp_add_parser.add_argument("target", nargs="+", help="<url> for remote, or <command> [args...] for local")
+    mcp_add_parser.add_argument("--local", action="store_true", help="Force local (stdio) registration")
+    mcp_add_parser.add_argument("--remote", action="store_true", help="Force remote (URL) registration")
+    mcp_subparsers.add_parser("list", help="List MCP servers for the active project")
+    mcp_remove_parser = mcp_subparsers.add_parser("remove", help="Remove an MCP server by index")
+    mcp_remove_parser.add_argument("index", help="Server index from 'slp mcp list'")
+
+    # Project commands (companion to the desktop app)
+    project_parser = subparsers.add_parser("project", help="List, current, or switch the current project")
+    project_subparsers = project_parser.add_subparsers(dest="project_command", help="Project commands")
+    project_subparsers.add_parser("list", help="List all projects with IDs and details")
+    project_subparsers.add_parser("current", help="Show the current project and its ID")
+    project_switch_parser = project_subparsers.add_parser("switch", help="Switch the current project by index")
+    project_switch_parser.add_argument("index", help="Project index from 'slp project list'")
+
     args = parser.parse_args()
 
     # Persist -t token to keychain so it's available to all consumers
@@ -459,6 +817,12 @@ def main():
         cmd_status(host, port)
     elif args.command == "token":
         cmd_token(args)
+    elif args.command == "skill":
+        cmd_skill(args, host, port)
+    elif args.command == "mcp":
+        cmd_mcp(args, host, port)
+    elif args.command == "project":
+        cmd_project(args, host, port)
     else:
         cmd_run(args, host, port, model_name, project_dir)
 
