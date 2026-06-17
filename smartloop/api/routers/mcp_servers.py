@@ -19,6 +19,7 @@ from smartloop.api.model import (
     MCPOAuthCallbackRequest,
 )
 from smartloop.api.services import ModelService, get_model_service
+from smartloop.mcp.client import MCPDiscoveryError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["mcp"])
@@ -89,6 +90,8 @@ async def _register_local_mcp_server(
             cwd=request.cwd,
             project_id=project_id,
         )
+    except MCPDiscoveryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     server_resp = _build_server_response(result)
@@ -324,6 +327,8 @@ async def add_mcp_server_to_project(
             project_id=project_id,
         )
         return _build_server_response(result)
+    except MCPDiscoveryError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

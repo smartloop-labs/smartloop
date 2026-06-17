@@ -35,7 +35,7 @@ from docling.datamodel.settings import settings as docling_settings
 from docling.utils.model_downloader import download_models as download_docling_models
 from smartloop.model import Model
 from smartloop.mcp.local_client import LocalMCPClient
-from smartloop.mcp.client import MCPLaunchError
+from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
 from smartloop.agents.orchestrator import SLPOrchestrator
 from smartloop.agents.planner import SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME, FETCH_SERVER_ID
 from smartloop.agents.mcp.skill_generator import MCPSkillGenerator
@@ -2718,6 +2718,15 @@ class ModelService:
             pkg = args[0]
             args = ["--from", pkg, pkg]
 
+        # `uvx` is only a ~340KB trampoline that execs the real `uv` binary,
+        # which it locates *solely* as a sibling file next to itself (it does
+        # not search PATH). A system with `uvx` but no adjacent `uv` therefore
+        # fails. Since `uvx <args>` is exactly `uv tool run <args>`, prefer the
+        # self-contained `uv` binary when it is available on PATH.
+        if command == "uvx" and shutil.which("uv"):
+            command = "uv"
+            args = ["tool", "run", *args]
+
         if name is None:
             # Derive a display name from the package/script, i.e. the first
             # non-flag arg (e.g. "uvx mcp-server-fetch" → "mcp-server-fetch"),
@@ -2745,25 +2754,34 @@ class ModelService:
             config=MCPServerConfig(command=command, args=args, env=resolved_env, cwd=resolved_cwd),
         )
 
-        # Discover tools by launching the process and doing the MCP handshake
+        # Discover tools by launching the process and doing the MCP handshake.
+        # Any failure here is fatal: we do not persist a server whose tools we
+        # could not enumerate, and the error is surfaced to the API caller.
+        discovery_error: str | None = None
         try:
             with LocalMCPClient(command=command, args=args, env=resolved_env, cwd=resolved_cwd) as client:
                 result = client.connect_and_discover_tools()
         except MCPLaunchError as exc:
-            # uvx prints hints like "Use `uvx --from <pkg> <exec>` instead" when
-            # the package name and executable name differ.  Parse and auto-retry.
-            hint = re.search(r"Use `uvx (.*?)` instead", str(exc))
-            if command == "uvx" and hint:
-                fixed_args = hint.group(1).split()
+            # Both `uvx` and `uv tool run` print a hint like
+            # "Use `uvx --from <pkg> <exec>` instead" (or the `uv tool run`
+            # form) when the package name and executable name differ. Parse the
+            # suggested args and auto-retry under whichever launcher we used.
+            hint = re.search(r"Use `uv(?:x| tool run) (.*?)` instead", str(exc))
+            if hint:
+                suggested = hint.group(1).split()
+                # Preserve the `tool run` prefix when launching via the real
+                # `uv` binary; for bare `uvx` there is no prefix.
+                prefix = args[:2] if command == "uv" and args[:2] == ["tool", "run"] else []
+                fixed_args = [*prefix, *suggested]
                 logger.info(
-                    "Retrying uvx with corrected args %s (original: %s)", fixed_args, args
+                    "Retrying %s with corrected args %s (original: %s)", command, fixed_args, args
                 )
                 args = fixed_args
-                if "--from" in fixed_args:
-                    from_idx = fixed_args.index("--from")
-                    fixed_pkg = fixed_args[from_idx + 1] if from_idx + 1 < len(fixed_args) else None
+                if "--from" in suggested:
+                    from_idx = suggested.index("--from")
+                    fixed_pkg = suggested[from_idx + 1] if from_idx + 1 < len(suggested) else None
                 else:
-                    fixed_pkg = next((a for a in fixed_args if not a.startswith("-")), None)
+                    fixed_pkg = next((a for a in suggested if not a.startswith("-")), None)
                 if fixed_pkg:
                     server.name = fixed_pkg.split("/")[-1]
                     server.pkg = server.name
@@ -2774,19 +2792,13 @@ class ModelService:
                         result = client.connect_and_discover_tools()
                 except Exception as retry_exc:
                     result = None
-                    logger.warning(
-                        "Could not discover tools from local MCP server '%s' after retry: %s", name, retry_exc
-                    )
+                    discovery_error = str(retry_exc)
             else:
                 result = None
-                logger.warning(
-                    "Could not discover tools from local MCP server '%s': %s", name, exc
-                )
+                discovery_error = str(exc)
         except Exception as exc:
             result = None
-            logger.warning(
-                "Could not discover tools from local MCP server '%s': %s", name, exc
-            )
+            discovery_error = str(exc)
 
         if result and result.success:
             server.tools = result.tools
@@ -2805,10 +2817,14 @@ class ModelService:
                 len(result.tools), name,
             )
         elif result is not None:
-            logger.warning(
-                "Could not discover tools from local MCP server '%s': %s",
-                name, result.error or "tool discovery failed",
+            discovery_error = result.error or "tool discovery failed"
+
+        if discovery_error is not None:
+            message = (
+                f"Could not discover tools from local MCP server '{name}': {discovery_error}"
             )
+            logger.warning(message)
+            raise MCPDiscoveryError(message)
 
         current_project.mcp_servers.append(server)
         self._model.save()

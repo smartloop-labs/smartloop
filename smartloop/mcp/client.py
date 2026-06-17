@@ -31,6 +31,15 @@ class MCPLaunchError(MCPClientError):
     pass
 
 
+class MCPDiscoveryError(MCPClientError):
+    """Raised when an MCP server is reachable-ish but its tools cannot be discovered.
+
+    Covers launcher-not-found, handshake failures, and ``tools/list`` errors —
+    any condition that leaves us unable to enumerate the server's tools.
+    """
+    pass
+
+
 @dataclass
 class MCPServerInfo:
     name: Optional[str] = None
