@@ -1402,8 +1402,13 @@ class ModelService:
         if mcp_catalogue and not already_has_mcp:
             mcp_field = (
                 '- "mcp_call": the single best matching tool call as a plain string '
-                '(e.g. "ServerName.tool_name(param)"). Use fixed values for params '
-                'known from context; bare param names for runtime values. '
+                'in the exact form server_name.tool_name(param). '
+                'The server_name prefix is REQUIRED — always include it. '
+                'Copy both the server_name and tool_name EXACTLY as they appear in the '
+                'available MCP tools list below (for example, if the list shows '
+                'weather.get_forecast, write weather.get_forecast(city=Paris)). '
+                'Do NOT wrap them in angle brackets and do NOT invent or rename the server. '
+                'Use fixed values for params known from context; bare param names for runtime values. '
                 'If the skill says "save" or "create", pick a create/save tool, NOT a list/read tool. '
                 'Omit if no tool clearly matches.\n\n'
                 f'{mcp_catalogue}\n'
@@ -1450,6 +1455,9 @@ class ModelService:
             mcp_call = meta.pop("mcp_call", None)
             if mcp_call:
                 mcp_call = re.sub(r'```\w*', '', mcp_call).strip()
+                # The LLM may emit a hallucinated server name. Re-bind the call
+                # to the server that actually owns the matching tool.
+                mcp_call = self._correct_mcp_call_server(mcp_call, project)
                 meta["mcp_block"] = f"```mcp\n{mcp_call}\n```"
             else:
                 meta.pop("mcp_block", None)
@@ -1458,6 +1466,63 @@ class ModelService:
         except Exception as e:
             logger.warning("Failed to generate skill metadata: %s", e)
             return {}
+
+    @staticmethod
+    def _correct_mcp_call_server(mcp_call: str, project: Optional["Project"]) -> str:
+        """Re-bind a generated ``Server.tool(args)`` call to the real server.
+
+        The skill-generation LLM is free-text and frequently emits a server
+        name that does not match any registered MCP server. Since tool names
+        are unambiguous within a project, we look the call's tool up in the
+        registered servers and, when found, rewrite the server portion to the
+        server that actually owns that tool. Returns the call unchanged when
+        no registered server exposes the tool.
+        """
+        if not project:
+            return mcp_call
+
+        # Split the call head ("server.tool") from its argument list. The model
+        # sometimes wraps the head in angle brackets/backticks (e.g.
+        # "<server.tool>(args)") — strip those from the head only, leaving any
+        # "<value>" runtime-param markers inside the parens untouched.
+        head, sep, tail = mcp_call.partition("(")
+        if sep:
+            head = head.strip().strip("<>`").strip()
+            mcp_call = f"{head}{sep}{tail}"
+
+        # Parse "[server.]tool(args)" — the tool is the identifier directly
+        # before the argument list; everything before the last dot, if present,
+        # is the (possibly wrong) server name. The model sometimes omits the
+        # server prefix entirely, so it is optional here.
+        m = re.match(r'^\s*(?:(.+)\.)?([\w-]+)\s*\((.*)\)\s*$', mcp_call, re.DOTALL)
+        if not m:
+            return mcp_call
+
+        emitted_server, tool_name, args_str = m.group(1), m.group(2), m.group(3)
+
+        # Find the registered server that actually owns this tool.
+        for server in project.mcp_servers:
+            if not server.tools or server.id == SYSTEM_TOOLS_SERVER_ID:
+                continue
+            if any(t.name == tool_name for t in server.tools):
+                if not emitted_server:
+                    logger.info(
+                        "Bound generated mcp_call (no server prefix) to server "
+                        "'%s' (owns tool '%s')", server.name, tool_name,
+                    )
+                elif server.name != emitted_server:
+                    logger.info(
+                        "Re-bound generated mcp_call from server '%s' to '%s' "
+                        "(owns tool '%s')",
+                        emitted_server, server.name, tool_name,
+                    )
+                return f"{server.name}.{tool_name}({args_str})"
+
+        logger.warning(
+            "Generated mcp_call references tool '%s' not found on any "
+            "registered server; leaving as-is", tool_name,
+        )
+        return mcp_call
 
     @staticmethod
     def _visible_project_dir(project: "Project") -> str:
