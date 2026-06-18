@@ -93,6 +93,23 @@ class LocalMCPClient:
 
         return self.command
 
+    @staticmethod
+    def _startup_hint(stderr: str) -> str:
+        """Return an actionable hint for known launcher failures, else ''.
+
+        ``uvx`` is only a thin trampoline that execs the real ``uv`` binary,
+        which it locates solely as a sibling next to itself (it does not search
+        PATH). A host with ``uvx`` but no adjacent ``uv`` fails with
+        "Could not find the `uv` binary". Point the user at the fix.
+        """
+        if stderr and "Could not find the `uv` binary" in stderr:
+            return (
+                "\nHint: `uvx` requires the `uv` binary installed alongside it. "
+                "Install uv: `curl -LsSf https://astral.sh/uv/install.sh | sh` "
+                "(Windows: `powershell -c \"irm https://astral.sh/uv/install.ps1 | iex\"`)."
+            )
+        return ""
+
     def _is_builtin_module(self) -> bool:
         return (
             len(self.args) >= 2
@@ -152,6 +169,7 @@ class LocalMCPClient:
                     stderr = ""
                 raise MCPLaunchError(
                     f"MCP server process exited during startup (exit code {code})."
+                    + self._startup_hint(stderr)
                     + (f"\nstderr: {stderr.strip()}" if stderr and stderr.strip() else "")
                 )
 

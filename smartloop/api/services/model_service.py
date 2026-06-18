@@ -35,7 +35,7 @@ from docling.datamodel.settings import settings as docling_settings
 from docling.utils.model_downloader import download_models as download_docling_models
 from smartloop.model import Model
 from smartloop.mcp.local_client import LocalMCPClient
-from smartloop.mcp.client import MCPLaunchError
+from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
 from smartloop.agents.orchestrator import SLPOrchestrator
 from smartloop.agents.planner import SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME, FETCH_SERVER_ID
 from smartloop.agents.mcp.skill_generator import MCPSkillGenerator
@@ -1402,8 +1402,13 @@ class ModelService:
         if mcp_catalogue and not already_has_mcp:
             mcp_field = (
                 '- "mcp_call": the single best matching tool call as a plain string '
-                '(e.g. "ServerName.tool_name(param)"). Use fixed values for params '
-                'known from context; bare param names for runtime values. '
+                'in the exact form server_name.tool_name(param). '
+                'The server_name prefix is REQUIRED — always include it. '
+                'Copy both the server_name and tool_name EXACTLY as they appear in the '
+                'available MCP tools list below (for example, if the list shows '
+                'weather.get_forecast, write weather.get_forecast(city=Paris)). '
+                'Do NOT wrap them in angle brackets and do NOT invent or rename the server. '
+                'Use fixed values for params known from context; bare param names for runtime values. '
                 'If the skill says "save" or "create", pick a create/save tool, NOT a list/read tool. '
                 'Omit if no tool clearly matches.\n\n'
                 f'{mcp_catalogue}\n'
@@ -1450,6 +1455,9 @@ class ModelService:
             mcp_call = meta.pop("mcp_call", None)
             if mcp_call:
                 mcp_call = re.sub(r'```\w*', '', mcp_call).strip()
+                # The LLM may emit a hallucinated server name. Re-bind the call
+                # to the server that actually owns the matching tool.
+                mcp_call = self._correct_mcp_call_server(mcp_call, project)
                 meta["mcp_block"] = f"```mcp\n{mcp_call}\n```"
             else:
                 meta.pop("mcp_block", None)
@@ -1458,6 +1466,63 @@ class ModelService:
         except Exception as e:
             logger.warning("Failed to generate skill metadata: %s", e)
             return {}
+
+    @staticmethod
+    def _correct_mcp_call_server(mcp_call: str, project: Optional["Project"]) -> str:
+        """Re-bind a generated ``Server.tool(args)`` call to the real server.
+
+        The skill-generation LLM is free-text and frequently emits a server
+        name that does not match any registered MCP server. Since tool names
+        are unambiguous within a project, we look the call's tool up in the
+        registered servers and, when found, rewrite the server portion to the
+        server that actually owns that tool. Returns the call unchanged when
+        no registered server exposes the tool.
+        """
+        if not project:
+            return mcp_call
+
+        # Split the call head ("server.tool") from its argument list. The model
+        # sometimes wraps the head in angle brackets/backticks (e.g.
+        # "<server.tool>(args)") — strip those from the head only, leaving any
+        # "<value>" runtime-param markers inside the parens untouched.
+        head, sep, tail = mcp_call.partition("(")
+        if sep:
+            head = head.strip().strip("<>`").strip()
+            mcp_call = f"{head}{sep}{tail}"
+
+        # Parse "[server.]tool(args)" — the tool is the identifier directly
+        # before the argument list; everything before the last dot, if present,
+        # is the (possibly wrong) server name. The model sometimes omits the
+        # server prefix entirely, so it is optional here.
+        m = re.match(r'^\s*(?:(.+)\.)?([\w-]+)\s*\((.*)\)\s*$', mcp_call, re.DOTALL)
+        if not m:
+            return mcp_call
+
+        emitted_server, tool_name, args_str = m.group(1), m.group(2), m.group(3)
+
+        # Find the registered server that actually owns this tool.
+        for server in project.mcp_servers:
+            if not server.tools or server.id == SYSTEM_TOOLS_SERVER_ID:
+                continue
+            if any(t.name == tool_name for t in server.tools):
+                if not emitted_server:
+                    logger.info(
+                        "Bound generated mcp_call (no server prefix) to server "
+                        "'%s' (owns tool '%s')", server.name, tool_name,
+                    )
+                elif server.name != emitted_server:
+                    logger.info(
+                        "Re-bound generated mcp_call from server '%s' to '%s' "
+                        "(owns tool '%s')",
+                        emitted_server, server.name, tool_name,
+                    )
+                return f"{server.name}.{tool_name}({args_str})"
+
+        logger.warning(
+            "Generated mcp_call references tool '%s' not found on any "
+            "registered server; leaving as-is", tool_name,
+        )
+        return mcp_call
 
     @staticmethod
     def _visible_project_dir(project: "Project") -> str:
@@ -2718,6 +2783,15 @@ class ModelService:
             pkg = args[0]
             args = ["--from", pkg, pkg]
 
+        # `uvx` is only a ~340KB trampoline that execs the real `uv` binary,
+        # which it locates *solely* as a sibling file next to itself (it does
+        # not search PATH). A system with `uvx` but no adjacent `uv` therefore
+        # fails. Since `uvx <args>` is exactly `uv tool run <args>`, prefer the
+        # self-contained `uv` binary when it is available on PATH.
+        if command == "uvx" and shutil.which("uv"):
+            command = "uv"
+            args = ["tool", "run", *args]
+
         if name is None:
             # Derive a display name from the package/script, i.e. the first
             # non-flag arg (e.g. "uvx mcp-server-fetch" → "mcp-server-fetch"),
@@ -2745,25 +2819,34 @@ class ModelService:
             config=MCPServerConfig(command=command, args=args, env=resolved_env, cwd=resolved_cwd),
         )
 
-        # Discover tools by launching the process and doing the MCP handshake
+        # Discover tools by launching the process and doing the MCP handshake.
+        # Any failure here is fatal: we do not persist a server whose tools we
+        # could not enumerate, and the error is surfaced to the API caller.
+        discovery_error: str | None = None
         try:
             with LocalMCPClient(command=command, args=args, env=resolved_env, cwd=resolved_cwd) as client:
                 result = client.connect_and_discover_tools()
         except MCPLaunchError as exc:
-            # uvx prints hints like "Use `uvx --from <pkg> <exec>` instead" when
-            # the package name and executable name differ.  Parse and auto-retry.
-            hint = re.search(r"Use `uvx (.*?)` instead", str(exc))
-            if command == "uvx" and hint:
-                fixed_args = hint.group(1).split()
+            # Both `uvx` and `uv tool run` print a hint like
+            # "Use `uvx --from <pkg> <exec>` instead" (or the `uv tool run`
+            # form) when the package name and executable name differ. Parse the
+            # suggested args and auto-retry under whichever launcher we used.
+            hint = re.search(r"Use `uv(?:x| tool run) (.*?)` instead", str(exc))
+            if hint:
+                suggested = hint.group(1).split()
+                # Preserve the `tool run` prefix when launching via the real
+                # `uv` binary; for bare `uvx` there is no prefix.
+                prefix = args[:2] if command == "uv" and args[:2] == ["tool", "run"] else []
+                fixed_args = [*prefix, *suggested]
                 logger.info(
-                    "Retrying uvx with corrected args %s (original: %s)", fixed_args, args
+                    "Retrying %s with corrected args %s (original: %s)", command, fixed_args, args
                 )
                 args = fixed_args
-                if "--from" in fixed_args:
-                    from_idx = fixed_args.index("--from")
-                    fixed_pkg = fixed_args[from_idx + 1] if from_idx + 1 < len(fixed_args) else None
+                if "--from" in suggested:
+                    from_idx = suggested.index("--from")
+                    fixed_pkg = suggested[from_idx + 1] if from_idx + 1 < len(suggested) else None
                 else:
-                    fixed_pkg = next((a for a in fixed_args if not a.startswith("-")), None)
+                    fixed_pkg = next((a for a in suggested if not a.startswith("-")), None)
                 if fixed_pkg:
                     server.name = fixed_pkg.split("/")[-1]
                     server.pkg = server.name
@@ -2774,19 +2857,13 @@ class ModelService:
                         result = client.connect_and_discover_tools()
                 except Exception as retry_exc:
                     result = None
-                    logger.warning(
-                        "Could not discover tools from local MCP server '%s' after retry: %s", name, retry_exc
-                    )
+                    discovery_error = str(retry_exc)
             else:
                 result = None
-                logger.warning(
-                    "Could not discover tools from local MCP server '%s': %s", name, exc
-                )
+                discovery_error = str(exc)
         except Exception as exc:
             result = None
-            logger.warning(
-                "Could not discover tools from local MCP server '%s': %s", name, exc
-            )
+            discovery_error = str(exc)
 
         if result and result.success:
             server.tools = result.tools
@@ -2805,10 +2882,14 @@ class ModelService:
                 len(result.tools), name,
             )
         elif result is not None:
-            logger.warning(
-                "Could not discover tools from local MCP server '%s': %s",
-                name, result.error or "tool discovery failed",
+            discovery_error = result.error or "tool discovery failed"
+
+        if discovery_error is not None:
+            message = (
+                f"Could not discover tools from local MCP server '{name}': {discovery_error}"
             )
+            logger.warning(message)
+            raise MCPDiscoveryError(message)
 
         current_project.mcp_servers.append(server)
         self._model.save()
