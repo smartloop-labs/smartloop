@@ -40,9 +40,22 @@ class LLMExecutor:
         n_llm_workers: int = 0,
         model_path: str | None = None,
         project_id: str | None = None,
+        log_queue=None,
     ):
         self._io_pool = ThreadPoolExecutor(max_workers=max_io_workers, thread_name_prefix="io")
         self._llm_pool: ProcessPoolExecutor | None = None
+
+        # When the parent process has set up centralized logging, hand the
+        # shared queue to spawn workers so their records flow back to the
+        # listener.  Fall back to looking it up from logging_setup so callers
+        # don't have to thread it through.
+        if log_queue is None:
+            try:
+                from smartloop.utils.logging_setup import get_log_queue
+                log_queue = get_log_queue()
+            except Exception:
+                log_queue = None
+        self._log_queue = log_queue
 
         if n_llm_workers > 0 and model_path:
             # ``n_llm_workers`` is the on/off switch + preferred count; the
@@ -82,7 +95,7 @@ class LLMExecutor:
                 max_workers=effective_workers,
                 mp_context=mp_context,
                 initializer=init_worker,
-                initargs=(model_path, project_id or ""),
+                initargs=(model_path, project_id or "", self._log_queue),
             )
 
     @staticmethod
