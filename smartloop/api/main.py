@@ -319,10 +319,20 @@ def _install_centralized_logging() -> None:
     )
     queue = make_log_queue()
     setup_root_logging(queue, level="DEBUG")
+    # main.py (the CLI entry point) clamps "smartloop" to WARNING to keep the
+    # interactive `slp` shell quiet — but start_server_foreground is launched
+    # from that same main.py, so the server inherits that gag.  Lift it only
+    # when the user has explicitly asked for DEBUG; at INFO (the default, used
+    # by the shipped Electron build) the gag stays so server.log only
+    # accumulates uvicorn access lines + warnings/errors, not the full
+    # orchestrator / DAG / planner / explorer / MCP trace.
+    log_level = (api_settings.log_level or "INFO").upper()
+    if log_level == "DEBUG":
+        logging.getLogger("smartloop").setLevel(logging.DEBUG)
     listener = start_listener(
         queue,
         home_dir=_app_settings.home_dir,
-        file_level=api_settings.log_level,
+        file_level=log_level,
     )
     # Module-level code already attached _TokenRedactFilter to
     # ``uvicorn.access`` at import time; setup_root_logging only resets root

@@ -130,3 +130,46 @@ def test_spawn_process_records_reach_parent_listener():
 
     assert "hello from spawn" in buf.getvalue()
     assert "spawn.test" in buf.getvalue()
+
+
+# --------------------------------------------------------------------------
+# api_settings.log_level controls whether the smartloop gag is lifted
+# --------------------------------------------------------------------------
+
+def _run_install_with_log_level(monkeypatch, tmp_path, level):
+    """Set api_settings.log_level, install centralized logging, return listener."""
+    from smartloop.api import main as api_main
+
+    # main.py clamps smartloop to WARNING; restore that baseline before
+    # _install_centralized_logging so each case starts from the same state.
+    logging.getLogger("smartloop").setLevel(logging.WARNING)
+
+    monkeypatch.setattr(api_main.api_settings, "log_level", level)
+    # home_dir is a computed property backed by slp_home — set the field.
+    monkeypatch.setattr(api_main._app_settings, "slp_home", str(tmp_path))
+
+    # Fresh queue per call — the singleton in logging_setup persists across
+    # tests otherwise.
+    import smartloop.utils.logging_setup as ls
+    monkeypatch.setattr(ls, "_LOG_QUEUE", None)
+
+    api_main._install_centralized_logging()
+    return api_main.app.state.log_listener
+
+
+def test_log_level_info_keeps_smartloop_at_warning(monkeypatch, tmp_path):
+    """Shipped electron build (log_level=INFO) keeps main.py's smartloop gag."""
+    listener = _run_install_with_log_level(monkeypatch, tmp_path, "INFO")
+    try:
+        assert logging.getLogger("smartloop").level == logging.WARNING
+    finally:
+        listener.stop()
+
+
+def test_log_level_debug_lifts_smartloop_gag(monkeypatch, tmp_path):
+    """Dev mode (log_level=DEBUG) lifts the gag so orchestrator logs reach the file."""
+    listener = _run_install_with_log_level(monkeypatch, tmp_path, "DEBUG")
+    try:
+        assert logging.getLogger("smartloop").level == logging.DEBUG
+    finally:
+        listener.stop()
