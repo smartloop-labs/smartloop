@@ -1,4 +1,4 @@
-.PHONY: help venv build test test-unit test-cov build-binary sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
+.PHONY: help venv build run run-debug test test-unit test-cov build-binary sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
 
 UNAME_S := $(shell uname -s)
 DIST_DIR := dist/slp
@@ -81,6 +81,8 @@ help:
 	@echo ""
 	@echo "  Development:"
 	@echo "  build           - Create venv, install requirements and llama-cpp-python with GPU support"
+	@echo "  run             - Start the API server with default INFO logging"
+	@echo "  run-debug       - Start the API server with LOG_LEVEL=DEBUG (verbose orchestrator/DAG/MCP logs)"
 	@echo "  test            - Run slp --help and check llama-cpp GPU binding"
 	@echo "  clean           - Remove .venv, build artifacts, and caches"
 	@echo ""
@@ -118,6 +120,12 @@ build: venv
 	@echo "=== Pre-downloading docling and EasyOCR models ==="
 	$(PYTHON) -c "from docling.utils.model_downloader import download_models; download_models(with_easyocr=True)"
 	@echo "=== Build complete ==="
+
+run:
+	$(PYTHON) -m main agent start
+
+run-debug:
+	LOG_LEVEL=DEBUG $(PYTHON) -m main agent start
 
 test-deps:
 	$(PIP) install -q -e ".[dev]"

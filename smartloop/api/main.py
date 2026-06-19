@@ -34,7 +34,9 @@ _app_settings.version = __version__
 # Port file for persisting actual bound port (shared in home directory)
 PORT_FILE = os.path.join(_app_settings.home_dir, "server.port")
 
-# Configure logging — INFO level; handlers are added by _setup_file_logging at startup.
+# Root logger is configured by smartloop.utils.logging_setup.setup_root_logging
+# inside run_server / start_server_foreground.  Until that runs, fall back to a
+# permissive root level so import-time logs aren't dropped.
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -147,6 +149,15 @@ async def lifespan(app: FastAPI):
     model_service.unload_model()
 
     logger.info("Model unloaded, shutdown complete")
+
+    # Stop the centralized log listener last so the lines above still flush
+    # through the rotating file handler.
+    listener = getattr(app.state, "log_listener", None)
+    if listener is not None:
+        try:
+            listener.stop()
+        except Exception:
+            pass
 
 
 app = FastAPI(
@@ -295,18 +306,44 @@ class _PortCapturingServer(uvicorn.Server):
                     break
 
 
-def _setup_file_logging():
-    """Send INFO logs to stdout — callers are responsible for redirecting to a file."""
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(logging.INFO)
-    stream_handler.setFormatter(formatter)
-    logging.getLogger().addHandler(stream_handler)
+def _install_centralized_logging() -> None:
+    """Install the shared log queue, root QueueHandler, and parent listener.
+
+    The same queue is later picked up by ``LLMExecutor`` via
+    ``logging_setup.get_log_queue`` so spawn worker processes log through
+    the same listener.  Stashes the listener on ``app.state`` so the
+    lifespan shutdown can stop it.
+    """
+    from smartloop.utils.logging_setup import (
+        make_log_queue, setup_root_logging, start_listener,
+    )
+    queue = make_log_queue()
+    setup_root_logging(queue, level="DEBUG")
+    # main.py (the CLI entry point) clamps "smartloop" to WARNING to keep the
+    # interactive `slp` shell quiet — but start_server_foreground is launched
+    # from that same main.py, so the server inherits that gag.  Lift it only
+    # when the user has explicitly asked for DEBUG; at INFO (the default, used
+    # by the shipped Electron build) the gag stays so server.log only
+    # accumulates uvicorn access lines + warnings/errors, not the full
+    # orchestrator / DAG / planner / explorer / MCP trace.
+    log_level = (api_settings.log_level or "INFO").upper()
+    if log_level == "DEBUG":
+        logging.getLogger("smartloop").setLevel(logging.DEBUG)
+    listener = start_listener(
+        queue,
+        home_dir=_app_settings.home_dir,
+        file_level=log_level,
+    )
+    # Module-level code already attached _TokenRedactFilter to
+    # ``uvicorn.access`` at import time; setup_root_logging only resets root
+    # handlers, so that filter survives this call.
+    app.state.log_listener = listener
+    app.state.log_queue = queue
 
 
 def run_server():
     """Run the uvicorn server (for development/direct execution)."""
-    _setup_file_logging()
+    _install_centralized_logging()
 
     # Write PID file for tracking
     pid_file = os.path.join(_app_settings.home_dir, "server.pid")
@@ -364,7 +401,7 @@ def start_server_foreground(host: str, port: int, service: bool = True) -> None:
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text(str(os.getpid()))
 
-    _setup_file_logging()
+    _install_centralized_logging()
 
     max_backoff = 60  # seconds
     backoff = 1

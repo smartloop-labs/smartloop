@@ -15,19 +15,19 @@ _llm = None  # Module-global: one Llama model per process
 _MIN_WORKER_N_CTX = 2048
 
 
-def _configure_worker_logging() -> None:
-    """Route worker process logs to stderr so they appear in the parent's output."""
-    root = logging.getLogger()
-    if not root.handlers:
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        ))
-        root.addHandler(handler)
-        root.setLevel(logging.INFO)
+def _configure_worker_logging(log_queue=None) -> None:
+    """Configure logging inside a spawn worker process.
+
+    When ``log_queue`` is provided, route records through it back to the
+    parent's QueueListener — single source of truth for output.  When ``None``
+    (tests, ad-hoc usage), fall back to a stderr handler so the worker is
+    still observable.
+    """
+    from smartloop.utils.logging_setup import worker_setup_logging
+    worker_setup_logging(log_queue)
 
 
-def init_worker(model_path: str, project_id: str) -> None:
+def init_worker(model_path: str, project_id: str, log_queue=None) -> None:
     """Called once per process by ProcessPoolExecutor(initializer=...).
 
     Never raises: a raised initializer marks the whole ProcessPoolExecutor
@@ -37,7 +37,7 @@ def init_worker(model_path: str, project_id: str) -> None:
     is lost, and ``run_inference`` surfaces a clean error its caller can catch.
     """
     global _llm
-    _configure_worker_logging()
+    _configure_worker_logging(log_queue)
 
     import multiprocessing
     proc = multiprocessing.current_process()
