@@ -199,9 +199,11 @@ class WorkspaceModel(BaseModel):
         if any(kw in combined for kw in ("code", "coder", "starcoder", "deepseek-coder")):
             caps.append("coding")
 
+        # Vision is inferred only from an explicit vision marker in the name
+        # (e.g. Qwen2.5-VL).  gemma-3-4b is NOT inferred as vision: llama-cpp has
+        # no Gemma3 vision handler, so tagging it vision only produces a model
+        # that's considered for OCR and then skipped every time.
         if any(kw in combined for kw in ("vision", "vlm", "vl")):
-            caps.append("vision")
-        elif not re.search(r"[-_]text", combined) and "gemma" in combined and size >= 4:
             caps.append("vision")
 
         if size >= 3:
