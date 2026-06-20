@@ -132,6 +132,39 @@ class LlmFactory:
             return False
 
     @staticmethod
+    def _force_clip_on_cpu(logger: Logger) -> None:
+        """Make the multimodal (CLIP/mmproj) encoder load on CPU.
+
+        llama-cpp-python's vision handler hardcodes ``ctx_params.use_gpu = True``
+        for the mmproj context (``_init_mtmd_context``), so the projector and its
+        image activations always land on the GPU.  On a VRAM-constrained device
+        that OOMs *inside the native clip encode* — an uncatchable SIGSEGV that
+        core-dumps the server (the subprocess crash-probe is skipped for vision
+        models).  We patch ``mtmd_init_from_file`` to flip ``use_gpu`` off so the
+        projector runs on CPU; the LLM itself still runs on GPU, and encoding one
+        page image on CPU is fine for batch OCR.  Idempotent and version-tolerant
+        (depends only on the call signature + the ``use_gpu`` field).
+        """
+        try:
+            import llama_cpp.mtmd_cpp as mtmd_cpp
+        except Exception:
+            return
+        if getattr(mtmd_cpp, "_slp_clip_cpu", False):
+            return
+        _orig = mtmd_cpp.mtmd_init_from_file
+
+        def _cpu_init(clip_path, model, ctx_params):
+            try:
+                ctx_params.use_gpu = False
+            except Exception:
+                pass
+            return _orig(clip_path, model, ctx_params)
+
+        mtmd_cpp.mtmd_init_from_file = _cpu_init
+        mtmd_cpp._slp_clip_cpu = True
+        logger.info("[vision] CLIP/mmproj forced to CPU (avoids GPU OOM in clip encode)")
+
+    @staticmethod
     def _make_vision_chat_handler(mmproj_path: str, model_path: str, logger: Logger):
         """Build the architecture-appropriate multimodal chat handler, or None.
 
@@ -155,6 +188,9 @@ class LlmFactory:
                     f"Vision handler {cls_name} not in installed llama-cpp; loading text-only"
                 )
                 return None
+            # Keep the projector off the GPU so its image-encode pass can't OOM
+            # the (uncatchable) native clip code on a tight-VRAM device.
+            LlmFactory._force_clip_on_cpu(logger)
             return handler_cls(clip_model_path=mmproj_path, verbose=False)
         except Exception as e:
             logger.warning(f"Failed to init vision handler {cls_name} ({e}); loading text-only")
