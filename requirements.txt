@@ -18,7 +18,6 @@ langchain-text-splitters>=0.3.3
 
 # Document Processing
 markitdown[pdf,docx,pptx,xlsx]>=0.1.1
-openai>=1.40.0
 pymupdf>=1.24.0
 pylatexenc>=2.10
 

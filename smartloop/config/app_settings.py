@@ -132,9 +132,9 @@ class AppSettings(BaseSettings):
     )
     # Document parsing uses MarkItDown for fast text extraction and pushes OCR /
     # image understanding to a vision-capable model (selected by the "vision"
-    # capability, like the orchestrator) served via the local /vision/v1
-    # endpoint.  When enabled and a vision model is available, scanned/low-text
-    # PDF pages are transcribed by that model to maximize extraction.
+    # capability, like the orchestrator) loaded in-process via get_vision_llm().
+    # When enabled and a vision model is available, scanned/low-text PDF pages
+    # are transcribed by that model to maximize extraction.
     vision_enabled: bool = Field(
         default=True,
         validation_alias="slp_vision_enabled",
@@ -191,23 +191,3 @@ class AppSettings(BaseSettings):
         if self.slp_home:
             return os.path.expanduser(self.slp_home)
         return os.path.expanduser("~/.smartloop")
-
-    @property
-    def bound_api_port(self) -> int:
-        """Return the actually-bound API port.
-
-        The server writes its real port to ``<home>/server.port`` after
-        binding (the configured ``api_port`` may be 0 / auto).  Falls back to
-        the configured port when the file is absent or unreadable.
-        """
-        try:
-            port_file = os.path.join(self.home_dir, "server.port")
-            with open(port_file) as f:
-                return int(f.read().strip())
-        except Exception:
-            return self.api_port
-
-    @property
-    def vision_base_url(self) -> str:
-        """OpenAI-compatible base URL for the local vision endpoint."""
-        return f"http://127.0.0.1:{self.bound_api_port}/vision/v1"

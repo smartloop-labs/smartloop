@@ -1,12 +1,14 @@
-"""Validate that scanned (image-only) PDFs are OCR'd through the vision API.
+"""Validate that scanned (image-only) PDFs are OCR'd through the vision model.
 
 The document parser extracts text with MarkItDown for normal PDFs, but a
 scanned / image-only PDF has no extractable text.  In that case each sparse
 page must be rendered to an image and transcribed by the vision-capable model
-via the local ``/vision/v1/chat/completions`` endpoint (an OpenAI-compatible
-client call).  These tests assert that path is exercised — and that it is NOT
-exercised for text PDFs or when no vision model is available.
+selected by ``ModelService.get_vision_llm()`` — called **in-process** via
+``create_chat_completion`` with an ``image_url`` data URI.  These tests assert
+that path is exercised — and that it is NOT exercised for text PDFs or when no
+vision model is available.
 """
+import contextlib
 import os
 import tempfile
 from types import SimpleNamespace
@@ -20,25 +22,35 @@ from smartloop.parsers import document_parser as dp
 from smartloop.parsers.parser_factory import ParserFactory
 
 
-# --- fakes for the OpenAI-compatible vision client ---------------------------
+# --- fakes for the in-process vision model -----------------------------------
 
-class _FakeCompletions:
-    """Records create() calls and returns a canned transcription."""
+class _FakeVisionLLM:
+    """Records create_chat_completion() calls; returns a canned transcription."""
 
     def __init__(self, content):
         self._content = content
         self.calls = []
+        # The parser reaches the completion via ``vision_llm.model``.
+        self.model = SimpleNamespace(create_chat_completion=self._create)
 
-    def create(self, **kwargs):
+    def _create(self, **kwargs):
         self.calls.append(kwargs)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=self._content))]
-        )
+        return {"choices": [{"message": {"content": self._content}}]}
 
 
-class _FakeVisionClient:
-    def __init__(self, content="# Page\nTranscribed by vision model."):
-        self.chat = SimpleNamespace(completions=_FakeCompletions(content))
+class _FakeModelService:
+    """Minimal stand-in: just the inference semaphore the parser locks on."""
+
+    _inference_lock = contextlib.nullcontext()
+
+
+def _patch_vision(monkeypatch, llm):
+    """Make ``_vision_llm()`` return (llm, fake_service), or (None, None)."""
+    service = _FakeModelService()
+    monkeypatch.setattr(
+        dp, "_vision_llm",
+        lambda: (llm, service) if llm is not None else (None, None),
+    )
 
 
 # --- helpers -----------------------------------------------------------------
@@ -77,59 +89,50 @@ def _parse(path, logger):
 
 # --- tests -------------------------------------------------------------------
 
-def test_scanned_pdf_is_transcribed_via_vision_api(monkeypatch, caplog):
-    """Each sparse page is sent to the vision chat-completions API as an image."""
-    fake = _FakeVisionClient(content="Vision OCR: revenue grew 20%.")
-    monkeypatch.setattr(dp, "_vision_client", lambda: (fake, "vision"))
-    monkeypatch.setattr(dp, "_vision_available", lambda base_url, logger: True)
+def test_scanned_pdf_is_transcribed_via_vision_model(monkeypatch):
+    """Each sparse page is sent to the vision model as an image."""
+    llm = _FakeVisionLLM(content="Vision OCR: revenue grew 20%.")
+    _patch_vision(monkeypatch, llm)
 
     import logging
     path = _scanned_pdf(pages=3)
     _, text = _parse(path, logging.getLogger("test"))
 
-    create_calls = fake.chat.completions.calls
-    # One vision API call per scanned page.
-    assert len(create_calls) == 3, f"expected 3 OCR calls, got {len(create_calls)}"
+    # One vision completion per scanned page.
+    assert len(llm.calls) == 3, f"expected 3 OCR calls, got {len(llm.calls)}"
 
     # Every call must carry the page image as a base64 data URI (i.e. it really
-    # went through the vision API, not text generation).
-    for call in create_calls:
+    # went through the multimodal model, not text generation).
+    for call in llm.calls:
         parts = call["messages"][0]["content"]
         image_parts = [p for p in parts if p.get("type") == "image_url"]
-        assert image_parts, "vision API call missing image content"
+        assert image_parts, "vision call missing image content"
         assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
-        assert call["model"] == "vision"
 
     # The transcription is included in the parser output.
     assert "Vision OCR: revenue grew 20%." in text
 
 
 def test_scanned_pdf_skips_ocr_when_vision_unavailable(monkeypatch):
-    """No mmproj / endpoint down → fast fallback, zero vision API calls."""
-    fake = _FakeVisionClient()
-    monkeypatch.setattr(dp, "_vision_client", lambda: (fake, "vision"))
-    monkeypatch.setattr(dp, "_vision_available", lambda base_url, logger: False)
+    """No vision model → fast fallback, zero vision calls."""
+    _patch_vision(monkeypatch, None)
 
     import logging
     path = _scanned_pdf(pages=4)
     _, text = _parse(path, logging.getLogger("test"))
 
-    assert fake.chat.completions.calls == [], "must not call vision API when unavailable"
     # Scanned pages have no text, so the result is empty — but it returns fast.
     assert text == ""
 
 
-def test_text_pdf_does_not_use_vision_api(monkeypatch):
-    """Text-rich PDFs use the fast extraction path with no vision API calls."""
-    fake = _FakeVisionClient()
-    monkeypatch.setattr(dp, "_vision_client", lambda: (fake, "vision"))
-    # If the parser wrongly probed availability we'd still catch zero create calls,
-    # but make availability True to prove the fast path skips OCR on its own.
-    monkeypatch.setattr(dp, "_vision_available", lambda base_url, logger: True)
+def test_text_pdf_does_not_use_vision_model(monkeypatch):
+    """Text-rich PDFs use the fast extraction path with no vision calls."""
+    llm = _FakeVisionLLM(content="should not be called")
+    _patch_vision(monkeypatch, llm)
 
     import logging
     path = _text_pdf(pages=2)
     _, text = _parse(path, logging.getLogger("test"))
 
-    assert fake.chat.completions.calls == [], "text PDF must not hit the vision API"
+    assert llm.calls == [], "text PDF must not invoke the vision model"
     assert "quarterly report" in text.lower()

@@ -2371,7 +2371,7 @@ class ModelService:
 
         # Document conversion now uses MarkItDown (lightweight, no model
         # pre-download).  OCR / image understanding is handled on demand by the
-        # vision-capable model via the /vision/v1 endpoint.
+        # vision-capable model loaded in-process via get_vision_llm().
 
         # Indexer task (auto=True — watches for pending documents)
         indexer = IndexerTask(workspace=workspace, logger=logger)
