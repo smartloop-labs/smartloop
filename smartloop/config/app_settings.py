@@ -150,6 +150,11 @@ class AppSettings(BaseSettings):
         validation_alias="slp_vision_n_ctx",
         description="Context window for the vision OCR model. Must hold a full page image (~2k tokens) plus the transcription; kept as small as that allows so it still fits alongside the agent model.",
     )
+    vision_clip_device: str = Field(
+        default="auto",
+        validation_alias="slp_vision_clip_device",
+        description='Device for the CLIP/mmproj image encoder: "auto" (GPU when enough VRAM is free, else CPU), "gpu" (force GPU — faster but OOM-segfaults if VRAM is tight), or "cpu" (always CPU).',
+    )
     # Optional smaller model for decision nodes (classify, match_skills).
     # Falls back to the main model when not set.
     decision_model: Optional[str] = Field(

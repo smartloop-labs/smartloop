@@ -488,10 +488,12 @@ class ModelService:
                     ws_model.model_name,
                 )
                 continue
+            clip_on_cpu = self._clip_on_cpu(gguf_path, cap)
             try:
                 llm = LlmFactory.get_llama_cpp_instance(
                     gguf_path, logger, self.get_project_id() or "",
                     max_n_ctx=cap, mmproj_path=mmproj_path,
+                    clip_on_cpu=clip_on_cpu,
                 )
                 self._vision_llm = llm
                 self._vision_model_name = ws_model.model_name
@@ -622,6 +624,40 @@ class ModelService:
             )
             return False
         return True
+
+    def _clip_on_cpu(self, gguf_path: str, cap: int) -> bool:
+        """Decide whether the vision CLIP/mmproj encoder must run on CPU.
+
+        GPU is preferred (faster), but the projector + per-image activations
+        OOM the native clip code — an *uncatchable* SIGSEGV — when VRAM is too
+        tight.  ``vision_clip_device`` forces the choice ("gpu"/"cpu"); in
+        "auto" the projector stays on GPU only when free VRAM comfortably
+        exceeds the weights + KV + projector/activation headroom, else CPU.
+        """
+        from smartloop.config.app_settings import AppSettings
+        pref = (AppSettings().vision_clip_device or "auto").lower()
+        if pref == "gpu":
+            return False
+        if pref == "cpu":
+            return True
+        ft = self._device_free_total_gb()
+        if ft is None:
+            return False  # no CUDA device — use_gpu is moot (ggml runs clip on CPU)
+        free_gb, _ = ft
+        try:
+            model_gb = os.path.getsize(gguf_path) / 1024**3
+        except OSError:
+            return True
+        # Projector weights (~0.8GB) + per-image encode activation headroom.
+        need_gb = model_gb + 0.5 * (cap / 4096) + 1.8
+        if free_gb < need_gb:
+            logger.info(
+                "[vision] CLIP on CPU — only %.1fGB free, GPU clip needs ~%.1fGB "
+                "(set SLP_VISION_CLIP_DEVICE=gpu to force, or free VRAM)",
+                free_gb, need_gb,
+            )
+            return True
+        return False
 
     def _detect_large_model(self) -> None:
         """Load the largest downloaded model for agent/skill tasks, if it fits.

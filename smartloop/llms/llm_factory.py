@@ -165,12 +165,17 @@ class LlmFactory:
         logger.info("[vision] CLIP/mmproj forced to CPU (avoids GPU OOM in clip encode)")
 
     @staticmethod
-    def _make_vision_chat_handler(mmproj_path: str, model_path: str, logger: Logger):
+    def _make_vision_chat_handler(mmproj_path: str, model_path: str, logger: Logger,
+                                  clip_on_cpu: bool = False):
         """Build the architecture-appropriate multimodal chat handler, or None.
 
         Returns None (caller loads text-only / skips) when the model's
         architecture has no supported handler in the installed llama-cpp — this
         is what prevents a crash on e.g. gemma3.
+
+        ``clip_on_cpu`` forces the CLIP/mmproj encoder onto CPU (see
+        ``_force_clip_on_cpu``); the caller sets it only when GPU VRAM is too
+        tight to run the projector without an OOM segfault.
         """
         cls_name = LlmFactory._vision_handler_class_name(model_path)
         if not cls_name:
@@ -188,9 +193,11 @@ class LlmFactory:
                     f"Vision handler {cls_name} not in installed llama-cpp; loading text-only"
                 )
                 return None
-            # Keep the projector off the GPU so its image-encode pass can't OOM
-            # the (uncatchable) native clip code on a tight-VRAM device.
-            LlmFactory._force_clip_on_cpu(logger)
+            # Keep the projector off the GPU only when asked — its image-encode
+            # pass OOM-segfaults the (uncatchable) native clip code on a
+            # tight-VRAM device.  With enough VRAM it stays on GPU (faster).
+            if clip_on_cpu:
+                LlmFactory._force_clip_on_cpu(logger)
             return handler_cls(clip_model_path=mmproj_path, verbose=False)
         except Exception as e:
             logger.warning(f"Failed to init vision handler {cls_name} ({e}); loading text-only")
@@ -200,7 +207,7 @@ class LlmFactory:
     def get_llama_cpp_instance(
         path: str, logger: Logger, project_id: str, lora_path: str | None = None,
         *, probe: bool = True, max_n_ctx: int | None = None,
-        mmproj_path: str | None = None,
+        mmproj_path: str | None = None, clip_on_cpu: bool = False,
     ):
         """Returns an instance of the configured LlamaCpp wrapper class.
 
@@ -227,7 +234,8 @@ class LlmFactory:
 
         chat_handler = None
         if mmproj_path:
-            chat_handler = LlmFactory._make_vision_chat_handler(mmproj_path, path, logger)
+            chat_handler = LlmFactory._make_vision_chat_handler(
+                mmproj_path, path, logger, clip_on_cpu=clip_on_cpu)
             if chat_handler is not None:
                 # Handler holds a loaded CLIP model; it can't be pickled into
                 # the probe subprocess, so load directly in-process.
