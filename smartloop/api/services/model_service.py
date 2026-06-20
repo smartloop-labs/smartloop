@@ -457,7 +457,10 @@ class ModelService:
             if m.enabled and m.downloaded
             and "vision" in [c.lower() for c in m.effective_capabilities]
         ]
-        candidates.sort(key=lambda m: m.param_size_b, reverse=True)
+        # Smallest VL model first: OCR quality is adequate from a lighter model,
+        # and a smaller one is far more likely to fit on GPU alongside the
+        # orchestrator + on-demand agent models (e.g. Qwen2-VL-2B over -3B).
+        candidates.sort(key=lambda m: m.param_size_b or 0.0)
 
         # OCR is a latency-tolerant batch task, so give the vision model a small
         # dedicated context and waive the agent-model reserve — it only needs to

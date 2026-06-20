@@ -8,3 +8,4 @@ from .llama3_2_3b import Llama3_2_3bModel
 from .phi4_mini_it import Phi4MiniModel
 from .gemma4_2b import Gemma4_2bModel
 from .qwen2_5_vl_3b import Qwen2_5VL_3bModel
+from .qwen2_vl_2b import Qwen2VL_2bModel
