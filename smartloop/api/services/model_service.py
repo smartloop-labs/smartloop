@@ -31,8 +31,6 @@ from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
 from smartloop.db.feedback_indexer import FeedbackIndexer
 from smartloop.feedback_store import FeedbackStore, FeedbackEntry, ConversationTurn
-from docling.datamodel.settings import settings as docling_settings
-from docling.utils.model_downloader import download_models as download_docling_models
 from smartloop.model import Model
 from smartloop.mcp.local_client import LocalMCPClient
 from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
@@ -95,6 +93,10 @@ class ModelService:
         self._decision_model_name: Optional[str] = None
         self._large_llm: Optional[BaseLLM] = None
         self._large_model_name: Optional[str] = None
+        # Multimodal vision model for document OCR (needs main + mmproj GGUF).
+        self._vision_llm: Optional[BaseLLM] = None
+        self._vision_model_name: Optional[str] = None
+        self._vision_unavailable: bool = False
         # Set once the large model has been considered (loaded, skipped for
         # fit, or absent), so we don't re-probe VRAM on every agent request.
         self._large_model_attempted: bool = False
@@ -353,6 +355,10 @@ class ModelService:
         self._large_llm = None
         self._large_model_name = None
         self._large_model_attempted = False
+        # Vision (multimodal) model is also loaded lazily on first OCR use.
+        self._vision_llm = None
+        self._vision_model_name = None
+        self._vision_unavailable = False
 
         self._warmup_embeddings()
         self._warmup_inference()
@@ -399,6 +405,102 @@ class ModelService:
         self._detect_large_model()
         return self._large_llm
 
+    @staticmethod
+    def _find_model_ggufs(model_dir: str) -> tuple[Optional[str], Optional[str]]:
+        """Return (main_gguf, mmproj_gguf) found directly in ``model_dir``.
+
+        The mmproj / CLIP projector ships as a separate ``*mmproj*.gguf`` (or
+        ``*clip*.gguf``) alongside the model GGUF; it must not be mistaken for
+        the main weights, so it is matched by name and excluded from the main
+        pick.
+        """
+        main_gguf = None
+        mmproj_gguf = None
+        if os.path.isdir(model_dir):
+            for f in sorted(os.listdir(model_dir)):
+                if not f.endswith(".gguf"):
+                    continue
+                lower = f.lower()
+                if "mmproj" in lower or "clip" in lower:
+                    if mmproj_gguf is None:
+                        mmproj_gguf = os.path.join(model_dir, f)
+                elif main_gguf is None:
+                    main_gguf = os.path.join(model_dir, f)
+        return main_gguf, mmproj_gguf
+
+    def get_vision_llm(self) -> Optional[BaseLLM]:
+        """Return a loaded *multimodal* vision LLM, or None when unavailable.
+
+        Vision-capable models are considered largest-first (like the
+        orchestrator), but a model is only usable for OCR when ALL of these
+        hold, so unrunnable candidates are skipped rather than crashing:
+          * its mmproj / CLIP projector GGUF is present (else it's blind), and
+          * the installed llama-cpp has a chat handler for its architecture
+            (e.g. gemma3 has none in llama-cpp-python and aborts natively), and
+          * it fits in available memory.
+        Returns None when no candidate qualifies (callers fall back to text).
+        """
+        from smartloop.config.app_settings import AppSettings
+        if not AppSettings().vision_enabled:
+            return None
+        if self._vision_llm is not None:
+            return self._vision_llm
+        if self._vision_unavailable:
+            return None
+        if not self._model or not self._model.workspace:
+            return None
+
+        from smartloop.llms.llm_factory import LlmFactory
+        workspace = self._model.workspace
+        candidates = [
+            m for m in workspace.models
+            if m.enabled and m.downloaded
+            and "vision" in [c.lower() for c in m.effective_capabilities]
+        ]
+        candidates.sort(key=lambda m: m.param_size_b, reverse=True)
+
+        cap = AppSettings().llm_large_n_ctx_cap
+        for ws_model in candidates:
+            model_dir = workspace.model_dir_for(ws_model.model_id)
+            gguf_path, mmproj_path = self._find_model_ggufs(model_dir)
+            if not gguf_path or not mmproj_path:
+                logger.info(
+                    "[vision] %s skipped — missing %s",
+                    ws_model.model_name,
+                    "weights GGUF" if not gguf_path else "mmproj/CLIP GGUF",
+                )
+                continue
+            if not LlmFactory.vision_handler_supported(gguf_path):
+                logger.warning(
+                    "[vision] %s skipped — installed llama-cpp has no vision handler "
+                    "for its architecture (%s)",
+                    ws_model.model_name, LlmFactory._read_gguf_arch(gguf_path),
+                )
+                continue
+            if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
+                logger.warning(
+                    "[vision] %s skipped — won't fit in available memory",
+                    ws_model.model_name,
+                )
+                continue
+            try:
+                llm = LlmFactory.get_llama_cpp_instance(
+                    gguf_path, logger, self.get_project_id() or "",
+                    max_n_ctx=cap, mmproj_path=mmproj_path,
+                )
+                self._vision_llm = llm
+                self._vision_model_name = ws_model.model_name
+                logger.info(
+                    "[vision] Loaded %s (+mmproj) for image OCR", ws_model.model_name
+                )
+                return llm
+            except Exception as e:
+                logger.warning("[vision] Failed to load %s: %s", ws_model.model_name, e)
+
+        logger.warning("[vision] No runnable vision model available — image OCR disabled")
+        self._vision_unavailable = True
+        return None
+
     def _get_llm_for_capability(self, capability: str) -> Optional[BaseLLM]:
         """Return a loaded LLM matching the requested capability.
 
@@ -425,12 +527,10 @@ class ModelService:
 
         try:
             model_dir = workspace.model_dir_for(ws_model.model_id)
-            gguf_path = None
-            if os.path.isdir(model_dir):
-                for f in os.listdir(model_dir):
-                    if f.endswith(".gguf"):
-                        gguf_path = os.path.join(model_dir, f)
-                        break
+            # _find_model_ggufs excludes the mmproj/CLIP GGUF from the main pick.
+            # This path is text-only capability routing (orchestrator); image OCR
+            # goes through get_vision_llm(), which loads the multimodal handler.
+            gguf_path, _mmproj = self._find_model_ggufs(model_dir)
             if not gguf_path:
                 return None
 
@@ -2269,18 +2369,9 @@ class ModelService:
                 if migrate_chroma_to_index_store(project.project_dir):
                     logger.info(f"Migrated ChromaDB data for project '{project.name or project.id}'")
 
-        # Pre-download docling models (layout, tableformer, easyocr) so
-        # document conversion never stalls on a network fetch.
-        # Skip if models are already cached to avoid slow network checks on startup.
-        try:
-            docling_cache = docling_settings.cache_dir / "models"
-            if not docling_cache.is_dir() or not any(docling_cache.iterdir()):
-                download_docling_models(with_easyocr=True, with_rapidocr=False)
-                logger.info("Docling models cached locally")
-            else:
-                logger.info("Docling models already cached, skipping download check")
-        except Exception as e:
-            logger.warning(f"Docling model pre-download failed: {e}")
+        # Document conversion now uses MarkItDown (lightweight, no model
+        # pre-download).  OCR / image understanding is handled on demand by the
+        # vision-capable model via the /vision/v1 endpoint.
 
         # Indexer task (auto=True — watches for pending documents)
         indexer = IndexerTask(workspace=workspace, logger=logger)

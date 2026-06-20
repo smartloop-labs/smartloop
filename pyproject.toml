@@ -26,8 +26,9 @@ dependencies = [
     "langchain-text-splitters>=0.3.3",
 
     # Document Processing
-    "docling-slim[convert-core,format-pdf,format-office,format-web,feat-ocr-easyocr]==2.95.0",
-    "docling-ibm-models",
+    "markitdown[pdf,docx,pptx,xlsx]>=0.1.1",
+    "openai>=1.40.0",
+    "pymupdf>=1.24.0",
     "pylatexenc>=2.10",
 
     # API Framework

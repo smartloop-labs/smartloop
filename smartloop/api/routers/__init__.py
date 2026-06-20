@@ -12,5 +12,6 @@ from .skills import router as skills_router
 from .users import router as users_router
 from .feedback import router as feedback_router
 from .project_io import router as project_io_router
+from .openai_compat import router as vision_router
 
-__all__ = ["auth_router", "chat_router", "documents_router", "projects_router", "assets_router", "mcp_servers_router", "models_router", "init_router", "skills_router", "users_router", "feedback_router", "project_io_router"]
+__all__ = ["auth_router", "chat_router", "documents_router", "projects_router", "assets_router", "mcp_servers_router", "models_router", "init_router", "skills_router", "users_router", "feedback_router", "project_io_router", "vision_router"]

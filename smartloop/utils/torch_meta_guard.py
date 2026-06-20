@@ -5,8 +5,8 @@ accelerate's ``init_empty_weights`` context, which patches the *global*
 ``nn.Module.register_parameter`` / ``register_buffer`` so new parameters are
 created on the ``meta`` device.  The context normally restores those methods,
 but because they are class-level (shared across threads) a *concurrent* model
-load — e.g. the document indexer loading the docling layout model while the
-embedding model loads — can observe the patched version and build its weights
+load — e.g. two HF models loading at once (the embedding model and another)
+— can observe the patched version and build its weights
 on ``meta``.  The load then fails with::
 
     NotImplementedError: Cannot copy out of meta tensor; no data!
@@ -76,9 +76,9 @@ def repair_meta_init() -> bool:
 def safe_model_load():
     """Serialize a torch model load and repair any leaked meta-init patch.
 
-    Wrap model construction (embedding models, docling layout models, HF
-    models) so concurrent loads don't poison each other via accelerate's
-    global ``init_empty_weights`` patch.
+    Wrap model construction (embedding models and other HF models) so
+    concurrent loads don't poison each other via accelerate's global
+    ``init_empty_weights`` patch.
     """
     with _MODEL_LOAD_LOCK:
         repair_meta_init()

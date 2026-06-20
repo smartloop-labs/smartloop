@@ -130,10 +130,20 @@ class AppSettings(BaseSettings):
         validation_alias="slp_embedding_model",
         description="Sentence-transformer model name for dense retrieval.",
     )
-    docling_device: str = Field(
-        default="auto",
-        validation_alias="slp_docling_device",
-        description='Device for docling parsing models: "auto" (default, MPS→CUDA→CPU), "cpu", or "cuda".',
+    # Document parsing uses MarkItDown for fast text extraction and pushes OCR /
+    # image understanding to a vision-capable model (selected by the "vision"
+    # capability, like the orchestrator) served via the local /vision/v1
+    # endpoint.  When enabled and a vision model is available, scanned/low-text
+    # PDF pages are transcribed by that model to maximize extraction.
+    vision_enabled: bool = Field(
+        default=True,
+        validation_alias="slp_vision_enabled",
+        description="Use a vision-capable model for OCR/image understanding during document parsing.",
+    )
+    vision_ocr_min_chars_per_page: int = Field(
+        default=100,
+        validation_alias="slp_vision_ocr_min_chars_per_page",
+        description="PDF pages with fewer extracted chars than this are treated as scanned and OCR'd by the vision model.",
     )
     # Optional smaller model for decision nodes (classify, match_skills).
     # Falls back to the main model when not set.
@@ -181,3 +191,23 @@ class AppSettings(BaseSettings):
         if self.slp_home:
             return os.path.expanduser(self.slp_home)
         return os.path.expanduser("~/.smartloop")
+
+    @property
+    def bound_api_port(self) -> int:
+        """Return the actually-bound API port.
+
+        The server writes its real port to ``<home>/server.port`` after
+        binding (the configured ``api_port`` may be 0 / auto).  Falls back to
+        the configured port when the file is absent or unreadable.
+        """
+        try:
+            port_file = os.path.join(self.home_dir, "server.port")
+            with open(port_file) as f:
+                return int(f.read().strip())
+        except Exception:
+            return self.api_port
+
+    @property
+    def vision_base_url(self) -> str:
+        """OpenAI-compatible base URL for the local vision endpoint."""
+        return f"http://127.0.0.1:{self.bound_api_port}/vision/v1"

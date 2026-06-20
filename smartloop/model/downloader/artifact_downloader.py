@@ -17,6 +17,12 @@ from smartloop.workspace import Workspace
 _CPU_COUNT = os.cpu_count() or 4
 _IO_THREAD_BUDGET = min(32, _CPU_COUNT * 2)  # total concurrent connections (capped at 32)
 
+def _is_mmproj(path: str) -> bool:
+    """True when ``path`` is a vision mmproj / CLIP projector GGUF."""
+    name = os.path.basename(path).lower()
+    return "mmproj" in name or "clip" in name
+
+
 MAX_WORKERS = min(4, _CPU_COUNT)                      # parallel file downloads (capped: I/O-bound)
 CHUNK_SIZE = 8 * 1024 * 1024                         # 8 MB read buffer for simple downloads
 RANGE_READ_SIZE = 1 * 1024 * 1024                    # 1 MB read buffer within each chunk
@@ -290,12 +296,17 @@ class SLPArtifactDownloader(SLPDownloader):
         model_id = self._resolve_model_id(resolved_name)
         artifacts = self._bootstrap_source.get_artifacts(resolved_name)
 
-        # Prefer quantized GGUF (e.g. *-Q4_K_M.gguf) over the raw F16 GGUF
+        # Prefer quantized GGUF (e.g. *-Q4_K_M.gguf) over the raw F16 GGUF, but
+        # always keep the mmproj / CLIP projector GGUF (vision models need it).
         quantized = {
             k: v for k, v in artifacts.items()
             if os.path.basename(k).endswith(".gguf") and "-Q" in os.path.basename(k).upper()
         }
-        artifacts = quantized or {
+        mmproj = {
+            k: v for k, v in artifacts.items()
+            if os.path.basename(k).endswith(".gguf") and _is_mmproj(k)
+        }
+        artifacts = {**quantized, **mmproj} or {
             k: v for k, v in artifacts.items()
             if os.path.basename(k).endswith(".gguf")
         }
@@ -360,12 +371,17 @@ class SLPArtifactDownloader(SLPDownloader):
 
         artifacts = self._model_source.get_artifacts(model_name)
 
-        # Prefer quantized GGUF (e.g. *-Q4_K_M.gguf) over the raw F16 GGUF
+        # Prefer quantized GGUF (e.g. *-Q4_K_M.gguf) over the raw F16 GGUF, but
+        # always keep the mmproj / CLIP projector GGUF (vision models need it).
         quantized = {
             k: v for k, v in artifacts.items()
             if os.path.basename(k).endswith(".gguf") and "-Q" in os.path.basename(k).upper()
         }
-        artifacts = quantized or {
+        mmproj = {
+            k: v for k, v in artifacts.items()
+            if os.path.basename(k).endswith(".gguf") and _is_mmproj(k)
+        }
+        artifacts = {**quantized, **mmproj} or {
             k: v for k, v in artifacts.items()
             if os.path.basename(k).endswith(".gguf")
         }

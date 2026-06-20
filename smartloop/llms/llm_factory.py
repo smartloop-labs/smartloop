@@ -83,10 +83,88 @@ class LlmFactory:
             logger.warning(f"Probe load error: {e}")
             return False
 
+    # Map a model's GGUF ``general.architecture`` to the llama-cpp vision chat
+    # handler that knows its image-token / prompt format.  Using the WRONG
+    # handler (or none) for a model crashes the native clip code, so an arch
+    # without an entry here is treated as unsupported (text-only / skipped)
+    # rather than guessed.  ``gemma3`` is deliberately absent: llama-cpp-python
+    # has no Gemma3 handler and the legacy clip path aborts on its projector.
+    _VISION_HANDLER_BY_ARCH = [
+        (("qwen2vl", "qwen2.5vl", "qwen2_5vl", "qwen3vl", "qwenvl"), "Qwen25VLChatHandler"),
+        (("minicpmv", "minicpm-v", "minicpm"), "MiniCPMv26ChatHandler"),
+        (("nanollava",), "NanoLlavaChatHandler"),
+        (("moondream",), "MoondreamChatHandler"),
+        (("llava",), "Llava16ChatHandler"),
+    ]
+
+    @staticmethod
+    def _read_gguf_arch(path: str) -> str | None:
+        """Return a model GGUF's ``general.architecture`` (e.g. 'qwen2vl')."""
+        try:
+            import gguf
+            reader = gguf.GGUFReader(path)
+            field = reader.fields.get("general.architecture")
+            if field:
+                return bytes(field.parts[field.data[0]]).decode("utf-8", "ignore")
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _vision_handler_class_name(model_path: str) -> str | None:
+        """Name of the supported vision handler for this model, or None."""
+        arch = (LlmFactory._read_gguf_arch(model_path) or "").lower()
+        for keys, cls_name in LlmFactory._VISION_HANDLER_BY_ARCH:
+            if any(k in arch for k in keys):
+                return cls_name
+        return None
+
+    @staticmethod
+    def vision_handler_supported(model_path: str) -> bool:
+        """True when the installed llama-cpp can run this model's vision input."""
+        cls_name = LlmFactory._vision_handler_class_name(model_path)
+        if not cls_name:
+            return False
+        try:
+            import llama_cpp.llama_chat_format as chf
+            return getattr(chf, cls_name, None) is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _make_vision_chat_handler(mmproj_path: str, model_path: str, logger: Logger):
+        """Build the architecture-appropriate multimodal chat handler, or None.
+
+        Returns None (caller loads text-only / skips) when the model's
+        architecture has no supported handler in the installed llama-cpp — this
+        is what prevents a crash on e.g. gemma3.
+        """
+        cls_name = LlmFactory._vision_handler_class_name(model_path)
+        if not cls_name:
+            arch = LlmFactory._read_gguf_arch(model_path)
+            logger.warning(
+                f"No supported vision chat handler for architecture {arch!r}; "
+                f"loading text-only (image OCR disabled for this model)"
+            )
+            return None
+        try:
+            import llama_cpp.llama_chat_format as chf
+            handler_cls = getattr(chf, cls_name, None)
+            if handler_cls is None:
+                logger.warning(
+                    f"Vision handler {cls_name} not in installed llama-cpp; loading text-only"
+                )
+                return None
+            return handler_cls(clip_model_path=mmproj_path, verbose=False)
+        except Exception as e:
+            logger.warning(f"Failed to init vision handler {cls_name} ({e}); loading text-only")
+            return None
+
     @staticmethod
     def get_llama_cpp_instance(
         path: str, logger: Logger, project_id: str, lora_path: str | None = None,
         *, probe: bool = True, max_n_ctx: int | None = None,
+        mmproj_path: str | None = None,
     ):
         """Returns an instance of the configured LlamaCpp wrapper class.
 
@@ -100,10 +178,24 @@ class LlmFactory:
         copies pass a small value so several models' KV caches fit on one GPU
         (the context auto-sizing otherwise assumes the model is alone on the
         device and reserves nearly all VRAM for a single copy).
+
+        ``mmproj_path``: path to a CLIP/mmproj GGUF.  When set, the model is
+        loaded as a multimodal (vision) instance with a vision chat handler so
+        it can describe / OCR images.  The subprocess probe is skipped (the
+        handler object isn't JSON-serializable) and the load is forced
+        in-process.
         """
         import torch
         from llama_cpp import Llama
         from smartloop.llms.llama_cpp import LlamaCpp
+
+        chat_handler = None
+        if mmproj_path:
+            chat_handler = LlmFactory._make_vision_chat_handler(mmproj_path, path, logger)
+            if chat_handler is not None:
+                # Handler holds a loaded CLIP model; it can't be pickled into
+                # the probe subprocess, so load directly in-process.
+                probe = False
 
         from smartloop.config.app_settings import AppSettings as _AppSettings
         _app_cfg = _AppSettings()
@@ -195,6 +287,10 @@ class LlmFactory:
         if lora_path:
             config['lora_path'] = lora_path
             logger.info(f"Loading LoRA adapter: {lora_path}")
+
+        if chat_handler is not None:
+            config['chat_handler'] = chat_handler
+            logger.info(f"Loading vision model with mmproj: {mmproj_path}")
 
         logger.info(f"Loading model with config: n_ctx={n_ctx}, n_gpu_layers={config['n_gpu_layers']}, model_size={model_size_gb:.1f}GB")
 
