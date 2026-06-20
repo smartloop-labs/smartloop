@@ -145,6 +145,11 @@ class AppSettings(BaseSettings):
         validation_alias="slp_vision_ocr_min_chars_per_page",
         description="PDF pages with fewer extracted chars than this are treated as scanned and OCR'd by the vision model.",
     )
+    vision_n_ctx: int = Field(
+        default=2048,
+        validation_alias="slp_vision_n_ctx",
+        description="Context window for the vision OCR model. Kept small so it fits alongside the agent model — OCR only needs the image tokens plus a short transcription.",
+    )
     # Optional smaller model for decision nodes (classify, match_skills).
     # Falls back to the main model when not set.
     decision_model: Optional[str] = Field(

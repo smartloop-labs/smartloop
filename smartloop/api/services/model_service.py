@@ -459,7 +459,11 @@ class ModelService:
         ]
         candidates.sort(key=lambda m: m.param_size_b, reverse=True)
 
-        cap = AppSettings().llm_large_n_ctx_cap
+        # OCR is a latency-tolerant batch task, so give the vision model a small
+        # dedicated context and waive the agent-model reserve — it only needs to
+        # fit the image tokens plus a short transcription, and shouldn't be
+        # blocked by headroom kept for the (already-resident) agent model.
+        cap = AppSettings().vision_n_ctx
         for ws_model in candidates:
             model_dir = workspace.model_dir_for(ws_model.model_id)
             gguf_path, mmproj_path = self._find_model_ggufs(model_dir)
@@ -477,7 +481,8 @@ class ModelService:
                     ws_model.model_name, LlmFactory._read_gguf_arch(gguf_path),
                 )
                 continue
-            if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
+            if not self._large_model_fits(gguf_path, cap, ws_model.model_name,
+                                          reserve_gb=0.0):
                 logger.warning(
                     "[vision] %s skipped — won't fit in available memory",
                     ws_model.model_name,
@@ -580,12 +585,16 @@ class ModelService:
             pass
         return None
 
-    def _large_model_fits(self, gguf_path: str, cap: int, label: str = "") -> bool:
+    def _large_model_fits(self, gguf_path: str, cap: int, label: str = "",
+                          reserve_gb: Optional[float] = None) -> bool:
         """True if a large model's capped footprint fits in free VRAM.
 
         Estimates the model's footprint (weights + KV cache @ ``cap`` +
         per-process overhead) and compares it against free device memory after
-        the configured reserve (``llm_large_fit_reserve_gb``).  Always True on
+        a reserve.  ``reserve_gb`` defaults to the configured
+        ``llm_large_fit_reserve_gb``; callers that load a latency-tolerant model
+        (e.g. the on-demand vision OCR model) may pass a smaller value (or 0) to
+        let it use the headroom the reserve normally protects.  Always True on
         CPU (RAM is plentiful) or when the device can't be queried.  When it
         returns False the caller skips the load and falls back to the default
         routing model instead of risking an OOM / starving the worker pool.
@@ -599,7 +608,8 @@ class ModelService:
         except OSError:
             return True
         from smartloop.config.app_settings import AppSettings
-        reserve_gb = AppSettings().llm_large_fit_reserve_gb
+        if reserve_gb is None:
+            reserve_gb = AppSettings().llm_large_fit_reserve_gb
         kv_gb = 0.5 * (cap / 4096)
         footprint_gb = model_gb + kv_gb + 0.7
         if footprint_gb + reserve_gb > free_gb:
