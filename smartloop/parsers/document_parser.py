@@ -34,6 +34,14 @@ _IMAGE_PROMPT = (
     "into clean GitHub-flavored Markdown."
 )
 
+# Page-render DPI and output budget for PDF OCR.  A full page image consumes a
+# large share of the vision model's (small) context — at 150 DPI a letter page
+# is ~2800 image tokens, which alone overflows a 2048 ctx.  130 DPI keeps a page
+# near ~2100 tokens so it plus the transcription fit within vision_n_ctx (4096),
+# while staying legible for OCR.
+_OCR_DPI = 130
+_OCR_MAX_TOKENS = 1536
+
 
 class _VisionChatCompletions:
     """``chat.completions`` over the in-process vision LLM (OpenAI-shaped).
@@ -193,7 +201,7 @@ class DocumentParser(BaseParser):
         llama.cpp's vision handler takes images).
         """
         try:
-            pix = page.get_pixmap(dpi=150)
+            pix = page.get_pixmap(dpi=_OCR_DPI)
             b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
             resp = client.chat.completions.create(
                 model=model,
@@ -205,7 +213,7 @@ class DocumentParser(BaseParser):
                          "image_url": {"url": f"data:image/png;base64,{b64}"}},
                     ],
                 }],
-                max_tokens=2048,
+                max_tokens=_OCR_MAX_TOKENS,
                 temperature=0.0,
             )
             return (resp.choices[0].message.content or "").strip()
