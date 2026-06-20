@@ -86,23 +86,6 @@ async def vision_health(model_service: ModelService = Depends(get_model_service)
     return {"available": llm is not None}
 
 
-@router.get("/models")
-async def list_models(model_service: ModelService = Depends(get_model_service)):
-    """Minimal OpenAI-style model listing for the vision endpoint."""
-    name = "vision"
-    try:
-        ws = model_service._model.workspace if model_service._model else None
-        ws_model = ws.best_model_for("vision") if ws else None
-        if ws_model:
-            name = ws_model.model_name
-    except Exception:
-        pass
-    return {
-        "object": "list",
-        "data": [{"id": name, "object": "model", "owned_by": "smartloop"}],
-    }
-
-
 async def _stream_completion(model_service: ModelService, llm, req: VisionChatRequest):
     """Yield SSE chunks by running the blocking stream in the executor."""
     max_tokens = req.max_tokens or 2048
