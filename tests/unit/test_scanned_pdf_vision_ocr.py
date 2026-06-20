@@ -1,14 +1,17 @@
-"""Validate that scanned (image-only) PDFs are OCR'd through the vision model.
+"""Validate that scanned PDFs and images are OCR'd through the vision model.
 
-The document parser extracts text with MarkItDown for normal PDFs, but a
-scanned / image-only PDF has no extractable text.  In that case each sparse
-page must be rendered to an image and transcribed by the vision-capable model
-selected by ``ModelService.get_vision_llm()`` — called **in-process** via
-``create_chat_completion`` with an ``image_url`` data URI.  These tests assert
-that path is exercised — and that it is NOT exercised for text PDFs or when no
-vision model is available.
+The document parser extracts text with MarkItDown for normal docs.  Images and
+scanned / image-only PDF pages carry no extractable text, so they are sent to
+the vision-capable model (selected by ``ModelService.get_vision_llm()``) through
+an in-process client that speaks MarkItDown's OpenAI ``llm_client`` interface:
+
+* images go through MarkItDown's image converter, and
+* scanned PDF pages are rendered with PyMuPDF and transcribed page-by-page.
+
+These tests assert those paths are exercised — and that they are NOT exercised
+for text PDFs or when no vision model is available.
 """
-import contextlib
+import logging
 import os
 import tempfile
 from types import SimpleNamespace
@@ -22,35 +25,27 @@ from smartloop.parsers import document_parser as dp
 from smartloop.parsers.parser_factory import ParserFactory
 
 
-# --- fakes for the in-process vision model -----------------------------------
+# --- fakes for the in-process vision client ----------------------------------
 
-class _FakeVisionLLM:
-    """Records create_chat_completion() calls; returns a canned transcription."""
+class _FakeCompletions:
+    """Records create() calls and returns a canned transcription."""
 
     def __init__(self, content):
         self._content = content
         self.calls = []
-        # The parser reaches the completion via ``vision_llm.model``.
-        self.model = SimpleNamespace(create_chat_completion=self._create)
 
-    def _create(self, **kwargs):
+    def create(self, **kwargs):
         self.calls.append(kwargs)
-        return {"choices": [{"message": {"content": self._content}}]}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=self._content))]
+        )
 
 
-class _FakeModelService:
-    """Minimal stand-in: just the inference semaphore the parser locks on."""
+class _FakeVisionClient:
+    """OpenAI-``llm_client``-shaped fake (what MarkItDown / _ocr_page call)."""
 
-    _inference_lock = contextlib.nullcontext()
-
-
-def _patch_vision(monkeypatch, llm):
-    """Make ``_vision_llm()`` return (llm, fake_service), or (None, None)."""
-    service = _FakeModelService()
-    monkeypatch.setattr(
-        dp, "_vision_llm",
-        lambda: (llm, service) if llm is not None else (None, None),
-    )
+    def __init__(self, content="# Page\nTranscribed by vision model."):
+        self.chat = SimpleNamespace(completions=_FakeCompletions(content))
 
 
 # --- helpers -----------------------------------------------------------------
@@ -82,8 +77,21 @@ def _text_pdf(pages=2) -> str:
     return path
 
 
-def _parse(path, logger):
-    parser = ParserFactory(None).get_parser("application/pdf", path, logger)
+def _png() -> str:
+    """A small standalone PNG image (no text layer — only the vision model
+    can describe it)."""
+    doc = fitz.open()
+    page = doc.new_page(width=200, height=200)
+    page.draw_rect(fitz.Rect(20, 20, 180, 180), fill=(0.2, 0.4, 0.6))
+    pix = page.get_pixmap()
+    path = os.path.join(tempfile.mkdtemp(), "image.png")
+    pix.save(path)
+    doc.close()
+    return path
+
+
+def _parse(mime, path):
+    parser = ParserFactory(None).get_parser(mime, path, logging.getLogger("test"))
     return parser, parser.parse()
 
 
@@ -91,48 +99,67 @@ def _parse(path, logger):
 
 def test_scanned_pdf_is_transcribed_via_vision_model(monkeypatch):
     """Each sparse page is sent to the vision model as an image."""
-    llm = _FakeVisionLLM(content="Vision OCR: revenue grew 20%.")
-    _patch_vision(monkeypatch, llm)
+    fake = _FakeVisionClient(content="Vision OCR: revenue grew 20%.")
+    monkeypatch.setattr(dp, "_vision_client", lambda: (fake, "vision"))
+    monkeypatch.setattr(dp, "_vision_available", lambda logger: True)
 
-    import logging
     path = _scanned_pdf(pages=3)
-    _, text = _parse(path, logging.getLogger("test"))
+    _, text = _parse("application/pdf", path)
 
-    # One vision completion per scanned page.
-    assert len(llm.calls) == 3, f"expected 3 OCR calls, got {len(llm.calls)}"
+    create_calls = fake.chat.completions.calls
+    # One vision call per scanned page.
+    assert len(create_calls) == 3, f"expected 3 OCR calls, got {len(create_calls)}"
 
-    # Every call must carry the page image as a base64 data URI (i.e. it really
-    # went through the multimodal model, not text generation).
-    for call in llm.calls:
+    # Every call must carry the page image as a base64 data URI.
+    for call in create_calls:
         parts = call["messages"][0]["content"]
         image_parts = [p for p in parts if p.get("type") == "image_url"]
         assert image_parts, "vision call missing image content"
         assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
 
-    # The transcription is included in the parser output.
     assert "Vision OCR: revenue grew 20%." in text
 
 
 def test_scanned_pdf_skips_ocr_when_vision_unavailable(monkeypatch):
     """No vision model → fast fallback, zero vision calls."""
-    _patch_vision(monkeypatch, None)
+    fake = _FakeVisionClient()
+    monkeypatch.setattr(dp, "_vision_client", lambda: (fake, "vision"))
+    monkeypatch.setattr(dp, "_vision_available", lambda logger: False)
 
-    import logging
     path = _scanned_pdf(pages=4)
-    _, text = _parse(path, logging.getLogger("test"))
+    _, text = _parse("application/pdf", path)
 
+    assert fake.chat.completions.calls == [], "must not call vision when unavailable"
     # Scanned pages have no text, so the result is empty — but it returns fast.
     assert text == ""
 
 
 def test_text_pdf_does_not_use_vision_model(monkeypatch):
     """Text-rich PDFs use the fast extraction path with no vision calls."""
-    llm = _FakeVisionLLM(content="should not be called")
-    _patch_vision(monkeypatch, llm)
+    fake = _FakeVisionClient()
+    monkeypatch.setattr(dp, "_vision_client", lambda: (fake, "vision"))
+    monkeypatch.setattr(dp, "_vision_available", lambda logger: True)
 
-    import logging
     path = _text_pdf(pages=2)
-    _, text = _parse(path, logging.getLogger("test"))
+    _, text = _parse("application/pdf", path)
 
-    assert llm.calls == [], "text PDF must not invoke the vision model"
+    assert fake.chat.completions.calls == [], "text PDF must not invoke the vision model"
     assert "quarterly report" in text.lower()
+
+
+def test_image_is_described_via_vision_model(monkeypatch):
+    """A standalone image is OCR'd/described through MarkItDown's image
+    converter, backed by the in-process vision client."""
+    fake = _FakeVisionClient(content="A blue square. Text: HELLO WORLD")
+    monkeypatch.setattr(dp, "_vision_client", lambda: (fake, "vision"))
+
+    path = _png()
+    _, text = _parse("image/png", path)
+
+    # The image reached the vision model as an image_url part...
+    calls = fake.chat.completions.calls
+    assert calls, "image must be sent to the vision model"
+    parts = calls[0]["messages"][0]["content"]
+    assert any(p.get("type") == "image_url" for p in parts)
+    # ...and its description is in the parser output.
+    assert "A blue square. Text: HELLO WORLD" in text

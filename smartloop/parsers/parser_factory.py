@@ -23,13 +23,17 @@ class ParserFactory:
         xlsx="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         html=mimetypes.types_map['.html'],
         csv=mimetypes.types_map['.csv'],
+        png="image/png",
+        jpeg="image/jpeg",
     )
 
     def __init__(self, llm: BaseLLM = None):
         self.llm = llm
-        # PDF, DOCX, PPTX, XLSX and HTML are all converted to markdown via
-        # MarkItDown (DocumentParser); PDF/DOCX keep thin subclasses for
-        # readability.  TXT and CSV use their own lightweight parsers.
+        # PDF, DOCX, PPTX, XLSX, HTML and images are all converted to markdown
+        # via MarkItDown (DocumentParser); PDF/DOCX keep thin subclasses for
+        # readability.  Images (PNG/JPEG) are OCR'd/described by the vision
+        # model through MarkItDown's image converter.  TXT and CSV use their own
+        # lightweight parsers.
         self.parsers = {
             self.SUPPORTED_DOCUMENT_TYPE['pdf']: PdfParser,
             self.SUPPORTED_DOCUMENT_TYPE['txt']: TextParser,
@@ -37,6 +41,8 @@ class ParserFactory:
             self.SUPPORTED_DOCUMENT_TYPE['pptx']: DocumentParser,
             self.SUPPORTED_DOCUMENT_TYPE['xlsx']: DocumentParser,
             self.SUPPORTED_DOCUMENT_TYPE['html']: DocumentParser,
+            self.SUPPORTED_DOCUMENT_TYPE['png']: DocumentParser,
+            self.SUPPORTED_DOCUMENT_TYPE['jpeg']: DocumentParser,
             self.SUPPORTED_DOCUMENT_TYPE['csv']:  CsvParser,
         }
 
