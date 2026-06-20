@@ -56,8 +56,11 @@ class AppSettings(BaseSettings):
     cors_origins: str = Field(default="*", validation_alias="slp_api_cors_origins")
     # Parallel inference slots — allows multiple agents to run concurrently
     # in the same model instance via continuous batching (llama.cpp n_parallel).
-    # Increases VRAM/RAM usage proportionally; keep at 1 on memory-constrained devices.
-    n_parallel: int = Field(default=2, validation_alias="slp_n_parallel")
+    # Increases VRAM/RAM usage proportionally (n_llm_workers defaults to this, so
+    # each extra slot is another resident model copy).  Default 1 keeps VRAM free
+    # for the on-demand skills/agent (large) model and the vision OCR model;
+    # raise it on machines with VRAM headroom.
+    n_parallel: int = Field(default=1, validation_alias="slp_n_parallel")
     # Number of LLM worker processes for parallel inference via
     # ProcessPoolExecutor.  Each worker loads its own model copy, so
     # RAM/VRAM usage scales linearly.  Defaults to n_parallel so the
