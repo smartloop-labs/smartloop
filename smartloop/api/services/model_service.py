@@ -638,12 +638,10 @@ class ModelService:
                 return
 
             model_dir = workspace.model_dir_for(largest.model_id)
-            gguf_path = None
-            if os.path.isdir(model_dir):
-                for f in os.listdir(model_dir):
-                    if f.endswith(".gguf"):
-                        gguf_path = os.path.join(model_dir, f)
-                        break
+            # Exclude the mmproj/CLIP GGUF — it is not loadable as a main model
+            # (e.g. gemma-3-4b-it ships one upstream even though we don't use it
+            # for vision); loading it as weights crashes the native loader.
+            gguf_path, _mmproj = self._find_model_ggufs(model_dir)
             if not gguf_path:
                 logger.info("[large-model] GGUF not found for %s, skipping", largest.model_name)
                 return

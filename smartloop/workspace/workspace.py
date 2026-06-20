@@ -17,6 +17,13 @@ from smartloop.config.app_settings import AppSettings
 
 _settings = AppSettings()
 
+
+def _is_mmproj_gguf(filename: str) -> bool:
+    """True when a GGUF is a vision mmproj / CLIP projector (not main weights)."""
+    name = os.path.basename(filename).lower()
+    return "mmproj" in name or "clip" in name
+
+
 if TYPE_CHECKING:
     from smartloop.model import SLPModel
 
@@ -422,7 +429,8 @@ class Workspace(BaseModel):
             ws_model = self.get_model()
         if ws_model and ws_model.bin_dir and os.path.isdir(ws_model.bin_dir):
             quantize = (ws_model.config.quantize if ws_model.config else "").upper()
-            gguf_files = [f for f in os.listdir(ws_model.bin_dir) if f.endswith(".gguf")]
+            gguf_files = [f for f in os.listdir(ws_model.bin_dir)
+                          if f.endswith(".gguf") and not _is_mmproj_gguf(f)]
             if quantize:
                 for f in gguf_files:
                     if f.upper().endswith(f"-{quantize}.GGUF"):
@@ -432,11 +440,12 @@ class Workspace(BaseModel):
         exact = self.model_path_for(model_id)
         if os.path.exists(exact):
             return exact
-        # Fallback: find any .gguf file in the model directory
+        # Fallback: find any main .gguf in the model directory.  The mmproj /
+        # CLIP projector GGUF is excluded — it is not a loadable main model.
         model_dir = self.model_dir_for(model_id)
         if os.path.isdir(model_dir):
             for f in os.listdir(model_dir):
-                if f.endswith(".gguf"):
+                if f.endswith(".gguf") and not _is_mmproj_gguf(f):
                     return os.path.join(model_dir, f)
         return exact
 
