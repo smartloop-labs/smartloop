@@ -168,6 +168,8 @@ class SLPArtifactDownloader(SLPDownloader):
                 filename = futures[future]
                 try:
                     future.result()
+                except PermissionError:
+                    raise
                 except Exception as e:
                     self.logger.error(f"[error] {filename}: {e}")
                     failed.append(filename)
@@ -212,6 +214,11 @@ class SLPArtifactDownloader(SLPDownloader):
         """Download a file in a single request (small files)."""
         downloaded = 0
         with httpx.stream("GET", url, follow_redirects=True, timeout=300) as resp:
+            if resp.status_code == 401:
+                raise PermissionError(
+                    "Download rejected (401 Unauthorized). "
+                    "The download URL may have expired or the resource requires authentication."
+                )
             resp.raise_for_status()
             with open(dest, "wb") as f:
                 for chunk in resp.iter_bytes(chunk_size=CHUNK_SIZE):
@@ -233,6 +240,11 @@ class SLPArtifactDownloader(SLPDownloader):
         headers = {"Range": f"bytes={start}-{end}"}
         with httpx.stream("GET", url, headers=headers, follow_redirects=True,
                           timeout=300) as resp:
+            if resp.status_code == 401:
+                raise PermissionError(
+                    "Download rejected (401 Unauthorized). "
+                    "The download URL may have expired or the resource requires authentication."
+                )
             resp.raise_for_status()
             with open(dest, "r+b") as f:
                 f.seek(start)
