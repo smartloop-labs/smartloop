@@ -175,62 +175,39 @@ class ModelService:
                 project.sessions.append(session_id)
                 self._model.save()
 
-    def _ensure_model(self, model_name: Optional[str] = None, developer_token: Optional[str] = None, hf_token: Optional[str] = None, register: bool = False) -> None:
-        """
-        Initialize the workspace/Model object without loading the LLM into memory.
+    def _ensure_model(self) -> None:
+        """Ensure the default orchestrator model is initialized."""
+        default = api_settings.default_model
 
-        If ``self._model`` is already set and the requested model matches
-        the active workspace model, the existing instance is reused.
+        if self._model is not None and self._model_name == default:
+            return
 
-        Resolves model name in order: explicit argument → workspace active
-        model → api_settings.default_model.
-
-        Args:
-            register: If True, register the model in the workspace when it
-                      is not found.  Only init/build/train callers should
-                      set this.
-        """
-        _model_name = model_name
-
-        # Load workspace first so we can resolve the active model
         workspace = self._ensure_workspace(ModelConfig(
-            model_name=_model_name or api_settings.default_model,
-            hf_token=hf_token or api_settings.hf_token,
-            developer_token=developer_token or api_settings.developer_token,
+            model_name=default,
+            hf_token=api_settings.hf_token,
+            developer_token=api_settings.developer_token,
         ))
 
-        # Resolve: explicit arg → api_settings.default_model.  The orchestrator/
-        # main model is ALWAYS the small base model; the workspace's active
-        # selection only designates the on-demand large model, so we never
-        # resolve the loaded model from the active selection here.
-        if not _model_name:
-            _model_name = api_settings.default_model
+        ws_model = workspace.get_model(default)
+        if not ws_model:
+            model_type = SUPPORTED_MODELS.get(default)
+            if not model_type:
+                raise ValueError(f"Default model {default} not found in workspace")
+            ws_model = workspace.add_model(default, model_type.model_id(), config=ModelConfig(
+                model_name=default,
+                hf_token=api_settings.hf_token,
+                developer_token=api_settings.developer_token,
+            ))
 
         model_config = ModelConfig(
-            model_name=_model_name,
-            hf_token=hf_token or api_settings.hf_token,
-            developer_token=developer_token or api_settings.developer_token,
+            model_name=default,
+            hf_token=api_settings.hf_token,
+            developer_token=api_settings.developer_token,
         )
 
-        ws_model = workspace.get_model(_model_name)
-
-        if not ws_model and _model_name and register:
-            # Model not registered yet — try to add from SUPPORTED_MODELS
-            model_type = SUPPORTED_MODELS.get(_model_name)
-            if model_type:
-                ws_model = workspace.add_model(_model_name, model_type.model_id(), config=model_config)
-        elif ws_model and register:
-            # Model already registered — ensure it's set as the active model
-            workspace.set_active_model(_model_name)
-
-        if ws_model:
-            _model_name = ws_model.model_name
-        else:
-            raise ValueError(f"Model {_model_name} not found in workspace")
-
-        logger.info(f"[_ensure_model] resolved _model_name={_model_name}, model_config.model_name={model_config.model_name}")
+        logger.info(f"[_ensure_model] loading default model {default}")
         self._model = ModelFactory.get_model(model_config)
-        self._model_name = _model_name
+        self._model_name = default
  
     def _ensure_workspace(self, model_config: Optional[ModelConfig] = None) -> Workspace:
         """Return the workspace, creating it if necessary.
@@ -307,7 +284,7 @@ class ModelService:
             self._decision_model_name = None
             Workspace.reset()
 
-        self._ensure_model(target_model)
+        self._ensure_model()
 
         project_name = self.get_current_project_name() or "default"
         logger.info(f"Loading model: {target_model} (project: {project_name})")
@@ -949,7 +926,7 @@ class ModelService:
         """
 
         self.unload_model()
-        self._ensure_model(model_name, developer_token=developer_token)
+        self._ensure_model()
 
         if not self._model.workspace.current_project:
             raise ValueError(
@@ -985,7 +962,7 @@ class ModelService:
         self.unload_model()
 
         # 2. Initialise workspace (no LLM loaded)
-        self._ensure_model(model_name)
+        self._ensure_model()
 
         logger.info("Starting model training…")
         try:

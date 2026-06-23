@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field
 from smartloop.api.config import api_settings
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.auth import credential_store
+from smartloop.config import SUPPORTED_MODELS
+from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress, HFDownloader
 from smartloop.platform import auth as platform_auth
 
@@ -172,21 +174,20 @@ async def init(
     full model (safetensors, tokenizer, etc.) and builds the GGUF.
     Returns a streaming SSE response with real-time download progress.
     """
-    try:
-        model_service._ensure_model(request.model_name, request.developer_token, request.hf_token, register=True)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    model = model_service._model
-    workspace = model.workspace
+    workspace = model_service._ensure_workspace()
     target = request.model_name or api_settings.default_model
+
+    # Register the model in the workspace if not already present
     ws_model = workspace.get_model(target)
-
     if not ws_model:
-        raise HTTPException(status_code=400, detail=f"Model {target} not found in workspace")
+        model_cls = SUPPORTED_MODELS.get(target)
+        if not model_cls:
+            raise HTTPException(status_code=400, detail=f"Unknown model: {target}")
+        ws_model = workspace.add_model(target, model_cls.model_id())
+        if hasattr(model_cls, 'default_capabilities') and not ws_model.capabilities:
+            ws_model.capabilities = model_cls.default_capabilities()
 
-    if not (platform_auth.has_credentials() or request.hf_token):
-        workspace.models = [m for m in workspace.models if m.model_name != ws_model.model_name]
+    if not platform_auth.has_credentials():
         raise HTTPException(
             status_code=400,
             detail="Authentication required for model download. "
@@ -206,22 +207,22 @@ async def init(
                     yield event
 
                 ws_model.downloaded = True
-                model.save()
+                model_service._model.save()
             elif _gguf_exists(model_dir):
                 yield _sse_event({"status": "model_ready", "message": f"Model {target} already available."})
                 if not ws_model.downloaded:
                     ws_model.downloaded = True
-                model.save()
+                model_service._model.save()
             else:
                 downloader = SLPArtifactDownloader(workspace, logger)
                 async for event in _download_and_stream(downloader, ws_model.model_id, target):
                     yield event
 
                 ws_model.downloaded = True
-                model.save()
+                model_service._model.save()
 
             # 2. Ensure model pipeline
-            model_service._ensure_model(target, register=True)
+            model_service._ensure_model()
 
             # 3. Create bare project (no skills yet — LLM not loaded)
             async for event in _ensure_project(model_service, workspace, cwd=request.cwd):
@@ -334,7 +335,7 @@ async def bootstrap(
                 workspace.save()
 
             # 4. Ensure model pipeline
-            model_service._ensure_model(existing_model_name, register=True)
+            model_service._ensure_model()
 
             # 5. Start background tasks (indexer, etc.) if not already running
             if model_service._task_queue.get_task("indexer") is None:

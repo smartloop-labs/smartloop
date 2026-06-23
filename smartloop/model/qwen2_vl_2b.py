@@ -22,5 +22,9 @@ class Qwen2VL_2bModel(GenericModel):
         return ModelType.MULTI_MODAL
 
     @staticmethod
+    def default_capabilities() -> list[str]:
+        return ["vision"]
+
+    @staticmethod
     def model_id() -> str:
         return "Qwen/Qwen2-VL-2B-Instruct"

@@ -339,31 +339,26 @@ class Workspace(BaseModel):
     def get_model(self, model_name: Optional[str] = None) -> Optional[WorkspaceModel]:
         """Look up a registered model by its short name.
 
-        If *model_name* is ``None``, returns the active model.
+        If *model_name* is ``None``, returns the default model.
         """
         result = None
         if model_name is None:
-            for m in self.models:
-                if m.is_active:
-                    result = m
-                    break
-        else:
-            for m in self.models:
-                if m.model_name == model_name:
-                    result = m
-                    break
+            from smartloop.config.app_settings import AppSettings
+            model_name = AppSettings().default_model
+        for m in self.models:
+            if m.model_name == model_name:
+                result = m
+                break
         if result is not None:
             result.models_dir = self.models_dir
         return result
 
     def add_model(self, model_name: str, model_id: str, config: Optional[ModelConfig] = None) -> WorkspaceModel:
-        """Register a model if not already present and mark it as active."""
+        """Register a model in the workspace without changing the active model."""
         existing = self.get_model(model_name)
         if existing is not None:
             if config is not None:
                 if existing.config:
-                    # Merge: preserve existing values (e.g. developer_token)
-                    # when the incoming config has None for those fields.
                     merged = existing.config.model_dump()
                     for key, value in config.model_dump().items():
                         if value is not None:
@@ -371,12 +366,9 @@ class Workspace(BaseModel):
                     existing.config = ModelConfig.model_validate(merged)
                 else:
                     existing.config = config
-            self.set_active_model(model_name)
             return existing
-        # Deactivate all other models before appending
-        for m in self.models:
-            m.is_active = False
-        entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, is_active=True, models_dir=self.models_dir)
+        has_active = any(m.is_active for m in self.models)
+        entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, is_active=not has_active, models_dir=self.models_dir)
         self.models.append(entry)
         return entry
 

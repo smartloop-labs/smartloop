@@ -440,8 +440,7 @@ class GenericModel(SLPModel):
 
     def get_instance(self, debug: bool = False, is_trainable: bool = False) -> BaseLLM:
         if self._instance_cache is None:
-            ws_model = self.workspace.get_model()
-            model_id = ws_model.model_id if ws_model else ""
+            model_id = self.model_id()
             # Cascade: use project-level GGUF if it exists, else fall back to workspace GGUF
             gguf_path = self.workspace.resolve_gguf_path(model_id)
 
