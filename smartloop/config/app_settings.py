@@ -149,9 +149,9 @@ class AppSettings(BaseSettings):
         description="PDF pages with fewer extracted chars than this are treated as scanned and OCR'd by the vision model.",
     )
     vision_n_ctx: int = Field(
-        default=4096,
+        default=8192,
         validation_alias="slp_vision_n_ctx",
-        description="Context window for the vision OCR model. Must hold a full page image (~2k tokens) plus the transcription; kept as small as that allows so it still fits alongside the agent model.",
+        description="Context window for the vision OCR model. Must hold image tokens (~3-5k) plus the transcription output.",
     )
     vision_clip_device: str = Field(
         default="auto",

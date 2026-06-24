@@ -361,6 +361,21 @@ async def stream_chunks(
 
     yield _status_event("preparing", "processing", "Preparing response...")
 
+    # Truncate orchestrator context if it alone would overflow the model's
+    # context window, leaving room for the messages and output.
+    max_ctx = model_service.get_max_context_tokens()
+    if orchestrator_context and max_ctx > 0:
+        reserved = 1024  # room for messages + generation
+        ctx_tokens = model_service.count_tokens(orchestrator_context)
+        if ctx_tokens > max_ctx - reserved:
+            budget = max(512, max_ctx - reserved)
+            chars_per_token = max(1, len(orchestrator_context) // max(1, ctx_tokens))
+            orchestrator_context = orchestrator_context[: budget * chars_per_token]
+            logger.info(
+                "Truncated orchestrator context from %d to %d tokens to fit context window",
+                ctx_tokens, budget,
+            )
+
     messages = _compact_messages(messages, model_service,
                                 context_tokens=model_service.count_tokens(orchestrator_context or ""))
 
