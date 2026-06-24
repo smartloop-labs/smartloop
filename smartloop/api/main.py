@@ -98,6 +98,41 @@ async def _wait_for_config_and_load(model_service):
     logger.info("Model loaded successfully.")
 
 
+def _bootstrap_orchestrator_model(model_service) -> None:
+    """Download the orchestrator base model via the unauthenticated bootstrap
+    source and register it in the workspace.
+
+    Used as a fallback when the orchestrator GGUF is missing on disk (e.g. a
+    workspace created before the model was bootstrapped). Mirrors the core of
+    the ``POST /v1/bootstrap`` endpoint without the SSE streaming.
+    """
+    from smartloop.model.downloader.artifact_downloader import SLPArtifactDownloader
+
+    workspace = model_service._ensure_workspace()
+    downloader = SLPArtifactDownloader(workspace, logger)
+    bootstrap_models = downloader._bootstrap_source.list_models()
+    if not bootstrap_models:
+        raise RuntimeError("No bootstrap models available from the bootstrap source")
+
+    target = bootstrap_models[0]
+    name = target.get("name")
+    model_id = SLPArtifactDownloader._resolve_model_id(name)
+
+    logger.info(f"Bootstrapping orchestrator model '{name}'...")
+    downloader.bootstrap_download(name)
+
+    # Register (or reuse) the workspace entry and mark it downloaded so the
+    # subsequent load_model() and config watchers find it. add_model is
+    # alias-aware, so an existing legacy-named entry is reused, not duplicated.
+    workspace.add_model(name, model_id)
+    ws_model = workspace.get_model(name)
+    if ws_model is not None:
+        ws_model.models_dir = workspace.models_dir
+        ws_model.downloaded = True
+    workspace.save()
+    logger.info(f"Orchestrator model '{name}' bootstrapped successfully")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan manager for startup and shutdown events"""
@@ -120,6 +155,17 @@ async def lifespan(app: FastAPI):
         try:
             model_service.load_model()
             logger.info("Model pre-loaded successfully")
+        except FileNotFoundError as e:
+            # The orchestrator base model GGUF isn't on disk yet. Pull it via
+            # the unauthenticated bootstrap source and retry, rather than
+            # leaving the server running with no model loaded.
+            logger.warning(f"Orchestrator model missing ({e}); attempting bootstrap download...")
+            try:
+                _bootstrap_orchestrator_model(model_service)
+                model_service.load_model()
+                logger.info("Model pre-loaded successfully after bootstrap")
+            except Exception as e2:
+                logger.error(f"Failed to bootstrap and pre-load model: {e2}")
         except Exception as e:
             logger.error(f"Failed to pre-load model: {e}")
     else:

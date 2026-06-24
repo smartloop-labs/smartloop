@@ -246,6 +246,12 @@ class ModelService:
         workspace = self._model.workspace
         project = next((p for p in workspace.projects if p.id == project_id), None)
         if project is None:
+            # The cached workspace singleton can be stale when another process
+            # (e.g. the CLI/TUI) created the project and wrote config.json after
+            # this server loaded. Re-read from disk once before giving up.
+            workspace.reload()
+            project = next((p for p in workspace.projects if p.id == project_id), None)
+        if project is None:
             raise ValueError(f"Project not found: {project_id}")
         return project
 
@@ -444,6 +450,13 @@ class ModelService:
         # fit the image tokens plus a short transcription, and shouldn't be
         # blocked by headroom kept for the (already-resident) agent model.
         cap = AppSettings().vision_n_ctx
+        # Track whether any candidate was rejected for a *transient* reason
+        # (not enough free VRAM right now, or a load error) versus a *permanent*
+        # one (no mmproj, no handler).  A transient failure must NOT latch
+        # ``_vision_unavailable`` — free VRAM recovers once the indexing worker
+        # copies are released, so the next document should retry rather than be
+        # stuck on text-only for the rest of the process lifetime.
+        transient_failure = False
         for ws_model in candidates:
             model_dir = workspace.model_dir_for(ws_model.model_id)
             gguf_path, mmproj_path = self._find_model_ggufs(model_dir)
@@ -464,9 +477,11 @@ class ModelService:
             if not self._large_model_fits(gguf_path, cap, ws_model.model_name,
                                           reserve_gb=0.0):
                 logger.warning(
-                    "[vision] %s skipped — won't fit in available memory",
+                    "[vision] %s skipped — won't fit in available memory right now "
+                    "(will retry on the next document)",
                     ws_model.model_name,
                 )
+                transient_failure = True
                 continue
             clip_on_cpu = self._clip_on_cpu(gguf_path, cap)
             try:
@@ -483,6 +498,16 @@ class ModelService:
                 return llm
             except Exception as e:
                 logger.warning("[vision] Failed to load %s: %s", ws_model.model_name, e)
+                transient_failure = True
+
+        if transient_failure:
+            # At least one usable candidate exists but couldn't load this time;
+            # leave the latch clear so OCR retries once VRAM frees up.
+            logger.warning(
+                "[vision] No vision model could be loaded right now — text-only "
+                "for this document; will retry later"
+            )
+            return None
 
         logger.warning("[vision] No runnable vision model available — image OCR disabled")
         self._vision_unavailable = True
@@ -657,10 +682,27 @@ class ModelService:
             # user's active 4B).
             orchestrator = workspace.get_model(self._model_name)
             orchestrator_size = orchestrator.param_size_b if orchestrator else 0
-            largest = workspace.largest_downloaded_model()
-            if not largest or largest.param_size_b <= orchestrator_size:
+            # Pick the agent/large model by *capability*, not raw size: this
+            # model drives skills/synthesis, so it must declare the "skills"
+            # capability.  Selecting by size alone would load a vision-only VL
+            # model (e.g. qwen2-vl-2b) here as a redundant text copy — wasting
+            # VRAM that get_vision_llm needs for the actual OCR instance.  Among
+            # the skills-capable models, prefer the largest.
+            skills_models = [
+                m for m in workspace.models
+                if m.enabled and m.downloaded
+                and m.model_name != self._model_name
+                and "skills" in [c.lower() for c in m.effective_capabilities]
+            ]
+            if not skills_models:
+                logger.info(
+                    "[large-model] No skills-capable model downloaded — using the "
+                    "router model for skills/synthesis"
+                )
                 return
-            if largest.model_name == self._model_name:
+            largest = max(skills_models, key=lambda m: m.param_size_b or 0.0)
+            largest.models_dir = workspace.models_dir
+            if largest.param_size_b <= orchestrator_size:
                 return
 
             model_dir = workspace.model_dir_for(largest.model_id)
@@ -2767,6 +2809,46 @@ class ModelService:
             self._decision_model_name = None
 
             self._reset_llm_executor()
+            self._cleanup_gpu_cache()
+
+    def unload_vision_model(self) -> None:
+        """Release the on-demand vision/OCR model and return its VRAM.
+
+        Only the orchestrator model stays resident; the multimodal vision model
+        is loaded on demand by ``get_vision_llm`` for document OCR and freed here
+        once a stage completes (e.g. the indexer queue drains).  Dropping the
+        reference frees the llama.cpp context + its CUDA buffers (~1.4GB for
+        Qwen2-VL-2B; verified it returns to the GPU).  Clearing ``_vision_llm``
+        re-arms lazy reload, and ``_vision_unavailable`` is reset so a fresh
+        attempt re-evaluates fit rather than staying latched off.
+        """
+        if self._vision_llm is None:
+            return
+        with self._inference_lock:
+            if self._vision_llm is None:
+                return
+            logger.info("[vision] Unloading vision model %s — freeing VRAM",
+                        self._vision_model_name or "?")
+            self._vision_llm = None
+            self._vision_model_name = None
+            self._vision_unavailable = False
+            self._cleanup_gpu_cache()
+
+    def unload_large_model(self) -> None:
+        """Release the on-demand large agent/skills model and return its VRAM.
+
+        Like the vision model, the larger skills model is loaded on demand
+        (``_get_large_llm``) and is not part of the always-resident footprint —
+        freeing it here keeps only the orchestrator resident between stages.
+        """
+        if self._large_llm is None:
+            return
+        with self._inference_lock:
+            if self._large_llm is None:
+                return
+            logger.info("[large-model] Unloading large agent model — freeing VRAM")
+            self._large_llm = None
+            self._large_model_attempted = False
             self._cleanup_gpu_cache()
 
     # --------------------------------------------------------------- MCP servers

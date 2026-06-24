@@ -334,7 +334,17 @@ class LlmFactory:
 
         if chat_handler is not None:
             config['chat_handler'] = chat_handler
-            logger.info(f"Loading vision model with mmproj: {mmproj_path}")
+            # Flash attention — VISION LOAD ONLY (gated by chat_handler; the
+            # text/orchestrator models are unaffected). Without it the image
+            # encode allocates a fixed ~6GB compute buffer that OOM-segfaults
+            # the native clip code on a tight GPU; n_batch/n_ctx have NO effect
+            # on that spike (measured), flash_attn is the only lever — it brings
+            # the per-page peak to ~3GB so the encode runs on GPU alongside the
+            # resident orchestrator on an 8GB card.
+            config['flash_attn'] = True
+            logger.info(
+                f"Loading vision model with mmproj: {mmproj_path} (flash_attn=True)"
+            )
 
         logger.info(f"Loading model with config: n_ctx={n_ctx}, n_gpu_layers={config['n_gpu_layers']}, model_size={model_size_gb:.1f}GB")
 

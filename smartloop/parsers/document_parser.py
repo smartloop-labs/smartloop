@@ -36,10 +36,12 @@ _IMAGE_PROMPT = (
 
 # Page-render DPI and output budget for PDF OCR.  A full page image consumes a
 # large share of the vision model's (small) context — at 150 DPI a letter page
-# is ~2800 image tokens, which alone overflows a 2048 ctx.  130 DPI keeps a page
-# near ~2100 tokens so it plus the transcription fit within vision_n_ctx (4096),
-# while staying legible for OCR.
-_OCR_DPI = 130
+# is ~2800 image tokens, which alone overflows a 2048 ctx.  96 DPI keeps a page
+# near ~1150 tokens so it plus the transcription fit within vision_n_ctx (4096)
+# with room to spare, and shrinks the patch grid fed to the native clip encoder
+# (a smaller grid avoids the slice-encode segfault seen on large pages), while
+# staying legible for OCR.
+_OCR_DPI = 96
 _OCR_MAX_TOKENS = 1536
 
 

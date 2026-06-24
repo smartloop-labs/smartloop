@@ -14,5 +14,13 @@ class GemmaItModel(GenericModel):
         return ModelType.MULTI_MODAL
 
     @staticmethod
+    def default_capabilities() -> list[str]:
+        # gemma-3-4b is a 4B model: large enough to drive skills/synthesis.
+        # Advertise this in the catalog (mirrors Qwen2VL_2bModel's "vision")
+        # so the capability shows before the model is registered, matching the
+        # "skills" that effective_capabilities infers once it is.
+        return ["skills"]
+
+    @staticmethod
     def model_id() -> str:
         return "google/gemma-3-4b-it"

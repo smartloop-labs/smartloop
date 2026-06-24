@@ -173,7 +173,7 @@ class WorkspaceModel(BaseModel):
     def param_size_b(self) -> float:
         """Parse parameter count in billions from model_name or model_id.
 
-        Examples: 'llama3-1b' → 1.0, 'google/gemma-3-4b-it' → 4.0
+        Examples: 'gemma4-2b' → 2.0, 'google/gemma-3-4b-it' → 4.0
         (names without a size token, e.g. 'slp-orchestra-mini', fall back to
         the model_id: 'google/gemma-3-1b-it' → 1.0)
         """
