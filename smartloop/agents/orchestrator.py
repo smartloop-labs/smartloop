@@ -119,6 +119,10 @@ class SLPOrchestrator:
                         return llm
                 except Exception as e:
                     logger.warning("[models] capability model load failed (%s): %s", capability, e)
+                # No model declares this capability (or it won't fit): always
+                # fall back to the default model rather than loading the generic
+                # largest model.
+                return self.agent_llm
             if self.large_llm is None and self._large_llm_provider is not None:
                 try:
                     self.large_llm = self._large_llm_provider()
@@ -2026,8 +2030,15 @@ Is this context relevant to the user's request?
         )
 
         try:
-            synth_llm = self._llm_for_tier(ModelTier.LARGE)
-            logger.info("[models] SYNTHESIZE → %s: %s", ModelTier.LARGE.value, self._model_label(synth_llm))
+            # Route synthesis through the capability path so it loads the
+            # analysis-capable model — e.g. gemma3-4b — instead of the generic
+            # largest-model fallback.  "analysis" is a dedicated capability for
+            # this reduce/synthesis task, distinct from "skills" (step execution).
+            synth_llm = self._llm_for_tier(ModelTier.LARGE, capability="analysis")
+            logger.info(
+                "[models] SYNTHESIZE → %s/analysis: %s",
+                ModelTier.LARGE.value, self._model_label(synth_llm),
+            )
             result = str(synth_llm.invoke(prompt)).strip()
             if result:
                 logger.info(

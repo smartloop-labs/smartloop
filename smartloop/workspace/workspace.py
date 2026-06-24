@@ -209,7 +209,10 @@ class WorkspaceModel(BaseModel):
             caps.append("vision")
 
         if size >= 3:
+            # Large enough to drive both step execution ("skills") and the
+            # reduce/synthesis task ("analysis").
             caps.append("skills")
+            caps.append("analysis")
 
         return caps
 
