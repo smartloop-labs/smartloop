@@ -428,8 +428,6 @@ class ModelService:
             return None
         if self._vision_llm is not None:
             return self._vision_llm
-        if self._vision_unavailable:
-            return None
         if not self._model or not self._model.workspace:
             return None
 
@@ -501,16 +499,12 @@ class ModelService:
                 transient_failure = True
 
         if transient_failure:
-            # At least one usable candidate exists but couldn't load this time;
-            # leave the latch clear so OCR retries once VRAM frees up.
             logger.warning(
                 "[vision] No vision model could be loaded right now — text-only "
                 "for this document; will retry later"
             )
-            return None
-
-        logger.warning("[vision] No runnable vision model available — image OCR disabled")
-        self._vision_unavailable = True
+        else:
+            logger.warning("[vision] No runnable vision model available — image OCR disabled")
         return None
 
     def _get_llm_for_capability(self, capability: str) -> Optional[BaseLLM]:
