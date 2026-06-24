@@ -15,12 +15,7 @@ class GemmaItModel(GenericModel):
 
     @staticmethod
     def default_capabilities() -> list[str]:
-        # gemma-3-4b is a 4B model: large enough to drive skills (step
-        # execution) and analysis (the reduce/synthesis task).  Advertise both
-        # in the catalog (mirrors Qwen2VL_2bModel's "vision") so the capabilities
-        # show before the model is registered, matching what
-        # effective_capabilities infers once it is.
-        return ["skills", "analysis"]
+        return ["skills", "synthesis"]
 
     @staticmethod
     def model_id() -> str:

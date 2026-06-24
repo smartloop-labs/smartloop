@@ -2031,12 +2031,12 @@ Is this context relevant to the user's request?
 
         try:
             # Route synthesis through the capability path so it loads the
-            # analysis-capable model — e.g. gemma3-4b — instead of the generic
-            # largest-model fallback.  "analysis" is a dedicated capability for
+            # synthesis-capable model — e.g. gemma3-4b — instead of the generic
+            # largest-model fallback.  "synthesis" is a dedicated capability for
             # this reduce/synthesis task, distinct from "skills" (step execution).
-            synth_llm = self._llm_for_tier(ModelTier.LARGE, capability="analysis")
+            synth_llm = self._llm_for_tier(ModelTier.LARGE, capability="synthesis")
             logger.info(
-                "[models] SYNTHESIZE → %s/analysis: %s",
+                "[models] SYNTHESIZE → %s/synthesis: %s",
                 ModelTier.LARGE.value, self._model_label(synth_llm),
             )
             result = str(synth_llm.invoke(prompt)).strip()
