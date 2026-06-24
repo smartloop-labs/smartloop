@@ -151,9 +151,7 @@ def get_active_token() -> str | None:
 
 def has_credentials() -> bool:
     """Return True if any auth token is available."""
-    if os.environ.get("SLP_DEVELOPER_TOKEN"):
-        return True
-    return get_active_token() is not None
+    return bool(auth_headers())
 
 
 def auth_headers() -> dict[str, str]:
