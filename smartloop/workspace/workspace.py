@@ -347,8 +347,13 @@ class Workspace(BaseModel):
         if model_name is None:
             from smartloop.config.app_settings import AppSettings
             model_name = AppSettings().default_model
+        # Resolve backward-compatibility aliases (e.g. the old "gemma3-1b"
+        # bootstrap name) so lookups match regardless of which name a config or
+        # an existing workspace.json recorded.
+        from smartloop.config.supported_models import canonical_model_name
+        target = canonical_model_name(model_name)
         for m in self.models:
-            if m.model_name == model_name:
+            if canonical_model_name(m.model_name) == target:
                 result = m
                 break
         if result is not None:
