@@ -104,7 +104,7 @@ class SLPOrchestrator:
     # document is processed (one node each) for a complete answer — the LLM
     # worker pool just runs them faster in parallel, queuing the overflow;
     # nothing is dropped.
-    DOC_FANOUT_THRESHOLD = 2
+    DOC_FANOUT_THRESHOLD = 1
 
     def _llm_for_tier(self, tier: ModelTier, capability: Optional[str] = None) -> BaseLLM:
         if tier == ModelTier.LARGE:
