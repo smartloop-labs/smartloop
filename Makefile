@@ -1,4 +1,4 @@
-.PHONY: help venv build run run-debug test test-unit test-cov build-binary sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
+.PHONY: help venv install build run run-debug run-local test test-unit test-cov build-binary sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
 
 UNAME_S := $(shell uname -s)
 DIST_DIR := dist/slp
@@ -80,9 +80,11 @@ help:
 	@echo "Available targets:"
 	@echo ""
 	@echo "  Development:"
-	@echo "  build           - Create venv, install requirements and llama-cpp-python with GPU support"
+	@echo "  install         - Create venv and install Python requirements"
+	@echo "  build           - install + llama-cpp-python with GPU support + model downloads"
 	@echo "  run             - Start the API server with default INFO logging"
 	@echo "  run-debug       - Start the API server with LOG_LEVEL=DEBUG (verbose orchestrator/DAG/MCP logs)"
+	@echo "  run-local       - Start the agent against the local API (http://localhost:8888)"
 	@echo "  test            - Run slp --help and check llama-cpp GPU binding"
 	@echo "  clean           - Remove .venv, build artifacts, and caches"
 	@echo ""
@@ -108,17 +110,17 @@ venv:
 		python3 -m venv $(VENV); \
 	fi
 
-build: venv
+install: venv
 	@echo "=== Installing requirements ==="
 	$(PIP) install -r requirements.txt --index-url=https://pypi.org/simple
+
+build: install
 	@echo "=== Installing llama-cpp-python with GPU support ==="
 	$(LLAMA_INSTALL_CMD)
 	@echo "=== Pinning numpy<2.4 (OpenBLAS ELF alignment crash with PyInstaller) ==="
 	$(PIP) install "numpy>=1.24.0,<2.4" --force-reinstall --index-url=https://pypi.org/simple
 	@echo "=== Installing PyInstaller ==="
 	$(PIP) install pyinstaller --index-url=https://pypi.org/simple
-	@echo "=== Pre-downloading docling and EasyOCR models ==="
-	$(PYTHON) -c "from docling.utils.model_downloader import download_models; download_models(with_easyocr=True)"
 	@echo "=== Build complete ==="
 
 run:
@@ -126,6 +128,9 @@ run:
 
 run-debug:
 	LOG_LEVEL=DEBUG $(PYTHON) -m main agent start
+
+run-local:
+	SLP_API_BASE=http://localhost:8888 $(PYTHON) -m main agent start
 
 test-deps:
 	$(PIP) install -q -e ".[dev]"

@@ -29,10 +29,10 @@ class FakePlatformClient:
 class TestSLPModelSource:
     def test_get_artifacts(self):
         client = FakePlatformClient(artifacts={
-            "gemma3-1b": {"model.gguf": "https://storage/model.gguf"},
+            "slp-orchestra-mini": {"model.gguf": "https://storage/model.gguf"},
         })
         source = SLPModelSource(client)
-        result = source.get_artifacts("gemma3-1b")
+        result = source.get_artifacts("slp-orchestra-mini")
         assert result == {"model.gguf": "https://storage/model.gguf"}
 
     def test_requires_auth(self):
@@ -50,12 +50,12 @@ class TestSLPBootstrapSource:
         return SLPBootstrapSource(FakePlatformClient(bootstrap_models=models or []))
 
     def test_list_models(self):
-        models = [{"name": "gemma3-1b", "artifacts": {"m.gguf": "url"}}]
+        models = [{"name": "slp-orchestra-mini", "artifacts": {"m.gguf": "url"}}]
         source = self._make_source(models)
         assert source.list_models() == models
 
     def test_list_models_caches(self):
-        models = [{"name": "gemma3-1b", "artifacts": {"m.gguf": "url"}}]
+        models = [{"name": "slp-orchestra-mini", "artifacts": {"m.gguf": "url"}}]
         source = self._make_source(models)
         first = source.list_models()
         second = source.list_models()
@@ -66,21 +66,21 @@ class TestSLPBootstrapSource:
         assert source.requires_auth() is False
 
     def test_get_artifacts(self):
-        models = [{"name": "gemma3-1b", "artifacts": {"m.gguf": "https://url"}}]
+        models = [{"name": "slp-orchestra-mini", "artifacts": {"m.gguf": "https://url"}}]
         source = self._make_source(models)
-        assert source.get_artifacts("gemma3-1b") == {"m.gguf": "https://url"}
+        assert source.get_artifacts("slp-orchestra-mini") == {"m.gguf": "https://url"}
 
     def test_get_artifacts_unknown_model(self):
-        models = [{"name": "gemma3-1b", "artifacts": {"m.gguf": "url"}}]
+        models = [{"name": "slp-orchestra-mini", "artifacts": {"m.gguf": "url"}}]
         source = self._make_source(models)
         with pytest.raises(ValueError, match="not found in bootstrap"):
             source.get_artifacts("nonexistent")
 
     def test_get_artifacts_empty_artifacts(self):
-        models = [{"name": "gemma3-1b", "artifacts": {}}]
+        models = [{"name": "slp-orchestra-mini", "artifacts": {}}]
         source = self._make_source(models)
         with pytest.raises(ValueError, match="No artifacts"):
-            source.get_artifacts("gemma3-1b")
+            source.get_artifacts("slp-orchestra-mini")
 
     def test_empty_bootstrap_raises(self):
         source = self._make_source([])

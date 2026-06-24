@@ -44,10 +44,10 @@ class TestParseRemoteMd5:
 class TestResolveModelName:
     def test_known_model_roundtrip(self):
         # _resolve_model_id and _resolve_model_name should be inverses
-        model_id = SLPArtifactDownloader._resolve_model_id("gemma3-1b")
-        if model_id != "gemma3-1b":  # only if the model is in SUPPORTED_MODELS
+        model_id = SLPArtifactDownloader._resolve_model_id("slp-orchestra-mini")
+        if model_id != "slp-orchestra-mini":  # only if the model is in SUPPORTED_MODELS
             name = SLPArtifactDownloader._resolve_model_name(model_id)
-            assert name == "gemma3-1b"
+            assert name == "slp-orchestra-mini"
 
     def test_unknown_model_passthrough(self):
         assert SLPArtifactDownloader._resolve_model_name("unknown/model") == "unknown/model"

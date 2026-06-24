@@ -45,7 +45,7 @@ def stub_server():
 class TestListBootstrapModels:
     def test_returns_models(self, stub_server):
         base_url, handler = stub_server
-        models = [{"name": "gemma3-1b", "model_id": "google/gemma-3-1b-it"}]
+        models = [{"name": "slp-orchestra-mini", "model_id": "google/gemma-3-1b-it"}]
         handler.routes = {"/v1/bootstrap/models": (200, models)}
 
         client = SLPPlatformClient(base_url)
@@ -72,7 +72,7 @@ class TestListBootstrapModels:
 class TestListModels:
     def test_returns_models_with_auth(self, stub_server):
         base_url, handler = stub_server
-        models = [{"name": "gemma3-1b", "model_id": "google/gemma-3-1b-it"}]
+        models = [{"name": "slp-orchestra-mini", "model_id": "google/gemma-3-1b-it"}]
         handler.routes = {"/v1/models": (200, models)}
 
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {"Authorization": "Bearer jwt"})
@@ -80,7 +80,7 @@ class TestListModels:
 
     def test_returns_models_without_auth(self, stub_server):
         base_url, handler = stub_server
-        models = [{"name": "gemma3-1b", "model_id": "google/gemma-3-1b-it"}]
+        models = [{"name": "slp-orchestra-mini", "model_id": "google/gemma-3-1b-it"}]
         handler.routes = {"/v1/models": (200, models)}
 
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
@@ -89,7 +89,7 @@ class TestListModels:
     def test_retries_without_auth_on_401(self, stub_server):
         """When the first request (with auth) gets 401, retry without auth succeeds."""
         base_url, handler = stub_server
-        models = [{"name": "gemma3-1b", "model_id": "google/gemma-3-1b-it"}]
+        models = [{"name": "slp-orchestra-mini", "model_id": "google/gemma-3-1b-it"}]
         call_count = {"n": 0}
 
         # Override do_GET to return 401 on first call, 200 on second
@@ -134,34 +134,34 @@ class TestGetModelArtifacts:
     def test_returns_artifacts(self, stub_server):
         base_url, handler = stub_server
         handler.routes = {
-            "/v1/models/gemma3-1b/download": (200, {
+            "/v1/models/slp-orchestra-mini/download": (200, {
                 "artifacts": {"model.gguf": "https://storage/model.gguf"},
             }),
         }
 
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {"X-Api-Key": "test"})
-        result = client.get_model_artifacts("gemma3-1b")
+        result = client.get_model_artifacts("slp-orchestra-mini")
         assert result == {"model.gguf": "https://storage/model.gguf"}
 
     def test_empty_artifacts_raises(self, stub_server):
         base_url, handler = stub_server
         handler.routes = {
-            "/v1/models/gemma3-1b/download": (200, {"artifacts": {}}),
+            "/v1/models/slp-orchestra-mini/download": (200, {"artifacts": {}}),
         }
 
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
         with pytest.raises(ValueError, match="no artifacts"):
-            client.get_model_artifacts("gemma3-1b")
+            client.get_model_artifacts("slp-orchestra-mini")
 
     def test_401_raises_permission_error(self, stub_server):
         base_url, handler = stub_server
         handler.routes = {
-            "/v1/models/gemma3-1b/download": (401, {"error": "unauthorized"}),
+            "/v1/models/slp-orchestra-mini/download": (401, {"error": "unauthorized"}),
         }
 
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
         with pytest.raises(PermissionError, match="Authentication failed"):
-            client.get_model_artifacts("gemma3-1b")
+            client.get_model_artifacts("slp-orchestra-mini")
 
     def test_404_raises_permission_error(self, stub_server):
         base_url, handler = stub_server

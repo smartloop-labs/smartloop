@@ -104,7 +104,7 @@ class SLPOrchestrator:
     # document is processed (one node each) for a complete answer — the LLM
     # worker pool just runs them faster in parallel, queuing the overflow;
     # nothing is dropped.
-    DOC_FANOUT_THRESHOLD = 2
+    DOC_FANOUT_THRESHOLD = 1
 
     def _llm_for_tier(self, tier: ModelTier, capability: Optional[str] = None) -> BaseLLM:
         if tier == ModelTier.LARGE:
@@ -119,6 +119,9 @@ class SLPOrchestrator:
                         return llm
                 except Exception as e:
                     logger.warning("[models] capability model load failed (%s): %s", capability, e)
+            # No capability-specific model available — fall through to the
+            # generic large model so synthesis / analysis still gets the
+            # best available model rather than the small orchestrator.
             if self.large_llm is None and self._large_llm_provider is not None:
                 try:
                     self.large_llm = self._large_llm_provider()
@@ -657,7 +660,12 @@ class SLPOrchestrator:
                 if use_pool:
                     extract = str(self._executor.submit_llm(prompt).result()).strip()
                 else:
-                    extract = str(self.agent_llm.invoke(prompt)).strip()
+                    dp_llm = self._llm_for_tier(ModelTier.LARGE, capability="dp")
+                    logger.info(
+                        "[doc-batch] %s → %s",
+                        node_id, self._model_label(dp_llm),
+                    )
+                    extract = str(dp_llm.invoke(prompt)).strip()
             except Exception as e:
                 llm_failed = True
                 logger.warning(f"[doc-batch] {node_id} extraction failed: {e}")
@@ -2026,9 +2034,11 @@ Is this context relevant to the user's request?
         )
 
         try:
-            synth_llm = self._llm_for_tier(ModelTier.LARGE)
-            logger.info("[models] SYNTHESIZE → %s: %s", ModelTier.LARGE.value, self._model_label(synth_llm))
-            result = str(synth_llm.invoke(prompt)).strip()
+            logger.info(
+                "[models] SYNTHESIZE → agent_llm: %s",
+                self._model_label(self.agent_llm),
+            )
+            result = str(self.agent_llm.invoke(prompt)).strip()
             if result:
                 logger.info(
                     f"[synthesize] produced {len(result)} chars "

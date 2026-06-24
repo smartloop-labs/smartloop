@@ -716,7 +716,7 @@ def main():
 
     # Run command
     run_parser = subparsers.add_parser("run", help="Start interactive chat session")
-    run_parser.add_argument("--model", "-m", help="Model name (default: $SLP_BASE_MODEL_NAME or gemma3-1b)")
+    run_parser.add_argument("--model", "-m", help="Model name (default: $SLP_BASE_MODEL_NAME or slp-orchestra-mini)")
     run_parser.add_argument("--project-name", help="Project name (default: $SLP_PROJECT_NAME)")
     run_parser.add_argument("--host", help="API server host (default: $API_HOST or 127.0.0.1)")
     run_parser.add_argument("--port", "-p", type=int, help="API server port (default: $SLP_API_PORT or 38540)")

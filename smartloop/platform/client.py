@@ -101,6 +101,7 @@ class SLPPlatformClient:
             401: "Authentication failed. Check your SLP_DEVELOPER_TOKEN.",
             403: f"Model '{model_name}' is not available on your current plan. Please upgrade to access this model.",
             404: f"Model '{model_name}' not found on server.",
+            500: f"Server error while fetching model '{model_name}' artifacts."
         }, PermissionError)
 
         artifacts = resp.json().get("artifacts", {})

@@ -17,6 +17,13 @@ from smartloop.config.app_settings import AppSettings
 
 _settings = AppSettings()
 
+
+def _is_mmproj_gguf(filename: str) -> bool:
+    """True when a GGUF is a vision mmproj / CLIP projector (not main weights)."""
+    name = os.path.basename(filename).lower()
+    return "mmproj" in name or "clip" in name
+
+
 if TYPE_CHECKING:
     from smartloop.model import SLPModel
 
@@ -166,7 +173,9 @@ class WorkspaceModel(BaseModel):
     def param_size_b(self) -> float:
         """Parse parameter count in billions from model_name or model_id.
 
-        Examples: 'gemma3-1b' → 1.0, 'google/gemma-3-4b-it' → 4.0
+        Examples: 'gemma4-2b' → 2.0, 'google/gemma-3-4b-it' → 4.0
+        (names without a size token, e.g. 'slp-orchestra-mini', fall back to
+        the model_id: 'google/gemma-3-1b-it' → 1.0)
         """
         import re
         for src in (self.model_name, self.model_id):
@@ -192,13 +201,16 @@ class WorkspaceModel(BaseModel):
         if any(kw in combined for kw in ("code", "coder", "starcoder", "deepseek-coder")):
             caps.append("coding")
 
+        # Vision is inferred only from an explicit vision marker in the name
+        # (e.g. Qwen2.5-VL).  gemma-3-4b is NOT inferred as vision: llama-cpp has
+        # no Gemma3 vision handler, so tagging it vision only produces a model
+        # that's considered for OCR and then skipped every time.
         if any(kw in combined for kw in ("vision", "vlm", "vl")):
-            caps.append("vision")
-        elif not re.search(r"[-_]text", combined) and "gemma" in combined and size >= 4:
             caps.append("vision")
 
         if size >= 3:
             caps.append("skills")
+            caps.append("dp")
 
         return caps
 
@@ -330,31 +342,31 @@ class Workspace(BaseModel):
     def get_model(self, model_name: Optional[str] = None) -> Optional[WorkspaceModel]:
         """Look up a registered model by its short name.
 
-        If *model_name* is ``None``, returns the active model.
+        If *model_name* is ``None``, returns the default model.
         """
         result = None
         if model_name is None:
-            for m in self.models:
-                if m.is_active:
-                    result = m
-                    break
-        else:
-            for m in self.models:
-                if m.model_name == model_name:
-                    result = m
-                    break
+            from smartloop.config.app_settings import AppSettings
+            model_name = AppSettings().default_model
+        # Resolve backward-compatibility aliases (e.g. the old "gemma3-1b"
+        # bootstrap name) so lookups match regardless of which name a config or
+        # an existing workspace.json recorded.
+        from smartloop.config.supported_models import canonical_model_name
+        target = canonical_model_name(model_name)
+        for m in self.models:
+            if canonical_model_name(m.model_name) == target:
+                result = m
+                break
         if result is not None:
             result.models_dir = self.models_dir
         return result
 
     def add_model(self, model_name: str, model_id: str, config: Optional[ModelConfig] = None) -> WorkspaceModel:
-        """Register a model if not already present and mark it as active."""
+        """Register a model in the workspace without changing the active model."""
         existing = self.get_model(model_name)
         if existing is not None:
             if config is not None:
                 if existing.config:
-                    # Merge: preserve existing values (e.g. developer_token)
-                    # when the incoming config has None for those fields.
                     merged = existing.config.model_dump()
                     for key, value in config.model_dump().items():
                         if value is not None:
@@ -362,12 +374,9 @@ class Workspace(BaseModel):
                     existing.config = ModelConfig.model_validate(merged)
                 else:
                     existing.config = config
-            self.set_active_model(model_name)
             return existing
-        # Deactivate all other models before appending
-        for m in self.models:
-            m.is_active = False
-        entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, is_active=True, models_dir=self.models_dir)
+        has_active = any(m.is_active for m in self.models)
+        entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, is_active=not has_active, models_dir=self.models_dir)
         self.models.append(entry)
         return entry
 
@@ -422,7 +431,8 @@ class Workspace(BaseModel):
             ws_model = self.get_model()
         if ws_model and ws_model.bin_dir and os.path.isdir(ws_model.bin_dir):
             quantize = (ws_model.config.quantize if ws_model.config else "").upper()
-            gguf_files = [f for f in os.listdir(ws_model.bin_dir) if f.endswith(".gguf")]
+            gguf_files = [f for f in os.listdir(ws_model.bin_dir)
+                          if f.endswith(".gguf") and not _is_mmproj_gguf(f)]
             if quantize:
                 for f in gguf_files:
                     if f.upper().endswith(f"-{quantize}.GGUF"):
@@ -432,11 +442,12 @@ class Workspace(BaseModel):
         exact = self.model_path_for(model_id)
         if os.path.exists(exact):
             return exact
-        # Fallback: find any .gguf file in the model directory
+        # Fallback: find any main .gguf in the model directory.  The mmproj /
+        # CLIP projector GGUF is excluded — it is not a loadable main model.
         model_dir = self.model_dir_for(model_id)
         if os.path.isdir(model_dir):
             for f in os.listdir(model_dir):
-                if f.endswith(".gguf"):
+                if f.endswith(".gguf") and not _is_mmproj_gguf(f):
                     return os.path.join(model_dir, f)
         return exact
 

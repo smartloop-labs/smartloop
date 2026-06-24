@@ -58,6 +58,10 @@ class IndexerTask(BaseTask):
         self._inflight: set = set()
         self._last_scan: float = 0.0
         self._SCAN_INTERVAL: float = 5.0
+        # True once a document has been processed since the queue last went
+        # idle; used to release the on-demand vision model exactly once when
+        # the queue drains (so only the orchestrator stays resident).
+        self._processed_since_idle: bool = False
 
     # ------------------------------------------------------------------
     # Public queue API
@@ -113,12 +117,20 @@ class IndexerTask(BaseTask):
                         continue
                     self._inflight.add(doc_id)
                 self._set_status(TaskStatus.RUNNING, "Processing document")
+                self._processed_since_idle = True
                 self._executor.submit(self._worker_run, doc_id)
             except queue.Empty:
                 with self._inflight_lock:
                     idle = not self._inflight
                 if idle:
                     self._set_status(TaskStatus.PENDING, "Waiting for documents")
+                    # Stage boundary: all queued documents are indexed, so the
+                    # on-demand vision/OCR model is no longer needed — free its
+                    # VRAM (only the orchestrator stays resident). Done once per
+                    # drain to avoid reload churn while idle.
+                    if self._processed_since_idle:
+                        self._processed_since_idle = False
+                        self._release_on_demand_models()
             except Exception as e:
                 self.logger.error(f"[Indexer] Event loop error: {e}")
 
@@ -500,6 +512,14 @@ class IndexerTask(BaseTask):
         if llm is None:
             llm = model_service.load_model()
         return llm
+
+    def _release_on_demand_models(self) -> None:
+        """Free on-demand models when indexing goes idle (orchestrator stays)."""
+        try:
+            from smartloop.api.services import get_model_service
+            get_model_service().unload_vision_model()
+        except Exception as e:
+            self.logger.warning(f"[Indexer] Failed to release vision model: {e}")
 
     def start_watcher(self) -> None:
         """Alias for start_loop()."""

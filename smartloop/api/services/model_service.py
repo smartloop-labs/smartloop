@@ -31,8 +31,6 @@ from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
 from smartloop.db.feedback_indexer import FeedbackIndexer
 from smartloop.feedback_store import FeedbackStore, FeedbackEntry, ConversationTurn
-from docling.datamodel.settings import settings as docling_settings
-from docling.utils.model_downloader import download_models as download_docling_models
 from smartloop.model import Model
 from smartloop.mcp.local_client import LocalMCPClient
 from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
@@ -95,6 +93,10 @@ class ModelService:
         self._decision_model_name: Optional[str] = None
         self._large_llm: Optional[BaseLLM] = None
         self._large_model_name: Optional[str] = None
+        # Multimodal vision model for document OCR (needs main + mmproj GGUF).
+        self._vision_llm: Optional[BaseLLM] = None
+        self._vision_model_name: Optional[str] = None
+        self._vision_unavailable: bool = False
         # Set once the large model has been considered (loaded, skipped for
         # fit, or absent), so we don't re-probe VRAM on every agent request.
         self._large_model_attempted: bool = False
@@ -173,62 +175,39 @@ class ModelService:
                 project.sessions.append(session_id)
                 self._model.save()
 
-    def _ensure_model(self, model_name: Optional[str] = None, developer_token: Optional[str] = None, hf_token: Optional[str] = None, register: bool = False) -> None:
-        """
-        Initialize the workspace/Model object without loading the LLM into memory.
+    def _ensure_model(self) -> None:
+        """Ensure the default orchestrator model is initialized."""
+        default = api_settings.default_model
 
-        If ``self._model`` is already set and the requested model matches
-        the active workspace model, the existing instance is reused.
+        if self._model is not None and self._model_name == default:
+            return
 
-        Resolves model name in order: explicit argument → workspace active
-        model → api_settings.default_model.
-
-        Args:
-            register: If True, register the model in the workspace when it
-                      is not found.  Only init/build/train callers should
-                      set this.
-        """
-        _model_name = model_name
-
-        # Load workspace first so we can resolve the active model
         workspace = self._ensure_workspace(ModelConfig(
-            model_name=_model_name or api_settings.default_model,
-            hf_token=hf_token or api_settings.hf_token,
-            developer_token=developer_token or api_settings.developer_token,
+            model_name=default,
+            hf_token=api_settings.hf_token,
+            developer_token=api_settings.developer_token,
         ))
 
-        # Resolve: explicit arg → api_settings.default_model.  The orchestrator/
-        # main model is ALWAYS the small base model; the workspace's active
-        # selection only designates the on-demand large model, so we never
-        # resolve the loaded model from the active selection here.
-        if not _model_name:
-            _model_name = api_settings.default_model
+        ws_model = workspace.get_model(default)
+        if not ws_model:
+            model_type = SUPPORTED_MODELS.get(default)
+            if not model_type:
+                raise ValueError(f"Default model {default} not found in workspace")
+            ws_model = workspace.add_model(default, model_type.model_id(), config=ModelConfig(
+                model_name=default,
+                hf_token=api_settings.hf_token,
+                developer_token=api_settings.developer_token,
+            ))
 
         model_config = ModelConfig(
-            model_name=_model_name,
-            hf_token=hf_token or api_settings.hf_token,
-            developer_token=developer_token or api_settings.developer_token,
+            model_name=default,
+            hf_token=api_settings.hf_token,
+            developer_token=api_settings.developer_token,
         )
 
-        ws_model = workspace.get_model(_model_name)
-
-        if not ws_model and _model_name and register:
-            # Model not registered yet — try to add from SUPPORTED_MODELS
-            model_type = SUPPORTED_MODELS.get(_model_name)
-            if model_type:
-                ws_model = workspace.add_model(_model_name, model_type.model_id(), config=model_config)
-        elif ws_model and register:
-            # Model already registered — ensure it's set as the active model
-            workspace.set_active_model(_model_name)
-
-        if ws_model:
-            _model_name = ws_model.model_name
-        else:
-            raise ValueError(f"Model {_model_name} not found in workspace")
-
-        logger.info(f"[_ensure_model] resolved _model_name={_model_name}, model_config.model_name={model_config.model_name}")
+        logger.info(f"[_ensure_model] loading default model {default}")
         self._model = ModelFactory.get_model(model_config)
-        self._model_name = _model_name
+        self._model_name = default
  
     def _ensure_workspace(self, model_config: Optional[ModelConfig] = None) -> Workspace:
         """Return the workspace, creating it if necessary.
@@ -266,6 +245,12 @@ class ModelService:
         self._initialize_workspace()
         workspace = self._model.workspace
         project = next((p for p in workspace.projects if p.id == project_id), None)
+        if project is None:
+            # The cached workspace singleton can be stale when another process
+            # (e.g. the CLI/TUI) created the project and wrote config.json after
+            # this server loaded. Re-read from disk once before giving up.
+            workspace.reload()
+            project = next((p for p in workspace.projects if p.id == project_id), None)
         if project is None:
             raise ValueError(f"Project not found: {project_id}")
         return project
@@ -305,7 +290,7 @@ class ModelService:
             self._decision_model_name = None
             Workspace.reset()
 
-        self._ensure_model(target_model)
+        self._ensure_model()
 
         project_name = self.get_current_project_name() or "default"
         logger.info(f"Loading model: {target_model} (project: {project_name})")
@@ -353,6 +338,10 @@ class ModelService:
         self._large_llm = None
         self._large_model_name = None
         self._large_model_attempted = False
+        # Vision (multimodal) model is also loaded lazily on first OCR use.
+        self._vision_llm = None
+        self._vision_model_name = None
+        self._vision_unavailable = False
 
         self._warmup_embeddings()
         self._warmup_inference()
@@ -399,6 +388,125 @@ class ModelService:
         self._detect_large_model()
         return self._large_llm
 
+    @staticmethod
+    def _find_model_ggufs(model_dir: str) -> tuple[Optional[str], Optional[str]]:
+        """Return (main_gguf, mmproj_gguf) found directly in ``model_dir``.
+
+        The mmproj / CLIP projector ships as a separate ``*mmproj*.gguf`` (or
+        ``*clip*.gguf``) alongside the model GGUF; it must not be mistaken for
+        the main weights, so it is matched by name and excluded from the main
+        pick.
+        """
+        main_gguf = None
+        mmproj_gguf = None
+        if os.path.isdir(model_dir):
+            for f in sorted(os.listdir(model_dir)):
+                if not f.endswith(".gguf"):
+                    continue
+                lower = f.lower()
+                if "mmproj" in lower or "clip" in lower:
+                    if mmproj_gguf is None:
+                        mmproj_gguf = os.path.join(model_dir, f)
+                elif main_gguf is None:
+                    main_gguf = os.path.join(model_dir, f)
+        return main_gguf, mmproj_gguf
+
+    def get_vision_llm(self) -> Optional[BaseLLM]:
+        """Return a loaded *multimodal* vision LLM, or None when unavailable.
+
+        Vision-capable models are considered largest-first (like the
+        orchestrator), but a model is only usable for OCR when ALL of these
+        hold, so unrunnable candidates are skipped rather than crashing:
+          * its mmproj / CLIP projector GGUF is present (else it's blind), and
+          * the installed llama-cpp has a chat handler for its architecture
+            (e.g. gemma3 has none in llama-cpp-python and aborts natively), and
+          * it fits in available memory.
+        Returns None when no candidate qualifies (callers fall back to text).
+        """
+        from smartloop.config.app_settings import AppSettings
+        if not AppSettings().vision_enabled:
+            return None
+        if self._vision_llm is not None:
+            return self._vision_llm
+        if not self._model or not self._model.workspace:
+            return None
+
+        from smartloop.llms.llm_factory import LlmFactory
+        workspace = self._model.workspace
+        candidates = [
+            m for m in workspace.models
+            if m.enabled and m.downloaded
+            and "vision" in [c.lower() for c in m.effective_capabilities]
+        ]
+        # Smallest VL model first: OCR quality is adequate from a lighter model,
+        # and a smaller one is far more likely to fit on GPU alongside the
+        # orchestrator + on-demand agent models (e.g. Qwen2-VL-2B over -3B).
+        candidates.sort(key=lambda m: m.param_size_b or 0.0)
+
+        # OCR is a latency-tolerant batch task, so give the vision model a small
+        # dedicated context and waive the agent-model reserve — it only needs to
+        # fit the image tokens plus a short transcription, and shouldn't be
+        # blocked by headroom kept for the (already-resident) agent model.
+        cap = AppSettings().vision_n_ctx
+        # Track whether any candidate was rejected for a *transient* reason
+        # (not enough free VRAM right now, or a load error) versus a *permanent*
+        # one (no mmproj, no handler).  A transient failure must NOT latch
+        # ``_vision_unavailable`` — free VRAM recovers once the indexing worker
+        # copies are released, so the next document should retry rather than be
+        # stuck on text-only for the rest of the process lifetime.
+        transient_failure = False
+        for ws_model in candidates:
+            model_dir = workspace.model_dir_for(ws_model.model_id)
+            gguf_path, mmproj_path = self._find_model_ggufs(model_dir)
+            if not gguf_path or not mmproj_path:
+                logger.info(
+                    "[vision] %s skipped — missing %s",
+                    ws_model.model_name,
+                    "weights GGUF" if not gguf_path else "mmproj/CLIP GGUF",
+                )
+                continue
+            if not LlmFactory.vision_handler_supported(gguf_path):
+                logger.warning(
+                    "[vision] %s skipped — installed llama-cpp has no vision handler "
+                    "for its architecture (%s)",
+                    ws_model.model_name, LlmFactory._read_gguf_arch(gguf_path),
+                )
+                continue
+            if not self._large_model_fits(gguf_path, cap, ws_model.model_name,
+                                          reserve_gb=0.0):
+                logger.warning(
+                    "[vision] %s skipped — won't fit in available memory right now "
+                    "(will retry on the next document)",
+                    ws_model.model_name,
+                )
+                transient_failure = True
+                continue
+            clip_on_cpu = self._clip_on_cpu(gguf_path, cap)
+            try:
+                llm = LlmFactory.get_llama_cpp_instance(
+                    gguf_path, logger, self.get_project_id() or "",
+                    max_n_ctx=cap, mmproj_path=mmproj_path,
+                    clip_on_cpu=clip_on_cpu,
+                )
+                self._vision_llm = llm
+                self._vision_model_name = ws_model.model_name
+                logger.info(
+                    "[vision] Loaded %s (+mmproj) for image OCR", ws_model.model_name
+                )
+                return llm
+            except Exception as e:
+                logger.warning("[vision] Failed to load %s: %s", ws_model.model_name, e)
+                transient_failure = True
+
+        if transient_failure:
+            logger.warning(
+                "[vision] No vision model could be loaded right now — text-only "
+                "for this document; will retry later"
+            )
+        else:
+            logger.warning("[vision] No runnable vision model available — image OCR disabled")
+        return None
+
     def _get_llm_for_capability(self, capability: str) -> Optional[BaseLLM]:
         """Return a loaded LLM matching the requested capability.
 
@@ -425,12 +533,10 @@ class ModelService:
 
         try:
             model_dir = workspace.model_dir_for(ws_model.model_id)
-            gguf_path = None
-            if os.path.isdir(model_dir):
-                for f in os.listdir(model_dir):
-                    if f.endswith(".gguf"):
-                        gguf_path = os.path.join(model_dir, f)
-                        break
+            # _find_model_ggufs excludes the mmproj/CLIP GGUF from the main pick.
+            # This path is text-only capability routing (orchestrator); image OCR
+            # goes through get_vision_llm(), which loads the multimodal handler.
+            gguf_path, _mmproj = self._find_model_ggufs(model_dir)
             if not gguf_path:
                 return None
 
@@ -480,12 +586,16 @@ class ModelService:
             pass
         return None
 
-    def _large_model_fits(self, gguf_path: str, cap: int, label: str = "") -> bool:
+    def _large_model_fits(self, gguf_path: str, cap: int, label: str = "",
+                          reserve_gb: Optional[float] = None) -> bool:
         """True if a large model's capped footprint fits in free VRAM.
 
         Estimates the model's footprint (weights + KV cache @ ``cap`` +
         per-process overhead) and compares it against free device memory after
-        the configured reserve (``llm_large_fit_reserve_gb``).  Always True on
+        a reserve.  ``reserve_gb`` defaults to the configured
+        ``llm_large_fit_reserve_gb``; callers that load a latency-tolerant model
+        (e.g. the on-demand vision OCR model) may pass a smaller value (or 0) to
+        let it use the headroom the reserve normally protects.  Always True on
         CPU (RAM is plentiful) or when the device can't be queried.  When it
         returns False the caller skips the load and falls back to the default
         routing model instead of risking an OOM / starving the worker pool.
@@ -499,7 +609,8 @@ class ModelService:
         except OSError:
             return True
         from smartloop.config.app_settings import AppSettings
-        reserve_gb = AppSettings().llm_large_fit_reserve_gb
+        if reserve_gb is None:
+            reserve_gb = AppSettings().llm_large_fit_reserve_gb
         kv_gb = 0.5 * (cap / 4096)
         footprint_gb = model_gb + kv_gb + 0.7
         if footprint_gb + reserve_gb > free_gb:
@@ -512,6 +623,40 @@ class ModelService:
             )
             return False
         return True
+
+    def _clip_on_cpu(self, gguf_path: str, cap: int) -> bool:
+        """Decide whether the vision CLIP/mmproj encoder must run on CPU.
+
+        GPU is preferred (faster), but the projector + per-image activations
+        OOM the native clip code — an *uncatchable* SIGSEGV — when VRAM is too
+        tight.  ``vision_clip_device`` forces the choice ("gpu"/"cpu"); in
+        "auto" the projector stays on GPU only when free VRAM comfortably
+        exceeds the weights + KV + projector/activation headroom, else CPU.
+        """
+        from smartloop.config.app_settings import AppSettings
+        pref = (AppSettings().vision_clip_device or "auto").lower()
+        if pref == "gpu":
+            return False
+        if pref == "cpu":
+            return True
+        ft = self._device_free_total_gb()
+        if ft is None:
+            return False  # no CUDA device — use_gpu is moot (ggml runs clip on CPU)
+        free_gb, _ = ft
+        try:
+            model_gb = os.path.getsize(gguf_path) / 1024**3
+        except OSError:
+            return True
+        # Projector weights (~0.8GB) + per-image encode activation headroom.
+        need_gb = model_gb + 0.5 * (cap / 4096) + 1.8
+        if free_gb < need_gb:
+            logger.info(
+                "[vision] CLIP on CPU — only %.1fGB free, GPU clip needs ~%.1fGB "
+                "(set SLP_VISION_CLIP_DEVICE=gpu to force, or free VRAM)",
+                free_gb, need_gb,
+            )
+            return True
+        return False
 
     def _detect_large_model(self) -> None:
         """Load the largest downloaded model for agent/skill tasks, if it fits.
@@ -531,19 +676,34 @@ class ModelService:
             # user's active 4B).
             orchestrator = workspace.get_model(self._model_name)
             orchestrator_size = orchestrator.param_size_b if orchestrator else 0
-            largest = workspace.largest_downloaded_model()
-            if not largest or largest.param_size_b <= orchestrator_size:
+            # Pick the agent/large model by *capability*, not raw size: this
+            # model drives skills/synthesis, so it must declare the "skills"
+            # capability.  Selecting by size alone would load a vision-only VL
+            # model (e.g. qwen2-vl-2b) here as a redundant text copy — wasting
+            # VRAM that get_vision_llm needs for the actual OCR instance.  Among
+            # the skills-capable models, prefer the largest.
+            skills_models = [
+                m for m in workspace.models
+                if m.enabled and m.downloaded
+                and m.model_name != self._model_name
+                and "skills" in [c.lower() for c in m.effective_capabilities]
+            ]
+            if not skills_models:
+                logger.info(
+                    "[large-model] No skills-capable model downloaded — using the "
+                    "router model for skills/synthesis"
+                )
                 return
-            if largest.model_name == self._model_name:
+            largest = max(skills_models, key=lambda m: m.param_size_b or 0.0)
+            largest.models_dir = workspace.models_dir
+            if largest.param_size_b <= orchestrator_size:
                 return
 
             model_dir = workspace.model_dir_for(largest.model_id)
-            gguf_path = None
-            if os.path.isdir(model_dir):
-                for f in os.listdir(model_dir):
-                    if f.endswith(".gguf"):
-                        gguf_path = os.path.join(model_dir, f)
-                        break
+            # Exclude the mmproj/CLIP GGUF — it is not loadable as a main model
+            # (e.g. gemma-3-4b-it ships one upstream even though we don't use it
+            # for vision); loading it as weights crashes the native loader.
+            gguf_path, _mmproj = self._find_model_ggufs(model_dir)
             if not gguf_path:
                 logger.info("[large-model] GGUF not found for %s, skipping", largest.model_name)
                 return
@@ -802,7 +962,7 @@ class ModelService:
         """
 
         self.unload_model()
-        self._ensure_model(model_name, developer_token=developer_token)
+        self._ensure_model()
 
         if not self._model.workspace.current_project:
             raise ValueError(
@@ -838,7 +998,7 @@ class ModelService:
         self.unload_model()
 
         # 2. Initialise workspace (no LLM loaded)
-        self._ensure_model(model_name)
+        self._ensure_model()
 
         logger.info("Starting model training…")
         try:
@@ -2269,18 +2429,9 @@ class ModelService:
                 if migrate_chroma_to_index_store(project.project_dir):
                     logger.info(f"Migrated ChromaDB data for project '{project.name or project.id}'")
 
-        # Pre-download docling models (layout, tableformer, easyocr) so
-        # document conversion never stalls on a network fetch.
-        # Skip if models are already cached to avoid slow network checks on startup.
-        try:
-            docling_cache = docling_settings.cache_dir / "models"
-            if not docling_cache.is_dir() or not any(docling_cache.iterdir()):
-                download_docling_models(with_easyocr=True, with_rapidocr=False)
-                logger.info("Docling models cached locally")
-            else:
-                logger.info("Docling models already cached, skipping download check")
-        except Exception as e:
-            logger.warning(f"Docling model pre-download failed: {e}")
+        # Document conversion now uses MarkItDown (lightweight, no model
+        # pre-download).  OCR / image understanding is handled on demand by the
+        # vision-capable model loaded in-process via get_vision_llm().
 
         # Indexer task (auto=True — watches for pending documents)
         indexer = IndexerTask(workspace=workspace, logger=logger)
@@ -2652,6 +2803,46 @@ class ModelService:
             self._decision_model_name = None
 
             self._reset_llm_executor()
+            self._cleanup_gpu_cache()
+
+    def unload_vision_model(self) -> None:
+        """Release the on-demand vision/OCR model and return its VRAM.
+
+        Only the orchestrator model stays resident; the multimodal vision model
+        is loaded on demand by ``get_vision_llm`` for document OCR and freed here
+        once a stage completes (e.g. the indexer queue drains).  Dropping the
+        reference frees the llama.cpp context + its CUDA buffers (~1.4GB for
+        Qwen2-VL-2B; verified it returns to the GPU).  Clearing ``_vision_llm``
+        re-arms lazy reload, and ``_vision_unavailable`` is reset so a fresh
+        attempt re-evaluates fit rather than staying latched off.
+        """
+        if self._vision_llm is None:
+            return
+        with self._inference_lock:
+            if self._vision_llm is None:
+                return
+            logger.info("[vision] Unloading vision model %s — freeing VRAM",
+                        self._vision_model_name or "?")
+            self._vision_llm = None
+            self._vision_model_name = None
+            self._vision_unavailable = False
+            self._cleanup_gpu_cache()
+
+    def unload_large_model(self) -> None:
+        """Release the on-demand large agent/skills model and return its VRAM.
+
+        Like the vision model, the larger skills model is loaded on demand
+        (``_get_large_llm``) and is not part of the always-resident footprint —
+        freeing it here keeps only the orchestrator resident between stages.
+        """
+        if self._large_llm is None:
+            return
+        with self._inference_lock:
+            if self._large_llm is None:
+                return
+            logger.info("[large-model] Unloading large agent model — freeing VRAM")
+            self._large_llm = None
+            self._large_model_attempted = False
             self._cleanup_gpu_cache()
 
     # --------------------------------------------------------------- MCP servers

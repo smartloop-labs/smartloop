@@ -9,8 +9,11 @@ _LIST_MODELS = "smartloop.platform.client.SLPPlatformClient.list_models"
 
 class TestListModels:
     def test_returns_model_list(self, client):
+        # slp-orchestra-mini is the bootstrap (framework core) model; /v1/models
+        # lists the additional models a user can add, so the bootstrap model is
+        # filtered out of the result.
         mock_data = [
-            {"name": "gemma3-1b", "model_id": "google/gemma-3-1b-it"},
+            {"name": "slp-orchestra-mini", "model_id": "google/gemma-3-1b-it"},
             {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it"},
         ]
         with patch(_LIST_MODELS, return_value=mock_data):
@@ -18,10 +21,9 @@ class TestListModels:
 
         assert resp.status_code == 200
         data = resp.json()
-        assert len(data) == 2
-        assert data[0]["name"] == "gemma3-1b"
-        assert data[0]["model_id"] == "google/gemma-3-1b-it"
-        assert data[1]["name"] == "gemma3-4b"
+        names = [m["name"] for m in data]
+        assert "slp-orchestra-mini" not in names  # bootstrap model excluded
+        assert names == ["gemma3-4b"]
 
     def test_returns_empty_list(self, client):
         with patch(_LIST_MODELS, return_value=[]):

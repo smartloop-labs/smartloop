@@ -17,6 +17,31 @@ from smartloop.workspace import Workspace
 _CPU_COUNT = os.cpu_count() or 4
 _IO_THREAD_BUDGET = min(32, _CPU_COUNT * 2)  # total concurrent connections (capped at 32)
 
+def _is_mmproj(path: str) -> bool:
+    """True when ``path`` is a vision mmproj / CLIP projector GGUF."""
+    name = os.path.basename(path).lower()
+    return "mmproj" in name or "clip" in name
+
+
+def _select_gguf_artifacts(artifacts: dict) -> dict:
+    """Pick which GGUFs to download from a model's artifact map.
+
+    Keeps the quantized main weights (e.g. ``*-Q4_K_M.gguf``, preferred over the
+    raw F16) plus the mmproj / CLIP projector (vision models need it).  The
+    mmproj is never counted as the main weights, and the main weights are never
+    dropped when the model ships no quantized variant (the bug being fixed:
+    ``{**quantized, **mmproj}`` collapsed to mmproj-only for F16-only models,
+    leaving no loadable main GGUF).
+    """
+    gguf = {k: v for k, v in artifacts.items()
+            if os.path.basename(k).endswith(".gguf")}
+    mmproj = {k: v for k, v in gguf.items() if _is_mmproj(k)}
+    main = {k: v for k, v in gguf.items() if not _is_mmproj(k)}
+    quantized = {k: v for k, v in main.items()
+                 if "-Q" in os.path.basename(k).upper()}
+    return {**(quantized or main), **mmproj}
+
+
 MAX_WORKERS = min(4, _CPU_COUNT)                      # parallel file downloads (capped: I/O-bound)
 CHUNK_SIZE = 8 * 1024 * 1024                         # 8 MB read buffer for simple downloads
 RANGE_READ_SIZE = 1 * 1024 * 1024                    # 1 MB read buffer within each chunk
@@ -143,6 +168,8 @@ class SLPArtifactDownloader(SLPDownloader):
                 filename = futures[future]
                 try:
                     future.result()
+                except PermissionError:
+                    raise
                 except Exception as e:
                     self.logger.error(f"[error] {filename}: {e}")
                     failed.append(filename)
@@ -187,6 +214,11 @@ class SLPArtifactDownloader(SLPDownloader):
         """Download a file in a single request (small files)."""
         downloaded = 0
         with httpx.stream("GET", url, follow_redirects=True, timeout=300) as resp:
+            if resp.status_code == 401:
+                raise PermissionError(
+                    "Download rejected (401 Unauthorized). "
+                    "The download URL may have expired or the resource requires authentication."
+                )
             resp.raise_for_status()
             with open(dest, "wb") as f:
                 for chunk in resp.iter_bytes(chunk_size=CHUNK_SIZE):
@@ -208,6 +240,11 @@ class SLPArtifactDownloader(SLPDownloader):
         headers = {"Range": f"bytes={start}-{end}"}
         with httpx.stream("GET", url, headers=headers, follow_redirects=True,
                           timeout=300) as resp:
+            if resp.status_code == 401:
+                raise PermissionError(
+                    "Download rejected (401 Unauthorized). "
+                    "The download URL may have expired or the resource requires authentication."
+                )
             resp.raise_for_status()
             with open(dest, "r+b") as f:
                 f.seek(start)
@@ -290,15 +327,7 @@ class SLPArtifactDownloader(SLPDownloader):
         model_id = self._resolve_model_id(resolved_name)
         artifacts = self._bootstrap_source.get_artifacts(resolved_name)
 
-        # Prefer quantized GGUF (e.g. *-Q4_K_M.gguf) over the raw F16 GGUF
-        quantized = {
-            k: v for k, v in artifacts.items()
-            if os.path.basename(k).endswith(".gguf") and "-Q" in os.path.basename(k).upper()
-        }
-        artifacts = quantized or {
-            k: v for k, v in artifacts.items()
-            if os.path.basename(k).endswith(".gguf")
-        }
+        artifacts = _select_gguf_artifacts(artifacts)
 
         if not artifacts:
             raise ValueError(f"No GGUF artifact found for bootstrap model '{resolved_name}'")
@@ -315,7 +344,7 @@ class SLPArtifactDownloader(SLPDownloader):
     def _resolve_model_id(model_name: str) -> str:
         """Lookup the HuggingFace model_id from a short model name.
 
-        E.g. "gemma3-1b" → "google/gemma-3-1b-it".
+        E.g. "slp-orchestra-mini" → "google/gemma-3-1b-it".
         Falls back to model_name if no mapping is found.
         """
         from smartloop.config import SUPPORTED_MODELS
@@ -328,7 +357,7 @@ class SLPArtifactDownloader(SLPDownloader):
     def _resolve_model_name(model_id: str) -> str:
         """Reverse-lookup the short model name from a HuggingFace model_id.
 
-        E.g. "google/gemma-3-1b-it" → "gemma3-1b".
+        E.g. "google/gemma-3-1b-it" → "slp-orchestra-mini".
         Falls back to model_id if no mapping is found.
         """
         from smartloop.config import SUPPORTED_MODELS
@@ -360,15 +389,7 @@ class SLPArtifactDownloader(SLPDownloader):
 
         artifacts = self._model_source.get_artifacts(model_name)
 
-        # Prefer quantized GGUF (e.g. *-Q4_K_M.gguf) over the raw F16 GGUF
-        quantized = {
-            k: v for k, v in artifacts.items()
-            if os.path.basename(k).endswith(".gguf") and "-Q" in os.path.basename(k).upper()
-        }
-        artifacts = quantized or {
-            k: v for k, v in artifacts.items()
-            if os.path.basename(k).endswith(".gguf")
-        }
+        artifacts = _select_gguf_artifacts(artifacts)
 
         if not artifacts:
             self.logger.info(f"[ok] No GGUF files to download")

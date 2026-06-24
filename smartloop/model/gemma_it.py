@@ -14,5 +14,9 @@ class GemmaItModel(GenericModel):
         return ModelType.MULTI_MODAL
 
     @staticmethod
+    def default_capabilities() -> list[str]:
+        return ["skills", "dp"]
+
+    @staticmethod
     def model_id() -> str:
         return "google/gemma-3-4b-it"

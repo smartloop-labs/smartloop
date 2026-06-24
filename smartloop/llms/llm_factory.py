@@ -83,10 +83,131 @@ class LlmFactory:
             logger.warning(f"Probe load error: {e}")
             return False
 
+    # Map a model's GGUF ``general.architecture`` to the llama-cpp vision chat
+    # handler that knows its image-token / prompt format.  Using the WRONG
+    # handler (or none) for a model crashes the native clip code, so an arch
+    # without an entry here is treated as unsupported (text-only / skipped)
+    # rather than guessed.  ``gemma3`` is deliberately absent: llama-cpp-python
+    # has no Gemma3 handler and the legacy clip path aborts on its projector.
+    _VISION_HANDLER_BY_ARCH = [
+        (("qwen2vl", "qwen2.5vl", "qwen2_5vl", "qwen3vl", "qwenvl"), "Qwen25VLChatHandler"),
+        (("minicpmv", "minicpm-v", "minicpm"), "MiniCPMv26ChatHandler"),
+        (("nanollava",), "NanoLlavaChatHandler"),
+        (("moondream",), "MoondreamChatHandler"),
+        (("llava",), "Llava16ChatHandler"),
+    ]
+
+    @staticmethod
+    def _read_gguf_arch(path: str) -> str | None:
+        """Return a model GGUF's ``general.architecture`` (e.g. 'qwen2vl')."""
+        try:
+            import gguf
+            reader = gguf.GGUFReader(path)
+            field = reader.fields.get("general.architecture")
+            if field:
+                return bytes(field.parts[field.data[0]]).decode("utf-8", "ignore")
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _vision_handler_class_name(model_path: str) -> str | None:
+        """Name of the supported vision handler for this model, or None."""
+        arch = (LlmFactory._read_gguf_arch(model_path) or "").lower()
+        for keys, cls_name in LlmFactory._VISION_HANDLER_BY_ARCH:
+            if any(k in arch for k in keys):
+                return cls_name
+        return None
+
+    @staticmethod
+    def vision_handler_supported(model_path: str) -> bool:
+        """True when the installed llama-cpp can run this model's vision input."""
+        cls_name = LlmFactory._vision_handler_class_name(model_path)
+        if not cls_name:
+            return False
+        try:
+            import llama_cpp.llama_chat_format as chf
+            return getattr(chf, cls_name, None) is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _force_clip_on_cpu(logger: Logger) -> None:
+        """Make the multimodal (CLIP/mmproj) encoder load on CPU.
+
+        llama-cpp-python's vision handler hardcodes ``ctx_params.use_gpu = True``
+        for the mmproj context (``_init_mtmd_context``), so the projector and its
+        image activations always land on the GPU.  On a VRAM-constrained device
+        that OOMs *inside the native clip encode* — an uncatchable SIGSEGV that
+        core-dumps the server (the subprocess crash-probe is skipped for vision
+        models).  We patch ``mtmd_init_from_file`` to flip ``use_gpu`` off so the
+        projector runs on CPU; the LLM itself still runs on GPU, and encoding one
+        page image on CPU is fine for batch OCR.  Idempotent and version-tolerant
+        (depends only on the call signature + the ``use_gpu`` field).
+        """
+        try:
+            import llama_cpp.mtmd_cpp as mtmd_cpp
+        except Exception:
+            return
+        if getattr(mtmd_cpp, "_slp_clip_cpu", False):
+            return
+        _orig = mtmd_cpp.mtmd_init_from_file
+
+        def _cpu_init(clip_path, model, ctx_params):
+            try:
+                ctx_params.use_gpu = False
+            except Exception:
+                pass
+            return _orig(clip_path, model, ctx_params)
+
+        mtmd_cpp.mtmd_init_from_file = _cpu_init
+        mtmd_cpp._slp_clip_cpu = True
+        logger.info("[vision] CLIP/mmproj forced to CPU (avoids GPU OOM in clip encode)")
+
+    @staticmethod
+    def _make_vision_chat_handler(mmproj_path: str, model_path: str, logger: Logger,
+                                  clip_on_cpu: bool = False):
+        """Build the architecture-appropriate multimodal chat handler, or None.
+
+        Returns None (caller loads text-only / skips) when the model's
+        architecture has no supported handler in the installed llama-cpp — this
+        is what prevents a crash on e.g. gemma3.
+
+        ``clip_on_cpu`` forces the CLIP/mmproj encoder onto CPU (see
+        ``_force_clip_on_cpu``); the caller sets it only when GPU VRAM is too
+        tight to run the projector without an OOM segfault.
+        """
+        cls_name = LlmFactory._vision_handler_class_name(model_path)
+        if not cls_name:
+            arch = LlmFactory._read_gguf_arch(model_path)
+            logger.warning(
+                f"No supported vision chat handler for architecture {arch!r}; "
+                f"loading text-only (image OCR disabled for this model)"
+            )
+            return None
+        try:
+            import llama_cpp.llama_chat_format as chf
+            handler_cls = getattr(chf, cls_name, None)
+            if handler_cls is None:
+                logger.warning(
+                    f"Vision handler {cls_name} not in installed llama-cpp; loading text-only"
+                )
+                return None
+            # Keep the projector off the GPU only when asked — its image-encode
+            # pass OOM-segfaults the (uncatchable) native clip code on a
+            # tight-VRAM device.  With enough VRAM it stays on GPU (faster).
+            if clip_on_cpu:
+                LlmFactory._force_clip_on_cpu(logger)
+            return handler_cls(clip_model_path=mmproj_path, verbose=False)
+        except Exception as e:
+            logger.warning(f"Failed to init vision handler {cls_name} ({e}); loading text-only")
+            return None
+
     @staticmethod
     def get_llama_cpp_instance(
         path: str, logger: Logger, project_id: str, lora_path: str | None = None,
         *, probe: bool = True, max_n_ctx: int | None = None,
+        mmproj_path: str | None = None, clip_on_cpu: bool = False,
     ):
         """Returns an instance of the configured LlamaCpp wrapper class.
 
@@ -100,10 +221,25 @@ class LlmFactory:
         copies pass a small value so several models' KV caches fit on one GPU
         (the context auto-sizing otherwise assumes the model is alone on the
         device and reserves nearly all VRAM for a single copy).
+
+        ``mmproj_path``: path to a CLIP/mmproj GGUF.  When set, the model is
+        loaded as a multimodal (vision) instance with a vision chat handler so
+        it can describe / OCR images.  The subprocess probe is skipped (the
+        handler object isn't JSON-serializable) and the load is forced
+        in-process.
         """
         import torch
         from llama_cpp import Llama
         from smartloop.llms.llama_cpp import LlamaCpp
+
+        chat_handler = None
+        if mmproj_path:
+            chat_handler = LlmFactory._make_vision_chat_handler(
+                mmproj_path, path, logger, clip_on_cpu=clip_on_cpu)
+            if chat_handler is not None:
+                # Handler holds a loaded CLIP model; it can't be pickled into
+                # the probe subprocess, so load directly in-process.
+                probe = False
 
         from smartloop.config.app_settings import AppSettings as _AppSettings
         _app_cfg = _AppSettings()
@@ -196,6 +332,20 @@ class LlmFactory:
             config['lora_path'] = lora_path
             logger.info(f"Loading LoRA adapter: {lora_path}")
 
+        if chat_handler is not None:
+            config['chat_handler'] = chat_handler
+            # Flash attention — VISION LOAD, CUDA ONLY.  Without it the image
+            # encode allocates a fixed ~6GB compute buffer that OOM-segfaults
+            # the native clip code on a tight CUDA GPU; flash_attn brings the
+            # per-page peak to ~3GB.  On Metal (MPS) flash_attn is unsupported
+            # and causes the load to fail, silently falling back to CPU-only.
+            if torch.cuda.is_available():
+                config['flash_attn'] = True
+            logger.info(
+                f"Loading vision model with mmproj: {mmproj_path} "
+                f"(flash_attn={config.get('flash_attn', False)})"
+            )
+
         logger.info(f"Loading model with config: n_ctx={n_ctx}, n_gpu_layers={config['n_gpu_layers']}, model_size={model_size_gb:.1f}GB")
 
         # Probe in subprocess first to detect crashes (SIGABRT/segfault)
@@ -243,7 +393,7 @@ class LlmFactory:
         try:
             llm = Llama(**config)
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
+            logger.error(f"Failed to load model (n_gpu_layers={config['n_gpu_layers']}): {e}")
 
             # Fallback 1: reduce context size and retry with GPU
             if config['n_ctx'] > 2048:
@@ -256,14 +406,14 @@ class LlmFactory:
                     logger.error(f"Failed to load model with reduced context: {e2}")
                     # Fallback 2: try CPU-only mode with reduced context
                     if config['n_gpu_layers'] != 0:
-                        logger.warning("Retrying with CPU-only mode...")
+                        logger.warning("FALLING BACK TO CPU-ONLY (n_gpu_layers 0) — GPU load failed")
                         config['n_gpu_layers'] = 0
                         llm = Llama(**config)
                     else:
                         raise
             elif config['n_gpu_layers'] != 0:
                 # Fallback: try CPU-only mode if GPU loading fails
-                logger.warning("Retrying with CPU-only mode...")
+                logger.warning("FALLING BACK TO CPU-ONLY (n_gpu_layers 0) — GPU load failed")
                 config['n_gpu_layers'] = 0
                 llm = Llama(**config)
             else:

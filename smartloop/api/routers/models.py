@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from smartloop.api.services import ModelService, get_model_service
+from smartloop.config import SUPPORTED_MODELS
 from smartloop.config.app_settings import AppSettings
 from smartloop.platform.client import SLPPlatformClient
 
@@ -205,13 +206,21 @@ async def list_models(
     except Exception:
         ws_lookup = {}
 
+    bootstrap_model = settings.default_model
+
     result = []
     for m in models:
         entry = ModelEntry(**m) if isinstance(m, dict) else m
+        if entry.name == bootstrap_model:
+            continue
         ws_model = ws_lookup.get(entry.name)
         if ws_model:
             entry.enabled = ws_model.enabled
             entry.capabilities = ws_model.effective_capabilities
+        else:
+            model_cls = SUPPORTED_MODELS.get(entry.name)
+            if model_cls and hasattr(model_cls, 'default_capabilities'):
+                entry.capabilities = model_cls.default_capabilities()
         result.append(entry)
     return result
 
@@ -231,6 +240,8 @@ async def list_workspace_models(
 ):
     """List models registered in the local workspace."""
     try:
+        settings = AppSettings()
+        bootstrap_model = settings.default_model
         workspace = model_service._ensure_workspace()
         return [
             WorkspaceModelEntry(
@@ -242,6 +253,7 @@ async def list_workspace_models(
                 capabilities=m.effective_capabilities,
             )
             for m in workspace.models
+            if m.model_name != bootstrap_model
         ]
     except Exception as e:
         logger.exception("Error listing workspace models")

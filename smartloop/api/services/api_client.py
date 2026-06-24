@@ -35,14 +35,10 @@ class SLPAPIClient:
     def __init__(self, settings: Optional[AppSettings] = None):
         self._settings = settings or AppSettings()
         self._platform_client = SLPPlatformClient(self._settings.slp_api_base)
-        self._enabled = platform_auth.has_credentials()
-
-        if not self._enabled:
-            logger.info("Smartloop API client not configured (no credentials)")
 
     @property
     def enabled(self) -> bool:
-        return self._enabled
+        return platform_auth.has_credentials()
 
     # -------------------------------------------------------------- Telemetry
 
@@ -77,7 +73,7 @@ class SLPAPIClient:
         except Exception as e:
             logger.warning(f"Failed to write local token usage: {e}")
 
-        if not self._enabled:
+        if not self.enabled:
             return
 
         def _post():

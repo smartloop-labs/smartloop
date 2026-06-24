@@ -4,11 +4,11 @@ import logging
 
 from .csv_parser import CsvParser
 
+from .document_parser import DocumentParser
 from .docx2_parser import Docx2Parser
 from .pdf_parser import PdfParser
 
 from .text_parser import TextParser
-from .pptx_parser import PptxParser
 
 from smartloop.llms import BaseLLM
 
@@ -20,18 +20,29 @@ class ParserFactory:
         txt=mimetypes.types_map['.txt'],
         docx="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         pptx="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        xlsx="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        html=mimetypes.types_map['.html'],
         csv=mimetypes.types_map['.csv'],
-        # xlsx="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        # doc=mimetypes.types_map['.doc'],  # TODO: review the support for this one
+        png="image/png",
+        jpeg="image/jpeg",
     )
 
     def __init__(self, llm: BaseLLM = None):
         self.llm = llm
+        # PDF, DOCX, PPTX, XLSX, HTML and images are all converted to markdown
+        # via MarkItDown (DocumentParser); PDF/DOCX keep thin subclasses for
+        # readability.  Images (PNG/JPEG) are OCR'd/described by the vision
+        # model through MarkItDown's image converter.  TXT and CSV use their own
+        # lightweight parsers.
         self.parsers = {
             self.SUPPORTED_DOCUMENT_TYPE['pdf']: PdfParser,
             self.SUPPORTED_DOCUMENT_TYPE['txt']: TextParser,
             self.SUPPORTED_DOCUMENT_TYPE['docx']: Docx2Parser,
-            self.SUPPORTED_DOCUMENT_TYPE['pptx']: PptxParser,
+            self.SUPPORTED_DOCUMENT_TYPE['pptx']: DocumentParser,
+            self.SUPPORTED_DOCUMENT_TYPE['xlsx']: DocumentParser,
+            self.SUPPORTED_DOCUMENT_TYPE['html']: DocumentParser,
+            self.SUPPORTED_DOCUMENT_TYPE['png']: DocumentParser,
+            self.SUPPORTED_DOCUMENT_TYPE['jpeg']: DocumentParser,
             self.SUPPORTED_DOCUMENT_TYPE['csv']:  CsvParser,
         }
 
