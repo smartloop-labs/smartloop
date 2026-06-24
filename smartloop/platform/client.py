@@ -176,5 +176,5 @@ class SLPPlatformClient:
             resp = httpx.post(self._url(_USAGE_TOKENS), headers=self._auth_headers_fn(),
                               json=record, timeout=timeout)
             _raise_for_status(resp)
-        except httpx.ConnectError as e:
-            raise ConnectionError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error("Failed to push token usage: %s", e)
