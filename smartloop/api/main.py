@@ -18,7 +18,7 @@ import re as _re
 import time as _time
 
 from smartloop.api.config import api_settings
-from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router
+from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, mcp_presets_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router
 from smartloop.api.services import get_model_service, get_api_client
         
 from smartloop.config import AppSettings
@@ -232,6 +232,7 @@ app.include_router(documents_router)
 app.include_router(projects_router)
 app.include_router(assets_router)
 app.include_router(mcp_servers_router)
+app.include_router(mcp_presets_router)
 app.include_router(models_router)
 app.include_router(init_router)
 app.include_router(skills_router)
