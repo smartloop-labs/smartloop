@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # URL path constants
 _BOOTSTRAP_MODELS = "/v1/bootstrap/models"
 _MODEL_DOWNLOAD = "/v1/models/{}/download"
-_USAGE_TOKENS = "/usage/tokens"
+_USAGE_TOKENS = "/v1/usage/tokens"
 _USERS_ME = "/v1/users/me"
 _JWT_REFRESH = "/v1/auth/jwt/refresh"
 _MODEL_UPLOAD = "/v1/models/{}/upload"
@@ -171,6 +171,10 @@ class SLPPlatformClient:
         return resp.json()
 
     def push_token_usage(self, record: dict, timeout: int = 10) -> None:
-        """POST /usage/tokens (auth required). Fire-and-forget telemetry."""
-        httpx.post(self._url(_USAGE_TOKENS), headers=self._auth_headers_fn(),
-                   json=record, timeout=timeout)
+        """POST /v1/usage/tokens (auth required). Fire-and-forget telemetry."""
+        try:
+            resp = httpx.post(self._url(_USAGE_TOKENS), headers=self._auth_headers_fn(),
+                              json=record, timeout=timeout)
+            _raise_for_status(resp)
+        except httpx.ConnectError as e:
+            raise ConnectionError(f"Connection error: {e}") from e

@@ -19,7 +19,7 @@ import time as _time
 
 from smartloop.api.config import api_settings
 from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router
-from smartloop.api.services import get_model_service
+from smartloop.api.services import get_model_service, get_api_client
         
 from smartloop.config import AppSettings
 from smartloop.workspace import Workspace
@@ -242,6 +242,8 @@ app.include_router(project_io_router)
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    get_api_client().flush_token_usage()
+
     model_service = get_model_service()
     result = {
         "status": "healthy",

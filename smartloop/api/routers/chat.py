@@ -344,7 +344,6 @@ async def stream_chunks(
                 model_service.append_to_session(request.session_id, "user", last_user_msg)
             model_service.append_to_session(request.session_id, "assistant", orchestrator_context, message_id=message_id)
 
-        # Push token usage for mutation responses
         _project_id = model_service.get_project_id()
         _prompt_tokens = model_service.count_tokens(last_user_msg or "")
         _completion_tokens = model_service.count_tokens(orchestrator_context)
@@ -505,9 +504,7 @@ async def stream_chunks(
         max_context = model_service.get_max_context_tokens()
         total_tokens = prompt_tokens + completion_tokens
 
-        # Push token usage telemetry (non-blocking)
-        api_client = get_api_client()
-        api_client.push_token_usage(
+        get_api_client().push_token_usage(
             project_id=project_id,
             model=request.model,
             prompt_tokens=prompt_tokens,
@@ -697,9 +694,7 @@ async def create_chat_completion(
         prompt_tokens = model_service.count_tokens(prompt)
         completion_tokens = model_service.count_tokens(response_text)
 
-        # Push telemetry (non-blocking)
-        api_client = get_api_client()
-        api_client.push_token_usage(
+        get_api_client().push_token_usage(
             project_id=project_id,
             model=request.model,
             prompt_tokens=prompt_tokens,
