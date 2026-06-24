@@ -11,6 +11,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from smartloop.auth import credential_store
+from tui.constants import visible_model_name
 from tui.events import (
     BootstrapProgress,
     BootstrapStatus,
@@ -158,7 +159,7 @@ class ModelInfo:
                                 bar = self._render_block_bar(dl, total)
                                 progress_widget.update(f"{bar} [#8b949e]{pct:3.0f}%[/#8b949e]")
                                 download_label.update(
-                                    f"Downloading {fn}  {_format_bytes(dl)} / {_format_bytes(total)}"
+                                    f"Downloading {self._friendly_filename(fn)}  {_format_bytes(dl)} / {_format_bytes(total)}"
                                 )
                                 log.scroll_end(animate=False)
 
@@ -179,7 +180,7 @@ class ModelInfo:
                             case BootstrapComplete(model_name=mn, project=proj):
                                 if mn:
                                     self.model_name = mn
-                                    self.sub_title = mn
+                                    self.sub_title = visible_model_name(mn)
                                 if proj:
                                     self.project_id = proj.get("id")
                                     pname = proj.get("name", "")
@@ -213,10 +214,10 @@ class ModelInfo:
 
             if loaded_name:
                 self.model_name = loaded_name
-                self.sub_title = loaded_name
+                self.sub_title = visible_model_name(loaded_name)
             self._refresh_info_bar()
             if model_ready:
-                self._append_system(f"Switched to model: {self.model_name}")
+                self._append_system(f"Switched to model: {visible_model_name(self.model_name)}")
             else:
                 self._append_system(
                     f"Model {target} initialized but not ready yet — "

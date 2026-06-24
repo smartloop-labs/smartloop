@@ -8,6 +8,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from smartloop.config import AppSettings
+from tui.constants import visible_model_name
 from smartloop.conversation_store import ConversationStore
 from tui.events import (
     BootstrapProgress,
@@ -121,7 +122,7 @@ class Bootstrap:
 
                             case BootstrapComplete(model_name=mn, project=proj):
                                 self.model_name = mn
-                                self.sub_title = mn
+                                self.sub_title = visible_model_name(mn)
                                 if proj:
                                     self.project_id = proj.get("id")
                                     pname = proj.get("name", "")

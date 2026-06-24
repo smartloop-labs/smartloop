@@ -1230,10 +1230,6 @@ class ModelService:
         # Re-fetch: install_* may have replaced self._model via _ensure_model(),
         # so the passed `project` object can be stale (different workspace instance).
         project = self._get_project(project_id)
-        for server in project.mcp_servers:
-            if not server.tools:
-                continue
-            self._generate_mcp_workspace_doc(project, server)
         self._install_default_skills(project)
 
     def _install_default_skills(self, project: "Project") -> None:
@@ -2921,9 +2917,6 @@ class ModelService:
 
         result = self._mcp_server_to_dict(server)
 
-        if server.tools:
-            self._generate_mcp_workspace_doc(current_project, server)
-
         return result
 
     def add_local_mcp_server(
@@ -3087,54 +3080,7 @@ class ModelService:
 
         result = self._mcp_server_to_dict(server)
 
-        if server.tools:
-            self._generate_mcp_workspace_doc(current_project, server)
-
         return result
-
-    # Mapping of known server IDs to their bundled doc filenames
-    # (relative to smartloop/skills/).  These ship with pre-written
-    # files so we skip the LLM-based auto-generation for them.
-    _KNOWN_MCP_DOCS: dict[str, str] = {
-        SYSTEM_TOOLS_SERVER_ID: "__system_mcp__.md",
-        FETCH_SERVER_ID: "fetch-mcp.md",
-    }
-
-    def _generate_mcp_workspace_doc(self, project: "Project", server: "MCPServer") -> None:
-        """Generate a workspace document describing the MCP server's tools.
-
-        For known/system servers (listed in ``_KNOWN_MCP_DOCS``), the
-        pre-written file shipped with the package is used directly.
-        For custom servers, a deterministic tool listing is built
-        from server metadata (no LLM / GPU needed).
-
-        The document is written to disk and discovered by the
-        workspace indexer on the next search.
-        """
-        # --- fast path: use bundled content for known servers ---------------
-        bundled_filename = self._KNOWN_MCP_DOCS.get(server.id)
-        if bundled_filename:
-            bundled_path = os.path.join(
-                os.path.dirname(__file__), os.pardir, os.pardir, "skills", bundled_filename
-            )
-            bundled_path = os.path.normpath(bundled_path)
-            if os.path.isfile(bundled_path):
-                try:
-                    content = Path(bundled_path).read_text(encoding="utf-8")
-                except Exception as e:
-                    logger.warning("Failed to read bundled doc '%s': %s", bundled_path, e)
-                    return
-
-                if self._write_mcp_doc(project, server, content):
-                    logger.info(
-                        "Loaded bundled workspace doc for known MCP server '%s'",
-                        server.name,
-                    )
-                return
-
-        # --- normal path: deterministic tool listing (no LLM / GPU needed) --
-        content = MCPSkillGenerator._build_skill_content(server)
-        self._write_mcp_doc(project, server, content)
 
     def _write_mcp_doc(
         self,

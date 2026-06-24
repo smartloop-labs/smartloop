@@ -14,6 +14,7 @@ from textual.widgets import Static, OptionList, TextArea
 from textual.widgets.text_area import TextAreaTheme
 
 from smartloop.model_factory import SUPPORTED_MODELS
+from tui.constants import visible_model_name
 from tui.theme import Theme as theme
 from tui.widgets import CommandMenu, PromptTextArea, ChatLog
 from tui.workers import Connection, Bootstrap, Streaming
@@ -140,17 +141,12 @@ class SLPChat(
 
     @staticmethod
     def _friendly_filename(filename: str) -> str:
-        """Resolve a .gguf filename to its SUPPORTED_MODELS key.
-
-        Each model class has a model_id() like "google/gemma-3-4b-it".
-        The gguf filename typically starts with the part after "/".
-        Match against that to return the friendly key (e.g. "gemma3-4b").
-        """
+        """Resolve a .gguf filename to its visible model name."""
         base = Path(filename).name
         for key, model_cls in SUPPORTED_MODELS.items():
             model_suffix = Path(model_cls.model_id()).name
-            if base.startswith(model_suffix):
-                return key
+            if model_suffix in base:
+                return visible_model_name(key)
         # Fallback: strip .gguf extension
         if base.endswith(".gguf"):
             base = base[:-5]
