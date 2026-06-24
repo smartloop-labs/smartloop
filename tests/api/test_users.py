@@ -16,7 +16,7 @@ class TestGetMe:
             "is_premium": True,
             "is_paid": True,
             "number_of_tokens_processed": 5000,
-            "selected_model": "gemma3-1b",
+            "selected_model": "slp-orchestra-mini",
         }
         with patch(_GET_CURRENT_USER, return_value=mock_data):
             resp = client.get("/v1/users/me")
@@ -28,7 +28,7 @@ class TestGetMe:
         assert data["is_premium"] is True
         assert data["is_paid"] is True
         assert data["number_of_tokens_processed"] == 5000
-        assert data["selected_model"] == "gemma3-1b"
+        assert data["selected_model"] == "slp-orchestra-mini"
 
     def test_optional_fields_default(self, client):
         mock_data = {"email": "chris@example.com"}
@@ -78,6 +78,6 @@ class TestUpdateMe:
 
     def test_401_when_not_authenticated(self, client):
         with patch(_UPDATE_CURRENT_USER, side_effect=PermissionError("Not authenticated")):
-            resp = client.patch("/v1/users/me", json={"selected_model": "gemma3-1b"})
+            resp = client.patch("/v1/users/me", json={"selected_model": "slp-orchestra-mini"})
 
         assert resp.status_code == 401

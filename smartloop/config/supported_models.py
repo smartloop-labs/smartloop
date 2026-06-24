@@ -9,7 +9,7 @@ from smartloop.model import Gemma4_2bModel
 from smartloop.model import Qwen2VL_2bModel
 
 SUPPORTED_MODELS = OrderedDict({
-    "gemma3-1b": GemmaItTextModel,
+    "slp-orchestra-mini": GemmaItTextModel,
     "gemma3-4b": GemmaItModel,
     "llama3-1b": Llama3_2_1bModel,
     "llama3-3b": Llama3_2_3bModel,

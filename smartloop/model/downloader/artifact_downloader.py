@@ -344,7 +344,7 @@ class SLPArtifactDownloader(SLPDownloader):
     def _resolve_model_id(model_name: str) -> str:
         """Lookup the HuggingFace model_id from a short model name.
 
-        E.g. "gemma3-1b" → "google/gemma-3-1b-it".
+        E.g. "slp-orchestra-mini" → "google/gemma-3-1b-it".
         Falls back to model_name if no mapping is found.
         """
         from smartloop.config import SUPPORTED_MODELS
@@ -357,7 +357,7 @@ class SLPArtifactDownloader(SLPDownloader):
     def _resolve_model_name(model_id: str) -> str:
         """Reverse-lookup the short model name from a HuggingFace model_id.
 
-        E.g. "google/gemma-3-1b-it" → "gemma3-1b".
+        E.g. "google/gemma-3-1b-it" → "slp-orchestra-mini".
         Falls back to model_id if no mapping is found.
         """
         from smartloop.config import SUPPORTED_MODELS
