@@ -119,10 +119,9 @@ class SLPOrchestrator:
                         return llm
                 except Exception as e:
                     logger.warning("[models] capability model load failed (%s): %s", capability, e)
-                # No model declares this capability (or it won't fit): always
-                # fall back to the default model rather than loading the generic
-                # largest model.
-                return self.agent_llm
+            # No capability-specific model available — fall through to the
+            # generic large model so synthesis / analysis still gets the
+            # best available model rather than the small orchestrator.
             if self.large_llm is None and self._large_llm_provider is not None:
                 try:
                     self.large_llm = self._large_llm_provider()

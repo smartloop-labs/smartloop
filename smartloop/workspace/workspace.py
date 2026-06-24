@@ -188,7 +188,7 @@ class WorkspaceModel(BaseModel):
     def effective_capabilities(self) -> List[str]:
         """Return capabilities: user-set if present, otherwise inferred from model metadata."""
         if self.capabilities:
-            return self.capabilities
+            return ["synthesis" if c == "analysis" else c for c in self.capabilities]
         return self._infer_capabilities()
 
     def _infer_capabilities(self) -> List[str]:
