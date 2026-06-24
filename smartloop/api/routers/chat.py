@@ -343,6 +343,17 @@ async def stream_chunks(
             if last_user_msg:
                 model_service.append_to_session(request.session_id, "user", last_user_msg)
             model_service.append_to_session(request.session_id, "assistant", orchestrator_context, message_id=message_id)
+
+        # Push token usage for mutation responses
+        _project_id = model_service.get_project_id()
+        _prompt_tokens = model_service.count_tokens(last_user_msg or "")
+        _completion_tokens = model_service.count_tokens(orchestrator_context)
+        get_api_client().push_token_usage(
+            project_id=_project_id,
+            model=request.model,
+            prompt_tokens=_prompt_tokens,
+            completion_tokens=_completion_tokens,
+        )
         return
 
     project_id = model_service.get_project_id()

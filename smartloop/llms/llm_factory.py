@@ -334,16 +334,16 @@ class LlmFactory:
 
         if chat_handler is not None:
             config['chat_handler'] = chat_handler
-            # Flash attention — VISION LOAD ONLY (gated by chat_handler; the
-            # text/orchestrator models are unaffected). Without it the image
+            # Flash attention — VISION LOAD, CUDA ONLY.  Without it the image
             # encode allocates a fixed ~6GB compute buffer that OOM-segfaults
-            # the native clip code on a tight GPU; n_batch/n_ctx have NO effect
-            # on that spike (measured), flash_attn is the only lever — it brings
-            # the per-page peak to ~3GB so the encode runs on GPU alongside the
-            # resident orchestrator on an 8GB card.
-            config['flash_attn'] = True
+            # the native clip code on a tight CUDA GPU; flash_attn brings the
+            # per-page peak to ~3GB.  On Metal (MPS) flash_attn is unsupported
+            # and causes the load to fail, silently falling back to CPU-only.
+            if torch.cuda.is_available():
+                config['flash_attn'] = True
             logger.info(
-                f"Loading vision model with mmproj: {mmproj_path} (flash_attn=True)"
+                f"Loading vision model with mmproj: {mmproj_path} "
+                f"(flash_attn={config.get('flash_attn', False)})"
             )
 
         logger.info(f"Loading model with config: n_ctx={n_ctx}, n_gpu_layers={config['n_gpu_layers']}, model_size={model_size_gb:.1f}GB")
@@ -393,7 +393,7 @@ class LlmFactory:
         try:
             llm = Llama(**config)
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
+            logger.error(f"Failed to load model (n_gpu_layers={config['n_gpu_layers']}): {e}")
 
             # Fallback 1: reduce context size and retry with GPU
             if config['n_ctx'] > 2048:
@@ -406,14 +406,14 @@ class LlmFactory:
                     logger.error(f"Failed to load model with reduced context: {e2}")
                     # Fallback 2: try CPU-only mode with reduced context
                     if config['n_gpu_layers'] != 0:
-                        logger.warning("Retrying with CPU-only mode...")
+                        logger.warning("FALLING BACK TO CPU-ONLY (n_gpu_layers 0) — GPU load failed")
                         config['n_gpu_layers'] = 0
                         llm = Llama(**config)
                     else:
                         raise
             elif config['n_gpu_layers'] != 0:
                 # Fallback: try CPU-only mode if GPU loading fails
-                logger.warning("Retrying with CPU-only mode...")
+                logger.warning("FALLING BACK TO CPU-ONLY (n_gpu_layers 0) — GPU load failed")
                 config['n_gpu_layers'] = 0
                 llm = Llama(**config)
             else:

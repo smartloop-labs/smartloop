@@ -43,6 +43,11 @@ _IMAGE_PROMPT = (
 # staying legible for OCR.
 _OCR_DPI = 96
 _OCR_MAX_TOKENS = 1536
+# Cap the longest edge of rendered page images so the CLIP patch grid stays
+# small (~10x14 patches for a letter page).  A 26x37 grid (962 patches at
+# 96 DPI uncapped) dominates the vision-encode time; 560 px keeps it under
+# ~200 patches while remaining legible for OCR.
+_OCR_MAX_PIXELS = 560
 
 
 class _VisionChatCompletions:
@@ -59,14 +64,24 @@ class _VisionChatCompletions:
         self._model_service = model_service
 
     def create(self, *, messages, model=None, max_tokens=2048, temperature=0.0, **_):
+        import time
         llm = self._model_service.get_vision_llm()
         if llm is None:
             raise RuntimeError("No vision-capable model available")
+        n_gpu = llm.model.model_params.n_gpu_layers
+        logging.getLogger(__name__).info(
+            "[vision-ocr] create_chat_completion n_gpu_layers=%s", n_gpu,
+        )
+        t0 = time.monotonic()
         with self._model_service._inference_lock:
             result = llm.model.create_chat_completion(
                 messages=messages, max_tokens=max_tokens,
                 temperature=temperature, stream=False,
             )
+        elapsed = time.monotonic() - t0
+        logging.getLogger(__name__).info(
+            "[vision-ocr] completed in %.1fs", elapsed,
+        )
         content = ((result.get("choices") or [{}])[0]
                    .get("message", {}).get("content") or "")
         return SimpleNamespace(
@@ -183,10 +198,12 @@ class DocumentParser(BaseParser):
             logger.info(
                 f"Vision OCR: {len(sparse)}/{len(page_texts)} scanned page(s) in {name}"
             )
+
+            sparse_set = set(sparse)
             parts = []
-            for i, page in enumerate(doc):
-                if i in sparse:
-                    ocr = self._ocr_page(page, client, vision_model, logger)
+            for i in range(len(page_texts)):
+                if i in sparse_set:
+                    ocr = self._ocr_page(doc[i], client, vision_model, logger)
                     parts.append(ocr or page_texts[i])
                 else:
                     parts.append(page_texts[i])
@@ -196,14 +213,22 @@ class DocumentParser(BaseParser):
 
     @staticmethod
     def _ocr_page(page, client, model: str, logger: logging.Logger) -> str:
-        """Render a PDF page to PNG and transcribe it with the vision model.
+        """Render a single PDF page to a capped-size PNG and transcribe it.
 
-        Uses the same in-process vision client as MarkItDown
-        (``chat.completions.create`` with an ``image_url`` data URI — how
-        llama.cpp's vision handler takes images).
+        The render DPI is reduced so the longest edge stays at most
+        ``_OCR_MAX_PIXELS`` px.  This keeps the CLIP patch grid small
+        (e.g. ~15x20 instead of 26x37), which is the dominant cost in
+        the vision encode step.
         """
         try:
-            pix = page.get_pixmap(dpi=_OCR_DPI)
+            rect = page.rect
+            long_edge_pts = max(rect.width, rect.height)
+            base_px = long_edge_pts * _OCR_DPI / 72.0
+            if base_px > _OCR_MAX_PIXELS:
+                dpi = int(_OCR_DPI * _OCR_MAX_PIXELS / base_px)
+            else:
+                dpi = _OCR_DPI
+            pix = page.get_pixmap(dpi=dpi)
             b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
             resp = client.chat.completions.create(
                 model=model,
