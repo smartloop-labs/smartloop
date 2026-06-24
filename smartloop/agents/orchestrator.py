@@ -660,7 +660,12 @@ class SLPOrchestrator:
                 if use_pool:
                     extract = str(self._executor.submit_llm(prompt).result()).strip()
                 else:
-                    extract = str(self.agent_llm.invoke(prompt)).strip()
+                    dp_llm = self._llm_for_tier(ModelTier.LARGE, capability="dp")
+                    logger.info(
+                        "[doc-batch] %s → %s",
+                        node_id, self._model_label(dp_llm),
+                    )
+                    extract = str(dp_llm.invoke(prompt)).strip()
             except Exception as e:
                 llm_failed = True
                 logger.warning(f"[doc-batch] {node_id} extraction failed: {e}")
@@ -2029,16 +2034,11 @@ Is this context relevant to the user's request?
         )
 
         try:
-            # Route synthesis through the capability path so it loads the
-            # synthesis-capable model — e.g. gemma3-4b — instead of the generic
-            # largest-model fallback.  "synthesis" is a dedicated capability for
-            # this reduce/synthesis task, distinct from "skills" (step execution).
-            synth_llm = self._llm_for_tier(ModelTier.LARGE, capability="synthesis")
             logger.info(
-                "[models] SYNTHESIZE → %s/synthesis: %s",
-                ModelTier.LARGE.value, self._model_label(synth_llm),
+                "[models] SYNTHESIZE → agent_llm: %s",
+                self._model_label(self.agent_llm),
             )
-            result = str(synth_llm.invoke(prompt)).strip()
+            result = str(self.agent_llm.invoke(prompt)).strip()
             if result:
                 logger.info(
                     f"[synthesize] produced {len(result)} chars "

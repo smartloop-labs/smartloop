@@ -15,7 +15,7 @@ class GemmaItModel(GenericModel):
 
     @staticmethod
     def default_capabilities() -> list[str]:
-        return ["skills", "synthesis"]
+        return ["skills", "dp"]
 
     @staticmethod
     def model_id() -> str:
