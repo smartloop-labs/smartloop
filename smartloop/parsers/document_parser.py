@@ -184,11 +184,6 @@ class DocumentParser(BaseParser):
             sparse = [i for i, t in enumerate(page_texts) if len(t) < min_chars]
 
             if not sparse:
-                # Text-rich PDF — MarkItDown gives richer markdown (tables).
-                md_result = self._parse_with_markitdown(logger)
-                if md_result:
-                    return md_result
-                # MarkItDown failed; fall back to PyMuPDF text extraction.
                 return "\n\n".join(t for t in page_texts if t).strip()
 
             client, vision_model = _vision_client()
