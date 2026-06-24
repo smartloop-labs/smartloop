@@ -35,6 +35,8 @@ class SLPAPIClient:
     def __init__(self, settings: Optional[AppSettings] = None):
         self._settings = settings or AppSettings()
         self._platform_client = SLPPlatformClient(self._settings.slp_api_base)
+        self._pending_usage: list[dict] = []
+        self._pending_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -50,11 +52,12 @@ class SLPAPIClient:
         prompt_tokens: int,
         completion_tokens: int,
     ) -> None:
-        """Record token usage locally and push to the Smartloop API.
+        """Record token usage locally and queue for the next health-cycle push.
 
-        Runs the HTTP POST on a daemon thread so it never blocks the
-        caller.  Local append to ``~/.slp/token_usage.jsonl`` always
-        happens regardless of API availability.
+        Local append to ``~/.slp/token_usage.jsonl`` always happens
+        regardless of API availability.  The actual HTTP POST is
+        deferred to ``flush_token_usage`` which runs during the
+        periodic health check.
         """
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -73,15 +76,36 @@ class SLPAPIClient:
         except Exception as e:
             logger.warning(f"Failed to write local token usage: {e}")
 
-        if not self.enabled:
+        with self._pending_lock:
+            self._pending_usage.append(record)
+
+    def flush_token_usage(self) -> None:
+        """Push all pending token usage records to the platform API.
+
+        Called from the health check endpoint so pushes happen on the
+        natural polling cycle rather than inline during chat completion.
+        """
+        with self._pending_lock:
+            records = self._pending_usage[:]
+            self._pending_usage.clear()
+
+        if not records:
             return
 
+        if not self.enabled:
+            with self._pending_lock:
+                self._pending_usage.extend(records)
+            return
+
+        logger.info("Flushing %d pending token usage record(s)", len(records))
+
         def _post():
-            try:
-                self._platform_client.push_token_usage(record)
-                logger.info("Token usage pushed (%d tokens, project=%s)", record["total_tokens"], record.get("project_id"))
-            except Exception as e:
-                logger.debug(f"Token usage push failed (non-fatal): {e}")
+            for record in records:
+                try:
+                    self._platform_client.push_token_usage(record)
+                    logger.info("Token usage pushed (%d tokens, project=%s)", record["total_tokens"], record.get("project_id"))
+                except Exception as e:
+                    logger.debug(f"Token usage push failed (non-fatal): {e}")
 
         thread = threading.Thread(target=_post, daemon=True)
         thread.start()
