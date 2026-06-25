@@ -47,6 +47,7 @@ SLASH_COMMANDS = [
     ("/token set <token>", "Set developer token"),
     ("/token clear", "Clear developer token"),
     ("/model list", "List available models"),
-    ("/model switch <#>", "Switch to a model by index"),
+    ("/model enable <#>", "Enable a model by index (downloads if needed)"),
+    ("/model disable <#>", "Disable a model by index"),
     ("/help", "Show this help"),
 ]

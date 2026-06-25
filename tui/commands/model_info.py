@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 from rich.table import Table
 from textual import work
@@ -11,7 +9,6 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from smartloop.auth import credential_store
-from tui.constants import visible_model_name
 from tui.events import (
     BootstrapProgress,
     BootstrapStatus,
@@ -40,14 +37,20 @@ class ModelInfo:
         args = args.strip()
         if not args or args == "list":
             self._model_list()
-        elif args.startswith("switch "):
+        elif args.startswith("enable "):
             index_str = args[7:].strip()
             if index_str:
-                self._model_switch(index_str)
+                self._model_set_enabled(index_str, True)
             else:
-                self._append_system("Usage: /model switch <#>")
+                self._append_system("Usage: /model enable <#>")
+        elif args.startswith("disable "):
+            index_str = args[8:].strip()
+            if index_str:
+                self._model_set_enabled(index_str, False)
+            else:
+                self._append_system("Usage: /model disable <#>")
         else:
-            self._append_system("Usage: /model [list|switch <#>]")
+            self._append_system("Usage: /model [list|enable <#>|disable <#>]")
 
     @work(exclusive=True)
     async def _model_list(self) -> None:
@@ -59,11 +62,14 @@ class ModelInfo:
                 resp.raise_for_status()
                 models = resp.json()
 
-                current = ""
+                # Cross-reference workspace state: a model only counts as
+                # enabled when it's enabled *and* downloaded — the orchestrator
+                # can't use weights that aren't on disk.
+                ws_lookup: dict = {}
                 try:
-                    health = await client.get(f"{self.server_url}/health")
-                    if health.is_success:
-                        current = health.json().get("model_name") or ""
+                    ws_resp = await client.get(f"{self.server_url}/v1/models/workspace")
+                    if ws_resp.is_success:
+                        ws_lookup = {w.get("model_name"): w for w in ws_resp.json()}
                 except httpx.RequestError:
                     pass
 
@@ -76,17 +82,19 @@ class ModelInfo:
             table.add_column("Name")
             table.add_column("Description")
             table.add_column("Access")
-            table.add_column("Current")
+            table.add_column("Enabled")
             for i, m in enumerate(models, 1):
                 access = m.get("access_level") or ""
                 if not m.get("is_accessible", False):
                     access = f"{access} (locked)".strip()
+                ws = ws_lookup.get(m.get("name")) or {}
+                is_enabled = bool(ws.get("enabled") and ws.get("downloaded"))
                 table.add_row(
                     str(i),
                     m.get("name", ""),
                     (m.get("description") or "").strip(),
                     access,
-                    "yes" if m.get("name") == current else "",
+                    "yes" if is_enabled else "no",
                 )
             log = self.query_one("#chat-log", VerticalScroll)
             log.mount(Static(table, classes="system-msg"))
@@ -97,17 +105,19 @@ class ModelInfo:
             self._clear_loading()
 
     @work(exclusive=True)
-    async def _model_switch(self, index_str: str) -> None:
-        """Switch to a model by its index — init/download it, tracking SSE progress."""
+    async def _model_set_enabled(self, index_str: str, enabled: bool) -> None:
+        """Enable or disable a model by its index.
+
+        Enabled models are the ones the orchestrator is allowed to pick from
+        when running a task. Enabling a model that isn't on disk yet downloads
+        it first (tracking SSE progress); disabling just flips the flag.
+        """
+        action = "enable" if enabled else "disable"
         try:
             index = int(index_str)
         except ValueError:
-            self._append_system("Invalid index. Use /model list to see numbered models.")
+            self._append_system(f"Invalid index. Use /model list to see numbered models.")
             return
-
-        log = self.query_one("#chat-log", VerticalScroll)
-        download_label: Static | None = None
-        progress_widget: Static | None = None
 
         self._set_loading("Fetching models...")
         try:
@@ -123,13 +133,51 @@ class ModelInfo:
             model = models[index - 1]
             target = model.get("name", "")
 
-            payload: dict = {"model_name": target}
-            token = credential_store.get_token()
-            if token:
-                payload["developer_token"] = token
+            if enabled and not model.get("is_accessible", True):
+                self._append_system(f"{target} is not available on your plan.")
+                return
 
-            self._update_loading(f"Switching to {target}...")
+            # Enabling requires the model present locally — download if needed.
+            if enabled and not await self._ensure_model_downloaded(target):
+                return
 
+            self._update_loading(f"{'Enabling' if enabled else 'Disabling'} {target}...")
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.patch(
+                    f"{self.server_url}/v1/models/workspace/{target}",
+                    json={"enabled": enabled},
+                )
+            if resp.is_success:
+                self._append_system(f"{'Enabled' if enabled else 'Disabled'} model: {target}")
+            else:
+                detail = ""
+                try:
+                    detail = resp.json().get("detail", "")
+                except Exception:
+                    pass
+                self._append_system(f"Failed to {action} {target}{': ' + detail if detail else ''}")
+        except (httpx.RequestError, httpx.HTTPStatusError):
+            self._append_system("Request failed")
+        finally:
+            self._clear_loading()
+
+    async def _ensure_model_downloaded(self, target: str) -> bool:
+        """Download a model (no-op if already on disk) via the init SSE stream.
+
+        Returns True on success. The orchestrator base model stays loaded; this
+        only fetches/registers the target so it can be enabled.
+        """
+        log = self.query_one("#chat-log", VerticalScroll)
+        download_label: Static | None = None
+        progress_widget: Static | None = None
+
+        payload: dict = {"model_name": target}
+        token = credential_store.get_token()
+        if token:
+            payload["developer_token"] = token
+
+        self._update_loading(f"Preparing {target}...")
+        try:
             async with httpx.AsyncClient(timeout=1800) as client:
                 async with client.stream(
                     "POST",
@@ -143,8 +191,8 @@ class ModelInfo:
                             detail = response.json().get("detail", "")
                         except Exception:
                             pass
-                        self._append_system(f"Failed to switch model{': ' + detail if detail else ''}")
-                        return
+                        self._append_system(f"Failed to download {target}{': ' + detail if detail else ''}")
+                        return False
 
                     async for event in parse_bootstrap_sse(response):
                         match event:
@@ -177,57 +225,12 @@ class ModelInfo:
                                         download_label = None
                                 self._update_loading(msg or "Working...")
 
-                            case BootstrapComplete(model_name=mn, project=proj):
-                                if mn:
-                                    self.model_name = mn
-                                    self.sub_title = visible_model_name(mn)
-                                if proj:
-                                    self.project_id = proj.get("id")
-                                    pname = proj.get("name", "")
-                                    self.project_rules = proj.get("rules", "")
-                                    if pname:
-                                        self.title = pname
-
                             case BootstrapError(message=msg):
-                                self._append_system(f"Failed to switch model: {msg}")
-                                return
-
-            # Wait until the server reports the target model actually loaded
-            # before declaring success, so the first chat after a switch does
-            # not race the model load.
-            self._update_loading(f"Loading {target}...")
-            loaded_name = ""
-            model_ready = False
-            for _ in range(60):  # up to ~30s
-                try:
-                    async with httpx.AsyncClient(timeout=5) as client:
-                        health = await client.get(f"{self.server_url}/health")
-                    if health.is_success:
-                        h = health.json()
-                        loaded_name = h.get("model_name") or loaded_name
-                        if h.get("model_loaded") and loaded_name == target:
-                            model_ready = True
-                            break
-                except httpx.RequestError:
-                    pass
-                await asyncio.sleep(0.5)
-
-            if loaded_name:
-                self.model_name = loaded_name
-                self.sub_title = visible_model_name(loaded_name)
-            self._refresh_info_bar()
-            if model_ready:
-                self._append_system(f"Switched to model: {visible_model_name(self.model_name)}")
-            else:
-                self._append_system(
-                    f"Model {target} initialized but not ready yet — "
-                    "give it a moment before chatting."
-                )
-        except (httpx.RequestError, httpx.HTTPStatusError):
-            self._append_system("Request failed")
+                                self._append_system(f"Failed to download {target}: {msg}")
+                                return False
+            return True
         finally:
             if progress_widget is not None:
                 await progress_widget.remove()
             if download_label is not None:
                 await download_label.remove()
-            self._clear_loading()
