@@ -48,6 +48,10 @@ _OCR_MAX_TOKENS = 1536
 # 96 DPI uncapped) dominates the vision-encode time; 560 px keeps it under
 # ~200 patches while remaining legible for OCR.
 _OCR_MAX_PIXELS = 560
+# If the largest image on a page covers more than this fraction of the page
+# area, treat the page as a scan even when an embedded text layer exists
+# (the text layer is often garbage from a prior OCR pass).
+_SCAN_IMAGE_COVERAGE = 0.80
 
 
 class _VisionChatCompletions:
@@ -181,7 +185,12 @@ class DocumentParser(BaseParser):
         min_chars = AppSettings().vision_ocr_min_chars_per_page
         try:
             page_texts = [page.get_text("text").strip() for page in doc]
-            sparse = [i for i, t in enumerate(page_texts) if len(t) < min_chars]
+            sparse = []
+            for i, t in enumerate(page_texts):
+                if len(t) < min_chars:
+                    sparse.append(i)
+                elif self._page_is_scan(doc[i]):
+                    sparse.append(i)
 
             if not sparse:
                 return "\n\n".join(t for t in page_texts if t).strip()
@@ -209,6 +218,24 @@ class DocumentParser(BaseParser):
             return "\n\n".join(p for p in parts if p).strip()
         finally:
             doc.close()
+
+    @staticmethod
+    def _page_is_scan(page) -> bool:
+        """True when the page is dominated by a single image (scanned page).
+
+        Scanned PDFs often carry a low-quality embedded OCR text layer that
+        passes the character-count threshold but produces garbage.  Detecting
+        the full-page image lets us route these pages through vision OCR.
+        """
+        page_area = page.rect.width * page.rect.height
+        if page_area <= 0:
+            return False
+        for img in page.get_image_info():
+            bbox = img["bbox"]
+            img_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            if img_area / page_area >= _SCAN_IMAGE_COVERAGE:
+                return True
+        return False
 
     @staticmethod
     def _ocr_page(page, client, model: str, logger: logging.Logger) -> str:
