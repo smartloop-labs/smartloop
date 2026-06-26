@@ -14,10 +14,9 @@ from pydantic import BaseModel, Field
 
 from smartloop.api.config import api_settings
 from smartloop.api.services import ModelService, get_model_service
-from smartloop.auth import credential_store
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.config.model_config import ModelConfig
-from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress, HFDownloader
+from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
 from smartloop.platform import auth as platform_auth
 
 logger = logging.getLogger(__name__)
@@ -31,7 +30,6 @@ class InitRequest(BaseModel):
     """Request body for workspace initialization."""
     model_name: Optional[str] = Field(default=None, description="Model to initialize")
     developer_token: Optional[str] = Field(default=None, description="Developer token for model download")
-    hf_token: Optional[str] = Field(default=None, description="Hugging Face token for model download (if required)")
     cwd: Optional[str] = Field(default=None, description="Working directory for the default project; defaults to ~/smartloop/<name> when omitted")
 
 
@@ -170,8 +168,7 @@ async def init(
 ):
     """Initialize the workspace and download the model.
 
-    Downloads GGUF directly. When an HF token is provided, downloads the
-    full model (safetensors, tokenizer, etc.) and builds the GGUF.
+    Downloads the GGUF via the Smartloop artifact endpoints.
     Returns a streaming SSE response with real-time download progress.
     """
     workspace = model_service._ensure_workspace()
@@ -190,7 +187,7 @@ async def init(
     model_dir = ws_model.model_dir or ""
     needs_download = not _gguf_exists(model_dir)
 
-    if needs_download and not (platform_auth.has_credentials() or request.hf_token):
+    if needs_download and not platform_auth.has_credentials():
         raise HTTPException(
             status_code=400,
             detail="Authentication required for model download. "
@@ -199,17 +196,8 @@ async def init(
 
     async def event_stream():
         try:
-            # 1. Download + build if needed
-            # When an HF token is provided, ensure safetensors are downloaded
-            # (even if a GGUF already exists) so the model can be trained/built later.
-            if request.hf_token:
-                downloader = HFDownloader(workspace, logger)
-                async for event in _download_and_stream(downloader, ws_model.model_id, target):
-                    yield event
-
-                ws_model.downloaded = True
-                model_service._model.save()
-            elif _gguf_exists(model_dir):
+            # 1. Download if needed
+            if _gguf_exists(model_dir):
                 yield _sse_event({"status": "model_ready", "message": f"Model {target} already available."})
                 if not ws_model.downloaded:
                     ws_model.downloaded = True
