@@ -317,25 +317,43 @@ async def health_check():
     except Exception:
         pass
 
-    # Memory pressure: orchestrator process footprint vs device memory.
-    # On CUDA the models live in VRAM (not process RSS), so use the GPU's
-    # own used/total.  On MPS and CPU, mmap'd GGUF weights are reflected
-    # in process RSS, so RSS / total is accurate.
+    # Memory pressure: estimate total footprint of all enabled models that the
+    # orchestrator could load vs device memory.  This tells the desktop app
+    # whether the full model set fits before anything is actually loaded.
     try:
+        total_model_bytes = 0
+        workspace = Workspace.get_instance()
+        if workspace:
+            for m in workspace.models:
+                if not (m.enabled and m.downloaded):
+                    continue
+                try:
+                    model_dir = workspace.model_dir_for(m.model_id)
+                    gguf, mmproj = model_service._find_model_ggufs(model_dir)
+                    if gguf:
+                        total_model_bytes += os.path.getsize(gguf)
+                    if mmproj:
+                        total_model_bytes += os.path.getsize(mmproj)
+                except OSError:
+                    pass
+
+        process = psutil.Process()
+        mem_rss = process.memory_info().rss
+        overhead = max(mem_rss - total_model_bytes, 0)
+        estimated_total = total_model_bytes + overhead
+
         cuda_mem = False
         try:
             import torch
             if torch.cuda.is_available():
-                free_b, total_b = torch.cuda.mem_get_info()
-                result["memory_percent"] = int((total_b - free_b) / total_b * 100)
+                _, total_b = torch.cuda.mem_get_info()
+                result["memory_percent"] = int(estimated_total / total_b * 100)
                 cuda_mem = True
         except Exception:
             pass
         if not cuda_mem:
-            process = psutil.Process()
-            mem_rss = process.memory_info().rss
             mem_total = psutil.virtual_memory().total
-            result["memory_percent"] = int(mem_rss / mem_total * 100)
+            result["memory_percent"] = int(estimated_total / mem_total * 100)
     except Exception:
         pass
 
