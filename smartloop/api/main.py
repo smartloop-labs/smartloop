@@ -317,12 +317,25 @@ async def health_check():
     except Exception:
         pass
 
-    # Memory pressure: server process RSS vs total system memory
+    # Memory pressure: orchestrator process footprint vs device memory.
+    # On CUDA the models live in VRAM (not process RSS), so use the GPU's
+    # own used/total.  On MPS and CPU, mmap'd GGUF weights are reflected
+    # in process RSS, so RSS / total is accurate.
     try:
-        process = psutil.Process()
-        mem_rss = process.memory_info().rss
-        mem_total = psutil.virtual_memory().total
-        result["memory_percent"] = int(mem_rss / mem_total * 100)
+        cuda_mem = False
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_b, total_b = torch.cuda.mem_get_info()
+                result["memory_percent"] = int((total_b - free_b) / total_b * 100)
+                cuda_mem = True
+        except Exception:
+            pass
+        if not cuda_mem:
+            process = psutil.Process()
+            mem_rss = process.memory_info().rss
+            mem_total = psutil.virtual_memory().total
+            result["memory_percent"] = int(mem_rss / mem_total * 100)
     except Exception:
         pass
 
