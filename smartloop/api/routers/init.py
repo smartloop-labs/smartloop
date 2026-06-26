@@ -184,7 +184,7 @@ async def init(
         if hasattr(model_cls, 'default_capabilities') and not ws_model.capabilities:
             ws_model.capabilities = model_cls.default_capabilities()
 
-    model_dir = ws_model.model_dir or ""
+    model_dir = ws_model.model_dir
     needs_download = not _gguf_exists(model_dir)
 
     if needs_download and not platform_auth.has_credentials():
