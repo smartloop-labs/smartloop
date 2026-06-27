@@ -15,4 +15,4 @@ class GemmaItTextModel(GenericModel):
 
     @staticmethod
     def model_id() -> str:
-        return "google/gemma-3-1b-it"
+        return "smartloop-ai/slp-orchestra-mini"

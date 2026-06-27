@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import threading
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Set, List
@@ -17,15 +16,10 @@ from smartloop.config.app_settings import AppSettings
 
 _settings = AppSettings()
 
-
 def _is_mmproj_gguf(filename: str) -> bool:
     """True when a GGUF is a vision mmproj / CLIP projector (not main weights)."""
     name = os.path.basename(filename).lower()
     return "mmproj" in name or "clip" in name
-
-
-if TYPE_CHECKING:
-    from smartloop.model import SLPModel
 
 class DocumentStatus(Enum):
     PENDING = "pending"
@@ -341,24 +335,21 @@ class Workspace(BaseModel):
 
     def get_model(self, model_name: Optional[str] = None) -> Optional[WorkspaceModel]:
         """Look up a registered model by its short name.
-
         If *model_name* is ``None``, returns the default model.
         """
+        from smartloop.config.supported_models import SUPPORTED_MODELS
+        
         result = None
         if model_name is None:
-            from smartloop.config.app_settings import AppSettings
             model_name = AppSettings().default_model
-        # Resolve backward-compatibility aliases (e.g. the old "gemma3-1b"
-        # bootstrap name) so lookups match regardless of which name a config or
-        # an existing workspace.json recorded.
-        from smartloop.config.supported_models import canonical_model_name
-        target = canonical_model_name(model_name)
+        model_name = SUPPORTED_MODELS.get(model_name)
         for m in self.models:
-            if canonical_model_name(m.model_name) == target:
+            if SUPPORTED_MODELS.get(m.model_name) == model_name:
                 result = m
                 break
         if result is not None:
             result.models_dir = self.models_dir
+        
         return result
 
     def add_model(self, model_name: str, model_id: str, config: Optional[ModelConfig] = None) -> WorkspaceModel:
