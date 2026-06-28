@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.config.app_settings import AppSettings
-from smartloop.platform.client import SLPPlatformClient
+from smartloop.platform import PlatformService, get_platform_service
 
 try:
     from smartloop.trainer import BuildProgress, TrainingProgress
@@ -183,6 +183,7 @@ class ModelEntry(BaseModel):
     description: str | None = None
     access_level: str | None = None
     is_accessible: bool = False
+    sha256: str | None = None
     enabled: bool = True
     capabilities: list[str] = []
 
@@ -190,13 +191,11 @@ class ModelEntry(BaseModel):
 @router.get("/models", response_model=list[ModelEntry])
 async def list_models(
     model_service: ModelService = Depends(get_model_service),
+    svc: PlatformService = Depends(get_platform_service),
 ):
-    """List available models from the cloud API, enriched with workspace state."""
-    settings = AppSettings()
-    client = SLPPlatformClient(settings.slp_api_base)
-
+    """List available models from the cloud API (cached locally), enriched with workspace state."""
     try:
-        models = client.list_models()
+        models = svc.list_models()
     except ConnectionError:
         raise HTTPException(status_code=502, detail="Platform API unavailable")
 
@@ -206,6 +205,7 @@ async def list_models(
     except Exception:
         ws_lookup = {}
 
+    settings = AppSettings()
     bootstrap_model = settings.default_model
 
     result = []
