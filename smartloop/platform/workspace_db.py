@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     description   TEXT,
     access_level  TEXT,
     is_accessible INTEGER NOT NULL DEFAULT 0,
+    sha256        TEXT,
     fetched_at    REAL NOT NULL
 );
 """
@@ -132,6 +133,7 @@ class WorkspaceDB:
                 "description": r["description"],
                 "access_level": r["access_level"],
                 "is_accessible": bool(r["is_accessible"]),
+                "sha256": r["sha256"],
             }
             for r in rows
         ]
@@ -143,8 +145,8 @@ class WorkspaceDB:
             self._conn.execute("DELETE FROM model_catalog")
             self._conn.executemany(
                 """INSERT INTO model_catalog
-                       (model_id, name, size, description, access_level, is_accessible, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                       (model_id, name, size, description, access_level, is_accessible, sha256, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -154,6 +156,7 @@ class WorkspaceDB:
                         m.get("description"),
                         m.get("access_level"),
                         int(m.get("is_accessible", False)),
+                        m.get("sha256"),
                         now,
                     )
                     for m in models

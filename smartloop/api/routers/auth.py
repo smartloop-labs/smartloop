@@ -17,6 +17,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from smartloop.auth import credential_store
+from smartloop.platform import get_platform_service
 from smartloop.platform.client import SLPPlatformClient
 from smartloop.config.app_settings import AppSettings
 
@@ -60,6 +61,41 @@ class AuthStatusResponse(BaseModel):
 
 
 # -- endpoints ----------------------------------------------------------------
+
+
+_last_refreshed_token: Optional[str] = None
+
+
+def _refresh_platform_cache(refresh_user: bool = True) -> None:
+    """Force-refresh the cached model catalog (and optionally the user) on an
+    auth change.
+
+    The catalog always refreshes so each model's ``is_accessible`` — which the
+    cloud computes on the fly per-user — reflects the current auth state instead
+    of a stale entry. On logout pass ``refresh_user=False``: the cached user
+    profile is intentionally left in place (stale is fine; already-downloaded
+    models stay usable), and we avoid a pointless 401 round-trip.
+
+    Best-effort and independent: a failed user fetch doesn't block the catalog
+    refresh. A single login delivers the token redundantly (POST + Safari GET
+    fallback, plus retries), so we dedupe on the credential value — only a
+    genuine change triggers a refetch.
+    """
+    global _last_refreshed_token
+    token = credential_store.get_access_token() or credential_store.get_token()
+    if token and token == _last_refreshed_token:
+        return
+    svc = get_platform_service()
+    if refresh_user:
+        try:
+            svc.get_current_user(force=True)
+        except Exception:
+            logger.warning("Failed to refresh cached user", exc_info=True)
+    try:
+        svc.list_models(force=True)
+    except Exception:
+        logger.warning("Failed to refresh cached model catalog", exc_info=True)
+    _last_refreshed_token = token
 
 
 def _resolve_user() -> Optional[UserInfo]:
@@ -127,6 +163,7 @@ async def set_token(request: TokenSetRequest):
         credential_store.set_access_token(request.token)
         logger.info("Access token updated via /v1/auth/token")
 
+    _refresh_platform_cache()
     return await auth_status()
 
 
@@ -151,6 +188,10 @@ async def clear_token(
         credential_store.clear_refresh_token()
         logger.info("Access/refresh tokens cleared via /v1/auth/token")
 
+    # Refresh the catalog (now anonymous) so model is_accessible reflects the
+    # logout. Keep the cached user profile as-is — stale is acceptable and
+    # already-downloaded models remain usable.
+    _refresh_platform_cache(refresh_user=False)
     return await auth_status()
 
 
@@ -178,6 +219,7 @@ async def oauth_callback(request: OAuthCallbackRequest):
         credential_store.set_refresh_token(request.refresh_token)
 
     _log_token_received("POST", request.access_token, request.refresh_token)
+    _refresh_platform_cache()
     return await auth_status()
 
 
@@ -208,4 +250,5 @@ async def oauth_callback_get(
         credential_store.set_refresh_token(refresh_token)
 
     _log_token_received("GET", access_token, refresh_token)
+    _refresh_platform_cache()
     return RedirectResponse(url=f"{APP_URL}/redirect/?mode=desktop")

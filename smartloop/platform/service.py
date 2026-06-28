@@ -28,19 +28,24 @@ def _fetch_or_cache(
     get_timestamp: Callable[[], Optional[float]],
     fetch_remote: Callable[[], T],
     save_cache: Callable[[T], None],
+    force: bool = False,
 ) -> T:
     """Try cloud first, fall back to cache on connection error.
 
     If a fresh cache entry exists (within *ttl*), return it without
     hitting the cloud.  Otherwise fetch from cloud, update cache, and
     return.  On ``ConnectionError``, return stale cache if available.
+
+    When *force* is True, the TTL short-circuit is skipped and the cloud
+    is always queried (used to refresh per-user state on login).
     """
     # Check if cache is fresh enough
-    ts = get_timestamp()
-    if ts is not None and (time.time() - ts) < ttl:
-        cached = get_cached()
-        if cached is not None:
-            return cached
+    if not force:
+        ts = get_timestamp()
+        if ts is not None and (time.time() - ts) < ttl:
+            cached = get_cached()
+            if cached is not None:
+                return cached
 
     # Try cloud
     try:
@@ -77,7 +82,7 @@ class PlatformService:
         self._client = client
         self._db = db
 
-    def get_current_user(self) -> dict:
+    def get_current_user(self, force: bool = False) -> dict:
         """Return the current user's profile (cached or fresh)."""
         if self._db is None:
             return self._client.get_current_user()
@@ -87,6 +92,7 @@ class PlatformService:
             get_timestamp=self._db.user_fetched_at,
             fetch_remote=self._client.get_current_user,
             save_cache=self._db.save_user,
+            force=force,
         )
 
     def update_current_user(self, payload: dict) -> dict:
@@ -99,7 +105,7 @@ class PlatformService:
                 logger.warning("Failed to cache user update", exc_info=True)
         return data
 
-    def list_models(self) -> list[dict]:
+    def list_models(self, force: bool = False) -> list[dict]:
         """Return the model catalog (cached or fresh)."""
         if self._db is None:
             return self._client.list_models()
@@ -109,4 +115,5 @@ class PlatformService:
             get_timestamp=self._db.models_fetched_at,
             fetch_remote=self._client.list_models,
             save_cache=self._db.save_models,
+            force=force,
         )

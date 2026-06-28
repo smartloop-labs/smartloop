@@ -183,6 +183,7 @@ class ModelEntry(BaseModel):
     description: str | None = None
     access_level: str | None = None
     is_accessible: bool = False
+    sha256: str | None = None
     enabled: bool = True
     capabilities: list[str] = []
 
