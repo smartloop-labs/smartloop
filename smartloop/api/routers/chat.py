@@ -61,8 +61,9 @@ def format_messages_to_prompt(
 
     When *context* is provided (pre-formatted by the orchestrator), it is
     injected into the first user message as-is.  When no orchestrator context
-    is available, lightweight auxiliary context (cwd, project_info) is
-    injected instead.
+    is available the message is sent without auxiliary context so the model
+    answers from its own knowledge rather than mistaking directory listings
+    or project metadata for a restrictive knowledge base.
     """
     prompt_parts = []
 
@@ -85,16 +86,6 @@ def format_messages_to_prompt(
             if not context_injected:
                 if context:
                     user_parts.append(context)
-                else:
-                    if cwd:
-                        try:
-                            entries = sorted(os.listdir(cwd))[:50]
-                            listing = "\n".join(f"  {e}" for e in entries)
-                            user_parts.append(f"WORKING DIRECTORY ({cwd}):\n{listing}")
-                        except Exception:
-                            pass
-                    if project_info:
-                        user_parts.append(f"PROJECT INFO:\n{project_info}")
                 context_injected = True
 
             if msg.content:
