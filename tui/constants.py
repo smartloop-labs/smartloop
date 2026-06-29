@@ -1,7 +1,5 @@
 """tui/constants.py — Slash command registry (single source of truth)."""
 
-from smartloop.config import canonical_model_name
-
 VISIBLE_NAMES = {
     "slp-orchestra-mini": "SLP orchestra mini",
     "gemma3-4b": "Gemma 3 4B",
@@ -12,7 +10,7 @@ VISIBLE_NAMES = {
 
 def visible_model_name(key: str) -> str:
     """Return the human-readable display name for a model key."""
-    return VISIBLE_NAMES.get(canonical_model_name(key), key)
+    return VISIBLE_NAMES.get(key, key)
 
 
 LOADING_MESSAGES = [
