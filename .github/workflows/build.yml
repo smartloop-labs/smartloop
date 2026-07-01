@@ -191,6 +191,10 @@ jobs:
 
   build-windows:
     runs-on: windows-2022
+    # Scopes the Azure OIDC token to a stable subject
+    # (repo:smartloop-ai/smartloop:environment:release) so a single Trusted
+    # Signing federated credential covers both tag-push and manual dispatch runs.
+    environment: release
     defaults:
       run:
         shell: bash
@@ -290,6 +294,43 @@ jobs:
             ls "$LIBDIR"/${pat}_*.dll >/dev/null 2>&1 || { echo "FAIL: ${pat}_*.dll not bundled next to ggml-cuda.dll"; exit 1; }
           done
           echo "OK: slp $VER, GPU bindings present, CUDA runtime bundled."
+
+      # Authenticode-sign before archiving so the zip and its checksum cover the
+      # signed binaries. This is the Windows counterpart of the macOS sign +
+      # notarize steps: an unsigned slp.exe has no reputation and is blocked by
+      # Smart App Control / WDAC (Application Control). Azure Trusted Signing is
+      # a Microsoft-operated CA, so signed binaries are trusted immediately.
+      # Auth is OIDC (federated) via the job's `id-token: write` — no secrets.
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign binaries (Authenticode)
+        uses: azure/trusted-signing-action@v0.5.9
+        with:
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          # Sign slp.exe and every bundled DLL so a publisher-based WDAC policy
+          # that validates loaded modules is satisfied, not just the launcher.
+          files-folder: dist/slp
+          files-folder-filter: exe,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist/slp/slp.exe
+          Write-Host "slp.exe: $($sig.Status) - $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') {
+            throw "slp.exe signature is $($sig.Status), expected Valid"
+          }
 
       - name: Archive
         run: make archive-zip
