@@ -8,7 +8,6 @@ from textual import work
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
-from smartloop.auth import credential_store
 from tui.events import (
     BootstrapProgress,
     BootstrapStatus,
@@ -172,9 +171,6 @@ class ModelInfo:
         progress_widget: Static | None = None
 
         payload: dict = {"model_name": target}
-        token = credential_store.get_token()
-        if token:
-            payload["developer_token"] = token
 
         self._update_loading(f"Preparing {target}...")
         try:
