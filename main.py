@@ -749,8 +749,6 @@ def main():
                         help="Resume a previous conversation by session ID")
     parser.add_argument("-C", "--path", default=None, metavar="PATH",
                         help="Working directory to use (defaults to ~/smartloop or ~/smartloop/<project>)")
-    parser.add_argument("-t", "--developer-token", default=None, metavar="TOKEN",
-                        help="Developer token to authenticate this run (stored via the local API)")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # Run command
@@ -761,8 +759,6 @@ def main():
     run_parser.add_argument("--port", "-p", type=int, help="API server port (default: $SLP_API_PORT or 38540)")
     run_parser.add_argument("--resume", metavar="CONVERSATION_ID", default=None,
                            help="Resume a previous conversation by session ID")
-    run_parser.add_argument("-t", "--developer-token", default=None, metavar="TOKEN",
-                           help="Developer token to authenticate this run (stored via the local API)")
 
     # Status command
     subparsers.add_parser("status", help="Show project status")
@@ -829,12 +825,6 @@ def main():
     project_name = getattr(args, "project_name", None) or os.environ.get("SLP_PROJECT_NAME")
     host = getattr(args, "host", None) or os.environ.get("SLP_API_HOST", "127.0.0.1")
     port = getattr(args, "port", None) or settings.api_port
-
-    # -t/--developer-token authenticates this run by persisting the token via the API.
-    cli_token = (getattr(args, "developer_token", None) or "").strip()
-    if cli_token:
-        if not _post_developer_token(host, port, cli_token):
-            return
 
     # Project working directory
     if args.path:
