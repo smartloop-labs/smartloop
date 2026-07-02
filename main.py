@@ -24,7 +24,6 @@ from requests.exceptions import RequestException
 from rich.console import Console
 
 from version import __version__
-from smartloop.auth import credential_store
 from smartloop.config import AppSettings
 from smartloop.constants import SLP_PRIMARY
 from smartloop.server import (
@@ -142,6 +141,20 @@ def _require_server(host: str, port: int) -> bool:
         logger.error(f"Failed to start agent: {e}")
         return False
 
+def _post_developer_token(host: str, port: int, token: str) -> bool:
+    """Ensure a server is running and persist the developer token via /v1/auth/token."""
+    if not _require_server(host, port):
+        return False
+    try:
+        resp = requests.post(
+            f"{_base_url(host, port)}/v1/auth/token", json={"token": token}, timeout=10
+        )
+        resp.raise_for_status()
+    except RequestException as e:
+        console.print(f"[red]Failed to save token:[/red] {e}")
+        return False
+    return True
+
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
@@ -251,8 +264,12 @@ def cmd_agent(args, host: str, port: int) -> None:
         start_server(host, port, service=not getattr(args, "no_service", False))
 
 
-def cmd_token(args) -> None:
+def cmd_token(args, host: str, port: int) -> None:
     sub = args.token_command
+    # Credential writes go through the local API so it stays the single source
+    # of truth and force-refreshes the cached model catalog (per-user
+    # ``is_accessible``). Writing the credential store directly here would leave
+    # the catalog stale and pro models showing as locked.
     if sub == "set":
         t = getattr(args, "token_value", None)
         if not t:
@@ -261,22 +278,42 @@ def cmd_token(args) -> None:
                 "[dim]Get one at[/dim] [bold]https://app.smartloop.ai/developer[/bold]"
             )
             t = prompt("Token: ")
-        if t.strip():
-            credential_store.set_token(t.strip())
-            masked = t[:8] + "..." + t[-3:] if len(t) > 14 else "***"
-            console.print(f"[green]Token saved:[/green] {masked}")
-        else:
+        t = (t or "").strip()
+        if not t:
             console.print("[yellow]No token provided.[/yellow]")
+            return
+        if not _post_developer_token(host, port, t):
+            return
+        masked = t[:8] + "..." + t[-3:] if len(t) > 14 else "***"
+        console.print(f"[green]Token saved:[/green] {masked}")
     elif sub == "clear":
-        credential_store.clear_token()
-        credential_store.clear_access_token()
-        credential_store.clear_refresh_token()
+        if not _require_server(host, port):
+            return
+        try:
+            resp = requests.delete(f"{_base_url(host, port)}/v1/auth/token", timeout=10)
+            resp.raise_for_status()
+        except RequestException as e:
+            console.print(f"[red]Failed to clear tokens:[/red] {e}")
+            return
         console.print("[green]All tokens removed.[/green]")
     else:
-        t = credential_store.get_token()
-        if t:
-            masked = t[:8] + "..." + t[-3:] if len(t) > 14 else "***"
-            console.print(f"[green]Token:[/green] {masked}")
+        if not _require_server(host, port):
+            return
+        try:
+            resp = requests.get(f"{_base_url(host, port)}/v1/auth/status", timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except RequestException as e:
+            console.print(f"[red]Failed to read auth status:[/red] {e}")
+            return
+        if data.get("authenticated"):
+            method = data.get("method") or "unknown"
+            user = data.get("user") or {}
+            who = user.get("email") or user.get("name")
+            line = f"[green]Authenticated[/green] via {method}"
+            if who:
+                line += f" as {who}"
+            console.print(line)
         else:
             console.print(
                 "[dim]No token set. Use [bold]slp token set[/bold] to add one.[/dim]\n"
@@ -712,6 +749,8 @@ def main():
                         help="Resume a previous conversation by session ID")
     parser.add_argument("-C", "--path", default=None, metavar="PATH",
                         help="Working directory to use (defaults to ~/smartloop or ~/smartloop/<project>)")
+    parser.add_argument("-t", "--developer-token", default=None, metavar="TOKEN",
+                        help="Developer token to authenticate this run (stored via the local API)")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # Run command
@@ -722,6 +761,8 @@ def main():
     run_parser.add_argument("--port", "-p", type=int, help="API server port (default: $SLP_API_PORT or 38540)")
     run_parser.add_argument("--resume", metavar="CONVERSATION_ID", default=None,
                            help="Resume a previous conversation by session ID")
+    run_parser.add_argument("-t", "--developer-token", default=None, metavar="TOKEN",
+                           help="Developer token to authenticate this run (stored via the local API)")
 
     # Status command
     subparsers.add_parser("status", help="Show project status")
@@ -783,18 +824,17 @@ def main():
 
     args = parser.parse_args()
 
-    # Persist -t token to keychain so it's available to all consumers
-    cli_token = getattr(args, "developer_token", None)
-    if cli_token:
-        credential_store.set_token(cli_token)
-
-    developer_token = cli_token or os.environ.get("SLP_DEVELOPER_TOKEN")
-
     # Resolve configuration
     model_name = getattr(args, "model", None) or os.environ.get("SLP_BASE_MODEL_NAME")
     project_name = getattr(args, "project_name", None) or os.environ.get("SLP_PROJECT_NAME")
     host = getattr(args, "host", None) or os.environ.get("SLP_API_HOST", "127.0.0.1")
     port = getattr(args, "port", None) or settings.api_port
+
+    # -t/--developer-token authenticates this run by persisting the token via the API.
+    cli_token = (getattr(args, "developer_token", None) or "").strip()
+    if cli_token:
+        if not _post_developer_token(host, port, cli_token):
+            return
 
     # Project working directory
     if args.path:
@@ -816,7 +856,7 @@ def main():
     elif args.command == "status":
         cmd_status(host, port)
     elif args.command == "token":
-        cmd_token(args)
+        cmd_token(args, host, port)
     elif args.command == "skill":
         cmd_skill(args, host, port)
     elif args.command == "mcp":
