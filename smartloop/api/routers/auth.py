@@ -18,7 +18,6 @@ from pydantic import BaseModel, Field
 
 from smartloop.auth import credential_store
 from smartloop.platform import get_platform_service
-from smartloop.platform.client import SLPPlatformClient
 from smartloop.config.app_settings import AppSettings
 
 logger = logging.getLogger(__name__)
@@ -99,11 +98,13 @@ def _refresh_platform_cache(refresh_user: bool = True) -> None:
 
 
 def _resolve_user() -> Optional[UserInfo]:
-    """Call /v1/users/me to get the logged-in user profile. Returns None on failure."""
+    """Return the logged-in user's profile. Returns None on failure.
+
+    Resolves the user through the platform service layer so the cached
+    user info is used instead of an uncached client call.
+    """
     try:
-        settings = AppSettings()
-        client = SLPPlatformClient(settings.slp_api_base)
-        data = client.get_current_user()
+        data = get_platform_service().get_current_user()
         return UserInfo(email=data["email"], name=data.get("name"))
     except PermissionError:
         # 401 — access token is expired or revoked; clear it so we
