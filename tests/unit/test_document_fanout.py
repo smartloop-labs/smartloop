@@ -118,13 +118,20 @@ class TestRouteFanout:
         assert len(reduce_nodes) >= 1
         assert isinstance(captured["parent"], TransformNode)
 
-    def test_no_fanout_for_single_document(self):
+    def test_single_document_uses_one_batch_node(self):
+        # DOC_FANOUT_THRESHOLD = 1: even a single document goes through the
+        # same map-reduce structure so every retrieved document is processed
+        # by its own DAG node.  With one doc that's one batch + one reduce.
         orch = _make_orchestrator()
         sctx = SearchContext(vector_context="raw", documents=_docs(1))
         nodes, captured = self._route(orch, sctx)
 
-        assert not any(isinstance(n, LLMDecisionNode) for n in nodes.values())
-        assert isinstance(captured["parent"], RouteNode)
+        batch_nodes = [n for n in nodes.values() if isinstance(n, LLMDecisionNode)]
+        reduce_nodes = [n for n in nodes.values() if isinstance(n, TransformNode)]
+
+        assert len(batch_nodes) == 1
+        assert len(reduce_nodes) >= 1
+        assert isinstance(captured["parent"], TransformNode)
 
     def test_no_fanout_when_no_documents(self):
         orch = _make_orchestrator()

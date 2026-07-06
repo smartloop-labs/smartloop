@@ -116,6 +116,10 @@ class SLPOrchestrator:
                     llm = self._capability_llm_provider(capability)
                     if llm is not None:
                         self._capability_cache[capability] = llm
+                        logger.info(
+                            "[models] capability '%s' → %s",
+                            capability, self._model_label(llm),
+                        )
                         return llm
                 except Exception as e:
                     logger.warning("[models] capability model load failed (%s): %s", capability, e)
@@ -128,7 +132,13 @@ class SLPOrchestrator:
                 except Exception as e:
                     logger.warning("[models] large model load failed: %s", e)
                     self.large_llm = None
-            return self.large_llm or self.agent_llm
+            fallback = self.large_llm or self.agent_llm
+            if capability:
+                logger.warning(
+                    "[models] capability '%s' unresolved — falling back to %s",
+                    capability, self._model_label(fallback),
+                )
+            return fallback
         return self.agent_llm
 
     @staticmethod
@@ -826,6 +836,7 @@ class SLPOrchestrator:
             cwd=ctx.effective_cwd,
             available_capabilities=ctx.available_capabilities or None,
         )
+        _pre_promotion_intent = classification.intent
 
         if classification.intent == IntentType.CONVERSATION:
             has_matched_context = bool(
@@ -841,6 +852,19 @@ class SLPOrchestrator:
                 classification.reasoning = (
                     f"indexed context available ({', '.join(sources)}) — exploring"
                 )
+        elif classification.intent == IntentType.EXPLORE:
+            # Small classifier LLM often hallucinates EXPLORE for plain
+            # question queries.  If there's nothing indexed to explore,
+            # treat it as conversation — otherwise we'd waste a search
+            # step and route the answer through the small model.
+            has_something_to_explore = bool(
+                vector_context or search_ctx.skill_tool_results
+            )
+            if not has_something_to_explore:
+                classification.intent = IntentType.CONVERSATION
+                classification.reasoning = (
+                    "no indexed context to explore — treating as conversation"
+                )
 
         if classification.detected_urls and classification.intent == IntentType.CONVERSATION:
             classification.intent = IntentType.TOOL_CALL
@@ -850,9 +874,13 @@ class SLPOrchestrator:
             f"[classify] {classification.intent.value}: "
             f"{classification.reasoning}"
         )
-
-        if classification.intent == IntentType.CONVERSATION:
-            return []
+        if classification.intent != _pre_promotion_intent:
+            logger.info(
+                "[classify] intent adjusted %s → %s (%s)",
+                _pre_promotion_intent.value,
+                classification.intent.value,
+                classification.reasoning,
+            )
 
         plan_context = self.planner.build_context(
             ctx.user_message, ctx.available_servers,
@@ -878,6 +906,10 @@ class SLPOrchestrator:
 
         detected_capability = classification.capability
         for step in plan.steps:
+            # Planner-emitted CONVERSATIONAL steps carry their own tier +
+            # capability (LARGE / knowledge) — don't clobber them.
+            if step.step_type == StepType.CONVERSATIONAL and step.capability:
+                continue
             if has_skill and step.step_type == StepType.TOOL:
                 step.model_tier = ModelTier.LARGE
                 step.capability = detected_capability or "skills"
@@ -2350,7 +2382,9 @@ Is this context relevant to the user's request?
             return None
 
         # -- CONVERSATIONAL --
-        # Collect raw context; the final streaming LLM produces the response.
+        # When a capability model was resolved, generate the response here
+        # so the router can stream the final content directly.  Otherwise
+        # fall back to collecting raw context for the router's LLM.
         if step_type == StepType.CONVERSATIONAL:
             parts: List[str] = []
             if previous_results:
@@ -2361,6 +2395,28 @@ Is this context relevant to the user's request?
             if directive:
                 parts.append(directive)
             raw = "\n\n".join(parts) if parts else directive
+
+            if llm is not None and step.capability:
+                from smartloop.constants import SYSTEM_PROMPT
+                from datetime import date as _date
+                system = SYSTEM_PROMPT.format(
+                    current_date=_date.today().strftime("%B %d, %Y"),
+                )
+                prompt = f"<system>{system}</system><user>{raw}</user>"
+                try:
+                    response = str(llm.invoke(prompt)).strip()
+                    if response:
+                        logger.info(
+                            f"[step] conversational generated {len(response)} chars "
+                            f"via capability={step.capability}"
+                        )
+                        return response, response
+                except Exception as e:
+                    logger.warning(
+                        f"[step] conversational LLM invoke failed: {e} — "
+                        f"falling back to raw context"
+                    )
+
             logger.info(f"[step] conversational collected {len(raw)} chars of raw context")
             return raw, raw
 

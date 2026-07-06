@@ -180,9 +180,18 @@ class WorkspaceModel(BaseModel):
 
     @property
     def effective_capabilities(self) -> List[str]:
-        """Return capabilities: user-set if present, otherwise inferred from model metadata."""
-        if self.capabilities:
-            return self.capabilities
+        """Return capabilities declared by the model class — read-only.
+
+        The stored ``capabilities`` field is ignored so class defaults
+        stay authoritative and updates to any model's capabilities take
+        effect immediately on next request (no per-install migration).
+        Models without a ``SUPPORTED_MODELS`` entry fall back to
+        metadata-inferred capabilities.
+        """
+        from smartloop.config.supported_models import SUPPORTED_MODELS
+        model_cls = SUPPORTED_MODELS.get(self.model_name)
+        if model_cls and hasattr(model_cls, "default_capabilities"):
+            return list(model_cls.default_capabilities())
         return self._infer_capabilities()
 
     def _infer_capabilities(self) -> List[str]:
@@ -203,6 +212,7 @@ class WorkspaceModel(BaseModel):
             caps.append("vision")
 
         if size >= 3:
+            caps.append("knowledge")
             caps.append("skills")
             caps.append("dp")
 

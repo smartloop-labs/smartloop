@@ -119,11 +119,18 @@ def test_run_inference_invokes_loaded_model():
 # HybridExecutor._resolve_worker_count
 # --------------------------------------------------------------------------
 
-def _patch_cuda(free_gb, total_gb=48.0):
-    """Patch torch onto a CUDA device with the given free/total VRAM."""
+def _patch_cuda(free_gb, total_gb=48.0, device_count=8):
+    """Patch torch onto a CUDA device with the given free/total VRAM.
+
+    ``device_count`` defaults high because ``_resolve_worker_count`` also
+    caps at one worker copy per GPU (same-GPU processes serialize without
+    CUDA MPS).  These tests exercise the memory-cap logic; a low
+    device_count would cap ``requested`` before the memory check runs.
+    """
     gb = 1024 ** 3
     patches = [
         mock.patch("torch.cuda.is_available", return_value=True),
+        mock.patch("torch.cuda.device_count", return_value=device_count),
         mock.patch(
             "torch.cuda.mem_get_info",
             return_value=(int(free_gb * gb), int(total_gb * gb)),
