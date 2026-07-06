@@ -254,34 +254,46 @@ class Planner:
             logger.info(f"[classify] LLM → {result.intent.value}: {result.reasoning}")
 
         if available_capabilities:
-            result.capability = self._match_capability(user_message, available_capabilities)
+            result.capability = self._match_capability(
+                available_capabilities,
+                has_attachments=has_attachments,
+                has_matched_skills=bool(skills),
+                has_document_context=result.has_document_context,
+            )
             if result.capability:
                 logger.info(f"[classify] capability → {result.capability}")
 
         return result
 
     @staticmethod
-    def _match_capability(user_message: str, capabilities: List[str]) -> Optional[str]:
-        """Match the user message to the best available capability via keyword overlap."""
-        msg_lower = user_message.lower()
-        _CAPABILITY_KEYWORDS: Dict[str, List[str]] = {
-            "coding": ["code", "program", "function", "bug", "debug", "compile", "syntax", "refactor", "implement", "class", "method"],
-            "finance": ["finance", "stock", "price", "invest", "portfolio", "dividend", "revenue", "profit", "budget", "expense", "accounting"],
-            "vision": ["image", "photo", "picture", "visual", "diagram", "screenshot", "chart", "graph", "draw", "render"],
-            "writing": ["write", "essay", "article", "blog", "story", "draft", "edit", "proofread", "summarize", "translate"],
-            "math": ["math", "calculate", "equation", "formula", "algebra", "geometry", "statistics", "probability"],
-            "science": ["science", "physics", "chemistry", "biology", "experiment", "hypothesis", "research"],
-        }
-        best_cap = None
-        best_score = 0
-        for cap in capabilities:
-            cap_lower = cap.lower()
-            keywords = _CAPABILITY_KEYWORDS.get(cap_lower, [cap_lower])
-            score = sum(1 for kw in keywords if kw in msg_lower)
-            if score > best_score:
-                best_score = score
-                best_cap = cap
-        return best_cap if best_score > 0 else None
+    def _match_capability(
+        capabilities: List[str],
+        *,
+        has_attachments: bool = False,
+        has_matched_skills: bool = False,
+        has_document_context: bool = False,
+    ) -> Optional[str]:
+        """Pick a capability from planning signals in priority order.
+
+        Priority:
+          1. ``vision``    — attachments imply image/document OCR work.
+          2. ``skills``    — a matched skill defines the procedure to run.
+          3. ``dp``        — indexed document context: data-processing model.
+          4. ``knowledge`` — default for open-ended chat / general answers.
+
+        Returns the first capability whose signal fires *and* is present
+        in ``capabilities``, or ``None`` when nothing matches.
+        """
+        priority = (
+            ("vision", has_attachments),
+            ("skills", has_matched_skills),
+            ("dp", has_document_context),
+            ("knowledge", True),
+        )
+        for cap, signal in priority:
+            if signal and cap in capabilities:
+                return cap
+        return None
 
     def _detect_signals(
         self,
@@ -554,14 +566,31 @@ class Planner:
     ) -> ExecutionPlan:
         """Build an execution plan from a classification result.
 
-        For CONVERSATION → empty plan.
+        For CONVERSATION with a matched capability (e.g. ``knowledge``) →
+        one CONVERSATIONAL step routed to that capability's model.
+        For CONVERSATION without a capability → empty plan (router streams
+        via the small model directly).
         For TOOL_CALL, ACTION, EXPLORE → single-step plan (no LLM call).
         For MULTI_STEP → LLM-generated plan with fallback to signal-based steps.
         """
         intent = classification.intent
 
         if intent == IntentType.CONVERSATION:
-            return ExecutionPlan(steps=[], reasoning="conversation")
+            if classification.capability:
+                return ExecutionPlan(
+                    steps=[PlanStep(
+                        step=1,
+                        step_type=StepType.CONVERSATIONAL,
+                        tool_name="conversation",
+                        server_id=SYSTEM_TOOLS_SERVER_ID,
+                        server_name=SYSTEM_TOOLS_SERVER_NAME,
+                        instruction=context.user_message,
+                        model_tier=ModelTier.LARGE,
+                        capability=classification.capability,
+                    )],
+                    reasoning=f"conversation → capability '{classification.capability}'",
+                )
+            return ExecutionPlan(steps=[], reasoning="conversation (no capability)")
 
         if intent == IntentType.TOOL_CALL:
             return self._plan_tool_call(classification, context)

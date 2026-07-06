@@ -282,13 +282,30 @@ def test_classify_llm_fallback_unparseable(planner, mock_llm):
 # 3. create_plan with ClassificationResult                            #
 # ------------------------------------------------------------------ #
 
-def test_create_plan_conversation(planner):
+def test_create_plan_conversation_without_capability(planner):
+    # CONVERSATION intent with no capability matched → empty plan so the
+    # router can stream via the small model directly.
     classification = ClassificationResult(intent=IntentType.CONVERSATION)
     ctx = PlanContext(user_message="hello")
     plan = planner.create_plan(classification, ctx)
     assert isinstance(plan, ExecutionPlan)
     assert len(plan.steps) == 0
-    assert plan.reasoning == "conversation"
+    assert plan.reasoning.startswith("conversation")
+
+
+def test_create_plan_conversation_with_knowledge_capability(planner):
+    # CONVERSATION intent + knowledge capability → one CONVERSATIONAL step
+    # routed to the knowledge-capable model (e.g. gemma-3-4b).
+    classification = ClassificationResult(
+        intent=IntentType.CONVERSATION, capability="knowledge",
+    )
+    ctx = PlanContext(user_message="what are some places to visit in madrid")
+    plan = planner.create_plan(classification, ctx)
+    assert len(plan.steps) == 1
+    step = plan.steps[0]
+    assert step.step_type == StepType.CONVERSATIONAL
+    assert step.capability == "knowledge"
+    assert step.instruction == "what are some places to visit in madrid"
 
 
 def test_create_plan_tool_call(planner, sample_servers):

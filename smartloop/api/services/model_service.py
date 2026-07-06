@@ -517,13 +517,26 @@ class ModelService:
         model).
         """
         if not self._model or not self._model.workspace:
+            logger.warning(
+                "[capability-model] No workspace loaded — cannot resolve "
+                "capability '%s'", capability,
+            )
             return None
         workspace = self._model.workspace
         ws_model = workspace.best_model_for(capability)
         if not ws_model:
+            logger.warning(
+                "[capability-model] No enabled+downloaded model declares "
+                "capability '%s'", capability,
+            )
             return None
         cap_lower = capability.lower()
         if cap_lower not in [c.lower() for c in ws_model.effective_capabilities]:
+            logger.warning(
+                "[capability-model] Best model %s does not declare "
+                "capability '%s' (has %s)",
+                ws_model.model_name, capability, ws_model.effective_capabilities,
+            )
             return None
 
         cache_key = f"_cap_llm_{ws_model.model_name}"
@@ -538,6 +551,11 @@ class ModelService:
             # goes through get_vision_llm(), which loads the multimodal handler.
             gguf_path, _mmproj = self._find_model_ggufs(model_dir)
             if not gguf_path:
+                logger.warning(
+                    "[capability-model] No GGUF found for %s at %s — "
+                    "capability '%s' unavailable",
+                    ws_model.model_name, model_dir, capability,
+                )
                 return None
 
             from smartloop.config.app_settings import AppSettings
@@ -547,6 +565,11 @@ class ModelService:
             # (4B) model when it won't fit, so the plan step falls back to the
             # default routing model instead of OOM-ing.
             if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
+                logger.warning(
+                    "[capability-model] %s doesn't fit alongside the main "
+                    "model at n_ctx=%d — capability '%s' unavailable",
+                    ws_model.model_name, cap, capability,
+                )
                 return None
             from smartloop.llms.llm_factory import LlmFactory
             llm = LlmFactory.get_llama_cpp_instance(
@@ -1930,11 +1953,27 @@ class ModelService:
                 logger.info("[vector-search] No chunks found")
                 return None
 
+            # Absolute quality floor: if even the closest chunk is only
+            # weakly related, treat the whole result set as no match.
+            # Without this gate, weak matches populate vector_context and
+            # force the orchestrator's tier-1 classifier onto the EXPLORE
+            # path (planner.py `has_document_context` check), so a purely
+            # conversational prompt gets wrapped in DOCUMENT CONTEXT
+            # scaffolding pointing at irrelevant docs.
+            _MIN_BEST_DISTANCE = 0.55
+            best_distance = discovery[0].distance
+            if best_distance > _MIN_BEST_DISTANCE:
+                logger.info(
+                    f"[vector-search] Best match distance {best_distance:.3f} "
+                    f"exceeds quality floor {_MIN_BEST_DISTANCE} — "
+                    f"no relevant documents"
+                )
+                return None
+
             # Relevance cutoff: keep only chunks within a reasonable
             # margin of the best match.  This avoids pulling in weakly
             # related documents when a few strong matches exist.
             _DISTANCE_CUTOFF_MARGIN = 0.15
-            best_distance = discovery[0].distance
             cutoff = best_distance + _DISTANCE_CUTOFF_MARGIN
             before_count = len(discovery)
             discovery = [r for r in discovery if r.distance <= cutoff]
@@ -3216,7 +3255,7 @@ class ModelService:
                 pass
             self._llm_executor = None
 
-    def try_mcp_tool_call(
+    def orchestrate(
         self,
         user_message: str,
         skills: Optional[list] = None,
@@ -3224,27 +3263,34 @@ class ModelService:
         conversation_history: Optional[list] = None,
         has_attachments: bool = False,
     ) -> tuple[Optional[str], bool, Optional[str], Optional[list], Optional[str], bool]:
-        """Attempt to handle a user message via MCP tool call.
+        """Full orchestrator entry point for a user message.
 
-        Built-in tools (bash, grep, file-read, file-write, explore) are
-        registered as the ``System Tools`` MCP server and participate in
-        the same selection loop as external servers.  Vector search on
-        indexed documents is performed inside the orchestrator as part
-        of the explore phase.
+        Runs classification, context enrichment, DAG execution, capability
+        routing and — when the plan calls for it — MCP tool calls.  An MCP
+        tool call is one possible outcome, not the point of this method;
+        CONVERSATION intents route to a capability-tagged model instead.
 
         Args:
             conversation_history: Recent ``[{"role": ..., "content": ...}]``
                 turns passed to the ContextExplorer for history insight.
 
         Returns:
-            (context, matched, error, citations, skill_instruction) —
-            *context* is the formatted tool output,
-            *matched* is True when a tool was selected,
+            (context, matched, error, citations, skill_instruction, mutation)
+            — *context* is the formatted tool output,
+            *matched* is True when the orchestrator produced content,
             *error* is a user-facing error message (or None on success),
             *citations* is a list of source document dicts (or None),
-            *skill_instruction* is the matched skill content (or None).
+            *skill_instruction* is the matched skill content (or None),
+            *mutation* signals the router to stream *context* verbatim
+            instead of running it through another LLM.
         """
+        logger.info("[orchestrator] entered orchestrate: %r", user_message[:120])
         if self._model is None or self._llm is None:
+            logger.warning(
+                "[orchestrator] BYPASSED — model/llm not loaded "
+                "(model=%s, llm=%s). Falling back to raw stream_completion.",
+                self._model is not None, self._llm is not None,
+            )
             return None, False, None, None, None, False
 
         # Reload workspace from disk to pick up any changes made by
@@ -3253,6 +3299,10 @@ class ModelService:
 
         current_project = self._model.workspace.current_project
         if not current_project:
+            logger.warning(
+                "[orchestrator] BYPASSED — no current project. Falling back "
+                "to raw stream_completion.",
+            )
             return None, False, None, None, None, False
 
         # Migrate legacy REMOTE system servers to LOCAL on first access
@@ -3299,6 +3349,12 @@ class ModelService:
                 if m.enabled and m.downloaded:
                     caps.extend(m.effective_capabilities)
             available_capabilities = list(dict.fromkeys(caps))
+            logger.info(
+                "[caps] models=%s available_capabilities=%s",
+                [(m.model_name, m.enabled, m.downloaded, m.effective_capabilities)
+                 for m in workspace.models],
+                available_capabilities,
+            )
 
             result = orchestrator.execute(
                 user_message, eligible_servers,
