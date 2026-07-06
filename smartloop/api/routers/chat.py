@@ -281,7 +281,7 @@ async def stream_chunks(
         yield _status_event("tools", "processing", "Processing...")
         orchestrator_context, _, tool_error, citations, skill_instruction, is_mutation = await loop.run_in_executor(
             None,
-            lambda: model_service.try_mcp_tool_call(
+            lambda: model_service.orchestrate(
                 last_user_msg, skills=project_skills, cwd=request.cwd,
                 conversation_history=conversation_history,
                 has_attachments=has_attachments,
@@ -618,7 +618,7 @@ async def create_chat_completion(
         if last_user_msg:
             orchestrator_context, _, tool_error, citations, _, is_mutation = await loop.run_in_executor(
                 _executor,
-                lambda: model_service.try_mcp_tool_call(
+                lambda: model_service.orchestrate(
                     last_user_msg, skills=project_skills, cwd=request.cwd,
                     conversation_history=conversation_history,
                 ),

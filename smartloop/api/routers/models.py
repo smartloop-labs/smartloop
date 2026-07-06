@@ -271,7 +271,12 @@ async def update_workspace_model(
     request: _UpdateWorkspaceModelRequest,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """Update a workspace model's enabled state and/or capabilities."""
+    """Update a workspace model's enabled state.
+
+    ``capabilities`` in the request body is accepted for backward
+    compatibility but ignored — capabilities are read-only from the
+    model class (see ``WorkspaceModel.effective_capabilities``).
+    """
     try:
         workspace = model_service._ensure_workspace()
         model = workspace.get_model(model_name)
@@ -279,14 +284,12 @@ async def update_workspace_model(
             raise ValueError(f"Model not found: {model_name}")
         if request.enabled is not None:
             model.enabled = request.enabled
-        if request.capabilities is not None:
-            model.capabilities = request.capabilities
         workspace.save()
         return {
             "status": "ok",
             "model_name": model_name,
             "enabled": model.enabled,
-            "capabilities": model.capabilities,
+            "capabilities": model.effective_capabilities,
         }
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

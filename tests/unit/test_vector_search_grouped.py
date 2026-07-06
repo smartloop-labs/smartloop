@@ -81,3 +81,31 @@ def test_get_document_context_with_citations_tuple_shape():
     assert "=== Document: alpha.pdf ===" in context
     assert "Alpha body" in context
     assert len(citations) == 2
+
+
+def _weak_match_store():
+    """Store where every chunk is only weakly related (distance > 0.55)."""
+    chunks = [
+        ChunkResult(text="t1", document_id="d1", document_name="unrelated.pdf",
+                    distance=0.72, metadata={"page_number": 1},
+                    source_content="Unrelated body"),
+    ]
+    store = MagicMock()
+    store.query_with_metadata.return_value = chunks
+    store.get_by_document_ids.side_effect = (
+        lambda ids: [c for c in chunks if c.document_id in ids]
+    )
+    return store
+
+
+def test_weak_best_match_returns_none():
+    """Best-match distance above the quality floor → no documents surfaced,
+    so purely conversational prompts don't get routed through EXPLORE."""
+    store = _weak_match_store()
+    svc = _service_with_store(store)
+    with patch("smartloop.api.services.model_service.StoreFactory.create_store",
+               return_value=store):
+        assert svc.get_document_groups(query="places to visit in madrid") is None
+        assert svc.get_document_context_with_citations(
+            query="places to visit in madrid"
+        ) is None

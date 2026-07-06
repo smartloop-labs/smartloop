@@ -181,8 +181,6 @@ async def init(
         if not model_cls:
             raise HTTPException(status_code=400, detail=f"Unknown model: {target}")
         ws_model = workspace.add_model(target, model_cls.model_id())
-        if hasattr(model_cls, 'default_capabilities') and not ws_model.capabilities:
-            ws_model.capabilities = model_cls.default_capabilities()
 
     model_dir = ws_model.model_dir
     needs_download = not _gguf_exists(model_dir)
