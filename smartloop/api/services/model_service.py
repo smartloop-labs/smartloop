@@ -2904,6 +2904,12 @@ class ModelService:
             self._decision_llm = None
             self._decision_model_name = None
 
+            # Release any on-demand capability models cached by
+            # _get_llm_for_capability (self._cap_llm_<name>); these are set once
+            # and otherwise never freed, so a plain unload must sweep them too.
+            for key in [k for k in list(self.__dict__) if k.startswith("_cap_llm_")]:
+                delattr(self, key)
+
             self._reset_llm_executor()
             self._cleanup_gpu_cache()
 
@@ -2946,6 +2952,36 @@ class ModelService:
             self._large_llm = None
             self._large_model_attempted = False
             self._cleanup_gpu_cache()
+
+    def unload_model_by_name(self, model_name: str) -> bool:
+        """Release any resident instance(s) of a specific model, if loaded.
+
+        Called when a model is disabled so its VRAM/RAM is reclaimed
+        immediately rather than staying resident until the process exits.
+        A single model can occupy any of the on-demand slots — the
+        capability cache (``_cap_llm_<name>``), the large agent model, or the
+        vision model — so all are checked. Returns True if anything was freed.
+        """
+        cap_key = f"_cap_llm_{model_name}"
+        freed = False
+        with self._inference_lock:
+            if getattr(self, cap_key, None) is not None:
+                delattr(self, cap_key)
+                freed = True
+            if self._large_model_name == model_name and self._large_llm is not None:
+                self._large_llm = None
+                self._large_model_name = None
+                self._large_model_attempted = False
+                freed = True
+            if self._vision_model_name == model_name and self._vision_llm is not None:
+                self._vision_llm = None
+                self._vision_model_name = None
+                self._vision_unavailable = False
+                freed = True
+            if freed:
+                logger.info("[unload] Freed resident instance of %s", model_name)
+                self._cleanup_gpu_cache()
+        return freed
 
     # --------------------------------------------------------------- MCP servers
 

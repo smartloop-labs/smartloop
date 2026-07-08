@@ -285,6 +285,10 @@ async def update_workspace_model(
         if request.enabled is not None:
             model.enabled = request.enabled
         workspace.save()
+        # Disabling only flips a persisted flag; free any resident instance now
+        # so its VRAM/RAM is reclaimed without requiring a restart.
+        if request.enabled is False:
+            model_service.unload_model_by_name(model_name)
         return {
             "status": "ok",
             "model_name": model_name,
