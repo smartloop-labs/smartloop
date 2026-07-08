@@ -252,19 +252,16 @@ class LlmFactory:
     def _find_openvino_ir_dir(gguf_path: str) -> str | None:
         """Locate an OpenVINO IR export shipped alongside a GGUF model.
 
-        Checked in order: the ``SMARTLOOP_OV_MODEL_DIR`` env override, an
-        ``openvino/`` subdirectory next to the GGUF, then ``<stem>-ov/``.
-        A directory qualifies when it contains ``openvino_model.xml``.
+        The IR follows the workspace model layout: the GGUF lives in
+        ``models/<org>/<model-name>/<model-name>-<quant>.gguf`` and its IR
+        export sits beside it as ``<model-name>-ov/`` (named after the model,
+        not the quantized file).  The directory qualifies when it contains
+        ``openvino_model.xml``.
         """
-        candidates = []
-        env_dir = os.environ.get("SMARTLOOP_OV_MODEL_DIR")
-        if env_dir:
-            candidates.append(Path(env_dir))
-        p = Path(gguf_path)
-        candidates += [p.parent / "openvino", p.parent / f"{p.stem}-ov"]
-        for c in candidates:
-            if (c / "openvino_model.xml").exists():
-                return str(c)
+        model_dir = Path(gguf_path).parent
+        ir_dir = model_dir / f"{model_dir.name}-ov"
+        if (ir_dir / "openvino_model.xml").exists():
+            return str(ir_dir)
         return None
 
     @staticmethod
