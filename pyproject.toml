@@ -66,6 +66,13 @@ dependencies = [
 training = [
     "smartloop-trainer>=0.1.0",
 ]
+# Intel iGPU/NPU inference via OpenVINO GenAI (see LlmFactory Intel routing).
+# Only useful on Intel hosts without an NVIDIA GPU; `make install` installs
+# this automatically when it detects an Intel CPU (keep the pin in sync with
+# OPENVINO_VERSION in the Makefile).
+intel = [
+    "openvino-genai>=2025.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

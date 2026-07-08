@@ -31,6 +31,22 @@ else
     PLATFORM := windows
 endif
 
+# OpenVINO GenAI drives Intel iGPU/NPU inference (LlmFactory Intel routing).
+# available_intel_devices() can't gate this at install time — it needs the
+# openvino runtime already importable — so detect the Intel CPU at the OS
+# level instead. Intel Macs run on Metal via llama.cpp, so this is scoped to
+# Linux/Windows. Keep OPENVINO_VERSION in sync with the [intel] extra in
+# pyproject.toml.
+OPENVINO_VERSION := 2025.0
+ifeq ($(PLATFORM),linux)
+    INTEL_HOST := $(shell grep -qi genuineintel /proc/cpuinfo 2>/dev/null && echo yes || echo no)
+else ifeq ($(PLATFORM),windows)
+    INTEL_HOST := $(shell echo "$$PROCESSOR_IDENTIFIER" | grep -qi intel && echo yes || echo no)
+else
+    INTEL_HOST := no
+endif
+OV_INSTALL_CMD = $(PIP) install "openvino-genai>=$(OPENVINO_VERSION)" --index-url=https://pypi.org/simple
+
 # Set venv paths based on platform
 ifeq ($(PLATFORM),windows)
     PIP := $(VENV)/Scripts/pip
@@ -80,7 +96,7 @@ help:
 	@echo "Available targets:"
 	@echo ""
 	@echo "  Development:"
-	@echo "  install         - Create venv and install Python requirements"
+	@echo "  install         - Create venv and install Python requirements (+ OpenVINO GenAI on Intel hosts)"
 	@echo "  build           - install + llama-cpp-python with GPU support + model downloads"
 	@echo "  run             - Start the API server with default INFO logging"
 	@echo "  run-debug       - Start the API server with LOG_LEVEL=DEBUG (verbose orchestrator/DAG/MCP logs)"
@@ -113,6 +129,12 @@ venv:
 install: venv
 	@echo "=== Installing requirements ==="
 	$(PIP) install -r requirements.txt --index-url=https://pypi.org/simple
+ifeq ($(INTEL_HOST),yes)
+	@echo "=== Intel CPU detected — installing OpenVINO GenAI (Intel iGPU/NPU) ==="
+	$(OV_INSTALL_CMD)
+else
+	@echo "=== Non-Intel host — skipping OpenVINO GenAI (set INTEL_HOST=yes to force) ==="
+endif
 
 build: install
 	@echo "=== Installing llama-cpp-python with GPU support ==="
