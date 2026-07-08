@@ -78,9 +78,22 @@ async def _download_and_stream(downloader, model_id: str, model_name: str,
 
     download_task = loop.run_in_executor(None, _do_download)
 
+    # Emit a keepalive when no progress has flowed for a few seconds so the SSE
+    # connection survives download stalls (e.g. a dropped connection being
+    # retried) without the client or a proxy timing out the idle stream.
+    idle_ticks = 0
     while not download_task.done():
+        drained = False
         while not progress_queue.empty():
             yield _sse_event(progress_queue.get_nowait())
+            drained = True
+        if drained:
+            idle_ticks = 0
+        else:
+            idle_ticks += 1
+            if idle_ticks >= 10:  # ~5s of silence
+                yield _SSE_KEEPALIVE
+                idle_ticks = 0
         await asyncio.sleep(0.5)
 
     while not progress_queue.empty():

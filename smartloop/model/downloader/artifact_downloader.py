@@ -1,11 +1,14 @@
 import hashlib
 import os
 import logging
+import random
 import threading
+import time
 
 import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Callable, TypeVar
 
 from smartloop.platform import SLPPlatformClient
 from smartloop.platform import auth as platform_auth
@@ -48,6 +51,50 @@ RANGE_READ_SIZE = 1 * 1024 * 1024                    # 1 MB read buffer within e
 CHUNKED_THRESHOLD = 100 * 1024 * 1024                # 100 MB — files larger than this use chunked download
 CHUNK_WORKERS = max(2, _IO_THREAD_BUDGET // MAX_WORKERS)  # parallel chunk downloads per file
 
+# Retry policy for transient network failures during download. A dropped
+# connection mid-stream on a multi-GB GGUF would otherwise fail the whole
+# download; instead we retry with exponential backoff + jitter and resume
+# from where we left off. The attempt count is sized so the cumulative
+# backoff window (~1+2+4+8+16+30+30 ≈ 90s) bridges a typical 1–2 minute
+# network blip — during an outage, connection attempts fail almost instantly,
+# so it's the backoff, not the attempt count alone, that spans the gap.
+MAX_DOWNLOAD_ATTEMPTS = 8
+_RETRY_BASE_DELAY = 1.0                               # seconds; first backoff
+_RETRY_MAX_DELAY = 30.0                               # seconds; backoff cap
+_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}   # transient HTTP statuses
+
+# Per-operation timeout. The read timeout is deliberately short so a stalled
+# stream (e.g. Wi-Fi dropped mid-download) is detected in ~1 minute and retried,
+# instead of blocking on a dead socket for the whole read window. A large file
+# is still allowed to take arbitrarily long overall — this bounds the idle gap
+# between received bytes, not the total transfer time.
+_STREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=30.0)
+# How many times to re-download a file whose bytes fail MD5 verification
+# (silent corruption that completed without a network error).
+_MAX_VERIFY_ATTEMPTS = 3
+
+_UNAUTHORIZED_MSG = (
+    "Download rejected (401 Unauthorized). "
+    "The download URL may have expired or the resource requires authentication."
+)
+
+_T = TypeVar("_T")
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """True for transient failures worth retrying (network blips, 5xx, 429)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_STATUS
+    # httpx.TransportError covers connect/read/write timeouts, connection resets,
+    # and RemoteProtocolError (server closed the stream / incomplete read).
+    return isinstance(exc, httpx.TransportError)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with 50–100% jitter for a 1-based attempt number."""
+    delay = min(_RETRY_BASE_DELAY * (2 ** (attempt - 1)), _RETRY_MAX_DELAY)
+    return delay * (0.5 + random.random() * 0.5)
+
 class SLPArtifactDownloader(SLPDownloader):
     """Download model artifacts from URLs provided by an ArtifactSource.
 
@@ -87,15 +134,48 @@ class SLPArtifactDownloader(SLPDownloader):
                 pass
         return None
 
+    def _run_with_retries(self, description: str, attempt_fn: "Callable[[int], _T]") -> "_T":
+        """Call ``attempt_fn(attempt_number)`` with retries on transient errors.
+
+        ``attempt_fn`` must be resumable/idempotent: it is re-invoked from scratch
+        on each retry and is expected to pick up where the previous attempt left
+        off (e.g. by inspecting bytes already written). ``PermissionError`` (401)
+        and non-transient errors propagate immediately.
+        """
+        for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                return attempt_fn(attempt)
+            except PermissionError:
+                raise
+            except Exception as exc:
+                if not _is_retryable_error(exc) or attempt == MAX_DOWNLOAD_ATTEMPTS:
+                    raise
+                delay = _backoff_delay(attempt)
+                self.logger.warning(
+                    f"[retry] {description} failed "
+                    f"(attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS}): {exc}. "
+                    f"Retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+        # Unreachable: the loop either returns or raises on the final attempt.
+        raise RuntimeError(f"{description} exhausted retries")
+
     def _get_remote_file_info(self, url: str) -> tuple[int, str | None, bool]:
-        """HEAD request to get file size, MD5 hash, and Range support."""
-        try:
+        """HEAD request to get file size, MD5 hash, and Range support.
+
+        Retries transient failures; falls back to ``(0, None, False)`` when the
+        probe ultimately fails (callers then download single-stream, unverified).
+        """
+        def attempt(_attempt_no: int) -> tuple[int, str | None, bool]:
             resp = httpx.head(url, follow_redirects=True, timeout=30)
             cl = resp.headers.get("Content-Length")
             size = int(cl) if cl else 0
             md5 = self._parse_remote_md5(resp.headers)
             accept_ranges = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
             return size, md5, accept_ranges
+
+        try:
+            return self._run_with_retries("HEAD probe", attempt)
         except Exception:
             return 0, None, False
 
@@ -106,6 +186,7 @@ class SLPArtifactDownloader(SLPDownloader):
         pending: dict[str, str] = {}
         pending_sizes: dict[str, int] = {}
         pending_range: dict[str, bool] = {}
+        pending_md5: dict[str, str | None] = {}
         skipped = 0
 
         for filename, url in artifacts.items():
@@ -126,6 +207,7 @@ class SLPArtifactDownloader(SLPDownloader):
             pending[filename] = url
             pending_sizes[filename] = size
             pending_range[filename] = accept_ranges
+            pending_md5[filename] = remote_md5
 
         if skipped:
             self.logger.info(
@@ -159,7 +241,7 @@ class SLPArtifactDownloader(SLPDownloader):
                 pool.submit(
                     self._download_file, filename, url, local_dir,
                     pending_sizes.get(filename, 0), position, _per_file_callback,
-                    pending_range.get(filename, False),
+                    pending_range.get(filename, False), pending_md5.get(filename),
                 ): filename
                 for position, (filename, url) in enumerate(pending.items())
             }
@@ -184,23 +266,61 @@ class SLPArtifactDownloader(SLPDownloader):
 
     def _download_file(self, filename: str, url: str, local_dir: str, size: int, position: int,
                         progress_callback: ProgressCallback | None = None,
-                        supports_range: bool = False) -> str:
-        """Download a single file, using chunked parallel Range requests for large files."""
+                        supports_range: bool = False, remote_md5: str | None = None) -> str:
+        """Download a single file, then verify and atomically publish it.
+
+        Bytes are written to a ``.part`` sidecar so the final path only ever
+        appears once the download is complete (and MD5-verified, when the server
+        provides a digest). A corrupt download — bytes that finished without a
+        network error but don't match the expected MD5 — is re-downloaded from
+        scratch up to ``_MAX_VERIFY_ATTEMPTS`` times before giving up.
+        """
         flat_name = os.path.basename(filename)
         dest = os.path.join(local_dir, flat_name)
+        part = dest + ".part"
         size_mb = size / (1024 * 1024)
 
-        if supports_range and size >= CHUNKED_THRESHOLD:
-            chunk_size_mb = size / CHUNK_WORKERS / (1024 * 1024)
-            self.logger.info(
-                f"Downloading {flat_name} ({size_mb:.1f} MB) using "
-                f"{CHUNK_WORKERS} parallel chunks of {chunk_size_mb:.1f} MB each"
+        for verify_attempt in range(1, _MAX_VERIFY_ATTEMPTS + 1):
+            # Start each verification attempt from a clean slate so we never
+            # resume onto bytes a previous corrupt attempt wrote.
+            if os.path.exists(part):
+                os.remove(part)
+
+            if supports_range and size >= CHUNKED_THRESHOLD:
+                chunk_size_mb = size / CHUNK_WORKERS / (1024 * 1024)
+                self.logger.info(
+                    f"Downloading {flat_name} ({size_mb:.1f} MB) using "
+                    f"{CHUNK_WORKERS} parallel chunks of {chunk_size_mb:.1f} MB each"
+                )
+                self._download_file_chunked(flat_name, url, part, size, progress_callback)
+            else:
+                reason = "no Range support" if not supports_range else "below threshold"
+                self.logger.info(f"Downloading {flat_name} ({size_mb:.1f} MB) single-stream ({reason})")
+                self._download_file_simple(flat_name, url, part, size, progress_callback, supports_range)
+
+            # No server-provided digest → can't verify; the atomic rename below
+            # still guarantees we never publish a truncated file.
+            if not remote_md5:
+                break
+
+            local_md5 = self._compute_local_md5(part)
+            if local_md5 == remote_md5:
+                break
+
+            self.logger.warning(
+                f"[verify] {flat_name} MD5 mismatch "
+                f"(attempt {verify_attempt}/{_MAX_VERIFY_ATTEMPTS}): "
+                f"expected {remote_md5}, got {local_md5}"
             )
-            self._download_file_chunked(flat_name, url, dest, size, progress_callback)
-        else:
-            reason = "no Range support" if not supports_range else "below threshold"
-            self.logger.info(f"Downloading {flat_name} ({size_mb:.1f} MB) single-stream ({reason})")
-            self._download_file_simple(flat_name, url, dest, size, progress_callback)
+            if verify_attempt == _MAX_VERIFY_ATTEMPTS:
+                if os.path.exists(part):
+                    os.remove(part)
+                raise RuntimeError(
+                    f"{flat_name}: MD5 verification failed after {_MAX_VERIFY_ATTEMPTS} attempts"
+                )
+
+        # Atomically publish: the final path appears only now, fully written.
+        os.replace(part, dest)
 
         if progress_callback:
             progress_callback(DownloadProgress(
@@ -210,56 +330,89 @@ class SLPArtifactDownloader(SLPDownloader):
         return filename
 
     def _download_file_simple(self, flat_name: str, url: str, dest: str, size: int,
-                               progress_callback: ProgressCallback | None = None) -> None:
-        """Download a file in a single request (small files)."""
-        downloaded = 0
-        with httpx.stream("GET", url, follow_redirects=True, timeout=300) as resp:
-            if resp.status_code == 401:
-                raise PermissionError(
-                    "Download rejected (401 Unauthorized). "
-                    "The download URL may have expired or the resource requires authentication."
-                )
-            resp.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in resp.iter_bytes(chunk_size=CHUNK_SIZE):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_callback:
-                        progress_callback(DownloadProgress(
-                            filename=flat_name,
-                            downloaded=downloaded,
-                            total=size,
-                            status="downloading",
-                        ))
+                               progress_callback: ProgressCallback | None = None,
+                               supports_range: bool = False) -> None:
+        """Download a file in a single request, retrying transient failures.
+
+        When the server supports Range requests, a retry resumes from the bytes
+        already written rather than restarting from zero. Otherwise each retry
+        re-downloads the whole file.
+        """
+        def attempt(attempt_no: int) -> None:
+            # Resume only from bytes written by a PRIOR attempt in this call — the
+            # first attempt always starts clean, so a pre-existing corrupt file
+            # (which is why it's being re-downloaded) is overwritten, not trusted.
+            resume_from = 0
+            if attempt_no > 1 and supports_range and os.path.exists(dest):
+                resume_from = os.path.getsize(dest)
+                if size and resume_from >= size:
+                    return  # this attempt's predecessor already finished the file
+            headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
+            with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=_STREAM_TIMEOUT) as resp:
+                if resp.status_code == 401:
+                    raise PermissionError(_UNAUTHORIZED_MSG)
+                # If we asked to resume but the server ignored it (sent 200, not
+                # 206), it's streaming the whole file — rewrite from the start.
+                if resume_from and resp.status_code != 206:
+                    resume_from = 0
+                resp.raise_for_status()
+                downloaded = resume_from
+                with open(dest, "ab" if resume_from else "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=CHUNK_SIZE):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_callback:
+                            progress_callback(DownloadProgress(
+                                filename=flat_name,
+                                downloaded=downloaded,
+                                total=size,
+                                status="downloading",
+                            ))
+
+        self._run_with_retries(f"download {flat_name}", attempt)
 
     def _download_chunk(self, url: str, dest: str, start: int, end: int,
                         flat_name: str, total_size: int,
                         downloaded_counter: list, lock: threading.Lock,
                         progress_callback: ProgressCallback | None = None) -> None:
-        """Download a byte range and write it to the correct file offset."""
-        headers = {"Range": f"bytes={start}-{end}"}
-        with httpx.stream("GET", url, headers=headers, follow_redirects=True,
-                          timeout=300) as resp:
-            if resp.status_code == 401:
-                raise PermissionError(
-                    "Download rejected (401 Unauthorized). "
-                    "The download URL may have expired or the resource requires authentication."
-                )
-            resp.raise_for_status()
-            with open(dest, "r+b") as f:
-                f.seek(start)
-                for chunk in resp.iter_bytes(chunk_size=RANGE_READ_SIZE):
-                    f.write(chunk)
-                    if progress_callback:
-                        with lock:
-                            downloaded_counter[0] += len(chunk)
-                            current = downloaded_counter[0]
-                        progress_callback(DownloadProgress(
-                            filename=flat_name,
-                            downloaded=current,
-                            total=total_size,
-                            status="downloading",
-                        ))
+        """Download a byte range to its file offset, retrying transient failures.
+
+        A retry resumes from within the range: the file is pre-allocated (so its
+        on-disk size can't tell us how far we got), so we track the bytes written
+        for this chunk locally and resume from ``start + written``. The shared
+        progress counter only ever advances by newly written bytes, so a retry
+        never double-counts.
+        """
+        written = 0  # bytes of THIS chunk already flushed to disk
+
+        def attempt(_attempt_no: int) -> None:
+            nonlocal written
+            cur_start = start + written
+            if cur_start > end:
+                return  # chunk already fully written by a prior attempt
+            headers = {"Range": f"bytes={cur_start}-{end}"}
+            with httpx.stream("GET", url, headers=headers, follow_redirects=True,
+                              timeout=_STREAM_TIMEOUT) as resp:
+                if resp.status_code == 401:
+                    raise PermissionError(_UNAUTHORIZED_MSG)
+                resp.raise_for_status()
+                with open(dest, "r+b") as f:
+                    f.seek(cur_start)
+                    for chunk in resp.iter_bytes(chunk_size=RANGE_READ_SIZE):
+                        f.write(chunk)
+                        written += len(chunk)
+                        if progress_callback:
+                            with lock:
+                                downloaded_counter[0] += len(chunk)
+                                current = downloaded_counter[0]
+                            progress_callback(DownloadProgress(
+                                filename=flat_name,
+                                downloaded=current,
+                                total=total_size,
+                                status="downloading",
+                            ))
+
+        self._run_with_retries(f"chunk {start}-{end} of {flat_name}", attempt)
 
     def _download_file_chunked(self, flat_name: str, url: str, dest: str, size: int,
                                 progress_callback: ProgressCallback | None = None) -> None:
