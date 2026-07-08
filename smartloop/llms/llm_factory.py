@@ -265,6 +265,24 @@ class LlmFactory:
         return None
 
     @staticmethod
+    def _ir_npu_compatible(ir_dir: str) -> bool:
+        """False when the IR cannot compile on the NPU, so the load loop can
+        skip it without paying a doomed compile attempt.
+
+        Models with active sliding-window attention (e.g. Gemma-3,
+        sliding_window=512) bake a windowed mask Slice into the IR that the
+        NPU's static-shape SDPA validation rejects ("Attention mask input
+        shape not compatible with other inputs").
+        """
+        try:
+            cfg = json.loads((Path(ir_dir) / "config.json").read_text())
+        except Exception:
+            return True  # unknown — let the NPU compile attempt decide
+        if cfg.get("use_sliding_window") is False:
+            return True  # declared but disabled (e.g. Qwen2.5)
+        return not cfg.get("sliding_window")
+
+    @staticmethod
     def get_openvino_genai_instance(ir_dir: str, device: str, logger: Logger,
                                     project_id: str):
         """Load an OpenVINO IR model with openvino_genai on an Intel GPU/NPU.
@@ -344,13 +362,21 @@ class LlmFactory:
                 for intel_device in available_intel_devices():
                     if intel_device.upper() == "CPU":
                         continue
+                    if (intel_device.upper() == "NPU"
+                            and not LlmFactory._ir_npu_compatible(ir_dir)):
+                        logger.info(
+                            "Skipping NPU: model uses sliding-window "
+                            "attention, which the NPU cannot compile"
+                        )
+                        continue
                     try:
                         return LlmFactory.get_openvino_genai_instance(
                             ir_dir, intel_device, logger, project_id)
                     except Exception as e:
+                        reason = str(e).strip().splitlines()
                         logger.warning(
                             f"OpenVINO GenAI load failed on {intel_device} "
-                            f"({e}); trying next device"
+                            f"({reason[0] if reason else e}); trying next device"
                         )
                 else:
                     if available_intel_devices():
