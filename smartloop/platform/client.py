@@ -59,7 +59,7 @@ class SLPPlatformClient:
         """GET /v1/bootstrap/models (no auth). Returns the array of model entries."""
         try:
             resp = httpx.get(self._url(_BOOTSTRAP_MODELS), timeout=_TIMEOUT)
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         _raise_for_status(resp, {404: "Bootstrap endpoint not found on server."})
@@ -74,13 +74,13 @@ class SLPPlatformClient:
         try:
             resp = httpx.get(self._url(_MODELS), headers=self._auth_headers_fn(),
                              timeout=_TIMEOUT)
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         if resp.status_code == 401:
             try:
                 resp = httpx.get(self._url(_MODELS), timeout=_TIMEOUT)
-            except httpx.ConnectError as e:
+            except httpx.TransportError as e:
                 raise ConnectionError(f"Connection error: {e}") from e
 
         _raise_for_status(resp)
@@ -94,7 +94,7 @@ class SLPPlatformClient:
         try:
             resp = httpx.get(self._url(_MODEL_DOWNLOAD.format(model_name)),
                              headers=self._auth_headers_fn(), timeout=_TIMEOUT)
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         _raise_for_status(resp, {
@@ -114,7 +114,7 @@ class SLPPlatformClient:
         try:
             resp = httpx.get(self._url(_USERS_ME), headers=self._auth_headers_fn(),
                              timeout=_TIMEOUT)
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         _raise_for_status(resp, {
@@ -127,7 +127,7 @@ class SLPPlatformClient:
         try:
             resp = httpx.patch(self._url(_USERS_ME), headers=self._auth_headers_fn(),
                                json=payload, timeout=_TIMEOUT)
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         _raise_for_status(resp, {
@@ -143,7 +143,7 @@ class SLPPlatformClient:
         try:
             resp = httpx.post(self._url(_JWT_REFRESH),
                               json={"refresh_token": refresh_token}, timeout=_TIMEOUT)
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         _raise_for_status(resp, {
@@ -161,7 +161,7 @@ class SLPPlatformClient:
             resp = httpx.post(self._url(_MODEL_UPLOAD.format(model_name)),
                               headers=self._auth_headers_fn(),
                               json={"filename": filename}, timeout=_TIMEOUT)
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         _raise_for_status(resp, {
