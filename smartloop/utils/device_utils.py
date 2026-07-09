@@ -53,6 +53,21 @@ def _cuda_gpu_present() -> bool:
 _intel_devices_cache: dict = {}
 
 
+def _is_intel_gpu(core, device: str) -> bool:
+    """True when an OpenVINO GPU device is an Intel GPU rather than another
+    vendor's card exposed through the OpenCL ICD.
+
+    On a hybrid Intel+NVIDIA host OpenVINO can enumerate the NVIDIA dGPU as a
+    ``GPU`` device; running an LLM IR on it compiles but aborts at the first
+    decode.  Filtering by ``FULL_DEVICE_NAME`` keeps only real Intel GPUs.
+    """
+    try:
+        name = str(core.get_property(device, "FULL_DEVICE_NAME"))
+    except Exception:
+        return False
+    return "INTEL" in name.upper()
+
+
 def available_intel_devices() -> list:
     """Ordered Intel accelerators to try (plain ``NPU``/``GPU``), or [] when
     none exist (or the OpenVINO runtime is unavailable).
@@ -73,8 +88,21 @@ def available_intel_devices() -> list:
 
     try:
         from openvino import Core
-        bases = {d.split(".")[0].upper() for d in Core().available_devices}
-        devices = [n for n in ("NPU", "GPU") if n in bases]
+        core = Core()
+        available = core.available_devices
+        devices = []
+        # NPU first (preferred), then Intel GPUs.  Each GPU is kept by its
+        # exact device id (GPU / GPU.0 / GPU.1) so the GenAI LLMPipeline
+        # targets that specific Intel GPU instead of the default GPU.0 —
+        # which, on a hybrid host, may be the NVIDIA card.  NVIDIA/other
+        # GPUs are dropped by the vendor filter (an LLM IR can't run there).
+        for base in ("NPU", "GPU"):
+            for dev in available:
+                if dev.split(".")[0].upper() != base:
+                    continue
+                if base == "GPU" and not _is_intel_gpu(core, dev):
+                    continue
+                devices.append(dev.upper())
     except Exception:
         devices = []
     _intel_devices_cache["devices"] = devices
@@ -113,6 +141,9 @@ def ensure_openvino_device_env() -> Optional[str]:
         return None
     device = preferred_intel_device()
     if device:
+        # ggml-openvino accepts only the plain base name (GPU/NPU); strip any
+        # index (GPU.1 → GPU) carried by the vendor-filtered enumeration.
+        device = device.split(".")[0]
         os.environ["GGML_OPENVINO_DEVICE"] = device
     return device
 

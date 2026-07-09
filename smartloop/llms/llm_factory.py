@@ -254,14 +254,17 @@ class LlmFactory:
 
         The IR follows the workspace model layout: the GGUF lives in
         ``models/<org>/<model-name>/<model-name>-<quant>.gguf`` and its IR
-        export sits beside it as ``<model-name>-ov/`` (named after the model,
-        not the quantized file).  The directory qualifies when it contains
+        export sits beside it, named after the model (not the quantized
+        file).  Both an INT8 export (``<model-name>-ov-int8/``) and the
+        default export (``<model-name>-ov/``) are recognized, the INT8 one
+        taking precedence.  A directory qualifies when it contains
         ``openvino_model.xml``.
         """
         model_dir = Path(gguf_path).parent
-        ir_dir = model_dir / f"{model_dir.name}-ov"
-        if (ir_dir / "openvino_model.xml").exists():
-            return str(ir_dir)
+        for suffix in ("-ov-int8", "-ov"):
+            ir_dir = model_dir / f"{model_dir.name}{suffix}"
+            if (ir_dir / "openvino_model.xml").exists():
+                return str(ir_dir)
         return None
 
     @staticmethod
@@ -319,6 +322,22 @@ class LlmFactory:
             f"OpenVINO GenAI loaded {ir_dir} on {device} "
             f"in {time.time() - start:.1f}s (max_context={max_context})"
         )
+
+        # Some devices compile the model but abort on the very first decode —
+        # notably the Intel iGPU OpenCL runtime on hybrid NVIDIA+Intel hosts,
+        # which throws "clEnqueueMapBuffer ... CL_INVALID_VALUE" the moment
+        # inference starts.  Without this check the pipeline is returned as
+        # "loaded" and every real request then fails at generation (an empty
+        # response), with no chance to fall back.  Run a one-token decode here
+        # (the GenAI analogue of _probe_model_load's decode probe) so a device
+        # that can't actually generate raises now — the caller's load loop then
+        # advances to the next Intel device and ultimately to llama.cpp.
+        smoke = ov_genai.GenerationConfig()
+        smoke.max_new_tokens = 1
+        smoke.do_sample = False
+        pipe.generate("Hi", smoke)
+        logger.info(f"OpenVINO GenAI decode smoke-test passed on {device}")
+
         return OpenVinoGenAI(
             model=pipe,
             tokenizer=pipe.get_tokenizer(),
