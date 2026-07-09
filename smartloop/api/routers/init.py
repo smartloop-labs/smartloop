@@ -39,9 +39,16 @@ def _sse_event(data: dict, event: str = "progress") -> str:
 
 
 def _gguf_exists(model_dir: str) -> bool:
-    """Check whether a .gguf file exists in model_dir or its bin/ subdirectory."""
+    """Check whether a loadable model exists in model_dir.
+
+    True for a GGUF (in model_dir or its bin/ subdirectory) or an OpenVINO IR
+    export (the "<name>-ov-int8" variant ships ``openvino_model.xml`` directly
+    in the model folder, no GGUF).
+    """
     if not os.path.isdir(model_dir):
         return False
+    if os.path.exists(os.path.join(model_dir, "openvino_model.xml")):
+        return True
     if any(f.endswith(".gguf") for f in os.listdir(model_dir)):
         return True
     bin_dir = os.path.join(model_dir, "bin")
@@ -49,8 +56,14 @@ def _gguf_exists(model_dir: str) -> bool:
 
 
 async def _download_and_stream(downloader, model_id: str, model_name: str,
-                                is_bootstrap: bool = False):
-    """Download model files and stream progress."""
+                                is_bootstrap: bool = False,
+                                bootstrap_name: str | None = None):
+    """Download model files and stream progress.
+
+    ``bootstrap_name`` is the bootstrap entry to fetch (may be the
+    ``<name>-ov-int8`` IR variant); it can differ from the workspace routing
+    ``model_name``.
+    """
     progress_queue: Queue[dict] = Queue()
     _last_progress_time: dict[str, float] = {}
 
@@ -72,7 +85,7 @@ async def _download_and_stream(downloader, model_id: str, model_name: str,
 
     def _do_download():
         if is_bootstrap:
-            downloader.bootstrap_download(progress_callback=on_progress)
+            downloader.bootstrap_download(bootstrap_name, progress_callback=on_progress)
         else:
             downloader.download(model_id=model_id, progress_callback=on_progress)
 
@@ -303,18 +316,20 @@ async def bootstrap(
             if existing_model_name:
                 yield _sse_event({"status": "model_ready", "message": f"Model {existing_model_name} already available."})
             else:
-                # 3. Bootstrap download (GGUF only, no build needed)
+                # 3. Bootstrap download (GGUF, or OpenVINO IR on Intel hosts;
+                #    no build needed)
                 downloader = SLPArtifactDownloader(workspace, logger)
-                bootstrap_models = downloader._bootstrap_source.list_models()
-                target = bootstrap_models[0]
-                bootstrap_name = target.get("name")
+                target = downloader.bootstrap_target()
+                bootstrap_name = target.routing_name
 
-                bootstrap_model_id = SLPArtifactDownloader._resolve_model_id(bootstrap_name)
-                workspace.add_model(bootstrap_name, bootstrap_model_id)
+                workspace.add_model(bootstrap_name, target.model_id)
                 ws_model = workspace.get_model(bootstrap_name)
                 ws_model.models_dir = workspace.models_dir
 
-                async for event in _download_and_stream(downloader, bootstrap_model_id, bootstrap_name, is_bootstrap=True):
+                async for event in _download_and_stream(
+                    downloader, target.model_id, bootstrap_name,
+                    is_bootstrap=True, bootstrap_name=target.download_name,
+                ):
                     yield event
 
                 ws_model.downloaded = True

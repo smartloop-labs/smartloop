@@ -249,6 +249,11 @@ class LlmFactory:
             return None
 
     @staticmethod
+    def _is_openvino_ir_dir(path: str) -> bool:
+        """True when *path* is a directory holding an OpenVINO IR export."""
+        return bool(path) and (Path(path) / "openvino_model.xml").exists()
+
+    @staticmethod
     def _find_openvino_ir_dir(gguf_path: str) -> str | None:
         """Locate an OpenVINO IR export shipped alongside a GGUF model.
 
@@ -347,6 +352,40 @@ class LlmFactory:
         )
 
     @staticmethod
+    def load_openvino_ir(ir_dir: str, logger: Logger, project_id: str):
+        """Load an OpenVINO IR across the available Intel accelerators.
+
+        Tries each Intel device in preference order (NPU first, then Intel
+        GPUs), skipping the NPU for sliding-window models it cannot compile and
+        advancing past any device whose compile or first decode fails.  Returns
+        the loaded ``OpenVinoGenAI`` instance, or ``None`` when no Intel device
+        could load it — the caller decides whether to fall back to llama.cpp
+        (GGUF present) or surface the failure (IR-only model).
+        """
+        for intel_device in available_intel_devices():
+            if intel_device.upper() == "CPU":
+                continue
+            if (intel_device.upper() == "NPU"
+                    and not LlmFactory._ir_npu_compatible(ir_dir)):
+                logger.info(
+                    "Skipping NPU: model uses sliding-window "
+                    "attention, which the NPU cannot compile"
+                )
+                continue
+            try:
+                return LlmFactory.get_openvino_genai_instance(
+                    ir_dir, intel_device, logger, project_id)
+            except Exception as e:
+                reason = str(e).strip().splitlines()
+                logger.warning(
+                    f"OpenVINO GenAI load failed on {intel_device} "
+                    f"({reason[0] if reason else e}); trying next device"
+                )
+        if available_intel_devices():
+            logger.warning("OpenVINO GenAI unavailable on all Intel devices")
+        return None
+
+    @staticmethod
     def get_llama_cpp_instance(
         path: str, logger: Logger, project_id: str, lora_path: str | None = None,
         *, probe: bool = True, max_n_ctx: int | None = None,
@@ -378,31 +417,14 @@ class LlmFactory:
         if not mmproj_path and not lora_path:
             ir_dir = LlmFactory._find_openvino_ir_dir(path)
             if ir_dir:
-                for intel_device in available_intel_devices():
-                    if intel_device.upper() == "CPU":
-                        continue
-                    if (intel_device.upper() == "NPU"
-                            and not LlmFactory._ir_npu_compatible(ir_dir)):
-                        logger.info(
-                            "Skipping NPU: model uses sliding-window "
-                            "attention, which the NPU cannot compile"
-                        )
-                        continue
-                    try:
-                        return LlmFactory.get_openvino_genai_instance(
-                            ir_dir, intel_device, logger, project_id)
-                    except Exception as e:
-                        reason = str(e).strip().splitlines()
-                        logger.warning(
-                            f"OpenVINO GenAI load failed on {intel_device} "
-                            f"({reason[0] if reason else e}); trying next device"
-                        )
-                else:
-                    if available_intel_devices():
-                        logger.warning(
-                            "OpenVINO GenAI unavailable on all Intel devices; "
-                            "falling back to llama.cpp"
-                        )
+                instance = LlmFactory.load_openvino_ir(ir_dir, logger, project_id)
+                if instance is not None:
+                    return instance
+                if available_intel_devices():
+                    logger.warning(
+                        "OpenVINO GenAI unavailable on all Intel devices; "
+                        "falling back to llama.cpp"
+                    )
 
         import torch
         from llama_cpp import Llama

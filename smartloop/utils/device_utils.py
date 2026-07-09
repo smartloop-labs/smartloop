@@ -115,6 +115,23 @@ def preferred_intel_device() -> Optional[str]:
     return devices[0] if devices else None
 
 
+def openvino_genai_supported() -> bool:
+    """True when this host can run an OpenVINO IR model natively — the
+    ``openvino_genai`` runtime is importable AND a real Intel accelerator
+    (NPU or Intel GPU, not the buggy intel_cpu plugin) is available.
+
+    Used by the model downloader to decide whether to fetch the
+    ``<name>-ov-int8`` IR bootstrap variant instead of the GGUF: when this is
+    True the loader routes the model through OpenVINO GenAI, so shipping the
+    IR export (and no GGUF) is what makes it loadable.
+    """
+    try:
+        import openvino_genai  # noqa: F401
+    except Exception:
+        return False
+    return any(dev.upper() != "CPU" for dev in available_intel_devices())
+
+
 def ensure_openvino_device_env() -> Optional[str]:
     """Export GGML_OPENVINO_DEVICE before the first llama.cpp backend init.
 

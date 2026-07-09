@@ -153,6 +153,20 @@ class WorkspaceModel(BaseModel):
         return os.path.join(self.models_dir, self.model_id, f"{Path(self.model_id).name}.gguf")
 
     @property
+    def openvino_ir_dir(self) -> Optional[str]:
+        """This model's OpenVINO IR folder when it is an IR-only model, else None.
+
+        The "<name>-ov-int8" bootstrap variant ships an OpenVINO IR export
+        (``openvino_model.xml``/``.bin``) directly in the model folder — no
+        GGUF — so the loader routes it through OpenVINO GenAI instead of
+        llama.cpp.
+        """
+        md = self.model_dir
+        if md and os.path.exists(os.path.join(md, "openvino_model.xml")):
+            return md
+        return None
+
+    @property
     def bin_dir(self) -> str:
         """Directory where the built GGUF is written for this model."""
         return os.path.join(self.model_dir, "bin") if self.models_dir else ""

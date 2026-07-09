@@ -68,14 +68,38 @@ class ModelLoader:
                     return model
             else:
                 ws_model = self.workspace.get_model()
+                project = self.workspace.current_project
+
+                # OpenVINO IR-only model (the "<name>-ov-int8" bootstrap
+                # variant): the folder holds an OpenVINO IR export and no GGUF,
+                # so load it directly through OpenVINO GenAI rather than
+                # llama.cpp.  Only when the caller hasn't pinned an explicit
+                # GGUF path (LoRA / merge flows still use llama.cpp).
+                ir_dir = ws_model.openvino_ir_dir if (ws_model and not self.gguf_path) else None
+                if ir_dir:
+                    self.logger.info(f"Loading OpenVINO IR model from {ir_dir}")
+                    model = LlmFactory.load_openvino_ir(
+                        ir_dir, logger=self.logger,
+                        project_id=project.id if project else None,
+                    )
+                    if model is None:
+                        raise RuntimeError(
+                            f"OpenVINO IR at {ir_dir} could not be loaded on "
+                            f"any Intel device"
+                        )
+                    table = PrettyTable(align="l")
+                    table.field_names = ["Parameter", "Value"]
+                    table.add_row(["Project", next((p.id for p in self.workspace.projects if p.current), "N/A")])
+                    table.add_row(["Device", get_device_config().get_device_description()])
+                    print(table)
+                    return model
+
                 resolved_path = self.gguf_path or (ws_model.model_path if ws_model else "")
                 if not os.path.exists(resolved_path):
                     raise FileNotFoundError(f"Model file not found: {resolved_path}")
 
                 # Resolve LoRA adapter GGUF path (if any)
                 lora_path = self._resolve_adapter_path()
-
-                project = self.workspace.current_project
 
                 # When the LLM worker pool is active, each worker holds its own
                 # model copy on the same device.  Cap the main model's auto-sized
