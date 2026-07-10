@@ -2251,11 +2251,42 @@ class ModelService:
         """Check if a model is currently loaded"""
         return self._llm is not None
 
+    def _llm_for_response(self, capability: Optional[str]) -> Optional[BaseLLM]:
+        """Return the LLM to use for the final response.
+
+        Fallback chain when *capability* is set: capability-tagged model →
+        largest downloaded model → default orchestrator LLM.  Small models
+        struggle to synthesize long tool-result contexts, so we prefer any
+        larger model when one is available; falls back cleanly to
+        ``self._llm`` when nothing better is present.
+        """
+        if capability:
+            cap_llm = self._get_llm_for_capability(capability)
+            if cap_llm is not None and cap_llm is not self._llm:
+                logger.info(
+                    "[response] Using capability='%s' LLM for final response",
+                    capability,
+                )
+                return cap_llm
+            large_llm = self._get_large_llm()
+            if large_llm is not None and large_llm is not self._llm:
+                logger.info(
+                    "[response] Capability='%s' unavailable — falling back to large LLM",
+                    capability,
+                )
+                return large_llm
+            logger.info(
+                "[response] Capability='%s' unavailable and no larger model — using default LLM",
+                capability,
+            )
+        return self._llm
+
     def stream_completion(
         self,
         prompt: str,
         model_name: Optional[str] = None,
         cancelled: Optional[threading.Event] = None,
+        capability: Optional[str] = None,
     ) -> Iterator[GenerationChunk]:
         """
         Stream completion from the LLM.
@@ -2269,30 +2300,34 @@ class ModelService:
             model_name: Unused, kept for caller compatibility
             cancelled: Optional event that signals the caller wants to
                        abort inference early.  Checked between chunks.
+            capability: When set, prefer the LLM matching this capability
+                        over ``self._llm`` for the final response.
 
         Yields:
             GenerationChunk objects from the LLM
         """
-        if self._llm is None:
+        llm = self._llm_for_response(capability)
+        if llm is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         # Propagate cancellation event to the LLM so it can stop mid-inference
-        self._llm._cancelled = cancelled
+        llm._cancelled = cancelled
 
         # Lock around inference - llama-cpp is not thread-safe
         with self._inference_lock:
             try:
-                for chunk in self._llm.stream(prompt):
+                for chunk in llm.stream(prompt):
                     if cancelled is not None and cancelled.is_set():
                         break
                     yield chunk
             finally:
-                self._llm._cancelled = None
+                llm._cancelled = None
 
     def generate_completion(
         self,
         prompt: str,
         model_name: Optional[str] = None,
+        capability: Optional[str] = None,
     ) -> str:
         """
         Generate a non-streaming completion.
@@ -2302,15 +2337,18 @@ class ModelService:
         Args:
             prompt: The formatted prompt string
             model_name: Unused, kept for caller compatibility
+            capability: When set, prefer the LLM matching this capability
+                        over ``self._llm`` for the final response.
 
         Returns:
             The generated text response
         """
-        if self._llm is None:
+        llm = self._llm_for_response(capability)
+        if llm is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         with self._inference_lock:
-            return self._llm.invoke(prompt)
+            return llm.invoke(prompt)
 
     def add_document(self, source: str, project_id: str | None = None, progress_callback=None) -> dict:
         """Add a document source (file path or URL) to a project (by ID or current).
