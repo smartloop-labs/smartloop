@@ -51,6 +51,51 @@ def _status_event(step: str, status: str, message: str) -> str:
 _executor = ThreadPoolExecutor(max_workers=1)
 
 
+_TAG_ESCAPE = {
+    "<system>": "&lt;system&gt;",
+    "</system>": "&lt;/system&gt;",
+    "<user>": "&lt;user&gt;",
+    "</user>": "&lt;/user&gt;",
+    "<assistant>": "&lt;assistant&gt;",
+    "</assistant>": "&lt;/assistant&gt;",
+}
+
+
+def _extract_tool_content(orchestrator_context: str) -> str:
+    """Extract the raw tool payload from the orchestrator's wrapped context.
+
+    The orchestrator wraps live tool output as ``TOOL RESULTS:\\n{payload}\\n\\n
+    The above is live data...``.  When the model fails to synthesize we
+    want to fall back to just the payload, without the rules footer.
+    """
+    if not orchestrator_context:
+        return ""
+    marker = "TOOL RESULTS:\n"
+    start = orchestrator_context.find(marker)
+    if start < 0:
+        return orchestrator_context.strip()
+    body = orchestrator_context[start + len(marker):]
+    footer = "\n\nThe above is live data"
+    end = body.find(footer)
+    if end >= 0:
+        body = body[:end]
+    return body.strip()
+
+
+def _escape_role_tags(text: str) -> str:
+    """Escape literal role tags in *text* so they don't break the regex in
+    ``create_messages_from_prompt``.  Fetched web content can contain
+    ``<user>`` or ``</user>`` (e.g. HTML/chat tutorials); leaving them
+    unescaped truncates the extracted prompt catastrophically and makes
+    the model emit no output.
+    """
+    if not text:
+        return text
+    for tag, esc in _TAG_ESCAPE.items():
+        text = text.replace(tag, esc)
+    return text
+
+
 def format_messages_to_prompt(
     messages: List[ChatMessage],
     context: str | None = None,
@@ -74,22 +119,32 @@ def format_messages_to_prompt(
     prompt_parts.append(f"<system>{system_content}</system>")
 
     context_injected = False
+    last_user_idx = next(
+        (i for i in range(len(messages) - 1, -1, -1) if messages[i].role == "user"),
+        None,
+    )
 
-    for msg in messages:
+    for i, msg in enumerate(messages):
         if msg.role == "system":
             continue
         elif msg.role == "assistant":
-            prompt_parts.append(f"<assistant>{msg.content}</assistant>")
+            prompt_parts.append(
+                f"<assistant>{_escape_role_tags(msg.content or '')}</assistant>"
+            )
         elif msg.role == "user":
             user_parts = []
 
-            if not context_injected:
-                if context:
-                    user_parts.append(context)
-                context_injected = True
-
+            # Put the user's question FIRST so the model always sees a clear
+            # question, then the tool/document context.  Otherwise a short
+            # question (e.g. just a URL) gets buried after a large context
+            # block and small models emit no response.
             if msg.content:
-                user_parts.append(msg.content)
+                user_parts.append(_escape_role_tags(msg.content))
+
+            if not context_injected and i == last_user_idx:
+                if context:
+                    user_parts.append(_escape_role_tags(context))
+                context_injected = True
 
             user_content = "\n\n".join(user_parts)
             prompt_parts.append(f"<user>{user_content}</user>")
@@ -378,7 +433,11 @@ async def stream_chunks(
 
     yield _status_event("preparing", "completed", "Preparing response...")
 
-    logger.info("[models] RESPONSE → main LLM (model_service._model_name=%s)", getattr(model_service, '_model_name', '?'))
+    response_capability = "knowledge" if orchestrator_context else None
+    logger.info(
+        "[models] RESPONSE → main LLM (model_service._model_name=%s, capability=%s)",
+        getattr(model_service, '_model_name', '?'), response_capability,
+    )
 
     # Store the user message in session history
     if request.session_id and last_user_msg:
@@ -386,20 +445,127 @@ async def stream_chunks(
 
     cancelled = threading.Event()
 
+    def _is_degenerate(text: str) -> bool:
+        """True when the model produced no meaningful content.
+
+        A response of just ``\\`\\`\\``` (an unclosed code fence), whitespace,
+        or fewer than 3 alphanumeric characters means the model tried to
+        open a markdown block or stray token and hit EOS immediately.
+        """
+        stripped = text.strip().strip("`").strip("*").strip("_").strip()
+        if len(stripped) < 3:
+            return True
+        alnum = sum(ch.isalnum() for ch in stripped)
+        return alnum < 3
+
     def run_sync_stream():
-        """Run the sync stream in a thread and put chunks in queue"""
+        """Run the sync stream in a thread and put chunks in queue.
+
+        When tool context is present we buffer only the OPENING of the
+        stream so a degenerate output (small models often emit just ```)
+        can be detected and replaced by a non-streaming retry.  Once we
+        see enough real content we flush the buffer and stream normally
+        so larger, capable models don't lose streaming UX.
+        """
+        collected: list[str] = []
+        # Only buffer for tool-synthesis; regular chat streams immediately.
+        buffered = orchestrator_context is not None
+        opening_chars = 0
+        _ALNUM_STREAM_THRESHOLD = 20
+
         try:
-            for chunk in model_service.stream_completion(prompt, request.model, cancelled=cancelled):
+            for chunk in model_service.stream_completion(
+                prompt, request.model, cancelled=cancelled,
+                capability=response_capability,
+            ):
                 if cancelled.is_set():
                     break
                 text = chunk.text if hasattr(chunk, 'text') else str(chunk)
-                if text:
+                if not text:
+                    continue
+                collected.append(text)
+
+                if not buffered:
                     loop.call_soon_threadsafe(queue.put_nowait, text)
+                    continue
+
+                # Still in the opening-buffer window.
+                opening_chars += sum(ch.isalnum() for ch in text)
+                if opening_chars >= _ALNUM_STREAM_THRESHOLD:
+                    # Enough real content — flush buffered chunks and
+                    # switch to normal streaming mode for the remainder.
+                    for t in collected:
+                        loop.call_soon_threadsafe(queue.put_nowait, t)
+                    buffered = False
         except Exception as e:
             logger.error(f"Error in sync stream: {e}")
             loop.call_soon_threadsafe(queue.put_nowait, Exception(str(e)))
-        finally:
-            loop.call_soon_threadsafe(queue.put_nowait, None)  # Signal completion
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+            return
+
+        if cancelled.is_set():
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+            return
+
+        response = "".join(collected)
+
+        # If we already flushed the buffer we've been streaming — done.
+        if not buffered:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+            return
+
+        if orchestrator_context and _is_degenerate(response):
+            logger.warning(
+                "[stream] Degenerate response (%r) — retrying with simplified prompt",
+                response[:40],
+            )
+            # Strip the TOOL RESULTS wrapper and its rules, ask the model
+            # to answer with a minimal prompt structure.  Same-prompt
+            # retries produce the same output at low temperature, so we
+            # only bother with an input that's actually different.
+            raw_content = _extract_tool_content(orchestrator_context)
+            retry = ""
+            if raw_content:
+                simple_prompt = (
+                    f"<system>You are a helpful assistant.</system>\n"
+                    f"<user>{_escape_role_tags(last_user_msg or 'Summarize the content below.')}\n\n"
+                    f"Content:\n{_escape_role_tags(raw_content)}</user>"
+                )
+                try:
+                    retry = model_service.generate_completion(
+                        simple_prompt, request.model,
+                        capability=response_capability,
+                    )
+                except Exception as e:
+                    logger.error(f"[stream] Simplified retry failed: {e}")
+                    retry = ""
+
+            if retry and not _is_degenerate(retry):
+                response = retry
+            else:
+                logger.warning(
+                    "[stream] Simplified retry also degenerate (%r) — returning guidance message",
+                    (retry or "")[:40],
+                )
+                response = (
+                    "**No response generated.**\n\n"
+                    "The current model wasn't able to synthesize the "
+                    "fetched content. This usually means the loaded "
+                    "model doesn't have the capabilities needed for "
+                    "document reading or skill-based synthesis.\n\n"
+                    "To fix this, open **Settings → Models** and enable "
+                    "a model tagged with **DP** (document processing) or "
+                    "**skills** capability. Larger knowledge-capable "
+                    "models handle URL fetches, document Q&A, and "
+                    "long-context summaries much more reliably than "
+                    "the small default router model."
+                )
+
+        if orchestrator_context and response:
+            # Emit the (possibly retried) full response as one chunk.
+            loop.call_soon_threadsafe(queue.put_nowait, response)
+
+        loop.call_soon_threadsafe(queue.put_nowait, None)
 
     # Start the sync stream in thread pool
     _executor.submit(run_sync_stream)
@@ -463,6 +629,10 @@ async def stream_chunks(
 
         # Save partial (or full) response to session history
         full_response = "".join(full_response_parts)
+        logger.info(
+            "[stream] Streaming finished — %d chunk(s), %d char(s), preview=%r",
+            len(full_response_parts), len(full_response), full_response[:200],
+        )
         if request.session_id and full_response:
             model_service.append_to_session(request.session_id, "assistant", full_response, citations=citations, message_id=message_id)
 
@@ -664,11 +834,12 @@ async def create_chat_completion(
             model_service.append_to_session(request.session_id, "user", last_user_msg)
 
         # Run sync completion in thread pool
+        response_capability = "knowledge" if orchestrator_context else None
         response_text = await loop.run_in_executor(
             _executor,
-            model_service.generate_completion,
-            prompt,
-            request.model,
+            lambda: model_service.generate_completion(
+                prompt, request.model, capability=response_capability,
+            ),
         )
 
         # Auto file-write: if user asked to create/generate/write, save LLM response to file
