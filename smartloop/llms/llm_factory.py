@@ -2,11 +2,46 @@
 import os
 import json
 import sys
+import time
 import subprocess
 import tempfile
 from logging import Logger
 from pathlib import Path
-from smartloop.utils.device_utils import get_device_config
+from smartloop.utils.device_utils import (
+    get_device_config, ensure_openvino_device_env, available_intel_devices,
+)
+
+
+def _has_openvino_backend() -> bool:
+    """True when the ggml-openvino backend DLL/SO is present in the llama_cpp lib dir."""
+    try:
+        import llama_cpp
+        lib_dir = Path(llama_cpp.__file__).parent / "lib"
+        return any(
+            (lib_dir / name).exists()
+            for name in ("ggml-openvino.dll", "libggml-openvino.so", "ggml-openvino.so")
+        )
+    except Exception:
+        return False
+
+
+def _has_cuda_backend() -> bool:
+    """True when the ggml-cuda backend DLL/SO is present in the llama_cpp lib dir.
+
+    Guards against the case where nvidia-smi reports a GPU but the llama-cpp
+    build was compiled without CUDA support (e.g. only -DGGML_OPENVINO=ON).
+    Without this check n_gpu_layers is set non-zero for a missing backend,
+    causing ggml graph allocation to fail and llama_decode to return -3.
+    """
+    try:
+        import llama_cpp
+        lib_dir = Path(llama_cpp.__file__).parent / "lib"
+        return any(
+            (lib_dir / name).exists()
+            for name in ("ggml-cuda.dll", "libggml-cuda.so", "ggml-cuda.so")
+        )
+    except Exception:
+        return False
 
 
 def _get_cuda_vram_gb() -> float | None:
@@ -204,6 +239,140 @@ class LlmFactory:
             return None
 
     @staticmethod
+    def _is_openvino_ir_dir(path: str) -> bool:
+        """True when *path* is a directory holding an OpenVINO IR export."""
+        return bool(path) and (Path(path) / "openvino_model.xml").exists()
+
+    @staticmethod
+    def _find_openvino_ir_dir(gguf_path: str) -> str | None:
+        """Locate an OpenVINO IR export shipped alongside a GGUF model.
+
+        The IR follows the workspace model layout: the GGUF lives in
+        ``models/<org>/<model-name>/<model-name>-<quant>.gguf`` and its IR
+        export sits beside it, named after the model (not the quantized
+        file).  Both an INT8 export (``<model-name>-ov-int8/``) and the
+        default export (``<model-name>-ov/``) are recognized, the INT8 one
+        taking precedence.  A directory qualifies when it contains
+        ``openvino_model.xml``.
+        """
+        model_dir = Path(gguf_path).parent
+        for suffix in ("-ov-int8", "-ov"):
+            ir_dir = model_dir / f"{model_dir.name}{suffix}"
+            if (ir_dir / "openvino_model.xml").exists():
+                return str(ir_dir)
+        return None
+
+    @staticmethod
+    def _ir_npu_compatible(ir_dir: str) -> bool:
+        """False when the IR cannot compile on the NPU, so the load loop can
+        skip it without paying a doomed compile attempt.
+
+        Models with active sliding-window attention (e.g. Gemma-3,
+        sliding_window=512) bake a windowed mask Slice into the IR that the
+        NPU's static-shape SDPA validation rejects ("Attention mask input
+        shape not compatible with other inputs").
+        """
+        try:
+            cfg = json.loads((Path(ir_dir) / "config.json").read_text())
+        except Exception:
+            return True  # unknown — let the NPU compile attempt decide
+        if cfg.get("use_sliding_window") is False:
+            return True  # declared but disabled (e.g. Qwen2.5)
+        return not cfg.get("sliding_window")
+
+    @staticmethod
+    def get_openvino_genai_instance(ir_dir: str, device: str, logger: Logger,
+                                    project_id: str):
+        """Load an OpenVINO IR model with openvino_genai on an Intel GPU/NPU.
+
+        Used instead of llama.cpp on Intel machines: the ggml-openvino
+        backend cannot decode several architectures (Gemma-3 included) on
+        any device, while GenAI runs INT4/INT8 IR exports natively.
+        """
+        import openvino_genai as ov_genai
+        from smartloop.llms.openvino_genai_llm import OpenVinoGenAI
+
+        # Effective context: the model's trained maximum, capped so the
+        # KV cache stays reasonable on shared-memory Intel devices.
+        max_context = 8192
+        try:
+            cfg = json.loads((Path(ir_dir) / "config.json").read_text())
+            trained = int(cfg.get("max_position_embeddings", max_context))
+            max_context = max(2048, min(trained, 8192))
+        except Exception:
+            pass
+
+        properties = {}
+        if device.upper().startswith("GPU"):
+            # Cache compiled blobs next to the model to cut reload time.
+            properties["CACHE_DIR"] = str(Path(ir_dir) / ".ov_cache")
+        elif device.upper().startswith("NPU"):
+            # The NPU pipeline compiles for a fixed prompt budget
+            # (default 1024) — raise it so real RAG prompts fit.
+            properties["MAX_PROMPT_LEN"] = min(max_context, 4096)
+
+        start = time.time()
+        pipe = ov_genai.LLMPipeline(ir_dir, device, **properties)
+        logger.info(
+            f"OpenVINO GenAI loaded {ir_dir} on {device} "
+            f"in {time.time() - start:.1f}s (max_context={max_context})"
+        )
+
+        # Some devices compile the model but abort on the very first decode —
+        # notably the Intel iGPU OpenCL runtime on hybrid NVIDIA+Intel hosts.
+        # Run a one-token decode here (the GenAI analogue of the llama.cpp
+        # decode probe) so a device that can't actually generate raises now —
+        # the caller's load loop then advances to the next Intel device and
+        # ultimately to llama.cpp.
+        smoke = ov_genai.GenerationConfig()
+        smoke.max_new_tokens = 1
+        smoke.do_sample = False
+        pipe.generate("Hi", smoke)
+        logger.info(f"OpenVINO GenAI decode smoke-test passed on {device}")
+
+        return OpenVinoGenAI(
+            model=pipe,
+            tokenizer=pipe.get_tokenizer(),
+            logger=logger,
+            project_id=project_id,
+            max_context=max_context,
+        )
+
+    @staticmethod
+    def load_openvino_ir(ir_dir: str, logger: Logger, project_id: str):
+        """Load an OpenVINO IR across the available Intel accelerators.
+
+        Tries each Intel device in preference order (NPU first, then Intel
+        GPUs), skipping the NPU for sliding-window models it cannot compile and
+        advancing past any device whose compile or first decode fails.  Returns
+        the loaded ``OpenVinoGenAI`` instance, or ``None`` when no Intel device
+        could load it — the caller decides whether to fall back to llama.cpp
+        (GGUF present) or surface the failure (IR-only model).
+        """
+        for intel_device in available_intel_devices():
+            if intel_device.upper() == "CPU":
+                continue
+            if (intel_device.upper().startswith("NPU")
+                    and not LlmFactory._ir_npu_compatible(ir_dir)):
+                logger.info(
+                    "Skipping NPU: model uses sliding-window "
+                    "attention, which the NPU cannot compile"
+                )
+                continue
+            try:
+                return LlmFactory.get_openvino_genai_instance(
+                    ir_dir, intel_device, logger, project_id)
+            except Exception as e:
+                reason = str(e).strip().splitlines()
+                logger.warning(
+                    f"OpenVINO GenAI load failed on {intel_device} "
+                    f"({reason[0] if reason else e}); trying next device"
+                )
+        if available_intel_devices():
+            logger.warning("OpenVINO GenAI unavailable on all Intel devices")
+        return None
+
+    @staticmethod
     def get_llama_cpp_instance(
         path: str, logger: Logger, project_id: str, lora_path: str | None = None,
         *, probe: bool = True, max_n_ctx: int | None = None,
@@ -228,6 +397,23 @@ class LlmFactory:
         handler object isn't JSON-serializable) and the load is forced
         in-process.
         """
+        # Intel machines: prefer OpenVINO GenAI when an IR export ships
+        # alongside the GGUF — the ggml-openvino llama.cpp backend cannot
+        # decode several architectures (Gemma-3, all smartloop models included)
+        # on any OpenVINO device, while GenAI runs the INT8 IR natively on the
+        # iGPU/NPU.  LoRA and vision loads stay on llama.cpp.
+        if not mmproj_path and not lora_path:
+            ir_dir = LlmFactory._find_openvino_ir_dir(path)
+            if ir_dir:
+                instance = LlmFactory.load_openvino_ir(ir_dir, logger, project_id)
+                if instance is not None:
+                    return instance
+                if available_intel_devices():
+                    logger.warning(
+                        "OpenVINO GenAI unavailable on all Intel devices; "
+                        "falling back to llama.cpp"
+                    )
+
         import torch
         from llama_cpp import Llama
         from smartloop.llms.llama_cpp import LlamaCpp
@@ -252,38 +438,19 @@ class LlmFactory:
         # Calculate optimal context size based on available memory
         n_ctx = 8192  # Default context size
 
-        # Adjust GPU layers and context based on available memory
+        # Adjust GPU layers and context based on available memory.
+        # Priority: MPS (Mac) → OpenVINO (Intel iGPU/NPU) → CUDA (NVIDIA) → CPU.
+        # OpenVINO is tried first: when an Intel iGPU/NPU is present it is
+        # preferred over CUDA.  ov_device is set (before the first llama_cpp
+        # backend init) by DeviceConfig._detect_device() only when the
+        # ggml-openvino backend is built in AND a real Intel accelerator exists,
+        # so it doubles as the "can we do OpenVINO?" test here.
         vram_gb = _get_cuda_vram_gb()
-        if vram_gb is not None:
-            # Calculate available memory after model loading
-            # Reserve memory for: model weights + KV cache + overhead
-            available_for_kv = vram_gb - model_size_gb - 0.5  # 0.5GB overhead
+        ov_device = ensure_openvino_device_env()
+        # Extra Llama() kwargs a branch needs to pin device placement.
+        placement_kwargs: dict = {}
 
-            if available_for_kv > 0:
-                # Estimate context size based on available memory
-                # KV cache memory per 8k tokens (conservative estimates for quantized models)
-                kv_per_8k = 0.25 if model_size_gb < 3 else 0.5 if model_size_gb < 6 else 1.0
-                estimated_ctx = int((available_for_kv / kv_per_8k) * 8192)
-
-                # Allow larger contexts — cap at model's trained context length or hardware limit
-                max_ctx = 32768 if model_size_gb < 3 else 16384 if model_size_gb < 6 else 8192
-                n_ctx = max(2048, min(estimated_ctx, max_ctx))
-                logger.info(f"Calculated optimal context: {n_ctx} tokens for {vram_gb:.1f}GB VRAM, {model_size_gb:.1f}GB model")
-            else:
-                # Limited VRAM - use smaller context
-                n_ctx = 2048
-                logger.warning(f"Limited VRAM ({vram_gb:.1f}GB) for {model_size_gb:.1f}GB model, using context={n_ctx}")
-
-            # If model is larger than available VRAM, reduce GPU layers
-            if model_size_gb > vram_gb * 0.8:  # Use up to 80% VRAM for model weights
-                # Estimate layers that can fit (assuming ~30-40 layers for 4B models)
-                estimated_layers = int((vram_gb * 0.7) / model_size_gb * 35)
-                llama_config.n_gpu_layers = max(0, estimated_layers)
-                logger.warning(
-                    f"Model size ({model_size_gb:.1f}GB) requires conservative GPU allocation. "
-                    f"Using {llama_config.n_gpu_layers} GPU layers (rest on CPU)"
-                )
-        elif torch.backends.mps.is_available():
+        if torch.backends.mps.is_available():
             # Apple Silicon — unified memory shared between CPU and GPU.
             # Metal handles GPU offloading via n_gpu_layers=-1 (already set).
             import psutil
@@ -306,11 +473,78 @@ class LlmFactory:
                 f"Apple Silicon: {total_mem_gb:.0f}GB total, {available_mem_gb:.1f}GB available, "
                 f"{model_size_gb:.1f}GB model — using n_ctx={n_ctx}, n_gpu_layers={llama_config.n_gpu_layers}"
             )
+
+        elif ov_device and ov_device.upper() != "CPU":
+            # Intel iGPU/NPU via the ggml-openvino backend — preferred over CUDA.
+            # ov_device is a real Intel accelerator (GPU/NPU); OpenVINO's
+            # intel_cpu plugin is intentionally excluded (it has known decode
+            # bugs, e.g. a scatter_update assertion on Gemma 3), so a host with
+            # no Intel GPU/NPU falls through to CUDA or the native CPU backend.
+            llama_config.n_gpu_layers = -1  # offload all layers to iGPU/NPU via OpenVINO
+
+            # The NPU compiles a static graph, so a large context OOMs at load
+            # (the backend docs recommend an explicit small -c); cap it well
+            # below the GPU/CPU budget.  The iGPU shares system RAM, so size its
+            # KV cache from available memory like CUDA sizes from VRAM.
+            ov_ctx_cap = 4096 if ov_device.upper().startswith("NPU") else 32768
+            import psutil
+            avail_gb = psutil.virtual_memory().available / (1024**3)
+            available_for_kv = avail_gb - model_size_gb - 1.0
+            if available_for_kv > 0:
+                kv_per_8k = 0.5 if model_size_gb < 3 else 1.0 if model_size_gb < 6 else 1.5
+                n_ctx = max(2048, min(int(available_for_kv / kv_per_8k * 8192), ov_ctx_cap))
+            else:
+                n_ctx = min(2048, ov_ctx_cap)
+            logger.info(
+                f"OpenVINO backend — GGML_OPENVINO_DEVICE={ov_device}, "
+                f"n_ctx={n_ctx}, n_gpu_layers={llama_config.n_gpu_layers}"
+            )
+
+        elif vram_gb is not None and _has_cuda_backend():
+            # NVIDIA CUDA — context sized from VRAM so the KV cache fits.
+            # Reserve memory for: model weights + KV cache + overhead
+            available_for_kv = vram_gb - model_size_gb - 0.5  # 0.5GB overhead
+
+            if available_for_kv > 0:
+                # Estimate context size based on available memory
+                # KV cache memory per 8k tokens (conservative estimates for quantized models)
+                kv_per_8k = 0.25 if model_size_gb < 3 else 0.5 if model_size_gb < 6 else 1.0
+                estimated_ctx = int((available_for_kv / kv_per_8k) * 8192)
+
+                # Allow larger contexts — cap at model's trained context length or hardware limit
+                max_ctx = 32768 if model_size_gb < 3 else 16384 if model_size_gb < 6 else 8192
+                n_ctx = max(2048, min(estimated_ctx, max_ctx))
+                logger.info(f"CUDA: {vram_gb:.1f}GB VRAM, {model_size_gb:.1f}GB model — n_ctx={n_ctx}")
+            else:
+                # Limited VRAM - use smaller context
+                n_ctx = 2048
+                logger.warning(f"Limited VRAM ({vram_gb:.1f}GB) for {model_size_gb:.1f}GB model, using context={n_ctx}")
+
+            # If model is larger than available VRAM, reduce GPU layers
+            if model_size_gb > vram_gb * 0.8:  # Use up to 80% VRAM for model weights
+                # Estimate layers that can fit (assuming ~30-40 layers for 4B models)
+                estimated_layers = int((vram_gb * 0.7) / model_size_gb * 35)
+                llama_config.n_gpu_layers = max(0, estimated_layers)
+                logger.warning(
+                    f"Model size ({model_size_gb:.1f}GB) requires conservative GPU allocation. "
+                    f"Using {llama_config.n_gpu_layers} GPU layers (rest on CPU)"
+                )
+            if _has_openvino_backend():
+                # Combined CUDA+OpenVINO build with no usable Intel device: the
+                # scheduler otherwise splits layers between CUDA0 and OPENVINO0
+                # (which advertises system RAM as free device memory) and
+                # llama_decode fails with -3.  Pin every offloaded layer to CUDA0.
+                import llama_cpp as _llama_cpp
+                placement_kwargs = {
+                    'split_mode': getattr(_llama_cpp, 'LLAMA_SPLIT_MODE_NONE', 0),
+                    'main_gpu': 0,
+                }
+                logger.info("Dual CUDA+OpenVINO build — pinning all layers to CUDA0 (split_mode=NONE)")
+
         else:
-            # No GPU available — CPU only
+            # No GPU of any kind — pure CPU.
             llama_config.n_gpu_layers = 0
-            n_threads = os.cpu_count() or 4
-            logger.info(f"No GPU available, offloading entire model to CPU with {n_threads} threads")
+            logger.info(f"No GPU available, offloading entire model to CPU ({os.cpu_count() or 4} threads)")
 
         # Cap the auto-sized context for worker copies so multiple model
         # instances (each with its own KV cache) fit on a single GPU.
@@ -325,7 +559,8 @@ class LlmFactory:
             'n_ctx': n_ctx,
             'n_batch': 512,  # Smaller batch size for memory efficiency
             'n_threads': 4,  # Limit CPU threads
-            **llama_config.model_dump()
+            **llama_config.model_dump(),
+            **placement_kwargs,
         }
 
         if lora_path:

@@ -114,16 +114,20 @@ def _bootstrap_orchestrator_model(model_service) -> None:
     if not bootstrap_models:
         raise RuntimeError("No bootstrap models available from the bootstrap source")
 
-    target = bootstrap_models[0]
-    name = target.get("name")
-    model_id = SLPArtifactDownloader._resolve_model_id(name)
+    # Resolve the bootstrap target: on an Intel/OpenVINO host this prefers the
+    # "<name>-ov-int8" IR variant (its own model folder), else the GGUF model.
+    target = downloader.bootstrap_target()
+    name = target.routing_name
+    model_id = target.model_id
 
-    logger.info(f"Bootstrapping orchestrator model '{name}'...")
-    downloader.bootstrap_download(name)
+    logger.info(f"Bootstrapping orchestrator model '{target.download_name}'...")
+    downloader.bootstrap_download(target.download_name)
 
     # Register (or reuse) the workspace entry and mark it downloaded so the
     # subsequent load_model() and config watchers find it. add_model is
     # alias-aware, so an existing legacy-named entry is reused, not duplicated.
+    # The routing name stays the GGUF model's name (capability routing is
+    # unchanged); model_id points at the IR folder for the OpenVINO variant.
     workspace.add_model(name, model_id)
     ws_model = workspace.get_model(name)
     if ws_model is not None:

@@ -1,7 +1,9 @@
 """Device detection and configuration utilities for cross-platform compatibility"""
 import enum
+import os
 import torch
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Any, Optional
 from pydantic import BaseModel
 import sys
@@ -16,6 +18,132 @@ class DeviceType(enum.Enum):
     CPU = "cpu"
     CUDA = "cuda"
     MPS = "mps"
+    OPENVINO = "openvino"  # Intel iGPU/NPU via the ggml-openvino llama.cpp backend
+
+
+def _backend_dll_present(stem: str) -> bool:
+    """True when the given ggml backend library ships in the llama_cpp lib dir."""
+    try:
+        import llama_cpp
+        lib_dir = Path(llama_cpp.__file__).parent / "lib"
+        return any(
+            (lib_dir / name).exists()
+            for name in (f"{stem}.dll", f"lib{stem}.so", f"{stem}.so")
+        )
+    except Exception:
+        return False
+
+
+_intel_devices_cache: dict = {}
+
+
+def _is_intel_gpu(core, device: str) -> bool:
+    """True when an OpenVINO GPU device is an Intel GPU rather than another
+    vendor's card exposed through the OpenCL ICD.
+
+    On a hybrid Intel+NVIDIA host OpenVINO can enumerate the NVIDIA dGPU as a
+    ``GPU`` device; running an LLM on it aborts at the first decode.  Filtering
+    by ``FULL_DEVICE_NAME`` keeps only real Intel GPUs.
+    """
+    try:
+        name = str(core.get_property(device, "FULL_DEVICE_NAME"))
+    except Exception:
+        return False
+    return "INTEL" in name.upper()
+
+
+def available_intel_devices() -> list:
+    """Ordered Intel accelerators to try (plain ``NPU``/``GPU``), or [] when
+    none exist (or the OpenVINO runtime is unavailable).
+
+    NPU is preferred over GPU (keep the GPU free and run sustained LLM load on
+    the power-efficient NPU); GPU stays in the list as a fallback for models
+    whose ops don't compile on the NPU.  ``SMARTLOOP_OV_DEVICE`` overrides the
+    list with exactly that device.  Memoised — the OpenVINO ``Core()`` probe
+    costs a few hundred ms.
+    """
+    override = os.environ.get("SMARTLOOP_OV_DEVICE")
+    if override:
+        return [override.upper()]
+    if "devices" in _intel_devices_cache:
+        return _intel_devices_cache["devices"]
+
+    try:
+        from openvino import Core
+        core = Core()
+        available = core.available_devices
+        devices = []
+        # NPU first (preferred), then Intel GPUs.  NVIDIA/other GPUs exposed
+        # through the OpenCL ICD are dropped by the vendor filter (an LLM
+        # can't run there).
+        for base in ("NPU", "GPU"):
+            for dev in available:
+                if dev.split(".")[0].upper() != base:
+                    continue
+                if base == "GPU" and not _is_intel_gpu(core, dev):
+                    continue
+                devices.append(dev.upper())
+    except Exception:
+        devices = []
+    _intel_devices_cache["devices"] = devices
+    return devices
+
+
+def preferred_intel_device() -> Optional[str]:
+    """First entry of available_intel_devices(), or None."""
+    devices = available_intel_devices()
+    return devices[0] if devices else None
+
+
+def openvino_genai_supported() -> bool:
+    """True when this host can run an OpenVINO IR model through OpenVINO GenAI:
+    the ``openvino_genai`` runtime is importable AND a real Intel accelerator
+    (NPU or Intel GPU) is available.
+
+    Used by the model downloader to decide whether to bootstrap the
+    ``<name>-ov-int8`` IR variant instead of the GGUF — the GenAI route runs
+    Gemma-3 natively on the iGPU/NPU, which the ggml-openvino llama.cpp backend
+    cannot (see [[openvino-llamacpp-gemma3-blocked]]).
+    """
+    try:
+        import openvino_genai  # noqa: F401
+    except Exception:
+        return False
+    return any(dev.upper() != "CPU" for dev in available_intel_devices())
+
+
+def ensure_openvino_device_env() -> Optional[str]:
+    """Export GGML_OPENVINO_DEVICE before the first llama.cpp backend init.
+
+    The ggml-openvino backend reads GGML_OPENVINO_DEVICE exactly once, when
+    the backend registers (the first llama_cpp backend init anywhere in the
+    process); setting it later has no effect.  The device name must match an
+    entry the OpenVINO runtime enumerates *exactly* — on a multi-GPU host the
+    devices are "GPU.0"/"GPU.1" and passing the bare "GPU" is reported as "not
+    available" and silently falls back to the (buggy) intel_cpu device, so the
+    full enumerated id is exported verbatim.
+
+    Called from DeviceConfig._detect_device(), the common chokepoint of every
+    model-load path, so it runs before anything initialises llama_cpp.
+    Returns the exported device name, or None when OpenVINO routing does not
+    apply (no OV backend build, or no Intel accelerator).
+
+    OpenVINO is preferred over CUDA when both are available: an Intel iGPU/NPU
+    is chosen whenever one exists, and the factory only falls back to CUDA when
+    this returns None (or "CPU").
+    """
+    existing = os.environ.get("GGML_OPENVINO_DEVICE")
+    if existing:
+        return existing
+    if not _backend_dll_present("ggml-openvino"):
+        return None
+    device = preferred_intel_device()
+    if device:
+        # Export the full enumerated id (e.g. GPU.0) — the backend matches it
+        # exactly against the OpenVINO device list; a stripped "GPU" is treated
+        # as unavailable and falls back to CPU.
+        os.environ["GGML_OPENVINO_DEVICE"] = device
+    return device
 
 
 class LlamaCppConfig(BaseModel):
@@ -35,9 +163,19 @@ class DeviceConfig:
 
     def _detect_device(self) -> DeviceType:
         """Detect the best available device via llama_cpp"""
+        # Must run before llama_cpp initialises its backends — the OpenVINO
+        # device choice is latched at backend registration.
+        ov_device = ensure_openvino_device_env()
         from llama_cpp import llama_supports_gpu_offload
         if llama_supports_gpu_offload():
-            return DeviceType.MPS if sys.platform == 'darwin' else DeviceType.CUDA
+            if sys.platform == 'darwin':
+                return DeviceType.MPS
+            # ensure_openvino_device_env only exports a device when no working
+            # NVIDIA GPU is present, so it doubles as the CUDA-vs-OpenVINO
+            # discriminator here.
+            if ov_device:
+                return DeviceType.OPENVINO
+            return DeviceType.CUDA
         return DeviceType.CPU
 
     def get_device_description(self) -> str:
@@ -46,6 +184,9 @@ class DeviceConfig:
             return "NVIDIA GPU"
         elif self.device == DeviceType.MPS:
             return "Apple Metal GPU"
+        elif self.device == DeviceType.OPENVINO:
+            ov = os.environ.get("GGML_OPENVINO_DEVICE", "auto")
+            return f"Intel {ov} (OpenVINO)"
         return "CPU"
 
     def _get_compute_dtype(self) -> torch.dtype:

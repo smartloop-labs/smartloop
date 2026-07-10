@@ -5,6 +5,7 @@ import threading
 
 import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 from smartloop.platform import SLPPlatformClient
@@ -13,6 +14,23 @@ from smartloop.config import AppSettings
 from smartloop.model.downloader.artifact_source import SLPModelSource, SLPBootstrapSource
 from smartloop.model.downloader.slp_downloader import SLPDownloader, DownloadProgress, ProgressCallback
 from smartloop.workspace import Workspace
+
+
+@dataclass
+class BootstrapTarget:
+    """Resolved bootstrap model to download.
+
+    ``routing_name`` is the short model name the workspace registers under
+    (kept as the GGUF sibling's name so capability routing is unaffected);
+    ``model_id`` is the on-disk model folder — a dedicated ``<name>-ov-int8``
+    directory for the IR variant so the export is not nested inside the GGUF
+    model.  ``download_name`` is the bootstrap entry to fetch.
+    ``is_openvino`` is True when the IR variant was selected.
+    """
+    routing_name: str
+    model_id: str
+    download_name: str
+    is_openvino: bool
 
 _CPU_COUNT = os.cpu_count() or 4
 _IO_THREAD_BUDGET = min(32, _CPU_COUNT * 2)  # total concurrent connections (capped at 32)
@@ -40,6 +58,19 @@ def _select_gguf_artifacts(artifacts: dict) -> dict:
     quantized = {k: v for k, v in main.items()
                  if "-Q" in os.path.basename(k).upper()}
     return {**(quantized or main), **mmproj}
+
+
+def _select_ir_artifacts(artifacts: dict) -> dict:
+    """Pick which files to download for an OpenVINO IR bootstrap model.
+
+    The ``<name>-ov-int8`` entry ships an OpenVINO IR export — the
+    ``openvino_model.xml``/``.bin`` pair plus its tokenizer and ``config.json``
+    — and no GGUF.  All of those files are needed to load the model, so the
+    whole artifact map is kept as-is (any stray GGUF is dropped since the IR
+    route never uses it).
+    """
+    return {k: v for k, v in artifacts.items()
+            if not os.path.basename(k).endswith(".gguf")}
 
 
 MAX_WORKERS = min(4, _CPU_COUNT)                      # parallel file downloads (capped: I/O-bound)
@@ -300,42 +331,94 @@ class SLPArtifactDownloader(SLPDownloader):
                         f"(bytes {chunk_range[0]}-{chunk_range[1]}): {e}"
                     ) from e
 
-    def bootstrap_download(self, model_name: str | None = None,
-                           progress_callback: ProgressCallback | None = None) -> Path:
-        """Download GGUF model via the unauthenticated /v1/bootstrap/models endpoint.
+    def bootstrap_target(self, model_name: str | None = None) -> BootstrapTarget:
+        """Resolve which bootstrap model to download for this host.
 
-        Intended for first-run scenarios (Electron installer, brew install)
-        where the user has no developer token yet. Downloads only the GGUF
-        file so the model is immediately ready for inference without building.
+        On an Intel host with the OpenVINO runtime (``openvino_genai_supported``)
+        the ``<name>-ov-int8`` IR variant is preferred when the bootstrap
+        endpoint offers it — it is downloaded into its own ``<name>-ov-int8``
+        model folder and loaded through OpenVINO GenAI.  Otherwise (no OpenVINO,
+        or no IR variant published) the default GGUF model is used.
 
-        If *model_name* is provided, only that model's artifacts are downloaded.
-        Otherwise downloads the first model returned by the endpoint.
+        The returned ``routing_name`` is always the GGUF model's short name so
+        the workspace entry keeps the same capability routing regardless of the
+        artifact format.
         """
+        # Imported lazily to avoid a module-load import cycle
+        # (config -> supported_models -> model -> downloader) and to keep the
+        # OpenVINO/torch probe off the import path.
+        from smartloop.config import OV_INT8_SUFFIX
+        from smartloop.utils.device_utils import openvino_genai_supported
+
         models = self._bootstrap_source.list_models()
         if model_name:
-            target = next((m for m in models if m.get("name") == model_name), None)
-            if not target:
+            base = next((m for m in models if m.get("name") == model_name), None)
+            if not base:
                 available = ", ".join(m.get("name", "?") for m in models)
                 raise ValueError(
                     f"Model '{model_name}' not found in bootstrap. "
                     f"Available: {available}"
                 )
         else:
-            target = models[0]
+            base = models[0]
 
-        resolved_name = target.get("name", "unknown")
-        model_id = self._resolve_model_id(resolved_name)
+        base_name = base.get("name", "unknown")
+
+        if openvino_genai_supported() and not base_name.endswith(OV_INT8_SUFFIX):
+            ov_name = f"{base_name}{OV_INT8_SUFFIX}"
+            if any(m.get("name") == ov_name for m in models):
+                self.logger.info(
+                    f"OpenVINO runtime detected — bootstrapping IR variant '{ov_name}'"
+                )
+                return BootstrapTarget(
+                    routing_name=base_name,
+                    model_id=self._resolve_model_id(ov_name),
+                    download_name=ov_name,
+                    is_openvino=True,
+                )
+            self.logger.info(
+                f"OpenVINO runtime detected but no '{ov_name}' bootstrap variant "
+                f"available — falling back to GGUF model '{base_name}'"
+            )
+
+        return BootstrapTarget(
+            routing_name=base_name,
+            model_id=self._resolve_model_id(base_name),
+            download_name=base_name,
+            is_openvino=False,
+        )
+
+    def bootstrap_download(self, model_name: str | None = None,
+                           progress_callback: ProgressCallback | None = None) -> Path:
+        """Download a bootstrap model via the unauthenticated /v1/bootstrap/models endpoint.
+
+        Intended for first-run scenarios (Electron installer, brew install)
+        where the user has no developer token yet. Downloads only the runtime
+        artifacts (GGUF, or the OpenVINO IR export on an Intel/OpenVINO host)
+        so the model is immediately ready for inference without building.
+
+        If *model_name* is provided, that model (or its OpenVINO variant) is
+        downloaded. Otherwise the first model returned by the endpoint is used.
+        """
+        target = self.bootstrap_target(model_name)
+        resolved_name = target.download_name
+        model_id = target.model_id
+
         artifacts = self._bootstrap_source.get_artifacts(resolved_name)
-
-        artifacts = _select_gguf_artifacts(artifacts)
+        if target.is_openvino:
+            artifacts = _select_ir_artifacts(artifacts)
+            kind = "OpenVINO IR"
+        else:
+            artifacts = _select_gguf_artifacts(artifacts)
+            kind = "GGUF"
 
         if not artifacts:
-            raise ValueError(f"No GGUF artifact found for bootstrap model '{resolved_name}'")
+            raise ValueError(f"No {kind} artifact found for bootstrap model '{resolved_name}'")
 
         local_dir = os.path.join(self.workspace.models_dir, model_id)
         os.makedirs(local_dir, exist_ok=True)
 
-        self.logger.info(f"Bootstrap downloading model: {resolved_name}")
+        self.logger.info(f"Bootstrap downloading {kind} model: {resolved_name}")
 
         return self._download_artifacts(artifacts, local_dir, progress_callback,
                                         log_prefix="Bootstrap model", log_dir=local_dir)
