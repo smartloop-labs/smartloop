@@ -683,8 +683,7 @@ class SLPOrchestrator:
             _named = [n for n in doc_names if n]
             self._emit(
                 "read", "processing",
-                f"Reading {len(batch)} document(s): {', '.join(_named)}"
-                if _named else f"Reading {len(batch)} document(s)",
+                f"Reading document: {', '.join(_named)}" if _named else "Reading document",
             )
             combined = "\n\n".join(
                 f"=== Document: {d.get('document_name', '')} ===\n{d.get('content', '')}"
