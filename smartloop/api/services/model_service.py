@@ -2159,34 +2159,22 @@ class ModelService:
 
     # Reference words that signal the latest message depends on prior turns
     # (pronouns / ellipsis).  Only then does history need to resolve the query.
-    _REFERENCE_WORDS = frozenset({
-        "it", "its", "this", "that", "these", "those", "they", "them", "their",
-        "he", "she", "him", "her", "his", "hers", "one", "ones", "same",
-        "above", "previous", "former", "latter", "then",
-    })
-
     def _build_history_search_query(
         self, user_query: str, conversation_history: List[Dict[str, str]]
     ) -> str:
         """Resolve references in the search query using conversation history.
 
-        Conversation history is **context only** — it must not bias or narrow
-        the current query toward earlier topics.  A self-contained message is
-        used verbatim; history is consulted solely to resolve references
-        (pronouns, omitted subjects) in short/ambiguous messages.
+        Whenever the session has prior turns, history is always consulted to
+        resolve references (pronouns, omitted subjects, definite-article
+        follow-ups like "the place") in the latest message.  The rewrite
+        prompt returns a self-contained message unchanged, so there is no
+        semantic gate here — every follow-up in a session gets the chance to
+        be grounded against its history.
 
         The *conversation_history* is expected to be pre-filtered for
         relevance by the caller — no additional windowing is applied.
         """
         if len(conversation_history) <= 1:
-            return user_query
-
-        # Self-contained query → use as-is.  Only rewrite when the message is
-        # short or actually references prior turns, so history can't drag in
-        # entities/topics the user didn't ask about this turn.
-        words = re.findall(r"[a-zA-Z']+", user_query.lower())
-        has_reference = bool(set(words) & self._REFERENCE_WORDS)
-        if len(words) >= 5 and not has_reference:
             return user_query
 
         history_text = "\n".join(

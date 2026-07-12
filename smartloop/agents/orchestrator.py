@@ -453,7 +453,10 @@ class SLPOrchestrator:
     def _handle_skill_match(self, ctx: _OrchestratorContext, node: SkillMatchNode) -> NodeResult:
         """Parse skill front matter then LLM-match against the user query."""
         logger.info("[models] SKILL_MATCH → agent_llm: %s", self._model_label(self.agent_llm))
-        self._emit("analyze", "processing", "Analyzing request")
+        self._emit(
+            "analyze", "processing",
+            f"Analyzing your request against {len(ctx.skills)} available skill(s)",
+        )
         parsed_skills: List[Dict[str, str]] = []
         for sc in ctx.skills:
             name, desc = "", ""
@@ -508,7 +511,6 @@ class SLPOrchestrator:
     ) -> NodeResult:
         """Vector + workspace + feedback search."""
         logger.info("[models] COLLECT → no LLM (vector/feedback/workspace search)")
-        self._emit("search", "processing", "Searching documents")
         matched_skills = deps[skill_match_node.node_id].data.get("matched_skills")
         enriched = ctx.enriched
         search_ctx = self.explorer.collect_parallel(
@@ -532,10 +534,15 @@ class SLPOrchestrator:
     ) -> NodeResult:
         """Decision: build the unified pipeline. Dynamically adds downstream nodes."""
         logger.info("[models] ROUTE (classify+plan) → agent_llm: %s", self._model_label(self.agent_llm))
-        self._emit("plan", "processing", "Planning response")
         matched_skills = deps[skill_match_node.node_id].data.get("matched_skills")
         search_ctx = deps[collect_node.node_id].data.get("search_ctx")
         enrich_ctx = ctx.enriched
+        _skill_names = ", ".join(s.get("name", "") for s in (matched_skills or []) if s.get("name"))
+        self._emit(
+            "plan", "processing",
+            f"Planning the response using skill(s): {_skill_names}"
+            if _skill_names else "Planning the response and selecting tools",
+        )
 
         if matched_skills:
             ctx.skill_bodies = [
@@ -673,7 +680,12 @@ class SLPOrchestrator:
 
         def handler(deps: Dict) -> NodeResult:
             doc_names = [d.get("document_name", "") for d in batch]
-            self._emit("read", "processing", "Reading documents")
+            _named = [n for n in doc_names if n]
+            self._emit(
+                "read", "processing",
+                f"Reading {len(batch)} document(s): {', '.join(_named)}"
+                if _named else f"Reading {len(batch)} document(s)",
+            )
             combined = "\n\n".join(
                 f"=== Document: {d.get('document_name', '')} ===\n{d.get('content', '')}"
                 for d in batch
@@ -1584,7 +1596,10 @@ Assess whether these search results are relevant to the user's request. If relev
             if ctx.skill_context and all_accumulated:
                 parts = [r["content"] for r in all_accumulated if r["content"]]
                 if parts:
-                    self._emit("synthesize", "processing", "Synthesizing results")
+                    self._emit(
+                        "synthesize", "processing",
+                        f"Synthesizing the final answer from {len(parts)} result(s)",
+                    )
                     raw_combined = "\n\n---\n\n".join(parts)
                     synthesized = self._synthesize_skill_results(
                         user_message=ctx.user_message,
@@ -3291,7 +3306,6 @@ Is this context relevant to the user's request?
 
         Returns ``(formatted_content, raw_content)`` or ``None`` on failure.
         """
-        self._emit("tools", "processing", f"Running {tool_name}")
         access_token = self.tool_caller.get_access_token(server)
         server_url = self.tool_caller.get_server_url(server)
 
