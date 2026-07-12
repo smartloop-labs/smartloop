@@ -13,7 +13,7 @@ import sys
 
 
 from pathlib import Path
-from typing import Dict, Optional, Iterator, List
+from typing import Callable, Dict, Optional, Iterator, List
 from uuid import uuid4
 
 import yaml
@@ -3300,6 +3300,7 @@ class ModelService:
         cwd: Optional[str] = None,
         conversation_history: Optional[list] = None,
         has_attachments: bool = False,
+        progress_callback: Optional[Callable[[str, str, str], None]] = None,
     ) -> tuple[Optional[str], bool, Optional[str], Optional[list], Optional[str], bool]:
         """Full orchestrator entry point for a user message.
 
@@ -3402,6 +3403,7 @@ class ModelService:
                 model_service=self,
                 conversation_history=conversation_history,
                 available_capabilities=available_capabilities or None,
+                progress_callback=progress_callback,
             )
 
             # Save workspace in case tokens were refreshed during the call

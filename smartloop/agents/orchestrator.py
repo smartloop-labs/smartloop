@@ -192,6 +192,25 @@ class SLPOrchestrator:
                 project_id=project_id,
             )
         self._dag_executor = DAGExecutor(max_workers=6)
+        # Optional per-request progress sink set by execute(); surfaces live
+        # step activity (search, tool calls, ...) to the streaming API layer.
+        self._progress_callback: Optional[Callable[[str, str, str], None]] = None
+
+    def _emit(self, step: str, status: str, message: str) -> None:
+        """Report an orchestration step to the optional progress callback.
+
+        The callback is supplied by the streaming API layer to surface live
+        activity as SSE ``chat.status`` events.  It is invoked from DAG worker
+        threads, so it must be thread-safe; any failure here must never break
+        orchestration.
+        """
+        cb = self._progress_callback
+        if cb is None:
+            return
+        try:
+            cb(step, status, message)
+        except Exception:
+            logger.debug("[progress] callback failed", exc_info=True)
 
     # Thin forwarding for test compatibility (tests mock _call_tool_for_server)
     def _call_tool_for_server(self, *args, **kwargs):
@@ -209,8 +228,15 @@ class SLPOrchestrator:
         model_service: Optional[Any] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         available_capabilities: Optional[List[str]] = None,
+        progress_callback: Optional[Callable[[str, str, str], None]] = None,
     ) -> MCPExecutionResult:
-        """Top-level entry point: plan → run → reason."""
+        """Top-level entry point: plan → run → reason.
+
+        ``progress_callback(step, status, message)`` — when supplied — is
+        invoked as each step runs so the streaming layer can surface live
+        activity to the client.  It fires from DAG worker threads.
+        """
+        self._progress_callback = progress_callback
         self._skill_report = None
         logger.info(
             "[models] response=%s  agent=%s  large=%s",
@@ -427,6 +453,7 @@ class SLPOrchestrator:
     def _handle_skill_match(self, ctx: _OrchestratorContext, node: SkillMatchNode) -> NodeResult:
         """Parse skill front matter then LLM-match against the user query."""
         logger.info("[models] SKILL_MATCH → agent_llm: %s", self._model_label(self.agent_llm))
+        self._emit("analyze", "processing", "Analyzing request")
         parsed_skills: List[Dict[str, str]] = []
         for sc in ctx.skills:
             name, desc = "", ""
@@ -481,6 +508,7 @@ class SLPOrchestrator:
     ) -> NodeResult:
         """Vector + workspace + feedback search."""
         logger.info("[models] COLLECT → no LLM (vector/feedback/workspace search)")
+        self._emit("search", "processing", "Searching documents")
         matched_skills = deps[skill_match_node.node_id].data.get("matched_skills")
         enriched = ctx.enriched
         search_ctx = self.explorer.collect_parallel(
@@ -504,6 +532,7 @@ class SLPOrchestrator:
     ) -> NodeResult:
         """Decision: build the unified pipeline. Dynamically adds downstream nodes."""
         logger.info("[models] ROUTE (classify+plan) → agent_llm: %s", self._model_label(self.agent_llm))
+        self._emit("plan", "processing", "Planning response")
         matched_skills = deps[skill_match_node.node_id].data.get("matched_skills")
         search_ctx = deps[collect_node.node_id].data.get("search_ctx")
         enrich_ctx = ctx.enriched
@@ -644,6 +673,7 @@ class SLPOrchestrator:
 
         def handler(deps: Dict) -> NodeResult:
             doc_names = [d.get("document_name", "") for d in batch]
+            self._emit("read", "processing", "Reading documents")
             combined = "\n\n".join(
                 f"=== Document: {d.get('document_name', '')} ===\n{d.get('content', '')}"
                 for d in batch
@@ -1554,6 +1584,7 @@ Assess whether these search results are relevant to the user's request. If relev
             if ctx.skill_context and all_accumulated:
                 parts = [r["content"] for r in all_accumulated if r["content"]]
                 if parts:
+                    self._emit("synthesize", "processing", "Synthesizing results")
                     raw_combined = "\n\n---\n\n".join(parts)
                     synthesized = self._synthesize_skill_results(
                         user_message=ctx.user_message,
@@ -3260,6 +3291,7 @@ Is this context relevant to the user's request?
 
         Returns ``(formatted_content, raw_content)`` or ``None`` on failure.
         """
+        self._emit("tools", "processing", f"Running {tool_name}")
         access_token = self.tool_caller.get_access_token(server)
         server_url = self.tool_caller.get_server_url(server)
 
