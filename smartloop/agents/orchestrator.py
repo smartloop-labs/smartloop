@@ -1210,6 +1210,7 @@ Assess whether these search results are relevant to the user's request. If relev
                 project_dir=ctx.project_dir,
                 model_service=ctx.model_service,
                 llm=exec_llm,
+                conversation_history=ctx.conversation_history,
             )
 
             if result:
@@ -1779,9 +1780,15 @@ Is this context relevant to the user's request?
 
         doc_citations = explore_citations if not tool_context else None
 
+        # A conversational route has no tool plan — its ``tool_context`` is the
+        # model's own generated answer, not external tool output.  Don't frame
+        # it as "live data returned by an external tool" or the final response
+        # leaks that framing (e.g. "Based on the tool's data, ...").
+        has_tool_results = bool(tool_context) and not is_conversation
+
         ready_context = self._format_ready_context(
             combined, skill_instruction, doc_citations,
-            ctx.effective_cwd, has_tool_results=bool(tool_context),
+            ctx.effective_cwd, has_tool_results=has_tool_results,
         )
 
         logger.info(
@@ -2409,6 +2416,7 @@ Is this context relevant to the user's request?
         project_dir: Optional[str] = None,
         model_service: Optional[Any] = None,
         llm: Optional[BaseLLM] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Optional[tuple]:
         tool_name = step.tool_name or ""
         has_explicit_tool = bool(step.tool_name)
@@ -2448,7 +2456,16 @@ Is this context relevant to the user's request?
                 system = SYSTEM_PROMPT.format(
                     current_date=_date.today().strftime("%B %d, %Y"),
                 )
-                prompt = f"<system>{system}</system><user>{raw}</user>"
+                # Include the session's prior turns so a follow-up like
+                # "the top place from that list" can reference the assistant's
+                # earlier reply instead of claiming nothing was provided.
+                history_block = ""
+                for turn in conversation_history or []:
+                    role = turn.get("role", "")
+                    content = turn.get("content", "")
+                    if role in ("user", "assistant") and content:
+                        history_block += f"<{role}>{content}</{role}>"
+                prompt = f"<system>{system}</system>{history_block}<user>{raw}</user>"
                 try:
                     response = str(llm.invoke(prompt)).strip()
                     if response:
