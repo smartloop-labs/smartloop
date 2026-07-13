@@ -789,9 +789,12 @@ class ModelService:
         return self._decision_llm
 
     def search_workspace(self, query: str, work_dir: str, n_results: int = 10) -> list:
-        """Index workspace files on demand then search.
+        """Search the workspace-files collection.
 
-        Indexing is incremental (hash-based) so repeated calls are cheap.
+        Indexing is done in the background by :class:`IndexerTask` (same
+        path as document indexing), so this call only queries the store —
+        it never walks the filesystem on the request path.
+
         Returns a list of :class:`~smartloop.db.store.ChunkResult` ordered
         by relevance.
         """
@@ -807,7 +810,6 @@ class ModelService:
                     logger=logger,
                     base_dir=self._model.workspace.workspace_dir,
                 )
-            self._workspace_indexer.index(work_dir)
             return self._workspace_indexer.search(query, n_results=n_results)
         except Exception as e:
             logger.warning(f"[workspace-index] search_workspace failed: {e}")

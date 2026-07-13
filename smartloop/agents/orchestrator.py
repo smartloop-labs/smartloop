@@ -1684,6 +1684,23 @@ Is this context relevant to the user's request?
         """
         has_skill = bool(ctx.skill_context)
 
+        # A relevance match in any indexed source (documents, feedback, or
+        # workspace files) means the query is grounded in indexed content —
+        # it is not purely conversational.  The route classifier is a small,
+        # unreliable model that often mislabels such content questions
+        # ("summarize the proposal") as conversation; a concrete search match
+        # overrides that guess so the matched context is not dropped below.
+        if is_conversation and (
+            vector_context
+            or search_ctx.feedback_context
+            or search_ctx.workspace_context
+        ):
+            logger.info(
+                "[collect] indexed match found — overriding conversation "
+                "route to use retrieved context"
+            )
+            is_conversation = False
+
         if is_synthesized and tool_context:
             all_tool_names = tool_names_used or [EXPLORE_TOOL]
             skill_instruction = self._compact_skill_instruction(ctx.skill_context, ctx.user_message)
