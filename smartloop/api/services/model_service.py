@@ -66,6 +66,41 @@ _PROGRAMMING_ERRORS = (NameError, AttributeError, TypeError, ImportError)
 
 DEFAULT_MAX_CONTEXT_TOKENS = 8192
 
+# Shared vector-retrieval selection criteria — applied identically to
+# document and workspace search so both rank and select content the same
+# way (broad recall, quality floor, relevance cutoff) instead of each path
+# using its own divergent thresholds.
+_RECALL_MAX_DISTANCE = 0.8      # broad initial recall before selection
+_MIN_BEST_DISTANCE = 0.55       # quality floor: reject a weak best match
+_DISTANCE_CUTOFF_MARGIN = 0.15  # keep chunks within this margin of the best
+
+
+def _select_relevant_chunks(chunks: list, label: str = "vector-search") -> list:
+    """Apply the shared relevance-selection criteria to ranked chunks.
+
+    *chunks* must be ordered closest-first (ascending distance).  Returns the
+    kept chunks, or ``[]`` when the best match fails the quality floor.
+    Shared by document and workspace retrieval so both apply the same
+    emphasis/thresholds rather than duplicating (and drifting) the logic.
+    """
+    if not chunks:
+        return []
+    best = chunks[0].distance
+    if best > _MIN_BEST_DISTANCE:
+        logger.info(
+            f"[{label}] best match distance {best:.3f} exceeds quality floor "
+            f"{_MIN_BEST_DISTANCE} — no relevant matches"
+        )
+        return []
+    cutoff = best + _DISTANCE_CUTOFF_MARGIN
+    kept = [c for c in chunks if c.distance <= cutoff]
+    if len(kept) < len(chunks):
+        logger.info(
+            f"[{label}] cutoff {cutoff:.3f} (best={best:.3f}+{_DISTANCE_CUTOFF_MARGIN}) "
+            f"trimmed {len(chunks) - len(kept)} chunk(s)"
+        )
+    return kept
+
 class ModelService:
     """Singleton service to manage model lifecycle and inference"""
 
@@ -788,12 +823,21 @@ class ModelService:
         """Return the decision LLM, or None to fall back to the main model."""
         return self._decision_llm
 
-    def search_workspace(self, query: str, work_dir: str, n_results: int = 10) -> list:
+    def search_workspace(
+        self,
+        query: str,
+        work_dir: str,
+        n_results: int = 10,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ) -> list:
         """Search the workspace-files collection.
 
-        Indexing is done in the background by :class:`IndexerTask` (same
-        path as document indexing), so this call only queries the store —
-        it never walks the filesystem on the request path.
+        Uses the *same* selection criteria as document search
+        (:meth:`_vector_search_grouped`): the query is enriched from history
+        for reference/keyword emphasis, recalled broadly, then filtered by
+        the shared quality-floor + relevance-cutoff helper — instead of a
+        divergent fixed threshold.  Indexing is done in the background by
+        :class:`IndexerTask`, so this only queries the store.
 
         Returns a list of :class:`~smartloop.db.store.ChunkResult` ordered
         by relevance.
@@ -810,7 +854,23 @@ class ModelService:
                     logger=logger,
                     base_dir=self._model.workspace.workspace_dir,
                 )
-            return self._workspace_indexer.search(query, n_results=n_results)
+
+            # Same emphasis step as documents: resolve references / keywords
+            # against history so follow-ups are grounded.
+            search_query = query
+            if conversation_history:
+                search_query = self._build_history_search_query(query, conversation_history)
+
+            recall = max(n_results, 20)
+            chunks = self._workspace_indexer.search(
+                search_query, n_results=recall, max_distance=_RECALL_MAX_DISTANCE,
+            )
+            # Raw-query fallback, mirroring the document path.
+            if not chunks and search_query != query:
+                chunks = self._workspace_indexer.search(
+                    query, n_results=recall, max_distance=_RECALL_MAX_DISTANCE,
+                )
+            return _select_relevant_chunks(chunks, label="workspace-search")
         except Exception as e:
             logger.warning(f"[workspace-index] search_workspace failed: {e}")
             self._workspace_indexer = None
@@ -1955,36 +2015,15 @@ class ModelService:
                 logger.info("[vector-search] No chunks found")
                 return None
 
-            # Absolute quality floor: if even the closest chunk is only
-            # weakly related, treat the whole result set as no match.
-            # Without this gate, weak matches populate vector_context and
-            # force the orchestrator's tier-1 classifier onto the EXPLORE
-            # path (planner.py `has_document_context` check), so a purely
-            # conversational prompt gets wrapped in DOCUMENT CONTEXT
-            # scaffolding pointing at irrelevant docs.
-            _MIN_BEST_DISTANCE = 0.55
-            best_distance = discovery[0].distance
-            if best_distance > _MIN_BEST_DISTANCE:
-                logger.info(
-                    f"[vector-search] Best match distance {best_distance:.3f} "
-                    f"exceeds quality floor {_MIN_BEST_DISTANCE} — "
-                    f"no relevant documents"
-                )
+            # Apply the shared relevance-selection criteria (quality floor +
+            # relevance cutoff).  Without the floor, weak matches populate
+            # vector_context and force the orchestrator's tier-1 classifier
+            # onto the EXPLORE path, wrapping a conversational prompt in
+            # DOCUMENT CONTEXT scaffolding pointing at irrelevant docs.  The
+            # same helper drives workspace search so both select identically.
+            discovery = _select_relevant_chunks(discovery, label="vector-search")
+            if not discovery:
                 return None
-
-            # Relevance cutoff: keep only chunks within a reasonable
-            # margin of the best match.  This avoids pulling in weakly
-            # related documents when a few strong matches exist.
-            _DISTANCE_CUTOFF_MARGIN = 0.15
-            cutoff = best_distance + _DISTANCE_CUTOFF_MARGIN
-            before_count = len(discovery)
-            discovery = [r for r in discovery if r.distance <= cutoff]
-            if len(discovery) < before_count:
-                logger.info(
-                    f"[vector-search] Cutoff {cutoff:.3f} "
-                    f"(best={best_distance:.3f} + {_DISTANCE_CUTOFF_MARGIN}) "
-                    f"trimmed {before_count - len(discovery)} chunk(s)"
-                )
 
             # Log distances to help diagnose relevance issues
             unique_docs = list({r.document_name or r.document_id for r in discovery})
