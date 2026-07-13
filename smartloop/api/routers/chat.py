@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 import threading
 import uuid
 
@@ -643,7 +644,9 @@ async def stream_chunks(
         if written_path:
             yield _status_event("file-write", "completed", written_path)
             # Surface the file path as visible content so the user can click it
-            file_link = f"\n\n[{os.path.basename(written_path)}]({written_path})"
+            # Use forward slashes in the URL so the Markdown parser doesn't treat
+            # backslashes as escape characters (e.g. \.out → .out on Windows).
+            file_link = f"\n\n[{Path(written_path).name}]({Path(written_path).as_posix()})"
             write_chunk = ChatCompletionChunk(
                 model=request.model,
                 choices=[ChunkChoice(
@@ -846,7 +849,9 @@ async def create_chat_completion(
         if last_user_msg and request.cwd and response_text:
             written_path = model_service.maybe_write_output(last_user_msg, response_text, request.cwd, session_id=request.session_id)
             if written_path:
-                response_text = f"{response_text}\n\n[{os.path.basename(written_path)}]({written_path})"
+                # Use forward slashes in the URL so the Markdown parser doesn't treat
+                # backslashes as escape characters (e.g. \.out → .out on Windows).
+                response_text = f"{response_text}\n\n[{Path(written_path).name}]({Path(written_path).as_posix()})"
 
         # Store assistant response in session history (after auto-write so the link is included)
         message_id = request.message_id or f"msg-{uuid.uuid4().hex[:8]}"
