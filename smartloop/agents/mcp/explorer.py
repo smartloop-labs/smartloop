@@ -867,10 +867,10 @@ class Explorer:
 
     @staticmethod
     def _format_history(history: List[Dict[str, str]]) -> str:
-        """Format pre-filtered history turns into a concise text block.
+        """Format recent history turns into a concise text block.
 
-        The history is already relevance-filtered by the caller (via
-        ``ConversationStore.query_relevant``), so this method simply
+        The history is already selected by the caller (recency-based, via
+        ``ModelService.get_relevant_history``), so this method simply
         renders each turn as ``role: content`` (truncated) without any
         keyword extraction or summarization.
         """

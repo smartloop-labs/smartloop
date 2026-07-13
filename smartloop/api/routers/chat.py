@@ -20,6 +20,7 @@ from smartloop.api.model import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionChunk,
+    ChatStatusChunk,
     ChatMessage,
     Citation,
     Choice,
@@ -35,17 +36,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["chat"])
 
 def _status_event(step: str, status: str, message: str) -> str:
-    """Format a status event as a raw SSE data line.
+    """Format a status event as an SSE data line.
 
-    Uses ``object: "chat.status"`` so clients can distinguish these from
-    OpenAI-compatible ``chat.completion.chunk`` content lines.
+    Serializes a :class:`ChatStatusChunk` (``object: "chat.status"``) so
+    clients can distinguish these from OpenAI-compatible
+    ``chat.completion.chunk`` content lines and track them against a schema.
     """
-    payload = json.dumps({
-        "object": "chat.status",
-        "step": step,
-        "status": status,
-        "message": message,
-    })
+    payload = ChatStatusChunk(step=step, status=status, message=message).model_dump_json()
     return f"data: {payload}\n\n"
 
 # Thread pool for running sync LLM operations
@@ -257,28 +254,16 @@ def _compact_messages(
 
 def _build_messages_with_history(
     request: ChatCompletionRequest,
-    model_service: ModelService,
+    history: List[dict],
 ) -> List[ChatMessage]:
-    """Build the message list with relevant conversation history prepended.
+    """Prepend already-loaded conversation *history* to the request messages.
 
-    Uses TF-IDF relevance filtering via ``ConversationStore.query_relevant``
-    to select the most relevant prior turns, then prepends them before the
-    current request messages so the LLM can reference earlier context
-    (e.g. "create a table from that").
+    ``history`` is the session's recent turns (recency-based, alternation
+    enforced) loaded once by the caller via
+    ``ModelService.get_relevant_history`` and shared with the orchestrator,
+    so it is not re-queried here.  Prepending lets the LLM reference earlier
+    context (e.g. "create a table from that").
     """
-    if not request.session_id:
-        return request.messages
-
-    last_user_msg = next(
-        (m.content for m in reversed(request.messages) if m.role == "user"),
-        None,
-    )
-    if not last_user_msg:
-        return request.messages
-
-    history = model_service.get_relevant_history(
-        request.session_id, last_user_msg,
-    )
     if not history:
         return request.messages
 
@@ -308,7 +293,16 @@ async def stream_chunks(
         except ValueError:
             logger.warning(f"Project not found: {request.project_id}, using current project")
 
-    messages = _build_messages_with_history(request, model_service)
+    # Load the session's recent history ONCE and share it between the prompt
+    # (prepended prior turns) and the orchestrator (search/planning context).
+    _req_last_user = next(
+        (m.content for m in reversed(request.messages) if m.role == "user"), None
+    )
+    conversation_history = model_service.get_relevant_history(
+        request.session_id, _req_last_user or "",
+    ) if request.session_id and _req_last_user else []
+
+    messages = _build_messages_with_history(request, conversation_history)
 
     # Resolve attachments (with status events if attachments exist)
     has_attachments = any(m.attachments for m in messages if m.role == "user")
@@ -330,19 +324,45 @@ async def stream_chunks(
     citations = None
     skill_instruction = None
     is_mutation = False
-    conversation_history = model_service.get_relevant_history(
-        request.session_id, last_user_msg or "",
-    ) if request.session_id and last_user_msg else []
     if last_user_msg:
         yield _status_event("tools", "processing", "Processing...")
-        orchestrator_context, _, tool_error, citations, skill_instruction, is_mutation = await loop.run_in_executor(
+
+        # Bridge orchestrator step activity into the SSE stream. The
+        # orchestrator runs in a worker thread and reports each step via
+        # progress_callback; hand those events back to the event loop
+        # thread-safely and flush them as chat.status while it works, so the
+        # client shows live progress instead of a frozen spinner.
+        status_queue: asyncio.Queue = asyncio.Queue()
+
+        def _progress(step: str, status: str, message: str) -> None:
+            loop.call_soon_threadsafe(
+                status_queue.put_nowait, _status_event(step, status, message)
+            )
+
+        orchestrate_future = loop.run_in_executor(
             None,
             lambda: model_service.orchestrate(
                 last_user_msg, skills=project_skills, cwd=request.cwd,
                 conversation_history=conversation_history,
                 has_attachments=has_attachments,
+                progress_callback=_progress,
             ),
         )
+
+        while not orchestrate_future.done():
+            try:
+                event = await asyncio.wait_for(status_queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+            yield event
+
+        orchestrator_context, _, tool_error, citations, skill_instruction, is_mutation = (
+            await orchestrate_future
+        )
+        # Flush any step events scheduled just before completion.
+        while not status_queue.empty():
+            yield status_queue.get_nowait()
+
         if tool_error:
             yield _status_event("tools", "error", tool_error)
         else:
@@ -770,7 +790,16 @@ async def create_chat_completion(
                 logger.error(f"Failed to auto-reload model: {e}")
                 raise RuntimeError(f"No model loaded and auto-reload failed: {e}")
 
-        messages = _build_messages_with_history(request, model_service)
+        # Load the session's recent history ONCE and share it between the
+        # prompt (prepended prior turns) and the orchestrator.
+        _req_last_user = next(
+            (m.content for m in reversed(request.messages) if m.role == "user"), None
+        )
+        conversation_history = model_service.get_relevant_history(
+            request.session_id, _req_last_user or "",
+        ) if request.session_id and _req_last_user else []
+
+        messages = _build_messages_with_history(request, conversation_history)
         messages = _resolve_message_attachments(messages, model_service)
 
         last_user_msg = next(
@@ -785,9 +814,6 @@ async def create_chat_completion(
         tool_error = None
         citations = None
         is_mutation = False
-        conversation_history = model_service.get_relevant_history(
-            request.session_id, last_user_msg or "",
-        ) if request.session_id and last_user_msg else []
         if last_user_msg:
             orchestrator_context, _, tool_error, citations, _, is_mutation = await loop.run_in_executor(
                 _executor,

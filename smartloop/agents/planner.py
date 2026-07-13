@@ -463,14 +463,18 @@ class Planner:
         if result.has_document_context:
             doc_line = (
                 "Document context is available from uploaded documents.\n"
-                "Use EXPLORE only if the question is specifically about the user's documents.\n"
+                "Use EXPLORE for any question about the user's documents or their contents.\n"
                 "Use CONVERSATION if the question is general knowledge (e.g. recommendations, facts, opinions).\n"
+                "Do NOT use ACTION unless the message contains an explicit local file path, "
+                "shell command, or grep target — a plain question about content is EXPLORE, not ACTION.\n"
             )
 
         prompt = (
             "<system>Classify the user's intent. Reply with exactly one word:\n"
             "TOOL_CALL — needs an external MCP tool (API call, fetch, etc.)\n"
-            "ACTION — needs a local action (read file, run bash, grep, write file)\n"
+            "ACTION — needs a local action on an EXPLICIT target the user named: read a file "
+            "at a given path, run a given bash command, grep for a given pattern, or write a file. "
+            "A plain natural-language question with no path/command is NOT an ACTION.\n"
             "EXPLORE — needs to browse/explore local files or search uploaded documents\n"
             "MULTI_STEP — needs multiple steps\n"
             "CONVERSATION — can be answered from general knowledge or general conversation "

@@ -71,6 +71,23 @@ class ChatCompletionChunk(BaseModel):
     choices: List[ChunkChoice]
 
 
+class ChatStatusChunk(BaseModel):
+    """Streaming step-activity event emitted while the orchestrator works.
+
+    Interleaved in the same SSE stream as ``ChatCompletionChunk`` content
+    deltas. Clients distinguish it by ``object == "chat.status"`` and render
+    ``message`` as live progress (e.g. "Searching documents", "Running fetch").
+    """
+    object: Literal["chat.status"] = "chat.status"
+    step: str = Field(
+        default="", description="Machine-readable phase: analyze, search, plan, tools, read, streaming"
+    )
+    status: Literal["processing", "completed", "error"] = Field(
+        default="processing", description="Lifecycle of this step"
+    )
+    message: str = Field(default="", description="Human-readable activity to display")
+
+
 class Choice(BaseModel):
     """A single choice in a non-streaming response"""
     index: int = 0

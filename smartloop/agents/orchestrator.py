@@ -192,6 +192,25 @@ class SLPOrchestrator:
                 project_id=project_id,
             )
         self._dag_executor = DAGExecutor(max_workers=6)
+        # Optional per-request progress sink set by execute(); surfaces live
+        # step activity (search, tool calls, ...) to the streaming API layer.
+        self._progress_callback: Optional[Callable[[str, str, str], None]] = None
+
+    def _emit(self, step: str, status: str, message: str) -> None:
+        """Report an orchestration step to the optional progress callback.
+
+        The callback is supplied by the streaming API layer to surface live
+        activity as SSE ``chat.status`` events.  It is invoked from DAG worker
+        threads, so it must be thread-safe; any failure here must never break
+        orchestration.
+        """
+        cb = self._progress_callback
+        if cb is None:
+            return
+        try:
+            cb(step, status, message)
+        except Exception:
+            logger.debug("[progress] callback failed", exc_info=True)
 
     # Thin forwarding for test compatibility (tests mock _call_tool_for_server)
     def _call_tool_for_server(self, *args, **kwargs):
@@ -209,8 +228,15 @@ class SLPOrchestrator:
         model_service: Optional[Any] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         available_capabilities: Optional[List[str]] = None,
+        progress_callback: Optional[Callable[[str, str, str], None]] = None,
     ) -> MCPExecutionResult:
-        """Top-level entry point: plan → run → reason."""
+        """Top-level entry point: plan → run → reason.
+
+        ``progress_callback(step, status, message)`` — when supplied — is
+        invoked as each step runs so the streaming layer can surface live
+        activity to the client.  It fires from DAG worker threads.
+        """
+        self._progress_callback = progress_callback
         self._skill_report = None
         logger.info(
             "[models] response=%s  agent=%s  large=%s",
@@ -427,6 +453,10 @@ class SLPOrchestrator:
     def _handle_skill_match(self, ctx: _OrchestratorContext, node: SkillMatchNode) -> NodeResult:
         """Parse skill front matter then LLM-match against the user query."""
         logger.info("[models] SKILL_MATCH → agent_llm: %s", self._model_label(self.agent_llm))
+        self._emit(
+            "analyze", "processing",
+            f"Analyzing your request against {len(ctx.skills)} available skill(s)",
+        )
         parsed_skills: List[Dict[str, str]] = []
         for sc in ctx.skills:
             name, desc = "", ""
@@ -507,6 +537,12 @@ class SLPOrchestrator:
         matched_skills = deps[skill_match_node.node_id].data.get("matched_skills")
         search_ctx = deps[collect_node.node_id].data.get("search_ctx")
         enrich_ctx = ctx.enriched
+        _skill_names = ", ".join(s.get("name", "") for s in (matched_skills or []) if s.get("name"))
+        self._emit(
+            "plan", "processing",
+            f"Planning the response using skill(s): {_skill_names}"
+            if _skill_names else "Planning the response and selecting tools",
+        )
 
         if matched_skills:
             ctx.skill_bodies = [
@@ -644,6 +680,11 @@ class SLPOrchestrator:
 
         def handler(deps: Dict) -> NodeResult:
             doc_names = [d.get("document_name", "") for d in batch]
+            _named = [n for n in doc_names if n]
+            self._emit(
+                "read", "processing",
+                f"Reading document: {', '.join(_named)}" if _named else "Reading document",
+            )
             combined = "\n\n".join(
                 f"=== Document: {d.get('document_name', '')} ===\n{d.get('content', '')}"
                 for d in batch
@@ -1169,6 +1210,7 @@ Assess whether these search results are relevant to the user's request. If relev
                 project_dir=ctx.project_dir,
                 model_service=ctx.model_service,
                 llm=exec_llm,
+                conversation_history=ctx.conversation_history,
             )
 
             if result:
@@ -1554,6 +1596,10 @@ Assess whether these search results are relevant to the user's request. If relev
             if ctx.skill_context and all_accumulated:
                 parts = [r["content"] for r in all_accumulated if r["content"]]
                 if parts:
+                    self._emit(
+                        "synthesize", "processing",
+                        f"Synthesizing the final answer from {len(parts)} result(s)",
+                    )
                     raw_combined = "\n\n---\n\n".join(parts)
                     synthesized = self._synthesize_skill_results(
                         user_message=ctx.user_message,
@@ -1734,9 +1780,15 @@ Is this context relevant to the user's request?
 
         doc_citations = explore_citations if not tool_context else None
 
+        # A conversational route has no tool plan — its ``tool_context`` is the
+        # model's own generated answer, not external tool output.  Don't frame
+        # it as "live data returned by an external tool" or the final response
+        # leaks that framing (e.g. "Based on the tool's data, ...").
+        has_tool_results = bool(tool_context) and not is_conversation
+
         ready_context = self._format_ready_context(
             combined, skill_instruction, doc_citations,
-            ctx.effective_cwd, has_tool_results=bool(tool_context),
+            ctx.effective_cwd, has_tool_results=has_tool_results,
         )
 
         logger.info(
@@ -2364,6 +2416,7 @@ Is this context relevant to the user's request?
         project_dir: Optional[str] = None,
         model_service: Optional[Any] = None,
         llm: Optional[BaseLLM] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Optional[tuple]:
         tool_name = step.tool_name or ""
         has_explicit_tool = bool(step.tool_name)
@@ -2403,7 +2456,16 @@ Is this context relevant to the user's request?
                 system = SYSTEM_PROMPT.format(
                     current_date=_date.today().strftime("%B %d, %Y"),
                 )
-                prompt = f"<system>{system}</system><user>{raw}</user>"
+                # Include the session's prior turns so a follow-up like
+                # "the top place from that list" can reference the assistant's
+                # earlier reply instead of claiming nothing was provided.
+                history_block = ""
+                for turn in conversation_history or []:
+                    role = turn.get("role", "")
+                    content = turn.get("content", "")
+                    if role in ("user", "assistant") and content:
+                        history_block += f"<{role}>{content}</{role}>"
+                prompt = f"<system>{system}</system>{history_block}<user>{raw}</user>"
                 try:
                     response = str(llm.invoke(prompt)).strip()
                     if response:
