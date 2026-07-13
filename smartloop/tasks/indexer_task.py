@@ -67,6 +67,10 @@ class IndexerTask(BaseTask):
         self._workspace_indexer: Optional[WorkspaceIndexer] = None
         self._workspace_indexer_dir: Optional[str] = None
         self._workspace_scan_inflight: bool = False
+        # Wall-clock time and stats of the last completed workspace pass,
+        # surfaced via workspace_status for the /health endpoint.
+        self._last_workspace_scan_at: Optional[float] = None
+        self._last_workspace_stats: Optional[dict] = None
         # True once a document has been processed since the queue last went
         # idle; used to release the on-demand vision model exactly once when
         # the queue drains (so only the orchestrator stays resident).
@@ -524,11 +528,30 @@ class IndexerTask(BaseTask):
             self._workspace_indexer_dir = project.project_dir
 
         stats = self._workspace_indexer.index(work_dir)
+        self._last_workspace_stats = stats
+        self._last_workspace_scan_at = time.time()
         if stats.get("indexed") or stats.get("removed"):
             self.logger.info(
                 f"[Indexer] Workspace index — indexed={stats['indexed']}, "
                 f"skipped={stats['skipped']}, removed={stats['removed']}"
             )
+
+    @property
+    def workspace_status(self) -> dict:
+        """Snapshot of background workspace-file indexing for /health.
+
+        Reports whether a scan is in flight, how many files are currently
+        indexed, when the last pass completed (epoch seconds), the last
+        pass's stats, and the scan cadence.
+        """
+        indexer = self._workspace_indexer
+        return {
+            "scanning": self._workspace_scan_inflight,
+            "files_indexed": indexer.file_count if indexer else 0,
+            "last_scan_at": self._last_workspace_scan_at,
+            "last_stats": self._last_workspace_stats,
+            "scan_interval_seconds": self._WORKSPACE_SCAN_INTERVAL,
+        }
 
     # ------------------------------------------------------------------
     # BaseTask interface

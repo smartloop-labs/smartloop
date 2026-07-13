@@ -306,6 +306,8 @@ async def health_check():
                 "status": indexer_status.get("status"),
                 "queued": indexer_status.get("queued", 0),
             }
+            if "workspace" in indexer_status:
+                result["indexing"]["workspace"] = indexer_status["workspace"]
         workspace = Workspace.get_instance()
         if workspace and workspace.current_project:
             from smartloop.workspace import DocumentStatus
