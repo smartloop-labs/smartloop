@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from smartloop.db import StoreFactory
+from smartloop.db.workspace_indexer import WorkspaceIndexer
 from smartloop.utils import DocumentSplitter, normalize_path
 from smartloop.parsers.parser_factory import BaseLLM, ParserFactory
 from smartloop.tasks.base_task import BaseTask, TaskResult, TaskStatus
@@ -58,6 +59,18 @@ class IndexerTask(BaseTask):
         self._inflight: set = set()
         self._last_scan: float = 0.0
         self._SCAN_INTERVAL: float = 5.0
+        # Workspace (project working-directory) indexing runs on a slower
+        # cadence than the documents folder — the repo is larger and its
+        # index is only consulted opportunistically during chat.
+        self._last_workspace_scan: float = 0.0
+        self._WORKSPACE_SCAN_INTERVAL: float = 30.0
+        self._workspace_indexer: Optional[WorkspaceIndexer] = None
+        self._workspace_indexer_dir: Optional[str] = None
+        self._workspace_scan_inflight: bool = False
+        # Wall-clock time and stats of the last completed workspace pass,
+        # surfaced via workspace_status for the /health endpoint.
+        self._last_workspace_scan_at: Optional[float] = None
+        self._last_workspace_stats: Optional[dict] = None
         # True once a document has been processed since the queue last went
         # idle; used to release the on-demand vision model exactly once when
         # the queue drains (so only the orchestrator stays resident).
@@ -110,6 +123,18 @@ class IndexerTask(BaseTask):
                 if now - self._last_scan >= self._SCAN_INTERVAL:
                     self._scan_documents()
                     self._last_scan = now
+
+                # Incrementally index the project's working directory into
+                # the workspace collection.  Run it on the executor so a
+                # large first-time scan never blocks document processing.
+                if (
+                    not self._workspace_scan_inflight
+                    and self._executor is not None
+                    and now - self._last_workspace_scan >= self._WORKSPACE_SCAN_INTERVAL
+                ):
+                    self._last_workspace_scan = now
+                    self._workspace_scan_inflight = True
+                    self._executor.submit(self._run_workspace_scan)
 
                 doc_id = self._queue.get(timeout=1)
                 with self._inflight_lock:
@@ -445,6 +470,88 @@ class IndexerTask(BaseTask):
         with self._workspace_lock:
             project.documents = [d for d in project.documents if d.id != doc_id]
             self.workspace.save()
+
+    # ------------------------------------------------------------------
+    # Workspace (project working-directory) indexing
+    # ------------------------------------------------------------------
+
+    def request_workspace_scan(self) -> None:
+        """Ask the event loop to run a workspace index pass on its next tick.
+
+        Resetting the timer makes the loop fire a scan within ~1s (the queue
+        poll interval) instead of waiting out the full scan interval.  The
+        scan still runs on the executor, so callers are never blocked.  Used
+        on project switch and at the start of a chat request so freshly-edited
+        files are picked up promptly.
+        """
+        self._last_workspace_scan = 0.0
+
+    def _run_workspace_scan(self) -> None:
+        """Executor entry point for the background workspace index pass."""
+        try:
+            self._scan_workspace_files()
+        except Exception as e:
+            self.logger.warning(f"[Indexer] Workspace scan failed: {e}")
+        finally:
+            self._workspace_scan_inflight = False
+
+    def _scan_workspace_files(self) -> None:
+        """Incrementally index the project's working-directory files.
+
+        Mirrors ``_scan_documents`` but targets the code/workspace files in
+        the project's visible directory, indexing them into the dedicated
+        ``workspace_files`` collection.  Indexing here keeps it off the
+        request path — ``ModelService.search_workspace`` only queries the
+        store.  The underlying :class:`WorkspaceIndexer` is hash-incremental,
+        so repeat passes only re-embed changed files.
+        """
+        self._refresh_workspace()
+        project = self.workspace.current_project
+        if not project:
+            return
+
+        work_dir = project.visible_dir
+        if not work_dir or not os.path.isdir(work_dir):
+            return
+
+        # Recreate the indexer when the active project changes so the store
+        # and manifest always point at the current project's directory.
+        if (
+            self._workspace_indexer is None
+            or self._workspace_indexer_dir != project.project_dir
+        ):
+            self._workspace_indexer = WorkspaceIndexer(
+                project_dir=project.project_dir,
+                logger=self.logger,
+                base_dir=self.workspace.workspace_dir,
+            )
+            self._workspace_indexer_dir = project.project_dir
+
+        stats = self._workspace_indexer.index(work_dir)
+        self._last_workspace_stats = stats
+        self._last_workspace_scan_at = time.time()
+        if stats.get("indexed") or stats.get("removed"):
+            self.logger.info(
+                f"[Indexer] Workspace index — indexed={stats['indexed']}, "
+                f"skipped={stats['skipped']}, removed={stats['removed']}"
+            )
+
+    @property
+    def workspace_status(self) -> dict:
+        """Snapshot of background workspace-file indexing for /health.
+
+        Reports whether a scan is in flight, how many files are currently
+        indexed, when the last pass completed (epoch seconds), the last
+        pass's stats, and the scan cadence.
+        """
+        indexer = self._workspace_indexer
+        return {
+            "scanning": self._workspace_scan_inflight,
+            "files_indexed": indexer.file_count if indexer else 0,
+            "last_scan_at": self._last_workspace_scan_at,
+            "last_stats": self._last_workspace_stats,
+            "scan_interval_seconds": self._WORKSPACE_SCAN_INTERVAL,
+        }
 
     # ------------------------------------------------------------------
     # BaseTask interface

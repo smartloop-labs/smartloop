@@ -17,7 +17,7 @@ from smartloop.api.services import ModelService, get_model_service
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
-from smartloop.platform import auth as platform_auth
+from smartloop.platform import auth as platform_auth, get_platform_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["init"])
@@ -36,6 +36,27 @@ class InitRequest(BaseModel):
 def _sse_event(data: dict, event: str = "progress") -> str:
     """Format a dict as an SSE event string."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _seed_model_catalog() -> None:
+    """Fire-and-forget best-effort cache of the cloud model catalog.
+
+    Scheduled on the executor rather than awaited: list_models() is a sync
+    cloud call with a 30s timeout, and blocking on it would stall the SSE
+    stream. Seeding is off the critical path, so we never wait on it.
+    """
+    def _log_result(future) -> None:
+        exc = future.exception()
+        if exc is not None:
+            logger.warning("Could not seed model catalog cache", exc_info=exc)
+
+    try:
+        future = asyncio.get_event_loop().run_in_executor(
+            None, get_platform_service().list_models
+        )
+        future.add_done_callback(_log_result)
+    except Exception:
+        logger.warning("Could not schedule model catalog seed", exc_info=True)
 
 
 def _gguf_exists(model_dir: str) -> bool:
@@ -78,9 +99,22 @@ async def _download_and_stream(downloader, model_id: str, model_name: str,
 
     download_task = loop.run_in_executor(None, _do_download)
 
+    # Emit a keepalive when no progress has flowed for a few seconds so the SSE
+    # connection survives download stalls (e.g. a dropped connection being
+    # retried) without the client or a proxy timing out the idle stream.
+    idle_ticks = 0
     while not download_task.done():
+        drained = False
         while not progress_queue.empty():
             yield _sse_event(progress_queue.get_nowait())
+            drained = True
+        if drained:
+            idle_ticks = 0
+        else:
+            idle_ticks += 1
+            if idle_ticks >= 10:  # ~5s of silence
+                yield _SSE_KEEPALIVE
+                idle_ticks = 0
         await asyncio.sleep(0.5)
 
     while not progress_queue.empty():
@@ -208,6 +242,10 @@ async def init(
                 ws_model.downloaded = True
                 model_service._model.save()
 
+            # Workspace config.json exists after the save above, so the
+            # platform service can bind the workspace DB and persist the catalog.
+            _seed_model_catalog()
+
             # 2. Ensure model pipeline
             model_service._ensure_model()
 
@@ -271,6 +309,7 @@ async def bootstrap(
 
             # Fast path: already loaded
             if model_service._llm is not None and workspace.current_project:
+                _seed_model_catalog()
                 active = workspace.get_model()
                 yield _sse_event({
                     "status": "completed",
@@ -320,6 +359,10 @@ async def bootstrap(
                 ws_model.downloaded = True
                 existing_model_name = bootstrap_name
                 workspace.save()
+
+            # Workspace is on disk in both branches above, so the platform
+            # service can bind the workspace DB and persist the catalog.
+            _seed_model_catalog()
 
             # 4. Ensure model pipeline
             model_service._ensure_model()

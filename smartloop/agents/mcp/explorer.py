@@ -482,10 +482,18 @@ class Explorer:
         return ""
 
     @staticmethod
-    def _search_workspace(query: str, model_service: Any, cwd: str) -> str:
+    def _search_workspace(
+        query: str,
+        model_service: Any,
+        cwd: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
         """Workspace file search — thread-safe, I/O bound."""
         try:
-            ws_chunks = model_service.search_workspace(query, cwd, n_results=10)
+            ws_chunks = model_service.search_workspace(
+                query, cwd, n_results=10,
+                conversation_history=conversation_history,
+            )
             if ws_chunks:
                 seen_files: dict = {}
                 for chunk in ws_chunks:
@@ -554,6 +562,7 @@ class Explorer:
             f_fb = pool.submit(self._search_feedback, query, model_service)
             f_ws = pool.submit(
                 self._search_workspace, query, model_service, cwd,
+                history_for_search,
             ) if cwd else None
 
             # Collect results
@@ -867,10 +876,10 @@ class Explorer:
 
     @staticmethod
     def _format_history(history: List[Dict[str, str]]) -> str:
-        """Format pre-filtered history turns into a concise text block.
+        """Format recent history turns into a concise text block.
 
-        The history is already relevance-filtered by the caller (via
-        ``ConversationStore.query_relevant``), so this method simply
+        The history is already selected by the caller (recency-based, via
+        ``ModelService.get_relevant_history``), so this method simply
         renders each turn as ``role: content`` (truncated) without any
         keyword extraction or summarization.
         """

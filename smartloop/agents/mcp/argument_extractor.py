@@ -189,6 +189,54 @@ class MCPArgumentExtractor:
             return True
         return False
 
+    # Generic filler tokens small models emit in place of a real value.
+    _GENERIC_PLACEHOLDERS = frozenset({
+        "string", "value", "example", "placeholder", "none", "null",
+        "todo", "tbd", "your value", "n a",
+    })
+
+    def _is_placeholder_echo(
+        self, key: str, value: Any, param_info: Dict[str, Any]
+    ) -> bool:
+        """True when the value merely restates the parameter's name/description.
+
+        Small models frequently emit the field's own name or description as a
+        placeholder (e.g. path -> "file_path", url -> "your_url") instead of a
+        real value.  These tokens are never legitimate data — dropping them
+        lets the param be treated as missing rather than executed with a bogus
+        value (e.g. reading a file literally named "file_path").
+        """
+        if not isinstance(value, str):
+            return False
+        v = value.strip()
+        if not v:
+            return False
+        # Real data shapes are never placeholders: explicit paths, or a
+        # filename with an extension (about.md, src/app.py, ./notes).
+        if "/" in v or "\\" in v or re.search(r"\.\w{1,6}$", v):
+            return False
+
+        norm = lambda s: re.sub(r"[\s_\-]+", " ", s.strip().lower()).strip()
+        nv = norm(v)
+        if not nv:
+            return False
+
+        if nv in self._GENERIC_PLACEHOLDERS:
+            return True
+
+        # Echo of the parameter name ("path" -> "path" / "file path").
+        nk = norm(key)
+        if nk and (nv == nk or (len(nv.split()) <= 2 and nk in nv.split())):
+            return True
+
+        # Echo of a leading phrase in the description ("file path" ⊂
+        # "file path to read") for short, placeholder-like values.
+        desc = norm(param_info.get("description") or "")
+        if desc and len(nv.split()) <= 3 and nv in desc:
+            return True
+
+        return False
+
     def _parse_json(self, text: str) -> Any:
         """Parse JSON from LLM response text, handling markdown fences.
 
@@ -378,6 +426,7 @@ Respond with raw JSON only, no markdown.
                     and v is not None and v != "" and v != "null" and v != [] and v != "MISSING"
                     and not isinstance(v, (dict, list))
                     and not self._is_schema_echo(v, properties.get(k, {}))
+                    and not self._is_placeholder_echo(k, v, properties.get(k, {}))
                 }
 
                 # Only flag params as missing if they are actually required
@@ -636,6 +685,7 @@ Respond with raw JSON only, no markdown.
                 k: v for k, v in extracted.items()
                 if k in non_id_params and v is not None and v != ""
                 and not self._is_schema_echo(v, properties.get(k, {}))
+                and not self._is_placeholder_echo(k, v, properties.get(k, {}))
             }
 
             logger.info(f"Extracted non-ID params: {list(result.keys())}")

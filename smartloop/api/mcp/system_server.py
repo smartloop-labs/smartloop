@@ -60,18 +60,24 @@ async def file_read(path: str, query: Optional[str] = None) -> str:
         path: File path to read.
         query: Optional search query to filter matching lines.
     """
+    # Raise (rather than return an "Error: ..." string) on failure so the
+    # MCP result is flagged is_error=True.  The orchestrator then skips the
+    # step instead of treating the error text as authoritative tool output,
+    # which would otherwise suppress the workspace/document search fallback
+    # — e.g. "find my pitch" with a hallucinated path must fall through to
+    # semantic search over the indexed files, not dead-end on "file not found".
     if not path:
-        return "Error: no file path provided"
+        raise ValueError("no file path provided")
 
     if not os.path.isfile(path):
-        return f"Error: file not found: {path}"
+        raise FileNotFoundError(f"file not found: {path}")
 
     logger.info(f"[file-read] Reading '{path}', query='{query or ''}'")
 
     try:
         content = open(path, "r", encoding="utf-8", errors="replace").read()
     except Exception as e:
-        return f"Error reading file: {e}"
+        raise RuntimeError(f"error reading file: {e}")
 
     if query:
         lines = content.split("\n")
