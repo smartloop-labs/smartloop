@@ -126,6 +126,15 @@ class LLMExecutor:
                 gpu_cap = max(1, torch.cuda.device_count())
             elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
                 gpu_cap = 1
+            else:
+                # GPU backend torch can't see (e.g. Vulkan on AMD/Intel).
+                # Device count and VRAM aren't queryable through the
+                # llama-cpp-python bindings, so assume one device — same-GPU
+                # copies serialize anyway, and the RAM-based memory sizing
+                # below says nothing about VRAM.
+                from llama_cpp import llama_supports_gpu_offload
+                if llama_supports_gpu_offload():
+                    gpu_cap = 1
             if gpu_cap is not None and gpu_cap < requested:
                 logger.info(
                     "[device] %d GPU(s) — capping worker copies at one per GPU "

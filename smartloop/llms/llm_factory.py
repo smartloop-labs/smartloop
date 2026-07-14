@@ -30,6 +30,22 @@ def _get_cuda_vram_gb() -> float | None:
     return None
 
 
+def _llama_cpp_has_cuda_backend() -> bool:
+    """True when the installed llama.cpp was built with the CUDA backend.
+
+    ``torch.cuda.is_available()`` reflects *torch's* build, not llama.cpp's —
+    a Vulkan-only llama.cpp next to a CUDA torch wheel must not get
+    CUDA-specific load options.  The ggml CUDA backend ships as its own
+    shared library next to the llama library, so its presence is the flag.
+    """
+    try:
+        import llama_cpp
+        lib_dir = Path(llama_cpp.__file__).parent / "lib"
+        return any(lib_dir.glob("*ggml-cuda*"))
+    except Exception:
+        return False
+
+
 class LlmFactory:
     """Factory to create instances of LLM classes"""
 
@@ -229,7 +245,7 @@ class LlmFactory:
         in-process.
         """
         import torch
-        from llama_cpp import Llama
+        from llama_cpp import Llama, llama_supports_gpu_offload
         from smartloop.llms.llama_cpp import LlamaCpp
 
         chat_handler = None
@@ -306,6 +322,17 @@ class LlmFactory:
                 f"Apple Silicon: {total_mem_gb:.0f}GB total, {available_mem_gb:.1f}GB available, "
                 f"{model_size_gb:.1f}GB model — using n_ctx={n_ctx}, n_gpu_layers={llama_config.n_gpu_layers}"
             )
+        elif llama_supports_gpu_offload():
+            # GPU backend torch can't see — e.g. Vulkan on an AMD/Intel GPU,
+            # or an NVIDIA card with a CPU-only torch wheel and no nvidia-smi.
+            # Neither torch nor the llama-cpp-python bindings can report this
+            # device's VRAM, so keep the full offload from
+            # get_llama_cpp_config() with the default context; the subprocess
+            # probe below degrades to reduced-context / CPU if it doesn't fit.
+            logger.info(
+                f"GPU offload backend available but VRAM unknown (non-CUDA backend, "
+                f"e.g. Vulkan) — using n_ctx={n_ctx}, n_gpu_layers={llama_config.n_gpu_layers}"
+            )
         else:
             # No GPU available — CPU only
             llama_config.n_gpu_layers = 0
@@ -337,9 +364,11 @@ class LlmFactory:
             # Flash attention — VISION LOAD, CUDA ONLY.  Without it the image
             # encode allocates a fixed ~6GB compute buffer that OOM-segfaults
             # the native clip code on a tight CUDA GPU; flash_attn brings the
-            # per-page peak to ~3GB.  On Metal (MPS) flash_attn is unsupported
-            # and causes the load to fail, silently falling back to CPU-only.
-            if torch.cuda.is_available():
+            # per-page peak to ~3GB.  On Metal (MPS) and Vulkan flash_attn is
+            # unsupported and causes the load to fail, silently falling back
+            # to CPU-only — so gate on llama.cpp's compiled backend, not
+            # torch's (a Vulkan llama.cpp can sit next to a CUDA torch wheel).
+            if _llama_cpp_has_cuda_backend():
                 config['flash_attn'] = True
             logger.info(
                 f"Loading vision model with mmproj: {mmproj_path} "
