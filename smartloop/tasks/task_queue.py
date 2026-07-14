@@ -133,6 +133,9 @@ class TaskQueue:
         # Expose queue depth for tasks that support it (e.g. IndexerTask)
         if hasattr(task, "queue_size"):
             status["queued"] = task.queue_size
+        # Expose background workspace-indexing state (IndexerTask)
+        if hasattr(task, "workspace_status"):
+            status["workspace"] = task.workspace_status
         return status
 
     def _on_task_status_change(

@@ -879,29 +879,35 @@ class SLPOrchestrator:
         )
         _pre_promotion_intent = classification.intent
 
+        # Indexed context that can ground an EXPLORE answer.  All four
+        # sources count equally — a workspace-file or feedback match is just
+        # as real as a document match (each is only present when it cleared
+        # its search relevance threshold).  Counting only documents/skill-tools
+        # here caused workspace-only matches to be discarded and the query
+        # answered by the small model from raw guesswork.
+        matched_sources = []
+        if vector_context:
+            matched_sources.append("documents")
+        if search_ctx.workspace_context:
+            matched_sources.append("workspace")
+        if search_ctx.feedback_context:
+            matched_sources.append("feedback")
+        if search_ctx.skill_tool_results:
+            matched_sources.append("skill-tools")
+        has_indexed_context = bool(matched_sources)
+
         if classification.intent == IntentType.CONVERSATION:
-            has_matched_context = bool(
-                vector_context or search_ctx.skill_tool_results
-            )
-            if has_matched_context:
-                sources = []
-                if vector_context:
-                    sources.append("documents")
-                if search_ctx.skill_tool_results:
-                    sources.append("skill-tools")
+            if has_indexed_context:
                 classification.intent = IntentType.EXPLORE
                 classification.reasoning = (
-                    f"indexed context available ({', '.join(sources)}) — exploring"
+                    f"indexed context available ({', '.join(matched_sources)}) — exploring"
                 )
         elif classification.intent == IntentType.EXPLORE:
             # Small classifier LLM often hallucinates EXPLORE for plain
             # question queries.  If there's nothing indexed to explore,
             # treat it as conversation — otherwise we'd waste a search
             # step and route the answer through the small model.
-            has_something_to_explore = bool(
-                vector_context or search_ctx.skill_tool_results
-            )
-            if not has_something_to_explore:
+            if not has_indexed_context:
                 classification.intent = IntentType.CONVERSATION
                 classification.reasoning = (
                     "no indexed context to explore — treating as conversation"
@@ -1683,6 +1689,23 @@ Is this context relevant to the user's request?
         ``ctx.skill_context`` for presentation guidance when available.
         """
         has_skill = bool(ctx.skill_context)
+
+        # A relevance match in any indexed source (documents, feedback, or
+        # workspace files) means the query is grounded in indexed content —
+        # it is not purely conversational.  The route classifier is a small,
+        # unreliable model that often mislabels such content questions
+        # ("summarize the proposal") as conversation; a concrete search match
+        # overrides that guess so the matched context is not dropped below.
+        if is_conversation and (
+            vector_context
+            or search_ctx.feedback_context
+            or search_ctx.workspace_context
+        ):
+            logger.info(
+                "[collect] indexed match found — overriding conversation "
+                "route to use retrieved context"
+            )
+            is_conversation = False
 
         if is_synthesized and tool_context:
             all_tool_names = tool_names_used or [EXPLORE_TOOL]
