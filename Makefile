@@ -40,40 +40,26 @@ else
     PYTHON := $(VENV)/bin/python
 endif
 
-# Portable x86-64-v3 (AVX2) baseline for the CPU-only from-source fallback.
-GGML_PORTABLE := -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS
+# ggml source builds default to -march=native; pin a portable x86-64-v3 (AVX2)
+# baseline on Linux/Windows so CI-built binaries don't emit AVX-512 and SIGILL
+# on CPUs that lack it (the failure the old prebuilt-wheel pin guarded against).
+GGML_X86_PORTABLE := -DGGML_NATIVE=OFF -DGGML_AVX2=ON
 
-# abetlen prebuilt CUDA wheels switched from cpython-specific (cp311-cp311) to
-# universal py3-none at v0.3.20, which introduced AVX-512 and causes SIGILL on
-# CPUs that lack it. Pin to the last safe version.
-LLAMA_ABETLEN_VERSION := 0.3.19
-
-# Prebuilt CUDA wheel from the abetlen index (Linux NVIDIA and Windows).
-LLAMA_ABETLEN_WHEEL = $(PIP) install llama-cpp-python==$(LLAMA_ABETLEN_VERSION) --extra-index-url=https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
-
-# From-source build (macOS Metal, CPU fallback). CMAKE_BUILD_PARALLEL_LEVEL
-# parallelises the ninja/make invocation that pip drives internally.
-JOBS := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
-LLAMA_SOURCE_BUILD = CMAKE_ARGS="-DGGML_METAL=ON" CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
-
+# GPU backends: Metal + Vulkan (via MoltenVK) on macOS, Vulkan elsewhere.
+# Every platform builds llama-cpp-python from source — there are no prebuilt
+# Vulkan wheels — which requires the Vulkan SDK (headers + glslc) at build time.
 ifeq ($(PLATFORM),darwin)
-    LLAMA_INSTALL_CMD = $(LLAMA_SOURCE_BUILD)
-else ifeq ($(PLATFORM),linux)
-    HAS_NVIDIA := $(shell command -v nvidia-smi >/dev/null 2>&1 && echo yes || echo no)
-    ifeq ($(CUDA),1)
-        LLAMA_INSTALL_CMD = $(LLAMA_ABETLEN_WHEEL)
-    else ifeq ($(HAS_NVIDIA),yes)
-        LLAMA_INSTALL_CMD = $(LLAMA_ABETLEN_WHEEL)
-    else
-        LLAMA_INSTALL_CMD = CMAKE_ARGS="$(GGML_PORTABLE)" CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --no-binary llama-cpp-python --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
-    endif
+    LLAMA_CMAKE_ARGS := -DGGML_METAL=ON -DGGML_VULKAN=ON
 else
-    # Windows: prefer a locally cached wheel (wheelhouse/, populated by CI's
-    # actions/cache) so we don't recompile the ~1h CUDA source build on every
-    # run. When wheelhouse/ is absent or has no matching wheel, --find-links is
-    # a no-op and pip falls back to the abetlen index / source build as before.
-    LLAMA_INSTALL_CMD = $(PIP) install llama-cpp-python==$(LLAMA_ABETLEN_VERSION) --find-links wheelhouse --extra-index-url=https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
+    LLAMA_CMAKE_ARGS := -DGGML_VULKAN=ON $(GGML_X86_PORTABLE)
 endif
+
+# CMAKE_BUILD_PARALLEL_LEVEL parallelises the ninja/make invocation that pip
+# drives internally. --find-links wheelhouse installs a compiled wheel cached
+# by CI (actions/cache); when wheelhouse/ is absent or has no matching wheel it
+# is a no-op and pip builds from the PyPI sdist with LLAMA_CMAKE_ARGS.
+JOBS := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
+LLAMA_INSTALL_CMD = CMAKE_ARGS="$(LLAMA_CMAKE_ARGS)" CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --find-links wheelhouse --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
 
 
 help:

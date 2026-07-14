@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 import sys
 import platform
 import site
@@ -61,33 +62,47 @@ for sp in site.getsitepackages():
             binaries.append((str(lib_file), 'llama_cpp/lib'))
         break
 
-# Bundle CUDA runtime libraries so the binary runs on machines that have the
-# NVIDIA driver but not the full CUDA toolkit. libcuda.so.1 is intentionally
-# excluded — it is the driver stub and must come from the host driver.
-#
-# These go next to their only consumer, libggml-cuda.so in llama_cpp/lib, NOT
-# into the _internal root. Dropping cuBLAS/cudart into the root pollutes the
-# loader's primary search directory and breaks numpy's bundled OpenBLAS stack
-# at import time (surfacing as the misleading numpy "import from source
-# directory" error) — a Linux-only failure, since macOS numpy uses Accelerate.
-# This mirrors the Windows job, which bundles the CUDA DLLs into llama_cpp/lib.
-if sys.platform != 'win32':
-    _cuda_runtime_libs = [
-        'libcudart.so.12',
-        'libcublas.so.12',
-        'libcublasLt.so.12',
-    ]
-    _cuda_search_dirs = [
-        '/usr/lib/x86_64-linux-gnu',
-        '/usr/local/cuda/lib64',
-        '/usr/local/cuda-12/lib64',
-    ]
-    for _lib in _cuda_runtime_libs:
-        for _d in _cuda_search_dirs:
-            _p = Path(_d) / _lib
-            if _p.exists():
-                binaries.append((str(_p), 'llama_cpp/lib'))
-                break
+# Bundle the Vulkan runtime so end users install nothing Vulkan-related.
+# Only the GPU's own ICD/driver comes from the host (the same contract as
+# libcuda.so.1 under the old CUDA build):
+#  - Linux: bundle the loader (libvulkan.so.1) next to its only consumer,
+#    libggml-vulkan.so in llama_cpp/lib — NOT the _internal root, which is the
+#    dynamic loader's primary search dir and breaks numpy's OpenBLAS stack.
+#  - Windows: PyInstaller skips System32 DLLs during dependency analysis, so
+#    add the loader (vulkan-1.dll) explicitly. Machines whose GPU driver ships
+#    its own copy in System32 resolve that one first; ours is the fallback.
+#  - macOS: bundle MoltenVK (the Vulkan-on-Metal driver) plus an ICD manifest
+#    rewritten to point at the bundled dylib; hooks/rthook_vulkan_icd.py aims
+#    the loader at it. Metal remains available as the native backend.
+if sys.platform.startswith('linux'):
+    for _d in ['/usr/lib/x86_64-linux-gnu', '/usr/lib64', '/usr/lib']:
+        _p = Path(_d) / 'libvulkan.so.1'
+        if _p.exists():
+            binaries.append((str(_p), 'llama_cpp/lib'))
+            break
+elif sys.platform == 'win32':
+    _vk_candidates = []
+    if os.environ.get('VULKAN_SDK'):
+        _vk_candidates.append(Path(os.environ['VULKAN_SDK']) / 'runtime' / 'x64' / 'vulkan-1.dll')
+    _vk_candidates.append(Path(os.environ.get('WINDIR', r'C:\Windows')) / 'System32' / 'vulkan-1.dll')
+    for _p in _vk_candidates:
+        if _p.exists():
+            binaries.append((str(_p), 'llama_cpp/lib'))
+            break
+elif sys.platform == 'darwin':
+    import json
+    for _prefix in [Path('/opt/homebrew'), Path('/usr/local')]:
+        _mvk = _prefix / 'lib' / 'libMoltenVK.dylib'
+        _icd = _prefix / 'share' / 'vulkan' / 'icd.d' / 'MoltenVK_icd.json'
+        if _mvk.exists() and _icd.exists():
+            binaries.append((str(_mvk), 'llama_cpp/lib'))
+            _manifest = json.loads(_icd.read_text())
+            _manifest['ICD']['library_path'] = './libMoltenVK.dylib'
+            _out = Path('build') / 'MoltenVK_icd.json'
+            _out.parent.mkdir(parents=True, exist_ok=True)
+            _out.write_text(json.dumps(_manifest))
+            datas.append((str(_out), 'llama_cpp/lib'))
+            break
 
 try:
     import chromadb
@@ -178,7 +193,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=['hooks/rthook_utf8.py', 'hooks/rthook_chroma_telemetry.py'],
+    runtime_hooks=['hooks/rthook_utf8.py', 'hooks/rthook_chroma_telemetry.py', 'hooks/rthook_vulkan_icd.py'],
     excludes=[
         '.venv',
         'venv',

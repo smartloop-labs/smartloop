@@ -57,21 +57,17 @@ function Test-Platform {
 }
 
 # ---------------------------------------------------------------------------
-# CUDA runtime requirements.
+# Vulkan runtime requirements.
 #
-# The Windows build links llama.cpp's CUDA backend (ggml-cuda.dll), which
-# imports version-specific CUDA runtime libraries (e.g. cudart64_12.dll,
-# cublas64_12.dll, cublasLt64_12.dll). The NVIDIA *driver* only provides
-# nvcuda.dll. The runtime libraries are bundled into the release archive next
-# to ggml-cuda.dll at build time (see `dist` in the Makefile and the Windows
-# GPU-packaging check in .github/workflows/build.yml) -- the installer does not
-# provision them. All we do here is detect an NVIDIA GPU up front, since the
-# build is GPU-accelerated and needs one.
+# The Windows build links llama.cpp's Vulkan backend (ggml-vulkan.dll). The
+# Vulkan loader (vulkan-1.dll) is bundled into the release archive next to
+# ggml-vulkan.dll at build time (see smartloop.spec), so nothing is
+# provisioned here. The GPU driver itself (NVIDIA/AMD/Intel) must come from
+# the host; a System32 vulkan-1.dll is a reliable sign one is installed. We
+# only report status up front -- without a driver, inference falls back to CPU.
 # ---------------------------------------------------------------------------
-function Test-NvidiaGpu {
-    if (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue) { return $true }
-    if (Test-Path (Join-Path $env:WINDIR 'System32\nvcuda.dll')) { return $true }
-    return $false
+function Test-VulkanRuntime {
+    return (Test-Path (Join-Path $env:WINDIR 'System32\vulkan-1.dll'))
 }
 
 # ---------------------------------------------------------------------------
@@ -266,13 +262,12 @@ function Install-Smartloop {
     Test-Platform
     Write-Muted 'Reading package lists... Done'
 
-    # Preflight: report GPU status. The published build is GPU-accelerated, so
-    # flag a missing NVIDIA GPU up front; the matching CUDA runtime itself is
-    # verified and provisioned after extraction (see Resolve-CudaRuntime).
-    if (Test-NvidiaGpu) {
-        Write-Muted 'NVIDIA GPU detected; CUDA runtime will be verified after download.'
+    # Preflight: report GPU status. The published build is GPU-accelerated via
+    # Vulkan, so flag a missing Vulkan runtime up front.
+    if (Test-VulkanRuntime) {
+        Write-Muted 'Vulkan runtime detected; GPU acceleration is available.'
     } else {
-        Write-Host 'Note: no NVIDIA GPU detected. This build is GPU-accelerated and needs an NVIDIA GPU + driver.' -ForegroundColor Yellow
+        Write-Host 'Note: no Vulkan runtime detected. Install a current GPU driver (NVIDIA/AMD/Intel) for GPU acceleration; inference will otherwise run on CPU.' -ForegroundColor Yellow
     }
 
     $slpExisting = Join-Path $InstallDir 'bin\slp.cmd'

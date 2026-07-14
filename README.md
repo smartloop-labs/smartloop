@@ -33,7 +33,7 @@ irm https://smartloop.ai/install.ps1 | iex
 **From source:**
 
 > [!NOTE]
-> Requires the `CUDA` toolkit. For NVIDIA GPU acceleration on Linux/Windows, install [CUDA 12.4](https://developer.nvidia.com/cuda-12-4-0-download-archive) before proceeding. The build step auto-creates and activates a virtual environment, then detects your GPU backend — Metal on macOS, CUDA on Linux/Windows with NVIDIA.
+> Requires the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) (on macOS: `brew install vulkan-headers vulkan-loader molten-vk shaderc`). The build step auto-creates and activates a virtual environment, then compiles the GPU backend — Metal + Vulkan on macOS, Vulkan on Linux/Windows (works with NVIDIA, AMD, and Intel GPUs).
 
 ```bash
 git clone https://github.com/smartloop-ai/smartloop.git
@@ -100,10 +100,10 @@ You projects live inside `~/smartloop/<slug>` directory and this is where skills
 | Requirement | Description |
 |-------------|-------------|
 | OS | macOS (Apple Silicon), Linux (x86_64), or Windows (x86_64) |
-| CUDA | 12.4+ (optional — NVIDIA GPU acceleration on Linux/Windows, defaults to CPU) |
+| Vulkan | GPU driver with Vulkan support (optional — GPU acceleration on Linux/Windows for NVIDIA/AMD/Intel, defaults to CPU) |
 
 > [!NOTE]
-> macOS uses Metal for GPU acceleration automatically. On Windows and Linux, the pre-built release bundles the CUDA runtime, so only the NVIDIA driver is required. To build from source with GPU support, install the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads).
+> macOS uses Metal for GPU acceleration automatically (with Vulkan via MoltenVK as an alternative). On Windows and Linux, the pre-built release uses Vulkan, so any current GPU driver (NVIDIA, AMD, or Intel) is sufficient. To build from source with GPU support, install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home).
 
 ### License
 

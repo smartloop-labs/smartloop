@@ -50,15 +50,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install CUDA runtime libraries
+      # The Vulkan SDK provides the headers, loader, and glslc that the
+      # GGML_VULKAN=ON source build of llama-cpp-python needs.
+      - name: Install Vulkan SDK
         run: |
-          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
-          sudo apt-get install -y cuda-cudart-12-6 libcublas-12-6
-
-      - name: Set CUDA environment
-        run: echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          sudo apt-get install -y vulkan-sdk
 
       - name: Cache docling/EasyOCR models
         uses: actions/cache@v4
@@ -69,7 +68,7 @@ jobs:
             model-cache-${{ runner.os }}-
 
       - name: Install dependencies
-        run: make build CUDA=1
+        run: make build
 
       - name: Build slp binary
         run: make build-binary
@@ -80,14 +79,14 @@ jobs:
           TAG="${{ inputs.tag || github.ref_name }}"
           VER="$(dist/slp/slp --version | awk '{print $NF}')"
           [ "$VER" = "${TAG#v}" ] || { echo "FAIL: binary reports version $VER, tag says ${TAG#v}"; exit 1; }
-          CUDA_SO="$(find dist/slp/_internal -name libggml-cuda.so | head -1)"
-          [ -n "$CUDA_SO" ] || { echo "FAIL: libggml-cuda.so missing — CPU-only build"; exit 1; }
-          for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
-            find dist/slp/_internal -name "${so}*" | grep -q . || { echo "FAIL: $so not bundled into the dist"; exit 1; }
-          done
-          missing="$(LD_LIBRARY_PATH="$PWD/dist/slp/_internal:$PWD/dist/slp/_internal/llama_cpp/lib" ldd "$CUDA_SO" | awk '/not found/{print $1}' | grep -vxF 'libcuda.so.1' || true)"
-          [ -z "$missing" ] || { echo "FAIL: unresolved non-driver deps:"; echo "$missing"; exit 1; }
-          echo "OK: slp $VER, GPU bindings present, CUDA runtime bundled."
+          VULKAN_SO="$(find dist/slp/_internal -name libggml-vulkan.so | head -1)"
+          [ -n "$VULKAN_SO" ] || { echo "FAIL: libggml-vulkan.so missing — CPU-only build"; exit 1; }
+          # PyInstaller bundles the Vulkan loader (libvulkan) it finds linked
+          # against libggml-vulkan.so; the ICD/driver comes from the host GPU.
+          find dist/slp/_internal -name "libvulkan.so*" | grep -q . || { echo "FAIL: libvulkan.so (Vulkan loader) not bundled into the dist"; exit 1; }
+          missing="$(LD_LIBRARY_PATH="$PWD/dist/slp/_internal:$PWD/dist/slp/_internal/llama_cpp/lib" ldd "$VULKAN_SO" | awk '/not found/{print $1}' || true)"
+          [ -z "$missing" ] || { echo "FAIL: unresolved deps:"; echo "$missing"; exit 1; }
+          echo "OK: slp $VER, Vulkan backend present, loader bundled."
 
       - name: Archive
         run: make archive
@@ -122,6 +121,11 @@ jobs:
           key: pip-macos-${{ hashFiles('pyproject.toml') }}
           restore-keys: |
             pip-macos-
+
+      # Vulkan headers/loader + glslc (shaderc) for the GGML_VULKAN=ON build;
+      # molten-vk is the ICD that maps Vulkan onto Metal at runtime.
+      - name: Install Vulkan SDK (MoltenVK)
+        run: brew install vulkan-headers vulkan-loader molten-vk shaderc
 
       - name: Import Apple certificate
         env:
@@ -161,7 +165,12 @@ jobs:
           TAG="${{ inputs.tag || github.ref_name }}"
           VER="$(dist/slp/slp --version | awk '{print $NF}')"
           [ "$VER" = "${TAG#v}" ] || { echo "FAIL: binary reports version $VER, tag says ${TAG#v}"; exit 1; }
-          echo "OK: slp $VER"
+          find dist/slp/_internal -name "libggml-metal*" | grep -q . || { echo "FAIL: Metal backend missing from dist"; exit 1; }
+          find dist/slp/_internal -name "libggml-vulkan*" | grep -q . || { echo "FAIL: Vulkan backend missing from dist"; exit 1; }
+          find dist/slp/_internal -name "libvulkan*" | grep -q . || { echo "FAIL: Vulkan loader (libvulkan) not bundled"; exit 1; }
+          find dist/slp/_internal -name "libMoltenVK*" | grep -q . || { echo "FAIL: MoltenVK not bundled — Vulkan would need a user install"; exit 1; }
+          find dist/slp/_internal -name "MoltenVK_icd.json" | grep -q . || { echo "FAIL: MoltenVK ICD manifest not bundled"; exit 1; }
+          echo "OK: slp $VER, Metal + Vulkan backends present, MoltenVK bundled."
 
       - name: Sign
         env:
@@ -208,35 +217,46 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.21
-        with:
-          cuda: '12.4.0'
+      # The Vulkan SDK provides the headers, loader, and glslc that the
+      # GGML_VULKAN=ON source build of llama-cpp-python needs.
+      - name: Install Vulkan SDK
+        shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.313.2
+        run: |
+          curl.exe -f -L -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" `
+            "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
 
       - name: Install make
         run: choco install make -y
 
       # Resolve the pinned llama-cpp-python version from the Makefile so the
-      # cache key tracks it automatically — bumping LLAMA_ABETLEN_VERSION
-      # invalidates the stale wheel instead of silently reusing it.
+      # cache key tracks it automatically — bumping LLAMA_VERSION invalidates
+      # the stale wheel instead of silently reusing it.
       - name: Resolve llama-cpp-python version
         id: llama-ver
-        run: echo "version=$(grep '^LLAMA_ABETLEN_VERSION' Makefile | sed 's/.*:= *//')" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(grep '^LLAMA_VERSION' Makefile | sed 's/.*:= *//')" >> "$GITHUB_OUTPUT"
 
-      # The CUDA source build of llama-cpp-python takes ~1h. It's deterministic
-      # for a fixed (llama version, CUDA 12.4, py3.11, runner) tuple, so cache
-      # the compiled wheel and only recompile when one of those changes.
-      - name: Cache llama-cpp-python CUDA wheel
+      # The MSVC source build of llama-cpp-python is slow (tens of minutes).
+      # It's deterministic for a fixed (llama version, Vulkan backend, py3.11,
+      # runner) tuple, so cache the compiled wheel and only recompile when one
+      # of those changes.
+      - name: Cache llama-cpp-python Vulkan wheel
         id: llama-wheel-cache
         uses: actions/cache@v4
         with:
           path: wheelhouse
-          key: llama-cpp-${{ steps.llama-ver.outputs.version }}-cu124-py311-windows-2022
+          key: llama-cpp-${{ steps.llama-ver.outputs.version }}-vulkan-py311-windows-2022
 
-      - name: Pre-build llama-cpp-python CUDA wheel
+      - name: Pre-build llama-cpp-python Vulkan wheel
         if: steps.llama-wheel-cache.outputs.cache-hit != 'true'
         env:
-          CMAKE_ARGS: "-DGGML_CUDA=ON"
+          # Keep in sync with LLAMA_CMAKE_ARGS in the Makefile so the cached
+          # wheel matches what the make fallback would build.
+          CMAKE_ARGS: "-DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_AVX2=ON"
           CMAKE_BUILD_PARALLEL_LEVEL: ${{ env.NUMBER_OF_PROCESSORS }}
         run: |
           python -m pip install --upgrade pip wheel
@@ -254,29 +274,20 @@ jobs:
             model-cache-${{ runner.os }}-
 
       # On a cache hit `make build` installs the prebuilt wheel from wheelhouse/
-      # via --find-links (Makefile); CMAKE_ARGS only matters for the rare
-      # source-build fallback when no cached wheel matches.
+      # via --find-links (Makefile); otherwise the Makefile builds from source
+      # with its own LLAMA_CMAKE_ARGS (Vulkan).
       - name: Install dependencies
-        env:
-          CMAKE_ARGS: "-DGGML_CUDA=ON"
-        run: make build CUDA=1
+        run: make build
 
-      # The abetlen wheel's ggml-cuda.dll links against the CUDA runtime but
-      # does not vendor those DLLs. Copy them from the toolkit into llama_cpp/lib
-      # so PyInstaller bundles them next to ggml-cuda.dll.
-      - name: Bundle CUDA runtime into llama_cpp
+      # Fail early if the Vulkan backend didn't get compiled in. The Vulkan
+      # loader (vulkan-1.dll) is bundled into the dist by smartloop.spec so
+      # end users don't need any Vulkan runtime installed.
+      - name: Verify Vulkan backend built
         run: |
           set -euo pipefail
           LLAMA_LIB="$(cygpath -u "$(.venv/Scripts/python -c 'import os,importlib.util as u; s=u.find_spec("llama_cpp"); print(os.path.join(os.path.dirname(s.origin),"lib"))')")"
-          [ -f "$LLAMA_LIB/ggml-cuda.dll" ] || { echo "FAIL: ggml-cuda.dll missing — CPU-only build (GGML_CUDA=ON not honored?)"; exit 1; }
-          CUDA_BIN="$(cygpath -u "${CUDA_PATH:-$CUDA_HOME}")/bin"
-          [ -d "$CUDA_BIN" ] || { echo "FAIL: CUDA bin dir not found (CUDA_PATH=$CUDA_PATH CUDA_HOME=$CUDA_HOME)"; exit 1; }
-          for pat in cudart64 cublas64 cublasLt64; do
-            src="$(ls "$CUDA_BIN"/${pat}_*.dll 2>/dev/null | head -1)"
-            [ -n "$src" ] || { echo "FAIL: ${pat}_*.dll not found in $CUDA_BIN — toolkit install incomplete"; exit 1; }
-            cp "$src" "$LLAMA_LIB/"
-            echo "  bundled $(basename "$src") <- $src"
-          done
+          [ -f "$LLAMA_LIB/ggml-vulkan.dll" ] || { echo "FAIL: ggml-vulkan.dll missing — CPU-only build (GGML_VULKAN=ON not honored?)"; exit 1; }
+          echo "OK: ggml-vulkan.dll present in $LLAMA_LIB"
 
       - name: Build slp binary
         run: make build-binary
@@ -287,13 +298,10 @@ jobs:
           TAG="${{ inputs.tag || github.ref_name }}"
           VER="$(dist/slp/slp --version | awk '{print $NF}')"
           [ "$VER" = "${TAG#v}" ] || { echo "FAIL: binary reports version $VER, tag says ${TAG#v}"; exit 1; }
-          GGML_CUDA="$(find dist/slp/_internal -name ggml-cuda.dll | head -1)"
-          [ -n "$GGML_CUDA" ] || { echo "FAIL: ggml-cuda.dll missing — CPU-only build"; exit 1; }
-          LIBDIR="$(dirname "$GGML_CUDA")"
-          for pat in cudart64 cublas64 cublasLt64; do
-            ls "$LIBDIR"/${pat}_*.dll >/dev/null 2>&1 || { echo "FAIL: ${pat}_*.dll not bundled next to ggml-cuda.dll"; exit 1; }
-          done
-          echo "OK: slp $VER, GPU bindings present, CUDA runtime bundled."
+          GGML_VULKAN="$(find dist/slp/_internal -name ggml-vulkan.dll | head -1)"
+          [ -n "$GGML_VULKAN" ] || { echo "FAIL: ggml-vulkan.dll missing — CPU-only build"; exit 1; }
+          [ -f "$(dirname "$GGML_VULKAN")/vulkan-1.dll" ] || { echo "FAIL: vulkan-1.dll (Vulkan loader) not bundled next to ggml-vulkan.dll"; exit 1; }
+          echo "OK: slp $VER, Vulkan backend present, loader bundled."
 
       # Authenticode-sign before archiving so the zip and its checksum cover the
       # signed binaries. This is the Windows counterpart of the macOS sign +
