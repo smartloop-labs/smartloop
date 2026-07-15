@@ -91,10 +91,17 @@ elif sys.platform == 'win32':
             break
 elif sys.platform == 'darwin':
     import json
+    # Homebrew's molten-vk formula moved the ICD manifest from share/ to etc/
+    # (>= 1.4), so accept either location.
+    _mvk_found = False
     for _prefix in [Path('/opt/homebrew'), Path('/usr/local')]:
         _mvk = _prefix / 'lib' / 'libMoltenVK.dylib'
-        _icd = _prefix / 'share' / 'vulkan' / 'icd.d' / 'MoltenVK_icd.json'
-        if _mvk.exists() and _icd.exists():
+        _icds = [
+            _prefix / _sub / 'vulkan' / 'icd.d' / 'MoltenVK_icd.json'
+            for _sub in ('etc', 'share')
+        ]
+        _icd = next((p for p in _icds if p.exists()), None)
+        if _mvk.exists() and _icd is not None:
             binaries.append((str(_mvk), 'llama_cpp/lib'))
             _manifest = json.loads(_icd.read_text())
             _manifest['ICD']['library_path'] = './libMoltenVK.dylib'
@@ -102,7 +109,15 @@ elif sys.platform == 'darwin':
             _out.parent.mkdir(parents=True, exist_ok=True)
             _out.write_text(json.dumps(_manifest))
             datas.append((str(_out), 'llama_cpp/lib'))
+            _mvk_found = True
             break
+    if not _mvk_found:
+        # Fail the build here rather than letting CI's post-build verify catch
+        # a bundle that silently shipped without Vulkan support.
+        raise SystemExit(
+            'MoltenVK not found: need libMoltenVK.dylib plus MoltenVK_icd.json '
+            'under /opt/homebrew or /usr/local (brew install molten-vk)'
+        )
 
 try:
     import chromadb
