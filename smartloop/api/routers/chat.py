@@ -312,6 +312,15 @@ async def stream_chunks(
     if has_attachments:
         yield _status_event("attachments", "completed", "Attachments resolved")
 
+    # Image attachments on the current turn are handed to the orchestrator so a
+    # vision-capable model reads the pixels + the user's own question, instead
+    # of a pre-processed text transcription that loses the visual content.
+    _cur_user = next((m for m in reversed(request.messages) if m.role == "user"), None)
+    image_attachments = (
+        model_service.get_asset_images(_cur_user.attachments)
+        if _cur_user and _cur_user.attachments else []
+    )
+
     # Get project skills and document context separately
     last_user_msg = next(
         (m.content for m in reversed(messages) if m.role == "user"), None
@@ -345,6 +354,7 @@ async def stream_chunks(
                 last_user_msg, skills=project_skills, cwd=request.cwd,
                 conversation_history=conversation_history,
                 has_attachments=has_attachments,
+                images=image_attachments,
                 progress_callback=_progress,
             ),
         )
@@ -408,7 +418,16 @@ async def stream_chunks(
         yield "data: [DONE]\n\n"
         if request.session_id:
             if last_user_msg:
-                model_service.append_to_session(request.session_id, "user", last_user_msg)
+                # For image turns, fold the vision model's reading of the image
+                # into the stored user turn so later turns (which no longer carry
+                # the attachment) can still reference what the image contained.
+                user_record = last_user_msg
+                if image_attachments:
+                    user_record = (
+                        f"{last_user_msg}\n\n[Attached image — description]:\n"
+                        f"{orchestrator_context}"
+                    )
+                model_service.append_to_session(request.session_id, "user", user_record)
             model_service.append_to_session(request.session_id, "assistant", orchestrator_context, message_id=message_id)
 
         _project_id = model_service.get_project_id()
@@ -809,6 +828,12 @@ async def create_chat_completion(
         project_skills = [s for s in model_service.get_project_skills() if not s.system]
         loop = asyncio.get_event_loop()
 
+        _cur_user = next((m for m in reversed(request.messages) if m.role == "user"), None)
+        image_attachments = (
+            model_service.get_asset_images(_cur_user.attachments)
+            if _cur_user and _cur_user.attachments else []
+        )
+
         # Orchestrator handles vector search, MCP tools, and explore in one step
         orchestrator_context = None
         tool_error = None
@@ -820,6 +845,7 @@ async def create_chat_completion(
                 lambda: model_service.orchestrate(
                     last_user_msg, skills=project_skills, cwd=request.cwd,
                     conversation_history=conversation_history,
+                    images=image_attachments,
                 ),
             )
 

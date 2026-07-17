@@ -1,5 +1,6 @@
 """Singleton model service for managing LLM lifecycle"""
 
+import base64
 import json
 import logging
 import mimetypes
@@ -3329,6 +3330,7 @@ class ModelService:
         cwd: Optional[str] = None,
         conversation_history: Optional[list] = None,
         has_attachments: bool = False,
+        images: Optional[list[tuple[bytes, str]]] = None,
         progress_callback: Optional[Callable[[str, str, str], None]] = None,
     ) -> tuple[Optional[str], bool, Optional[str], Optional[list], Optional[str], bool]:
         """Full orchestrator entry point for a user message.
@@ -3360,6 +3362,22 @@ class ModelService:
                 self._model is not None, self._llm is not None,
             )
             return None, False, None, None, None, False
+
+        # Image attachment → let a vision-capable model read the pixels with the
+        # user's own question and answer directly, then hand the answer back with
+        # mutation=True so the router streams it verbatim (no text-only
+        # re-synthesis, which cannot see the image).  Falls through to the normal
+        # pipeline when no vision model is available.
+        if images:
+            try:
+                answer = self.vision_answer(user_message, images)
+                if answer:
+                    return answer, True, None, None, None, True
+                logger.warning("[orchestrator] vision_answer returned empty — "
+                               "falling through to text pipeline")
+            except Exception as e:
+                logger.warning("[orchestrator] vision answer failed (%s) — "
+                               "falling through to text pipeline", e)
 
         # Reload workspace from disk to pick up any changes made by
         # background indexers or project setup since the last request.
@@ -3638,44 +3656,53 @@ class ModelService:
         asset_dir = self._assets_dir() / asset_id
         asset_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write the original file to a temp location for parsing
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-
         markdown_content = None
         is_markdown = False
+        is_image = (content_type or "").startswith("image/")
 
-        try:
-            mime_type = content_type or (mimetypes.guess_type(filename)[0] or "application/octet-stream")
-            llm = self.load_model()
+        if is_image:
+            # Images are NOT pre-processed to text here: OCR-at-upload throws
+            # away the visual content, so "describe the person" can't be
+            # answered later.  Persist the original pixels instead and let a
+            # vision-capable model read them at query time with the user's
+            # actual question (see ``vision_answer`` / ``orchestrate``).
+            (asset_dir / f"original{ext or '.img'}").write_bytes(file_bytes)
+        else:
+            # Write the original file to a temp location for parsing
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
 
-            # get_parser raises ValueError for unsupported mime types — treat as raw storage
             try:
-                parser = ParserFactory(llm).get_parser(mime_type, tmp_path, logger)
+                mime_type = content_type or (mimetypes.guess_type(filename)[0] or "application/octet-stream")
+                llm = self.load_model()
+
+                # get_parser raises ValueError for unsupported mime types — treat as raw storage
+                try:
+                    parser = ParserFactory(llm).get_parser(mime_type, tmp_path, logger)
+                except ValueError:
+                    parser = None
+
+                if parser is not None:
+                    markdown_content = parser.parse()
+                    is_markdown = True
+
+                    # Enforce token limit using the loaded LLM's tokenizer
+                    _MAX_TOKENS = llm.get_max_tokens() if llm else 8192
+                    estimated_tokens = llm.get_num_tokens(markdown_content)
+                    if estimated_tokens > _MAX_TOKENS:
+                        raise ValueError(
+                            f"Attachment too large: ~{estimated_tokens:,} tokens estimated "
+                            f"(maximum is {_MAX_TOKENS:,}). "
+                            "Please split the document into smaller sections."
+                        )
+
             except ValueError:
-                parser = None
-
-            if parser is not None:
-                markdown_content = parser.parse()
-                is_markdown = True
-
-                # Enforce token limit using the loaded LLM's tokenizer
-                _MAX_TOKENS = llm.get_max_tokens() if llm else 8192
-                estimated_tokens = llm.get_num_tokens(markdown_content)
-                if estimated_tokens > _MAX_TOKENS:
-                    raise ValueError(
-                        f"Attachment too large: ~{estimated_tokens:,} tokens estimated "
-                        f"(maximum is {_MAX_TOKENS:,}). "
-                        "Please split the document into smaller sections."
-                    )
-
-        except ValueError:
-            raise
-        except Exception as parse_err:
-            logger.error(f"Parser conversion failed for {filename}: {parse_err}; storing raw bytes")
-        finally:
-            os.unlink(tmp_path)
+                raise
+            except Exception as parse_err:
+                logger.error(f"Parser conversion failed for {filename}: {parse_err}; storing raw bytes")
+            finally:
+                os.unlink(tmp_path)
 
         # Persist metadata
         metadata = {
@@ -3684,6 +3711,7 @@ class ModelService:
             "content_type": content_type,
             "size": len(file_bytes),
             "markdown": is_markdown,
+            "image": is_image,
         }
         (asset_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
@@ -3736,5 +3764,93 @@ class ModelService:
             except ValueError:
                 logger.warning(f"Attachment asset not found: {aid}")
         return "\n\n---\n\n".join(parts)
+
+    def get_asset_images(self, asset_ids: list[str]) -> list[tuple[bytes, str]]:
+        """Return ``[(bytes, mime_type)]`` for the image assets among ``asset_ids``.
+
+        Only assets stored as images (``metadata['image']`` true, with an
+        ``original.*`` file on disk) are returned; document assets are ignored
+        so the caller can route image-attachment turns to the vision model.
+        """
+        images: list[tuple[bytes, str]] = []
+        for aid in asset_ids or []:
+            asset_dir = Path(self._assets_dir(), aid)
+            meta_path = asset_dir / "metadata.json"
+            if not meta_path.exists():
+                logger.warning(f"Attachment asset not found: {aid}")
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            content_type = meta.get("content_type") or "application/octet-stream"
+            if not (meta.get("image") or content_type.startswith("image/")):
+                continue
+            original = next(iter(asset_dir.glob("original.*")), None)
+            if original is not None:
+                images.append((original.read_bytes(), content_type))
+        return images
+
+    # Anti-hallucination guidance for image Q&A.  It is folded into the *user*
+    # message rather than a system message: the Qwen2-VL GGUF + llama.cpp chat
+    # handler emits EOS immediately (empty output) when a system message
+    # accompanies an image, so we mirror MarkItDown's proven single-user-message
+    # shape and put the steering in the prompt text instead.
+    _VISION_QA_GUIDANCE = (
+        "Answer using only what is actually visible in the image. If the answer "
+        "is not visible, say so plainly instead of guessing. Do not invent "
+        "people, text, or details that are not there.\n\n"
+    )
+
+    def vision_answer(
+        self,
+        prompt: str,
+        images: list[tuple[bytes, str]],
+        max_tokens: int = 1024,
+    ) -> str:
+        """Return a vision-model answer to ``prompt`` about the given ``images``.
+
+        The image pixels and the user's own prompt go straight to the multimodal
+        model via ``create_chat_completion`` (non-streaming — the proven path
+        the OCR pipeline uses), so the model reads exactly what the user asked
+        about with no lossy upload-time transcription in between.  ``images`` is
+        a list of ``(bytes, mime_type)``.
+
+        The request deliberately uses a single user message (text + image) with
+        no system message — see ``_VISION_QA_GUIDANCE``.
+
+        Raises ``RuntimeError`` when no vision-capable model is available so the
+        caller can surface actionable guidance instead of a silent empty reply.
+        """
+        llm = self.get_vision_llm()
+        if llm is None:
+            raise RuntimeError("No vision-capable model available")
+
+        content: list[dict] = [
+            {"type": "text", "text": f"{self._VISION_QA_GUIDANCE}{prompt}"}
+        ]
+        for data, mime in images:
+            b64 = base64.b64encode(data).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        messages = [{"role": "user", "content": content}]
+
+        with self._inference_lock:
+            result = llm.model.create_chat_completion(
+                messages=messages, max_tokens=max_tokens,
+                temperature=0.0, stream=False,
+            )
+        choice0 = (result.get("choices") or [{}])[0]
+        answer = (choice0.get("message", {}).get("content") or "").strip()
+        # Qwen2-VL sometimes prefixes its reply with a stray "label:" (often an
+        # empty label, leaving a leading ":"); drop it so the answer reads clean.
+        answer = answer.lstrip(":").strip()
+        logger.info(
+            "[vision-answer] %d char(s), finish=%s, preview=%r",
+            len(answer), choice0.get("finish_reason"), answer[:120],
+        )
+        return answer
 
 
