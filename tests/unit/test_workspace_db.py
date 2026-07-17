@@ -119,6 +119,48 @@ class TestModelPersistence:
         assert db.models_fetched_at() is None
 
 
+_RELEASE = {
+    "version": "1.0.15",
+    "name": "Release 1.0.15",
+    "notes": "shiny",
+    "channel": "stable",
+    "artifacts": [
+        {"platform": "darwin", "arch": "arm64", "kind": "zip",
+         "url": "https://cdn/x.zip", "sha512": "abc", "size": 123},
+    ],
+    "min_version": "1.0.10",
+}
+
+
+class TestReleasePersistence:
+    def test_empty_on_creation(self, db):
+        assert db.get_release() is None
+        assert db.get_release("beta") is None
+        assert db.release_fetched_at() is None
+
+    def test_save_and_get(self, db):
+        db.save_release("stable", _RELEASE)
+        assert db.get_release("stable") == _RELEASE
+        assert db.release_fetched_at("stable") > 0
+
+    def test_channels_are_independent(self, db):
+        db.save_release("stable", _RELEASE)
+        beta = {**_RELEASE, "channel": "beta", "version": "1.1.0-beta.1"}
+        db.save_release("beta", beta)
+        assert db.get_release("stable")["version"] == "1.0.15"
+        assert db.get_release("beta")["version"] == "1.1.0-beta.1"
+
+    def test_upsert_overwrites(self, db):
+        db.save_release("stable", _RELEASE)
+        db.save_release("stable", {**_RELEASE, "version": "1.0.16"})
+        assert db.get_release("stable")["version"] == "1.0.16"
+
+    def test_none_release_records_timestamp_but_returns_none(self, db):
+        db.save_release("stable", None)
+        assert db.get_release("stable") is None
+        assert db.release_fetched_at("stable") > 0  # a fetch DID happen
+
+
 class TestWorkspacePersistence:
     def test_empty_on_creation(self, db):
         assert db.get_workspace() is None

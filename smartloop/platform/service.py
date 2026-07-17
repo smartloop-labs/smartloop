@@ -19,6 +19,7 @@ T = TypeVar("T")
 # TTL in seconds
 USER_TTL = 5 * 60       # 5 minutes
 MODELS_TTL = 15 * 60    # 15 minutes
+RELEASES_TTL = 60 * 60  # 1 hour
 
 
 def _fetch_or_cache(
@@ -115,5 +116,27 @@ class PlatformService:
             get_timestamp=self._db.models_fetched_at,
             fetch_remote=self._client.list_models,
             save_cache=self._db.save_models,
+            force=force,
+        )
+
+    def get_latest_release(self, channel: str = "stable", force: bool = False) -> Optional[dict]:
+        """Return the latest published release for *channel* (cached or fresh).
+
+        Returns the raw release dict (or ``None`` when the channel has no
+        published release).  The cloud client returns the full
+        LatestReleaseResponse wrapper; we cache only the ``release`` field so
+        the per-client ``current_version`` comparison happens at request time.
+        """
+        def _fetch_release() -> Optional[dict]:
+            return (self._client.get_latest_release(channel) or {}).get("release")
+
+        if self._db is None:
+            return _fetch_release()
+        return _fetch_or_cache(
+            ttl=RELEASES_TTL,
+            get_cached=lambda: self._db.get_release(channel),
+            get_timestamp=lambda: self._db.release_fetched_at(channel),
+            fetch_remote=_fetch_release,
+            save_cache=lambda rel: self._db.save_release(channel, rel),
             force=force,
         )

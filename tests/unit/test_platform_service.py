@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from smartloop.platform.service import PlatformService, USER_TTL
+from smartloop.platform.service import PlatformService, USER_TTL, RELEASES_TTL
 from smartloop.platform.workspace_db import WorkspaceDB
 
 
@@ -23,15 +23,27 @@ _MODELS = [
      "description": "Gemma 3 1B", "access_level": "public", "is_accessible": True},
 ]
 
+_RELEASE = {"version": "1.0.15", "name": "v", "notes": "", "channel": "stable",
+            "artifacts": [], "min_version": None}
+# The cloud client returns the full LatestReleaseResponse wrapper.
+_RELEASE_WRAPPER = {"update_available": None, "update_required": False, "release": _RELEASE}
+
 
 class _FakeClient:
     """Minimal stand-in for SLPPlatformClient."""
 
-    def __init__(self, *, user=None, models=None, fail=False):
+    def __init__(self, *, user=None, models=None, release_wrapper=None, fail=False):
         self._user = user
         self._models = models
+        self._release_wrapper = release_wrapper
         self._fail = fail
-        self.call_count = {"user": 0, "models": 0, "update": 0}
+        self.call_count = {"user": 0, "models": 0, "update": 0, "release": 0}
+
+    def get_latest_release(self, channel="stable"):
+        self.call_count["release"] += 1
+        if self._fail:
+            raise ConnectionError("offline")
+        return self._release_wrapper
 
     def get_current_user(self):
         self.call_count["user"] += 1
@@ -146,6 +158,14 @@ class TestNoDB:
         svc.list_models()
         assert client.call_count["models"] == 2
 
+    def test_get_latest_release_proxies_to_cloud(self):
+        client = _FakeClient(release_wrapper=_RELEASE_WRAPPER)
+        svc = PlatformService(client, db=None)
+        # unwraps the LatestReleaseResponse to just the release field
+        assert svc.get_latest_release("stable") == _RELEASE
+        svc.get_latest_release("stable")
+        assert client.call_count["release"] == 2
+
     def test_update_proxies_without_caching(self):
         client = _FakeClient(user=_USER)
         svc = PlatformService(client, db=None)
@@ -186,3 +206,51 @@ class TestListModels:
 
         with pytest.raises(ConnectionError):
             svc.list_models()
+
+
+class TestGetLatestRelease:
+    def test_unwraps_and_caches_the_release_field(self, db):
+        client = _FakeClient(release_wrapper=_RELEASE_WRAPPER)
+        svc = PlatformService(client, db)
+
+        result = svc.get_latest_release("stable")
+        assert result == _RELEASE
+        assert client.call_count["release"] == 1
+        assert db.get_release("stable") == _RELEASE
+
+    def test_returns_cached_within_ttl(self, db):
+        client = _FakeClient(release_wrapper=_RELEASE_WRAPPER)
+        svc = PlatformService(client, db)
+
+        svc.get_latest_release("stable")
+        svc.get_latest_release("stable")
+        assert client.call_count["release"] == 1
+
+    def test_force_bypasses_ttl(self, db):
+        client = _FakeClient(release_wrapper=_RELEASE_WRAPPER)
+        svc = PlatformService(client, db)
+
+        svc.get_latest_release("stable")
+        svc.get_latest_release("stable", force=True)
+        assert client.call_count["release"] == 2
+
+    def test_falls_back_to_cache_when_offline(self, db):
+        db.save_release("stable", _RELEASE)
+
+        client = _FakeClient(fail=True)
+        svc = PlatformService(client, db)
+
+        assert svc.get_latest_release("stable") == _RELEASE
+
+    def test_refetches_after_ttl(self, db, monkeypatch):
+        client = _FakeClient(release_wrapper=_RELEASE_WRAPPER)
+        svc = PlatformService(client, db)
+
+        svc.get_latest_release("stable")
+        assert client.call_count["release"] == 1
+
+        original_time = time.time
+        monkeypatch.setattr(time, "time", lambda: original_time() + RELEASES_TTL + 1)
+
+        svc.get_latest_release("stable")
+        assert client.call_count["release"] == 2

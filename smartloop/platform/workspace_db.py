@@ -5,6 +5,7 @@ responses when the cloud platform is unreachable.  Lives at
 ``~/.smartloop/workspace.db``.
 """
 
+import json
 import os
 import sqlite3
 import threading
@@ -40,6 +41,12 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     is_accessible INTEGER NOT NULL DEFAULT 0,
     sha256        TEXT,
     fetched_at    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS release_cache (
+    channel     TEXT PRIMARY KEY,
+    release     TEXT,            -- JSON of the latest published ReleaseRead, or NULL
+    fetched_at  REAL NOT NULL
 );
 """
 
@@ -171,6 +178,50 @@ class WorkspaceDB:
                 "SELECT MIN(fetched_at) AS ts FROM model_catalog"
             ).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
+
+    # ------------------------------------------------------------------
+    # Releases
+    # ------------------------------------------------------------------
+
+    def get_release(self, channel: str = "stable") -> Optional[dict]:
+        """Return the cached latest release for *channel*, or ``None``.
+
+        ``None`` is returned both when nothing has been cached and when the
+        cached value records that the channel has no published release.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT release FROM release_cache WHERE channel = ?", (channel,)
+            ).fetchone()
+        if row is None or row["release"] is None:
+            return None
+        return json.loads(row["release"])
+
+    def save_release(self, channel: str, release: Optional[dict]) -> None:
+        """Upsert the latest release for *channel* from a cloud API response.
+
+        *release* may be ``None`` to record that the channel currently has no
+        published release (still bumps ``fetched_at``).
+        """
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO release_cache (channel, release, fetched_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(channel) DO UPDATE SET
+                       release = excluded.release,
+                       fetched_at = excluded.fetched_at
+                """,
+                (channel, json.dumps(release) if release is not None else None, time.time()),
+            )
+            self._conn.commit()
+
+    def release_fetched_at(self, channel: str = "stable") -> Optional[float]:
+        """Return the timestamp of the last release fetch for *channel*, or ``None``."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fetched_at FROM release_cache WHERE channel = ?", (channel,)
+            ).fetchone()
+        return row["fetched_at"] if row else None
 
     # ------------------------------------------------------------------
     # Workspace

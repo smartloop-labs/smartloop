@@ -4,7 +4,7 @@ Handles only JSON control-plane calls — no file downloading.
 """
 
 import logging
-from typing import Callable
+from typing import Callable, Optional
 
 import httpx
 
@@ -20,6 +20,7 @@ _USERS_ME = "/v1/users/me"
 _JWT_REFRESH = "/v1/auth/jwt/refresh"
 _MODEL_UPLOAD = "/v1/models/{}/upload"
 _MODELS = "/v1/models"
+_RELEASES_LATEST = "/v1/releases/latest"
 
 _TIMEOUT = 30
 
@@ -82,6 +83,24 @@ class SLPPlatformClient:
                 resp = httpx.get(self._url(_MODELS), timeout=_TIMEOUT)
             except httpx.TransportError as e:
                 raise ConnectionError(f"Connection error: {e}") from e
+
+        _raise_for_status(resp)
+        return resp.json()
+
+    def get_latest_release(self, channel: str = "stable") -> Optional[dict]:
+        """GET /v1/releases/latest (no auth). Returns the LatestReleaseResponse dict.
+
+        We poll WITHOUT ``current_version`` so the cached payload is
+        client-agnostic; update_available/update_required are computed locally
+        per request.  Returns the full wrapper ``{update_available, update_required,
+        release}``; callers use the ``release`` field (which may be ``None`` when
+        no published release exists for the channel).
+        """
+        try:
+            resp = httpx.get(self._url(_RELEASES_LATEST),
+                             params={"channel": channel}, timeout=_TIMEOUT)
+        except httpx.TransportError as e:
+            raise ConnectionError(f"Connection error: {e}") from e
 
         _raise_for_status(resp)
         return resp.json()
