@@ -161,8 +161,8 @@ class TestNoDB:
     def test_get_latest_release_proxies_to_cloud(self):
         client = _FakeClient(release_wrapper=_RELEASE_WRAPPER)
         svc = PlatformService(client, db=None)
-        # unwraps the LatestReleaseResponse to just the release field
-        assert svc.get_latest_release("stable") == _RELEASE
+        # returns the LatestReleaseResponse envelope
+        assert svc.get_latest_release("stable") == _RELEASE_WRAPPER
         svc.get_latest_release("stable")
         assert client.call_count["release"] == 2
 
@@ -209,13 +209,14 @@ class TestListModels:
 
 
 class TestGetLatestRelease:
-    def test_unwraps_and_caches_the_release_field(self, db):
+    def test_returns_envelope_and_caches_the_release_field(self, db):
         client = _FakeClient(release_wrapper=_RELEASE_WRAPPER)
         svc = PlatformService(client, db)
 
         result = svc.get_latest_release("stable")
-        assert result == _RELEASE
+        assert result == _RELEASE_WRAPPER
         assert client.call_count["release"] == 1
+        # only the inner release is cached (client-agnostic)
         assert db.get_release("stable") == _RELEASE
 
     def test_returns_cached_within_ttl(self, db):
@@ -240,7 +241,7 @@ class TestGetLatestRelease:
         client = _FakeClient(fail=True)
         svc = PlatformService(client, db)
 
-        assert svc.get_latest_release("stable") == _RELEASE
+        assert svc.get_latest_release("stable")["release"] == _RELEASE
 
     def test_refetches_after_ttl(self, db, monkeypatch):
         client = _FakeClient(release_wrapper=_RELEASE_WRAPPER)

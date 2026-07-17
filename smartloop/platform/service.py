@@ -119,24 +119,33 @@ class PlatformService:
             force=force,
         )
 
-    def get_latest_release(self, channel: str = "stable", force: bool = False) -> Optional[dict]:
-        """Return the latest published release for *channel* (cached or fresh).
+    def get_latest_release(self, channel: str = "stable", force: bool = False) -> dict:
+        """Return the latest-release envelope for *channel* (cached or fresh).
 
-        Returns the raw release dict (or ``None`` when the channel has no
-        published release).  The cloud client returns the full
-        LatestReleaseResponse wrapper; we cache only the ``release`` field so
-        the per-client ``current_version`` comparison happens at request time.
+        Mirrors the cloud ``LatestReleaseResponse`` shape
+        ``{update_available, update_required, release}``.  We poll the cloud
+        WITHOUT ``current_version`` and cache only the inner ``release`` (so one
+        cache entry serves every client); ``update_available`` /
+        ``update_required`` are left null/False here and computed per-request by
+        the caller.  ``release`` is ``None`` when the channel has no published
+        release.
+
+        Set *force* to bypass the TTL and re-poll the cloud — used by the
+        client's explicit "check for updates" action, mirroring
+        :meth:`get_current_user`.
         """
         def _fetch_release() -> Optional[dict]:
             return (self._client.get_latest_release(channel) or {}).get("release")
 
         if self._db is None:
-            return _fetch_release()
-        return _fetch_or_cache(
-            ttl=RELEASES_TTL,
-            get_cached=lambda: self._db.get_release(channel),
-            get_timestamp=lambda: self._db.release_fetched_at(channel),
-            fetch_remote=_fetch_release,
-            save_cache=lambda rel: self._db.save_release(channel, rel),
-            force=force,
-        )
+            release = _fetch_release()
+        else:
+            release = _fetch_or_cache(
+                ttl=RELEASES_TTL,
+                get_cached=lambda: self._db.get_release(channel),
+                get_timestamp=lambda: self._db.release_fetched_at(channel),
+                fetch_remote=_fetch_release,
+                save_cache=lambda rel: self._db.save_release(channel, rel),
+                force=force,
+            )
+        return {"update_available": None, "update_required": False, "release": release}

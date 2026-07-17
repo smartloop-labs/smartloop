@@ -49,6 +49,7 @@ class LatestReleaseResponse(BaseModel):
 async def latest_release(
     current_version: str | None = None,
     channel: str | None = None,
+    force: bool = False,
     svc: PlatformService = Depends(get_platform_service),
 ):
     """Return the latest published release for *channel* (cached locally).
@@ -57,6 +58,9 @@ async def latest_release(
     ``update_required`` are computed locally by semver comparison, mirroring the
     cloud ``/releases/latest`` contract.  ``feed_url`` is derived from
     ``SLP_API_BASE`` so it tracks dev/prod automatically.
+
+    Pass ``force=true`` (used by an explicit "check for updates" action) to
+    bypass the local cache TTL and re-poll the cloud immediately.
     """
     # Local import keeps semver optional at module load and avoids any import cycle.
     from smartloop.platform import semver
@@ -67,12 +71,15 @@ async def latest_release(
         raise HTTPException(status_code=400, detail=f"Unknown channel {channel!r}")
 
     try:
-        release = svc.get_latest_release(channel)
+        wrapper = svc.get_latest_release(channel, force=force)
     except ConnectionError:
         raise HTTPException(status_code=502, detail="Platform API unavailable")
 
     feed_url = f"{settings.slp_api_base.rstrip('/')}/v1/releases/feed/{channel}"
 
+    # PlatformService returns the cloud wrapper {update_available, update_required, release};
+    # the inner `release` may be None when no published release exists for the channel.
+    release = (wrapper or {}).get("release")
     if not release:
         return LatestReleaseResponse(feed_url=feed_url, channel=channel)
 
