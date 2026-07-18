@@ -3379,21 +3379,29 @@ class ModelService:
             )
             return None, False, None, None, None, False
 
-        # Image attachment → let a vision-capable model read the pixels with the
-        # user's own question and answer directly, then hand the answer back with
-        # mutation=True so the router streams it verbatim (no text-only
-        # re-synthesis, which cannot see the image).  Falls through to the normal
-        # pipeline when no vision model is available.
+        # Image attachment → a vision-capable model first *perceives* the image
+        # (a concrete description scoped to the user's request) and that
+        # perception is folded into the message as an "[Image context: …]" block.
+        # The rest of the pipeline — document retrieval, capability routing, MCP,
+        # synthesis — then plans and answers grounded in what the image shows, so
+        # e.g. "recommend products for this nail color" can search the product
+        # docs.  When there is no project to orchestrate over, the perception is
+        # streamed back directly (mutation=True).  Falls through untouched when no
+        # vision model is available or perception comes back empty.
+        image_perception: Optional[str] = None
         if images:
             try:
-                answer = self.vision_answer(user_message, images)
-                if answer:
-                    return answer, True, None, None, None, True
-                logger.warning("[orchestrator] vision_answer returned empty — "
-                               "falling through to text pipeline")
+                image_perception = self.vision_perceive(user_message, images)
             except Exception as e:
-                logger.warning("[orchestrator] vision answer failed (%s) — "
-                               "falling through to text pipeline", e)
+                logger.warning("[orchestrator] vision perception failed (%s) — "
+                               "continuing without image context", e)
+            if image_perception:
+                logger.info("[orchestrator] image perception: %r",
+                            image_perception[:200])
+                user_message = f"{user_message}\n\n[Image context: {image_perception}]"
+            else:
+                logger.warning("[orchestrator] vision perception empty — "
+                               "continuing without image context")
 
         # Reload workspace from disk to pick up any changes made by
         # background indexers or project setup since the last request.
@@ -3401,6 +3409,12 @@ class ModelService:
 
         current_project = self._model.workspace.current_project
         if not current_project:
+            if image_perception:
+                logger.info(
+                    "[orchestrator] no current project — streaming image "
+                    "perception directly.",
+                )
+                return image_perception, True, None, None, None, True
             logger.warning(
                 "[orchestrator] BYPASSED — no current project. Falling back "
                 "to raw stream_completion.",
@@ -3807,16 +3821,50 @@ class ModelService:
                 images.append((original.read_bytes(), content_type))
         return images
 
-    # Anti-hallucination guidance for image Q&A.  It is folded into the *user*
-    # message rather than a system message: the Qwen2-VL GGUF + llama.cpp chat
-    # handler emits EOS immediately (empty output) when a system message
-    # accompanies an image, so we mirror MarkItDown's proven single-user-message
-    # shape and put the steering in the prompt text instead.
+    # Anti-hallucination guidance for image Q&A, sent as the system message.
+    # (An earlier version folded this into the *user* message to avoid sending a
+    # system message at all, on the theory that a system message made Qwen2-VL
+    # emit EOS immediately.  That theory was wrong: Qwen25VLChatHandler always
+    # injects a default "You are a helpful assistant." system message when the
+    # caller supplies none — the same shape MarkItDown's working OCR path uses —
+    # so a system message is present either way.  Supplying our own simply
+    # replaces that default with useful steering.)
     _VISION_QA_GUIDANCE = (
         "Answer using only what is actually visible in the image. If the answer "
         "is not visible, say so plainly instead of guessing. Do not invent "
-        "people, text, or details that are not there.\n\n"
+        "people, text, or details that are not there."
     )
+
+    # Perception prompt for the orchestrator's image path.  Unlike direct Q&A,
+    # this asks the vision model only to *describe* what it sees — scoped to the
+    # user's request so the description surfaces the details that matter (colors,
+    # objects, visible text) — because the perception is fed back into the text
+    # pipeline (retrieval, capability routing, MCP, synthesis), which then does
+    # the actual answering with documents/tools the vision model can't see.
+    _VISION_PERCEPTION_PROMPT = (
+        "Describe what is visible in this image, focusing on the details that "
+        "are relevant to the following request. Be concrete and specific about "
+        "colors, objects, and any visible text. Describe only what is visible; "
+        "do not answer the request or make recommendations.\n\nRequest: {request}"
+    )
+
+    def vision_perceive(
+        self,
+        user_message: str,
+        images: list[tuple[bytes, str]],
+        max_tokens: int = 512,
+    ) -> str:
+        """Return a concrete description of ``images`` scoped to ``user_message``.
+
+        This is the orchestrator's image entry point: the returned text is
+        folded into the user message as an ``[Image context: …]`` block so the
+        downstream text pipeline can plan and answer against documents, MCP and
+        capability models grounded in what the image shows.  It reuses
+        ``vision_answer``'s inference path (and its GPU-clip-OOM recovery) with a
+        description-only prompt — see ``_VISION_PERCEPTION_PROMPT``.
+        """
+        prompt = self._VISION_PERCEPTION_PROMPT.format(request=user_message)
+        return self.vision_answer(prompt, images, max_tokens=max_tokens)
 
     def vision_answer(
         self,
@@ -3832,8 +3880,9 @@ class ModelService:
         about with no lossy upload-time transcription in between.  ``images`` is
         a list of ``(bytes, mime_type)``.
 
-        The request deliberately uses a single user message (text + image) with
-        no system message — see ``_VISION_QA_GUIDANCE``.
+        The anti-hallucination steering goes in the system message and the
+        user's own prompt (plus the image) in a single user message — see
+        ``_VISION_QA_GUIDANCE``.
 
         Raises ``RuntimeError`` when no vision-capable model is available so the
         caller can surface actionable guidance instead of a silent empty reply.
@@ -3842,16 +3891,17 @@ class ModelService:
         if llm is None:
             raise RuntimeError("No vision-capable model available")
 
-        content: list[dict] = [
-            {"type": "text", "text": f"{self._VISION_QA_GUIDANCE}{prompt}"}
-        ]
+        content: list[dict] = [{"type": "text", "text": prompt}]
         for data, mime in images:
             b64 = base64.b64encode(data).decode("ascii")
             content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{b64}"},
             })
-        messages = [{"role": "user", "content": content}]
+        messages = [
+            {"role": "system", "content": self._VISION_QA_GUIDANCE},
+            {"role": "user", "content": content},
+        ]
 
         def _ask(vision_llm):
             with self._inference_lock:
