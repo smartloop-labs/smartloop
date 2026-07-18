@@ -133,6 +133,9 @@ class ModelService:
         self._vision_llm: Optional[BaseLLM] = None
         self._vision_model_name: Optional[str] = None
         self._vision_unavailable: bool = False
+        # Latched after a GPU clip encode crashes (native OOM on a large
+        # image): subsequent vision loads keep the CLIP encoder on CPU.
+        self._vision_clip_cpu: bool = False
         # Set once the large model has been considered (loaded, skipped for
         # fit, or absent), so we don't re-probe VRAM on every agent request.
         self._large_model_attempted: bool = False
@@ -696,18 +699,31 @@ class ModelService:
         pref = (AppSettings().vision_clip_device or "auto").lower()
         if pref == "gpu":
             return False
-        if pref == "cpu":
+        if pref == "cpu" or self._vision_clip_cpu:
             return True
         ft = self._device_free_total_gb()
         if ft is None:
-            return False  # no CUDA device — use_gpu is moot (ggml runs clip on CPU)
+            # VRAM unknown (e.g. a Vulkan llama.cpp build beside a CPU-only
+            # torch wheel).  Follow the build: when llama.cpp supports GPU
+            # offload the projector stays on GPU with the model (Vulkan
+            # included); a CPU-only build runs it on CPU regardless of use_gpu.
+            try:
+                from llama_cpp import llama_supports_gpu_offload
+                return not llama_supports_gpu_offload()
+            except Exception:
+                return False
         free_gb, _ = ft
         try:
             model_gb = os.path.getsize(gguf_path) / 1024**3
         except OSError:
             return True
         # Projector weights (~0.8GB) + per-image encode activation headroom.
-        need_gb = model_gb + 0.5 * (cap / 4096) + 1.8
+        # flash_attn is CUDA-only (see get_llama_cpp_instance); without it the
+        # clip encode of a large image allocates a ~6GB compute buffer instead
+        # of ~3GB, so non-CUDA backends need correspondingly more free VRAM.
+        from smartloop.llms.llm_factory import _llama_cpp_has_cuda_backend
+        act_gb = 1.8 if _llama_cpp_has_cuda_backend() else 6.0
+        need_gb = model_gb + 0.5 * (cap / 4096) + act_gb
         if free_gb < need_gb:
             logger.info(
                 "[vision] CLIP on CPU — only %.1fGB free, GPU clip needs ~%.1fGB "
@@ -3837,11 +3853,33 @@ class ModelService:
             })
         messages = [{"role": "user", "content": content}]
 
-        with self._inference_lock:
-            result = llm.model.create_chat_completion(
-                messages=messages, max_tokens=max_tokens,
-                temperature=0.0, stream=False,
+        def _ask(vision_llm):
+            with self._inference_lock:
+                return vision_llm.model.create_chat_completion(
+                    messages=messages, max_tokens=max_tokens,
+                    temperature=0.0, stream=False,
+                )
+
+        try:
+            result = _ask(llm)
+        except Exception as e:
+            # The GPU clip encode of a large image can exhaust device memory
+            # inside native code (no flash-attn on non-CUDA backends), which
+            # surfaces as an access-violation OSError.  Reload once with the
+            # CLIP encoder on CPU — the LLM itself stays on GPU — and retry
+            # instead of degrading to the blind text pipeline.
+            if self._vision_clip_cpu:
+                raise
+            logger.warning(
+                "[vision-answer] encode failed with GPU clip (%s) — "
+                "reloading with CLIP on CPU and retrying", e,
             )
+            self._vision_clip_cpu = True
+            self.unload_vision_model()
+            llm = self.get_vision_llm()
+            if llm is None:
+                raise
+            result = _ask(llm)
         choice0 = (result.get("choices") or [{}])[0]
         answer = (choice0.get("message", {}).get("content") or "").strip()
         # Qwen2-VL sometimes prefixes its reply with a stray "label:" (often an
