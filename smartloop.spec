@@ -16,6 +16,16 @@ datas += _tmp_ret[0]
 binaries += _tmp_ret[1]
 hiddenimports += _tmp_ret[2]
 
+# Magika (MarkItDown's file-type detector) ships its ML model + config as
+# package data that PyInstaller's analysis doesn't pick up. MarkItDown builds a
+# Magika instance at construction time, so without the model dir it raises
+# "model dir not found at .../magika/models/standard_v3_3" and every image/doc
+# attachment fails before ever reaching the vision model.
+_magika_ret = collect_all('magika')
+datas += _magika_ret[0]
+binaries += _magika_ret[1]
+hiddenimports += _magika_ret[2]
+
 # Bundle smartloop/skills (local package data — .md files etc.)
 _skills_dir = Path('.') / 'smartloop' / 'skills'
 if _skills_dir.exists():
