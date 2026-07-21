@@ -255,3 +255,57 @@ class TestGetLatestRelease:
 
         svc.get_latest_release("stable")
         assert client.call_count["release"] == 2
+
+    def test_raises_when_offline_and_never_fetched(self, db):
+        client = _FakeClient(fail=True)
+        svc = PlatformService(client, db)
+
+        with pytest.raises(ConnectionError):
+            svc.get_latest_release("beta")
+
+
+# A channel that exists but has nothing published yet (e.g. an unreleased
+# `beta`): the cloud returns a wrapper whose `release` is None. `None` is a
+# real cached value here, not a cache miss — these tests guard the sentinel fix.
+_EMPTY_WRAPPER = {"update_available": None, "update_required": False, "release": None}
+
+
+class TestGetLatestReleaseEmptyChannel:
+    def test_empty_release_is_cached_within_ttl(self, db):
+        client = _FakeClient(release_wrapper=_EMPTY_WRAPPER)
+        svc = PlatformService(client, db)
+
+        first = svc.get_latest_release("beta")
+        second = svc.get_latest_release("beta")
+
+        assert first["release"] is None
+        assert second["release"] is None
+        # The TTL fast-path must apply even though the release is None — no
+        # redundant second cloud call for an empty channel.
+        assert client.call_count["release"] == 1
+
+    def test_empty_release_served_offline_after_being_fetched(self, db):
+        client = _FakeClient(release_wrapper=_EMPTY_WRAPPER)
+        svc = PlatformService(client, db)
+
+        # First poll learns "nothing published" and records a timestamp.
+        svc.get_latest_release("beta")
+
+        # Now go offline and force past the TTL: we should serve the known-empty
+        # state rather than raising, because we HAVE fetched before.
+        client._fail = True
+        result = svc.get_latest_release("beta", force=True)
+        assert result["release"] is None
+
+    def test_refetches_empty_channel_after_ttl(self, db, monkeypatch):
+        client = _FakeClient(release_wrapper=_EMPTY_WRAPPER)
+        svc = PlatformService(client, db)
+
+        svc.get_latest_release("beta")
+        assert client.call_count["release"] == 1
+
+        original_time = time.time
+        monkeypatch.setattr(time, "time", lambda: original_time() + RELEASES_TTL + 1)
+
+        svc.get_latest_release("beta")
+        assert client.call_count["release"] == 2

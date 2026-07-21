@@ -133,19 +133,46 @@ class PlatformService:
         Set *force* to bypass the TTL and re-poll the cloud — used by the
         client's explicit "check for updates" action, mirroring
         :meth:`get_current_user`.
+
+        NOTE: this does NOT reuse :func:`_fetch_or_cache`.  That helper treats a
+        cached value of ``None`` as "nothing cached", but for releases ``None``
+        is a *legitimate* cached value meaning "this channel has no published
+        release yet" (e.g. an unreleased ``beta``).  Conflating the two would
+        make the TTL fast-path and the offline fallback misfire for empty
+        channels — re-polling the cloud on every request, and returning an error
+        offline for a state we already know.  So we discriminate on the fetch
+        *timestamp* (present iff we've ever successfully polled), which the DB
+        records even when the release itself is ``None``.
         """
         def _fetch_release() -> Optional[dict]:
             return (self._client.get_latest_release(channel) or {}).get("release")
 
+        def _envelope(release: Optional[dict]) -> dict:
+            return {"update_available": None, "update_required": False, "release": release}
+
         if self._db is None:
+            return _envelope(_fetch_release())
+
+        fetched_at = self._db.release_fetched_at(channel)
+        have_cache = fetched_at is not None
+
+        # Fresh cache within TTL — serve without hitting the cloud. Works even
+        # when the cached release is None (channel has nothing published).
+        if not force and have_cache and (time.time() - fetched_at) < RELEASES_TTL:
+            return _envelope(self._db.get_release(channel))
+
+        try:
             release = _fetch_release()
-        else:
-            release = _fetch_or_cache(
-                ttl=RELEASES_TTL,
-                get_cached=lambda: self._db.get_release(channel),
-                get_timestamp=lambda: self._db.release_fetched_at(channel),
-                fetch_remote=_fetch_release,
-                save_cache=lambda rel: self._db.save_release(channel, rel),
-                force=force,
-            )
-        return {"update_available": None, "update_required": False, "release": release}
+        except ConnectionError:
+            # Offline — serve whatever we last learned, including a known-empty
+            # channel. Only re-raise if we've genuinely never fetched.
+            if have_cache:
+                logger.info("Platform API unreachable, serving cached release for %r", channel)
+                return _envelope(self._db.get_release(channel))
+            raise
+
+        try:
+            self._db.save_release(channel, release)
+        except Exception:
+            logger.warning("Failed to write release cache", exc_info=True)
+        return _envelope(release)

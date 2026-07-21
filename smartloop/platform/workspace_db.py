@@ -187,7 +187,10 @@ class WorkspaceDB:
         """Return the cached latest release for *channel*, or ``None``.
 
         ``None`` is returned both when nothing has been cached and when the
-        cached value records that the channel has no published release.
+        cached value records that the channel has no published release. To tell
+        those two states apart, use :meth:`release_fetched_at` — it returns a
+        timestamp once the channel has been polled, even if the release is
+        ``None``.
         """
         with self._lock:
             row = self._conn.execute(
