@@ -184,7 +184,10 @@ class Explorer:
         )
 
         try:
-            response = str(self.llm.invoke(prompt)).strip().lower()
+            # Skill matching only needs the model to emit a few skill
+            # numbers (e.g. "1, 3"). Cap the output so a missing stop token
+            # can't trigger runaway greedy generation that stalls the request.
+            response = str(self.llm.invoke(prompt, max_tokens=16)).strip().lower()
             logger.info(f"[skill-match] LLM response: {response[:100]}")
 
             if "none" in response and len(response) < 10:
