@@ -1,4 +1,13 @@
-"""FastMCP-based system tools server – bash, file-read, file-write, grep."""
+"""FastMCP-based system tools server – bash, file-read, file-write, grep.
+
+Tools raise (rather than return an "Error: ..." string) on failure so the
+MCP result is flagged is_error=True.  The orchestrator then skips the step
+instead of treating the error text as authoritative tool output, which
+would otherwise suppress the workspace/document search fallback — e.g.
+"find my pitch" with a hallucinated path or a grep that misses must fall
+through to semantic search over the indexed files, not dead-end on
+"file not found" / "no matches".
+"""
 
 import logging
 import os
@@ -32,6 +41,9 @@ async def bash(command: str, cwd: Optional[str] = None, timeout: int = 30) -> st
         timeout: Timeout in seconds.
     """
     logger.info(f"[bash] Executing: {command[:200]}, cwd={cwd}")
+    # A command that ran to completion is a real result even with a nonzero
+    # exit code — its output (e.g. failing tests) belongs in the answer.
+    # Only failures to produce a result at all (timeout, spawn error) raise.
     try:
         proc = subprocess.run(
             ["bash", "-c", command],
@@ -40,16 +52,15 @@ async def bash(command: str, cwd: Optional[str] = None, timeout: int = 30) -> st
             timeout=timeout,
             cwd=cwd,
         )
-        output = ""
-        if proc.stdout:
-            output += proc.stdout
-        if proc.stderr:
-            output += proc.stderr
-        return f"exit code {proc.returncode}\n{output.strip()}"
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout}s"
-    except Exception as e:
-        return f"Error: {e}"
+        raise RuntimeError(f"command timed out after {timeout}s")
+
+    output = ""
+    if proc.stdout:
+        output += proc.stdout
+    if proc.stderr:
+        output += proc.stderr
+    return f"exit code {proc.returncode}\n{output.strip()}"
 
 
 @mcp.tool(name="file-read")
@@ -60,12 +71,6 @@ async def file_read(path: str, query: Optional[str] = None) -> str:
         path: File path to read.
         query: Optional search query to filter matching lines.
     """
-    # Raise (rather than return an "Error: ..." string) on failure so the
-    # MCP result is flagged is_error=True.  The orchestrator then skips the
-    # step instead of treating the error text as authoritative tool output,
-    # which would otherwise suppress the workspace/document search fallback
-    # — e.g. "find my pitch" with a hallucinated path must fall through to
-    # semantic search over the indexed files, not dead-end on "file not found".
     if not path:
         raise ValueError("no file path provided")
 
@@ -116,9 +121,9 @@ async def file_write(path: str, content: str) -> str:
         content: Content to write.
     """
     if not path:
-        return "Error: no file path provided"
+        raise ValueError("no file path provided")
     if content is None:
-        return "Error: no content provided"
+        raise ValueError("no content provided")
 
     content = _extract_fenced_content(content)
 
@@ -133,7 +138,7 @@ async def file_write(path: str, content: str) -> str:
             "can locate and download it from the chat log."
         )
     except Exception as e:
-        return f"Error writing file: {e}"
+        raise RuntimeError(f"error writing file: {e}")
 
 
 @mcp.tool(name="grep")
@@ -146,7 +151,7 @@ async def grep(pattern: str, glob: str = "*", timeout: int = 30) -> str:
         timeout: Timeout in seconds.
     """
     if not pattern:
-        return "Error: no search pattern provided"
+        raise ValueError("no search pattern provided")
 
     logger.info(f"[grep] Searching for '{pattern}' (glob={glob})")
     cmd = ["grep", "-rn", "--include", glob, pattern, "."]
@@ -155,11 +160,17 @@ async def grep(pattern: str, glob: str = "*", timeout: int = 30) -> str:
             cmd, capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return f"Search timed out after {timeout}s"
+        raise RuntimeError(f"search timed out after {timeout}s")
+
+    # grep exits 0 on match, 1 on no match, >=2 on error (stdout is empty
+    # either way — without the returncode check a bad regex would be
+    # misreported as a clean miss).
+    if proc.returncode > 1:
+        raise RuntimeError(f"grep failed: {proc.stderr.strip()}")
 
     output = proc.stdout.strip()
     if not output:
-        return f"No matches found for '{pattern}'"
+        raise RuntimeError(f"no matches found for '{pattern}'")
     lines = output.split("\n")
     if len(lines) > 50:
         output = (

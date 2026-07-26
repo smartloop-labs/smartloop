@@ -1176,15 +1176,22 @@ class ModelService:
     def install_system_tools_server(self, project_id: str) -> None:
         """Register the System Tools MCP server on a project if not already present."""
         project = self._get_project(project_id)
+        # Match on the stable id, not the display name: records saved under
+        # an earlier name (e.g. "Smartloop") would otherwise never be found,
+        # so their tool list stays stale and a duplicate server with the
+        # same id gets appended — tool resolution then keeps hitting the
+        # stale record, which wins the id-first find_server lookup.
         existing = next(
-            (s for s in project.mcp_servers if s.name == SYSTEM_TOOLS_SERVER_NAME), None,
+            (s for s in project.mcp_servers if s.id == SYSTEM_TOOLS_SERVER_ID), None,
         )
         if existing is not None:
-            # Refresh the advertised tool list so projects created before a
-            # tool was added (e.g. grep) pick it up on next load.
+            # Refresh the advertised name/tool list so projects created
+            # before a rename or before a tool was added (e.g. grep) pick
+            # up the changes on next load.
             current = [t.name for t in (existing.tools or [])]
             wanted = [t.name for t in self._SYSTEM_TOOL_DEFS]
-            if current != wanted:
+            if current != wanted or existing.name != SYSTEM_TOOLS_SERVER_NAME:
+                existing.name = SYSTEM_TOOLS_SERVER_NAME
                 existing.tools = list(self._SYSTEM_TOOL_DEFS)
                 self._model.save()
                 logger.info(f"Refreshed System Tools server tools: {wanted}")
@@ -1231,8 +1238,20 @@ class ModelService:
     def install_fetch_server(self, project_id: str) -> None:
         """Register the fetch MCP server on a project if not already present."""
         project = self._get_project(project_id)
-        if any(s.name == self.FETCH_SERVER_NAME for s in project.mcp_servers):
-            logger.info("Fetch server already registered")
+        # Match on the stable id (see install_system_tools_server).
+        existing = next(
+            (s for s in project.mcp_servers if s.id == FETCH_SERVER_ID), None,
+        )
+        if existing is not None:
+            current = [t.name for t in (existing.tools or [])]
+            wanted = [t.name for t in self._FETCH_TOOL_DEFS]
+            if current != wanted or existing.name != self.FETCH_SERVER_NAME:
+                existing.name = self.FETCH_SERVER_NAME
+                existing.tools = list(self._FETCH_TOOL_DEFS)
+                self._model.save()
+                logger.info(f"Refreshed fetch server tools: {wanted}")
+            else:
+                logger.info("Fetch server already registered")
             return
 
         server = MCPServer(

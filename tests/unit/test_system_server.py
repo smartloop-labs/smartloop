@@ -69,9 +69,52 @@ def test_grep_glob_filter(tmp_path):
         assert "b.txt" not in out
 
 
-def test_grep_no_matches(tmp_path):
+def test_grep_no_matches_is_error(tmp_path):
+    """A miss raises so the orchestrator skips the step and the workspace
+    search fallback fires, instead of 'No matches' suppressing it."""
     (tmp_path / "a.py").write_text("nothing\n")
     with _client(tmp_path) as c:
         r = c.call_tool("grep", {"pattern": "ZZZ_NOPE"})
+        assert r.is_error
+        assert "no matches" in _text(r).lower()
+
+
+def test_grep_bad_regex_is_error(tmp_path):
+    """A real grep failure (exit code 2) is an error, not a clean miss."""
+    (tmp_path / "a.py").write_text("content\n")
+    with _client(tmp_path) as c:
+        r = c.call_tool("grep", {"pattern": "["})
+        assert r.is_error
+        assert "no matches" not in _text(r).lower()
+
+
+def test_file_read_missing_path_is_error(tmp_path):
+    with _client(tmp_path) as c:
+        r = c.call_tool("file-read", {"path": "does/not/exist.md"})
+        assert r.is_error
+        assert "not found" in _text(r)
+
+
+def test_file_write_empty_path_is_error(tmp_path):
+    with _client(tmp_path) as c:
+        r = c.call_tool("file-write", {"path": "", "content": "hello"})
+        assert r.is_error
+
+
+def test_bash_nonzero_exit_is_normal_output(tmp_path):
+    """A command that ran to completion is a real result even when it
+    fails — its exit code and output belong in the answer."""
+    with _client(tmp_path) as c:
+        r = c.call_tool("bash", {"command": "echo boom >&2; exit 3"})
         assert r.success
-        assert "No matches" in _text(r)
+        assert not r.is_error
+        out = _text(r)
+        assert "exit code 3" in out
+        assert "boom" in out
+
+
+def test_bash_timeout_is_error(tmp_path):
+    with _client(tmp_path) as c:
+        r = c.call_tool("bash", {"command": "sleep 5", "timeout": 1})
+        assert r.is_error
+        assert "timed out" in _text(r)
