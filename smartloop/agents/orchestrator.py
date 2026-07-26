@@ -1063,7 +1063,10 @@ class SLPOrchestrator:
                         pre_step_nodes.append(fanout_node)
                     else:
                         resolve_node = LLMDecisionNode(depends_on=list(prev_nodes))
-                        resolve_handler = self._make_resolve_handler(ctx, step, search_ctx)
+                        resolve_handler = self._make_resolve_handler(
+                            ctx, step, search_ctx,
+                            has_upstream=bool(pre_step_nodes),
+                        )
                         nodes_and_handlers.append((resolve_node, resolve_handler))
 
                         execute_node = ToolCallNode(depends_on=[resolve_node])
@@ -1233,11 +1236,21 @@ Assess whether these search results are relevant to the user's request. If relev
         ctx: _OrchestratorContext,
         step: PlanStep,
         search_ctx: SearchContext,
+        has_upstream: bool = True,
     ) -> Callable:
         """Create a resolve handler for a TOOL step (parameter resolution).
 
         Works uniformly for both skill-derived and prompt-derived steps.
         Uses ``ctx.skill_context`` for condition extraction when available.
+
+        ``has_upstream`` is False for the first tool step in the plan. A
+        condition gates a tool on a *prior* result, so it is meaningless for
+        a step with nothing upstream — evaluating one there would always skip
+        (no prior result can satisfy it). This is exactly what happens for a
+        lone fetch step whose skill text reads "when the user requests a URL,
+        fetch it": the extractor misreads that applicability clause as a
+        runtime condition and drops the only step. Skip condition gating when
+        there is no upstream.
         """
         step_llm = self._llm_for_tier(step.model_tier, step.capability)
         logger.info(
@@ -1250,8 +1263,8 @@ Assess whether these search results are relevant to the user's request. If relev
             prev_results = self._collect_raw_from_deps(deps)
             node_id = f"step_{step.step}_{step.tool_name or step.step_type.value}_resolve"
 
-            condition = step.condition
-            if not condition and ctx.skill_context:
+            condition = step.condition if has_upstream else None
+            if has_upstream and not condition and ctx.skill_context:
                 condition = self._extract_tool_condition_from_text(
                     ctx.skill_context, step.tool_name or "",
                 )
@@ -1973,13 +1986,19 @@ Is this context relevant to the user's request?
                 return None
 
             question = response.strip().strip('"\'')
-            if "?" in question:
-                parts = question.split("?")
-                for i in range(len(parts) - 1, -1, -1):
-                    candidate = parts[i].strip()
-                    if candidate and len(candidate) > 10:
-                        question = candidate + "?"
-                        break
+            # A valid condition is a YES/NO question. A bare "YES"/"NO" (or any
+            # answer with no question mark) is a malformed reply, not a real
+            # condition — treat it as unconditional rather than fabricating an
+            # ``llm:YES`` gate that can never be satisfied.
+            if "?" not in question:
+                return None
+
+            parts = question.split("?")
+            for i in range(len(parts) - 1, -1, -1):
+                candidate = parts[i].strip()
+                if candidate and len(candidate) > 10:
+                    question = candidate + "?"
+                    break
 
             return f"llm:{question}"
 

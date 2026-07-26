@@ -79,24 +79,53 @@ class LlamaCpp(BaseLLM[Llama]):
 
         try:
             messages = self.create_messages_from_prompt(prompt)
-            available_tokens = self._get_available_tokens(prompt)
-            output = self.model.create_chat_completion(
+            requested_max = kwargs.get("max_tokens")
+            available_tokens = (
+                requested_max if requested_max is not None
+                else self._get_available_tokens(prompt)
+            )
+            # Stream internally so generation can be interrupted between
+            # tokens when the request is cancelled. stream=False is a single
+            # blocking call that cannot be halted once started.
+            stream = self.model.create_chat_completion(
                 messages=messages,
                 max_tokens=available_tokens,
                 temperature=self.temperature,
                 repeat_penalty=1.2,
                 frequency_penalty=0.1,
                 presence_penalty=0.1,
-                stream=False
+                stream=True
             )
+
+            parts: List[str] = []
+            chunk_count = 0
+            cancelled = False
+            for chunk in stream:
+                # Check for cancellation between chunks.
+                if self._cancelled is not None and self._cancelled.is_set():
+                    cancelled = True
+                    break
+
+                text = ""
+                if isinstance(chunk, dict) and chunk.get('choices'):
+                    choice = chunk['choices'][0]
+                    if 'delta' in choice and 'content' in choice['delta']:
+                        text = choice['delta']['content'] or ""
+                    elif 'message' in choice and 'content' in choice['message']:
+                        text = choice['message']['content'] or ""
+                    elif 'text' in choice:
+                        text = choice['text'] or ""
+
+                if text:
+                    parts.append(text)
+                    chunk_count += 1
+
             elapsed = time.time() - start_time
-            usage = output.get('usage', {})
-            completion_tokens = usage.get('completion_tokens', 0)
             self.logger.info(
-                f"Completed | completion_tokens={completion_tokens} "
-                f"elapsed={elapsed:.3f}s"
+                f"{'Cancelled' if cancelled else 'Completed'} | "
+                f"chunks={chunk_count} elapsed={elapsed:.3f}s"
             )
-            return re.sub(r'[\t]+', "", output['choices'][0]['message']['content'].strip())
+            return re.sub(r'[\t]+', "", "".join(parts).strip())
         except Exception as ex:
             self.logger.error(f"Generation failed: {ex}")
         finally:
@@ -187,19 +216,26 @@ class LlamaCpp(BaseLLM[Llama]):
         """Get the type of language model used by this chat model. Used for logging purposes only."""
         return "smartloop"
 
-    def invoke(self, prompt: str) -> str:
+    def invoke(self, prompt: str, max_tokens: Optional[int] = None) -> str:
         """
         Invoke the LLM with the given prompt
 
         Args:
             prompt: The user query string
+            max_tokens: Optional cap on generated tokens. Use a small value
+                for short classification-style calls (e.g. skill matching) to
+                avoid runaway greedy generation when the model fails to emit
+                a stop token.
 
         Returns:
             Generated response text
         """
 
         try:
-            response = self._call(prompt)
+            response = (
+                self._call(prompt, max_tokens=max_tokens)
+                if max_tokens is not None else self._call(prompt)
+            )
 
             cleaned_response = response.strip()
             if cleaned_response.endswith('<|eot_id|>'):
