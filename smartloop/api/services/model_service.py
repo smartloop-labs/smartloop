@@ -1625,17 +1625,57 @@ class ModelService:
         return None
 
     @staticmethod
-    def _build_mcp_tools_catalogue(project: Optional["Project"]) -> str:
-        """Return a formatted list of available MCP tools for the prompt."""
+    def _build_mcp_tools_catalogue(project: Optional["Project"], input_text: str = "") -> str:
+        """Return a formatted list of available MCP tools for the prompt.
+
+        A tool is only offered when the user's input **explicitly references
+        it** by name. Skills should never silently acquire an MCP call the user
+        did not ask for; small models otherwise over-trigger on incidental
+        words like "fetch", "get" or "data" in the skill body and bolt on a
+        spurious ``server.tool(...)`` block. When nothing is explicitly
+        referenced this returns "" so no MCP block is generated.
+        """
         if not project:
             return ""
+        text_lc = input_text.lower()
+
+        def _mentioned(name: str) -> bool:
+            """True when a server/tool identifier is referenced in the input.
+
+            Matches whole tokens so ``fetch`` doesn't hit ``fetched`` inside a
+            sentence; underscores/hyphens in tool names are treated as word
+            characters (e.g. ``get_forecast``).
+            """
+            name = (name or "").strip().lower()
+            if not name:
+                return False
+            return re.search(rf'(?<!\w){re.escape(name)}(?!\w)', text_lc) is not None
+
         lines = []
         for server in project.mcp_servers:
             # Exclude the internal Smartloop system tools (bash, file-ops, explore)
             # but include fetch and all user-registered servers.
             if not server.tools or server.id == SYSTEM_TOOLS_SERVER_ID:
                 continue
+
+            is_web_fetch = any(
+                kw in server.name.lower() for kw in ("fetch", "browse", "scrape")
+            )
             for tool in server.tools:
+                # Only surface the tool when the user explicitly referenced it.
+                # Tools are invoked as ``server_name.tool_name``, so the
+                # qualified form is the unambiguous signal and always counts.
+                referenced = _mentioned(f"{server.name}.{tool.name}")
+                if not is_web_fetch:
+                    # Non web-fetch tools have distinctive names unlikely to
+                    # collide with prose, so a bare tool/server mention is
+                    # enough. Web-fetch tools ("fetch"/"scrape") share their
+                    # name with common English verbs, so they require the
+                    # qualified form above — never a bare-word match.
+                    referenced = referenced or _mentioned(tool.name) or _mentioned(server.name)
+                if not referenced:
+                    continue
+
                 desc = tool.description or ""
                 # Summarise required parameters from the input schema
                 params = ""
@@ -1672,7 +1712,7 @@ class ModelService:
             logger.warning("No LLM available for skill metadata generation")
             return {}
 
-        mcp_catalogue = self._build_mcp_tools_catalogue(project)
+        mcp_catalogue = self._build_mcp_tools_catalogue(project, input_text=content)
         already_has_mcp = "```mcp" in content
 
         mcp_field = ""
@@ -3367,6 +3407,7 @@ class ModelService:
         has_attachments: bool = False,
         images: Optional[list[tuple[bytes, str]]] = None,
         progress_callback: Optional[Callable[[str, str, str], None]] = None,
+        cancelled: Optional[threading.Event] = None,
     ) -> tuple[Optional[str], bool, Optional[str], Optional[list], Optional[str], bool]:
         """Full orchestrator entry point for a user message.
 
@@ -3491,16 +3532,34 @@ class ModelService:
                 available_capabilities,
             )
 
-            result = orchestrator.execute(
-                user_message, eligible_servers,
-                skills=skill_contents, cwd=cwd,
-                has_attachments=has_attachments,
-                project_dir=visible_project_dir,
-                model_service=self,
-                conversation_history=conversation_history,
-                available_capabilities=available_capabilities or None,
-                progress_callback=progress_callback,
-            )
+            # Propagate the cancellation event onto the orchestrator's
+            # primary LLMs so short planning steps (skill matching, routing)
+            # can be interrupted between tokens instead of blocking the whole
+            # request until they finish generating.
+            cancel_llms = [
+                llm for llm in {id(self._llm): self._llm,
+                                id(self._decision_llm): self._decision_llm}.values()
+                if llm is not None
+            ]
+            if cancelled is not None:
+                for llm in cancel_llms:
+                    llm._cancelled = cancelled
+
+            try:
+                result = orchestrator.execute(
+                    user_message, eligible_servers,
+                    skills=skill_contents, cwd=cwd,
+                    has_attachments=has_attachments,
+                    project_dir=visible_project_dir,
+                    model_service=self,
+                    conversation_history=conversation_history,
+                    available_capabilities=available_capabilities or None,
+                    progress_callback=progress_callback,
+                )
+            finally:
+                if cancelled is not None:
+                    for llm in cancel_llms:
+                        llm._cancelled = None
 
             # Save workspace in case tokens were refreshed during the call
             try:

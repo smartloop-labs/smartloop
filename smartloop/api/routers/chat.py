@@ -328,6 +328,12 @@ async def stream_chunks(
 
     project_skills = [s for s in model_service.get_project_skills() if not s.system]
 
+    # Shared cancellation signal for the whole request. Created before
+    # orchestration so a client disconnect during the planning phase (skill
+    # matching, routing) interrupts those LLM calls too — not just the final
+    # response stream. The generator's finally sets it on exit/disconnect.
+    cancelled = threading.Event()
+
     # Orchestrator handles vector search, MCP tools, and explore in one step
     orchestrator_context = None
     citations = None
@@ -356,6 +362,7 @@ async def stream_chunks(
                 has_attachments=has_attachments,
                 images=image_attachments,
                 progress_callback=_progress,
+                cancelled=cancelled,
             ),
         )
 
@@ -483,7 +490,8 @@ async def stream_chunks(
     if request.session_id and last_user_msg:
         model_service.append_to_session(request.session_id, "user", last_user_msg)
 
-    cancelled = threading.Event()
+    # `cancelled` is created earlier (before orchestration) and reused here so
+    # the same signal covers both the planning phase and the response stream.
 
     def _is_degenerate(text: str) -> bool:
         """True when the model produced no meaningful content.
