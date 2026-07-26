@@ -7,10 +7,11 @@ MCP over stdio uses newline-delimited JSON-RPC 2.0:
 import json
 import logging
 import os
-import select
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -48,6 +49,14 @@ class LocalMCPClient:
         self._process: Optional[subprocess.Popen] = None
         self._request_id = 0
         self._initialized = False
+        # Background readers drain stdout/stderr into these. select() cannot be
+        # used on pipe handles on Windows (WinError 10038 "not a socket"), so we
+        # read on daemon threads and apply timeouts via Queue.get instead.
+        self._stdout_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._stderr_chunks: list[str] = []
+        self._stderr_lock = threading.Lock()
+        self._reader_stdout: Optional[threading.Thread] = None
+        self._reader_stderr: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -163,6 +172,8 @@ class LocalMCPClient:
                     break
                 # Process exited — read all available stderr and raise now so
                 # the caller (model_service's hint-retry logic) can inspect it.
+                # No reader threads are running yet, so a direct blocking read is
+                # safe here (the pipe is at EOF).
                 try:
                     stderr = self._process.stderr.read()
                 except Exception:
@@ -173,7 +184,47 @@ class LocalMCPClient:
                     + (f"\nstderr: {stderr.strip()}" if stderr and stderr.strip() else "")
                 )
 
+        self._start_readers()
         return self
+
+    # ------------------------------------------------------------------
+    # Background pipe readers (portable replacement for select())
+    # ------------------------------------------------------------------
+
+    def _start_readers(self) -> None:
+        self._reader_stdout = threading.Thread(
+            target=self._pump_stdout, daemon=True
+        )
+        self._reader_stderr = threading.Thread(
+            target=self._pump_stderr, daemon=True
+        )
+        self._reader_stdout.start()
+        self._reader_stderr.start()
+
+    def _pump_stdout(self) -> None:
+        stdout = self._process.stdout
+        try:
+            while True:
+                line = stdout.readline()
+                if line == "":  # EOF
+                    break
+                self._stdout_queue.put(line)
+        except Exception:
+            pass
+        finally:
+            self._stdout_queue.put(None)  # signal EOF to _recv
+
+    def _pump_stderr(self) -> None:
+        stderr = self._process.stderr
+        try:
+            while True:
+                line = stderr.readline()
+                if line == "":  # EOF
+                    break
+                with self._stderr_lock:
+                    self._stderr_chunks.append(line)
+        except Exception:
+            pass
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if self._process:
@@ -201,11 +252,17 @@ class LocalMCPClient:
         return self._request_id
 
     def _read_stderr_nonblocking(self, max_bytes: int = 500) -> str:
-        """Read up to *max_bytes* from stderr without blocking."""
+        """Return up to *max_bytes* of stderr collected by the reader thread.
+
+        Gives the pump a brief moment to flush any pending diagnostic output so
+        error messages can carry a useful stderr tail.
+        """
         try:
-            readable, _, _ = select.select([self._process.stderr], [], [], 0.5)
-            if readable:
-                return self._process.stderr.read(max_bytes)
+            if self._reader_stderr is not None:
+                self._reader_stderr.join(timeout=0.5)
+            with self._stderr_lock:
+                data = "".join(self._stderr_chunks)
+            return data.strip()[:max_bytes]
         except Exception as e:
             logger.debug("Error reading stderr: %s", e, exc_info=True)
         return ""
@@ -240,24 +297,19 @@ class LocalMCPClient:
                 raise MCPProtocolError(
                     f"MCP tool call timed out after {self.timeout}s"
                 )
-            readable, _, _ = select.select(
-                [self._process.stdout], [], [], remaining
-            )
-            if not readable:
+            try:
+                line = self._stdout_queue.get(timeout=remaining)
+            except queue.Empty:
                 raise MCPProtocolError(
                     f"MCP tool call timed out after {self.timeout}s"
                 )
-            line = self._process.stdout.readline()
-            if not line:
+            if line is None:  # stdout reader hit EOF
                 exited = self._process.poll() is not None
                 if exited:
-                    try:
-                        stderr = self._process.stderr.read() or ""
-                    except Exception:
-                        stderr = ""
+                    stderr = self._read_stderr_nonblocking()
                     raise MCPLaunchError(
                         f"MCP process exited (code {self._process.returncode})."
-                        + (f" stderr: {stderr.strip()}" if stderr.strip() else "")
+                        + (f" stderr: {stderr}" if stderr else "")
                     )
                 stderr = self._read_stderr_nonblocking()
                 raise MCPProtocolError(
