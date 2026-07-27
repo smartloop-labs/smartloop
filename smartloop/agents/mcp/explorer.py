@@ -157,7 +157,23 @@ class Explorer:
         self,
         user_message: str,
         parsed_skills: List[Dict[str, str]],
+        llm: Optional[BaseLLM] = None,
     ) -> List[Dict[str, str]]:
+        """Match a user message to skills, unioning two complementary signals.
+
+        Keyword overlap alone is brittle — a real request ("what is the
+        purpose of the funds?") may share only one word with the skill, and a
+        complex prompt may share none.  So the LLM is the primary qualifier
+        and handles indirect / multi-part phrasing; a cheap deterministic
+        *direct* topic match against the curated skill name backs it up so an
+        obvious hit ("funds" ↔ ``fund-info``) is never lost to a flaky small
+        model.
+
+        ``llm`` overrides the model used for the semantic qualifier — the
+        caller passes the ``skills``-capability model, which is far better at
+        the intent judgement than the small orchestrator model.  Falls back to
+        ``self.llm`` when not given.
+        """
         matchable = [
             s for s in parsed_skills
             if not s["name"].startswith("__")
@@ -165,127 +181,123 @@ class Explorer:
         if not matchable:
             return []
 
+        direct = self._direct_name_matches(user_message, matchable)
+        llm_matched = self._llm_match_skills(user_message, matchable, llm=llm)
+
+        # Union, preserving the presentation order; dedup by skill name.
+        keep = {s["name"] for s in direct} | {s["name"] for s in llm_matched}
+        matched = [s for s in matchable if s["name"] in keep]
+
+        if matched:
+            logger.info(
+                f"[skill-match] Matched {len(matched)} skill(s): "
+                f"{[s['name'] for s in matched]} "
+                f"(direct={[s['name'] for s in direct]})"
+            )
+        return matched
+
+    def _llm_match_skills(
+        self,
+        user_message: str,
+        matchable: List[Dict[str, str]],
+        llm: Optional[BaseLLM] = None,
+    ) -> List[Dict[str, str]]:
+        """Ask the LLM which skills apply — the primary, semantic matcher.
+
+        Handles complex or indirectly-worded prompts that share few or no
+        literal keywords with the skill.  Returns ``[]`` when the model
+        matches nothing or the call fails (the deterministic direct-name
+        match in :meth:`match_skills` still stands on its own).
+        """
         skill_list = "\n".join(
             f"  {i+1}. {s['name']}: {s['description']}"
             for i, s in enumerate(matchable)
         )
 
         prompt = (
-            "<system>You are matching a user message to instruction sets (skills). "
-            "Each skill describes when it applies and contains instructions for "
-            "how to handle that type of user request. "
-            "A user message may match multiple skills if the request spans "
-            "several concerns. Pick ALL skills whose descriptions are relevant "
-            "to the user's query. "
-            "Reply with ONLY the number(s) of matching skills (comma-separated), "
-            "or NONE if no skill is relevant.\n\n"
-            f"Available skills:\n{skill_list}\n</system>"
+            "<system>You decide which instruction sets (skills), if any, apply "
+            "to the user's request. Judge by INTENT, not topic: match a skill "
+            "only when the request asks you to perform the task the skill is "
+            "for. A general or definitional question ('what is X', 'why does X "
+            "matter', 'what is the purpose of X') is NOT a match for a skill "
+            "that acts on X (e.g. summarizes or reports X).\n\n"
+            "Answer with the matching skill number(s), comma-separated. If none "
+            "apply, answer exactly -1. Prefer -1 when unsure; never pick a "
+            "skill just because it is the only one listed.\n\n"
+            "Examples — given skill '1. sales-report: build a summary table of "
+            "sales figures':\n"
+            "  request 'summarize this quarter's sales' -> 1\n"
+            "  request 'what is a sales report?' -> -1\n"
+            "  request 'what is the purpose of sales?' -> -1\n\n"
+            f"Skills:\n{skill_list}</system>"
             f"<user>{user_message}</user>"
         )
 
+        match_llm = llm or self.llm
         try:
             # Skill matching only needs the model to emit a few skill
             # numbers (e.g. "1, 3"). Cap the output so a missing stop token
             # can't trigger runaway greedy generation that stalls the request.
-            response = str(self.llm.invoke(prompt, max_tokens=16)).strip().lower()
+            response = str(match_llm.invoke(prompt, max_tokens=16)).strip().lower()
             logger.info(f"[skill-match] LLM response: {response[:100]}")
-
-            if "none" in response and len(response) < 10:
-                return []
-
-            matched: List[Dict[str, str]] = []
-            seen: set = set()
-
-            # Parse numbers from the response (handles "1", "1, 3", "1,2")
-            for token in re.findall(r'\d+', response):
-                idx = int(token) - 1  # 1-based in prompt
-                if 0 <= idx < len(matchable):
-                    s = matchable[idx]
-                    if s["name"] not in seen:
-                        matched.append(s)
-                        seen.add(s["name"])
-
-            # Fallback: check if the LLM returned skill names instead
-            if not matched:
-                for s in matchable:
-                    if s["name"].lower() in response and s["name"] not in seen:
-                        matched.append(s)
-                        seen.add(s["name"])
-
-            if matched:
-                logger.info(
-                    f"[skill-match] Matched {len(matched)} skill(s): "
-                    f"{[s['name'] for s in matched]}"
-                )
-                return matched
-
-            # Fallback: keyword overlap between user message and skill
-            # description.  Small models often return "none" even when
-            # the skill clearly applies.  We tokenise both strings and
-            # require ≥2 overlapping content words (length ≥ 4).
-            matched = self._keyword_fallback_match(user_message, matchable)
-            if matched:
-                logger.info(
-                    f"[skill-match] Matched {len(matched)} skill(s) via keyword fallback: "
-                    f"{[s['name'] for s in matched]}"
-                )
-            return matched
-
         except Exception as e:
             logger.warning(f"[skill-match] LLM failed: {e}")
+            return []
 
-        # Even if LLM fails entirely, try keyword fallback
-        return self._keyword_fallback_match(user_message, matchable)
-
-    @staticmethod
-    def _keyword_fallback_match(
-        user_message: str,
-        skills: List[Dict[str, str]],
-        min_overlap: int = 2,
-        min_word_len: int = 4,
-    ) -> List[Dict[str, str]]:
-        """Match skills by keyword overlap when LLM matching fails.
-
-        Tokenises the user message and each skill's name + description,
-        then checks for ≥ ``min_overlap`` shared content words (words
-        with length ≥ ``min_word_len``).  This is language-agnostic —
-        it works on raw word forms without stop-word lists.
-
-        The overlap threshold increases with the number of skills to
-        reduce false positives: threshold = min_overlap + (num_skills // 5).
-        """
-        num_skills = len(skills)
-        # Scale threshold: more skills → require more keyword overlap
-        # to reduce false-positive matches as the skill set grows.
-        effective_threshold = min_overlap + (num_skills // 5)
-
-        def _tokens(text: str) -> set:
-            return {
-                w for w in re.findall(r'\w+', text.lower())
-                if len(w) >= min_word_len
-            }
-
-        msg_tokens = _tokens(user_message)
-        if not msg_tokens:
+        # Explicit no-match sentinels. Handle these before digit parsing so
+        # "-1" isn't misread as skill 1 (``\d+`` would match the "1").
+        if "none" in response and len(response) < 10:
             return []
 
         matched: List[Dict[str, str]] = []
+        seen: set = set()
+
+        # Parse signed integers (handles "1", "1, 3", "-1"). Only positive
+        # 1-based indices select a skill; -1 / 0 / out-of-range are ignored,
+        # so a "-1" reply yields no matches.
+        for token in re.findall(r'-?\d+', response):
+            idx = int(token) - 1  # 1-based in prompt
+            if 0 <= idx < len(matchable):
+                s = matchable[idx]
+                if s["name"] not in seen:
+                    matched.append(s)
+                    seen.add(s["name"])
+
+        # Fallback: the model sometimes echoes skill names instead of numbers.
+        if not matched:
+            for s in matchable:
+                if s["name"].lower() in response and s["name"] not in seen:
+                    matched.append(s)
+                    seen.add(s["name"])
+
+        return matched
+
+    @staticmethod
+    def _direct_name_matches(
+        user_message: str,
+        skills: List[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        """Match skills the user *names explicitly* — a direct invocation.
+
+        This is intentionally strict: it fires only when the skill's full
+        name appears as a phrase in the message (e.g. "run the fund-info
+        skill", "give me the fund info").  A bare topic mention ("what is
+        the purpose of the funds?") is NOT a direct match — that judgement
+        belongs to the LLM qualifier, which weighs the user's intent against
+        the skill's described use case.
+        """
+        msg = re.sub(r'[\s_\-]+', ' ', user_message.lower()).strip()
+
+        matched: List[Dict[str, str]] = []
         for s in skills:
-            skill_text = f"{s.get('name', '')} {s.get('description', '')} {s.get('content', '')}"
-            skill_tokens = _tokens(skill_text)
-            overlap = msg_tokens & skill_tokens
-
-            # Reject if the message is too short for keyword matching to
-            # be reliable.  When the entire message overlaps (ratio == 1.0)
-            # but has ≤ 3 tokens, it's almost certainly a false positive
-            # from generic words like "proof read".
-            if len(msg_tokens) <= 3 and len(overlap) == len(msg_tokens):
+            name = s.get("name", "")
+            phrase = re.sub(r'[\s_\-]+', ' ', name.lower()).strip()
+            if not phrase:
                 continue
-
-            if len(overlap) >= effective_threshold:
-                logger.debug(
-                    f"[skill-match] keyword overlap for '{s['name']}': {overlap}"
-                )
+            # Word-boundary phrase match so "fund info" hits but "funding fo"
+            # does not.
+            if re.search(rf'\b{re.escape(phrase)}\b', msg):
+                logger.debug(f"[skill-match] direct name invocation: '{name}'")
                 matched.append(s)
 
         return matched
