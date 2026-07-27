@@ -567,8 +567,13 @@ class Planner:
         self,
         classification: ClassificationResult,
         context: PlanContext,
+        llm: Optional[BaseLLM] = None,
     ) -> ExecutionPlan:
         """Build an execution plan from a classification result.
+
+        ``llm`` overrides the model used for LLM-based multi-step planning —
+        the caller passes a stronger model (e.g. the large 'dp' model) for the
+        complex tool-selection reasoning. Falls back to ``self.llm``.
 
         For CONVERSATION with a matched capability (e.g. ``knowledge``) →
         one CONVERSATIONAL step routed to that capability's model.
@@ -606,7 +611,7 @@ class Planner:
             return self._plan_explore(classification, context)
 
         if intent == IntentType.MULTI_STEP:
-            return self._plan_multi_step(classification, context)
+            return self._plan_multi_step(classification, context, llm=llm)
 
         return ExecutionPlan(steps=[], reasoning="unknown intent")
 
@@ -738,6 +743,7 @@ class Planner:
 
     def _plan_multi_step(
         self, classification: ClassificationResult, context: PlanContext,
+        llm: Optional[BaseLLM] = None,
     ) -> ExecutionPlan:
         """Build a multi-step plan.
 
@@ -745,7 +751,7 @@ class Planner:
         directly from the classification's detected signals.
         """
         # Try LLM-based planning
-        plan = self._llm_plan(classification, context)
+        plan = self._llm_plan(classification, context, llm=llm)
         if plan.steps:
             return plan
 
@@ -754,6 +760,7 @@ class Planner:
 
     def _llm_plan(
         self, classification: ClassificationResult, context: PlanContext,
+        llm: Optional[BaseLLM] = None,
     ) -> ExecutionPlan:
         """Call LLM to produce a step ordering for multi-step requests."""
         # Build a focused prompt — classification already tells us what signals exist
@@ -862,10 +869,12 @@ class Planner:
             "</user>"
         )
 
+        plan_llm = llm or self.llm
+
         # Budget check
-        max_tokens = self.llm.get_max_tokens()
+        max_tokens = plan_llm.get_max_tokens()
         token_budget = int(max_tokens * 0.8)
-        prompt_tokens = self.llm.get_num_tokens(prompt)
+        prompt_tokens = plan_llm.get_num_tokens(prompt)
         if prompt_tokens > token_budget:
             # Trim skills
             if context.skills:
@@ -885,7 +894,7 @@ class Planner:
                 )
 
         try:
-            response = str(self.llm.invoke(prompt)).strip()
+            response = str(plan_llm.invoke(prompt)).strip()
             logger.info(f"[plan] Raw LLM plan ({len(response)} chars): {response[:500]}")
             return self._parse_plan_response(response, context.user_message, classification)
         except Exception as e:
