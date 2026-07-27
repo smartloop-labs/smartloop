@@ -154,6 +154,14 @@ class LocalMCPClient:
             env=merged_env,
             cwd=self.cwd,
             text=True,
+            # MCP stdio is UTF-8 by spec. Without pinning this, Popen decodes
+            # with the locale codec (cp1252 on Windows), so a response carrying
+            # non-cp1252 bytes (smart quotes, em-dashes from a fetched page)
+            # raises UnicodeDecodeError inside the reader thread. That gets
+            # swallowed and misreported as an unexpected stdout EOF. errors=
+            # "replace" keeps a stray byte from ever tearing down the stream.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
 
@@ -209,8 +217,8 @@ class LocalMCPClient:
                 if line == "":  # EOF
                     break
                 self._stdout_queue.put(line)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[mcp-local] stdout reader stopped: %s", e, exc_info=True)
         finally:
             self._stdout_queue.put(None)  # signal EOF to _recv
 
