@@ -1,5 +1,5 @@
-"""Regression tests: install_system_tools_server / install_fetch_server must
-find an existing record by its stable id, not its display name.
+"""Regression tests: install_system_tools_server must find an existing record
+by its stable id, not its display name.
 
 Records saved under an earlier name (e.g. "Smartloop" before the constant
 was unified to "smartloop") were never matched by the name-based lookup, so
@@ -29,8 +29,6 @@ def _svc(project):
     svc = MagicMock()
     svc._get_project = MagicMock(return_value=project)
     svc._SYSTEM_TOOL_DEFS = ModelService._SYSTEM_TOOL_DEFS
-    svc._FETCH_TOOL_DEFS = ModelService._FETCH_TOOL_DEFS
-    svc.FETCH_SERVER_NAME = ModelService.FETCH_SERVER_NAME
     svc._model = MagicMock()
     return svc
 
@@ -94,13 +92,28 @@ def test_missing_record_is_registered():
     svc._model.save.assert_called_once()
 
 
-def test_stale_fetch_record_is_refreshed_not_duplicated():
-    stale = _server(FETCH_SERVER_ID, "Fetch", ["fetch"])
-    project = SimpleNamespace(id="p1", mcp_servers=[stale])
+def test_legacy_fetch_server_is_removed():
+    # Fetching moved from an MCP server to the in-process FetchAgent, so a
+    # previously installed fetch server must be dropped from the project.
+    stale = _server(FETCH_SERVER_ID, "fetch", ["fetch"])
+    system = _server(
+        SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
+        [t.name for t in ModelService._SYSTEM_TOOL_DEFS],
+    )
+    project = SimpleNamespace(id="p1", mcp_servers=[stale, system])
     svc = _svc(project)
 
-    ModelService.install_fetch_server(svc, "p1")
+    ModelService.remove_fetch_server(svc, "p1")
 
-    assert len(project.mcp_servers) == 1
-    assert stale.name == ModelService.FETCH_SERVER_NAME
+    assert [s.id for s in project.mcp_servers] == [SYSTEM_TOOLS_SERVER_ID]
     svc._model.save.assert_called_once()
+
+
+def test_remove_fetch_server_noop_when_absent():
+    project = SimpleNamespace(id="p1", mcp_servers=[])
+    svc = _svc(project)
+
+    ModelService.remove_fetch_server(svc, "p1")
+
+    assert project.mcp_servers == []
+    svc._model.save.assert_not_called()

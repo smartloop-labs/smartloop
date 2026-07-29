@@ -1216,76 +1216,27 @@ class ModelService:
         self._model.save()
         logger.info(f"Registered System Tools server on project {project_id}")
 
-    FETCH_SERVER_NAME = "fetch"
+    def remove_fetch_server(self, project_id: str) -> None:
+        """Remove the legacy fetch MCP server — fetching is now the FetchAgent.
 
-    _FETCH_TOOL_DEFS = [
-        MCPToolDefinition(
-            name="fetch",
-            description="Fetches a URL from the internet and extracts its contents as markdown",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL to fetch"},
-                    "max_length": {"type": "integer", "description": "Maximum number of characters to return", "default": sys.maxsize},
-                    "start_index": {"type": "integer", "description": "Start content from this character index", "default": 0},
-                    "raw": {"type": "boolean", "description": "Get raw content without markdown conversion", "default": False},
-                },
-                "required": ["url"],
-            },
-        ),
-    ]
-
-    def install_fetch_server(self, project_id: str) -> None:
-        """Register the fetch MCP server on a project if not already present."""
+        URL fetching moved from an MCP server (``__fetch__``) to an in-process
+        agent resolved as a plan step, so any previously installed fetch server
+        is dropped from the project.
+        """
         project = self._get_project(project_id)
-        # Match on the stable id (see install_system_tools_server).
-        existing = next(
-            (s for s in project.mcp_servers if s.id == FETCH_SERVER_ID), None,
-        )
-        if existing is not None:
-            current = [t.name for t in (existing.tools or [])]
-            wanted = [t.name for t in self._FETCH_TOOL_DEFS]
-            if current != wanted or existing.name != self.FETCH_SERVER_NAME:
-                existing.name = self.FETCH_SERVER_NAME
-                existing.tools = list(self._FETCH_TOOL_DEFS)
-                self._model.save()
-                logger.info(f"Refreshed fetch server tools: {wanted}")
-            else:
-                logger.info("Fetch server already registered")
-            return
-
-        server = MCPServer(
-            id=FETCH_SERVER_ID,
-            name=self.FETCH_SERVER_NAME,
-            pkg="mcp-server-fetch",
-            description="Fetches URLs from the internet and extracts content as markdown",
-            server_type=MCPServerType.LOCAL,
-            config=MCPServerConfig(
-                command=sys.executable,
-                args=["-m", "smartloop.api.mcp.fetch_server"],
-            ),
-            enabled=True,
-            system=False,
-            tools=list(self._FETCH_TOOL_DEFS),
-        )
-        project.mcp_servers.append(server)
-        self._model.save()
-        logger.info(f"Registered fetch server on project {project_id}")
+        before = len(project.mcp_servers)
+        project.mcp_servers = [
+            s for s in project.mcp_servers if s.id != FETCH_SERVER_ID
+        ]
+        if len(project.mcp_servers) != before:
+            self._model.save()
+            logger.info(f"Removed legacy fetch server from project {project_id}")
 
     def _migrate_servers_to_local(self, project: "Project") -> None:
         """Migrate legacy REMOTE system servers to LOCAL (stdio subprocess)."""
         migrated = False
         _LAUNCHERS = {"uvx", "npx", "pipx", "deno", "bunx"}
         for server in project.mcp_servers:
-            if server.id == FETCH_SERVER_ID and server.server_type == MCPServerType.REMOTE:
-                server.server_type = MCPServerType.LOCAL
-                server.config = MCPServerConfig(
-                    command=sys.executable,
-                    args=["-m", "smartloop.api.mcp.fetch_server"],
-                )
-                server.remote_config = None
-                migrated = True
-                logger.info(f"Migrated fetch server to LOCAL on project {project.id}")
             if server.id == SYSTEM_TOOLS_SERVER_ID and server.server_type == MCPServerType.REMOTE:
                 server.server_type = MCPServerType.LOCAL
                 server.config = MCPServerConfig(
@@ -1317,12 +1268,6 @@ class ModelService:
 
     _DEFAULT_SKILLS = [
         Skill(
-            id="fetch-url",
-            name="fetch-url",
-            description="Use when the user requests to find information from a URL — extracts data from the provided URL and returns it.",
-            content="when user requests information from an url use fetch tool extract information from the URL\n\n```mcp\nfetch.fetch(url)\n```",
-        ),
-        Skill(
             id="file-read",
             name="file-read",
             description="Use when the user wants to read, view, or inspect the contents of a file.",
@@ -1347,7 +1292,7 @@ class ModelService:
         project_id = project.id
         self._migrate_servers_to_local(project)
         self.install_system_tools_server(project_id)
-        self.install_fetch_server(project_id)
+        self.remove_fetch_server(project_id)
         # Re-fetch: install_* may have replaced self._model via _ensure_model(),
         # so the passed `project` object can be stale (different workspace instance).
         project = self._get_project(project_id)

@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from smartloop.llms import BaseLLM
-from smartloop.workspace.workspace import MCPServerType
 
 from smartloop.agents.planner import PlanStep, StepType, MCPToolContext, SYSTEM_TOOLS_SERVER_ID
 
@@ -148,6 +147,8 @@ class Explorer:
         self.tool_caller = tool_caller
         self.arg_extractor = arg_extractor
         self._use_llm_history = use_llm_for_history
+        from smartloop.agents.fetch_agent import FetchAgent
+        self.fetch_agent = FetchAgent()
 
     # ================================================================== #
     # Skill matching                                                       #
@@ -1199,64 +1200,15 @@ class Explorer:
     # ================================================================== #
 
     def fetch_url(
-        self, url: str, mcp_servers: List["MCPServer"],
+        self, url: str, mcp_servers: Optional[List["MCPServer"]] = None,
     ) -> str:
-        sorted_servers = sorted(
-            mcp_servers,
-            key=lambda s: 0 if s.server_type == MCPServerType.LOCAL else 1,
-        )
-        for server in sorted_servers:
-            if not server.enabled or not server.tools:
-                continue
-            for tool in server.tools:
-                t_name = (tool.name or "").lower()
-                t_desc = (tool.description or "").lower()
-                if not any(kw in t_name or kw in t_desc for kw in FETCH_TOOL_KEYWORDS):
-                    continue
+        """Fetch a URL as markdown via the in-process FetchAgent.
 
-                url_param = None
-                props = (tool.input_schema or {}).get("properties", {})
-                for p_name, p_info in props.items():
-                    if self.arg_extractor._is_url_parameter(p_name, p_info):
-                        url_param = p_name
-                        break
-                url_param = url_param or "url"
-
-                logger.info(f"[explore] Fetching URL via '{tool.name}': {url}")
-                try:
-                    result = self.tool_caller.call_tool(
-                        server=server,
-                        tool_name=tool.name,
-                        arguments={url_param: url},
-                        access_token=self.tool_caller.get_access_token(server),
-                    )
-                    if not result.success or not result.content:
-                        logger.warning(f"[explore] Fetch failed: {result.error}")
-                        return ""
-
-                    raw_parts = [
-                        block.get("text", "") if isinstance(block, dict) and block.get("type") == "text"
-                        else str(block)
-                        for block in result.content
-                    ]
-                    raw = "\n".join(raw_parts)
-
-                    if self.is_javascript_page(raw):
-                        msg = (
-                            f"The page at {url} requires JavaScript to render its content. "
-                            "JavaScript-rendered pages cannot be processed."
-                        )
-                        logger.info(f"[explore] JavaScript page detected: {url}")
-                        return msg
-
-                    logger.info(f"[explore] Fetched {len(raw)} chars from {url}")
-                    return raw
-                except Exception as e:
-                    logger.warning(f"[explore] Fetch error for {url}: {e}")
-                    return ""
-
-        logger.info("[explore] No fetch-capable MCP tool found")
-        return ""
+        ``mcp_servers`` is accepted for backward compatibility but unused —
+        fetching is no longer an MCP tool call.
+        """
+        logger.info(f"[explore] Fetching URL via FetchAgent: {url}")
+        return self.fetch_agent.fetch(url)
 
     def resolve_fetch_steps(
         self,
@@ -1285,69 +1237,18 @@ class Explorer:
                     if not urls:
                         urls = self.arg_extractor._extract_urls_from_text(step.instruction)
                     if urls:
-                        fetch_step = self._make_fetch_step(urls[0], step.instruction, available_servers)
-                        if fetch_step:
-                            logger.info(
-                                f"[resolve] Step {step.step}: URL '{urls[0]}' → "
-                                f"deterministic fetch via '{fetch_step.server_name}/{fetch_step.tool_name}'"
-                            )
-                            resolved.append(PlanStep(
-                                step=step.step,
-                                step_type=StepType.TOOL,
-                                tool_name=fetch_step.tool_name,
-                                server_id=fetch_step.server_id,
-                                server_name=fetch_step.server_name,
-                                instruction=fetch_step.instruction,
-                            ))
-                            continue
+                        logger.info(
+                            f"[resolve] Step {step.step}: URL '{urls[0]}' → FetchAgent step"
+                        )
+                        resolved.append(PlanStep(
+                            step=step.step,
+                            step_type=StepType.FETCH,
+                            tool_name="fetch",
+                            server_id="",
+                            server_name="",
+                            instruction=f"Fetch {urls[0]} and extract its main content. Context: {step.instruction}",
+                            default_args={"url": urls[0]},
+                        ))
+                        continue
             resolved.append(step)
         return resolved
-
-    def _make_fetch_step(self, url: str, instruction: str, available_servers: List[Dict[str, Any]]) -> Optional["PlanStep"]:
-        sorted_servers = sorted(
-            available_servers,
-            key=lambda s: 0 if s.get("server_type") == MCPServerType.LOCAL else 1,
-        )
-        for srv in sorted_servers:
-            if srv.get("id") == SYSTEM_TOOLS_SERVER_ID:
-                continue
-            for tool in srv.get("tools", []):
-                t_name = tool.get("name", "").lower()
-                t_desc = tool.get("description", "").lower()
-                if any(kw in t_name or kw in t_desc for kw in FETCH_TOOL_KEYWORDS):
-                    return PlanStep(
-                        step=0,
-                        step_type=StepType.TOOL,
-                        tool_name=tool["name"],
-                        server_id=srv["id"],
-                        server_name=srv.get("name", ""),
-                        instruction=f"Fetch {url} and extract its main content. Context: {instruction}",
-                    )
-        return None
-
-    @staticmethod
-    def is_javascript_page(content: str) -> bool:
-        if not content:
-            return False
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(content, "html.parser")
-        noscript = soup.find("noscript")
-        if noscript:
-            noscript_text = noscript.get_text(strip=True).lower()
-            js_phrases = [
-                "enable javascript", "javascript is required",
-                "javascript is needed", "requires javascript",
-                "turn on javascript", "javascript must be enabled",
-                "please enable javascript",
-            ]
-            if any(phrase in noscript_text for phrase in js_phrases):
-                return True
-        body = soup.find("body") or soup
-        visible_text = body.get_text(separator=" ", strip=True)
-        scripts = soup.find_all("script")
-        if len(scripts) > 0 and len(visible_text) < 200:
-            return True
-        root_div = soup.find("div", id=re.compile(r"^(root|app|__next)$"))
-        if root_div and not root_div.get_text(strip=True):
-            return True
-        return False
