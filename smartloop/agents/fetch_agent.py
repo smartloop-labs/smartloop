@@ -25,7 +25,7 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 _STRIP_TAGS = ["script", "style", "noscript", "svg", "iframe", "link", "meta"]
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SmartloopFetch/1.0)"}
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; Smartloop/1.0)"}
 
 _JS_PHRASES = [
     "enable javascript", "javascript is required",
