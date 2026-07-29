@@ -1216,6 +1216,10 @@ class ModelService:
         self._model.save()
         logger.info(f"Registered System Tools server on project {project_id}")
 
+    # Skills that shipped with the old fetch MCP server; obsolete now that
+    # fetching is handled in-process by the FetchAgent.
+    _STALE_FETCH_SKILLS = ("fetch-mcp", "fetch-url")
+
     def remove_fetch_server(self, project_id: str) -> None:
         """Remove the legacy fetch MCP server — fetching is now the FetchAgent.
 
@@ -1231,6 +1235,23 @@ class ModelService:
         if len(project.mcp_servers) != before:
             self._model.save()
             logger.info(f"Removed legacy fetch server from project {project_id}")
+        self._remove_stale_fetch_skills(project)
+
+    def _remove_stale_fetch_skills(self, project: "Project") -> None:
+        """Delete leftover fetch skill directories from disk.
+
+        Projects created before the FetchAgent change may still have
+        ``fetch-mcp``/``fetch-url`` SKILL.md directories on disk. They reference
+        the removed ``__fetch__`` server, so drop them.
+        """
+        skills_dir = self._skills_dir(project)
+        for name in self._STALE_FETCH_SKILLS:
+            skill_dir = os.path.join(skills_dir, name)
+            if os.path.isdir(skill_dir):
+                shutil.rmtree(skill_dir, ignore_errors=True)
+                logger.info(
+                    f"Removed stale fetch skill '{name}' from project {project.id}"
+                )
 
     def _migrate_servers_to_local(self, project: "Project") -> None:
         """Migrate legacy REMOTE system servers to LOCAL (stdio subprocess)."""
@@ -3517,12 +3538,12 @@ class ModelService:
 
             if result.error:
                 error_msg = f"Tool '{result.tool_name}' failed: {result.error}"
-                logger.warning(f"MCP tool call failed ({result.tool_name}): {result.error}")
+                logger.warning(f"Tool call failed ({result.tool_name}): {result.error}")
                 return None, True, error_msg, None, None, False
 
             if result.content:
                 logger.info(
-                    f"MCP tool '{result.tool_name}' returned "
+                    f"Tool '{result.tool_name}' returned "
                     f"{len(result.content)} chars of context"
                 )
                 return result.content, True, None, result.citations, result.skill_instruction, result.mutation
@@ -3531,7 +3552,7 @@ class ModelService:
 
         except Exception as e:
             error_msg = f"Tool call failed: {e}"
-            logger.warning(f"MCP tool call attempt failed: {e}")
+            logger.warning(f"Tool call attempt failed: {e}")
             return None, True, error_msg, None, None, False
 
     # -------------------------------------------------------------- auto-write

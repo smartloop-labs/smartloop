@@ -69,16 +69,66 @@ class FetchAgent:
         elif not raw and "html" in content_type:
             text = self._html_to_markdown(response.text)
             if self.is_javascript_page(response.text):
-                logger.info(f"[fetch] JavaScript page detected: {url}")
-                return (
-                    f"The page at {url} requires JavaScript to render its content. "
-                    "JavaScript-rendered pages cannot be processed."
+                logger.info(
+                    f"[fetch] JavaScript page detected: {url} — "
+                    "rendering with headless browser"
                 )
+                rendered = self._render_with_playwright(url)
+                rendered_md = self._html_to_markdown(rendered) if rendered else ""
+                if rendered_md:
+                    text = rendered_md
+                else:
+                    return (
+                        f"The page at {url} requires JavaScript to render its "
+                        "content. JavaScript-rendered pages cannot be processed."
+                    )
         else:
             text = response.text
 
         logger.info(f"[fetch] Fetched {len(text)} chars from {url}")
         return text[start_index : start_index + max_length]
+
+    @staticmethod
+    def _render_with_playwright(url: str, timeout_ms: int = 30000) -> str:
+        """Render a JavaScript page with headless Chromium and return its HTML.
+
+        Used as a fallback when a plain GET returns a page that needs JavaScript
+        to populate its content.  Runs Playwright's sync API in a dedicated
+        thread so it never collides with a running asyncio event loop (the
+        fetch step may execute inside an async request handler or a DAG worker).
+
+        Playwright is intentionally NOT a bundled dependency — it and its
+        browser binaries are too heavy to ship to every install.  This method
+        is opt-in: it only renders when the user has installed Playwright
+        (`pip install playwright && playwright install chromium`).  It returns
+        "" if Playwright or its browser binary is unavailable, or if rendering
+        fails — the caller then falls back to the plain result.
+        """
+        def _run() -> str:
+            try:
+                from playwright.sync_api import sync_playwright
+            except ImportError:
+                logger.info(
+                    "[fetch] Playwright not installed — cannot render JS page. "
+                    "Install with `pip install playwright && playwright install chromium`."
+                )
+                return ""
+            try:
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    try:
+                        page = browser.new_page(user_agent=_HEADERS["User-Agent"])
+                        page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                        return page.content()
+                    finally:
+                        browser.close()
+            except Exception as e:
+                logger.warning(f"[fetch] Playwright render failed for {url}: {e}")
+                return ""
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_run).result()
 
     @staticmethod
     def _is_pdf(url: str, content_type: str) -> bool:
