@@ -334,8 +334,10 @@ def test_create_plan_tool_call_url_fetch(planner, sample_servers):
     )
     plan = planner.create_plan(classification, ctx)
     assert len(plan.steps) == 1
-    assert plan.steps[0].step_type == StepType.TOOL
-    assert "fetch" in (plan.steps[0].tool_name or "").lower()
+    # URL fetching is now a dedicated FETCH step run by the FetchAgent, not
+    # an MCP tool call.
+    assert plan.steps[0].step_type == StepType.FETCH
+    assert plan.steps[0].default_args == {"url": "https://example.com/page"}
 
 
 def test_create_plan_action_bash(planner):

@@ -47,6 +47,7 @@ class StepType(str, Enum):
     """Semantic action categories available in an execution plan."""
     ANALYZE        = "analyze"        # LLM reasons about user intent and context before planning
     TOOL           = "tool"           # Call an external MCP tool
+    FETCH          = "fetch"          # Fetch a URL → markdown via the FetchAgent
     EXPLORE        = "explore"        # Walk the local filesystem tree + vector search
     ACTION         = "action"         # Built-in action: bash, write, read, grep, summarize
     CONVERSATIONAL = "conversational" # LLM generates content from knowledge
@@ -567,8 +568,13 @@ class Planner:
         self,
         classification: ClassificationResult,
         context: PlanContext,
+        llm: Optional[BaseLLM] = None,
     ) -> ExecutionPlan:
         """Build an execution plan from a classification result.
+
+        ``llm`` overrides the model used for LLM-based multi-step planning —
+        the caller passes a stronger model (e.g. the large 'dp' model) for the
+        complex tool-selection reasoning. Falls back to ``self.llm``.
 
         For CONVERSATION with a matched capability (e.g. ``knowledge``) →
         one CONVERSATIONAL step routed to that capability's model.
@@ -606,7 +612,7 @@ class Planner:
             return self._plan_explore(classification, context)
 
         if intent == IntentType.MULTI_STEP:
-            return self._plan_multi_step(classification, context)
+            return self._plan_multi_step(classification, context, llm=llm)
 
         return ExecutionPlan(steps=[], reasoning="unknown intent")
 
@@ -627,25 +633,14 @@ class Planner:
                 reasoning=f"MCP tool: {tool.tool_name}",
             )
 
-        # URL fetch — find a fetch-capable tool
+        # URL fetch — run the FetchAgent as a dedicated step
         if classification.detected_urls:
             url = classification.detected_urls[0]
             fetch_step = self._make_fetch_step(url, context)
-            if fetch_step:
-                fetch_step.step = 1
-                return ExecutionPlan(
-                    steps=[fetch_step],
-                    reasoning=f"fetch URL: {url}",
-                )
-            # No fetch tool found — placeholder for orchestrator to resolve
+            fetch_step.step = 1
             return ExecutionPlan(
-                steps=[PlanStep(
-                    step=1, step_type=StepType.TOOL,
-                    tool_name="fetch",
-                    server_id="", server_name="",
-                    instruction=f"Fetch {url} and extract its main content.",
-                )],
-                reasoning=f"fetch URL (unresolved): {url}",
+                steps=[fetch_step],
+                reasoning=f"fetch URL: {url}",
             )
 
         return ExecutionPlan(steps=[], reasoning="tool_call but no tool matched")
@@ -738,6 +733,7 @@ class Planner:
 
     def _plan_multi_step(
         self, classification: ClassificationResult, context: PlanContext,
+        llm: Optional[BaseLLM] = None,
     ) -> ExecutionPlan:
         """Build a multi-step plan.
 
@@ -745,7 +741,7 @@ class Planner:
         directly from the classification's detected signals.
         """
         # Try LLM-based planning
-        plan = self._llm_plan(classification, context)
+        plan = self._llm_plan(classification, context, llm=llm)
         if plan.steps:
             return plan
 
@@ -754,6 +750,7 @@ class Planner:
 
     def _llm_plan(
         self, classification: ClassificationResult, context: PlanContext,
+        llm: Optional[BaseLLM] = None,
     ) -> ExecutionPlan:
         """Call LLM to produce a step ordering for multi-step requests."""
         # Build a focused prompt — classification already tells us what signals exist
@@ -862,10 +859,12 @@ class Planner:
             "</user>"
         )
 
+        plan_llm = llm or self.llm
+
         # Budget check
-        max_tokens = self.llm.get_max_tokens()
+        max_tokens = plan_llm.get_max_tokens()
         token_budget = int(max_tokens * 0.8)
-        prompt_tokens = self.llm.get_num_tokens(prompt)
+        prompt_tokens = plan_llm.get_num_tokens(prompt)
         if prompt_tokens > token_budget:
             # Trim skills
             if context.skills:
@@ -885,7 +884,7 @@ class Planner:
                 )
 
         try:
-            response = str(self.llm.invoke(prompt)).strip()
+            response = str(plan_llm.invoke(prompt)).strip()
             logger.info(f"[plan] Raw LLM plan ({len(response)} chars): {response[:500]}")
             return self._parse_plan_response(response, context.user_message, classification)
         except Exception as e:
@@ -902,15 +901,8 @@ class Planner:
         # Fetch URLs first (context gathering)
         for url in classification.detected_urls:
             fetch_step = self._make_fetch_step(url, context)
-            if fetch_step:
-                fetch_step.step = step_num
-                steps.append(fetch_step)
-            else:
-                steps.append(PlanStep(
-                    step=step_num, step_type=StepType.TOOL,
-                    tool_name="fetch", server_id="", server_name="",
-                    instruction=f"Fetch {url} and extract its main content.",
-                ))
+            fetch_step.step = step_num
+            steps.append(fetch_step)
             step_num += 1
 
         # MCP tool calls
@@ -997,16 +989,22 @@ class Planner:
     # Keywords that identify a URL-fetching tool by name or description.
     _FETCH_TOOL_KEYWORDS = {"fetch", "browse", "scrape", "web", "http", "navigate", "get_url"}
 
-    def _make_fetch_step(self, url: str, context: PlanContext) -> Optional[PlanStep]:
-        """Return None so the orchestrator resolves fetch to the right server.
+    def _make_fetch_step(self, url: str, context: PlanContext) -> PlanStep:
+        """Build a FETCH step that the orchestrator runs via the FetchAgent.
 
-        The local fetch server (``__fetch__``) is excluded from
-        ``context.mcp_tools``, so matching here would only find remote
-        servers.  Returning ``None`` lets the orchestrator's
-        ``_resolve_fetch_steps`` wire the step to the correct
-        (local-first) fetch tool at execution time.
+        Fetching is no longer an MCP tool call — the FetchAgent performs the
+        HTTP GET and converts HTML/PDF to markdown in-process.  The URL is
+        carried in ``default_args`` so no argument resolution is needed.
         """
-        return None
+        return PlanStep(
+            step=0,
+            step_type=StepType.FETCH,
+            tool_name="fetch",
+            server_id="",
+            server_name="",
+            instruction=f"Fetch {url} and extract its main content.",
+            default_args={"url": url},
+        )
 
     # ------------------------------------------------------------------ #
     # Response parsing                                                     #

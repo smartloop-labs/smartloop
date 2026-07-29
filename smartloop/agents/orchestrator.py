@@ -42,6 +42,7 @@ from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 from smartloop.utils.mcp_result_formatter import ResultFormatter
 
 from smartloop.agents.mcp.explorer import Explorer, SearchContext, EnrichedContext
+from smartloop.agents.fetch_agent import FetchAgent
 from smartloop.agents.sanitize import fence_document_content
 from smartloop.config.app_settings import AppSettings
 
@@ -141,6 +142,37 @@ class SLPOrchestrator:
             return fallback
         return self.agent_llm
 
+    def _decision_llm(self, capability: str) -> BaseLLM:
+        """Resolve a capability model for a low-value *decision* node
+        (skill matching, multi-step planning).
+
+        Unlike :meth:`_llm_for_tier`, this never forces a generic large-model
+        load: it uses the capability model only when it is already resident or
+        comfortably fits (the provider's own headroom guard decides), and
+        otherwise falls straight back to the small orchestrator model. This
+        keeps the better intent judgement "when available" without adding VRAM
+        pressure — and risking an OOM — on memory-tight devices.
+        """
+        if capability and self._capability_llm_provider is not None:
+            cached = self._capability_cache.get(capability)
+            if cached is not None:
+                return cached
+            try:
+                llm = self._capability_llm_provider(capability)
+                if llm is not None:
+                    self._capability_cache[capability] = llm
+                    logger.info(
+                        "[models] decision capability '%s' → %s",
+                        capability, self._model_label(llm),
+                    )
+                    return llm
+            except Exception as e:
+                logger.warning(
+                    "[models] decision capability load failed (%s): %s",
+                    capability, e,
+                )
+        return self.agent_llm
+
     @staticmethod
     def _model_label(llm: BaseLLM) -> str:
         try:
@@ -177,6 +209,7 @@ class SLPOrchestrator:
         self.tool_caller = MCPToolCaller(self.arg_extractor, self.result_mapper)
         self.result_formatter = ResultFormatter(orchestrator_llm)
         self.explorer = Explorer(self.agent_llm, self.tool_caller, self.arg_extractor)
+        self._fetch_agent = FetchAgent()
 
         # Prefer a shared, long-lived executor (its LLM worker processes load
         # the model once and are reused across requests).  Fall back to a
@@ -452,7 +485,6 @@ class SLPOrchestrator:
 
     def _handle_skill_match(self, ctx: _OrchestratorContext, node: SkillMatchNode) -> NodeResult:
         """Parse skill front matter then LLM-match against the user query."""
-        logger.info("[models] SKILL_MATCH → agent_llm: %s", self._model_label(self.agent_llm))
         self._emit(
             "analyze", "processing",
             f"Analyzing your request against {len(ctx.skills)} available skill(s)",
@@ -496,8 +528,22 @@ class SLPOrchestrator:
                 s for s in skills_for_matching
                 if not any(kw in s.get("name", "").lower() for kw in ("fetch", "browse", "scrape"))
             ]
+
+        # Nothing to match — skip the LLM entirely so a project with no skills
+        # never pays to load the heavier skills model.
+        if not skills_for_matching:
+            self._matched_skills = []
+            return NodeResult(node_id=node.node_id, success=True, data={"matched_skills": []})
+
+        # Skill matching is an intent judgement the small orchestrator model is
+        # poor at (it defaults to picking the only listed skill). Prefer the
+        # 'skills'-capability model, but only when it is resident or fits — a
+        # memory-tight device falls back to the mini instead of risking an OOM.
+        match_llm = self._decision_llm("skills")
+        logger.info("[models] SKILL_MATCH → %s", self._model_label(match_llm))
+
         matched_skills = self.explorer.match_skills(
-            ctx.user_message, skills_for_matching,
+            ctx.user_message, skills_for_matching, llm=match_llm,
         )
         self._matched_skills = matched_skills
         return NodeResult(node_id=node.node_id, success=True, data={"matched_skills": matched_skills})
@@ -935,7 +981,16 @@ class SLPOrchestrator:
             skills=planner_skills,
             document_context=vector_context or ctx.document_context,
         )
-        plan = self.planner.create_plan(classification, plan_context)
+        # Multi-step tool selection is complex reasoning — prefer the large
+        # 'dp' model when it is resident or fits, else fall back to the mini.
+        # Resolved lazily, only for MULTI_STEP, so simple requests never touch
+        # the 4B and a memory-tight device is never pushed into an OOM.
+        plan_llm = None
+        if classification.intent == IntentType.MULTI_STEP:
+            plan_llm = self._decision_llm("dp")
+            logger.info("[models] PLAN (multi-step) → %s", self._model_label(plan_llm))
+
+        plan = self.planner.create_plan(classification, plan_context, llm=plan_llm)
         if plan.steps:
             plan.steps = self.explorer.resolve_fetch_steps(
                 plan.steps, ctx.available_servers, ctx.user_message
@@ -1111,6 +1166,25 @@ class SLPOrchestrator:
         def handler(deps: Dict) -> NodeResult:
             prev_results = self._collect_raw_from_deps(deps)
             node_id = f"step_{step.step}_{step.tool_name or step.step_type.value}"
+
+            # FETCH: run the FetchAgent (HTTP GET → markdown) in-process
+            if step.step_type == StepType.FETCH:
+                url = (step.default_args or {}).get("url", "")
+                if not url:
+                    urls = re.findall(r'https?://[^\s<>\'")\]]+', step.instruction or "")
+                    url = urls[0] if urls else ""
+                if not url:
+                    logger.warning("[fetch] No URL to fetch for step %s", step.step)
+                    return self._step_result(node_id, step, "")
+                self._emit("fetch", "processing", f"Fetching {url}")
+                content = self._fetch_agent.fetch(url)
+                # Return empty on failure so downstream reasoning falls back to
+                # any explore/vector context instead of surfacing a fetch error.
+                if not content:
+                    logger.info(f"[fetch] step {step.step}: empty result from {url}")
+                    return self._step_result(node_id, step, "")
+                logger.info(f"[fetch] step {step.step}: {len(content)} chars from {url}")
+                return self._step_result(node_id, step, content, content)
 
             # EXPLORE: return pre-fetched search context (already collected)
             if step.step_type == StepType.EXPLORE:

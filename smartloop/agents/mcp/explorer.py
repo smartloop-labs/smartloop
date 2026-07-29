@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from smartloop.llms import BaseLLM
-from smartloop.workspace.workspace import MCPServerType
 
 from smartloop.agents.planner import PlanStep, StepType, MCPToolContext, SYSTEM_TOOLS_SERVER_ID
 
@@ -148,6 +147,8 @@ class Explorer:
         self.tool_caller = tool_caller
         self.arg_extractor = arg_extractor
         self._use_llm_history = use_llm_for_history
+        from smartloop.agents.fetch_agent import FetchAgent
+        self.fetch_agent = FetchAgent()
 
     # ================================================================== #
     # Skill matching                                                       #
@@ -157,7 +158,23 @@ class Explorer:
         self,
         user_message: str,
         parsed_skills: List[Dict[str, str]],
+        llm: Optional[BaseLLM] = None,
     ) -> List[Dict[str, str]]:
+        """Match a user message to skills, unioning two complementary signals.
+
+        Keyword overlap alone is brittle — a real request ("what is the
+        purpose of the funds?") may share only one word with the skill, and a
+        complex prompt may share none.  So the LLM is the primary qualifier
+        and handles indirect / multi-part phrasing; a cheap deterministic
+        *direct* topic match against the curated skill name backs it up so an
+        obvious hit ("funds" ↔ ``fund-info``) is never lost to a flaky small
+        model.
+
+        ``llm`` overrides the model used for the semantic qualifier — the
+        caller passes the ``skills``-capability model, which is far better at
+        the intent judgement than the small orchestrator model.  Falls back to
+        ``self.llm`` when not given.
+        """
         matchable = [
             s for s in parsed_skills
             if not s["name"].startswith("__")
@@ -165,127 +182,123 @@ class Explorer:
         if not matchable:
             return []
 
+        direct = self._direct_name_matches(user_message, matchable)
+        llm_matched = self._llm_match_skills(user_message, matchable, llm=llm)
+
+        # Union, preserving the presentation order; dedup by skill name.
+        keep = {s["name"] for s in direct} | {s["name"] for s in llm_matched}
+        matched = [s for s in matchable if s["name"] in keep]
+
+        if matched:
+            logger.info(
+                f"[skill-match] Matched {len(matched)} skill(s): "
+                f"{[s['name'] for s in matched]} "
+                f"(direct={[s['name'] for s in direct]})"
+            )
+        return matched
+
+    def _llm_match_skills(
+        self,
+        user_message: str,
+        matchable: List[Dict[str, str]],
+        llm: Optional[BaseLLM] = None,
+    ) -> List[Dict[str, str]]:
+        """Ask the LLM which skills apply — the primary, semantic matcher.
+
+        Handles complex or indirectly-worded prompts that share few or no
+        literal keywords with the skill.  Returns ``[]`` when the model
+        matches nothing or the call fails (the deterministic direct-name
+        match in :meth:`match_skills` still stands on its own).
+        """
         skill_list = "\n".join(
             f"  {i+1}. {s['name']}: {s['description']}"
             for i, s in enumerate(matchable)
         )
 
         prompt = (
-            "<system>You are matching a user message to instruction sets (skills). "
-            "Each skill describes when it applies and contains instructions for "
-            "how to handle that type of user request. "
-            "A user message may match multiple skills if the request spans "
-            "several concerns. Pick ALL skills whose descriptions are relevant "
-            "to the user's query. "
-            "Reply with ONLY the number(s) of matching skills (comma-separated), "
-            "or NONE if no skill is relevant.\n\n"
-            f"Available skills:\n{skill_list}\n</system>"
+            "<system>You decide which instruction sets (skills), if any, apply "
+            "to the user's request. Judge by INTENT, not topic: match a skill "
+            "only when the request asks you to perform the task the skill is "
+            "for. A general or definitional question ('what is X', 'why does X "
+            "matter', 'what is the purpose of X') is NOT a match for a skill "
+            "that acts on X (e.g. summarizes or reports X).\n\n"
+            "Answer with the matching skill number(s), comma-separated. If none "
+            "apply, answer exactly -1. Prefer -1 when unsure; never pick a "
+            "skill just because it is the only one listed.\n\n"
+            "Examples — given skill '1. sales-report: build a summary table of "
+            "sales figures':\n"
+            "  request 'summarize this quarter's sales' -> 1\n"
+            "  request 'what is a sales report?' -> -1\n"
+            "  request 'what is the purpose of sales?' -> -1\n\n"
+            f"Skills:\n{skill_list}</system>"
             f"<user>{user_message}</user>"
         )
 
+        match_llm = llm or self.llm
         try:
             # Skill matching only needs the model to emit a few skill
             # numbers (e.g. "1, 3"). Cap the output so a missing stop token
             # can't trigger runaway greedy generation that stalls the request.
-            response = str(self.llm.invoke(prompt, max_tokens=16)).strip().lower()
+            response = str(match_llm.invoke(prompt, max_tokens=16)).strip().lower()
             logger.info(f"[skill-match] LLM response: {response[:100]}")
-
-            if "none" in response and len(response) < 10:
-                return []
-
-            matched: List[Dict[str, str]] = []
-            seen: set = set()
-
-            # Parse numbers from the response (handles "1", "1, 3", "1,2")
-            for token in re.findall(r'\d+', response):
-                idx = int(token) - 1  # 1-based in prompt
-                if 0 <= idx < len(matchable):
-                    s = matchable[idx]
-                    if s["name"] not in seen:
-                        matched.append(s)
-                        seen.add(s["name"])
-
-            # Fallback: check if the LLM returned skill names instead
-            if not matched:
-                for s in matchable:
-                    if s["name"].lower() in response and s["name"] not in seen:
-                        matched.append(s)
-                        seen.add(s["name"])
-
-            if matched:
-                logger.info(
-                    f"[skill-match] Matched {len(matched)} skill(s): "
-                    f"{[s['name'] for s in matched]}"
-                )
-                return matched
-
-            # Fallback: keyword overlap between user message and skill
-            # description.  Small models often return "none" even when
-            # the skill clearly applies.  We tokenise both strings and
-            # require ≥2 overlapping content words (length ≥ 4).
-            matched = self._keyword_fallback_match(user_message, matchable)
-            if matched:
-                logger.info(
-                    f"[skill-match] Matched {len(matched)} skill(s) via keyword fallback: "
-                    f"{[s['name'] for s in matched]}"
-                )
-            return matched
-
         except Exception as e:
             logger.warning(f"[skill-match] LLM failed: {e}")
+            return []
 
-        # Even if LLM fails entirely, try keyword fallback
-        return self._keyword_fallback_match(user_message, matchable)
-
-    @staticmethod
-    def _keyword_fallback_match(
-        user_message: str,
-        skills: List[Dict[str, str]],
-        min_overlap: int = 2,
-        min_word_len: int = 4,
-    ) -> List[Dict[str, str]]:
-        """Match skills by keyword overlap when LLM matching fails.
-
-        Tokenises the user message and each skill's name + description,
-        then checks for ≥ ``min_overlap`` shared content words (words
-        with length ≥ ``min_word_len``).  This is language-agnostic —
-        it works on raw word forms without stop-word lists.
-
-        The overlap threshold increases with the number of skills to
-        reduce false positives: threshold = min_overlap + (num_skills // 5).
-        """
-        num_skills = len(skills)
-        # Scale threshold: more skills → require more keyword overlap
-        # to reduce false-positive matches as the skill set grows.
-        effective_threshold = min_overlap + (num_skills // 5)
-
-        def _tokens(text: str) -> set:
-            return {
-                w for w in re.findall(r'\w+', text.lower())
-                if len(w) >= min_word_len
-            }
-
-        msg_tokens = _tokens(user_message)
-        if not msg_tokens:
+        # Explicit no-match sentinels. Handle these before digit parsing so
+        # "-1" isn't misread as skill 1 (``\d+`` would match the "1").
+        if "none" in response and len(response) < 10:
             return []
 
         matched: List[Dict[str, str]] = []
+        seen: set = set()
+
+        # Parse signed integers (handles "1", "1, 3", "-1"). Only positive
+        # 1-based indices select a skill; -1 / 0 / out-of-range are ignored,
+        # so a "-1" reply yields no matches.
+        for token in re.findall(r'-?\d+', response):
+            idx = int(token) - 1  # 1-based in prompt
+            if 0 <= idx < len(matchable):
+                s = matchable[idx]
+                if s["name"] not in seen:
+                    matched.append(s)
+                    seen.add(s["name"])
+
+        # Fallback: the model sometimes echoes skill names instead of numbers.
+        if not matched:
+            for s in matchable:
+                if s["name"].lower() in response and s["name"] not in seen:
+                    matched.append(s)
+                    seen.add(s["name"])
+
+        return matched
+
+    @staticmethod
+    def _direct_name_matches(
+        user_message: str,
+        skills: List[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        """Match skills the user *names explicitly* — a direct invocation.
+
+        This is intentionally strict: it fires only when the skill's full
+        name appears as a phrase in the message (e.g. "run the fund-info
+        skill", "give me the fund info").  A bare topic mention ("what is
+        the purpose of the funds?") is NOT a direct match — that judgement
+        belongs to the LLM qualifier, which weighs the user's intent against
+        the skill's described use case.
+        """
+        msg = re.sub(r'[\s_\-]+', ' ', user_message.lower()).strip()
+
+        matched: List[Dict[str, str]] = []
         for s in skills:
-            skill_text = f"{s.get('name', '')} {s.get('description', '')} {s.get('content', '')}"
-            skill_tokens = _tokens(skill_text)
-            overlap = msg_tokens & skill_tokens
-
-            # Reject if the message is too short for keyword matching to
-            # be reliable.  When the entire message overlaps (ratio == 1.0)
-            # but has ≤ 3 tokens, it's almost certainly a false positive
-            # from generic words like "proof read".
-            if len(msg_tokens) <= 3 and len(overlap) == len(msg_tokens):
+            name = s.get("name", "")
+            phrase = re.sub(r'[\s_\-]+', ' ', name.lower()).strip()
+            if not phrase:
                 continue
-
-            if len(overlap) >= effective_threshold:
-                logger.debug(
-                    f"[skill-match] keyword overlap for '{s['name']}': {overlap}"
-                )
+            # Word-boundary phrase match so "fund info" hits but "funding fo"
+            # does not.
+            if re.search(rf'\b{re.escape(phrase)}\b', msg):
+                logger.debug(f"[skill-match] direct name invocation: '{name}'")
                 matched.append(s)
 
         return matched
@@ -1187,64 +1200,15 @@ class Explorer:
     # ================================================================== #
 
     def fetch_url(
-        self, url: str, mcp_servers: List["MCPServer"],
+        self, url: str, mcp_servers: Optional[List["MCPServer"]] = None,
     ) -> str:
-        sorted_servers = sorted(
-            mcp_servers,
-            key=lambda s: 0 if s.server_type == MCPServerType.LOCAL else 1,
-        )
-        for server in sorted_servers:
-            if not server.enabled or not server.tools:
-                continue
-            for tool in server.tools:
-                t_name = (tool.name or "").lower()
-                t_desc = (tool.description or "").lower()
-                if not any(kw in t_name or kw in t_desc for kw in FETCH_TOOL_KEYWORDS):
-                    continue
+        """Fetch a URL as markdown via the in-process FetchAgent.
 
-                url_param = None
-                props = (tool.input_schema or {}).get("properties", {})
-                for p_name, p_info in props.items():
-                    if self.arg_extractor._is_url_parameter(p_name, p_info):
-                        url_param = p_name
-                        break
-                url_param = url_param or "url"
-
-                logger.info(f"[explore] Fetching URL via '{tool.name}': {url}")
-                try:
-                    result = self.tool_caller.call_tool(
-                        server=server,
-                        tool_name=tool.name,
-                        arguments={url_param: url},
-                        access_token=self.tool_caller.get_access_token(server),
-                    )
-                    if not result.success or not result.content:
-                        logger.warning(f"[explore] Fetch failed: {result.error}")
-                        return ""
-
-                    raw_parts = [
-                        block.get("text", "") if isinstance(block, dict) and block.get("type") == "text"
-                        else str(block)
-                        for block in result.content
-                    ]
-                    raw = "\n".join(raw_parts)
-
-                    if self.is_javascript_page(raw):
-                        msg = (
-                            f"The page at {url} requires JavaScript to render its content. "
-                            "JavaScript-rendered pages cannot be processed."
-                        )
-                        logger.info(f"[explore] JavaScript page detected: {url}")
-                        return msg
-
-                    logger.info(f"[explore] Fetched {len(raw)} chars from {url}")
-                    return raw
-                except Exception as e:
-                    logger.warning(f"[explore] Fetch error for {url}: {e}")
-                    return ""
-
-        logger.info("[explore] No fetch-capable MCP tool found")
-        return ""
+        ``mcp_servers`` is accepted for backward compatibility but unused —
+        fetching is no longer an MCP tool call.
+        """
+        logger.info(f"[explore] Fetching URL via FetchAgent: {url}")
+        return self.fetch_agent.fetch(url)
 
     def resolve_fetch_steps(
         self,
@@ -1273,69 +1237,18 @@ class Explorer:
                     if not urls:
                         urls = self.arg_extractor._extract_urls_from_text(step.instruction)
                     if urls:
-                        fetch_step = self._make_fetch_step(urls[0], step.instruction, available_servers)
-                        if fetch_step:
-                            logger.info(
-                                f"[resolve] Step {step.step}: URL '{urls[0]}' → "
-                                f"deterministic fetch via '{fetch_step.server_name}/{fetch_step.tool_name}'"
-                            )
-                            resolved.append(PlanStep(
-                                step=step.step,
-                                step_type=StepType.TOOL,
-                                tool_name=fetch_step.tool_name,
-                                server_id=fetch_step.server_id,
-                                server_name=fetch_step.server_name,
-                                instruction=fetch_step.instruction,
-                            ))
-                            continue
+                        logger.info(
+                            f"[resolve] Step {step.step}: URL '{urls[0]}' → FetchAgent step"
+                        )
+                        resolved.append(PlanStep(
+                            step=step.step,
+                            step_type=StepType.FETCH,
+                            tool_name="fetch",
+                            server_id="",
+                            server_name="",
+                            instruction=f"Fetch {urls[0]} and extract its main content. Context: {step.instruction}",
+                            default_args={"url": urls[0]},
+                        ))
+                        continue
             resolved.append(step)
         return resolved
-
-    def _make_fetch_step(self, url: str, instruction: str, available_servers: List[Dict[str, Any]]) -> Optional["PlanStep"]:
-        sorted_servers = sorted(
-            available_servers,
-            key=lambda s: 0 if s.get("server_type") == MCPServerType.LOCAL else 1,
-        )
-        for srv in sorted_servers:
-            if srv.get("id") == SYSTEM_TOOLS_SERVER_ID:
-                continue
-            for tool in srv.get("tools", []):
-                t_name = tool.get("name", "").lower()
-                t_desc = tool.get("description", "").lower()
-                if any(kw in t_name or kw in t_desc for kw in FETCH_TOOL_KEYWORDS):
-                    return PlanStep(
-                        step=0,
-                        step_type=StepType.TOOL,
-                        tool_name=tool["name"],
-                        server_id=srv["id"],
-                        server_name=srv.get("name", ""),
-                        instruction=f"Fetch {url} and extract its main content. Context: {instruction}",
-                    )
-        return None
-
-    @staticmethod
-    def is_javascript_page(content: str) -> bool:
-        if not content:
-            return False
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(content, "html.parser")
-        noscript = soup.find("noscript")
-        if noscript:
-            noscript_text = noscript.get_text(strip=True).lower()
-            js_phrases = [
-                "enable javascript", "javascript is required",
-                "javascript is needed", "requires javascript",
-                "turn on javascript", "javascript must be enabled",
-                "please enable javascript",
-            ]
-            if any(phrase in noscript_text for phrase in js_phrases):
-                return True
-        body = soup.find("body") or soup
-        visible_text = body.get_text(separator=" ", strip=True)
-        scripts = soup.find_all("script")
-        if len(scripts) > 0 and len(visible_text) < 200:
-            return True
-        root_div = soup.find("div", id=re.compile(r"^(root|app|__next)$"))
-        if root_div and not root_div.get_text(strip=True):
-            return True
-        return False
