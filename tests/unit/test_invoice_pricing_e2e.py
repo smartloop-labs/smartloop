@@ -264,6 +264,16 @@ class TestInvoicePricingPipeline:
     def fetch_server(self):
         return _make_fetch_server()
 
+    @pytest.fixture(autouse=True)
+    def _patch_fetch_agent(self):
+        """URL fetching runs through the in-process FetchAgent (not an MCP
+        tool). Patch it to return the canned pricing page for every test."""
+        with patch(
+            "smartloop.agents.fetch_agent.FetchAgent.fetch",
+            return_value=LOVABLE_PRICING_PAGE,
+        ) as m:
+            yield m
+
     def _build_plan_response(self, data_dir: str, output_path: str) -> str:
         """Return the JSON plan the LLM planner would produce."""
         return json.dumps([
@@ -498,8 +508,8 @@ class TestInvoicePricingPipeline:
     # Test: fetch step gets pricing data                                 #
     # ------------------------------------------------------------------ #
 
-    def test_fetch_retrieves_pricing_page(self, workspace, fetch_server):
-        """The explore step internally calls fetch and pricing content
+    def test_fetch_retrieves_pricing_page(self, workspace, fetch_server, _patch_fetch_agent):
+        """The FetchAgent runs for the URL step and pricing content
         appears in the output."""
         data_dir = str(workspace / "data")
         output_path = str(workspace / "report.md")
@@ -520,7 +530,7 @@ class TestInvoicePricingPipeline:
         )
 
         with patch.object(orchestrator.explorer, "collect_parallel", return_value=_make_invoice_search_ctx()), \
-             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch) as mock_call:
+             patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
             result = orchestrator.execute(
                 user_message=self.USER_PROMPT.format(
                     data_dir=data_dir, output_path=output_path
@@ -531,8 +541,8 @@ class TestInvoicePricingPipeline:
 
         assert result.handled is True
 
-        # The MCP fetch tool was called (by explore internally and/or as a plan step)
-        assert mock_call.call_count >= 1
+        # The FetchAgent was invoked for the URL step
+        assert _patch_fetch_agent.called
 
         # Pricing data appears in the combined output
         assert "Business" in result.content or "$50" in result.content
@@ -610,6 +620,7 @@ class TestInvoicePricingPipeline:
         )
 
         with patch.object(orchestrator.explorer, "collect_parallel", return_value=_make_invoice_search_ctx()), \
+             patch("smartloop.agents.fetch_agent.FetchAgent.fetch", return_value=""), \
              patch.object(orchestrator.tool_caller, "call_tool", return_value=fake_fetch):
             result = orchestrator.execute(
                 user_message=self.USER_PROMPT.format(

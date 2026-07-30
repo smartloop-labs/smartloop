@@ -172,6 +172,41 @@ class TestGetModelArtifacts:
             client.get_model_artifacts("nonexistent")
 
 
+class TestGetLatestRelease:
+    def test_returns_wrapper(self, stub_server):
+        base_url, handler = stub_server
+        wrapper = {
+            "update_available": None,
+            "update_required": False,
+            "release": {"version": "1.0.15", "name": "v", "channel": "stable"},
+        }
+        handler.routes = {"/v1/releases/latest": (200, wrapper)}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        assert client.get_latest_release("stable") == wrapper
+
+    def test_null_release_returned(self, stub_server):
+        base_url, handler = stub_server
+        wrapper = {"update_available": None, "update_required": False, "release": None}
+        handler.routes = {"/v1/releases/latest": (200, wrapper)}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        assert client.get_latest_release("beta")["release"] is None
+
+    def test_error_raises_connection_error(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/releases/latest": (500, {"detail": "boom"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError, match="API error"):
+            client.get_latest_release("stable")
+
+    def test_unreachable_raises_connection_error(self):
+        client = SLPPlatformClient("http://127.0.0.1:1", auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError):
+            client.get_latest_release("stable")
+
+
 class TestGetCurrentUser:
     def test_returns_user_profile(self, stub_server):
         base_url, handler = stub_server

@@ -39,6 +39,10 @@ class AppSettings(BaseSettings):
     slp_api_base: str = Field(default='https://api.smartloop.ai', validation_alias='slp_api_base')
     # Developer Token for GCS downloads
     developer_token: Optional[str] = Field(default=None, validation_alias='slp_developer_token')
+    # Supported release channels (comma-separated). The first entry is the
+    # default channel used when a client doesn't specify one, and the set
+    # scopes which channels the /v1/releases endpoint will serve.
+    release_channels_raw: str = Field(default='stable,beta', validation_alias='slp_release_channels')
 
     # Version – set from smartloop.__version__ after init
     version: Optional[str] = Field(default=None)
@@ -193,6 +197,12 @@ class AppSettings(BaseSettings):
             )
         self.vector_store_backend = backend
         return self
+
+    @property
+    def release_channels(self) -> list[str]:
+        """Supported release channels; first entry is the default channel."""
+        channels = [c.strip() for c in self.release_channels_raw.split(",") if c.strip()]
+        return channels or ["stable"]
 
     @property
     def home_dir(self) -> str:

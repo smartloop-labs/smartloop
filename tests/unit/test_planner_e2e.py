@@ -208,6 +208,16 @@ class TestClassifyPlanExecutePipeline:
     def fetch_server(self):
         return _make_fetch_server()
 
+    @pytest.fixture(autouse=True)
+    def _patch_fetch_agent(self):
+        """URL fetching runs through the in-process FetchAgent — patch it so
+        tests never hit the network."""
+        with patch(
+            "smartloop.agents.fetch_agent.FetchAgent.fetch",
+            return_value=JOB_DESCRIPTION_HTML,
+        ) as m:
+            yield m
+
     def test_multi_step_read_fetch_write(self, tmp_workspace, fetch_server):
         """File path + URL + write → MULTI_STEP → read + fetch + write steps."""
         resume_path = str(tmp_workspace / "resume.txt")
@@ -364,7 +374,8 @@ class TestClassifyPlanExecutePipeline:
             success=False, content=None, error="Connection timeout",
         )
 
-        with patch.object(orchestrator.tool_caller, "call_tool",
+        with patch("smartloop.agents.fetch_agent.FetchAgent.fetch", return_value=""), \
+             patch.object(orchestrator.tool_caller, "call_tool",
                           side_effect=_delegating_call_tool(orchestrator, fake_fetch_result)):
             result = orchestrator.execute(
                 user_message=f"Read {resume_path} and fetch https://example.com/job",

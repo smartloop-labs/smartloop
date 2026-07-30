@@ -42,6 +42,7 @@ from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 from smartloop.utils.mcp_result_formatter import ResultFormatter
 
 from smartloop.agents.mcp.explorer import Explorer, SearchContext, EnrichedContext
+from smartloop.agents.fetch_agent import FetchAgent
 from smartloop.agents.sanitize import fence_document_content
 from smartloop.config.app_settings import AppSettings
 
@@ -208,6 +209,7 @@ class SLPOrchestrator:
         self.tool_caller = MCPToolCaller(self.arg_extractor, self.result_mapper)
         self.result_formatter = ResultFormatter(orchestrator_llm)
         self.explorer = Explorer(self.agent_llm, self.tool_caller, self.arg_extractor)
+        self._fetch_agent = FetchAgent()
 
         # Prefer a shared, long-lived executor (its LLM worker processes load
         # the model once and are reused across requests).  Fall back to a
@@ -1164,6 +1166,25 @@ class SLPOrchestrator:
         def handler(deps: Dict) -> NodeResult:
             prev_results = self._collect_raw_from_deps(deps)
             node_id = f"step_{step.step}_{step.tool_name or step.step_type.value}"
+
+            # FETCH: run the FetchAgent (HTTP GET → markdown) in-process
+            if step.step_type == StepType.FETCH:
+                url = (step.default_args or {}).get("url", "")
+                if not url:
+                    urls = re.findall(r'https?://[^\s<>\'")\]]+', step.instruction or "")
+                    url = urls[0] if urls else ""
+                if not url:
+                    logger.warning("[fetch] No URL to fetch for step %s", step.step)
+                    return self._step_result(node_id, step, "")
+                self._emit("fetch", "processing", f"Fetching {url}")
+                content = self._fetch_agent.fetch(url)
+                # Return empty on failure so downstream reasoning falls back to
+                # any explore/vector context instead of surfacing a fetch error.
+                if not content:
+                    logger.info(f"[fetch] step {step.step}: empty result from {url}")
+                    return self._step_result(node_id, step, "")
+                logger.info(f"[fetch] step {step.step}: {len(content)} chars from {url}")
+                return self._step_result(node_id, step, content, content)
 
             # EXPLORE: return pre-fetched search context (already collected)
             if step.step_type == StepType.EXPLORE:

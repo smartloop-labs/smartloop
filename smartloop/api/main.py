@@ -18,13 +18,14 @@ import re as _re
 import time as _time
 
 from smartloop.api.config import api_settings
-from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router
+from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router
 from smartloop.api.services import get_model_service, get_api_client
         
 from smartloop.config import AppSettings
 from smartloop.workspace import Workspace
 from smartloop.utils.log_utils import print_logo
 from smartloop.platform.token_agent import run_token_refresh_loop
+from smartloop.platform.release_agent import run_release_poll_loop
 from smartloop import __version__
 
 _app_settings = AppSettings()
@@ -146,6 +147,7 @@ async def lifespan(app: FastAPI):
         logger.info("🔧 Debug mode enabled - will load base model with LoRA adapters")
 
     token_refresh_task = asyncio.create_task(run_token_refresh_loop())
+    release_poll_task = asyncio.create_task(run_release_poll_loop())
 
     config_watcher_task = None
     model_service = get_model_service()
@@ -186,6 +188,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     token_refresh_task.cancel()
+    release_poll_task.cancel()
     if config_watcher_task and not config_watcher_task.done():
         config_watcher_task.cancel()
 
@@ -238,6 +241,7 @@ app.include_router(skills_router)
 app.include_router(users_router)
 app.include_router(feedback_router)
 app.include_router(project_io_router)
+app.include_router(releases_router)
 
 @app.get("/health")
 async def health_check():
