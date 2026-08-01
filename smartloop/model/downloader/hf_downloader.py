@@ -9,7 +9,7 @@ from pathlib import Path
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import disable_progress_bars
 
-from smartloop.model.downloader.slp_downloader import SLPDownloader, DownloadProgress, ProgressCallback
+from smartloop.model.downloader.slp_downloader import SLPDownloader, DownloadProgress, ProgressCallback, AggregateProgress
 from smartloop.workspace import Workspace
 
 MAX_WORKERS = min(4, os.cpu_count() or 4)
@@ -57,6 +57,10 @@ class HFDownloader(SLPDownloader):
         total_mb = total_bytes / (1024 * 1024)
         self.logger.info(f"Downloading {len(pending)} file(s), {total_mb:.1f} MB total")
 
+        # Roll the parallel per-file progress up into a single 0->100% bar so
+        # the client sees one download, not the files fighting over the meter.
+        aggregate = AggregateProgress(total_bytes, progress_callback, model_id)
+
         done = threading.Event()
 
         def _poll_progress():
@@ -75,7 +79,7 @@ class HFDownloader(SLPDownloader):
                     prev = last_reported.get(f.path, 0)
                     if progress_callback and file_downloaded > 0 and file_downloaded != prev:
                         last_reported[f.path] = file_downloaded
-                        progress_callback(DownloadProgress(
+                        aggregate(DownloadProgress(
                             filename=os.path.basename(f.path),
                             downloaded=file_downloaded,
                             total=f.size,
@@ -112,14 +116,7 @@ class HFDownloader(SLPDownloader):
                     f"Failed to download {len(failed)} file(s): {', '.join(failed)}"
                 )
 
-            if progress_callback:
-                for f in pending:
-                    progress_callback(DownloadProgress(
-                        filename=os.path.basename(f.path),
-                        downloaded=f.size,
-                        total=f.size,
-                        status="completed",
-                    ))
+            aggregate.finish()
 
             self.logger.info(f"[ok] Model downloaded to: {local_dir}")
             return Path(local_dir)
