@@ -14,7 +14,7 @@ from smartloop.platform import SLPPlatformClient
 from smartloop.platform import auth as platform_auth
 from smartloop.config import AppSettings
 from smartloop.model.downloader.artifact_source import SLPModelSource, SLPBootstrapSource
-from smartloop.model.downloader.slp_downloader import SLPDownloader, DownloadProgress, ProgressCallback
+from smartloop.model.downloader.slp_downloader import SLPDownloader, DownloadProgress, ProgressCallback, AggregateProgress
 from smartloop.workspace import Workspace
 
 _CPU_COUNT = os.cpu_count() or 4
@@ -181,7 +181,7 @@ class SLPArtifactDownloader(SLPDownloader):
 
     def _download_artifacts(self, artifacts: dict[str, str], local_dir: str,
                              progress_callback: ProgressCallback | None,
-                             log_prefix: str, log_dir: str) -> Path:
+                             log_prefix: str, log_dir: str, label: str) -> Path:
         """Check, download, and verify a set of artifacts. Shared by bootstrap and download."""
         pending: dict[str, str] = {}
         pending_sizes: dict[str, int] = {}
@@ -224,15 +224,9 @@ class SLPArtifactDownloader(SLPDownloader):
             f"Downloading {len(pending)} file(s), {total_mb:.1f} MB total"
         )
 
-        def _per_file_callback(progress: DownloadProgress) -> None:
-            if not progress_callback:
-                return
-            progress_callback(DownloadProgress(
-                filename=progress.filename,
-                downloaded=progress.downloaded,
-                total=progress.total,
-                status=progress.status,
-            ))
+        # Roll the parallel per-file progress up into a single 0->100% bar so
+        # the client sees one download, not the files fighting over the meter.
+        aggregate = AggregateProgress(total_bytes, progress_callback, label)
 
         failed = []
 
@@ -240,7 +234,7 @@ class SLPArtifactDownloader(SLPDownloader):
             futures = {
                 pool.submit(
                     self._download_file, filename, url, local_dir,
-                    pending_sizes.get(filename, 0), position, _per_file_callback,
+                    pending_sizes.get(filename, 0), position, aggregate,
                     pending_range.get(filename, False), pending_md5.get(filename),
                 ): filename
                 for position, (filename, url) in enumerate(pending.items())
@@ -261,6 +255,7 @@ class SLPArtifactDownloader(SLPDownloader):
                 f"Failed to download {len(failed)} file(s): {', '.join(failed)}"
             )
 
+        aggregate.finish()
         self.logger.info(f"[ok] {log_prefix} downloaded to: {log_dir}")
         return Path(local_dir)
 
@@ -491,7 +486,8 @@ class SLPArtifactDownloader(SLPDownloader):
         self.logger.info(f"Bootstrap downloading model: {resolved_name}")
 
         return self._download_artifacts(artifacts, local_dir, progress_callback,
-                                        log_prefix="Bootstrap model", log_dir=local_dir)
+                                        log_prefix="Bootstrap model", log_dir=local_dir,
+                                        label=resolved_name)
 
     @staticmethod
     def _resolve_model_id(model_name: str) -> str:
@@ -549,4 +545,5 @@ class SLPArtifactDownloader(SLPDownloader):
             return Path(local_dir)
 
         return self._download_artifacts(artifacts, local_dir, progress_callback,
-                                        log_prefix="Model", log_dir=local_dir)
+                                        log_prefix="Model", log_dir=local_dir,
+                                        label=model_name)
