@@ -222,6 +222,17 @@ async def list_models(
             if model_cls and hasattr(model_cls, 'default_capabilities'):
                 entry.capabilities = model_cls.default_capabilities()
         result.append(entry)
+
+    # Best model first: rank by model version (a newer version wins even with
+    # fewer params), then parameter size. Falls back to (0, 0) for models with
+    # no class entry so they sort last, in their original catalogue order.
+    def _rank(entry: ModelEntry) -> tuple[int, float]:
+        cls = SUPPORTED_MODELS.get(entry.name)
+        if cls is None:
+            return (0, 0.0)
+        return (cls.model_version(), float(cls.param_size_in_b()))
+
+    result.sort(key=_rank, reverse=True)
     return result
 
 
@@ -243,6 +254,11 @@ async def list_workspace_models(
         settings = AppSettings()
         bootstrap_model = settings.default_model
         workspace = model_service._ensure_workspace()
+        # Best model first: newest version, then larger size (see _rank).
+        models = sorted(
+            (m for m in workspace.models if m.model_name != bootstrap_model),
+            key=lambda m: m._rank, reverse=True,
+        )
         return [
             WorkspaceModelEntry(
                 model_name=m.model_name,
@@ -252,8 +268,7 @@ async def list_workspace_models(
                 enabled=m.enabled,
                 capabilities=m.effective_capabilities,
             )
-            for m in workspace.models
-            if m.model_name != bootstrap_model
+            for m in models
         ]
     except Exception as e:
         logger.exception("Error listing workspace models")
