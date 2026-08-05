@@ -8,6 +8,14 @@ class LLMOptions:
 class ModelType(Enum):
     TEXT = "text"
     MULTI_MODAL = "multi-modal"
+
+class ModelCapability(str, Enum):
+    GENERAL = "general"
+    KNOWLEDGE = "knowledge"
+    SKILLS = "skills"
+    DP = "dp"
+    VISION = "vision"
+    CODING = "coding"
 	
 class Document:
 	def __init__(self, **kwargs) -> None:

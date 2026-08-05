@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from smartloop.llms import BaseLLM
+from smartloop.types import ModelCapability
 
 # Tool name constants — duplicated here to avoid circular imports with
 # smartloop.agents.mcp.server_selector.
@@ -286,10 +287,10 @@ class Planner:
         in ``capabilities``, or ``None`` when nothing matches.
         """
         priority = (
-            ("vision", has_attachments),
-            ("skills", has_matched_skills),
-            ("dp", has_document_context),
-            ("knowledge", True),
+            (ModelCapability.VISION, has_attachments),
+            (ModelCapability.SKILLS, has_matched_skills),
+            (ModelCapability.DP, has_document_context),
+            (ModelCapability.KNOWLEDGE, True),
         )
         for cap, signal in priority:
             if signal and cap in capabilities:

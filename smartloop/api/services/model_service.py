@@ -26,13 +26,14 @@ from smartloop.api.services.project_io import resolve_visible_dir
 from smartloop.model_factory import ModelFactory
 from smartloop.config import ModelConfig, SUPPORTED_MODELS
 from smartloop.llms.base_llm import BaseLLM
+from smartloop.types import ModelCapability
 from smartloop.workspace import DocumentInfo, DocumentStatus, MCPServer, Workspace
 from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
 from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
 from smartloop.db.feedback_indexer import FeedbackIndexer
 from smartloop.feedback_store import FeedbackStore, FeedbackEntry, ConversationTurn
-from smartloop.model import Model
+from smartloop.model.model_manager import Model
 from smartloop.mcp.local_client import LocalMCPClient
 from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
 from smartloop.agents.orchestrator import SLPOrchestrator
@@ -475,7 +476,7 @@ class ModelService:
         candidates = [
             m for m in workspace.models
             if m.enabled and m.downloaded
-            and "vision" in [c.lower() for c in m.effective_capabilities]
+            and ModelCapability.VISION in m.effective_capabilities
         ]
         # Smallest VL model first: OCR quality is adequate from a lighter model,
         # and a smaller one is far more likely to fit on GPU alongside the
@@ -751,6 +752,7 @@ class ModelService:
             # user's active 4B).
             orchestrator = workspace.get_model(self._model_name)
             orchestrator_size = orchestrator.param_size_b if orchestrator else 0
+            orchestrator_rank = orchestrator._rank if orchestrator else (0, 0.0)
             # Pick the agent/large model by *capability*, not raw size: this
             # model drives skills/synthesis, so it must declare the "skills"
             # capability.  Selecting by size alone would load a vision-only VL
@@ -761,7 +763,7 @@ class ModelService:
                 m for m in workspace.models
                 if m.enabled and m.downloaded
                 and m.model_name != self._model_name
-                and "skills" in [c.lower() for c in m.effective_capabilities]
+                and ModelCapability.SKILLS in m.effective_capabilities
             ]
             if not skills_models:
                 logger.info(
@@ -769,9 +771,11 @@ class ModelService:
                     "router model for skills/synthesis"
                 )
                 return
-            largest = max(skills_models, key=lambda m: m.param_size_b or 0.0)
+            # Rank by version first (a newer model wins even if smaller), then
+            # by size — and only load it when it actually out-ranks the router.
+            largest = max(skills_models, key=lambda m: m._rank)
             largest.models_dir = workspace.models_dir
-            if largest.param_size_b <= orchestrator_size:
+            if largest._rank <= orchestrator_rank:
                 return
 
             model_dir = workspace.model_dir_for(largest.model_id)

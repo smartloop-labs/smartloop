@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import logging
 import os
 import re
 import tempfile
 from pathlib import Path
 import hashlib
-from typing import Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -14,12 +16,14 @@ from rich.console import Console
 from prettytable import PrettyTable
 
 from smartloop.utils import normalize_path
-from smartloop.workspace import Workspace, Document, DocumentStatus
-from smartloop.workspace.workspace import Skill
+from smartloop.workspace.types import Document, DocumentStatus, Skill
 from smartloop.loader import ModelLoader
 from smartloop.model.slp_model import SLPModel
 from smartloop.model.downloader import SLPDownloader
 from smartloop.llms.base_llm import BaseLLM
+
+if TYPE_CHECKING:
+    from smartloop.workspace import Workspace
     
 console = Console()
 

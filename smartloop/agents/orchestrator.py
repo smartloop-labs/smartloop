@@ -18,6 +18,7 @@ from typing import Callable, Dict, Any, List, Optional
 from pydantic import BaseModel, Field
 
 from smartloop.llms import BaseLLM
+from smartloop.types import ModelCapability
 from smartloop.workspace.workspace import MCPServer, MCPServerType
 from smartloop.agents.hybrid_executor import LLMExecutor
 from smartloop.agents.dag_executor import DAGExecutor
@@ -539,7 +540,7 @@ class SLPOrchestrator:
         # poor at (it defaults to picking the only listed skill). Prefer the
         # 'skills'-capability model, but only when it is resident or fits — a
         # memory-tight device falls back to the mini instead of risking an OOM.
-        match_llm = self._decision_llm("skills")
+        match_llm = self._decision_llm(ModelCapability.SKILLS)
         logger.info("[models] SKILL_MATCH → %s", self._model_label(match_llm))
 
         matched_skills = self.explorer.match_skills(
@@ -757,7 +758,7 @@ class SLPOrchestrator:
                 if use_pool:
                     extract = str(self._executor.submit_llm(prompt).result()).strip()
                 else:
-                    dp_llm = self._llm_for_tier(ModelTier.LARGE, capability="dp")
+                    dp_llm = self._llm_for_tier(ModelTier.LARGE, capability=ModelCapability.DP)
                     logger.info(
                         "[doc-batch] %s → %s",
                         node_id, self._model_label(dp_llm),
@@ -987,7 +988,7 @@ class SLPOrchestrator:
         # the 4B and a memory-tight device is never pushed into an OOM.
         plan_llm = None
         if classification.intent == IntentType.MULTI_STEP:
-            plan_llm = self._decision_llm("dp")
+            plan_llm = self._decision_llm(ModelCapability.DP)
             logger.info("[models] PLAN (multi-step) → %s", self._model_label(plan_llm))
 
         plan = self.planner.create_plan(classification, plan_context, llm=plan_llm)
@@ -1014,7 +1015,7 @@ class SLPOrchestrator:
                 continue
             if has_skill and step.step_type == StepType.TOOL:
                 step.model_tier = ModelTier.LARGE
-                step.capability = detected_capability or "skills"
+                step.capability = detected_capability or ModelCapability.SKILLS
             else:
                 step.model_tier = ModelTier.SMALL
                 if detected_capability:

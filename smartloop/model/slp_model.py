@@ -1,13 +1,17 @@
+from __future__ import annotations
+
 import logging
 
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from typing import Iterator, Union
+from typing import TYPE_CHECKING, Iterator, Union
 
 from smartloop.types import ModelType
 from smartloop.llms.base_llm import BaseLLM
-from smartloop.workspace import Workspace
+
+if TYPE_CHECKING:
+    from smartloop.workspace import Workspace
 
 class SLPModel(ABC):
     """Abstract base class for Smartloop model"""
@@ -45,6 +49,24 @@ class SLPModel(ABC):
     @abstractmethod
     def model_id() -> str:
         pass
+
+    @staticmethod
+    def model_version() -> int:
+        """Model family version (e.g. Gemma 3 → 3).
+
+        Used for selection: a higher version always wins over a lower one,
+        even when its parameter count is smaller. Override per model.
+        """
+        return 0
+
+    @staticmethod
+    def param_size_in_b() -> float:
+        """Parameter count in billions (e.g. 4 for a 4B model).
+
+        Override per model. Returns 0 when unknown, in which case callers
+        fall back to parsing the size from the model name/id.
+        """
+        return 0.0
 
     @abstractmethod
     def get_instance(self, debug: bool = False) -> BaseLLM:
