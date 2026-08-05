@@ -3448,10 +3448,22 @@ class ModelService:
             final response prompt is rebuilt from the original messages + this
             returned context — so the image description must ride along here or
             the answering model won't see it (and will deny an image was sent).
+
+            The block is phrased as an instruction, not passive context: the
+            answering model is text-only, so without being told the image was
+            already analyzed it fixates on the user's "attached image" wording
+            and replies that it cannot view images. This makes the description
+            authoritative and tells it to answer directly.
             """
             if not image_perception:
                 return ctx
-            block = f"[Image the user attached — description]:\n{image_perception}"
+            block = (
+                "The user attached an image. A vision model has already analyzed "
+                "it — treat the description below as the actual contents of that "
+                "image and answer the user's request directly. Do NOT say you "
+                "cannot see or view the image.\n\n"
+                f"Image contents: {image_perception}"
+            )
             return f"{block}\n\n{ctx}" if ctx else block
 
         # Reload workspace from disk to pick up any changes made by
