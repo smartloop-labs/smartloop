@@ -30,11 +30,15 @@ class Gemma4_2bModel(GenericModel):
     @staticmethod
     def default_capabilities() -> list[ModelCapability]:
         return [
-            ModelCapability.KNOWLEDGE, 
-            ModelCapability.SKILLS, 
-            ModelCapability.DP, 
+            ModelCapability.KNOWLEDGE,
+            ModelCapability.SKILLS,
+            ModelCapability.DP,
             ModelCapability.VISION
         ]
+
+    @staticmethod
+    def vision_chat_handler() -> str:
+        return "Gemma4ChatHandler"
 
     @staticmethod
     def model_id() -> str:

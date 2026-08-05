@@ -136,9 +136,15 @@ class LlmFactory:
         return None
 
     @staticmethod
-    def vision_handler_supported(model_path: str) -> bool:
-        """True when the installed llama-cpp can run this model's vision input."""
-        cls_name = LlmFactory._vision_handler_class_name(model_path)
+    def vision_handler_supported(model_path: str, handler_name: str | None = None) -> bool:
+        """True when the installed llama-cpp can run this model's vision input.
+
+        ``handler_name`` is the handler the model class declares
+        (``vision_chat_handler()``); when given it is authoritative and the
+        GGUF-arch guess is skipped. Falls back to arch sniffing for models
+        that don't declare one.
+        """
+        cls_name = handler_name or LlmFactory._vision_handler_class_name(model_path)
         if not cls_name:
             return False
         try:
@@ -182,18 +188,22 @@ class LlmFactory:
 
     @staticmethod
     def _make_vision_chat_handler(mmproj_path: str, model_path: str, logger: Logger,
-                                  clip_on_cpu: bool = False):
-        """Build the architecture-appropriate multimodal chat handler, or None.
+                                  clip_on_cpu: bool = False,
+                                  handler_name: str | None = None):
+        """Build the multimodal chat handler for this model, or None.
 
-        Returns None (caller loads text-only / skips) when the model's
-        architecture has no supported handler in the installed llama-cpp — this
-        is what prevents a crash on e.g. gemma3.
+        ``handler_name`` is the handler declared by the model class
+        (``vision_chat_handler()``) and is authoritative when provided;
+        otherwise the handler is inferred from the GGUF architecture. Returns
+        None (caller loads text-only / skips) when neither yields a handler
+        available in the installed llama-cpp — this is what prevents a crash
+        on e.g. gemma3.
 
         ``clip_on_cpu`` forces the CLIP/mmproj encoder onto CPU (see
         ``_force_clip_on_cpu``); the caller sets it only when GPU VRAM is too
         tight to run the projector without an OOM segfault.
         """
-        cls_name = LlmFactory._vision_handler_class_name(model_path)
+        cls_name = handler_name or LlmFactory._vision_handler_class_name(model_path)
         if not cls_name:
             arch = LlmFactory._read_gguf_arch(model_path)
             logger.warning(
@@ -224,6 +234,7 @@ class LlmFactory:
         path: str, logger: Logger, project_id: str, lora_path: str | None = None,
         *, probe: bool = True, max_n_ctx: int | None = None,
         mmproj_path: str | None = None, clip_on_cpu: bool = False,
+        vision_handler: str | None = None,
     ):
         """Returns an instance of the configured LlamaCpp wrapper class.
 
@@ -243,6 +254,10 @@ class LlmFactory:
         it can describe / OCR images.  The subprocess probe is skipped (the
         handler object isn't JSON-serializable) and the load is forced
         in-process.
+
+        ``vision_handler``: chat-handler class name declared by the model
+        class (``vision_chat_handler()``); authoritative when set, otherwise
+        the handler is inferred from the GGUF architecture.
         """
         import torch
         from llama_cpp import Llama, llama_supports_gpu_offload
@@ -251,7 +266,8 @@ class LlmFactory:
         chat_handler = None
         if mmproj_path:
             chat_handler = LlmFactory._make_vision_chat_handler(
-                mmproj_path, path, logger, clip_on_cpu=clip_on_cpu)
+                mmproj_path, path, logger, clip_on_cpu=clip_on_cpu,
+                handler_name=vision_handler)
             if chat_handler is not None:
                 # Handler holds a loaded CLIP model; it can't be pickled into
                 # the probe subprocess, so load directly in-process.

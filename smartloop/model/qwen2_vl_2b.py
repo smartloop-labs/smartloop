@@ -39,5 +39,9 @@ class Qwen2VL_2bModel(GenericModel):
         return [ModelCapability.VISION]
 
     @staticmethod
+    def vision_chat_handler() -> str:
+        return "Qwen25VLChatHandler"
+
+    @staticmethod
     def model_id() -> str:
         return "Qwen/Qwen2-VL-2B-Instruct"

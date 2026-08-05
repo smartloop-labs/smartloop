@@ -478,10 +478,13 @@ class ModelService:
             if m.enabled and m.downloaded
             and ModelCapability.VISION in m.effective_capabilities
         ]
-        # Smallest VL model first: OCR quality is adequate from a lighter model,
-        # and a smaller one is far more likely to fit on GPU alongside the
-        # orchestrator + on-demand agent models (e.g. Qwen2-VL-2B over -3B).
-        candidates.sort(key=lambda m: m.param_size_b or 0.0)
+        # Newest model version first (a v4 multimodal model wins over an older
+        # VL one, even at equal/smaller size); within the same version prefer
+        # the lighter model — OCR quality is adequate from a smaller model and
+        # it's far likelier to fit on GPU alongside the orchestrator + on-demand
+        # agent models. The per-candidate fit guard below falls through to the
+        # next when the preferred one won't fit.
+        candidates.sort(key=lambda m: (-m.model_version, m.param_size_b or 0.0))
 
         # OCR is a latency-tolerant batch task, so give the vision model a small
         # dedicated context and waive the agent-model reserve — it only needs to
@@ -505,11 +508,16 @@ class ModelService:
                     "weights GGUF" if not gguf_path else "mmproj/CLIP GGUF",
                 )
                 continue
-            if not LlmFactory.vision_handler_supported(gguf_path):
+            # The handler the model class declares alongside its VISION
+            # capability (falls back to GGUF-arch sniffing when absent).
+            model_cls = SUPPORTED_MODELS.get(ws_model.model_name)
+            vision_handler = model_cls.vision_chat_handler() if model_cls else None
+            if not LlmFactory.vision_handler_supported(gguf_path, vision_handler):
                 logger.warning(
                     "[vision] %s skipped — installed llama-cpp has no vision handler "
-                    "for its architecture (%s)",
-                    ws_model.model_name, LlmFactory._read_gguf_arch(gguf_path),
+                    "(declared=%s, arch=%s)",
+                    ws_model.model_name, vision_handler,
+                    LlmFactory._read_gguf_arch(gguf_path),
                 )
                 continue
             if not self._large_model_fits(gguf_path, cap, ws_model.model_name,
@@ -526,7 +534,7 @@ class ModelService:
                 llm = LlmFactory.get_llama_cpp_instance(
                     gguf_path, logger, self.get_project_id() or "",
                     max_n_ctx=cap, mmproj_path=mmproj_path,
-                    clip_on_cpu=clip_on_cpu,
+                    clip_on_cpu=clip_on_cpu, vision_handler=vision_handler,
                 )
                 self._vision_llm = llm
                 self._vision_model_name = ws_model.model_name
@@ -3433,6 +3441,19 @@ class ModelService:
                 logger.warning("[orchestrator] vision perception empty — "
                                "continuing without image context")
 
+        def _with_image_context(ctx: Optional[str]) -> Optional[str]:
+            """Prepend the image description to the returned context.
+
+            The perception is folded into ``user_message`` for planning, but the
+            final response prompt is rebuilt from the original messages + this
+            returned context — so the image description must ride along here or
+            the answering model won't see it (and will deny an image was sent).
+            """
+            if not image_perception:
+                return ctx
+            block = f"[Image the user attached — description]:\n{image_perception}"
+            return f"{block}\n\n{ctx}" if ctx else block
+
         # Reload workspace from disk to pick up any changes made by
         # background indexers or project setup since the last request.
         self._model.workspace.reload()
@@ -3538,6 +3559,10 @@ class ModelService:
                 pass
 
             if not result.handled:
+                # No tool handled it, but if we perceived an image its
+                # description must still reach the final response as context.
+                if image_perception:
+                    return _with_image_context(None), True, None, None, None, False
                 return None, False, None, None, None, False
 
             if result.error:
@@ -3550,9 +3575,9 @@ class ModelService:
                     f"Tool '{result.tool_name}' returned "
                     f"{len(result.content)} chars of context"
                 )
-                return result.content, True, None, result.citations, result.skill_instruction, result.mutation
+                return _with_image_context(result.content), True, None, result.citations, result.skill_instruction, result.mutation
 
-            return None, True, None, None, result.skill_instruction, False
+            return _with_image_context(None), True, None, None, result.skill_instruction, False
 
         except Exception as e:
             error_msg = f"Tool call failed: {e}"

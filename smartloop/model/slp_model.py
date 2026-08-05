@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from typing import TYPE_CHECKING, Iterator, Union
+from typing import TYPE_CHECKING, Iterator, Optional, Union
 
 from smartloop.types import ModelType
 from smartloop.llms.base_llm import BaseLLM
@@ -67,6 +67,18 @@ class SLPModel(ABC):
         fall back to parsing the size from the model name/id.
         """
         return 0.0
+
+    @staticmethod
+    def vision_chat_handler() -> Optional[str]:
+        """llama-cpp chat-handler class name for this model's image input.
+
+        Declared alongside ``ModelCapability.VISION`` so a vision model owns
+        the handler it needs (e.g. ``Gemma4ChatHandler``). The loader uses
+        this to decode image pixels; using the wrong handler for an
+        architecture crashes the native clip code, so a model that declares
+        VISION must also declare the handler here. Returns ``None`` for
+        non-vision models (loaded text-only)."""
+        return None
 
     @abstractmethod
     def get_instance(self, debug: bool = False) -> BaseLLM:
