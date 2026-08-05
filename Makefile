@@ -9,7 +9,7 @@ SLP_GCS_BUCKET := gs://smartloop-gcp-us-east-releases
 DL_GCS_BUCKET := gs://dl.smartloop.ai
 SERVER_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 RAW_ARCH := $(shell uname -m)
-LLAMA_VERSION := 0.3.19
+LLAMA_VERSION := 0.3.34
 
 ifeq ($(RAW_ARCH),x86_64)
     SERVER_ARCH := amd64

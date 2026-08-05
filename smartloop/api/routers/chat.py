@@ -30,6 +30,7 @@ from smartloop.api.model import (
 )
 from smartloop.api.services import ModelService, get_model_service, get_api_client
 from smartloop.constants import SYSTEM_PROMPT
+from smartloop.types import ModelCapability
 
 
 logger = logging.getLogger(__name__)
@@ -480,7 +481,7 @@ async def stream_chunks(
 
     yield _status_event("preparing", "completed", "Preparing response...")
 
-    response_capability = "knowledge" if orchestrator_context else None
+    response_capability = ModelCapability.GENERAL if orchestrator_context else None
     logger.info(
         "[models] RESPONSE → main LLM (model_service._model_name=%s, capability=%s)",
         getattr(model_service, '_model_name', '?'), response_capability,
@@ -897,7 +898,7 @@ async def create_chat_completion(
             model_service.append_to_session(request.session_id, "user", last_user_msg)
 
         # Run sync completion in thread pool
-        response_capability = "knowledge" if orchestrator_context else None
+        response_capability = ModelCapability.GENERAL if orchestrator_context else None
         response_text = await loop.run_in_executor(
             _executor,
             lambda: model_service.generate_completion(

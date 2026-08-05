@@ -26,13 +26,14 @@ from smartloop.api.services.project_io import resolve_visible_dir
 from smartloop.model_factory import ModelFactory
 from smartloop.config import ModelConfig, SUPPORTED_MODELS
 from smartloop.llms.base_llm import BaseLLM
+from smartloop.types import ModelCapability
 from smartloop.workspace import DocumentInfo, DocumentStatus, MCPServer, Workspace
 from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
 from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
 from smartloop.db.feedback_indexer import FeedbackIndexer
 from smartloop.feedback_store import FeedbackStore, FeedbackEntry, ConversationTurn
-from smartloop.model import Model
+from smartloop.model.model_manager import Model
 from smartloop.mcp.local_client import LocalMCPClient
 from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
 from smartloop.agents.orchestrator import SLPOrchestrator
@@ -458,7 +459,8 @@ class ModelService:
         hold, so unrunnable candidates are skipped rather than crashing:
           * its mmproj / CLIP projector GGUF is present (else it's blind), and
           * the installed llama-cpp has a chat handler for its architecture
-            (e.g. gemma3 has none in llama-cpp-python and aborts natively), and
+            (the model-declared handler, e.g. the generic MTMDChatHandler, or an
+            arch-sniffed one; a missing handler is skipped, never crashed), and
           * it fits in available memory.
         Returns None when no candidate qualifies (callers fall back to text).
         """
@@ -475,12 +477,15 @@ class ModelService:
         candidates = [
             m for m in workspace.models
             if m.enabled and m.downloaded
-            and "vision" in [c.lower() for c in m.effective_capabilities]
+            and ModelCapability.VISION in m.effective_capabilities
         ]
-        # Smallest VL model first: OCR quality is adequate from a lighter model,
-        # and a smaller one is far more likely to fit on GPU alongside the
-        # orchestrator + on-demand agent models (e.g. Qwen2-VL-2B over -3B).
-        candidates.sort(key=lambda m: m.param_size_b or 0.0)
+        # Newest model version first (a v4 multimodal model wins over an older
+        # VL one, even at equal/smaller size); within the same version prefer
+        # the lighter model — OCR quality is adequate from a smaller model and
+        # it's far likelier to fit on GPU alongside the orchestrator + on-demand
+        # agent models. The per-candidate fit guard below falls through to the
+        # next when the preferred one won't fit.
+        candidates.sort(key=lambda m: (-m.model_version, m.param_size_b or 0.0))
 
         # OCR is a latency-tolerant batch task, so give the vision model a small
         # dedicated context and waive the agent-model reserve — it only needs to
@@ -504,11 +509,16 @@ class ModelService:
                     "weights GGUF" if not gguf_path else "mmproj/CLIP GGUF",
                 )
                 continue
-            if not LlmFactory.vision_handler_supported(gguf_path):
+            # The handler the model class declares alongside its VISION
+            # capability (falls back to GGUF-arch sniffing when absent).
+            model_cls = SUPPORTED_MODELS.get(ws_model.model_name)
+            vision_handler = model_cls.vision_chat_handler() if model_cls else None
+            if not LlmFactory.vision_handler_supported(gguf_path, vision_handler):
                 logger.warning(
                     "[vision] %s skipped — installed llama-cpp has no vision handler "
-                    "for its architecture (%s)",
-                    ws_model.model_name, LlmFactory._read_gguf_arch(gguf_path),
+                    "(declared=%s, arch=%s)",
+                    ws_model.model_name, vision_handler,
+                    LlmFactory._read_gguf_arch(gguf_path),
                 )
                 continue
             if not self._large_model_fits(gguf_path, cap, ws_model.model_name,
@@ -525,7 +535,7 @@ class ModelService:
                 llm = LlmFactory.get_llama_cpp_instance(
                     gguf_path, logger, self.get_project_id() or "",
                     max_n_ctx=cap, mmproj_path=mmproj_path,
-                    clip_on_cpu=clip_on_cpu,
+                    clip_on_cpu=clip_on_cpu, vision_handler=vision_handler,
                 )
                 self._vision_llm = llm
                 self._vision_model_name = ws_model.model_name
@@ -751,6 +761,7 @@ class ModelService:
             # user's active 4B).
             orchestrator = workspace.get_model(self._model_name)
             orchestrator_size = orchestrator.param_size_b if orchestrator else 0
+            orchestrator_rank = orchestrator._rank if orchestrator else (0, 0.0)
             # Pick the agent/large model by *capability*, not raw size: this
             # model drives skills/synthesis, so it must declare the "skills"
             # capability.  Selecting by size alone would load a vision-only VL
@@ -761,7 +772,7 @@ class ModelService:
                 m for m in workspace.models
                 if m.enabled and m.downloaded
                 and m.model_name != self._model_name
-                and "skills" in [c.lower() for c in m.effective_capabilities]
+                and ModelCapability.SKILLS in m.effective_capabilities
             ]
             if not skills_models:
                 logger.info(
@@ -769,9 +780,11 @@ class ModelService:
                     "router model for skills/synthesis"
                 )
                 return
-            largest = max(skills_models, key=lambda m: m.param_size_b or 0.0)
+            # Rank by version first (a newer model wins even if smaller), then
+            # by size — and only load it when it actually out-ranks the router.
+            largest = max(skills_models, key=lambda m: m._rank)
             largest.models_dir = workspace.models_dir
-            if largest.param_size_b <= orchestrator_size:
+            if largest._rank <= orchestrator_rank:
                 return
 
             model_dir = workspace.model_dir_for(largest.model_id)
@@ -3421,6 +3434,13 @@ class ModelService:
             except Exception as e:
                 logger.warning("[orchestrator] vision perception failed (%s) — "
                                "continuing without image context", e)
+            finally:
+                # The vision model has done its one job for this request — the
+                # perception is folded into the text below and the rest of the
+                # pipeline is text-only. Release the auxiliary model now so its
+                # VRAM is freed for the downstream synthesis (and not left
+                # resident between chats) rather than waiting for idle unload.
+                self.unload_vision_model()
             if image_perception:
                 logger.info("[orchestrator] image perception: %r",
                             image_perception[:200])
@@ -3428,6 +3448,31 @@ class ModelService:
             else:
                 logger.warning("[orchestrator] vision perception empty — "
                                "continuing without image context")
+
+        def _with_image_context(ctx: Optional[str]) -> Optional[str]:
+            """Prepend the image description to the returned context.
+
+            The perception is folded into ``user_message`` for planning, but the
+            final response prompt is rebuilt from the original messages + this
+            returned context — so the image description must ride along here or
+            the answering model won't see it (and will deny an image was sent).
+
+            The block is phrased as an instruction, not passive context: the
+            answering model is text-only, so without being told the image was
+            already analyzed it fixates on the user's "attached image" wording
+            and replies that it cannot view images. This makes the description
+            authoritative and tells it to answer directly.
+            """
+            if not image_perception:
+                return ctx
+            block = (
+                "The user attached an image. A vision model has already analyzed "
+                "it — treat the description below as the actual contents of that "
+                "image and answer the user's request directly. Do NOT say you "
+                "cannot see or view the image.\n\n"
+                f"Image contents: {image_perception}"
+            )
+            return f"{block}\n\n{ctx}" if ctx else block
 
         # Reload workspace from disk to pick up any changes made by
         # background indexers or project setup since the last request.
@@ -3534,6 +3579,10 @@ class ModelService:
                 pass
 
             if not result.handled:
+                # No tool handled it, but if we perceived an image its
+                # description must still reach the final response as context.
+                if image_perception:
+                    return _with_image_context(None), True, None, None, None, False
                 return None, False, None, None, None, False
 
             if result.error:
@@ -3546,9 +3595,9 @@ class ModelService:
                     f"Tool '{result.tool_name}' returned "
                     f"{len(result.content)} chars of context"
                 )
-                return result.content, True, None, result.citations, result.skill_instruction, result.mutation
+                return _with_image_context(result.content), True, None, result.citations, result.skill_instruction, result.mutation
 
-            return None, True, None, None, result.skill_instruction, False
+            return _with_image_context(None), True, None, None, result.skill_instruction, False
 
         except Exception as e:
             error_msg = f"Tool call failed: {e}"

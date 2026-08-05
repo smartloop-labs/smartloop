@@ -6,13 +6,15 @@ import logging
 import os
 import threading
 from enum import Enum
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Set, List
+from typing import Any, ClassVar, Dict, Optional, Set, List
 from pathlib import Path
 
 from uuid import uuid4
 from pydantic import BaseModel, computed_field, ConfigDict, Field
-from smartloop.config import ModelConfig
-from smartloop.config.app_settings import AppSettings
+from smartloop.config import ModelConfig, AppSettings
+from smartloop.config import SUPPORTED_MODELS
+from smartloop.types import ModelCapability
+from smartloop.workspace.types import Document, DocumentInfo, DocumentStatus, Skill
 
 _settings = AppSettings()
 
@@ -20,51 +22,6 @@ def _is_mmproj_gguf(filename: str) -> bool:
     """True when a GGUF is a vision mmproj / CLIP projector (not main weights)."""
     name = os.path.basename(filename).lower()
     return "mmproj" in name or "clip" in name
-
-class DocumentStatus(Enum):
-    PENDING = "pending"
-    CONVERTING = "converting"
-    INDEXING = "indexing"
-    FAILED = "failed"
-    INDEXED = "indexed"
-    DELETED = "deleted"
-    PROCESSED = "processed"
-
-class Document(BaseModel):
-    model_config = ConfigDict(json_schema_extra={"exclude_none": True})
-
-    id: str
-    path: str
-    name: Optional[str] = None  # original filename — set once, never overwritten by indexer
-    summary: Optional[str] = None
-    status: DocumentStatus = DocumentStatus.PENDING
-
-    def to_info(self) -> "DocumentInfo":
-        """Return a serialization-ready view of this document."""
-        from pathlib import Path as _Path
-        return DocumentInfo(
-            id=self.id,
-            path=self.path,
-            status=self.status.value,
-            summary=self.summary,
-            filename=self.name or (_Path(self.path).name if self.path else None),
-        )
-
-
-class DocumentInfo(BaseModel):
-    """Serialization-ready view of a Document, suitable for API responses and SSE events.
-
-    Uses a plain string for ``status`` so callers never need to call ``.value``
-    on the enum directly.
-    ``id`` is None for files that have been dropped into the inbox but not yet
-    registered by the indexer.
-    """
-    id: Optional[str] = None
-    path: Optional[str] = None
-    status: str = "pending"
-    summary: Optional[str] = None
-    filename: Optional[str] = None
-
 
 class MCPToolDefinition(BaseModel):
     """Tool definition discovered from an MCP server."""
@@ -165,18 +122,33 @@ class WorkspaceModel(BaseModel):
 
     @property
     def param_size_b(self) -> float:
-        """Parse parameter count in billions from model_name or model_id.
+        """Parameter count in billions, taken from the model class.
 
-        Examples: 'gemma4-2b' → 2.0, 'google/gemma-3-4b-it' → 4.0
-        (names without a size token, e.g. 'slp-orchestra-mini', fall back to
-        the model_id: 'google/gemma-3-1b-it' → 1.0)
+        Sourced from the ``param_size_in_b()`` declared on the model class
+        (the authoritative source). Returns 0 for models without a
+        ``SUPPORTED_MODELS`` entry or an explicit size.
         """
-        import re
-        for src in (self.model_name, self.model_id):
-            m = re.search(r'(\d+(?:\.\d+)?)\s*[bB]', src)
-            if m:
-                return float(m.group(1))
+        model_cls = SUPPORTED_MODELS.get(self.model_name)
+        if model_cls is not None:
+            return float(model_cls.param_size_in_b())
         return 0.0
+
+    @property
+    def model_version(self) -> int:
+        """Model family version declared by the model class (0 if unknown).
+
+        Selection prefers a higher version over a lower one even when the
+        higher-version model has fewer parameters.
+        """
+        model_cls = SUPPORTED_MODELS.get(self.model_name)
+        if model_cls is not None:
+            return int(model_cls.model_version())
+        return 0
+
+    @property
+    def _rank(self) -> tuple[int, float]:
+        """Selection rank: higher model version wins first, then larger size."""
+        return (self.model_version, self.param_size_b)
 
     @property
     def effective_capabilities(self) -> List[str]:
@@ -188,7 +160,6 @@ class WorkspaceModel(BaseModel):
         Models without a ``SUPPORTED_MODELS`` entry fall back to
         metadata-inferred capabilities.
         """
-        from smartloop.config.supported_models import SUPPORTED_MODELS
         model_cls = SUPPORTED_MODELS.get(self.model_name)
         if model_cls and hasattr(model_cls, "default_capabilities"):
             return list(model_cls.default_capabilities())
@@ -199,31 +170,25 @@ class WorkspaceModel(BaseModel):
         caps: List[str] = []
         size = self.param_size_b
 
-        caps.append("general")
+        caps.append(ModelCapability.GENERAL)
 
         if any(kw in combined for kw in ("code", "coder", "starcoder", "deepseek-coder")):
-            caps.append("coding")
+            caps.append(ModelCapability.CODING)
 
         # Vision is inferred only from an explicit vision marker in the name
         # (e.g. Qwen2.5-VL).  gemma-3-4b is NOT inferred as vision: llama-cpp has
         # no Gemma3 vision handler, so tagging it vision only produces a model
         # that's considered for OCR and then skipped every time.
         if any(kw in combined for kw in ("vision", "vlm", "vl")):
-            caps.append("vision")
+            caps.append(ModelCapability.VISION)
 
         if size >= 3:
-            caps.append("knowledge")
-            caps.append("skills")
-            caps.append("dp")
+            # GENERAL already added above; larger models additionally handle
+            # skills and document processing.
+            caps.append(ModelCapability.SKILLS)
+            caps.append(ModelCapability.DP)
 
         return caps
-
-class Skill(BaseModel):
-    id: str
-    name: str
-    description: Optional[str] = None
-    content: str
-    system: bool = False
 
 class Project (BaseModel):
     id: str
@@ -347,8 +312,6 @@ class Workspace(BaseModel):
         """Look up a registered model by its short name.
         If *model_name* is ``None``, returns the default model.
         """
-        from smartloop.config.supported_models import SUPPORTED_MODELS
-        
         result = None
         if model_name is None:
             model_name = AppSettings().default_model
@@ -382,11 +345,15 @@ class Workspace(BaseModel):
         return entry
 
     def largest_downloaded_model(self) -> Optional[WorkspaceModel]:
-        """Return the largest enabled, downloaded model by parameter count, or None."""
+        """Return the best enabled, downloaded model, or None.
+
+        Ranks by model version first (a newer version always wins, even with
+        a smaller parameter count), then by parameter count.
+        """
         candidates = [m for m in self.models if m.enabled and m.downloaded and m.param_size_b > 0]
         if not candidates:
             return None
-        candidates.sort(key=lambda m: m.param_size_b, reverse=True)
+        candidates.sort(key=lambda m: m._rank, reverse=True)
         best = candidates[0]
         best.models_dir = self.models_dir
         return best
@@ -394,9 +361,10 @@ class Workspace(BaseModel):
     def best_model_for(self, capability: str) -> Optional[WorkspaceModel]:
         """Return the best enabled, downloaded model matching a capability.
 
-        Prefers the largest model that declares the capability (user-set
-        or inferred). Falls back to ``largest_downloaded_model`` when no
-        model matches.
+        Among models that declare the capability (user-set or inferred),
+        prefers the newest version first (even with a smaller parameter
+        count), then the largest. Falls back to ``largest_downloaded_model``
+        when no model matches.
         """
         cap = capability.lower()
         candidates = [
@@ -406,7 +374,7 @@ class Workspace(BaseModel):
         ]
         if not candidates:
             return self.largest_downloaded_model()
-        candidates.sort(key=lambda m: m.param_size_b, reverse=True)
+        candidates.sort(key=lambda m: m._rank, reverse=True)
         best = candidates[0]
         best.models_dir = self.models_dir
         return best

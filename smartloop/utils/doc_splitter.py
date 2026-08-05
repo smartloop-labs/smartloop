@@ -4,7 +4,7 @@ from typing import List
 
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 from smartloop.parsers.parser_factory import BaseLLM
-from smartloop.workspace import Document
+from smartloop.workspace.types import Document
 
 max_tokens = 512  # max tokens per chunk — set lower than model limit to allow room for prompt
 

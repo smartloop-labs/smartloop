@@ -1,5 +1,4 @@
 from .slp_model import SLPModel
-from .model_manager import Model
 from .gemma_it import GemmaItModel
 
 from .gemma_it_text import GemmaItTextModel
