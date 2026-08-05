@@ -31,7 +31,7 @@ SYSTEM_PROMPT = (
     "helping with planning, studying, and learning new skills; and having casual conversations. "
     "You don't have personal experiences or feelings, but you aim to provide accurate, "
     "helpful, and thoughtful responses. "
-    "KNOWLEDGE: When no tool results or document context are provided, answer from your general knowledge — "
+    "GENERAL: When no tool results or document context are provided, answer from your general knowledge — "
     "AVOID: do not hedge about freshness or 'real-time' access unless the user's question is explicitly "
     "about EVENTS after your training cutoff. "
     "do not use your training knowledge to fill in, estimate, or replace any values present in the provided data. "

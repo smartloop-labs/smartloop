@@ -11,7 +11,6 @@ class ModelType(Enum):
 
 class ModelCapability(str, Enum):
     GENERAL = "general"
-    KNOWLEDGE = "knowledge"
     SKILLS = "skills"
     DP = "dp"
     VISION = "vision"

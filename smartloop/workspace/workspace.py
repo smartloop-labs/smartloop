@@ -183,7 +183,8 @@ class WorkspaceModel(BaseModel):
             caps.append(ModelCapability.VISION)
 
         if size >= 3:
-            caps.append(ModelCapability.KNOWLEDGE)
+            # GENERAL already added above; larger models additionally handle
+            # skills and document processing.
             caps.append(ModelCapability.SKILLS)
             caps.append(ModelCapability.DP)
 

@@ -30,7 +30,7 @@ class Gemma4_2bModel(GenericModel):
     @staticmethod
     def default_capabilities() -> list[ModelCapability]:
         return [
-            ModelCapability.KNOWLEDGE,
+            ModelCapability.GENERAL,
             ModelCapability.SKILLS,
             ModelCapability.DP,
             ModelCapability.VISION

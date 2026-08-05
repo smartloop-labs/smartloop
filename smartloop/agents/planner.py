@@ -281,7 +281,7 @@ class Planner:
           1. ``vision``    — attachments imply image/document OCR work.
           2. ``skills``    — a matched skill defines the procedure to run.
           3. ``dp``        — indexed document context: data-processing model.
-          4. ``knowledge`` — default for open-ended chat / general answers.
+          5. ``general``   — default for open-ended chat / general answers.
 
         Returns the first capability whose signal fires *and* is present
         in ``capabilities``, or ``None`` when nothing matches.
@@ -290,7 +290,7 @@ class Planner:
             (ModelCapability.VISION, has_attachments),
             (ModelCapability.SKILLS, has_matched_skills),
             (ModelCapability.DP, has_document_context),
-            (ModelCapability.KNOWLEDGE, True),
+            (ModelCapability.GENERAL, True),
         )
         for cap, signal in priority:
             if signal and cap in capabilities:
@@ -577,7 +577,7 @@ class Planner:
         the caller passes a stronger model (e.g. the large 'dp' model) for the
         complex tool-selection reasoning. Falls back to ``self.llm``.
 
-        For CONVERSATION with a matched capability (e.g. ``knowledge``) →
+        For CONVERSATION with a matched capability (e.g. ``general``) →
         one CONVERSATIONAL step routed to that capability's model.
         For CONVERSATION without a capability → empty plan (router streams
         via the small model directly).
