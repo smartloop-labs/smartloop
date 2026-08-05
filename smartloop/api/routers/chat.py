@@ -685,6 +685,11 @@ async def stream_chunks(
         if request.session_id and full_response:
             model_service.append_to_session(request.session_id, "assistant", full_response, citations=citations, message_id=message_id)
 
+        # Response is fully streamed — free the on-demand auxiliary models
+        # (vision + large agent) so only the orchestrator stays resident
+        # between chats. Runs on normal completion, error, and cancellation.
+        model_service.unload_auxiliary_models()
+
     # Auto file-write: if user asked to create/generate/write, save LLM response to file
     if full_response_parts and last_user_msg and request.cwd:
         full_response = "".join(full_response_parts)
@@ -963,3 +968,10 @@ async def create_chat_completion(
     except Exception as e:
         logger.exception("Error in chat completion")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Free the on-demand auxiliary models (vision + large agent) after each
+        # response so only the orchestrator stays resident. The streaming path
+        # defers this to stream_chunks' finally (which fires when the stream
+        # drains, not when the StreamingResponse object is returned here).
+        if not request.stream:
+            model_service.unload_auxiliary_models()

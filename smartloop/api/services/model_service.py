@@ -3002,6 +3002,20 @@ class ModelService:
             self._large_model_attempted = False
             self._cleanup_gpu_cache()
 
+    def unload_auxiliary_models(self) -> None:
+        """Release every on-demand auxiliary model, keeping only the resident
+        orchestrator.
+
+        The vision/OCR model and the large agent/skills model are both loaded
+        on demand for a single response and are not part of the always-resident
+        footprint. Called at the end of each orchestration/response cycle so
+        their VRAM is returned between chats rather than left resident. Both
+        underlying unloads are idempotent, so this is safe to call whether or
+        not either model was actually loaded for the request.
+        """
+        self.unload_vision_model()
+        self.unload_large_model()
+
     # --------------------------------------------------------------- MCP servers
 
     def add_remote_mcp_server(
