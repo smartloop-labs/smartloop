@@ -103,8 +103,10 @@ class LlmFactory:
     # handler that knows its image-token / prompt format.  Using the WRONG
     # handler (or none) for a model crashes the native clip code, so an arch
     # without an entry here is treated as unsupported (text-only / skipped)
-    # rather than guessed.  ``gemma3`` is deliberately absent: llama-cpp-python
-    # has no Gemma3 handler and the legacy clip path aborts on its projector.
+    # rather than guessed.  ``gemma3``/``gemma4`` are absent here because their
+    # model classes declare the handler explicitly via ``vision_chat_handler()``
+    # (the generic MTMDChatHandler / its Gemma4ChatHandler subclass), which is
+    # authoritative and bypasses this arch-sniffing fallback.
     _VISION_HANDLER_BY_ARCH = [
         (("qwen2vl", "qwen2.5vl", "qwen2_5vl", "qwen3vl", "qwenvl"), "Qwen25VLChatHandler"),
         (("minicpmv", "minicpm-v", "minicpm"), "MiniCPMv26ChatHandler"),

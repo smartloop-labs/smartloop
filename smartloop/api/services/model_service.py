@@ -459,7 +459,8 @@ class ModelService:
         hold, so unrunnable candidates are skipped rather than crashing:
           * its mmproj / CLIP projector GGUF is present (else it's blind), and
           * the installed llama-cpp has a chat handler for its architecture
-            (e.g. gemma3 has none in llama-cpp-python and aborts natively), and
+            (the model-declared handler, e.g. the generic MTMDChatHandler, or an
+            arch-sniffed one; a missing handler is skipped, never crashed), and
           * it fits in available memory.
         Returns None when no candidate qualifies (callers fall back to text).
         """
@@ -3433,6 +3434,13 @@ class ModelService:
             except Exception as e:
                 logger.warning("[orchestrator] vision perception failed (%s) — "
                                "continuing without image context", e)
+            finally:
+                # The vision model has done its one job for this request — the
+                # perception is folded into the text below and the rest of the
+                # pipeline is text-only. Release the auxiliary model now so its
+                # VRAM is freed for the downstream synthesis (and not left
+                # resident between chats) rather than waiting for idle unload.
+                self.unload_vision_model()
             if image_perception:
                 logger.info("[orchestrator] image perception: %r",
                             image_perception[:200])

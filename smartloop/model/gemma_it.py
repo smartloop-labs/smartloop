@@ -28,7 +28,20 @@ class GemmaItModel(GenericModel):
 
     @staticmethod
     def default_capabilities() -> list[ModelCapability]:
-        return [ModelCapability.GENERAL, ModelCapability.SKILLS, ModelCapability.DP]
+        return [
+            ModelCapability.GENERAL,
+            ModelCapability.SKILLS,
+            ModelCapability.DP,
+            ModelCapability.VISION
+        ]
+
+    @staticmethod
+    def vision_chat_handler() -> str:
+        # llama-cpp-python has no Gemma3-specific handler; its Gemma4ChatHandler
+        # is just an empty subclass of the generic mtmd handler. Gemma 3's mmproj
+        # loads through that same generic path (projector auto-detected from the
+        # GGUF), so declare the base MTMDChatHandler directly.
+        return "MTMDChatHandler"
 
     @staticmethod
     def model_id() -> str:
