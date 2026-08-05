@@ -124,8 +124,11 @@ jobs:
 
       # Vulkan headers/loader + glslc (shaderc) for the GGML_VULKAN=ON build;
       # molten-vk is the ICD that maps Vulkan onto Metal at runtime.
+      # spirv-headers/spirv-tools satisfy ggml-vulkan's find_package(SPIRV-Headers)
+      # at CMake-configure time — the LunarG SDK bundles these on Linux/Windows,
+      # but on brew they're separate formulae.
       - name: Install Vulkan SDK (MoltenVK)
-        run: brew install vulkan-headers vulkan-loader molten-vk shaderc
+        run: brew install vulkan-headers vulkan-loader molten-vk shaderc spirv-headers spirv-tools
 
       - name: Import Apple certificate
         env:
