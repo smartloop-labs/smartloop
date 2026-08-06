@@ -3109,6 +3109,45 @@ class ModelService:
         self.unload_vision_model()
         self.unload_large_model()
 
+    def unload_model_by_name(self, model_name: str) -> bool:
+        """Free VRAM held by a specific model, e.g. when it's deselected.
+
+        Deselecting a model in the UI flips its ``enabled`` flag so future
+        loads skip it, but an instance already resident in a cache slot keeps
+        its llama.cpp context + GPU buffers until dropped here.  Clears every
+        slot backed by ``model_name`` — the on-demand large/vision caches and
+        any per-capability (``_cap_llm_<name>``) cache — then reclaims the GPU.
+        Idempotent; returns True if anything was actually unloaded.
+        """
+        with self._inference_lock:
+            unloaded = False
+
+            if self._large_llm is not None and self._large_model_name == model_name:
+                logger.info("[unload] Releasing deselected large model %s", model_name)
+                self._large_llm = None
+                self._large_model_name = None
+                self._large_model_attempted = False
+                unloaded = True
+
+            if self._vision_llm is not None and self._vision_model_name == model_name:
+                logger.info("[unload] Releasing deselected vision model %s", model_name)
+                self._vision_llm = None
+                self._vision_model_name = None
+                self._vision_unavailable = False
+                unloaded = True
+
+            cache_key = f"_cap_llm_{model_name}"
+            cached = getattr(self, cache_key, None)
+            if cached is not None and cached is not _GPU_FAULTED:
+                logger.info("[unload] Releasing deselected capability model %s", model_name)
+                setattr(self, cache_key, None)
+                unloaded = True
+
+            if unloaded:
+                self._cleanup_gpu_cache()
+
+        return unloaded
+
     # --------------------------------------------------------------- MCP servers
 
     def add_remote_mcp_server(

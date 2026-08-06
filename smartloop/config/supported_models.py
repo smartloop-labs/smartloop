@@ -11,11 +11,13 @@ class _LazyModelDict:
             from smartloop.model.gemma_it import GemmaItModel
             from smartloop.model.gemma4_2b import Gemma4_2bModel
             from smartloop.model.qwen2_vl_2b import Qwen2VL_2bModel
+            from smartloop.model.ministral_3b import Ministral3bModel
             self._data = OrderedDict({
                 "slp-orchestra-mini": GemmaItTextModel,
                 "gemma3-4b": GemmaItModel,
                 "gemma4-e2b": Gemma4_2bModel,
                 "qwen2-vl-2b": Qwen2VL_2bModel,
+                "ministral3-3b": Ministral3bModel,
             })
         return self._data
 
