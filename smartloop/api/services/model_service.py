@@ -66,6 +66,13 @@ logger = logging.getLogger(__name__)
 # bugs surface loudly rather than silently returning no context.
 _PROGRAMMING_ERRORS = (NameError, AttributeError, TypeError, ImportError)
 
+# Cache sentinel: a larger response model (capability/large) that passed the
+# load-time fit guard but then exhausted GPU memory during generation (e.g.
+# Vulkan ErrorOutOfDeviceMemory).  Stored in place of the cached LLM so later
+# requests skip straight to the default router model instead of re-loading a
+# model that won't fit.  See ModelService._evict_response_llm.
+_GPU_FAULTED = object()
+
 DEFAULT_MAX_CONTEXT_TOKENS = 8192
 
 # Shared vector-retrieval selection criteria — applied identically to
@@ -382,6 +389,11 @@ class ModelService:
         self._vision_llm = None
         self._vision_model_name = None
         self._vision_unavailable = False
+        # Clear any capability-model GPU-fault evictions so a fresh model load
+        # re-evaluates them against the newly active configuration.
+        for attr in list(vars(self)):
+            if attr.startswith("_cap_llm_") and getattr(self, attr) is _GPU_FAULTED:
+                setattr(self, attr, None)
 
         self._warmup_embeddings()
         self._warmup_inference()
@@ -590,6 +602,10 @@ class ModelService:
 
         cache_key = f"_cap_llm_{ws_model.model_name}"
         cached = getattr(self, cache_key, None)
+        if cached is _GPU_FAULTED:
+            # Evicted after a runtime GPU OOM — don't reload it, let the caller
+            # fall back to the default router model.
+            return None
         if cached is not None:
             return cached
 
@@ -2365,6 +2381,44 @@ class ModelService:
             )
         return self._llm
 
+    def _default_fallback_llm(self, failed_llm: BaseLLM) -> Optional[BaseLLM]:
+        """The default router LLM to fall back to when a larger response model
+        fails during generation, or None when the failed model already IS the
+        default (there's nothing smaller/lighter to retry on)."""
+        if failed_llm is self._llm:
+            return None
+        return self._llm
+
+    def _evict_response_llm(self, llm: BaseLLM) -> None:
+        """Stop routing responses to a model that faulted during generation.
+
+        A larger model can pass the load-time fit guard yet still exhaust GPU
+        memory once generation allocates its compute buffers (e.g. Vulkan
+        ``ErrorOutOfDeviceMemory``).  Drop it from the response caches so later
+        requests route straight to the default model instead of re-loading a
+        model that won't fit the GPU.
+        """
+        if llm is self._large_llm:
+            logger.warning(
+                "[response] Large model %s faulted on GPU — evicting; "
+                "routing responses to the default model",
+                self._large_model_name,
+            )
+            self._large_llm = None
+            self._large_model_name = None
+            # Latch so _get_large_llm doesn't re-attempt the load this session.
+            self._large_model_attempted = True
+            return
+        for attr in list(vars(self)):
+            if attr.startswith("_cap_llm_") and getattr(self, attr) is llm:
+                logger.warning(
+                    "[response] Capability model %s faulted on GPU — evicting; "
+                    "routing responses to the default model",
+                    attr[len("_cap_llm_"):],
+                )
+                setattr(self, attr, _GPU_FAULTED)
+                return
+
     def stream_completion(
         self,
         prompt: str,
@@ -2394,16 +2448,42 @@ class ModelService:
         if llm is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        # Propagate cancellation event to the LLM so it can stop mid-inference
-        llm._cancelled = cancelled
-
         # Lock around inference - llama-cpp is not thread-safe
         with self._inference_lock:
+            emitted = 0
             try:
+                # Propagate cancellation event so the LLM can stop mid-inference.
+                llm._cancelled = cancelled
                 for chunk in llm.stream(prompt):
                     if cancelled is not None and cancelled.is_set():
                         break
+                    emitted += 1
                     yield chunk
+            except Exception as ex:
+                fallback = self._default_fallback_llm(llm)
+                # A larger response model can OOM the GPU once generation
+                # allocates its compute buffers (Vulkan ErrorOutOfDeviceMemory).
+                # Re-route to the default router model, which is small enough to
+                # fit — but only when nothing has been streamed yet, since a
+                # mid-stream restart would duplicate the emitted text (the GPU
+                # OOM aborts before the first token, so this holds in practice).
+                if emitted == 0 and fallback is not None:
+                    logger.warning(
+                        "[response] Response model failed during generation (%s) "
+                        "— falling back to the default model", ex,
+                    )
+                    self._evict_response_llm(llm)
+                    llm._cancelled = None
+                    try:
+                        fallback._cancelled = cancelled
+                        for chunk in fallback.stream(prompt):
+                            if cancelled is not None and cancelled.is_set():
+                                break
+                            yield chunk
+                    finally:
+                        fallback._cancelled = None
+                else:
+                    raise
             finally:
                 llm._cancelled = None
 
@@ -2432,7 +2512,20 @@ class ModelService:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         with self._inference_lock:
-            return llm.invoke(prompt)
+            try:
+                return llm.invoke(prompt)
+            except Exception as ex:
+                # Same GPU-OOM fallback as stream_completion: retry the
+                # non-streaming response on the default router model.
+                fallback = self._default_fallback_llm(llm)
+                if fallback is None:
+                    raise
+                logger.warning(
+                    "[response] Response model failed during generation (%s) "
+                    "— falling back to the default model", ex,
+                )
+                self._evict_response_llm(llm)
+                return fallback.invoke(prompt)
 
     def add_document(self, source: str, project_id: str | None = None, progress_callback=None) -> dict:
         """Add a document source (file path or URL) to a project (by ID or current).
