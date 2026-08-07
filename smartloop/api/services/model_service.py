@@ -491,12 +491,12 @@ class ModelService:
             if m.enabled and m.downloaded
             and ModelCapability.VISION in m.effective_capabilities
         ]
-        # Largest model first (a bigger multimodal model gives better OCR/vision
-        # quality — e.g. a 3B model wins over a newer-version 2B one); ties on
-        # size fall back to the newer version. The per-candidate fit guard below
-        # falls through to the next when the preferred one won't fit, so a device
-        # that can't hold the largest still gets a working smaller model.
-        candidates.sort(key=lambda m: (m.param_size_b or 0.0, m.model_version), reverse=True)
+        # Fastest model first: vision runs locally, so latency beats the small
+        # OCR-quality gain of a bigger model. Fewest params win (e.g. a 2B model
+        # over a 3B one), ties break toward the newer version. The per-candidate
+        # fit guard below falls through when the preferred one won't fit — and
+        # since the smallest is tried first, it's also the most likely to fit.
+        candidates.sort(key=lambda m: (-(m.param_size_b or 0.0), m.model_version), reverse=True)
 
         # OCR is a latency-tolerant batch task, so give the vision model a small
         # dedicated context and waive the agent-model reserve — it only needs to
