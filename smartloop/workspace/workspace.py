@@ -151,6 +151,17 @@ class WorkspaceModel(BaseModel):
         return (self.model_version, self.param_size_b)
 
     @property
+    def _rank_speed(self) -> tuple[float, int]:
+        """Selection rank where the fastest model wins first, then newer version.
+
+        Used for DP and VISION: both run locally, so latency matters more than
+        the marginal quality gain of a bigger model. Fewer parameters → faster,
+        so a 2B model is chosen over a 3B one; ties break toward the newer
+        version. Negated size makes "smaller" rank higher under ``reverse=True``.
+        """
+        return (-self.param_size_b, self.model_version)
+
+    @property
     def effective_capabilities(self) -> List[str]:
         """Return capabilities declared by the model class — read-only.
 
@@ -358,13 +369,24 @@ class Workspace(BaseModel):
         best.models_dir = self.models_dir
         return best
 
+    # Capabilities that pick the *fastest* model (fewest params, then newest
+    # version) instead of the newest-then-largest default. DP and VISION both
+    # run locally and are latency-sensitive, so speed beats the marginal quality
+    # gain of a bigger model — one uniform rule for both.
+    _SPEED_FIRST_CAPABILITIES = frozenset({
+        ModelCapability.DP.value,
+        ModelCapability.VISION.value,
+    })
+
     def best_model_for(self, capability: str) -> Optional[WorkspaceModel]:
         """Return the best enabled, downloaded model matching a capability.
 
-        Among models that declare the capability (user-set or inferred),
-        prefers the newest version first (even with a smaller parameter
-        count), then the largest. Falls back to ``largest_downloaded_model``
-        when no model matches.
+        Among models that declare the capability (user-set or inferred), DP and
+        VISION prefer the *fastest* model (fewest params, then newer version),
+        because they run locally and latency matters more than the small quality
+        gain of a bigger model; general/skills prefer the newest version, then
+        the largest. Falls back to ``largest_downloaded_model`` when no model
+        matches.
         """
         cap = capability.lower()
         candidates = [
@@ -374,7 +396,12 @@ class Workspace(BaseModel):
         ]
         if not candidates:
             return self.largest_downloaded_model()
-        candidates.sort(key=lambda m: m._rank, reverse=True)
+        rank = (
+            (lambda m: m._rank_speed)
+            if cap in self._SPEED_FIRST_CAPABILITIES
+            else (lambda m: m._rank)
+        )
+        candidates.sort(key=rank, reverse=True)
         best = candidates[0]
         best.models_dir = self.models_dir
         return best

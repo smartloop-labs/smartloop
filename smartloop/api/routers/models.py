@@ -299,6 +299,11 @@ async def update_workspace_model(
             raise ValueError(f"Model not found: {model_name}")
         if request.enabled is not None:
             model.enabled = request.enabled
+            # Deselecting a model must also free any VRAM it still holds — the
+            # enabled flag only gates future loads, not an already-resident
+            # instance (see ModelService.unload_model_by_name).
+            if request.enabled is False:
+                model_service.unload_model_by_name(model_name)
         workspace.save()
         return {
             "status": "ok",
