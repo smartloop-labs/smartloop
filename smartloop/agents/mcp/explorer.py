@@ -407,12 +407,9 @@ class Explorer:
                     seen_files: dict = {}
                     for chunk in ws_chunks:
                         fname = chunk.document_name or chunk.document_id
-                        # Skip skill files — they are instructions, not data
-                        if fname and (
-                            "/skills/" in fname
-                            or fname.startswith("skills/")
-                            or fname.upper().endswith("SKILL.MD")
-                        ):
+                        # Skip skill/system files — they are instructions and
+                        # tool metadata, not data (see _is_non_data_file).
+                        if fname and Explorer._is_non_data_file(fname):
                             continue
                         if fname not in seen_files or chunk.distance < seen_files[fname].distance:
                             seen_files[fname] = chunk
@@ -498,6 +495,29 @@ class Explorer:
         return ""
 
     @staticmethod
+    def _is_non_data_file(fname: str) -> bool:
+        """True for skill/system files that are instructions or tool metadata,
+        not user data — they must never leak into retrieved context.
+
+        Covers skill files (``skills/`` dirs, ``SKILL.md``), MCP catalogue files
+        (``mcp-*``), and bundled system files whose basename is ``__``-prefixed —
+        notably ``__system_mcp__.md``, which lists the built-in tool
+        descriptions. Without this a fund/table prompt can sweep those tool
+        descriptions in as fake data rows (e.g. "Smartloop | SMTL | N/A").
+        """
+        if not fname:
+            return False
+        base = os.path.basename(fname)
+        return (
+            "/skills/" in fname
+            or fname.startswith("skills/")
+            or fname.upper().endswith("SKILL.MD")
+            or fname.startswith("mcp-")
+            or base.startswith("mcp-")
+            or base.startswith("__")
+        )
+
+    @staticmethod
     def _search_workspace(
         query: str,
         model_service: Any,
@@ -514,12 +534,7 @@ class Explorer:
                 seen_files: dict = {}
                 for chunk in ws_chunks:
                     fname = chunk.document_name or chunk.document_id
-                    if fname and (
-                        "/skills/" in fname
-                        or fname.startswith("skills/")
-                        or fname.upper().endswith("SKILL.MD")
-                        or fname.startswith("mcp-")
-                    ):
+                    if fname and Explorer._is_non_data_file(fname):
                         continue
                     if fname not in seen_files or chunk.distance < seen_files[fname].distance:
                         seen_files[fname] = chunk

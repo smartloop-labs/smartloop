@@ -491,13 +491,12 @@ class ModelService:
             if m.enabled and m.downloaded
             and ModelCapability.VISION in m.effective_capabilities
         ]
-        # Newest model version first (a v4 multimodal model wins over an older
-        # VL one, even at equal/smaller size); within the same version prefer
-        # the lighter model — OCR quality is adequate from a smaller model and
-        # it's far likelier to fit on GPU alongside the orchestrator + on-demand
-        # agent models. The per-candidate fit guard below falls through to the
-        # next when the preferred one won't fit.
-        candidates.sort(key=lambda m: (-m.model_version, m.param_size_b or 0.0))
+        # Largest model first (a bigger multimodal model gives better OCR/vision
+        # quality — e.g. a 3B model wins over a newer-version 2B one); ties on
+        # size fall back to the newer version. The per-candidate fit guard below
+        # falls through to the next when the preferred one won't fit, so a device
+        # that can't hold the largest still gets a working smaller model.
+        candidates.sort(key=lambda m: (m.param_size_b or 0.0, m.model_version), reverse=True)
 
         # OCR is a latency-tolerant batch task, so give the vision model a small
         # dedicated context and waive the agent-model reserve — it only needs to
@@ -628,14 +627,26 @@ class ModelService:
             cap = _s.llm_large_n_ctx_cap
             # Same fit guard as the default large model: skip the capability
             # (4B) model when it won't fit, so the plan step falls back to the
-            # default routing model instead of OOM-ing.
+            # default routing model instead of OOM-ing. But first, since each
+            # step may use a different capability model, eagerly release the
+            # prior steps' models (and the on-demand large model) and retry —
+            # that frees enough VRAM to run the next step's model on a
+            # memory-tight device instead of degrading to the default.
             if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
-                logger.warning(
-                    "[capability-model] %s doesn't fit alongside the main "
-                    "model at n_ctx=%d — capability '%s' unavailable",
-                    ws_model.model_name, cap, capability,
+                if not (
+                    self._evict_capability_models(keep_model_name=ws_model.model_name)
+                    and self._large_model_fits(gguf_path, cap, ws_model.model_name)
+                ):
+                    logger.warning(
+                        "[capability-model] %s doesn't fit alongside the main "
+                        "model at n_ctx=%d — capability '%s' unavailable",
+                        ws_model.model_name, cap, capability,
+                    )
+                    return None
+                logger.info(
+                    "[capability-model] Freed prior-step models to fit %s "
+                    "for capability '%s'", ws_model.model_name, capability,
                 )
-                return None
             from smartloop.llms.llm_factory import LlmFactory
             llm = LlmFactory.get_llama_cpp_instance(
                 gguf_path, logger, self.get_project_id() or "",
@@ -1316,6 +1327,21 @@ class ModelService:
         if migrated:
             self._model.save()
 
+    # Built-in tool/system skills that back the orchestrator's routing. The
+    # orchestrator still uses them, but they must never surface in the
+    # user-facing skill list (nor be user-selectable): file/shell tool skills
+    # plus any ``__``-prefixed internal skill (e.g. ``__system_mcp__``).
+    _SYSTEM_SKILL_NAMES = frozenset({
+        "file-read", "file-write", "bash", "grep", "explore",
+    })
+
+    @classmethod
+    def _is_system_skill(cls, name: str) -> bool:
+        """True for built-in tool skills and ``__``-prefixed internal skills."""
+        return bool(name) and (
+            name in cls._SYSTEM_SKILL_NAMES or name.startswith("__")
+        )
+
     _DEFAULT_SKILLS = [
         Skill(
             id="file-read",
@@ -1928,9 +1954,18 @@ class ModelService:
         raise ValueError(f"Skill not found: {skill_id}")
 
     def list_skills(self, project_id: str) -> list[dict]:
-        """List all skills for a project, read from disk."""
+        """List a project's user-created skills, read from disk.
+
+        Built-in tool skills (file-read/file-write/bash/grep/explore) and
+        ``__``-prefixed internal skills back the orchestrator's routing but are
+        never exposed here, so the client only sees skills the user created.
+        """
         project = self._get_project(project_id)
-        return [s.model_dump() for s in self._read_skills_from_disk(project)]
+        return [
+            s.model_dump()
+            for s in self._read_skills_from_disk(project)
+            if not self._is_system_skill(s.name)
+        ]
 
     def delete_skill(self, project_id: str, skill_id: str) -> dict:
         """Delete a skill by removing its SKILL.md directory from disk."""
@@ -3095,6 +3130,43 @@ class ModelService:
             self._large_model_attempted = False
             self._cleanup_gpu_cache()
 
+    def _evict_capability_models(self, keep_model_name: Optional[str] = None) -> bool:
+        """Free resident per-capability models to reclaim VRAM between steps.
+
+        A single request runs several steps (document processing, skills,
+        vision), each of which may use a *different* capability model. On a
+        memory-tight device those must not all stay resident, so when the next
+        step's model won't fit we drop the others here — every
+        ``_cap_llm_<name>`` cache except ``keep_model_name`` (the one about to be
+        used) plus the on-demand large agent model — then reclaim the GPU.
+
+        Idempotent; returns True if anything was actually freed. Not held under
+        ``_inference_lock``: it runs on the load path, before the requesting
+        step infers, and only evicts models other than the one being loaded.
+        """
+        freed = False
+        keep_key = f"_cap_llm_{keep_model_name}" if keep_model_name else None
+        for attr in list(self.__dict__):
+            if not attr.startswith("_cap_llm_") or attr == keep_key:
+                continue
+            cached = getattr(self, attr, None)
+            if cached is not None and cached is not _GPU_FAULTED:
+                logger.info(
+                    "[mem] Evicting prior-step capability model %s to free VRAM",
+                    attr[len("_cap_llm_"):],
+                )
+                setattr(self, attr, None)
+                freed = True
+        if self._large_llm is not None and self._large_model_name != keep_model_name:
+            logger.info("[mem] Evicting on-demand large model to free VRAM")
+            self._large_llm = None
+            self._large_model_name = None
+            self._large_model_attempted = False
+            freed = True
+        if freed:
+            self._cleanup_gpu_cache()
+        return freed
+
     def unload_auxiliary_models(self) -> None:
         """Release every on-demand auxiliary model, keeping only the resident
         orchestrator.
@@ -3523,6 +3595,19 @@ class ModelService:
                 pass
             self._llm_executor = None
 
+    # Signals that an image-attachment request wants to *use* indexed documents
+    # (cross-validate / answer with them), not just read the image. When none of
+    # these appear, an attached image is treated as the sole source and the
+    # retrieved documents are discarded so they can't mis-attribute its contents.
+    _IMAGE_CROSS_REF_RE = re.compile(
+        r"\b(compare|comparison|match(?:es|ing)?|validate|verif(?:y|ies|ication)|"
+        r"cross[-\s]?(?:check|validat\w*|referenc\w*)|reconcile|consistent|discrepanc\w*|"
+        r"recommend|suggest|against (?:our|the|my)|based on (?:our|the|my)|"
+        r"using (?:our|the|my)|according to (?:our|the|my)|"
+        r"(?:in|from|with) (?:our|the|my|these|those) (?:record|document|doc|file|data|report)s?)\b",
+        re.IGNORECASE,
+    )
+
     def orchestrate(
         self,
         user_message: str,
@@ -3533,6 +3618,7 @@ class ModelService:
         images: Optional[list[tuple[bytes, str]]] = None,
         progress_callback: Optional[Callable[[str, str, str], None]] = None,
         cancelled: Optional[threading.Event] = None,
+        requested_skill: Optional[str] = None,
     ) -> tuple[Optional[str], bool, Optional[str], Optional[list], Optional[str], bool]:
         """Full orchestrator entry point for a user message.
 
@@ -3574,6 +3660,7 @@ class ModelService:
         # streamed back directly (mutation=True).  Falls through untouched when no
         # vision model is available or perception comes back empty.
         image_perception: Optional[str] = None
+        image_sole_source: bool = False
         if images:
             try:
                 image_perception = self.vision_perceive(user_message, images)
@@ -3590,6 +3677,13 @@ class ModelService:
             if image_perception:
                 logger.info("[orchestrator] image perception: %r",
                             image_perception[:200])
+                # Decide by user intent whether the image is the SOLE source or
+                # documents should also inform the answer. A bare extract/read of
+                # the attached image discards the retrieved docs (they only cause
+                # mis-attribution); a request to compare, validate, or answer
+                # using indexed content keeps them for cross-validation.
+                image_sole_source = not self._IMAGE_CROSS_REF_RE.search(user_message or "")
+                logger.info("[orchestrator] image sole-source=%s", image_sole_source)
                 user_message = f"{user_message}\n\n[Image context: {image_perception}]"
             else:
                 logger.warning("[orchestrator] vision perception empty — "
@@ -3611,14 +3705,37 @@ class ModelService:
             """
             if not image_perception:
                 return ctx
+            authority = (
+                "the SOLE source for answering this request"
+                if image_sole_source
+                else "an authoritative source for this request"
+            )
             block = (
                 "The user attached an image. A vision model has already analyzed "
                 "it — treat the description below as the actual contents of that "
-                "image and answer the user's request directly. Do NOT say you "
-                "cannot see or view the image.\n\n"
+                f"image and {authority}. Answer the user's request directly; do "
+                "NOT say you cannot see or view the image.\n\n"
                 f"Image contents: {image_perception}"
             )
-            return f"{block}\n\n{ctx}" if ctx else block
+            if not ctx:
+                return block
+            if not image_sole_source:
+                # Cross-validation intent — the image is authoritative but the
+                # retrieved documents may corroborate or help answer it.
+                return f"{block}\n\n{ctx}"
+            # Pure extract/read of the image — the retrieved documents are
+            # background only. Without this the answering model merges similar
+            # indexed docs into the answer and mis-attributes the image's own
+            # fields to them (e.g. a driver-license image cited to an unrelated
+            # sample PDF).
+            return (
+                f"{block}\n\n---\n\n"
+                "The material below was retrieved from indexed documents as "
+                "background only. Do NOT answer from it, cite it, or attribute "
+                "the image's contents to any document — the image above is the "
+                "sole source for this request.\n\n"
+                f"{ctx}"
+            )
 
         # Reload workspace from disk to pick up any changes made by
         # background indexers or project setup since the last request.
@@ -3712,6 +3829,7 @@ class ModelService:
                     conversation_history=conversation_history,
                     available_capabilities=available_capabilities or None,
                     progress_callback=progress_callback,
+                    requested_skill=requested_skill,
                 )
             finally:
                 if cancelled is not None:
@@ -3741,7 +3859,11 @@ class ModelService:
                     f"Tool '{result.tool_name}' returned "
                     f"{len(result.content)} chars of context"
                 )
-                return _with_image_context(result.content), True, None, result.citations, result.skill_instruction, result.mutation
+                # Drop document citations when the image is the sole source —
+                # the answer comes from the image, so citing retrieved docs would
+                # mis-attribute the image's contents to unrelated files.
+                _citations = None if image_sole_source else result.citations
+                return _with_image_context(result.content), True, None, _citations, result.skill_instruction, result.mutation
 
             return _with_image_context(None), True, None, None, result.skill_instruction, False
 

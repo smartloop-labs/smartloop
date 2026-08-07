@@ -50,6 +50,40 @@ def _status_event(step: str, status: str, message: str) -> str:
 _executor = ThreadPoolExecutor(max_workers=1)
 
 
+# A leading ``/<skill-name>`` in the prompt is an explicit request to fulfil the
+# turn with that skill (e.g. ``/fund-info summarise Q3``). Capture the token and
+# the remainder so the token can be matched against the project's skills.
+_SLASH_SKILL_RE = re.compile(r"^\s*/([A-Za-z0-9][\w-]*)\s*(.*)$", re.DOTALL)
+
+
+def _resolve_requested_skill(message: str, skills: list) -> tuple:
+    """Resolve a leading ``/<skill-name>`` slash-command against *skills*.
+
+    Returns ``(skill_name, cleaned_message)`` when the prompt opens with a
+    slash-command that names one of the project's skills — matched case- and
+    separator-insensitively, so ``/fund-info`` hits a ``fund_info`` skill. The
+    remainder of the prompt (after the token) becomes the message; when the user
+    typed only the token, a minimal ``Run the '<name>' skill.`` stands in.
+
+    Returns ``(None, message)`` unchanged when there is no leading slash-command
+    or it names no known skill, so an ordinary prompt that merely starts with a
+    path (``/etc/hosts …``) is left untouched.
+    """
+    if not message:
+        return None, message
+    m = _SLASH_SKILL_RE.match(message)
+    if not m:
+        return None, message
+    token, rest = m.group(1), m.group(2)
+    norm = lambda s: re.sub(r"[\s_\-]+", "", (s or "").lower())
+    wanted = norm(token)
+    for s in skills:
+        if norm(getattr(s, "name", "")) == wanted:
+            cleaned = rest.strip() or f"Run the '{s.name}' skill."
+            return s.name, cleaned
+    return None, message
+
+
 _TAG_ESCAPE = {
     "<system>": "&lt;system&gt;",
     "</system>": "&lt;/system&gt;",
@@ -329,6 +363,22 @@ async def stream_chunks(
 
     project_skills = [s for s in model_service.get_project_skills() if not s.system]
 
+    # A leading ``/<skill-name>`` in the prompt is an explicit request to fulfil
+    # this turn with that skill (e.g. ``/morning what is my agenda``). Resolve it
+    # against the project's skills, strip the token from the prompt (the planning
+    # copy and the final-answer message), and pass the skill name to the
+    # orchestrator, which validates it against the request intent before use.
+    requested_skill = None
+    _cur_msg = next((m for m in reversed(messages) if m.role == "user"), None)
+    if _cur_msg is not None and _cur_msg.content:
+        requested_skill, cleaned = _resolve_requested_skill(
+            _cur_msg.content, project_skills,
+        )
+        if requested_skill:
+            _cur_msg.content = cleaned
+            last_user_msg = cleaned
+            logger.info("[skill] user-selected skill: %r", requested_skill)
+
     # Shared cancellation signal for the whole request. Created before
     # orchestration so a client disconnect during the planning phase (skill
     # matching, routing) interrupts those LLM calls too — not just the final
@@ -364,6 +414,7 @@ async def stream_chunks(
                 images=image_attachments,
                 progress_callback=_progress,
                 cancelled=cancelled,
+                requested_skill=requested_skill,
             ),
         )
 
