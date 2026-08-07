@@ -31,6 +31,7 @@ class GemmaItModel(GenericModel):
         return [
             ModelCapability.GENERAL,
             ModelCapability.SKILLS,
+            ModelCapability.DP,
         ]
 
     @staticmethod

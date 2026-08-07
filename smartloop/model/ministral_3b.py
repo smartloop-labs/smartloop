@@ -31,6 +31,7 @@ class Ministral3bModel(GenericModel):
         return [
             ModelCapability.GENERAL,
             ModelCapability.SKILLS,
+            ModelCapability.DP,
             ModelCapability.VISION
         ]
 

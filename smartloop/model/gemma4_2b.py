@@ -31,8 +31,6 @@ class Gemma4_2bModel(GenericModel):
     def default_capabilities() -> list[ModelCapability]:
         return [
             ModelCapability.GENERAL,
-            ModelCapability.SKILLS,
-            ModelCapability.DP,
             ModelCapability.VISION
         ]
 
