@@ -151,6 +151,17 @@ class WorkspaceModel(BaseModel):
         return (self.model_version, self.param_size_b)
 
     @property
+    def _rank_version_then_small(self) -> tuple[int, float]:
+        """Selection rank: newer version first, then the SMALLER (faster) model.
+
+        Used for DP — prefer the newest model, but at equal version pick the
+        smaller/faster one (e.g. Ministral 3B over Gemma 3 4B) since document
+        extraction runs locally and the smaller model is fast enough. Negated
+        size makes "smaller" rank higher under ``reverse=True``.
+        """
+        return (self.model_version, -self.param_size_b)
+
+    @property
     def _rank_speed(self) -> tuple[float, int]:
         """Selection rank where the fastest model wins first, then newer version.
 
@@ -372,20 +383,26 @@ class Workspace(BaseModel):
     # Capabilities that pick the *fastest* model (fewest params, then newest
     # version) instead of the newest-then-largest default. VISION runs locally
     # and is latency-sensitive, so speed beats the marginal OCR-quality gain of
-    # a bigger model. DP/skills/general stay version-first (newest → largest).
+    # a bigger model.
     _SPEED_FIRST_CAPABILITIES = frozenset({
         ModelCapability.VISION.value,
+    })
+
+    # Capabilities that prefer the newest version, but the SMALLER/faster model
+    # on a version tie. DP: newest wins, but at equal version the faster (smaller)
+    # model is picked since extraction runs locally and is fast enough.
+    _VERSION_THEN_SMALL_CAPABILITIES = frozenset({
+        ModelCapability.DP.value,
     })
 
     def best_model_for(self, capability: str) -> Optional[WorkspaceModel]:
         """Return the best enabled, downloaded model matching a capability.
 
-        Among models that declare the capability (user-set or inferred), VISION
-        prefers the *fastest* model (fewest params, then newer version), because
-        it runs locally and latency matters more than the small OCR-quality gain
-        of a bigger model; all other capabilities (general, skills, dp) prefer
-        the newest version first (even with a smaller parameter count), then the
-        largest. Falls back to ``largest_downloaded_model`` when no model matches.
+        Among models that declare the capability (user-set or inferred):
+        VISION prefers the *fastest* model (fewest params, then newer version);
+        DP prefers the *newest* version, then the *smaller* (faster) model on a
+        tie; general/skills prefer the newest version, then the largest. Falls
+        back to ``largest_downloaded_model`` when no model matches.
         """
         cap = capability.lower()
         candidates = [
@@ -395,11 +412,12 @@ class Workspace(BaseModel):
         ]
         if not candidates:
             return self.largest_downloaded_model()
-        rank = (
-            (lambda m: m._rank_speed)
-            if cap in self._SPEED_FIRST_CAPABILITIES
-            else (lambda m: m._rank)
-        )
+        if cap in self._SPEED_FIRST_CAPABILITIES:
+            rank = lambda m: m._rank_speed
+        elif cap in self._VERSION_THEN_SMALL_CAPABILITIES:
+            rank = lambda m: m._rank_version_then_small
+        else:
+            rank = lambda m: m._rank
         candidates.sort(key=rank, reverse=True)
         best = candidates[0]
         best.models_dir = self.models_dir
