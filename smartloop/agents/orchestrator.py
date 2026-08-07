@@ -127,6 +127,7 @@ class SLPOrchestrator:
                             "[models] capability '%s' → %s",
                             capability, self._model_label(llm),
                         )
+                        self._emit_model_selected(capability, llm)
                         return llm
                 except Exception as e:
                     logger.warning("[models] capability model load failed (%s): %s", capability, e)
@@ -145,6 +146,7 @@ class SLPOrchestrator:
                     "[models] capability '%s' unresolved — falling back to %s",
                     capability, self._model_label(fallback),
                 )
+                self._emit_model_selected(capability, fallback)
             return fallback
         return self.agent_llm
 
@@ -170,6 +172,7 @@ class SLPOrchestrator:
                         "[models] decision capability '%s' → %s",
                         capability, self._model_label(llm),
                     )
+                    self._emit_model_selected(capability, llm)
                     return llm
             except Exception as e:
                 logger.warning(
@@ -248,6 +251,23 @@ class SLPOrchestrator:
             cb(step, status, message)
         except Exception:
             logger.debug("[progress] callback failed", exc_info=True)
+
+    # DP and VISION pick the fastest model as an internal optimization — their
+    # choice isn't surfaced to the user. Skills (and any future capability) DO
+    # surface their selected model via an SSE.
+    _SILENT_MODEL_CAPABILITIES = frozenset({
+        ModelCapability.DP.value, ModelCapability.VISION.value,
+    })
+
+    def _emit_model_selected(self, capability: Optional[str], llm: BaseLLM) -> None:
+        """Surface the selected model as an SSE, except for the silent
+        (internal-optimization) capabilities."""
+        if not capability or capability.lower() in self._SILENT_MODEL_CAPABILITIES:
+            return
+        self._emit(
+            "model", "processing",
+            f"Selected {self._model_label(llm)} for {capability}",
+        )
 
     # Thin forwarding for test compatibility (tests mock _call_tool_for_server)
     def _call_tool_for_server(self, *args, **kwargs):
