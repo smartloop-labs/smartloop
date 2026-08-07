@@ -368,19 +368,21 @@ class Workspace(BaseModel):
         return best
 
     # Capabilities where the larger model wins first (quality scales with size),
-    # rather than the newest version. Others prefer the newer version first.
+    # rather than the newest version. Only VISION: OCR benefits from a bigger
+    # multimodal model. DP stays version-first so it lands on the latest (and
+    # typically faster) model, co-located with SKILLS on that same model.
     _SIZE_FIRST_CAPABILITIES = frozenset({
-        ModelCapability.DP.value, ModelCapability.VISION.value,
+        ModelCapability.VISION.value,
     })
 
     def best_model_for(self, capability: str) -> Optional[WorkspaceModel]:
         """Return the best enabled, downloaded model matching a capability.
 
-        Among models that declare the capability (user-set or inferred), DP and
-        VISION prefer the *largest* model first (then newer version), because a
-        bigger model gives better document-processing / OCR quality; all other
-        capabilities prefer the newest version first (even with a smaller
-        parameter count), then the largest. Falls back to
+        Among models that declare the capability (user-set or inferred), VISION
+        prefers the *largest* model first (then newer version), because a bigger
+        multimodal model gives better OCR quality; all other capabilities
+        (general, skills, dp) prefer the newest version first (even with a
+        smaller parameter count), then the largest. Falls back to
         ``largest_downloaded_model`` when no model matches.
         """
         cap = capability.lower()
