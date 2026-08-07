@@ -121,6 +121,7 @@ class SLPOrchestrator:
                 # reference would pin that VRAM and defeat the eager release,
                 # so a subsequent capability (e.g. skills after dp) can't fit.
                 try:
+                    self._emit_model_loading(capability)
                     llm = self._capability_llm_provider(capability)
                     if llm is not None:
                         logger.info(
@@ -252,17 +253,17 @@ class SLPOrchestrator:
         except Exception:
             logger.debug("[progress] callback failed", exc_info=True)
 
-    # DP and VISION pick the fastest model as an internal optimization — their
-    # choice isn't surfaced to the user. Skills (and any future capability) DO
-    # surface their selected model via an SSE.
-    _SILENT_MODEL_CAPABILITIES = frozenset({
-        ModelCapability.DP.value, ModelCapability.VISION.value,
-    })
+    def _emit_model_loading(self, capability: Optional[str]) -> None:
+        """Surface an *immediate* "loading" SSE before the (potentially slow)
+        capability model load, so the user gets feedback right away instead of
+        only after the model is resident."""
+        if not capability:
+            return
+        self._emit("model", "processing", f"Loading model for {capability}…")
 
     def _emit_model_selected(self, capability: Optional[str], llm: BaseLLM) -> None:
-        """Surface the selected model as an SSE, except for the silent
-        (internal-optimization) capabilities."""
-        if not capability or capability.lower() in self._SILENT_MODEL_CAPABILITIES:
+        """Surface the selected capability model as an SSE."""
+        if not capability:
             return
         self._emit(
             "model", "processing",
