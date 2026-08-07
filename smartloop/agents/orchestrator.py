@@ -236,6 +236,8 @@ class SLPOrchestrator:
         # Optional per-request progress sink set by execute(); surfaces live
         # step activity (search, tool calls, ...) to the streaming API layer.
         self._progress_callback: Optional[Callable[[str, str, str], None]] = None
+        # Per-request dedupe for model-selection SSEs (reset in execute()).
+        self._emitted_model_events: set = set()
 
     def _emit(self, step: str, status: str, message: str) -> None:
         """Report an orchestration step to the optional progress callback.
@@ -253,21 +255,50 @@ class SLPOrchestrator:
         except Exception:
             logger.debug("[progress] callback failed", exc_info=True)
 
+    # Client-facing labels for capabilities. The enum values (e.g. "dp") are
+    # internal terms; map them to human-readable text before surfacing in SSEs.
+    _CAPABILITY_LABELS = {
+        ModelCapability.GENERAL.value: "general",
+        ModelCapability.SKILLS.value: "skills",
+        ModelCapability.DP.value: "document processing",
+        ModelCapability.VISION.value: "vision",
+        ModelCapability.CODING.value: "coding",
+    }
+
+    def _capability_label(self, capability: str) -> str:
+        return self._CAPABILITY_LABELS.get(capability.lower(), capability)
+
+    def _model_event_seen(self, key: str) -> bool:
+        """True if this model SSE already fired this request (and record it).
+
+        Collapses the per-node emits of a fan-out (one model resolution per
+        document) into a single client message. Racy across the parallel batch
+        threads, but a rare duplicate emit is harmless.
+        """
+        if key in self._emitted_model_events:
+            return True
+        self._emitted_model_events.add(key)
+        return False
+
     def _emit_model_loading(self, capability: Optional[str]) -> None:
         """Surface an *immediate* "loading" SSE before the (potentially slow)
         capability model load, so the user gets feedback right away instead of
-        only after the model is resident."""
-        if not capability:
-            return
-        self._emit("model", "processing", f"Loading model for {capability}…")
-
-    def _emit_model_selected(self, capability: Optional[str], llm: BaseLLM) -> None:
-        """Surface the selected capability model as an SSE."""
-        if not capability:
+        only after the model is resident. Emitted once per capability/request."""
+        if not capability or self._model_event_seen(f"loading:{capability.lower()}"):
             return
         self._emit(
             "model", "processing",
-            f"Selected {self._model_label(llm)} for {capability}",
+            f"Loading model for {self._capability_label(capability)}…",
+        )
+
+    def _emit_model_selected(self, capability: Optional[str], llm: BaseLLM) -> None:
+        """Surface the selected capability model as an SSE. Emitted once per
+        capability/request (a fan-out resolves the model once per document)."""
+        if not capability or self._model_event_seen(f"selected:{capability.lower()}"):
+            return
+        self._emit(
+            "model", "processing",
+            f"Selected {self._model_label(llm)} for {self._capability_label(capability)}",
         )
 
     # Thin forwarding for test compatibility (tests mock _call_tool_for_server)
@@ -297,6 +328,10 @@ class SLPOrchestrator:
         """
         self._progress_callback = progress_callback
         self._skill_report = None
+        # Per-request dedupe for model-selection SSEs: a capability's model is
+        # resolved once per DAG node (e.g. once per document in a fan-out), but
+        # the user only needs to be told which model was picked once per request.
+        self._emitted_model_events = set()
         logger.info(
             "[models] response=%s  agent=%s  large=%s",
             self._model_label(self.orchestrator_llm),

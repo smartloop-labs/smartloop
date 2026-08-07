@@ -463,7 +463,9 @@ class ModelService:
                     main_gguf = os.path.join(model_dir, f)
         return main_gguf, mmproj_gguf
 
-    def get_vision_llm(self) -> Optional[BaseLLM]:
+    def get_vision_llm(
+        self, on_model_selected: Optional[Callable[[str], None]] = None,
+    ) -> Optional[BaseLLM]:
         """Return a loaded *multimodal* vision LLM, or None when unavailable.
 
         Vision-capable models are considered largest-first (like the
@@ -475,11 +477,17 @@ class ModelService:
             arch-sniffed one; a missing handler is skipped, never crashed), and
           * it fits in available memory.
         Returns None when no candidate qualifies (callers fall back to text).
+
+        ``on_model_selected(model_name)`` — when supplied — fires with the name
+        of the model chosen, right before it is loaded (or immediately for an
+        already-resident one), so callers can surface it before the heavy load.
         """
         from smartloop.config.app_settings import AppSettings
         if not AppSettings().vision_enabled:
             return None
         if self._vision_llm is not None:
+            if on_model_selected and self._vision_model_name:
+                on_model_selected(self._vision_model_name)
             return self._vision_llm
         if not self._model or not self._model.workspace:
             return None
@@ -542,6 +550,11 @@ class ModelService:
                 transient_failure = True
                 continue
             clip_on_cpu = self._clip_on_cpu(gguf_path, cap)
+            # Announce the chosen model before the (heavy) load so callers can
+            # surface it immediately — this candidate passed every guard above,
+            # so it's the one that will load (barring a load-time exception).
+            if on_model_selected:
+                on_model_selected(ws_model.model_name)
             try:
                 llm = LlmFactory.get_llama_cpp_instance(
                     gguf_path, logger, self.get_project_id() or "",
@@ -3608,6 +3621,23 @@ class ModelService:
         re.IGNORECASE,
     )
 
+    @staticmethod
+    def _emit_progress(
+        progress_callback: Optional[Callable[[str, str, str], None]],
+        step: str, status: str, message: str,
+    ) -> None:
+        """Fire a progress/SSE event, swallowing any callback error.
+
+        A no-op when no callback is supplied; a failing callback must never
+        break orchestration.
+        """
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(step, status, message)
+        except Exception:
+            logger.debug("[progress] callback failed", exc_info=True)
+
     def orchestrate(
         self,
         user_message: str,
@@ -3662,8 +3692,17 @@ class ModelService:
         image_perception: Optional[str] = None
         image_sole_source: bool = False
         if images:
+            # Surface the vision model on the SSE stream naming the model that
+            # was actually picked, fired right before the (heavy) load. The
+            # vision path loads its model here, outside _llm_for_tier, so it
+            # must emit its own event.
+            def _on_vision_model(name: str) -> None:
+                self._emit_progress(progress_callback, "model", "processing",
+                                    f"Processing image with {name}")
             try:
-                image_perception = self.vision_perceive(user_message, images)
+                image_perception = self.vision_perceive(
+                    user_message, images, on_model_selected=_on_vision_model,
+                )
             except Exception as e:
                 logger.warning("[orchestrator] vision perception failed (%s) — "
                                "continuing without image context", e)
@@ -4214,6 +4253,7 @@ class ModelService:
         user_message: str,
         images: list[tuple[bytes, str]],
         max_tokens: int = 512,
+        on_model_selected: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Return a concrete description of ``images`` scoped to ``user_message``.
 
@@ -4225,13 +4265,17 @@ class ModelService:
         description-only prompt — see ``_VISION_PERCEPTION_PROMPT``.
         """
         prompt = self._VISION_PERCEPTION_PROMPT.format(request=user_message)
-        return self.vision_answer(prompt, images, max_tokens=max_tokens)
+        return self.vision_answer(
+            prompt, images, max_tokens=max_tokens,
+            on_model_selected=on_model_selected,
+        )
 
     def vision_answer(
         self,
         prompt: str,
         images: list[tuple[bytes, str]],
         max_tokens: int = 1024,
+        on_model_selected: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Return a vision-model answer to ``prompt`` about the given ``images``.
 
@@ -4248,7 +4292,7 @@ class ModelService:
         Raises ``RuntimeError`` when no vision-capable model is available so the
         caller can surface actionable guidance instead of a silent empty reply.
         """
-        llm = self.get_vision_llm()
+        llm = self.get_vision_llm(on_model_selected=on_model_selected)
         if llm is None:
             raise RuntimeError("No vision-capable model available")
 
