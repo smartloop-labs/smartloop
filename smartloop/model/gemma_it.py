@@ -32,7 +32,6 @@ class GemmaItModel(GenericModel):
             ModelCapability.GENERAL,
             ModelCapability.SKILLS,
             ModelCapability.DP,
-            ModelCapability.VISION,
         ]
 
     @staticmethod
