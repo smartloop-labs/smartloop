@@ -30,7 +30,7 @@ class Ministral3bModel(GenericModel):
     def default_capabilities() -> list[ModelCapability]:
         return [
             ModelCapability.GENERAL,
-            ModelCapability.DP,
+            ModelCapability.SKILLS,
             ModelCapability.VISION
         ]
 
