@@ -583,11 +583,13 @@ class ModelService:
     def _get_llm_for_capability(self, capability: str) -> Optional[BaseLLM]:
         """Return a loaded LLM matching the requested capability.
 
-        Uses ``workspace.best_model_for(capability)`` to find the best
-        enabled model that declares the capability.  Loads the GGUF
-        lazily and caches the result.  Returns ``None`` when no matching
-        model is available (caller should fall back to the default large
-        model).
+        Walks the capability's models largest-first (``ranked_models_for``,
+        biggest size then newer version) and returns the first that is already
+        resident or fits in memory — evicting prior-step capability models to
+        make room when needed.  When the largest doesn't fit it promotes down to
+        the next-largest same-capability model that does, rather than dropping
+        straight to the tiny default.  Returns ``None`` only when no capable
+        model fits (caller then falls back to the default/large model).
         """
         if not self._model or not self._model.workspace:
             logger.warning(
@@ -596,87 +598,89 @@ class ModelService:
             )
             return None
         workspace = self._model.workspace
-        ws_model = workspace.best_model_for(capability)
-        if not ws_model:
+        ranked = workspace.ranked_models_for(capability)
+        if not ranked:
             logger.warning(
                 "[capability-model] No enabled+downloaded model declares "
                 "capability '%s'", capability,
             )
             return None
-        cap_lower = capability.lower()
-        if cap_lower not in [c.lower() for c in ws_model.effective_capabilities]:
-            logger.warning(
-                "[capability-model] Best model %s does not declare "
-                "capability '%s' (has %s)",
-                ws_model.model_name, capability, ws_model.effective_capabilities,
-            )
-            return None
 
-        cache_key = f"_cap_llm_{ws_model.model_name}"
-        cached = getattr(self, cache_key, None)
-        if cached is _GPU_FAULTED:
-            # Evicted after a runtime GPU OOM — don't reload it, let the caller
-            # fall back to the default router model.
-            return None
-        if cached is not None:
-            return cached
+        from smartloop.config.app_settings import AppSettings
+        cap = AppSettings().llm_large_n_ctx_cap
 
-        try:
-            model_dir = workspace.model_dir_for(ws_model.model_id)
-            # _find_model_ggufs excludes the mmproj/CLIP GGUF from the main pick.
-            # This path is text-only capability routing (orchestrator); image OCR
-            # goes through get_vision_llm(), which loads the multimodal handler.
-            gguf_path, _mmproj = self._find_model_ggufs(model_dir)
-            if not gguf_path:
-                logger.warning(
-                    "[capability-model] No GGUF found for %s at %s — "
-                    "capability '%s' unavailable",
-                    ws_model.model_name, model_dir, capability,
-                )
-                return None
+        for ws_model in ranked:
+            cache_key = f"_cap_llm_{ws_model.model_name}"
+            cached = getattr(self, cache_key, None)
+            if cached is _GPU_FAULTED:
+                # Evicted after a runtime GPU OOM — don't reload it; try the
+                # next-smaller capable model instead of the tiny default.
+                continue
+            if cached is not None:
+                # Resident and already passed the fit guard when loaded — as the
+                # largest resident candidate, it's the best available.
+                return cached
 
-            from smartloop.config.app_settings import AppSettings
-            _s = AppSettings()
-            cap = _s.llm_large_n_ctx_cap
-            # Same fit guard as the default large model: skip the capability
-            # (4B) model when it won't fit, so the plan step falls back to the
-            # default routing model instead of OOM-ing. But first, since each
-            # step may use a different capability model, eagerly release the
-            # prior steps' models (and the on-demand large model) and retry —
-            # that frees enough VRAM to run the next step's model on a
-            # memory-tight device instead of degrading to the default.
-            if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
-                if not (
-                    self._evict_capability_models(keep_model_name=ws_model.model_name)
-                    and self._large_model_fits(gguf_path, cap, ws_model.model_name)
-                ):
+            try:
+                model_dir = workspace.model_dir_for(ws_model.model_id)
+                # _find_model_ggufs excludes the mmproj/CLIP GGUF from the main
+                # pick.  This path is text-only capability routing; image OCR
+                # goes through get_vision_llm(), which loads the multimodal
+                # handler.
+                gguf_path, _mmproj = self._find_model_ggufs(model_dir)
+                if not gguf_path:
                     logger.warning(
-                        "[capability-model] %s doesn't fit alongside the main "
-                        "model at n_ctx=%d — capability '%s' unavailable",
-                        ws_model.model_name, cap, capability,
+                        "[capability-model] No GGUF found for %s at %s — "
+                        "trying next-smaller model for capability '%s'",
+                        ws_model.model_name, model_dir, capability,
                     )
-                    return None
-                logger.info(
-                    "[capability-model] Freed prior-step models to fit %s "
-                    "for capability '%s'", ws_model.model_name, capability,
+                    continue
+
+                # Fit guard: skip a model that won't fit alongside the main
+                # model.  First eagerly release prior steps' capability models
+                # (and the on-demand large model) and retry — that frees enough
+                # VRAM to run this model on a memory-tight device.  If it still
+                # doesn't fit, promote down to the next-smaller candidate.
+                if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
+                    if not (
+                        self._evict_capability_models(keep_model_name=ws_model.model_name)
+                        and self._large_model_fits(gguf_path, cap, ws_model.model_name)
+                    ):
+                        logger.warning(
+                            "[capability-model] %s doesn't fit alongside the "
+                            "main model at n_ctx=%d — trying next-smaller model "
+                            "for capability '%s'",
+                            ws_model.model_name, cap, capability,
+                        )
+                        continue
+                    logger.info(
+                        "[capability-model] Freed prior-step models to fit %s "
+                        "for capability '%s'", ws_model.model_name, capability,
+                    )
+                from smartloop.llms.llm_factory import LlmFactory
+                llm = LlmFactory.get_llama_cpp_instance(
+                    gguf_path, logger, self.get_project_id() or "",
+                    max_n_ctx=cap,
                 )
-            from smartloop.llms.llm_factory import LlmFactory
-            llm = LlmFactory.get_llama_cpp_instance(
-                gguf_path, logger, self.get_project_id() or "",
-                max_n_ctx=cap,
-            )
-            setattr(self, cache_key, llm)
-            logger.info(
-                "[capability-model] Loaded %s for capability '%s'",
-                ws_model.model_name, capability,
-            )
-            return llm
-        except Exception as e:
-            logger.warning(
-                "[capability-model] Failed to load %s for capability '%s': %s",
-                ws_model.model_name, capability, e,
-            )
-            return None
+                setattr(self, cache_key, llm)
+                logger.info(
+                    "[capability-model] Loaded %s for capability '%s'",
+                    ws_model.model_name, capability,
+                )
+                return llm
+            except Exception as e:
+                logger.warning(
+                    "[capability-model] Failed to load %s for capability '%s': "
+                    "%s — trying next-smaller model", ws_model.model_name,
+                    capability, e,
+                )
+                continue
+
+        logger.info(
+            "[capability-model] No model declaring capability '%s' fits in "
+            "memory — falling back to the default/large model", capability,
+        )
+        return None
 
     @staticmethod
     def _device_free_total_gb() -> Optional[tuple[float, float]]:
@@ -820,45 +824,59 @@ class ModelService:
                     "router model for skills/synthesis"
                 )
                 return
-            # Rank by version first (a newer model wins even if smaller), then
-            # by size — and only load it when it actually out-ranks the router.
-            largest = max(skills_models, key=lambda m: m._rank)
-            largest.models_dir = workspace.models_dir
-            if largest._rank <= orchestrator_rank:
-                return
-
-            model_dir = workspace.model_dir_for(largest.model_id)
-            # Exclude the mmproj/CLIP GGUF — it is not loadable as a main model
-            # (e.g. gemma-3-4b-it ships one upstream even though we don't use it
-            # for vision); loading it as weights crashes the native loader.
-            gguf_path, _mmproj = self._find_model_ggufs(model_dir)
-            if not gguf_path:
-                logger.info("[large-model] GGUF not found for %s, skipping", largest.model_name)
-                return
+            # Rank by size first (largest wins), then newer version as a tie-
+            # break — largest-first — and walk down to the next-largest that fits
+            # in VRAM when the biggest doesn't, rather than skipping the large
+            # model entirely.  Only load one that actually out-ranks the router.
+            skills_models.sort(key=lambda m: m._rank, reverse=True)
 
             from smartloop.config.app_settings import AppSettings
-            _s = AppSettings()
-            cap = _s.llm_large_n_ctx_cap
+            cap = AppSettings().llm_large_n_ctx_cap
 
-            # Fit guard: skip the load when the large model's capped footprint
-            # won't fit in free VRAM after the reserve.  free VRAM already
-            # excludes the resident main model, so this is the room genuinely
-            # left for the agent model.
-            if not self._large_model_fits(gguf_path, cap, largest.model_name):
+            for largest in skills_models:
+                largest.models_dir = workspace.models_dir
+                # Sorted largest-first: once a candidate no longer out-ranks the
+                # router, none of the remaining (smaller) ones will either.
+                if largest._rank <= orchestrator_rank:
+                    break
+
+                model_dir = workspace.model_dir_for(largest.model_id)
+                # Exclude the mmproj/CLIP GGUF — it is not loadable as a main
+                # model (e.g. gemma-3-4b-it ships one upstream even though we
+                # don't use it for vision); loading it as weights crashes the
+                # native loader.
+                gguf_path, _mmproj = self._find_model_ggufs(model_dir)
+                if not gguf_path:
+                    logger.info(
+                        "[large-model] GGUF not found for %s, trying next-smaller",
+                        largest.model_name,
+                    )
+                    continue
+
+                # Fit guard: skip a model whose capped footprint won't fit in
+                # free VRAM after the reserve (free VRAM already excludes the
+                # resident main model).  When it doesn't fit, promote down to the
+                # next-largest skills model instead of dropping the large model.
+                if not self._large_model_fits(gguf_path, cap, largest.model_name):
+                    logger.info(
+                        "[large-model] %s doesn't fit — trying next-smaller "
+                        "skills model", largest.model_name,
+                    )
+                    continue
+
+                logger.info(
+                    "[large-model] Loading larger model on demand: %s (%.0fB) > "
+                    "router %s (%.0fB), n_ctx<=%d — %s",
+                    largest.model_name, largest.param_size_b,
+                    self._model_name or "?", orchestrator_size, cap, gguf_path,
+                )
+                from smartloop.llms.llm_factory import LlmFactory
+                self._large_llm = LlmFactory.get_llama_cpp_instance(
+                    gguf_path, logger, self.get_project_id() or "", max_n_ctx=cap,
+                )
+                self._large_model_name = largest.model_name
+                logger.info("[large-model] Loaded %s for agent/skill tasks", largest.model_name)
                 return
-
-            logger.info(
-                "[large-model] Loading larger model on demand: %s (%.0fB) > router "
-                "%s (%.0fB), n_ctx<=%d — %s",
-                largest.model_name, largest.param_size_b,
-                self._model_name or "?", orchestrator_size, cap, gguf_path,
-            )
-            from smartloop.llms.llm_factory import LlmFactory
-            self._large_llm = LlmFactory.get_llama_cpp_instance(
-                gguf_path, logger, self.get_project_id() or "", max_n_ctx=cap,
-            )
-            self._large_model_name = largest.model_name
-            logger.info("[large-model] Loaded %s for agent/skill tasks", largest.model_name)
         except Exception as e:
             logger.warning("[large-model] Failed to load larger model: %s", e)
             self._large_llm = None
@@ -2399,6 +2417,23 @@ class ModelService:
         """Check if a model is currently loaded"""
         return self._llm is not None
 
+    @staticmethod
+    def _model_label(llm: BaseLLM) -> str:
+        """Human-readable name for a loaded LLM, from its GGUF metadata.
+
+        Falls back to the class name when metadata is unavailable so the
+        response log always names *something* concrete.
+        """
+        try:
+            meta = llm.model.metadata
+            name = meta.get("general.name", "")
+            size = meta.get("general.size_label", "")
+            if name:
+                return f"{name} ({size})" if size else name
+        except Exception:
+            pass
+        return type(llm).__name__
+
     def _llm_for_response(self, capability: Optional[str]) -> Optional[BaseLLM]:
         """Return the LLM to use for the final response.
 
@@ -2495,6 +2530,11 @@ class ModelService:
         llm = self._llm_for_response(capability)
         if llm is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        logger.info(
+            "[models] RESPONSE → %s (capability=%s)",
+            self._model_label(llm), capability,
+        )
 
         # Lock around inference - llama-cpp is not thread-safe
         with self._inference_lock:
