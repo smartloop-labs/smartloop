@@ -112,6 +112,18 @@ class SLPOrchestrator:
     # nothing is dropped.
     DOC_FANOUT_THRESHOLD = 1
 
+    # Output cap for decision/classification LLM calls (yes/no, relevance, a
+    # short condition question).  Their answer is a handful of tokens, but
+    # without a cap the model may fail to emit a stop token and ramble up to the
+    # full context window — and with several matched skills those runaways stack
+    # into a multi-minute stall.  Content-generating calls (extract/analyze/
+    # synthesize) are intentionally NOT capped here: they stay bounded by the
+    # model's context window (see llama_cpp._get_available_tokens) so capping
+    # would only risk truncating a legitimate answer.
+    DECISION_MAX_TOKENS = 64
+    # Cap for short free-text extractions (e.g. a 1-3 sentence formatting hint).
+    SHORT_TEXT_MAX_TOKENS = 256
+
     def _llm_for_tier(self, tier: ModelTier, capability: Optional[str] = None) -> BaseLLM:
         if tier == ModelTier.LARGE:
             if capability and self._capability_llm_provider is not None:
@@ -1842,7 +1854,9 @@ Is this context relevant to the user's request?
 </user>"""
 
             try:
-                result = str(self.agent_llm.invoke(prompt)).strip().upper()
+                result = str(self.agent_llm.invoke(
+                    prompt, max_tokens=self.DECISION_MAX_TOKENS,
+                )).strip().upper()
                 if "NOT_RELEVANT" in result:
                     search_ctx.feedback_context = ""
                     search_ctx.workspace_context = ""
@@ -2171,7 +2185,9 @@ Is this context relevant to the user's request?
         )
 
         try:
-            response = str(self.agent_llm.invoke(prompt)).strip()
+            response = str(self.agent_llm.invoke(
+                prompt, max_tokens=self.DECISION_MAX_TOKENS,
+            )).strip()
             logger.info(f"[condition-extract] LLM response: {response[:120]}")
 
             if not response or "none" in response.lower()[:20]:
@@ -2401,7 +2417,9 @@ Is this context relevant to the user's request?
         )
 
         try:
-            result = str(self.agent_llm.invoke(prompt)).strip()
+            result = str(self.agent_llm.invoke(
+                prompt, max_tokens=self.SHORT_TEXT_MAX_TOKENS,
+            )).strip()
             if not result or "none" in result.lower()[:10]:
                 return None
             logger.info(f"[skill] compact instruction: {result[:200]}")
@@ -2574,7 +2592,9 @@ Is this context relevant to the user's request?
                 "YES or NO?"
             )
             try:
-                response = str(self.orchestrator_llm.invoke(prompt)).strip().upper()
+                response = str(self.orchestrator_llm.invoke(
+                    prompt, max_tokens=self.DECISION_MAX_TOKENS,
+                )).strip().upper()
                 # Fail-open: only skip if the LLM explicitly says NO
                 # without any YES. This handles ambiguous responses by
                 # defaulting to execute.

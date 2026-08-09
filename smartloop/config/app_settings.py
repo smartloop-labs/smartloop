@@ -168,6 +168,17 @@ class AppSettings(BaseSettings):
         default=None, validation_alias="slp_decision_model",
         description="Small model for decision nodes. Falls back to main model.",
     )
+    # Wall-clock budget (seconds) for a single orchestration pass (planning +
+    # tool/skill execution) before the streaming chat endpoint cancels it and
+    # surfaces a timeout.  A native llama.cpp inference call can't be preempted
+    # mid-token, so this bounds a stuck/runaway step (e.g. a small model that
+    # never emits a stop token while executing several matched skills) instead
+    # of hanging the client forever.  0 disables the watchdog.
+    orchestrate_timeout_s: float = Field(
+        default=180.0,
+        validation_alias="slp_orchestrate_timeout_s",
+        description="Max seconds for one orchestration pass before it is cancelled; 0 disables.",
+    )
     # Vector store backend for document/feedback/workspace retrieval.  Both do
     # dense (semantic relevancy) search — retrieval is fundamentally a
     # relevancy match, so dense handles paraphrases / different languages — with

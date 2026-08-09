@@ -146,20 +146,15 @@ class WorkspaceModel(BaseModel):
         return 0
 
     @property
-    def _rank(self) -> tuple[int, float]:
-        """Selection rank: higher model version wins first, then larger size."""
-        return (self.model_version, self.param_size_b)
+    def _rank(self) -> tuple[float, int]:
+        """Selection rank: larger size wins first, then newer model version.
 
-    @property
-    def _rank_speed(self) -> tuple[float, int]:
-        """Selection rank where the fastest model wins first, then newer version.
-
-        Used for DP and VISION: both run locally, so latency matters more than
-        the marginal quality gain of a bigger model. Fewer parameters → faster,
-        so a 2B model is chosen over a 3B one; ties break toward the newer
-        version. Negated size makes "smaller" rank higher under ``reverse=True``.
+        Size is the primary key so the most capable (largest) model is always
+        preferred; the model version only breaks a tie between two models of the
+        same parameter count.  (A newer but *smaller* model therefore does NOT
+        outrank a larger older one — selection favors capacity over generation.)
         """
-        return (-self.param_size_b, self.model_version)
+        return (self.param_size_b, self.model_version)
 
     @property
     def effective_capabilities(self) -> List[str]:
@@ -358,8 +353,8 @@ class Workspace(BaseModel):
     def largest_downloaded_model(self) -> Optional[WorkspaceModel]:
         """Return the best enabled, downloaded model, or None.
 
-        Ranks by model version first (a newer version always wins, even with
-        a smaller parameter count), then by parameter count.
+        Ranks by parameter count first (the largest model wins), then by model
+        version as a tie-breaker between same-size models.
         """
         candidates = [m for m in self.models if m.enabled and m.downloaded and m.param_size_b > 0]
         if not candidates:
@@ -369,24 +364,14 @@ class Workspace(BaseModel):
         best.models_dir = self.models_dir
         return best
 
-    # Capabilities that pick the *fastest* model (fewest params, then newest
-    # version) instead of the newest-then-largest default. DP and VISION both
-    # run locally and are latency-sensitive, so speed beats the marginal quality
-    # gain of a bigger model — one uniform rule for both.
-    _SPEED_FIRST_CAPABILITIES = frozenset({
-        ModelCapability.DP.value,
-        ModelCapability.VISION.value,
-    })
+    def ranked_models_for(self, capability: str) -> List["WorkspaceModel"]:
+        """Enabled, downloaded models declaring *capability*, best-first.
 
-    def best_model_for(self, capability: str) -> Optional[WorkspaceModel]:
-        """Return the best enabled, downloaded model matching a capability.
-
-        Among models that declare the capability (user-set or inferred), DP and
-        VISION prefer the *fastest* model (fewest params, then newer version),
-        because they run locally and latency matters more than the small quality
-        gain of a bigger model; general/skills prefer the newest version, then
-        the largest. Falls back to ``largest_downloaded_model`` when no model
-        matches.
+        Ranked by :attr:`WorkspaceModel._rank` (larger size first, then newer
+        version), so the most capable model leads. Callers walk this list down to
+        a smaller same-capability model when the largest doesn't fit in memory,
+        rather than dropping straight to the tiny default. Empty when no
+        downloaded model declares the capability.
         """
         cap = capability.lower()
         candidates = [
@@ -394,17 +379,23 @@ class Workspace(BaseModel):
             if m.enabled and m.downloaded and m.param_size_b > 0
             and cap in [c.lower() for c in m.effective_capabilities]
         ]
-        if not candidates:
-            return self.largest_downloaded_model()
-        rank = (
-            (lambda m: m._rank_speed)
-            if cap in self._SPEED_FIRST_CAPABILITIES
-            else (lambda m: m._rank)
-        )
-        candidates.sort(key=rank, reverse=True)
-        best = candidates[0]
-        best.models_dir = self.models_dir
-        return best
+        candidates.sort(key=lambda m: m._rank, reverse=True)
+        for m in candidates:
+            m.models_dir = self.models_dir
+        return candidates
+
+    def best_model_for(self, capability: str) -> Optional[WorkspaceModel]:
+        """Return the single best model for a capability — the largest (by
+        size, then newer version) that declares it — or the largest downloaded
+        model when none declares it.
+
+        Memory is NOT considered here; callers that must fit the model in VRAM
+        use :meth:`ranked_models_for` and walk down to a smaller candidate.
+        """
+        ranked = self.ranked_models_for(capability)
+        if ranked:
+            return ranked[0]
+        return self.largest_downloaded_model()
 
     def model_dir_for(self, model_id: str) -> str:
         """Return the workspace-level directory for a given model_id."""

@@ -254,7 +254,7 @@ async def list_workspace_models(
         settings = AppSettings()
         bootstrap_model = settings.default_model
         workspace = model_service._ensure_workspace()
-        # Best model first: newest version, then larger size (see _rank).
+        # Best model first: largest size, then newer version (see _rank).
         models = sorted(
             (m for m in workspace.models if m.model_name != bootstrap_model),
             key=lambda m: m._rank, reverse=True,

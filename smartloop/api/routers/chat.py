@@ -418,7 +418,52 @@ async def stream_chunks(
             ),
         )
 
+        from smartloop.config.app_settings import AppSettings
+        _orch_timeout = AppSettings().orchestrate_timeout_s
+        _deadline = loop.time() + _orch_timeout if _orch_timeout > 0 else None
+
         while not orchestrate_future.done():
+            if _deadline is not None and loop.time() > _deadline:
+                # A native llama.cpp call can't be preempted mid-token, so we
+                # signal cancellation (checked between chunks) and stop waiting
+                # rather than hang the client. We don't await the future — a
+                # truly stuck call would block forever; the executor thread
+                # unwinds on its own once the current chunk returns.
+                cancelled.set()
+                logger.error(
+                    "[orchestrate] exceeded %.0fs budget — cancelling and "
+                    "returning a timeout to the client", _orch_timeout,
+                )
+                # Drain any progress events already queued before giving up.
+                while not status_queue.empty():
+                    yield status_queue.get_nowait()
+                yield _status_event(
+                    "tools", "error",
+                    f"Orchestration timed out after {_orch_timeout:.0f}s",
+                )
+                timeout_chunk = ChatCompletionChunk(
+                    model=request.model,
+                    choices=[ChunkChoice(
+                        index=0,
+                        delta=DeltaContent(
+                            role="assistant",
+                            content=(
+                                "**Request timed out.**\n\n"
+                                "The assistant took too long analyzing and "
+                                "running the matched skills/tools and was "
+                                "stopped. This often means the loaded model is "
+                                "too small to synthesize the gathered context. "
+                                "Try a simpler request, or enable a larger "
+                                "model in **Settings → Models**."
+                            ),
+                        ),
+                        finish_reason="stop",
+                    )],
+                )
+                yield f"data: {timeout_chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+                model_service.unload_auxiliary_models()
+                return
             try:
                 event = await asyncio.wait_for(status_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
@@ -533,9 +578,11 @@ async def stream_chunks(
     yield _status_event("preparing", "completed", "Preparing response...")
 
     response_capability = ModelCapability.GENERAL if orchestrator_context else None
-    logger.info(
-        "[models] RESPONSE → main LLM (model_service._model_name=%s, capability=%s)",
-        getattr(model_service, '_model_name', '?'), response_capability,
+    # The concrete model is resolved (capability → large → default) inside
+    # stream_completion, which logs the actual `[models] RESPONSE → ...` there.
+    logger.debug(
+        "[models] dispatching response synthesis (capability=%s)",
+        response_capability,
     )
 
     # Store the user message in session history
