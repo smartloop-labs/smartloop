@@ -235,13 +235,15 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-# Do NOT strip on Linux. numpy 2.x ships libscipy_openblas64_*.so built with a
+# Never strip. On Linux, numpy 2.x ships libscipy_openblas64_*.so built with a
 # large ELF max-page-size; GNU strip on the build host rewrites it with
 # non-page-aligned load segments, so the loader rejects it at runtime with
 # "ELF load command address/offset not page-aligned" — which numpy rewraps as
-# the misleading "import numpy from its source directory" ImportError. Stripping
-# stays enabled on macOS (Accelerate-backed numpy, no OpenBLAS) to keep size down.
-_strip = sys.platform == 'darwin'
+# the misleading "import numpy from its source directory" ImportError. On macOS,
+# stripping libtorch_cpu.dylib corrupts it enough that PyTorch's MPS Metal-shader
+# JIT segfaults (SIGSEGV) at inference time — a crash seen only in the packaged
+# build, never when running from the pristine venv wheels. Keep symbols intact.
+_strip = False
 
 exe = EXE(
     pyz,
@@ -252,7 +254,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=_strip,
-    upx=True,
+    upx=False,
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -265,7 +267,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=_strip,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='slp',
 )
