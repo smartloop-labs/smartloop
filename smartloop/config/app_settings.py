@@ -118,24 +118,31 @@ class AppSettings(BaseSettings):
         validation_alias="slp_doc_extract_max_chars",
         description="Hard cap on fan-out extraction characters; 0 = derive from the extractor context.",
     )
-    # Device for the sentence-transformer embedding model (chroma backend).
-    # Defaults to CPU so it doesn't compete with the LLM copies for VRAM —
-    # the GPU is reserved for the generative model(s).  Set to "cuda" only
-    # when there's spare VRAM.  "auto" lets sentence-transformers choose.
+    # Device/offload for the GGUF embedding model.  "auto" (default) offloads
+    # fully to the GPU (Metal/Vulkan) — BGE-M3 is small (~400MB) and its encoder
+    # is compute-heavy, so the GPU is worth it.  Set to "cpu" on memory-tight
+    # devices to keep the GPU budget entirely for the generative model(s);
+    # "cpu" runs the embedder with no GPU offload (n_gpu_layers=0).
     embedding_device: str = Field(
-        default="cpu",
+        default="auto",
         validation_alias="slp_embedding_device",
-        description='Device for the embedding model: "cpu" (default), "cuda", or "auto".',
+        description='Embedding device: "auto" (GPU offload, default) or "cpu".',
     )
-    # Sentence-transformer model for dense retrieval.  Defaults to the
-    # MULTILINGUAL paraphrase model so a query in one language matches
-    # documents in another (and paraphrases match).  Changing this requires
-    # re-embedding stored documents — the sqlite store detects the change and
-    # recomputes automatically.
-    embedding_model: str = Field(
-        default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-        validation_alias="slp_embedding_model",
-        description="Sentence-transformer model name for dense retrieval.",
+    # GGUF embedding model for dense retrieval, run on the bundled llama.cpp
+    # Metal/Vulkan backend (no torch).  Defaults to BGE-M3, which is MULTILINGUAL
+    # so a query in one language matches documents in another (and paraphrases
+    # match); Q4_K_M keeps the download/bundle small (~417MB).  Changing the
+    # model changes the vector space, so the sqlite store detects the change via
+    # the active embedding identity and re-embeds automatically.
+    embedding_gguf_repo: str = Field(
+        default="gpustack/bge-m3-GGUF",
+        validation_alias="slp_embedding_gguf_repo",
+        description="HF repo id of the GGUF embedding model (llama-cpp backend).",
+    )
+    embedding_gguf_file: str = Field(
+        default="bge-m3-Q4_K_M.gguf",
+        validation_alias="slp_embedding_gguf_file",
+        description="GGUF filename within the repo.",
     )
     # Document parsing uses MarkItDown for fast text extraction and pushes OCR /
     # image understanding to a vision-capable model (selected by the "vision"
@@ -179,20 +186,6 @@ class AppSettings(BaseSettings):
         validation_alias="slp_orchestrate_timeout_s",
         description="Max seconds for one orchestration pass before it is cancelled; 0 disables.",
     )
-    # Vector store backend for document/feedback/workspace retrieval.  Both do
-    # dense (semantic relevancy) search — retrieval is fundamentally a
-    # relevancy match, so dense handles paraphrases / different languages — with
-    # a keyword-coverage boost for entity precision.
-    #   "sqlite" — SQLite-stored embeddings + numpy cosine (default; no extra
-    #              deps, falls back to TF-IDF only if the embedding model can't
-    #              load).
-    #   "chroma" — embedded ChromaDB (HNSW index; requires the chromadb
-    #              package).
-    vector_store_backend: str = Field(
-        default="sqlite", validation_alias="slp_vector_store_backend",
-        description='Vector store backend: "sqlite" or "chroma" (both dense).',
-    )
-
     @model_validator(mode="after")
     def _resolve_defaults(self) -> "AppSettings":
         """Resolve defaults that depend on other fields."""
@@ -200,13 +193,6 @@ class AppSettings(BaseSettings):
             self.developer_token = credential_store.get_active_token()
         if self.n_llm_workers is None:
             self.n_llm_workers = self.n_parallel
-        backend = (self.vector_store_backend or "sqlite").strip().lower()
-        if backend not in ("sqlite", "chroma"):
-            raise ValueError(
-                f"Invalid vector_store_backend {self.vector_store_backend!r} — "
-                'expected "sqlite" or "chroma".'
-            )
-        self.vector_store_backend = backend
         return self
 
     @property
