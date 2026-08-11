@@ -1398,7 +1398,11 @@ Assess whether these search results are relevant to the user's request. If relev
                 available_servers=ctx.available_servers,
                 cwd=ctx.effective_cwd,
                 previous_results=prev_results if prev_results else None,
-                document_context=ctx.document_context,
+                # Prefer the reduced document context (the DP model's extraction,
+                # written to search_ctx.vector_context by the doc-reduce node) so a
+                # skill step running on a *different* model still sees it — matching
+                # the plan-build path. Fall back to the original doc context.
+                document_context=search_ctx.vector_context or ctx.document_context,
                 project_dir=ctx.project_dir,
                 model_service=ctx.model_service,
                 llm=exec_llm,
@@ -1797,6 +1801,13 @@ Assess whether these search results are relevant to the user's request. If relev
             synthesized = None
             if ctx.skill_context and all_accumulated:
                 parts = [r["content"] for r in all_accumulated if r["content"]]
+                # Include the reduced document context (the DP model's extraction)
+                # in the synthesis input so a skill run on a *different* model
+                # still grounds its answer in the processed documents. Skip when a
+                # step already carried it forward to avoid duplicating the text.
+                doc_ctx = search_ctx.vector_context
+                if doc_ctx and not any(doc_ctx in p for p in parts):
+                    parts.insert(0, doc_ctx)
                 if parts:
                     self._emit(
                         "synthesize", "processing",
@@ -2368,11 +2379,16 @@ Is this context relevant to the user's request?
         )
 
         try:
+            # Synthesis writes the final skill answer, so use the ranked large
+            # model for the skills capability (largest-first via ranked_models_for),
+            # not the small orchestrator. Falls back to the large/agent model when
+            # no skills-capable model fits.
+            synth_llm = self._llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
             logger.info(
-                "[models] SYNTHESIZE → agent_llm: %s",
-                self._model_label(self.agent_llm),
+                "[models] SYNTHESIZE → %s",
+                self._model_label(synth_llm),
             )
-            result = str(self.agent_llm.invoke(prompt)).strip()
+            result = str(synth_llm.invoke(prompt)).strip()
             if result:
                 logger.info(
                     f"[synthesize] produced {len(result)} chars "
