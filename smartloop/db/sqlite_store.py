@@ -242,8 +242,8 @@ class IndexStore(VectorStore):
         # Clear stored embeddings if the configured embedding model changed
         # (e.g. switching to the multilingual model) so they're recomputed.
         try:
-            from smartloop.db.embeddings import _MODEL_NAME as _emb_model
-            _ensure_embedding_model(self._db_path, _emb_model)
+            from smartloop.db.embeddings import active_embedding_identity
+            _ensure_embedding_model(self._db_path, active_embedding_identity())
         except Exception:
             pass
 

@@ -31,6 +31,25 @@ _skills_dir = Path('.') / 'smartloop' / 'skills'
 if _skills_dir.exists():
     datas.append((str(_skills_dir), 'smartloop/skills'))
 
+# Bundle the GGUF embedding model so a packaged install works offline with no
+# first-run download.  Placed at <bundle>/embeddings/<file>, which
+# smartloop.db.llama_embeddings._bundled_gguf_path() resolves via sys._MEIPASS.
+# Repo/file mirror the app defaults (override via SLP_EMBEDDING_GGUF_* to match a
+# customised default).  Best-effort: if the download fails the app still fetches
+# it at runtime, so the build doesn't hard-fail on a transient HF outage.
+try:
+    from huggingface_hub import hf_hub_download
+    _emb_repo = os.environ.get('SLP_EMBEDDING_GGUF_REPO', 'gpustack/bge-m3-GGUF')
+    _emb_file = os.environ.get('SLP_EMBEDDING_GGUF_FILE', 'bge-m3-Q4_K_M.gguf')
+    _emb_gguf = hf_hub_download(repo_id=_emb_repo, filename=_emb_file)
+    datas.append((_emb_gguf, 'embeddings'))
+    print(f"[spec] Bundled embedding model {_emb_repo}/{_emb_file}")
+except Exception as _emb_exc:
+    print(
+        f"[spec] WARNING: could not bundle embedding GGUF ({_emb_exc}); "
+        "the app will download it at first use."
+    )
+
 # Include package metadata required at runtime (importlib.metadata lookups)
 for pkg in ['docling-slim', 'docling-core', 'docling-parse']:
     try:
@@ -129,13 +148,6 @@ elif sys.platform == 'darwin':
             'under /opt/homebrew or /usr/local (brew install molten-vk)'
         )
 
-try:
-    import chromadb
-    chromadb_dir = Path(chromadb.__file__).parent
-    datas.append((str(chromadb_dir), 'chromadb'))
-except ImportError:
-    pass
-
 # Collect rich unicode data (dynamically imported via importlib, filenames contain hyphens)
 try:
     import rich._unicode_data as _rud
@@ -200,25 +212,13 @@ a = Analysis(
         'docling.models.plugins.defaults',
         'docling.pipeline.base_pipeline',
         'easyocr',
-        'chromadb',
-        'chromadb.config',
-        'chromadb.api',
-        'chromadb.db',
-        'chromadb.db.impl',
-        'chromadb.db.impl.sqlite',
-        'chromadb.segment',
-        'chromadb.telemetry',
-        'chromadb.telemetry.product.posthog',
-        'chromadb.api.rust',
-        'chromadb_rust_bindings',
-        'posthog',
         'pysqlite3',
         'sqlite3',
         'multipart',
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=['hooks/rthook_utf8.py', 'hooks/rthook_chroma_telemetry.py', 'hooks/rthook_vulkan_icd.py'],
+    runtime_hooks=['hooks/rthook_utf8.py', 'hooks/rthook_vulkan_icd.py'],
     excludes=[
         '.venv',
         'venv',

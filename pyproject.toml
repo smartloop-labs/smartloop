@@ -17,9 +17,7 @@ dependencies = [
     "huggingface-hub>=0.20.0",
     "mistral-common[image]>=1.8.6",
 
-    # Language Models and Embeddings
-    "sentence-transformers>=2.2.0",
-    "chromadb>=0.4.0",
+    # Embeddings run on llama.cpp (GGUF); see smartloop/db/llama_embeddings.py.
 
     # LangChain Framework
     "langchain>=0.3.27",
