@@ -222,6 +222,11 @@ a = Analysis(
     excludes=[
         '.venv',
         'venv',
+        # We ship a CPU-only torch (GPU inference is Vulkan via llama.cpp), so
+        # the nvidia-cu12 CUDA runtime packages should never be present. Exclude
+        # them as a guard so a stray CUDA torch can't balloon the bundle by >1GB.
+        'nvidia',
+        'triton',
         'tensorflow',
         'tf_keras',
         'keras',

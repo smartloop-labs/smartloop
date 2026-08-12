@@ -98,6 +98,15 @@ venv:
 
 install: venv
 	@echo "=== Installing requirements ==="
+ifeq ($(PLATFORM),linux)
+	@# The default PyPI torch wheel on Linux is the CUDA build: it pulls
+	@# nvidia-cu12 runtime libs (cuBLAS/cuDNN/cudart, >1GB) that PyInstaller then
+	@# bundles. Our only GPU backend is Vulkan (llama.cpp); torch runs CPU-only
+	@# for EasyOCR/docling. Pre-install the CPU wheel so the requirements.txt pin
+	@# is already satisfied and no CUDA libs ever land in the tree.
+	@echo "=== Installing CPU-only torch (Vulkan is the GPU backend; no CUDA) ==="
+	$(PIP) install "torch>=2.5.1" --index-url=https://download.pytorch.org/whl/cpu
+endif
 	$(PIP) install -r requirements.txt --index-url=https://pypi.org/simple
 
 build: install
