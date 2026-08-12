@@ -86,7 +86,11 @@ jobs:
           find dist/slp/_internal -name "libvulkan.so*" | grep -q . || { echo "FAIL: libvulkan.so (Vulkan loader) not bundled into the dist"; exit 1; }
           missing="$(LD_LIBRARY_PATH="$PWD/dist/slp/_internal:$PWD/dist/slp/_internal/llama_cpp/lib" ldd "$VULKAN_SO" | awk '/not found/{print $1}' || true)"
           [ -z "$missing" ] || { echo "FAIL: unresolved deps:"; echo "$missing"; exit 1; }
-          echo "OK: slp $VER, Vulkan backend present, loader bundled."
+          # GPU inference is Vulkan; torch is CPU-only. If a CUDA torch sneaks
+          # back in it drags >1GB of nvidia-cu12 runtime libs into the bundle.
+          cuda="$(find dist/slp/_internal \( -name 'libcud*.so*' -o -name 'libcublas*.so*' -o -name 'libnvrtc*.so*' \) 2>/dev/null || true)"
+          [ -z "$cuda" ] || { echo "FAIL: CUDA libs bundled (expected CPU-only torch):"; echo "$cuda"; exit 1; }
+          echo "OK: slp $VER, Vulkan backend present, loader bundled, no CUDA libs."
 
       - name: Archive
         run: make archive
