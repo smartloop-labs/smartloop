@@ -56,6 +56,7 @@ class MCPConnectResult:
     server_info: Optional[MCPServerInfo] = None
     error: Optional[str] = None
     resource_hint: Optional[str] = None  # resource URI from 401 WWW-Authenticate
+    resource_metadata_url: Optional[str] = None  # PRM metadata URL from 401 WWW-Authenticate
 
 
 @dataclass
@@ -115,6 +116,26 @@ class MCPClient:
         if match:
             return match.group(1)
         match = re.search(r'resource=(\S+)', www_authenticate)
+        if match:
+            return match.group(1).rstrip(',')
+        return None
+
+    @staticmethod
+    def _parse_resource_metadata_from_www_authenticate(www_authenticate: str) -> Optional[str]:
+        """Parse the PRM metadata URL from a WWW-Authenticate header (RFC 9728 §5.1).
+
+        The server advertises the Protected Resource Metadata location via
+        ``resource_metadata="<url>"``. This is distinct from the RFC 8707
+        ``resource=`` field parsed by :meth:`_parse_resource_from_www_authenticate`.
+        """
+        if not www_authenticate:
+            return None
+        # Match resource_metadata="..." or resource_metadata=<non-whitespace>.
+        # The literal ``_metadata`` suffix keeps this from matching the plain ``resource=`` field.
+        match = re.search(r'resource_metadata="([^"]+)"', www_authenticate)
+        if match:
+            return match.group(1)
+        match = re.search(r'resource_metadata=(\S+)', www_authenticate)
         if match:
             return match.group(1).rstrip(',')
         return None
@@ -312,8 +333,14 @@ class MCPClient:
             resource_hint = self._parse_resource_from_www_authenticate(
                 e.www_authenticate
             ) if e.www_authenticate else None
+            resource_metadata_url = self._parse_resource_metadata_from_www_authenticate(
+                e.www_authenticate
+            ) if e.www_authenticate else None
             return MCPConnectResult(
-                success=False, error=str(e), resource_hint=resource_hint
+                success=False,
+                error=str(e),
+                resource_hint=resource_hint,
+                resource_metadata_url=resource_metadata_url,
             )
         except MCPProtocolError as e:
             return MCPConnectResult(success=False, error=str(e))

@@ -165,6 +165,7 @@ async def _register_remote_mcp_server(
     )
 
     # Try direct connection (no auth or token)
+    connect_result = None
     try:
         with MCPClient() as client:
             connect_result = client.connect_and_discover_tools(
@@ -213,7 +214,10 @@ async def _register_remote_mcp_server(
             oauth_metadata = None
             prm = None
             try:
-                prm = oauth.discover_protected_resource_metadata(clean_url)
+                prm = oauth.discover_protected_resource_metadata(
+                    clean_url,
+                    metadata_url=getattr(connect_result, "resource_metadata_url", None),
+                )
                 if prm.authorization_servers:
                     oauth_metadata = oauth.discover_oauth_metadata(
                         prm.authorization_servers[0]
