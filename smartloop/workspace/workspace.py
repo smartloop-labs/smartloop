@@ -76,6 +76,7 @@ class MCPServer(BaseModel):
     pkg: Optional[str] = None
     description: Optional[str] = None
     summary: Optional[str] = None
+    tags: List[str] = []
     config: Optional[MCPServerConfig] = None
     server_type: MCPServerType = MCPServerType.LOCAL
     remote_config: Optional[RemoteMCPServerConfig] = None
