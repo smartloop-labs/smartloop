@@ -298,7 +298,33 @@ class ModelService:
             project = next((p for p in workspace.projects if p.id == project_id), None)
         if project is None:
             raise ValueError(f"Project not found: {project_id}")
+        self._sweep_legacy_fetch_server(project)
         return project
+
+    def _sweep_legacy_fetch_server(self, project: "Project") -> None:
+        """Drop the obsolete built-in ``__fetch__`` MCP server from a project.
+
+        URL fetching moved to the in-process FetchAgent, but projects created
+        before that change still carry a persisted ``__fetch__`` entry that shows
+        up in MCP listings. ``remove_fetch_server`` only sweeps the actively
+        loaded project (via ``_setup_project_tools``), so wild projects that are
+        merely listed never got cleaned. Sweep on every project access so they
+        self-heal. Idempotent — only writes when an entry is actually removed,
+        so it costs one save per stale project and nothing thereafter.
+        """
+        if not any(s.id == FETCH_SERVER_ID for s in project.mcp_servers):
+            return
+        project.mcp_servers = [
+            s for s in project.mcp_servers if s.id != FETCH_SERVER_ID
+        ]
+        try:
+            self._model.save()
+            logger.info("Swept legacy fetch server from project %s", project.id)
+        except Exception as e:
+            # Never let a persistence hiccup break project lookup.
+            logger.warning(
+                "Failed to persist legacy fetch sweep for %s: %s", project.id, e
+            )
 
     def load_model(self) -> BaseLLM:
         """
