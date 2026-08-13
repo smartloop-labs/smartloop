@@ -23,6 +23,7 @@ class MCPServerResponse(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
+    tags: List[str] = []
     command: Optional[str] = None
     args: List[str] = []
     cwd: Optional[str] = None
