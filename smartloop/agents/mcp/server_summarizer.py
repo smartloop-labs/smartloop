@@ -42,11 +42,9 @@ class MCPServerSummarizer:
             "</system>\n"
             "<user>\n"
             "Given this MCP server and its tools, output a JSON object with:\n"
-            '- "description": one short action phrase (about 12 words max) '
-            "describing what the tools listed below let the assistant do. Base it "
-            "ONLY on this server's tools — do not mention unrelated products. "
-            "Begin with a verb. Do NOT begin with \"This connector\", "
-            '"Provides tools for", or the server name, and do not end with a period.\n'
+            '- "description": one clear sentence describing what this server does '
+            "and what its tools let the assistant do, based only on the tools "
+            "listed below.\n"
             '- "tags": an array of 1 to 3 short, lowercase, single-word topical '
             "tags derived from this server's tools.\n\n"
             f"Name: {server.name}\n"
