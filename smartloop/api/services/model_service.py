@@ -3117,6 +3117,8 @@ class ModelService:
             ],
             server_info=server_info,
         )
+        self._enrich_mcp_server(server)
+
         current_project.mcp_servers.append(server)
         self._model.save()
         self._index_mcp_tools(current_project, server)
@@ -3275,11 +3277,15 @@ class ModelService:
             discovery_error = result.error or "tool discovery failed"
 
         if discovery_error is not None:
-            message = (
-                f"Could not discover tools from local MCP server '{name}': {discovery_error}"
+            # Keep the full raw error (often a multi-line traceback) in the logs,
+            # but hand the client a short, human-readable reason.
+            logger.warning(
+                "Could not discover tools from local MCP server '%s': %s",
+                name, discovery_error,
             )
-            logger.warning(message)
-            raise MCPDiscoveryError(message)
+            raise MCPDiscoveryError(self._friendly_discovery_error(discovery_error))
+
+        self._enrich_mcp_server(server)
 
         current_project.mcp_servers.append(server)
         self._model.save()
@@ -3362,6 +3368,90 @@ class ModelService:
             "server_tools": server_tools,
         }
 
+    def _enrich_mcp_server(self, server: "MCPServer") -> None:
+        """Enrich a hand-added MCP server via the local LLM when fields are
+        blank: a short ``description`` and ``tags`` for the UI, and a ``summary``
+        that the tool selector injects to route requests to this server
+        (server_selector.py builds a "Server summaries" section from it — without
+        it the router only has bare tool names to match). Best-effort — never
+        raises, so a failure (or no loaded model) leaves the connection as-is.
+        Runs only when tools were discovered and something is actually missing.
+        """
+        try:
+            if not server.tools:
+                return
+            if server.description and server.tags and server.summary:
+                return
+            if self._llm is None:
+                self.load_model()
+            llm = self._get_large_llm() or self._llm
+            if llm is None:
+                return
+            from smartloop.agents.mcp.server_summarizer import MCPServerSummarizer
+            summarizer = MCPServerSummarizer(llm)
+            with self._inference_lock:
+                # Description + tags (UI) — one JSON call when either is missing.
+                if not server.description or not server.tags:
+                    meta = summarizer.generate_metadata(server)
+                    if not server.description and meta.get("description"):
+                        server.description = meta["description"]
+                    if not server.tags and meta.get("tags"):
+                        server.tags = list(meta["tags"])[:3]
+                # Summary (tool selection) — free-text call, the highest-value
+                # field for routing. Kept separate so a JSON parse flake above
+                # doesn't cost us the summary, and vice versa. Falls back to the
+                # generated description so the selector always has capability
+                # text to match against, even if the summary call comes back empty.
+                if not server.summary:
+                    summary = summarizer.invoke(server)
+                    server.summary = summary or server.description or None
+        except Exception as e:
+            logger.warning(
+                "MCP enrichment failed for '%s': %s",
+                getattr(server, "name", "?"), e,
+            )
+
+    @staticmethod
+    def _friendly_discovery_error(raw: str) -> str:
+        """Map a raw MCP discovery failure (often a uvx/npx Python traceback)
+        to a short, human-readable message. Falls back to the first line of the
+        raw error when nothing matches. Kept in sync with the client so the UI
+        doesn't have to re-parse tracebacks.
+        """
+        msg = (raw or "").strip()
+        if not msg:
+            return "Couldn't start this connection."
+        low = msg.lower()
+        # Package deps unpinned/out of date vs the current MCP SDK
+        # (e.g. "No module named 'mcp.server.fastmcp'").
+        if re.search(r"no module named ['\"]?mcp[.'\"]|mcp\.server\.fastmcp|mcp\.shared", low):
+            return (
+                "This package isn't compatible with the current MCP SDK — its "
+                "dependencies are out of date. Try another package, or ask its "
+                "maintainer to update it."
+            )
+        # Package name doesn't resolve to anything published.
+        if re.search(
+            r"not found in the package registry|no solution found when resolving|"
+            r"no matching distribution|could not find a version",
+            low,
+        ):
+            return (
+                "Package not found. Double-check the name — it must be a published "
+                "package (PyPI for uvx, npm for npx)."
+            )
+        # uv / uvx (or npx) missing from PATH.
+        if re.search(r"command not found|uvx: not found|no such file or directory[^\n]*uvx|executable .* not found", low):
+            return "Couldn't run uvx. Make sure uv is installed and on your PATH."
+        # Any other import/startup crash from the package process.
+        if re.search(r"modulenotfounderror|importerror|traceback \(most recent call last\)|process exited", low):
+            return (
+                "This package failed to start (a dependency or startup error). "
+                "It may be broken or incompatible."
+            )
+        first = msg.split("\n")[0].strip()
+        return f"{first[:180]}…" if len(first) > 180 else first
+
     # --------------------------------------------------------- web search (pro)
 
     def get_web_search_config(self, project_id: str) -> dict:
@@ -3412,6 +3502,7 @@ class ModelService:
             "name": s.name,
             "description": s.description,
             "summary": s.summary,
+            "tags": s.tags,
             "server_type": s.server_type.value,
             "enabled": s.enabled,
             "system": s.system,

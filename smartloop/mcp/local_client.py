@@ -263,14 +263,16 @@ class LocalMCPClient:
         """Return up to *max_bytes* of stderr collected by the reader thread.
 
         Gives the pump a brief moment to flush any pending diagnostic output so
-        error messages can carry a useful stderr tail.
+        error messages can carry a useful stderr tail. Keeps the *tail* rather
+        than the head — for a Python traceback the actual exception (e.g. the
+        ModuleNotFoundError) is on the last line, which is what callers classify.
         """
         try:
             if self._reader_stderr is not None:
                 self._reader_stderr.join(timeout=0.5)
             with self._stderr_lock:
                 data = "".join(self._stderr_chunks)
-            return data.strip()[:max_bytes]
+            return data.strip()[-max_bytes:]
         except Exception as e:
             logger.debug("Error reading stderr: %s", e, exc_info=True)
         return ""
