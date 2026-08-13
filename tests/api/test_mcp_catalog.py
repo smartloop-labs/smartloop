@@ -55,6 +55,38 @@ class TestListMCPCatalog:
         assert data[1]["hosted_by"] == "local"
         assert data[1]["local_config"]["command"] == "uvx"
 
+    def test_derives_server_type_when_platform_omits_it(self, client):
+        """The platform catalog does not send server_type; the router derives it
+        from hosted_by / config presence rather than 500-ing on validation."""
+        mock_data = [
+            {
+                "slug": "notion",
+                "display_name": "Notion",
+                "hosted_by": "external",
+                "remote_config": {
+                    "server_url": "https://mcp.notion.com/mcp",
+                    "auth_type": "oauth",
+                },
+                "sort_order": 0,
+                "catalog_version": 1,
+            },
+            {
+                "slug": "yahoo-finance",
+                "display_name": "Yahoo Finance",
+                "hosted_by": "local",
+                "local_config": {"command": "uvx", "args": ["yahoo-finance-mcp"]},
+                "sort_order": 10,
+                "catalog_version": 1,
+            },
+        ]
+        with patch(_LIST_CATALOG, return_value=mock_data):
+            resp = client.get("/v1/mcp-catalog")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data[0]["server_type"] == "remote"
+        assert data[1]["server_type"] == "local"
+
     def test_returns_empty_list(self, client):
         with patch(_LIST_CATALOG, return_value=[]):
             resp = client.get("/v1/mcp-catalog")

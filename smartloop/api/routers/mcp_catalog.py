@@ -7,7 +7,7 @@ and exposes it to local clients (TUI, Electron) for one-click install.
 import logging
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from smartloop.config.app_settings import AppSettings
 from smartloop.platform.client import SLPPlatformClient
@@ -35,7 +35,9 @@ class MCPCatalogEntry(BaseModel):
     slug: str
     display_name: str
     description: str | None = None
-    server_type: str
+    # The platform catalog does not store server_type; derive it below so clients
+    # still get a populated "local"/"remote" value.
+    server_type: str | None = None
     hosted_by: str  # "external", "internal", or "local"
     remote_config: RemoteConfig | None = None
     local_config: LocalConfig | None = None
@@ -44,6 +46,16 @@ class MCPCatalogEntry(BaseModel):
     tags: list[str] = []
     sort_order: int = 0
     catalog_version: int = 1
+
+    @model_validator(mode="after")
+    def _default_server_type(self):
+        if not self.server_type:
+            self.server_type = (
+                "local"
+                if self.local_config is not None or self.hosted_by == "local"
+                else "remote"
+            )
+        return self
 
 
 @router.get("/mcp-catalog", response_model=list[MCPCatalogEntry])
