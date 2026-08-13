@@ -21,6 +21,7 @@ _JWT_REFRESH = "/v1/auth/jwt/refresh"
 _MODEL_UPLOAD = "/v1/models/{}/upload"
 _MODELS = "/v1/models"
 _RELEASES_LATEST = "/v1/releases/latest"
+_MCP_CATALOG = "/v1/mcp-catalog"
 
 _TIMEOUT = 30
 
@@ -103,6 +104,19 @@ class SLPPlatformClient:
             raise ConnectionError(f"Connection error: {e}") from e
 
         _raise_for_status(resp)
+        return resp.json()
+
+    def list_mcp_catalog(self) -> list[dict]:
+        """GET /v1/mcp-catalog (auth required). Returns list of curated MCP server catalog entries."""
+        try:
+            resp = httpx.get(self._url(_MCP_CATALOG), headers=self._auth_headers_fn(),
+                             timeout=_TIMEOUT)
+        except httpx.ConnectError as e:
+            raise ConnectionError(f"Connection error: {e}") from e
+
+        _raise_for_status(resp, {
+            401: "Authentication failed. Check your SLP_DEVELOPER_TOKEN.",
+        }, PermissionError)
         return resp.json()
 
     def get_model_artifacts(self, model_name: str) -> dict[str, str]:

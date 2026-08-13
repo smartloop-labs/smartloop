@@ -18,9 +18,10 @@ import re as _re
 import time as _time
 
 from smartloop.api.config import api_settings
-from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router, web_search_router, search_provider_router
+
+from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, mcp_catalog_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router, web_search_router, search_provider_router
+
 from smartloop.api.services import get_model_service, get_api_client
-        
 from smartloop.config import AppSettings
 from smartloop.workspace import Workspace
 from smartloop.utils.log_utils import print_logo
@@ -73,10 +74,10 @@ def _get_model_file_path() -> str | None:
         workspace = Workspace.load()  # ensure config is loaded and cached
 
         active_model = [m for m in workspace.models if m.is_active]
-        
+
         if not active_model:
             return None
-        
+
         active_model = next(iter(active_model))
 
         return os.path.join(workspace.models_dir, active_model.model_id, f"{active_model.model_id}.gguf")
@@ -251,6 +252,7 @@ app.include_router(documents_router)
 app.include_router(projects_router)
 app.include_router(assets_router)
 app.include_router(mcp_servers_router)
+app.include_router(mcp_catalog_router)
 app.include_router(models_router)
 app.include_router(init_router)
 app.include_router(skills_router)
