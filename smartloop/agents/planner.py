@@ -197,7 +197,6 @@ _WRITE_KEYWORDS = {
     "write to", "write a file", "write file", "write it to",
     "save to", "save as", "save file", "save it to",
     "create file", "create a file",
-    "rewrite",
 }
 
 # Keywords that signal a search/grep intent.
