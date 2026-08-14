@@ -7,27 +7,7 @@ from typing import Optional
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from smartloop.auth import credential_store
-
-
-def get_home_dir() -> str:
-    """The user's actual home directory.
-
-    Under the macOS App Sandbox (Mac App Store build) $HOME is redirected to the
-    app container, so os.path.expanduser('~') points *inside* the container.
-    getpwuid() returns the real home (e.g. /Users/<name>), which the sandboxed
-    app can reach for ~/smartloop via the
-    com.apple.security.temporary-exception.files.home-relative-path entitlement.
-    Off-sandbox (and on Windows, where `pwd` is unavailable) this equals
-    os.path.expanduser('~'). Distinct from AppSettings.home_dir (~/.smartloop /
-    SLP_HOME), which holds internal state and stays in the container.
-    """
-    try:
-        import pwd
-        return pwd.getpwuid(os.getuid()).pw_dir
-    except Exception:
-        return os.path.expanduser("~")
-
+from smartloop.auth import credential_store     
 
 class AppSettings(BaseSettings):
     """Application settings using Pydantic"""
