@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from smartloop.config.app_settings import AppSettings
+from smartloop.config.app_settings import AppSettings, get_home_dir
 from smartloop.workspace.workspace import Workspace
 
 logger = logging.getLogger(__name__)
@@ -23,8 +23,13 @@ _settings = AppSettings()
 
 
 def _visible_project_dir(project_name: str) -> str:
-    """Return ``~/smartloop/<project_name>``."""
-    return os.path.expanduser(os.path.join("~/smartloop", project_name))
+    """Return ``~/smartloop/<project_name>`` under the user's real home.
+
+    Uses get_home_dir() (real home via getpwuid) rather than os.path.expanduser,
+    so under the macOS App Sandbox this is the real ~/smartloop (browsable in
+    Finder) instead of the app container.
+    """
+    return os.path.join(get_home_dir(), "smartloop", project_name)
 
 
 def resolve_visible_dir(project_name: str) -> tuple[str, bool]:
