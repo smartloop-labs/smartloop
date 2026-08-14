@@ -75,8 +75,17 @@ class DownloaderTask(BaseTask):
             self._gguf_ready = True
             self.logger.info(f"[downloader] GGUF ready for {self.model_id}")
 
-            # Mark model as downloaded in workspace
-            ws_model = self.workspace.get_model()
+            # Mark the just-downloaded model as downloaded so on-demand
+            # large-model selection (best_model_for / largest_downloaded_model,
+            # which filter on `downloaded`) sees it immediately — without needing
+            # a project switch to reload the workspace from disk. Look it up by
+            # model_id (the model that was actually downloaded); get_model() with
+            # no argument returns the DEFAULT model, so it left a newly downloaded
+            # non-active model flagged not-downloaded and unusable until reload.
+            ws_model = next(
+                (m for m in self.workspace.models if m.model_id == self.model_id),
+                None,
+            )
             if ws_model and not ws_model.downloaded:
                 ws_model.downloaded = True
 
