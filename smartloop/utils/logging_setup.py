@@ -38,10 +38,24 @@ DEFAULT_BACKUP_COUNT = 5
 
 def make_log_queue() -> "multiprocessing.queues.Queue":
     """Create the process-wide log queue. Idempotent — returns the existing
-    queue if one was already created."""
+    queue if one was already created.
+
+    A ``multiprocessing.Queue`` is used so log records from spawn worker
+    processes (the LLM ``ProcessPoolExecutor``) reach the parent listener.
+    It relies on a POSIX named semaphore (``sem_open``), which the macOS App
+    Sandbox (Mac App Store build) denies with ``PermissionError``/``OSError``.
+    When that happens we fall back to a plain thread-safe ``queue.Queue``:
+    under the sandbox the LLM pool isn't spawned anyway (Apple Silicon caps at
+    one worker and reuses the in-process model — see hybrid_executor), so every
+    producer is a thread in this process and the thread queue is sufficient.
+    ``QueueHandler``/``QueueListener`` treat both queues identically."""
     global _LOG_QUEUE
     if _LOG_QUEUE is None:
-        _LOG_QUEUE = multiprocessing.Queue(-1)
+        try:
+            _LOG_QUEUE = multiprocessing.Queue(-1)
+        except (PermissionError, OSError):
+            import queue as _queue
+            _LOG_QUEUE = _queue.Queue(-1)
     return _LOG_QUEUE
 
 
