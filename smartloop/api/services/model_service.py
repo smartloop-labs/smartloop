@@ -44,7 +44,7 @@ from smartloop.parsers.parser_factory import ParserFactory
 from smartloop import ConversationStore, MessageInput
 
 from smartloop.api.config import api_settings
-from smartloop.config.app_settings import AppSettings, get_home_dir
+from smartloop.config.app_settings import AppSettings
 
 from smartloop.auth import credential_store
 from smartloop.model.downloader import SLPArtifactDownloader, HFDownloader
@@ -3003,7 +3003,9 @@ class ModelService:
         # Rename the visible project directory when the name changes.
         if name and name != project.name:
             old_visible = self._visible_project_dir(project)
-            new_visible = os.path.join(get_home_dir(), "smartloop", name)
+            new_visible = os.path.expanduser(
+                os.path.join("~/smartloop", name)
+            )
             if os.path.isdir(old_visible) and not os.path.exists(new_visible):
                 os.rename(old_visible, new_visible)
                 logger.info(

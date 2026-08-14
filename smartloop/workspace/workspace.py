@@ -12,7 +12,6 @@ from pathlib import Path
 from uuid import uuid4
 from pydantic import BaseModel, computed_field, ConfigDict, Field
 from smartloop.config import ModelConfig, AppSettings
-from smartloop.config.app_settings import get_home_dir
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.types import ModelCapability
 from smartloop.workspace.types import Document, DocumentInfo, DocumentStatus, Skill
@@ -216,12 +215,14 @@ class Project (BaseModel):
         """Return the user-visible project directory.
 
         Uses ``cwd`` (always set on new projects).  Falls back to
-        ``~/smartloop/<name>`` (real home) for legacy projects created before
+        ``~/smartloop/<name>`` for legacy projects created before
         ``cwd`` was persisted unconditionally.
         """
         if self.cwd:
             return os.path.expanduser(self.cwd)
-        return os.path.join(get_home_dir(), "smartloop", self.name or self.id)
+        return os.path.expanduser(
+            os.path.join("~/smartloop", self.name or self.id)
+        )
 
     def get_skills(self) -> List["Skill"]:
         """Read skills from disk (SKILL.md files), the single source of truth."""
