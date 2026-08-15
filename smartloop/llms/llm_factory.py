@@ -12,12 +12,15 @@ from smartloop.utils.device_utils import get_device_config
 def _get_cuda_vram_gb() -> float | None:
     """Return total VRAM in GB for CUDA device 0, or None if unavailable.
 
-    Tries torch first (fast), falls back to nvidia-smi when torch was
-    installed without CUDA support (CPU-only wheel).
+    Tries torch first (fast, when installed), falls back to nvidia-smi when
+    torch is absent or was installed without CUDA support (CPU-only wheel).
     """
-    import torch
-    if torch.cuda.is_available():
-        return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:
+        pass
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
@@ -261,7 +264,6 @@ class LlmFactory:
         class (``vision_chat_handler()``); authoritative when set, otherwise
         the handler is inferred from the GGUF architecture.
         """
-        import torch
         from llama_cpp import Llama, llama_supports_gpu_offload
         from smartloop.llms.llama_cpp import LlamaCpp
 
@@ -317,7 +319,7 @@ class LlmFactory:
                     f"Model size ({model_size_gb:.1f}GB) requires conservative GPU allocation. "
                     f"Using {llama_config.n_gpu_layers} GPU layers (rest on CPU)"
                 )
-        elif torch.backends.mps.is_available():
+        elif device_config.device.value == 'mps':
             # Apple Silicon — unified memory shared between CPU and GPU.
             # Metal handles GPU offloading via n_gpu_layers=-1 (already set).
             import psutil

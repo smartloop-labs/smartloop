@@ -352,7 +352,7 @@ class ModelService:
         if current_project:
             self._setup_project_tools(current_project)
 
-        self._llm = self._model.get_instance(debug=api_settings.debug_mode)
+        self._llm = self._model.get_instance()
         self._model_name = target_model
 
         # Cache the GGUF path so the orchestrator can pass it to LLM worker
@@ -412,7 +412,7 @@ class ModelService:
         try:
             logger.info(f"[decision-model] Loading decision model: {model_name}")
             decision_model_obj = Model(model_name)
-            self._decision_llm = decision_model_obj.get_instance(debug=api_settings.debug_mode)
+            self._decision_llm = decision_model_obj.get_instance()
             self._decision_model_name = model_name
             logger.info(f"[decision-model] Decision model loaded: {model_name}")
         except Exception as e:
@@ -718,12 +718,31 @@ class ModelService:
         None on CPU (RAM is plentiful; no fit guard needed) or when the device
         can't be queried.
         """
+        # CUDA VRAM: prefer torch (when installed), else nvidia-smi so torch-free
+        # builds stay accurate.
         try:
             import torch
             if torch.cuda.is_available():
                 free_b, total_b = torch.cuda.mem_get_info()
                 return free_b / 1024**3, total_b / 1024**3
-            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        except Exception:
+            pass
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                free_mib, total_mib = (x.strip() for x in result.stdout.splitlines()[0].split(","))
+                return float(free_mib) / 1024, float(total_mib) / 1024
+        except Exception:
+            pass
+        # Apple Silicon unified memory (Metal via llama.cpp, no torch needed).
+        try:
+            from llama_cpp import llama_supports_gpu_offload
+            if sys.platform == "darwin" and llama_supports_gpu_offload():
                 import psutil
                 vm = psutil.virtual_memory()
                 return vm.available / 1024**3, vm.total / 1024**3

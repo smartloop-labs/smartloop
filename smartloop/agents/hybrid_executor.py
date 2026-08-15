@@ -6,13 +6,72 @@ own model instance).
 """
 import logging
 import os
-import torch
+import subprocess
+import sys
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 from smartloop.agents.llm_worker import init_worker, run_inference
 
 logger = logging.getLogger(__name__)
+
+
+def _llama_gpu_offload() -> bool:
+    """True when the installed llama.cpp was built with a GPU backend."""
+    try:
+        from llama_cpp import llama_supports_gpu_offload
+        return bool(llama_supports_gpu_offload())
+    except Exception:
+        return False
+
+
+def _gpu_device_cap() -> int | None:
+    """Max concurrent GPU model copies (one per GPU), or None for CPU-only.
+
+    Uses torch when installed; otherwise any llama.cpp GPU backend (CUDA
+    without a torch wheel, Vulkan, Metal) caps at one copy per device.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return max(1, torch.cuda.device_count())
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return 1
+    except Exception:
+        pass
+    return 1 if _llama_gpu_offload() else None
+
+
+def _cuda_mem_info_gb():
+    """Return ``(name, free_gb, total_gb)`` for CUDA device 0, or None.
+
+    Prefers torch (fast); falls back to nvidia-smi so CUDA VRAM sizing stays
+    accurate in torch-free builds.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_b, total_b = torch.cuda.mem_get_info()
+            return torch.cuda.get_device_name(0), free_b / 1024**3, total_b / 1024**3
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            name, free_mib, total_mib = (x.strip() for x in result.stdout.splitlines()[0].split(","))
+            return name, float(free_mib) / 1024, float(total_mib) / 1024
+    except Exception:
+        pass
+    return None
+
+
+def _is_mps() -> bool:
+    """True on Apple Silicon with a llama.cpp Metal (GPU offload) backend."""
+    return sys.platform == "darwin" and _llama_gpu_offload()
 
 
 class LLMExecutor:
@@ -121,20 +180,13 @@ class LLMExecutor:
             # One model copy per GPU is the most that can run in parallel on
             # CUDA; same-GPU copies serialize.  MPS is a single device.  CPU is
             # uncapped here (cores parallelize) → memory is the only limit.
-            gpu_cap: int | None = None
-            if torch.cuda.is_available():
-                gpu_cap = max(1, torch.cuda.device_count())
-            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                gpu_cap = 1
-            else:
-                # GPU backend torch can't see (e.g. Vulkan on AMD/Intel).
-                # Device count and VRAM aren't queryable through the
-                # llama-cpp-python bindings, so assume one device — same-GPU
-                # copies serialize anyway, and the RAM-based memory sizing
-                # below says nothing about VRAM.
-                from llama_cpp import llama_supports_gpu_offload
-                if llama_supports_gpu_offload():
-                    gpu_cap = 1
+            # One model copy per GPU is the most that can run in parallel on
+            # CUDA; same-GPU copies serialize.  MPS is a single device.  A GPU
+            # backend torch can't see (e.g. Vulkan on AMD/Intel) also caps at
+            # one — device count and VRAM aren't queryable through the
+            # llama-cpp-python bindings, so assume one device.  CPU is uncapped
+            # here (cores parallelize) → memory is the only limit.
+            gpu_cap = _gpu_device_cap()
             if gpu_cap is not None and gpu_cap < requested:
                 logger.info(
                     "[device] %d GPU(s) — capping worker copies at one per GPU "
@@ -170,15 +222,14 @@ class LLMExecutor:
             # accelerator is active.  reserve keeps memory for the main model,
             # fragmentation headroom and the OS so workers don't claim
             # everything and crash the last copy that tries to load.
-            if torch.cuda.is_available():
-                free_b, total_b = torch.cuda.mem_get_info()
-                # mem_get_info() is a single snapshot taken before any worker
-                # loads; workers spawn concurrently, so keep a VRAM reserve
+            cuda_info = _cuda_mem_info_gb()
+            if cuda_info is not None:
+                # mem_get_info()/nvidia-smi is a single snapshot taken before any
+                # worker loads; workers spawn concurrently, so keep a VRAM reserve
                 # (was 0.0) to absorb that drift + allocator fragmentation.
-                device, free_gb, total_gb, reserve_gb = (
-                    torch.cuda.get_device_name(0), free_b / 1024**3, total_b / 1024**3, 1.5,
-                )
-            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                name, free_gb, total_gb = cuda_info
+                device, reserve_gb = name, 1.5
+            elif _is_mps():
                 # Apple Silicon: unified memory shared with the OS/main model.
                 import psutil
                 vm = psutil.virtual_memory()

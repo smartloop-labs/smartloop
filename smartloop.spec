@@ -4,7 +4,7 @@ import sys
 import platform
 import site
 from pathlib import Path
-from PyInstaller.utils.hooks import copy_metadata, collect_all
+from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
@@ -49,36 +49,6 @@ except Exception as _emb_exc:
         f"[spec] WARNING: could not bundle embedding GGUF ({_emb_exc}); "
         "the app will download it at first use."
     )
-
-# Include package metadata required at runtime (importlib.metadata lookups)
-for pkg in ['docling-slim', 'docling-core', 'docling-parse']:
-    try:
-        datas += copy_metadata(pkg)
-    except Exception:
-        pass
-
-# Include docling_parse resource directories (fonts, encodings, glyphs for PDF parsing)
-for sp in site.getsitepackages():
-    dp_dir = Path(sp) / 'docling_parse'
-    if dp_dir.exists():
-        for res_name in ['pdf_resources', 'pdf_resources_v2']:
-            res_dir = dp_dir / res_name
-            if res_dir.exists():
-                datas.append((str(res_dir), f'docling_parse/{res_name}'))
-        break
-
-# Include docling_core resource schemas (JSON document format schemas)
-for sp in site.getsitepackages():
-    schemas_dir = Path(sp) / 'docling_core' / 'resources'
-    if schemas_dir.exists():
-        datas.append((str(schemas_dir), 'docling_core/resources'))
-        break
-
-
-# Collect tui css files
-tui_css_dir = Path('.') / 'tui' / 'css'
-if tui_css_dir.exists():
-    datas.append((str(tui_css_dir), 'tui/css'))
 
 # Collect llama_cpp shared libraries (libllama, libggml, etc.)
 # These are required by the smartloop framework for model inference.
@@ -181,15 +151,6 @@ try:
 except ImportError:
     pass
 
-# Collect EasyOCR models and data (OCR engine for docling)
-try:
-    import easyocr
-    easyocr_dir = Path(easyocr.__file__).parent
-    datas.append((str(easyocr_dir), 'easyocr'))
-except ImportError:
-    pass
-
-
 a = Analysis(
     ['main.py'],
     pathex=[],
@@ -199,19 +160,9 @@ a = Analysis(
         'certifi',
         'version',
         'main',
-        'tui',
-        'tui.chat',
-        'textual',
-        'prompt_toolkit',
         'llama_cpp',
         'llama_cpp.llama_cpp',
         'llama_cpp._ctypes_extensions',
-        'docling',
-        'docling.document_converter',
-        'docling.models.plugins',
-        'docling.models.plugins.defaults',
-        'docling.pipeline.base_pipeline',
-        'easyocr',
         'pysqlite3',
         'sqlite3',
         'multipart',
@@ -222,9 +173,14 @@ a = Analysis(
     excludes=[
         '.venv',
         'venv',
-        # We ship a CPU-only torch (GPU inference is Vulkan via llama.cpp), so
-        # the nvidia-cu12 CUDA runtime packages should never be present. Exclude
-        # them as a guard so a stray CUDA torch can't balloon the bundle by >1GB.
+        # Inference runs entirely on llama.cpp (GGUF); torch/transformers are
+        # only needed for the optional training extra (smartloop-trainer) and
+        # must never land in the shipped bundle — torch alone is ~370MB and
+        # drags the >1GB nvidia-cu12 CUDA runtime with it.
+        'torch',
+        'transformers',
+        'accelerate',
+        'sentence_transformers',
         'nvidia',
         'triton',
         'tensorflow',
@@ -234,6 +190,14 @@ a = Analysis(
         'peft',
         'trl',
         'datasets',
+        # Unused document-OCR stack (docling); dragged easyocr/opencv/onnx.
+        'docling',
+        'docling_core',
+        'docling_parse',
+        'docling_ibm_models',
+        'easyocr',
+        'cv2',
+        'skimage',
     ],
     noarchive=False,
     optimize=0,

@@ -98,15 +98,10 @@ venv:
 
 install: venv
 	@echo "=== Installing requirements ==="
-ifeq ($(PLATFORM),linux)
-	@# The default PyPI torch wheel on Linux is the CUDA build: it pulls
-	@# nvidia-cu12 runtime libs (cuBLAS/cuDNN/cudart, >1GB) that PyInstaller then
-	@# bundles. Our only GPU backend is Vulkan (llama.cpp); torch runs CPU-only
-	@# for EasyOCR/docling. Pre-install the CPU wheel so the requirements.txt pin
-	@# is already satisfied and no CUDA libs ever land in the tree.
-	@echo "=== Installing CPU-only torch (Vulkan is the GPU backend; no CUDA) ==="
-	$(PIP) install "torch>=2.5.1" --index-url=https://download.pytorch.org/whl/cpu
-endif
+	@# Inference runs on llama.cpp (GGUF); torch is NOT a runtime dependency and
+	@# is intentionally absent from requirements.txt (it lives in the optional
+	@# `training` extra). This keeps the shipped bundle ~370MB+ smaller and avoids
+	@# pulling the >1GB nvidia-cu12 CUDA runtime that the default torch wheel drags.
 	$(PIP) install -r requirements.txt --index-url=https://pypi.org/simple
 
 build: install
@@ -145,7 +140,7 @@ test-unit: test-deps
 	$(PYTHON) -m pytest tests/unit -v
 
 test-cov: test-deps
-	$(PYTHON) -m pytest tests/ --cov=smartloop --cov=commands --cov=tui --cov-report=term-missing
+	$(PYTHON) -m pytest tests/ --cov=smartloop --cov-report=term-missing
 
 build-binary:
 	@echo "Building slp v$(SLP_VERSION) with PyInstaller..."

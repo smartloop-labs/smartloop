@@ -214,8 +214,10 @@ app = FastAPI(
     description="Smartloop local LLM inference framework - OpenAI-compatible API server",
     version=_app_settings.version,
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    # Internal API: Swagger/ReDoc and the OpenAPI schema are disabled.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 # CORS middleware
@@ -370,8 +372,7 @@ async def health_check():
 async def root():
     """Root endpoint"""
     return {
-        "message": "SLP API - OpenAI-compatible chat completion service",
-        "docs": "/docs",
+        "message": "Smartloop agent is healthy and running",
         "health": "/health",
     }
 
