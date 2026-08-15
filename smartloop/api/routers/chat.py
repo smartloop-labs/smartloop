@@ -95,24 +95,14 @@ _TAG_ESCAPE = {
 
 
 def _extract_tool_content(orchestrator_context: str) -> str:
-    """Extract the raw tool payload from the orchestrator's wrapped context.
-
-    The orchestrator wraps live tool output as ``TOOL RESULTS:\\n{payload}\\n\\n
-    The above is live data...``.  When the model fails to synthesize we
-    want to fall back to just the payload, without the rules footer.
-    """
+    """Extract the raw tool payload from the orchestrator's wrapped context."""
     if not orchestrator_context:
         return ""
     marker = "TOOL RESULTS:\n"
     start = orchestrator_context.find(marker)
     if start < 0:
         return orchestrator_context.strip()
-    body = orchestrator_context[start + len(marker):]
-    footer = "\n\nThe above is live data"
-    end = body.find(footer)
-    if end >= 0:
-        body = body[:end]
-    return body.strip()
+    return orchestrator_context[start + len(marker):].strip()
 
 
 def _escape_role_tags(text: str) -> str:

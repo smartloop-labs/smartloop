@@ -499,12 +499,10 @@ class ModelService:
             if m.enabled and m.downloaded
             and ModelCapability.VISION in m.effective_capabilities
         ]
-        # Fastest model first: vision runs locally, so latency beats the small
-        # OCR-quality gain of a bigger model. Fewest params win (e.g. a 2B model
-        # over a 3B one), ties break toward the newer version. The per-candidate
-        # fit guard below falls through when the preferred one won't fit — and
-        # since the smallest is tried first, it's also the most likely to fit.
-        candidates.sort(key=lambda m: (-(m.param_size_b or 0.0), m.model_version), reverse=True)
+        # Smallest first: lowest latency OCR; same-size ties broken by cap overlap then version.
+        candidates = self._ranked_candidates(
+            candidates, ref_caps={ModelCapability.VISION}, descending=False,
+        )
 
         # OCR is a latency-tolerant batch task, so give the vision model a small
         # dedicated context and waive the agent-model reserve — it only needs to
@@ -580,16 +578,39 @@ class ModelService:
             logger.warning("[vision] No runnable vision model available — image OCR disabled")
         return None
 
+    @staticmethod
+    def _ranked_candidates(
+        candidates: list,
+        ref_caps: set,
+        descending: bool = True,
+    ) -> list:
+        """Sort WorkspaceModel candidates by (size, cap-overlap, version).
+
+        ``ref_caps`` is the reference capability set used to score overlap so
+        that same-size models with broader coverage rank above narrower ones.
+        Pass ``descending=True`` (default) to walk largest→smallest; pass
+        ``False`` to walk smallest→largest.
+        """
+        return sorted(
+            candidates,
+            key=lambda m: (
+                m._rank[0],
+                len(ref_caps & set(m.effective_capabilities)),
+                m._rank[1],
+            ),
+            reverse=descending,
+        )
+
     def _get_llm_for_capability(self, capability: str) -> Optional[BaseLLM]:
         """Return a loaded LLM matching the requested capability.
 
-        Walks the capability's models largest-first (``ranked_models_for``,
-        biggest size then newer version) and returns the first that is already
-        resident or fits in memory — evicting prior-step capability models to
-        make room when needed.  When the largest doesn't fit it promotes down to
-        the next-largest same-capability model that does, rather than dropping
-        straight to the tiny default.  Returns ``None`` only when no capable
-        model fits (caller then falls back to the default/large model).
+        Walks the capability's models largest-first and returns the first that
+        is already resident or fits in memory — evicting prior-step capability
+        models to make room when needed.  When the largest doesn't fit it
+        promotes down to the next-largest same-capability model that does,
+        rather than dropping straight to the tiny default.  Returns ``None``
+        only when no capable model fits (caller then falls back to the
+        default/large model).
         """
         if not self._model or not self._model.workspace:
             logger.warning(
@@ -598,7 +619,15 @@ class ModelService:
             )
             return None
         workspace = self._model.workspace
-        ranked = workspace.ranked_models_for(capability)
+        cap_lower = capability.lower()
+        _candidates = [
+            m for m in workspace.models
+            if m.enabled and m.downloaded and m.param_size_b > 0
+            and cap_lower in [c.lower() for c in m.effective_capabilities]
+        ]
+        for m in _candidates:
+            m.models_dir = workspace.models_dir
+        ranked = self._ranked_candidates(_candidates, ref_caps={capability})
         if not ranked:
             logger.warning(
                 "[capability-model] No enabled+downloaded model declares "
@@ -806,34 +835,33 @@ class ModelService:
             orchestrator = workspace.get_model(self._model_name)
             orchestrator_size = orchestrator.param_size_b if orchestrator else 0
             orchestrator_rank = orchestrator._rank if orchestrator else (0, 0.0)
-            # Pick the agent/large model by *capability*, not raw size: this
-            # model drives skills/synthesis, so it must declare the "skills"
-            # capability.  Selecting by size alone would load a vision-only VL
-            # model (e.g. qwen2-vl-2b) here as a redundant text copy — wasting
-            # VRAM that get_vision_llm needs for the actual OCR instance.  Among
-            # the skills-capable models, prefer the largest.
-            skills_models = [
+            # Pick the agent/large model from any general-capable (text) model —
+            # filtering by GENERAL excludes vision-only models (e.g. qwen2-vl-2b
+            # which only declares VISION) without requiring a specific SKILLS tag.
+            # Walk largest-first; when the biggest doesn't fit, fall to the next
+            # lower tier (e.g. gemma4-4b → gemma4-2b) rather than the tiny router.
+            _text_caps = {ModelCapability.GENERAL, ModelCapability.SKILLS, ModelCapability.DP}
+            agent_models = [
                 m for m in workspace.models
                 if m.enabled and m.downloaded
                 and m.model_name != self._model_name
-                and ModelCapability.SKILLS in m.effective_capabilities
+                and _text_caps & set(m.effective_capabilities)
             ]
-            if not skills_models:
+            if not agent_models:
                 logger.info(
-                    "[large-model] No skills-capable model downloaded — using the "
-                    "router model for skills/synthesis"
+                    "[large-model] No general-capable model downloaded — using the "
+                    "router model for agent/synthesis tasks"
                 )
                 return
-            # Rank by size first (largest wins), then newer version as a tie-
-            # break — largest-first — and walk down to the next-largest that fits
-            # in VRAM when the biggest doesn't, rather than skipping the large
-            # model entirely.  Only load one that actually out-ranks the router.
-            skills_models.sort(key=lambda m: m._rank, reverse=True)
+            # Rank largest→smallest; same-size models with more cap overlap win.
+            agent_models = self._ranked_candidates(
+                agent_models, ref_caps=_text_caps, descending=True,
+            )
 
             from smartloop.config.app_settings import AppSettings
             cap = AppSettings().llm_large_n_ctx_cap
 
-            for largest in skills_models:
+            for largest in agent_models:
                 largest.models_dir = workspace.models_dir
                 # Sorted largest-first: once a candidate no longer out-ranks the
                 # router, none of the remaining (smaller) ones will either.
@@ -856,11 +884,11 @@ class ModelService:
                 # Fit guard: skip a model whose capped footprint won't fit in
                 # free VRAM after the reserve (free VRAM already excludes the
                 # resident main model).  When it doesn't fit, promote down to the
-                # next-largest skills model instead of dropping the large model.
+                # next-largest model instead of dropping straight to the router.
                 if not self._large_model_fits(gguf_path, cap, largest.model_name):
                     logger.info(
                         "[large-model] %s doesn't fit — trying next-smaller "
-                        "skills model", largest.model_name,
+                        "model", largest.model_name,
                     )
                     continue
 
@@ -3126,6 +3154,19 @@ class ModelService:
 
         self._model.save()
 
+    def _free_llm(self, llm) -> None:
+        """Explicitly close the native llama-cpp context so VRAM is freed immediately."""
+        if llm is None:
+            return
+        # Never close the always-resident orchestrator model.
+        if llm is self._llm:
+            return
+        try:
+            if hasattr(llm, 'model') and llm.model is not None and hasattr(llm.model, 'close'):
+                llm.model.close()
+        except Exception:
+            pass
+
     def _cleanup_gpu_cache(self):
         """Clear GPU cache to free up memory after unloading models."""
         gc.collect()
@@ -3143,8 +3184,10 @@ class ModelService:
         if self._llm is not None:
             project_name = self.get_current_project_name() or "default"
             logger.info(f"Unloading model: {self._model_name} (project: {project_name})")
+            self._free_llm(self._llm)
             self._llm = None
             self._model_name = None
+            self._free_llm(self._decision_llm)
             self._decision_llm = None
             self._decision_model_name = None
 
@@ -3169,6 +3212,7 @@ class ModelService:
                 return
             logger.info("[vision] Unloading vision model %s — freeing VRAM",
                         self._vision_model_name or "?")
+            self._free_llm(self._vision_llm)
             self._vision_llm = None
             self._vision_model_name = None
             self._vision_unavailable = False
@@ -3187,6 +3231,7 @@ class ModelService:
             if self._large_llm is None:
                 return
             logger.info("[large-model] Unloading large agent model — freeing VRAM")
+            self._free_llm(self._large_llm)
             self._large_llm = None
             self._large_model_attempted = False
             self._cleanup_gpu_cache()
@@ -3216,10 +3261,12 @@ class ModelService:
                     "[mem] Evicting prior-step capability model %s to free VRAM",
                     attr[len("_cap_llm_"):],
                 )
+                self._free_llm(cached)
                 setattr(self, attr, None)
                 freed = True
         if self._large_llm is not None and self._large_model_name != keep_model_name:
             logger.info("[mem] Evicting on-demand large model to free VRAM")
+            self._free_llm(self._large_llm)
             self._large_llm = None
             self._large_model_name = None
             self._large_model_attempted = False
@@ -3241,6 +3288,7 @@ class ModelService:
         """
         self.unload_vision_model()
         self.unload_large_model()
+        self._evict_capability_models()
 
     def unload_model_by_name(self, model_name: str) -> bool:
         """Free VRAM held by a specific model, e.g. when it's deselected.
@@ -3257,6 +3305,7 @@ class ModelService:
 
             if self._large_llm is not None and self._large_model_name == model_name:
                 logger.info("[unload] Releasing deselected large model %s", model_name)
+                self._free_llm(self._large_llm)
                 self._large_llm = None
                 self._large_model_name = None
                 self._large_model_attempted = False
@@ -3264,6 +3313,7 @@ class ModelService:
 
             if self._vision_llm is not None and self._vision_model_name == model_name:
                 logger.info("[unload] Releasing deselected vision model %s", model_name)
+                self._free_llm(self._vision_llm)
                 self._vision_llm = None
                 self._vision_model_name = None
                 self._vision_unavailable = False
@@ -3273,6 +3323,7 @@ class ModelService:
             cached = getattr(self, cache_key, None)
             if cached is not None and cached is not _GPU_FAULTED:
                 logger.info("[unload] Releasing deselected capability model %s", model_name)
+                self._free_llm(cached)
                 setattr(self, cache_key, None)
                 unloaded = True
 
