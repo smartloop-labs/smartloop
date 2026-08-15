@@ -3153,6 +3153,48 @@ class ModelService:
 
         return result
 
+    @staticmethod
+    def _mcp2_incompat_error(msg: str) -> bool:
+        """True when the discovery failure is the MCP SDK 2.x breakage.
+
+        ``mcp`` 2.0.0 (2026-07-28) removed ``mcp.server.fastmcp`` (renamed to
+        ``mcp.server.mcpserver.MCPServer``) and dropped several top-level
+        exports (e.g. ``McpError``). Packages that still import the old path or
+        symbols die at startup, because their unbounded ``mcp>=1.x`` requirement
+        resolves to 2.x. We do *not* match ``mcp_types`` — that is a 2.x-only
+        dependency and pinning below 2 would be wrong for it.
+        """
+        low = msg.lower()
+        return (
+            re.search(r"no module named ['\"]?mcp(\.|['\" ])", low) is not None
+            or "mcp.server.fastmcp" in low
+            or "mcp.shared" in low
+            or re.search(r"cannot import name .* from ['\"]?mcp(\.|['\" ])", low) is not None
+            or re.search(r"module ['\"]?mcp['\"]? has no attribute", low) is not None
+        )
+
+    @staticmethod
+    def _pin_mcp1x_args(command: str, args: list[str]) -> list[str] | None:
+        """Return ``args`` with ``--with mcp<2`` injected for uv/uvx launchers.
+
+        This pins the ephemeral environment to the MCP SDK 1.x line so servers
+        that still import ``mcp.server.fastmcp`` start again. Returns ``None``
+        when not applicable (non-uv launcher, or a ``--with`` flag is already
+        present so we never re-pin or loop forever).
+        """
+        if command not in ("uv", "uvx"):
+            return None
+        if any(a == "--with" for a in args) or any(a.startswith("--with=") for a in args):
+            return None
+        pin = ["--with", "mcp<2"]
+        if command == "uvx":
+            return [*pin, *args]
+        if args[:2] == ["tool", "run"]:
+            return [*args[:2], *pin, *args[2:]]
+        if args[:1] == ["run"]:
+            return [*args[:1], *pin, *args[1:]]
+        return None
+
     def add_local_mcp_server(
         self,
         command: str,
@@ -3245,40 +3287,70 @@ class ModelService:
             with LocalMCPClient(command=command, args=args, env=resolved_env, cwd=resolved_cwd) as client:
                 result = client.connect_and_discover_tools()
         except MCPLaunchError as exc:
-            # Both `uvx` and `uv tool run` print a hint like
-            # "Use `uvx --from <pkg> <exec>` instead" (or the `uv tool run`
-            # form) when the package name and executable name differ. Parse the
-            # suggested args and auto-retry under whichever launcher we used.
+            # Candidate fixes to retry, tried in order until one succeeds:
+            # 1. Both `uvx` and `uv tool run` print a hint like
+            #    "Use `uvx --from <pkg> <exec>` instead" (or the `uv tool run`
+            #    form) when the package name and executable name differ. Parse
+            #    the suggested args and auto-retry under our launcher.
+            # 2. MCP SDK 2.x removed `mcp.server.fastmcp`; pin the ephemeral env
+            #    to `mcp<2` so legacy servers start again (see _pin_mcp1x_args).
+            fixes: list[list[str]] = []
             hint = re.search(r"Use `uv(?:x| tool run) (.*?)` instead", str(exc))
             if hint:
                 suggested = hint.group(1).split()
                 # Preserve the `tool run` prefix when launching via the real
                 # `uv` binary; for bare `uvx` there is no prefix.
                 prefix = args[:2] if command == "uv" and args[:2] == ["tool", "run"] else []
-                fixed_args = [*prefix, *suggested]
-                logger.info(
-                    "Retrying %s with corrected args %s (original: %s)", command, fixed_args, args
-                )
-                args = fixed_args
-                if "--from" in suggested:
-                    from_idx = suggested.index("--from")
-                    fixed_pkg = suggested[from_idx + 1] if from_idx + 1 < len(suggested) else None
-                else:
-                    fixed_pkg = next((a for a in suggested if not a.startswith("-")), None)
-                if fixed_pkg:
-                    server.name = fixed_pkg.split("/")[-1]
-                    server.pkg = server.name
-                    name = server.name
-                server.config = MCPServerConfig(command=command, args=args, env=resolved_env, cwd=resolved_cwd)
+                fixes.append([*prefix, *suggested])
+            if self._mcp2_incompat_error(str(exc)):
+                pinned = self._pin_mcp1x_args(command, args)
+                if pinned is not None:
+                    logger.info(
+                        "Retrying %s with --with mcp<2 (MCP SDK 2.x incompatibility; "
+                        "original: %s)", command, args,
+                    )
+                    fixes.append(pinned)
+            result = None
+            discovery_error = str(exc)
+            for fixed_args in fixes:
                 try:
-                    with LocalMCPClient(command=command, args=args, env=resolved_env, cwd=resolved_cwd) as client:
+                    with LocalMCPClient(command=command, args=fixed_args, env=resolved_env, cwd=resolved_cwd) as client:
                         result = client.connect_and_discover_tools()
                 except Exception as retry_exc:
                     result = None
                     discovery_error = str(retry_exc)
-            else:
-                result = None
-                discovery_error = str(exc)
+                    # The retry can fail with a *different* failure than the
+                    # original (e.g. the uvx hint fix swapped in the right
+                    # executable, but the server then dies importing the MCP
+                    # SDK 2.x symbols). Re-check for the mcp<2 incompatibility
+                    # here too; _pin_mcp1x_args returns None when `--with` is
+                    # already present, so this never re-pins or loops forever.
+                    if self._mcp2_incompat_error(str(retry_exc)):
+                        pinned = self._pin_mcp1x_args(command, fixed_args)
+                        if pinned is not None:
+                            logger.info(
+                                "Retrying %s with --with mcp<2 (MCP SDK 2.x incompatibility; "
+                                "original: %s)", command, fixed_args,
+                            )
+                            fixes.append(pinned)
+                    continue
+                if not result or not result.success:
+                    discovery_error = result.error if result and result.error else "tool discovery failed"
+                    continue
+                args = fixed_args
+                server.config = MCPServerConfig(command=command, args=args, env=resolved_env, cwd=resolved_cwd)
+                if hint and suggested:
+                    if "--from" in suggested:
+                        from_idx = suggested.index("--from")
+                        fixed_pkg = suggested[from_idx + 1] if from_idx + 1 < len(suggested) else None
+                    else:
+                        fixed_pkg = next((a for a in suggested if not a.startswith("-")), None)
+                    if fixed_pkg:
+                        server.name = fixed_pkg.split("/")[-1]
+                        server.pkg = server.name
+                        name = server.name
+                discovery_error = None
+                break
         except Exception as exc:
             result = None
             discovery_error = str(exc)
@@ -3449,8 +3521,13 @@ class ModelService:
             return "Couldn't start this connection."
         low = msg.lower()
         # Package deps unpinned/out of date vs the current MCP SDK
-        # (e.g. "No module named 'mcp.server.fastmcp'").
-        if re.search(r"no module named ['\"]?mcp[.'\"]|mcp\.server\.fastmcp|mcp\.shared", low):
+        # (e.g. "No module named 'mcp.server.fastmcp'" or
+        # "cannot import name 'McpError' from 'mcp'").
+        if re.search(
+            r"no module named ['\"]?mcp[.'\"]|mcp\.server\.fastmcp|mcp\.shared|"
+            r"cannot import name .* from ['\"]?mcp",
+            low,
+        ):
             return (
                 "This package isn't compatible with the current MCP SDK — its "
                 "dependencies are out of date. Try another package, or ask its "
