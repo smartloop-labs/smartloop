@@ -350,16 +350,22 @@ async def health_check():
         overhead = max(mem_rss - total_model_bytes, 0)
         estimated_total = total_model_bytes + overhead
 
-        cuda_mem = False
+        # NVIDIA VRAM via nvidia-smi (the backend is Vulkan/llama.cpp; torch's
+        # CUDA view is irrelevant and torch isn't installed by default).
+        gpu_total_gb = None
         try:
-            import torch
-            if torch.cuda.is_available():
-                _, total_b = torch.cuda.mem_get_info()
-                result["memory_percent"] = int(estimated_total / total_b * 100)
-                cuda_mem = True
+            import subprocess
+            smi = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if smi.returncode == 0:
+                gpu_total_gb = float(smi.stdout.strip().splitlines()[0]) / 1024
         except Exception:
             pass
-        if not cuda_mem:
+        if gpu_total_gb:
+            result["memory_percent"] = int(estimated_total / (gpu_total_gb * 1024**3) * 100)
+        else:
             mem_total = psutil.virtual_memory().total
             result["memory_percent"] = int(estimated_total / mem_total * 100)
     except Exception:

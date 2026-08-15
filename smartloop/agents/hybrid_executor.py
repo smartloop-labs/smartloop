@@ -25,48 +25,49 @@ def _llama_gpu_offload() -> bool:
         return False
 
 
-def _gpu_device_cap() -> int | None:
-    """Max concurrent GPU model copies (one per GPU), or None for CPU-only.
+def _nvidia_smi_gpus() -> list:
+    """Return ``[(name, free_gb, total_gb), ...]`` for NVIDIA GPUs, or ``[]``.
 
-    Uses torch when installed; otherwise any llama.cpp GPU backend (CUDA
-    without a torch wheel, Vulkan, Metal) caps at one copy per device.
+    GPU availability is decided by llama.cpp; the backend is Vulkan, so torch's
+    CUDA view is irrelevant (and torch isn't installed by default). nvidia-smi
+    reports the physical NVIDIA GPU(s) directly. Non-NVIDIA Vulkan GPUs
+    (AMD/Intel) have no nvidia-smi → the caller falls back to RAM sizing.
     """
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return max(1, torch.cuda.device_count())
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return 1
-    except Exception:
-        pass
-    return 1 if _llama_gpu_offload() else None
-
-
-def _cuda_mem_info_gb():
-    """Return ``(name, free_gb, total_gb)`` for CUDA device 0, or None.
-
-    Prefers torch (fast); falls back to nvidia-smi so CUDA VRAM sizing stays
-    accurate in torch-free builds.
-    """
-    try:
-        import torch
-        if torch.cuda.is_available():
-            free_b, total_b = torch.cuda.mem_get_info()
-            return torch.cuda.get_device_name(0), free_b / 1024**3, total_b / 1024**3
-    except Exception:
-        pass
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.free,memory.total",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
         )
-        if result.returncode == 0:
-            name, free_mib, total_mib = (x.strip() for x in result.stdout.splitlines()[0].split(","))
-            return name, float(free_mib) / 1024, float(total_mib) / 1024
+        if result.returncode != 0:
+            return []
+        gpus = []
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 3:
+                name, free_mib, total_mib = parts
+                gpus.append((name, float(free_mib) / 1024, float(total_mib) / 1024))
+        return gpus
     except Exception:
-        pass
-    return None
+        return []
+
+
+def _gpu_device_cap() -> int | None:
+    """Max concurrent GPU model copies (one per GPU), or None for CPU-only.
+
+    One copy per physical NVIDIA GPU; any other llama.cpp GPU backend
+    (Vulkan on AMD/Intel, Metal) caps at a single device.
+    """
+    gpus = _nvidia_smi_gpus()
+    if gpus:
+        return len(gpus)
+    return 1 if _llama_gpu_offload() else None
+
+
+def _cuda_mem_info_gb():
+    """Return ``(name, free_gb, total_gb)`` for NVIDIA GPU 0, or None."""
+    gpus = _nvidia_smi_gpus()
+    return gpus[0] if gpus else None
 
 
 def _is_mps() -> bool:
@@ -172,20 +173,16 @@ class LLMExecutor:
         On GPUs the count is also capped at one copy per GPU: separate
         processes can't run GPU kernels concurrently on the same device (the
         driver serializes them without CUDA MPS), so the parallel ceiling is
-        ``torch.cuda.device_count()`` (1 for MPS).  A single GPU therefore caps
-        at 1 and the caller reuses the shared model.  CPU has no such cap —
+        the number of physical NVIDIA GPUs (nvidia-smi), or 1 for any other
+        llama.cpp GPU backend (Vulkan, Metal).  A single GPU therefore caps at
+        1 and the caller reuses the shared model.  CPU has no such cap —
         independent cores give real parallelism, sized by memory below.
         """
         try:
-            # One model copy per GPU is the most that can run in parallel on
-            # CUDA; same-GPU copies serialize.  MPS is a single device.  CPU is
+            # One model copy per GPU is the most that can run in parallel;
+            # same-GPU copies serialize.  A non-NVIDIA GPU backend (Vulkan on
+            # AMD/Intel, Metal) isn't enumerable, so assume one device.  CPU is
             # uncapped here (cores parallelize) → memory is the only limit.
-            # One model copy per GPU is the most that can run in parallel on
-            # CUDA; same-GPU copies serialize.  MPS is a single device.  A GPU
-            # backend torch can't see (e.g. Vulkan on AMD/Intel) also caps at
-            # one — device count and VRAM aren't queryable through the
-            # llama-cpp-python bindings, so assume one device.  CPU is uncapped
-            # here (cores parallelize) → memory is the only limit.
             gpu_cap = _gpu_device_cap()
             if gpu_cap is not None and gpu_cap < requested:
                 logger.info(

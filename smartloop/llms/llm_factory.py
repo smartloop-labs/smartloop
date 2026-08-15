@@ -10,17 +10,12 @@ from smartloop.utils.device_utils import get_device_config
 
 
 def _get_cuda_vram_gb() -> float | None:
-    """Return total VRAM in GB for CUDA device 0, or None if unavailable.
+    """Return total VRAM in GB for NVIDIA GPU 0, or None if unavailable.
 
-    Tries torch first (fast, when installed), falls back to nvidia-smi when
-    torch is absent or was installed without CUDA support (CPU-only wheel).
+    GPU availability is decided by llama.cpp and the backend is Vulkan, so
+    torch's CUDA view is irrelevant (and torch isn't installed by default).
+    Query nvidia-smi directly for the physical GPU's VRAM.
     """
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-    except Exception:
-        pass
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],

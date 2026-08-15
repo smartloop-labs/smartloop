@@ -718,15 +718,9 @@ class ModelService:
         None on CPU (RAM is plentiful; no fit guard needed) or when the device
         can't be queried.
         """
-        # CUDA VRAM: prefer torch (when installed), else nvidia-smi so torch-free
-        # builds stay accurate.
-        try:
-            import torch
-            if torch.cuda.is_available():
-                free_b, total_b = torch.cuda.mem_get_info()
-                return free_b / 1024**3, total_b / 1024**3
-        except Exception:
-            pass
+        # NVIDIA VRAM: query nvidia-smi directly. GPU availability is decided by
+        # llama.cpp and the backend is Vulkan, so torch's CUDA view is
+        # irrelevant (and torch isn't installed by default).
         try:
             import subprocess
             result = subprocess.run(
@@ -739,7 +733,7 @@ class ModelService:
                 return float(free_mib) / 1024, float(total_mib) / 1024
         except Exception:
             pass
-        # Apple Silicon unified memory (Metal via llama.cpp, no torch needed).
+        # Apple Silicon unified memory (Metal via llama.cpp).
         try:
             from llama_cpp import llama_supports_gpu_offload
             if sys.platform == "darwin" and llama_supports_gpu_offload():
