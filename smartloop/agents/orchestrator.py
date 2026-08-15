@@ -36,6 +36,7 @@ from smartloop.agents.planner import (
 from smartloop.agents.mcp.server_selector import (
     BASH_TOOL, GREP_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, EXPLORE_TOOL
 )
+from smartloop.agents.mcp.mcp_agent import MCPAgent
 from smartloop.agents.mcp.argument_extractor import MCPArgumentExtractor
 from smartloop.agents.mcp.dependency_analyzer import MCPDependencyAnalyzer
 from smartloop.agents.mcp.result_mapper import MCPResultMapper
@@ -44,6 +45,7 @@ from smartloop.utils.mcp_result_formatter import ResultFormatter
 
 from smartloop.agents.mcp.explorer import Explorer, SearchContext, EnrichedContext
 from smartloop.agents.fetch_agent import FetchAgent
+from smartloop.agents.web_search_agent import WebSearchAgent
 from smartloop.agents.sanitize import fence_document_content
 from smartloop.config.app_settings import AppSettings
 
@@ -230,6 +232,11 @@ class SLPOrchestrator:
         self.result_formatter = ResultFormatter(orchestrator_llm)
         self.explorer = Explorer(self.agent_llm, self.tool_caller, self.arg_extractor)
         self._fetch_agent = FetchAgent()
+        self._web_search_agent = WebSearchAgent()
+        # MCPAgent: vector-retrieves candidate tools as one flat server.tool_name
+        # list, then LLM-picks. This is the resolution path for external MCP tool
+        # steps (no separate server selector, no keyword-scan fallback).
+        self._mcp_agent = MCPAgent(self.agent_llm, logger)
 
         # Prefer a shared, long-lived executor (its LLM worker processes load
         # the model once and are reused across requests).  Fall back to a
@@ -1295,6 +1302,14 @@ class SLPOrchestrator:
                 logger.info(f"[fetch] step {step.step}: {len(content)} chars from {url}")
                 return self._step_result(node_id, step, content, content)
 
+            # WEB_SEARCH: run the WebSearchAgent (latest info/events) in-process
+            if step.step_type == StepType.WEB_SEARCH:
+                query = (step.default_args or {}).get("query") or step.instruction or ctx.user_message
+                self._emit("web_search", "processing", "Searching the web for the latest information")
+                content = self._web_search_agent.search(query)
+                logger.info(f"[web_search] step {step.step}: {len(content or '')} chars")
+                return self._step_result(node_id, step, content or "", content or "")
+
             # EXPLORE: return pre-fetched search context (already collected)
             if step.step_type == StepType.EXPLORE:
                 parts = []
@@ -1482,6 +1497,7 @@ Assess whether these search results are relevant to the user's request. If relev
                 cwd=ctx.effective_cwd,
                 previous_results=prev_results if prev_results else None,
                 llm=step_llm,
+                project_dir=ctx.project_dir,
             )
 
             if resolved is None:
@@ -3130,6 +3146,7 @@ Is this context relevant to the user's request?
         cwd: Optional[str],
         previous_results: Optional[List[Dict[str, Any]]] = None,
         llm: Optional[BaseLLM] = None,
+        project_dir: Optional[str] = None,
     ) -> Optional[tuple]:
         """Resolve tool arguments: find server, run deps, extract args.
 
@@ -3159,138 +3176,59 @@ Is this context relevant to the user's request?
             step.server_id = SYSTEM_TOOLS_SERVER_ID
             step.server_name = SYSTEM_TOOLS_SERVER_NAME
 
-        # Find server
+        is_system = (
+            step.server_id == SYSTEM_TOOLS_SERVER_ID or tool_name in _SYSTEM_TOOLS
+        )
+
+        # Find server + tool.
         server = None
         if step.server_id:
             server = self.tool_caller.find_server(mcp_servers, step.server_id, step.server_name)
-        if not server:
-            real_server_id = None
-            for srv in available_servers:
-                if srv.get("id") == SYSTEM_TOOLS_SERVER_ID:
-                    continue
-                for t in srv.get("tools", []):
-                    if t.get("name") == tool_name:
-                        real_server_id = srv["id"]
-                        logger.info(
-                            f"[resolve] Found tool '{tool_name}' in server "
-                            f"'{srv.get('name', '')}' (id={srv['id']})"
-                        )
-                        break
-                if real_server_id:
-                    break
 
-            if not real_server_id and step.server_name:
-                for srv in available_servers:
-                    if srv.get("id") == SYSTEM_TOOLS_SERVER_ID:
-                        continue
-                    srv_name = srv.get("name", "")
-                    if (srv_name.lower() == step.server_name.lower()
-                            or step.server_name.lower() in srv_name.lower()):
-                        real_server_id = srv["id"]
-                        logger.info(
-                            f"[resolve] Matched server '{srv_name}' via "
-                            f"name hint '{step.server_name}'"
-                        )
-                        break
-
-            if not real_server_id:
-                for srv in available_servers:
-                    if srv.get("id") == SYSTEM_TOOLS_SERVER_ID:
-                        continue
-                    srv_name = srv.get("name", "")
-                    if srv_name and srv_name.lower() in directive.lower():
-                        real_server_id = srv["id"]
-                        logger.info(
-                            f"[resolve] Matched server '{srv_name}' from directive"
-                        )
-                        break
-
-            if real_server_id:
-                server = self.tool_caller.find_server(mcp_servers, real_server_id, real_server_id)
-                if server:
-                    logger.info(
-                        f"[resolve] Resolved server for tool '{tool_name}' "
-                        f"via catalogue scan → '{server.name}' (id={server.id})"
+        if not is_system:
+            # External MCP tools resolve through the MCPAgent: it retrieves the
+            # top tools from the mcp_tools vector index as one flat
+            # server.tool_name list and the LLM picks one. There is no
+            # keyword-scan fallback. An explicit, already-resolvable plan choice
+            # (server present + exact tool schema) is honoured first so a
+            # well-specified plan skips retrieval.
+            explicit_ok = (
+                server is not None
+                and has_explicit_tool
+                and self.tool_caller.find_tool_schema(server, tool_name) is not None
+            )
+            if not explicit_ok:
+                picked = self._mcp_agent.select_tool(
+                    directive=directive,
+                    project_dir=project_dir,
+                    mcp_servers=mcp_servers,
+                )
+                if picked:
+                    picked_server_id, picked_tool = picked
+                    server = self.tool_caller.find_server(
+                        mcp_servers, picked_server_id, picked_server_id,
                     )
-                    if not self.tool_caller.find_tool_schema(server, tool_name):
-                        if not has_explicit_tool:
-                            matched_tool = self.tool_caller.find_tool_by_keyword(server, directive)
-                            if matched_tool:
-                                tool_name = matched_tool
-                                logger.info(
-                                    f"[resolve] Resolved tool '{step.tool_name}' → "
-                                    f"'{tool_name}' via keyword match on server '{server.name}'"
-                                )
-                        else:
-                            logger.warning(
-                                f"[resolve] Explicit tool '{tool_name}' not found on "
-                                f"server '{server.name}' — skipping keyword fallback"
-                            )
+                    if server:
+                        tool_name = picked_tool
+                        has_explicit_tool = True
+                        logger.info(
+                            f"[resolve] MCPAgent selected '{tool_name}' on "
+                            f"server '{server.name}' via vector retrieval"
+                        )
 
         if not server:
-            for srv_obj in mcp_servers:
-                if not srv_obj.enabled or not srv_obj.tools:
-                    continue
-                if srv_obj.id == SYSTEM_TOOLS_SERVER_ID:
-                    continue
-                for t in srv_obj.tools:
-                    if t.name == tool_name:
-                        server = srv_obj
-                        logger.info(
-                            f"[resolve] Found tool '{tool_name}' via "
-                            f"direct MCP server scan → '{srv_obj.name}'"
-                        )
-                        break
-                if not server and not has_explicit_tool:
-                    matched_tool = self.tool_caller.find_tool_by_keyword(srv_obj, tool_name)
-                    if matched_tool:
-                        server = srv_obj
-                        tool_name = matched_tool
-                        logger.info(
-                            f"[resolve] Resolved '{step.tool_name}' → '{tool_name}' "
-                            f"via keyword on '{srv_obj.name}'"
-                        )
-                if server:
-                    break
-
-        if not server:
-            logger.warning(f"[resolve] Server not found for tool '{tool_name}': {step.server_name} (id={step.server_id})")
+            logger.warning(
+                f"[resolve] Server not found for tool '{tool_name}': "
+                f"{step.server_name} (id={step.server_id})"
+            )
             return None
 
-        # Find tool schema
+        # Tool schema — exact lookup only (no keyword guessing).
         tool_schema = self.tool_caller.find_tool_schema(server, tool_name)
-        if not tool_schema and not has_explicit_tool:
-            resolved_tool = self.tool_caller.find_tool_by_keyword(server, directive)
-            if resolved_tool:
-                logger.info(
-                    f"[resolve] Tool '{tool_name}' not found — resolved to "
-                    f"'{resolved_tool}' via keyword match on instruction"
-                )
-                tool_name = resolved_tool
-                tool_schema = self.tool_caller.find_tool_schema(server, tool_name)
-
-            if not tool_schema:
-                for t in (server.tools or []):
-                    t_name = t.name if hasattr(t, 'name') else t.get('name', '')
-                    if t_name and t_name in directive:
-                        logger.info(
-                            f"[resolve] Tool '{tool_name}' not found — resolved to "
-                            f"'{t_name}' (mentioned in instruction)"
-                        )
-                        tool_name = t_name
-                        tool_schema = self.tool_caller.find_tool_schema(server, tool_name)
-                        break
-
-            if not tool_schema:
-                logger.warning(f"[resolve] Tool schema not found: {tool_name} on server '{server.name}'")
-                return None
-
-        # An explicit tool name skips the keyword-fallback block above, so a
-        # hallucinated step (e.g. a non-existent 'provide_url') can still reach
-        # here with no schema. Guard against it instead of crashing on None.get().
         if not tool_schema:
             logger.warning(
-                f"[resolve] Tool '{tool_name}' not found on server '{server.name}' — skipping step"
+                f"[resolve] Tool '{tool_name}' not found on server "
+                f"'{server.name}' — skipping step"
             )
             return None
 
@@ -3317,6 +3255,25 @@ Is this context relevant to the user's request?
             logger.info(
                 f"[resolve] Scoped '{tool_name}' schema to inferred args: "
                 f"{sorted(allowed_keys)}"
+            )
+        else:
+            # Prompt-derived step: only extract REQUIRED arguments. Optional
+            # params are left unset so the tool applies its own defaults — this
+            # stops the LLM fabricating optional filters (e.g. Linear
+            # list_issues' priority/query/includeArchived) that wrongly narrow
+            # or empty the result. Tools with no required params get no
+            # inferred arguments at all.
+            required = input_schema.get("required", [])
+            properties = input_schema.get("properties", {})
+            scoped_props = {k: v for k, v in properties.items() if k in required}
+            input_schema = {
+                **input_schema,
+                "properties": scoped_props,
+                "required": required,
+            }
+            logger.info(
+                f"[resolve] Scoped '{tool_name}' schema to required args only: "
+                f"{sorted(required)}"
             )
 
         server_url = self.tool_caller.get_server_url(server)
@@ -3444,7 +3401,12 @@ Is this context relevant to the user's request?
             all_deterministic = False
             break
 
-        if all_deterministic and deterministic_args:
+        if not input_schema.get('properties'):
+            # No required/declared params to extract — call the tool with no
+            # inferred arguments and let it apply its own defaults.
+            arguments = {}
+            logger.info("[resolve] '%s' has no extractable params — no inferred arguments", tool_name)
+        elif all_deterministic and deterministic_args:
             arguments = deterministic_args
             logger.info(
                 "[resolve] '%s' all required params filled deterministically: %s",

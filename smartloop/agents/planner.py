@@ -49,6 +49,7 @@ class StepType(str, Enum):
     ANALYZE        = "analyze"        # LLM reasons about user intent and context before planning
     TOOL           = "tool"           # Call an external MCP tool
     FETCH          = "fetch"          # Fetch a URL → markdown via the FetchAgent
+    WEB_SEARCH     = "web_search"     # Pull latest info/events via the WebSearchAgent
     EXPLORE        = "explore"        # Walk the local filesystem tree + vector search
     ACTION         = "action"         # Built-in action: bash, write, read, grep, summarize
     CONVERSATIONAL = "conversational" # LLM generates content from knowledge
@@ -586,6 +587,16 @@ class Planner:
         intent = classification.intent
 
         if intent == IntentType.CONVERSATION:
+            # Latest/live-info prompts can't be answered from stale training
+            # knowledge — route to the WebSearchAgent instead. A detected URL
+            # takes priority (fetch that page directly), so skip when present.
+            if self._detect_web_search(context.user_message) and not classification.detected_urls:
+                web_step = self._make_web_search_step(context)
+                web_step.step = 1
+                return ExecutionPlan(
+                    steps=[web_step],
+                    reasoning="conversation → web search (latest info)",
+                )
             if classification.capability:
                 return ExecutionPlan(
                     steps=[PlanStep(
@@ -1006,6 +1017,42 @@ class Planner:
             default_args={"url": url},
         )
 
+    # Phrases that signal the user wants up-to-date/live information the model's
+    # training data can't cover — routed to the WebSearchAgent.
+    _WEB_SEARCH_KEYWORDS = (
+        "latest", "recent", "recently", "current", "currently", "today",
+        "this week", "this month", "this year", "right now", "up to date",
+        "up-to-date", "breaking", "news", "headline", "trending",
+        "as of now", "these days", "just announced", "newest",
+    )
+
+    @classmethod
+    def _detect_web_search(cls, user_message: str) -> bool:
+        """True when the prompt asks for latest/live information (no URL given).
+
+        Deterministic keyword match so ``latest``/``news``/``current events``
+        style prompts route to the WebSearchAgent instead of a pure-knowledge
+        conversational answer that would be stale.
+        """
+        text = (user_message or "").lower()
+        return any(kw in text for kw in cls._WEB_SEARCH_KEYWORDS)
+
+    def _make_web_search_step(self, context: PlanContext) -> PlanStep:
+        """Build a WEB_SEARCH step run by the WebSearchAgent.
+
+        The user query is carried in ``default_args`` so no argument
+        resolution is needed (mirrors the FETCH step contract).
+        """
+        return PlanStep(
+            step=0,
+            step_type=StepType.WEB_SEARCH,
+            tool_name="web_search",
+            server_id="",
+            server_name="",
+            instruction=f"Search the web for: {context.user_message}",
+            default_args={"query": context.user_message},
+        )
+
     # ------------------------------------------------------------------ #
     # Response parsing                                                     #
     # ------------------------------------------------------------------ #
@@ -1049,6 +1096,8 @@ class Planner:
             step_type_map = {
                 "tool_call": StepType.TOOL,
                 "mcp": StepType.TOOL,
+                "web_search": StepType.WEB_SEARCH,
+                "search": StepType.WEB_SEARCH,
                 "conversation": StepType.CONVERSATIONAL,
                 "document": StepType.EXPLORE,
                 "read": StepType.TOOL,

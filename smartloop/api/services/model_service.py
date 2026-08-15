@@ -3424,6 +3424,7 @@ class ModelService:
         )
         current_project.mcp_servers.append(server)
         self._model.save()
+        self._index_mcp_tools(current_project, server)
 
         result = self._mcp_server_to_dict(server)
 
@@ -3587,10 +3588,84 @@ class ModelService:
 
         current_project.mcp_servers.append(server)
         self._model.save()
+        self._index_mcp_tools(current_project, server)
 
         result = self._mcp_server_to_dict(server)
 
         return result
+
+    def _index_mcp_tools(self, project: "Project", server: "MCPServer") -> None:
+        """Vectorize a server's tools into the project's ``mcp_tools`` collection.
+
+        Best-effort: a failure here must never block server registration, so
+        the MCPAgent's vector retrieval simply returns nothing until the next
+        successful index.
+        """
+        try:
+            from smartloop.db.mcp_tool_indexer import MCPToolIndexer
+            indexer = MCPToolIndexer(
+                project_dir=project.project_dir,
+                logger=logger,
+                base_dir=self._model.workspace.workspace_dir,
+            )
+            indexed = indexer.index_server(server)
+            logger.info(
+                "[mcp-index] Registered server '%s' → indexed %d tool(s); "
+                "project '%s' now has %d tool vector(s)",
+                server.name, indexed, project.name, indexer.count(),
+            )
+        except Exception as e:
+            logger.warning("Failed to index MCP tools for '%s': %s", server.name, e)
+
+    def _unindex_mcp_tools(self, project: "Project", server_id: str) -> None:
+        """Remove a server's tools from the project's ``mcp_tools`` collection."""
+        try:
+            from smartloop.db.mcp_tool_indexer import MCPToolIndexer
+            indexer = MCPToolIndexer(
+                project_dir=project.project_dir,
+                logger=logger,
+                base_dir=self._model.workspace.workspace_dir,
+            )
+            indexer.remove_server(server_id)
+            logger.info(
+                "[mcp-index] Deleted server '%s' tool vectors; project '%s' "
+                "now has %d tool vector(s)",
+                server_id, project.name, indexer.count(),
+            )
+        except Exception as e:
+            logger.warning("Failed to unindex MCP tools for '%s': %s", server_id, e)
+
+    def count_indexed_mcp_tools(self, project_id: str | None = None) -> dict:
+        """Diagnostic: how many MCP tool vectors are indexed for a project.
+
+        Returns ``{"project": <name>, "tool_vectors": <n>, "servers": <n>,
+        "server_tools": <n>}`` where ``tool_vectors`` is the count in the
+        ``mcp_tools`` vector collection and ``server_tools`` is the count from
+        the registered server definitions (they should match once every server
+        has been indexed).
+        """
+        if project_id:
+            project = self._get_project(project_id)
+        else:
+            self._initialize_workspace()
+            project = self._model.workspace.current_project
+            if not project:
+                raise ValueError("No current project found")
+
+        from smartloop.db.mcp_tool_indexer import MCPToolIndexer
+        indexer = MCPToolIndexer(
+            project_dir=project.project_dir,
+            logger=logger,
+            base_dir=self._model.workspace.workspace_dir,
+        )
+        servers = [s for s in project.mcp_servers if not getattr(s, "system", False)]
+        server_tools = sum(len(s.tools or []) for s in servers)
+        return {
+            "project": project.name,
+            "tool_vectors": indexer.count(),
+            "servers": len(servers),
+            "server_tools": server_tools,
+        }
 
     def _write_mcp_doc(
         self,
@@ -3687,6 +3762,7 @@ class ModelService:
             s for s in current_project.mcp_servers if s.id != server_id
         ]
         self._model.save()
+        self._unindex_mcp_tools(current_project, server_id)
 
         return {
             "id": server_id,

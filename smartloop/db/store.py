@@ -89,6 +89,14 @@ class VectorStore(ABC):
         """Fetch all chunks for the given document IDs (no semantic query)."""
         return []
 
+    def count(self) -> int:
+        """Return the number of stored chunks in this collection.
+
+        Default implementation returns 0; subclasses backed by a real store
+        should override.
+        """
+        return 0
+
     @abstractmethod
     def delete_document(self, document_id: str):
         """Remove all chunks for a document."""
