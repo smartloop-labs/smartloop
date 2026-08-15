@@ -2738,12 +2738,20 @@ class ModelService:
         downloader_cls = SLPArtifactDownloader if credential_store.has_credentials() else HFDownloader
         downloader = downloader_cls(workspace, logger)
 
+        def _on_download_complete(task, status, _message):
+            from smartloop.tasks.base_task import TaskStatus
+            if status == TaskStatus.COMPLETED:
+                # Re-arm large-model detection so the just-downloaded model is
+                # considered on the next orchestration request.
+                self._large_model_attempted = False
+
         task = DownloaderTask(
             workspace=workspace,
             downloader=downloader,
             logger=logger,
             model_id=model_id,
             progress_callback=progress_callback,
+            on_status_change=_on_download_complete,
         )
         self._task_queue.register(task)
         return task
