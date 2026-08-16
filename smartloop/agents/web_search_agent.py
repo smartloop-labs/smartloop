@@ -171,6 +171,10 @@ class WebSearchAgent:
             logger.info("[web_search] disabled for this project — skipping")
             return ""
 
+        if not self.is_configured():
+            logger.info("[web_search] no search provider/token configured — skipping")
+            return ""
+
         want = top_k or self._top_k
         n = num_candidates or self._num_candidates
         self.last_sources = []
@@ -327,4 +331,19 @@ class WebSearchAgent:
             return bool(project and project.web_search_enabled)
         except Exception as e:
             logger.warning("[web_search] enablement check failed: %s", e)
+            return False
+
+    @staticmethod
+    def is_configured() -> bool:
+        """True when a search provider with a token (e.g. Brave) is configured.
+
+        Without a configured provider/token there is nothing to search with, so
+        ``search`` skips silently rather than calling the hosted endpoint.
+        """
+        try:
+            from smartloop.search.providers import get_search_provider
+
+            return get_search_provider() is not None
+        except Exception as e:
+            logger.warning("[web_search] provider config check failed: %s", e)
             return False
