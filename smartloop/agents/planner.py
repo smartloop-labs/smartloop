@@ -49,6 +49,7 @@ class StepType(str, Enum):
     ANALYZE        = "analyze"        # LLM reasons about user intent and context before planning
     TOOL           = "tool"           # Call an external MCP tool
     FETCH          = "fetch"          # Fetch a URL → markdown via the FetchAgent
+    WEB_SEARCH     = "web_search"     # Pull latest info/events via the WebSearchAgent
     EXPLORE        = "explore"        # Walk the local filesystem tree + vector search
     ACTION         = "action"         # Built-in action: bash, write, read, grep, summarize
     CONVERSATIONAL = "conversational" # LLM generates content from knowledge
@@ -586,6 +587,10 @@ class Planner:
         intent = classification.intent
 
         if intent == IntentType.CONVERSATION:
+            # Web search is no longer keyword-routed here: when enabled on the
+            # project it runs as a parallel source in the collect step (see
+            # Explorer.collect_parallel), so latest-info context is gathered for
+            # every query without a brittle keyword gate.
             if classification.capability:
                 return ExecutionPlan(
                     steps=[PlanStep(
@@ -1049,6 +1054,8 @@ class Planner:
             step_type_map = {
                 "tool_call": StepType.TOOL,
                 "mcp": StepType.TOOL,
+                "web_search": StepType.WEB_SEARCH,
+                "search": StepType.WEB_SEARCH,
                 "conversation": StepType.CONVERSATIONAL,
                 "document": StepType.EXPLORE,
                 "read": StepType.TOOL,

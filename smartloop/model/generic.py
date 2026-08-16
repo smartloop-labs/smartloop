@@ -442,17 +442,14 @@ class GenericModel(SLPModel):
         builder = Builder(self.workspace, model_id, self.logger, output_dir=ws_model.bin_dir)
         builder.build(quantize_type=quantize_type, progress_callback=progress_callback)
 
-    def get_instance(self, debug: bool = False, is_trainable: bool = False) -> BaseLLM:
+    def get_instance(self) -> BaseLLM:
         if self._instance_cache is None:
             model_id = self.model_id()
             # Cascade: use project-level GGUF if it exists, else fall back to workspace GGUF
             gguf_path = self.workspace.resolve_gguf_path(model_id)
 
-            if not debug and os.path.exists(gguf_path):
-                self.logger.info(f"Loading model instance from GGUF: {gguf_path}")
-                model_loader = ModelLoader(self.workspace, self.logger, debug=False, is_trainable=False, gguf_path=gguf_path)
-            else:
-                model_loader = ModelLoader(self.workspace, self.logger, debug=debug, is_trainable=is_trainable, gguf_path=gguf_path)
+            self.logger.info(f"Loading model instance from GGUF: {gguf_path}")
+            model_loader = ModelLoader(self.workspace, self.logger, gguf_path=gguf_path)
             self._instance_cache = model_loader.load()
 
         return self._instance_cache

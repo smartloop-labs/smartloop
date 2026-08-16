@@ -6,13 +6,22 @@ own model instance).
 """
 import logging
 import os
-import torch
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 from smartloop.agents.llm_worker import init_worker, run_inference
+from smartloop.utils.device_utils import llama_gpu_offload, is_mps
 
 logger = logging.getLogger(__name__)
+
+
+def _gpu_device_cap() -> int | None:
+    """Max concurrent GPU model copies, or None for CPU-only.
+
+    A GPU backend (Vulkan/Metal) isn't enumerable and same-device copies
+    serialize, so cap at a single device whenever GPU offload is available.
+    """
+    return 1 if llama_gpu_offload() else None
 
 
 class LLMExecutor:
@@ -110,31 +119,19 @@ class LLMExecutor:
         above ``requested``.  The estimate is deliberately conservative since
         under-counting a worker's footprint crashes the last copy to load.
 
-        On GPUs the count is also capped at one copy per GPU: separate
-        processes can't run GPU kernels concurrently on the same device (the
-        driver serializes them without CUDA MPS), so the parallel ceiling is
-        ``torch.cuda.device_count()`` (1 for MPS).  A single GPU therefore caps
-        at 1 and the caller reuses the shared model.  CPU has no such cap —
-        independent cores give real parallelism, sized by memory below.
+        On a GPU the count is also capped at one copy: separate processes can't
+        run GPU kernels concurrently on the same device (the driver serializes
+        them), and a llama.cpp GPU backend (Vulkan/Metal) isn't enumerable, so
+        the parallel ceiling is a single device.  The caller then reuses the
+        shared model.  CPU has no such cap — independent cores give real
+        parallelism, sized by memory below.
         """
         try:
-            # One model copy per GPU is the most that can run in parallel on
-            # CUDA; same-GPU copies serialize.  MPS is a single device.  CPU is
+            # One model copy per GPU is the most that can run in parallel;
+            # same-GPU copies serialize.  A non-NVIDIA GPU backend (Vulkan on
+            # AMD/Intel, Metal) isn't enumerable, so assume one device.  CPU is
             # uncapped here (cores parallelize) → memory is the only limit.
-            gpu_cap: int | None = None
-            if torch.cuda.is_available():
-                gpu_cap = max(1, torch.cuda.device_count())
-            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                gpu_cap = 1
-            else:
-                # GPU backend torch can't see (e.g. Vulkan on AMD/Intel).
-                # Device count and VRAM aren't queryable through the
-                # llama-cpp-python bindings, so assume one device — same-GPU
-                # copies serialize anyway, and the RAM-based memory sizing
-                # below says nothing about VRAM.
-                from llama_cpp import llama_supports_gpu_offload
-                if llama_supports_gpu_offload():
-                    gpu_cap = 1
+            gpu_cap = _gpu_device_cap()
             if gpu_cap is not None and gpu_cap < requested:
                 logger.info(
                     "[device] %d GPU(s) — capping worker copies at one per GPU "
@@ -148,7 +145,12 @@ class LLMExecutor:
 
             from smartloop.config.app_settings import AppSettings
             _settings = AppSettings()
-            worker_ctx = _settings.llm_worker_n_ctx
+            # Worker/main context for PROVISIONING the copy count.  When
+            # uncapped (0), the actual models auto-size up at load (with the
+            # worker's halving retry as a safety net), so estimate with the
+            # former default 8192 here — budgeting the device bound instead
+            # would under-provision and disable the pool entirely.
+            worker_ctx = _settings.llm_worker_n_ctx or 8192
             # Per-copy footprint: weights + KV cache + per-process overhead.
             # The estimate is deliberately conservative — under-counting any
             # term makes ``fits`` round up to a worker that then fails
@@ -163,22 +165,17 @@ class LLMExecutor:
             # sized to ``llm_main_n_ctx_cap``), and a flat reserve badly
             # under-counts it — that's what let this over-provision workers and
             # OOM the last copy.  Estimate its footprint the same way as a copy.
-            main_kv_gb = 0.5 * (_settings.llm_main_n_ctx_cap / 4096)
+            main_ctx = _settings.llm_main_n_ctx_cap or 8192
+            main_kv_gb = 0.5 * (main_ctx / 4096)
             main_footprint_gb = model_gb + main_kv_gb + 0.7
 
             # Resolve (device_label, free_gb, total_gb, reserve_gb) for whichever
             # accelerator is active.  reserve keeps memory for the main model,
             # fragmentation headroom and the OS so workers don't claim
-            # everything and crash the last copy that tries to load.
-            if torch.cuda.is_available():
-                free_b, total_b = torch.cuda.mem_get_info()
-                # mem_get_info() is a single snapshot taken before any worker
-                # loads; workers spawn concurrently, so keep a VRAM reserve
-                # (was 0.0) to absorb that drift + allocator fragmentation.
-                device, free_gb, total_gb, reserve_gb = (
-                    torch.cuda.get_device_name(0), free_b / 1024**3, total_b / 1024**3, 1.5,
-                )
-            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            # everything and crash the last copy that tries to load.  VRAM is
+            # not probed — for a discrete GPU the Vulkan backend manages device
+            # memory, so we size workers against system RAM (conservative).
+            if is_mps():
                 # Apple Silicon: unified memory shared with the OS/main model.
                 import psutil
                 vm = psutil.virtual_memory()
@@ -187,15 +184,15 @@ class LLMExecutor:
             else:
                 import psutil
                 vm = psutil.virtual_memory()
-                device, total_gb = "CPU", vm.total / 1024**3
+                device, total_gb = "GPU/CPU (system RAM)" if llama_gpu_offload() else "CPU", vm.total / 1024**3
                 free_gb, reserve_gb = vm.available / 1024**3, 2.0
 
             # Charge for the main model only to the extent it isn't already
-            # resident.  ``mem_get_info`` is timing-dependent: if the executor
-            # is built *after* the model loads, ``free_gb`` already excludes it
-            # (already_used covers it → unaccounted ≈ 0); if built *before*,
-            # already_used ≈ 0 so we reserve the full footprint.  Either way we
-            # never double-charge and never ignore it.
+            # resident.  The free-memory snapshot is timing-dependent: if the
+            # executor is built *after* the model loads, ``free_gb`` already
+            # excludes it (already_used covers it → unaccounted ≈ 0); if built
+            # *before*, already_used ≈ 0 so we reserve the full footprint.
+            # Either way we never double-charge and never ignore it.
             already_used_gb = max(0.0, total_gb - free_gb)
             unaccounted_main_gb = max(0.0, main_footprint_gb - already_used_gb)
 

@@ -1,12 +1,103 @@
+import json
 import re
 from logging import Logger
-from typing import List
+from typing import Any, Dict, List, Optional
 
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 from smartloop.parsers.parser_factory import BaseLLM
 from smartloop.workspace.types import Document
 
 max_tokens = 512  # max tokens per chunk — set lower than model limit to allow room for prompt
+
+
+def json_to_table(text: str) -> Optional[str]:
+    """Convert a JSON array-of-objects document into a markdown table.
+
+    Handles a top-level array or an object holding one under a common key
+    (``rows``, ``data``, ``items``, ``results``, ``players``, ``values``).
+    Each object becomes a table row; columns are the union of keys, with
+    nested objects flattened using dot-prefixed keys (e.g. a player's
+    ``"values": {"epa": 0.3, ...}`` becomes ``values.epa``).  Floats are
+    rounded to 4 decimals and integral floats shown without the decimal
+    so dense stats stay compact.
+
+    Returns ``None`` when the text isn't JSON or has no tabular structure,
+    so callers fall back to text splitting / LLM extraction.  Deterministic
+    and context-window-independent — a large data file becomes a table
+    without ever loading it into a model (whose window overflows for big
+    documents, silently killing extraction).
+    """
+    _ROW_CAP = 500
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+
+    rows = data if isinstance(data, list) else None
+    if isinstance(data, dict):
+        for key in ("rows", "data", "items", "results", "players", "values"):
+            candidate = data.get(key)
+            if isinstance(candidate, list) and candidate and isinstance(candidate[0], dict):
+                rows = candidate
+                break
+    if not isinstance(rows, list):
+        return None
+
+    flat_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        flat: Dict[str, Any] = {}
+
+        def _flatten(obj: Dict[str, Any], prefix: str = "") -> None:
+            for k, v in obj.items():
+                key = f"{prefix}.{k}" if prefix else k
+                if isinstance(v, dict):
+                    _flatten(v, key)
+                else:
+                    flat[key] = v
+
+        _flatten(row)
+        flat_rows.append(flat)
+    if not flat_rows:
+        return None
+
+    total_rows = len(flat_rows)
+    truncated = total_rows > _ROW_CAP
+    flat_rows = flat_rows[:_ROW_CAP]
+    columns = list(dict.fromkeys(k for r in flat_rows for k in r))
+
+    def _cell(v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, float):
+            return str(int(v)) if v.is_integer() else f"{v:.4f}"
+        if isinstance(v, (dict, list)):
+            return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+        return str(v)
+
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "|" + "---|" * len(columns),
+    ]
+    for r in flat_rows:
+        lines.append("| " + " | ".join(_cell(r.get(c)) for c in columns) + " |")
+    if truncated:
+        lines.append(f"\n_({_ROW_CAP} of {total_rows} rows shown)_")
+    return "\n".join(lines)
+
+
+def is_markdown_table(text: str) -> bool:
+    """True when the text contains a complete markdown table.
+
+    Detection is the header separator row (e.g. ``|---|---|``) — a line of
+    only dashes/colons/pipes/spaces.  Content that is already a table needs
+    no LLM extraction: it's the structured representation a data query wants,
+    and feeding it through the extractor risks a context-window overflow.
+    """
+    return bool(re.search(r'(?m)^\|\s*[-:|]+\s*\|$', text))
 
 class DocumentSplitter:
     """Utility class for splitting documents into chunks."""

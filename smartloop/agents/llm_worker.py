@@ -45,8 +45,15 @@ def init_worker(model_path: str, project_id: str, log_queue=None) -> None:
 
     from smartloop.llms.llm_factory import LlmFactory
     from smartloop.config.app_settings import AppSettings
+    from smartloop.utils.device_utils import max_auto_context_tokens
     logger = logging.getLogger("llm_worker")
     worker_ctx = AppSettings().llm_worker_n_ctx
+    # 0 (default) = no cap: start from the device's auto-sized bound so each
+    # worker copy uses as much context as the machine allows.  The halving
+    # retry below still degrades gracefully when the auto-sized KV cache can't
+    # fit alongside sibling copies (or the main model).
+    if worker_ctx <= 0:
+        worker_ctx = max_auto_context_tokens()
 
     # Retry the load with a progressively smaller context window.  The KV cache
     # is the main per-copy VRAM lever, so a worker that can't fit its full

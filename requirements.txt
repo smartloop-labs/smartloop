@@ -1,13 +1,13 @@
 # Core ML Dependencies (inference)
-torch>=2.5.1
-transformers>=4.57,<5.0.0
-accelerate>=0.25.0
+# Inference runs on llama.cpp (GGUF). torch/transformers/accelerate are NOT
+# runtime deps — they are only needed for the optional training extra
+# (see pyproject.toml [project.optional-dependencies].training).
 tokenizers>=0.15.0
 sentencepiece>=0.1.99
 huggingface_hub>=0.20.0
 
 # Language Models and Embeddings
-sentence-transformers>=2.2.0
+# Embeddings run on llama.cpp (GGUF); see smartloop/db/llama_embeddings.py.
 chromadb>=0.4.0
 gguf>=0.17.1
 mistral-common[image]>=1.8.6
@@ -52,7 +52,3 @@ fastmcp>=3.3.1
 
 # HTML to Markdown conversion
 markdownify>=0.12.0
-
-# CLI / TUI
-prompt_toolkit>=3.0.47
-textual>=0.75.0

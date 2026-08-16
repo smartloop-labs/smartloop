@@ -57,13 +57,59 @@ class LlamaCpp(BaseLLM[Llama]):
         """Use Llama.cpp's tokenizer to tokenize the string and return the number of tokens"""
         return len(self.model.tokenize(text.encode('utf-8')))
 
+    # Overhead reserved for chat-template formatting when sizing prompt/output.
+    _CTX_OVERHEAD = 64
+    # Output tokens to keep free when a prompt has to be truncated to fit.
+    _MIN_OUTPUT_RESERVE = 512
+
     def _get_available_tokens(self, prompt: str) -> int:
-        """Calculate available output tokens after accounting for prompt size."""
+        """Output tokens that fit after the prompt, never exceeding n_ctx.
+
+        ``prompt + output`` must stay within ``n_ctx`` or llama.cpp rejects the
+        request.  Returns the true remaining budget (floored at 1) — it must
+        NOT force a fixed minimum, which is what previously drove
+        ``prompt + 1024 > n_ctx`` overflows.
+        """
         n_ctx = self.get_max_tokens()
         prompt_tokens = self.get_num_tokens(prompt)
-        # Reserve some overhead for chat template formatting
-        available = n_ctx - prompt_tokens - 64
-        return max(1024, available)
+        available = n_ctx - prompt_tokens - self._CTX_OVERHEAD
+        return max(1, available)
+
+    def _fit_prompt(self, prompt: str) -> str:
+        """Truncate an over-long prompt so it fits n_ctx with room for output.
+
+        A prompt that alone exceeds ``n_ctx`` makes llama.cpp reject the request
+        ("Requested tokens exceed context window") — no ``max_tokens`` value can
+        save it.  Keep the head (system/instructions) and tail (the user
+        question, usually last) and drop the middle bulk (retrieved context /
+        web results), inserting a marker so the model knows content was elided.
+        """
+        try:
+            n_ctx = self.get_max_tokens()
+            budget = n_ctx - self._MIN_OUTPUT_RESERVE - self._CTX_OVERHEAD
+            if budget <= 0:
+                return prompt
+            tokens = self.model.tokenize(prompt.encode("utf-8"))
+            if len(tokens) <= budget:
+                return prompt
+
+            marker = self.model.tokenize(b"\n\n...[context truncated to fit]...\n\n")
+            keep = budget - len(marker)
+            if keep <= 0:
+                kept = tokens[:budget]
+            else:
+                head = keep * 2 // 3
+                tail = keep - head
+                kept = tokens[:head] + marker + (tokens[-tail:] if tail > 0 else [])
+            truncated = self.model.detokenize(kept).decode("utf-8", errors="ignore")
+            self.logger.warning(
+                "[llm] prompt %d tok exceeds budget %d (n_ctx=%d) — truncated context to fit",
+                len(tokens), budget, n_ctx,
+            )
+            return truncated
+        except Exception as e:
+            self.logger.warning("[llm] prompt-fit guard failed: %s", e)
+            return prompt
 
     def _call(
         self,
@@ -74,6 +120,7 @@ class LlamaCpp(BaseLLM[Llama]):
     ) -> str:
         """Run the LLM on the given input."""
         start_time = time.time()
+        prompt = self._fit_prompt(prompt)
         prompt_tokens = self.get_num_tokens(prompt)
         self.logger.info(f"Generating response | prompt_tokens={prompt_tokens}")
 
@@ -149,6 +196,7 @@ class LlamaCpp(BaseLLM[Llama]):
 
         # Use create_chat_completion with stream=True to get streaming response
         # This automatically applies the model's chat template
+        prompt = self._fit_prompt(prompt)
         messages = self.create_messages_from_prompt(prompt)
         available_tokens = self._get_available_tokens(prompt)
 

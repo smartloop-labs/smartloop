@@ -29,7 +29,7 @@ from smartloop.api.model import (
     Usage,
 )
 from smartloop.api.services import ModelService, get_model_service, get_api_client
-from smartloop.constants import SYSTEM_PROMPT
+from smartloop.constants import SYSTEM_PROMPT, resolve_current_date
 from smartloop.types import ModelCapability
 
 
@@ -124,6 +124,7 @@ def format_messages_to_prompt(
     context: str | None = None,
     cwd: str | None = None,
     project_info: str | None = None,
+    current_date: str | None = None,
 ) -> str:
     """Convert OpenAI-style messages to the prompt format expected by the LLM.
 
@@ -135,11 +136,16 @@ def format_messages_to_prompt(
     """
     prompt_parts = []
 
-    system_content = SYSTEM_PROMPT.format(current_date=date.today().strftime("%B %d, %Y"))
+    system_content = SYSTEM_PROMPT
     for msg in messages:
         if msg.role == "system" and msg.content:
             system_content += "\n" + msg.content
     prompt_parts.append(f"<system>{system_content}</system>")
+
+    # The current date is runtime grounding the model was never trained on, so
+    # it rides with the current user turn (next to the question) rather than
+    # buried in the system prompt where a small model is unlikely to attend to it.
+    date_str = current_date or date.today().strftime("%B %d, %Y")
 
     context_injected = False
     last_user_idx = next(
@@ -165,6 +171,7 @@ def format_messages_to_prompt(
                 user_parts.append(_escape_role_tags(msg.content))
 
             if not context_injected and i == last_user_idx:
+                user_parts.append(f"[Current date: {date_str}]")
                 if context:
                     user_parts.append(_escape_role_tags(context))
                 context_injected = True
@@ -173,6 +180,19 @@ def format_messages_to_prompt(
             prompt_parts.append(f"<user>{user_content}</user>")
 
     return "\n".join(prompt_parts)
+
+
+def _request_current_date(request) -> str:
+    """Resolve the current date from the client's ``additional_message_params``.
+
+    Uses the browser's timezone + clock when supplied so date-aware answers
+    match the user's calendar; falls back to the server date otherwise.
+    """
+    params = getattr(request, "additional_message_params", None)
+    return resolve_current_date(
+        getattr(params, "user_date", None) if params else None,
+        getattr(params, "tz", None) if params else None,
+    )
 
 
 def _resolve_message_attachments(
@@ -204,6 +224,7 @@ def _compact_messages(
     model_service: ModelService,
     reserved_tokens: int = 2048,
     context_tokens: int = 0,
+    max_context: int | None = None,
 ) -> List[ChatMessage]:
     """Trim oldest conversation turns when the message list exceeds the context window.
 
@@ -214,8 +235,14 @@ def _compact_messages(
 
     ``context_tokens`` accounts for document_context, project_skills, and
     mcp_context that will be injected into the final prompt.
+
+    ``max_context`` is the window of the model that will actually synthesize
+    the response (which may be smaller than the default model's window — see
+    ``ModelService.get_response_max_context_tokens``).  Defaults to the
+    default model's window for compatibility with existing callers.
     """
-    max_context = model_service.get_max_context_tokens()
+    if max_context is None:
+        max_context = model_service.get_max_context_tokens()
     if max_context <= 0:
         return messages
 
@@ -405,6 +432,7 @@ async def stream_chunks(
                 progress_callback=_progress,
                 cancelled=cancelled,
                 requested_skill=requested_skill,
+                current_date=_request_current_date(request),
             ),
         )
 
@@ -540,40 +568,53 @@ async def stream_chunks(
 
     yield _status_event("preparing", "processing", "Preparing response...")
 
-    # Truncate orchestrator context if it alone would overflow the model's
-    # context window, leaving room for the messages and output.
-    max_ctx = model_service.get_max_context_tokens()
+    # The final synthesis runs on the capability/large/default model, whose
+    # context window can be *smaller* than the default router model's.  Size
+    # the context against the model that will actually consume it — otherwise
+    # web/document context overflows the response model, generation aborts,
+    # the request falls back to the default model, and the search content
+    # never reaches the LLM.
+    response_capability = ModelCapability.GENERAL if orchestrator_context else None
+    max_ctx = model_service.get_response_max_context_tokens(response_capability)
     if orchestrator_context and max_ctx > 0:
-        reserved = 1024  # room for messages + generation
+        # Size the context against the response model's real window, reserving
+        # room for the fixed prompt overhead (system prompt, chat history,
+        # template tags) PLUS a healthy output budget.  A flat reserve here
+        # left almost no output tokens once the system prompt was added, so
+        # grounded responses (e.g. F1 team standings) were cut off mid-sentence
+        # at the model's max_tokens limit.
+        output_reserve = 512
+        overhead_prompt = format_messages_to_prompt(
+            messages, context="", cwd=request.cwd, project_info=project_info,
+            current_date=_request_current_date(request),
+        )
+        overhead_tokens = model_service.count_tokens(overhead_prompt)
+        budget = max(256, max_ctx - overhead_tokens - output_reserve)
         ctx_tokens = model_service.count_tokens(orchestrator_context)
-        if ctx_tokens > max_ctx - reserved:
-            budget = max(512, max_ctx - reserved)
+        if ctx_tokens > budget:
             chars_per_token = max(1, len(orchestrator_context) // max(1, ctx_tokens))
             orchestrator_context = orchestrator_context[: budget * chars_per_token]
             logger.info(
-                "Truncated orchestrator context from %d to %d tokens to fit context window",
-                ctx_tokens, budget,
+                "[context] Truncated orchestrator context from %d to %d tokens "
+                "(overhead %d, output reserve %d) to fit response model window (%d)",
+                ctx_tokens, budget, overhead_tokens, output_reserve, max_ctx,
             )
 
-    messages = _compact_messages(messages, model_service,
-                                context_tokens=model_service.count_tokens(orchestrator_context or ""))
+    messages = _compact_messages(
+        messages, model_service,
+        context_tokens=model_service.count_tokens(orchestrator_context or ""),
+        max_context=max_ctx,
+    )
 
     prompt = format_messages_to_prompt(
         messages,
         context=orchestrator_context,
         cwd=request.cwd,
         project_info=project_info,
+        current_date=_request_current_date(request),
     )
 
     yield _status_event("preparing", "completed", "Preparing response...")
-
-    response_capability = ModelCapability.GENERAL if orchestrator_context else None
-    # The concrete model is resolved (capability → large → default) inside
-    # stream_completion, which logs the actual `[models] RESPONSE → ...` there.
-    logger.debug(
-        "[models] dispatching response synthesis (capability=%s)",
-        response_capability,
-    )
 
     # Store the user message in session history
     if request.session_id and last_user_msg:
@@ -948,6 +989,7 @@ async def create_chat_completion(
                     last_user_msg, skills=project_skills, cwd=request.cwd,
                     conversation_history=conversation_history,
                     images=image_attachments,
+                    current_date=_request_current_date(request),
                 ),
             )
 
@@ -984,6 +1026,7 @@ async def create_chat_completion(
             context=orchestrator_context,
             cwd=request.cwd,
             project_info=project_info,
+            current_date=_request_current_date(request),
         )
 
         # Store user message in session history

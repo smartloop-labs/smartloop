@@ -9,9 +9,8 @@ description = "AI Agent harness for extracting information and creating new cont
 requires-python = ">=3.11"
 dependencies = [
     # Core ML Dependencies (inference)
-    "torch>=2.5.1",
-    "transformers>=4.57,<5.0.0",
-    "accelerate>=0.25.0",
+    # Inference runs on llama.cpp (GGUF). torch/transformers/accelerate are
+    # NOT runtime deps — they live in the optional `training` extra below.
     "tokenizers>=0.15.0",
     "sentencepiece>=0.1.99",
     "huggingface-hub>=0.20.0",
@@ -55,15 +54,15 @@ dependencies = [
     "mcp>=1.26.0",
     "markdownify>=0.11.0",
 
-    # CLI / TUI
-    "prompt_toolkit>=3.0.47",
-    "textual>=0.75.0",
     "certifi",
 ]
 
 [project.optional-dependencies]
 training = [
     "smartloop-trainer>=0.1.0",
+    "torch>=2.5.1",
+    "transformers>=4.57,<5.0.0",
+    "accelerate>=0.25.0",
 ]
 dev = [
     "pytest>=8.0",
@@ -86,8 +85,7 @@ filterwarnings = [
 py-modules = ["main", "version"]
 
 [tool.setuptools.packages.find]
-include = ["tui*", "smartloop*"]
+include = ["smartloop*"]
 
 [tool.setuptools.package-data]
-tui = ["css/*.tcss", "css/*.css"]
 "smartloop.skills" = ["*.md"]

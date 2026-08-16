@@ -1,8 +1,7 @@
 """Device detection and configuration utilities for cross-platform compatibility"""
 import enum
-import torch
 import logging
-from typing import TYPE_CHECKING, Dict, Any, Optional
+from typing import TYPE_CHECKING
 from pydantic import BaseModel
 import sys
 
@@ -30,13 +29,11 @@ class DeviceConfig:
 
     def __init__(self):
         self.device = self._detect_device()
-        self.compute_dtype = self._get_compute_dtype()
         self.attn_implementation = self._get_attention_implementation()
 
     def _detect_device(self) -> DeviceType:
         """Detect the best available device via llama_cpp"""
-        from llama_cpp import llama_supports_gpu_offload
-        if llama_supports_gpu_offload():
+        if llama_gpu_offload():
             return DeviceType.MPS if sys.platform == 'darwin' else DeviceType.CUDA
         return DeviceType.CPU
 
@@ -47,12 +44,6 @@ class DeviceConfig:
         elif self.device == DeviceType.MPS:
             return "Apple Metal GPU"
         return "CPU"
-
-    def _get_compute_dtype(self) -> torch.dtype:
-        """Get the appropriate compute dtype for the device"""
-        if self.device in (DeviceType.CUDA, DeviceType.MPS):
-            return torch.bfloat16
-        return torch.float16
 
     def _get_attention_implementation(self) -> str:
         """Get the best attention implementation for the device"""
@@ -69,25 +60,6 @@ class DeviceConfig:
             verbose=False,
             n_parallel=max(1, n_parallel),
         )
-
-    def get_transformers_config(self, is_training: bool = False) -> Dict[str, Any]:
-        """Get configuration for transformers models
-
-        Args:
-            is_training: If True, forces all layers onto a single device (required
-                by SFTTrainer / Trainer which cannot handle device_map='auto').
-        """
-        config: Dict[str, Any] = {
-            'attn_implementation': self.attn_implementation,
-            'low_cpu_mem_usage': True,
-            'torch_dtype': self.compute_dtype,
-        }
-
-        if self.device == DeviceType.CUDA:
-            config['device_map'] = {'': 0} if is_training else 'auto'
-        # MPS and CPU: no device_map
-
-        return config
 
     def get_batch_size(self) -> int:
         """Get optimal batch size based on device"""
@@ -106,7 +78,6 @@ class DeviceConfig:
         """Log the current device configuration"""
         logger.info("Device Configuration:")
         logger.info(f"  Device: {self.device.value}")
-        logger.info(f"  Compute dtype: {self.compute_dtype}")
         logger.info(f"  Attention implementation: {self.attn_implementation}")
 
 
@@ -117,6 +88,45 @@ def get_device_config() -> DeviceConfig:
     return config
 
 
+def llama_gpu_offload() -> bool:
+    """True when the installed llama.cpp was built with a GPU backend.
+
+    This is the single source of truth for "is a GPU usable" across the app.
+    GPU availability and device memory are managed by llama.cpp / the backend
+    (Vulkan, Metal, CUDA) — VRAM is never probed directly.
+    """
+    try:
+        from llama_cpp import llama_supports_gpu_offload
+        return bool(llama_supports_gpu_offload())
+    except Exception:
+        return False
+
+
 def is_apple_silicon() -> bool:
     """Check if running on Apple Silicon (M1/M2/M3 etc.)"""
     return sys.platform == 'darwin'
+
+
+def max_auto_context_tokens() -> int:
+    """Upper bound (tokens) the llama.cpp factory will auto-size a model's
+    context window to on this device when no explicit cap is set.
+
+    Mirrors the Apple Silicon logic in ``LlmFactory.get_llama_cpp_instance``
+    (131072 on ≥32GB, 65536 on ≥16GB, else 32768; the factory then picks the
+    smaller of this bound and the memory-derived estimate).  Memory estimators
+    (worker-pool sizing, large-model fit guard) use this so "no cap" still
+    accounts for a realistic KV-cache footprint instead of zero.
+    """
+    try:
+        if is_apple_silicon():
+            import psutil
+            total_gb = psutil.virtual_memory().total / (1024 ** 3)
+            return 131072 if total_gb >= 32 else 65536 if total_gb >= 16 else 32768
+    except Exception:
+        pass
+    return 8192
+
+
+def is_mps() -> bool:
+    """True on Apple Silicon with a llama.cpp Metal (GPU offload) backend."""
+    return sys.platform == 'darwin' and llama_gpu_offload()

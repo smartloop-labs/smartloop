@@ -18,7 +18,7 @@ import re as _re
 import time as _time
 
 from smartloop.api.config import api_settings
-from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router
+from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router, web_search_router, search_provider_router
 from smartloop.api.services import get_model_service, get_api_client
         
 from smartloop.config import AppSettings
@@ -214,8 +214,10 @@ app = FastAPI(
     description="Smartloop local LLM inference framework - OpenAI-compatible API server",
     version=_app_settings.version,
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    # Internal API: Swagger/ReDoc and the OpenAPI schema are disabled.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 # CORS middleware
@@ -242,6 +244,8 @@ app.include_router(users_router)
 app.include_router(feedback_router)
 app.include_router(project_io_router)
 app.include_router(releases_router)
+app.include_router(web_search_router)
+app.include_router(search_provider_router)
 
 @app.get("/health")
 async def health_check():
@@ -348,18 +352,11 @@ async def health_check():
         overhead = max(mem_rss - total_model_bytes, 0)
         estimated_total = total_model_bytes + overhead
 
-        cuda_mem = False
-        try:
-            import torch
-            if torch.cuda.is_available():
-                _, total_b = torch.cuda.mem_get_info()
-                result["memory_percent"] = int(estimated_total / total_b * 100)
-                cuda_mem = True
-        except Exception:
-            pass
-        if not cuda_mem:
-            mem_total = psutil.virtual_memory().total
-            result["memory_percent"] = int(estimated_total / mem_total * 100)
+        # VRAM is not probed (the Vulkan backend manages discrete-GPU memory);
+        # report against system/unified RAM, which is correct for Apple Silicon
+        # and CPU and a reasonable proxy otherwise.
+        mem_total = psutil.virtual_memory().total
+        result["memory_percent"] = int(estimated_total / mem_total * 100)
     except Exception:
         pass
 
@@ -370,8 +367,7 @@ async def health_check():
 async def root():
     """Root endpoint"""
     return {
-        "message": "SLP API - OpenAI-compatible chat completion service",
-        "docs": "/docs",
+        "message": "Smartloop agent is healthy and running",
         "health": "/health",
     }
 
@@ -381,14 +377,16 @@ class _PortCapturingServer(uvicorn.Server):
 
     async def startup(self, sockets=None):
         await super().startup(sockets)
-        if self.servers:
-            for srv in self.servers:
-                if srv.sockets:
-                    actual_port = srv.sockets[0].getsockname()[1]
-                    os.makedirs(os.path.dirname(PORT_FILE), exist_ok=True)
-                    with open(PORT_FILE, "w") as f:
-                        f.write(str(actual_port))
-                    break
+        # ``servers`` is unset when the app's lifespan startup signals exit
+        # (uvicorn returns early). Guard so the real startup error surfaces
+        # instead of an AttributeError masking it.
+        for srv in getattr(self, "servers", None) or []:
+            if srv.sockets:
+                actual_port = srv.sockets[0].getsockname()[1]
+                os.makedirs(os.path.dirname(PORT_FILE), exist_ok=True)
+                with open(PORT_FILE, "w") as f:
+                    f.write(str(actual_port))
+                break
 
 
 def _install_centralized_logging() -> None:

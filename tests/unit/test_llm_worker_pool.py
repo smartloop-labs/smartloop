@@ -119,23 +119,21 @@ def test_run_inference_invokes_loaded_model():
 # HybridExecutor._resolve_worker_count
 # --------------------------------------------------------------------------
 
-def _patch_cuda(free_gb, total_gb=48.0, device_count=8):
-    """Patch torch onto a CUDA device with the given free/total VRAM.
+def _patch_device(free_gb, total_gb=48.0, gpu=False, mps=False):
+    """Patch the device seams used by ``_resolve_worker_count``.
 
-    ``device_count`` defaults high because ``_resolve_worker_count`` also
-    caps at one worker copy per GPU (same-GPU processes serialize without
-    CUDA MPS).  These tests exercise the memory-cap logic; a low
-    device_count would cap ``requested`` before the memory check runs.
+    VRAM is no longer probed: worker sizing keys off llama.cpp GPU offload
+    (capped at one device) and system RAM.  ``gpu``/``mps`` select the branch;
+    ``free_gb``/``total_gb`` drive the RAM budget.
     """
     gb = 1024 ** 3
+    vm = mock.Mock()
+    vm.total = int(total_gb * gb)
+    vm.available = int(free_gb * gb)
     patches = [
-        mock.patch("torch.cuda.is_available", return_value=True),
-        mock.patch("torch.cuda.device_count", return_value=device_count),
-        mock.patch(
-            "torch.cuda.mem_get_info",
-            return_value=(int(free_gb * gb), int(total_gb * gb)),
-        ),
-        mock.patch("torch.cuda.get_device_name", return_value="TestGPU"),
+        mock.patch("smartloop.agents.hybrid_executor.llama_gpu_offload", return_value=gpu or mps),
+        mock.patch("smartloop.agents.hybrid_executor.is_mps", return_value=mps),
+        mock.patch("psutil.virtual_memory", return_value=vm),
     ]
     for p in patches:
         p.start()
@@ -143,28 +141,34 @@ def _patch_cuda(free_gb, total_gb=48.0, device_count=8):
 
 
 def _resolve(free_gb, requested, model_gb=2.0, worker_ctx=8192,
-             total_gb=48.0, main_n_ctx_cap=4096):
+             total_gb=48.0, main_n_ctx_cap=4096, gpu=False, mps=False):
     s = _patch_settings(worker_ctx=worker_ctx, main_n_ctx_cap=main_n_ctx_cap)
-    cuda = _patch_cuda(free_gb, total_gb=total_gb)
+    dev = _patch_device(free_gb, total_gb=total_gb, gpu=gpu, mps=mps)
     size = mock.patch("os.path.getsize", return_value=int(model_gb * 1024 ** 3))
     size.start()
     try:
         return LLMExecutor._resolve_worker_count("/model.gguf", requested)
     finally:
         size.stop()
-        for p in cuda:
+        for p in dev:
             p.stop()
         s.stop()
 
 
+def test_resolve_gpu_caps_at_one_device():
+    # A GPU offload backend (Vulkan/Metal) isn't enumerable, so worker copies
+    # cap at a single device regardless of requested count or free memory.
+    assert _resolve(free_gb=40.0, requested=4, gpu=True) == 1
+
+
 def test_resolve_caps_at_requested_when_plenty_fits():
-    # 40GB free, ~3.7GB/copy → ~10 fit, but requested is the ceiling.
+    # CPU: 40GB free, ~3.7GB/copy → ~10 fit, but requested is the ceiling.
     assert _resolve(free_gb=40.0, requested=2) == 2
 
 
 def test_resolve_scales_down_when_memory_tight():
-    # 8GB free - 1.5 reserve = 6.5 usable; per copy ~3.7 → only 1 fits.
-    assert _resolve(free_gb=8.0, requested=4) == 1
+    # CPU: 7GB free - 2.0 reserve = 5.0 usable; per copy ~3.7 → only 1 fits.
+    assert _resolve(free_gb=7.0, requested=4) == 1
 
 
 def test_resolve_keeps_at_least_one_when_nothing_fits():
@@ -172,27 +176,26 @@ def test_resolve_keeps_at_least_one_when_nothing_fits():
     assert _resolve(free_gb=1.0, requested=4) == 1
 
 
-def test_resolve_reserve_prevents_packing_all_vram():
-    # Exactly enough for 2 copies (7.4GB) only AFTER ignoring reserve; with the
-    # 1.5GB reserve the second copy no longer fits → scales to 1.
-    # usable = 9.0 - 1.5 = 7.5; per copy 3.7 → 2 fit; cap at requested 2.
-    assert _resolve(free_gb=9.0, requested=2) == 2
-    # Drop free so usable is just under 2 copies: 8.8 - 1.5 = 7.3 → 1 fits.
-    assert _resolve(free_gb=8.8, requested=2) == 1
+def test_resolve_reserve_prevents_packing_ram():
+    # CPU reserve (2.0GB) keeps a copy from packing all RAM.
+    # usable = 12.0 - 2.0 = 10.0; per copy 3.7 → 2 fit; cap at requested 2.
+    assert _resolve(free_gb=12.0, requested=2) == 2
+    # Drop free so usable is under 2 copies: 9.0 - 2.0 = 7.0; per copy 3.7 → 1.
+    assert _resolve(free_gb=9.0, requested=2) == 1
 
 
 def test_resolve_reserves_main_model_when_not_yet_resident():
     # Executor built BEFORE the main model loads: total ≈ free, so the main
     # model's footprint is not yet reflected in usage and must be reserved.
     # model 0.8GB, main cap 4096 → main_fp = 0.8 + 0.5 + 0.7 = 2.0GB;
-    # per copy = 0.8 + 1.0 + 0.7 = 2.5GB on an 8GB card.
-    # usable = 7.8 - 1.5 reserve - 2.0 main = 4.3 → 1 copy fits.
+    # per copy = 0.8 + 1.0 + 0.7 = 2.5GB.
+    # usable = 7.8 - 2.0 reserve - 2.0 main = 3.8 → 1 copy fits.
     assert _resolve(
         free_gb=7.8, total_gb=8.0, requested=2, model_gb=0.8
     ) == 1
-    # Same card AFTER the main model is resident (free dropped by ~2GB): the
+    # Same box AFTER the main model is resident (free dropped by ~2GB): the
     # footprint is already in `used`, so we don't double-charge it.
-    # usable = 5.8 - 1.5 - 0 = 4.3 → still 1 (not 0); reserve isn't doubled.
+    # usable = 5.8 - 2.0 - 0 = 3.8 → still 1 (not 0); reserve isn't doubled.
     assert _resolve(
         free_gb=5.8, total_gb=8.0, requested=2, model_gb=0.8
     ) == 1

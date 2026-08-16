@@ -56,8 +56,8 @@ class Model(BaseModel):
     def build(self, progress_callback=None):
         self.slp_model.build(progress_callback=progress_callback)
 
-    def get_instance(self, debug: bool = False) -> BaseLLM:
-        return self.slp_model.get_instance(debug=debug)
+    def get_instance(self) -> BaseLLM:
+        return self.slp_model.get_instance()
 
 
 class ModelManager:

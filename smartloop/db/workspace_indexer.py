@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from smartloop.db.store import ChunkResult
 from smartloop.db.store_factory import StoreFactory
+from smartloop.utils import json_to_table
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +215,18 @@ class WorkspaceIndexer:
             if not text.strip():
                 stats["skipped"] += 1
                 continue
+
+            # Structured JSON documents (an array of objects) are converted to
+            # a markdown table BEFORE chunking so the workspace index holds
+            # clean table rows instead of fragmented JSON text — matching the
+            # main document indexer's behavior (see indexer_task).
+            table = json_to_table(text)
+            if table is not None:
+                self._logger.info(
+                    f"[workspace-index] {rel_path}: converted JSON → table "
+                    f"({len(table)} chars)"
+                )
+                text = table
 
             doc_id = _stable_id(rel_path)
             chunks = _chunk_text(text)

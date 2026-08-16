@@ -309,6 +309,27 @@ async def list_mcp_servers_for_project(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/projects/{project_id}/mcp/tools/count")
+async def count_indexed_mcp_tools_for_project(
+    project_id: str,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Diagnostic: how many MCP tool vectors are indexed for the project.
+
+    ``tool_vectors`` is the count in the ``mcp_tools`` vector collection;
+    ``server_tools`` is the total tools across registered servers. They should
+    match once every server has been indexed — a mismatch means some server's
+    tools were not vectorized.
+    """
+    try:
+        return model_service.count_indexed_mcp_tools(project_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error counting indexed MCP tools")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/projects/{project_id}/mcp", response_model=MCPServerResponse)
 async def add_mcp_server_to_project(
     project_id: str,

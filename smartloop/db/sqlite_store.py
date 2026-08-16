@@ -562,6 +562,14 @@ class IndexStore(VectorStore):
             )
         self.logger.info(f"Deleted chunks for document: {document_id}")
 
+    def count(self) -> int:
+        """Return the number of stored chunks in this collection."""
+        with _get_conn(self._db_path) as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {_TABLE} WHERE type = ?", (self._type,)
+            ).fetchone()
+        return int(row[0]) if row else 0
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
