@@ -308,8 +308,9 @@ class LlmFactory:
             logger.info(f"No GPU available, offloading entire model to CPU with {n_threads} threads")
 
         # Cap the auto-sized context for worker copies so multiple model
-        # instances (each with its own KV cache) fit on a single GPU.
-        if max_n_ctx is not None and n_ctx > max_n_ctx:
+        # instances (each with its own KV cache) fit on a single GPU.  A cap
+        # of 0/None means no cap — the model uses its full auto-sized window.
+        if max_n_ctx not in (None, 0) and n_ctx > max_n_ctx:
             logger.info(
                 f"Capping context {n_ctx} → {max_n_ctx} (shared-GPU worker copy)"
             )

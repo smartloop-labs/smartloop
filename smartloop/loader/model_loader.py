@@ -52,11 +52,13 @@ class ModelLoader:
             # model copy on the same device.  Cap the main model's auto-sized
             # context so its KV cache doesn't claim the whole GPU and leave
             # room for the worker copies (avoids llama.cpp CUDA OOM crashes).
+            # A cap of 0 (default) means no cap — the main model keeps its
+            # full auto-sized window.
             main_max_n_ctx = None
             try:
                 from smartloop.config.app_settings import AppSettings
                 _s = AppSettings()
-                if _s.n_llm_workers and _s.n_llm_workers > 0:
+                if _s.n_llm_workers and _s.n_llm_workers > 0 and _s.llm_main_n_ctx_cap > 0:
                     main_max_n_ctx = _s.llm_main_n_ctx_cap
                     self.logger.info(
                         f"[model] Worker pool active ({_s.n_llm_workers}); "

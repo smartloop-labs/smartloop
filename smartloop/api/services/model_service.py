@@ -38,7 +38,6 @@ from smartloop.mcp.local_client import LocalMCPClient
 from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
 from smartloop.agents.orchestrator import SLPOrchestrator
 from smartloop.agents.planner import SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME, FETCH_SERVER_ID
-from smartloop.agents.mcp.skill_generator import MCPSkillGenerator
 
 from smartloop.parsers.parser_factory import ParserFactory
 from smartloop import ConversationStore, MessageInput
@@ -754,7 +753,14 @@ class ModelService:
         from smartloop.config.app_settings import AppSettings
         if reserve_gb is None:
             reserve_gb = AppSettings().llm_large_fit_reserve_gb
-        kv_gb = 0.5 * (cap / 4096)
+        # 0 = no cap — the factory auto-sizes the model's context from live
+        # available memory (see LlmFactory.get_llama_cpp_instance), so the KV
+        # cache fits by construction: it simply loads at a smaller window
+        # instead of OOMing.  Only the bare weights + overhead footprint can
+        # veto here; estimate no KV cache.  (Estimating it at the device bound
+        # instead over-counts and rejects every capable model on a tight box.)
+        est_ctx = cap if cap > 0 else 0
+        kv_gb = 0.5 * (est_ctx / 4096)
         footprint_gb = model_gb + kv_gb + 0.7
         if footprint_gb + reserve_gb > free_gb:
             logger.warning(
@@ -1404,19 +1410,19 @@ class ModelService:
             id="file-read",
             name="file-read",
             description="Use when the user wants to read, view, or inspect the contents of a file.",
-            content="read the file at the given path and return its content\n\n```mcp\nsmartloop.file-read(path)\n```",
+            content="read the file at the given path and return its content",
         ),
         Skill(
             id="file-write",
             name="file-write",
             description="Use when the user wants to write, save, or create a file with specific content.",
-            content="write content to a file at the given path\n\n```mcp\nsmartloop.file-write(path, content)\n```",
+            content="write content to a file at the given path",
         ),
         Skill(
             id="bash",
             name="bash",
             description="Use when the user wants to run a shell command, execute a script, or perform system operations.",
-            content="execute the shell command on the host machine\n\n```mcp\nsmartloop.bash(command)\n```",
+            content="execute the shell command on the host machine",
         ),
     ]
 
@@ -1471,30 +1477,16 @@ class ModelService:
         body, meta = self._parse_skill_content(content)
         final_description = description or meta.get("description")
 
+        # Skills are authored directly (indexed and matched by user intent);
+        # nothing is LLM-generated here. Persist the provided content/metadata.
         resolved_name = name or meta.get("name")
-        already_complete = resolved_name and final_description
-
-        if already_complete:
-            generated = {}
-        else:
-            if self._llm is None:
-                self.load_model()
-            generated = self._generate_skill_metadata(body, project)
-
-        if generated.get("body"):
-            body = generated["body"]
-
-        mcp_block = generated.get("mcp_block")
-        if mcp_block and "```mcp" not in body:
-            body = body.rstrip() + "\n\n" + mcp_block
-
-        raw_name = resolved_name or generated.get("name") or self._extract_skill_name(body)
+        raw_name = resolved_name or self._extract_skill_name(body)
         sanitized_name = re.sub(r"[^a-z0-9]+", "-", raw_name.lower()).strip("-") or f"skill-{str(uuid4())[:8]}"
 
         skill = Skill(
             id=sanitized_name,
             name=sanitized_name,
-            description=final_description or generated.get("description"),
+            description=final_description,
             content=body,
         )
 
@@ -1586,338 +1578,6 @@ class ModelService:
                 words = stripped.split()[:2]
                 return " ".join(words)
         return "skill"
-
-    @staticmethod
-    def _match_mcp_tool_from_content(
-        content: str,
-        project: Optional["Project"],
-    ) -> Optional[str]:
-        """Eagerly scan skill content for mentions of known server/tool names.
-
-        Returns a ready ```mcp\\n...\\n``` block string when a
-        single unambiguous tool match is found, otherwise ``None``.
-
-        Matching strategy (highest confidence first):
-        1. Exact ``server_name.tool_name`` already present in content.
-        2. Tool name mentioned AND server name mentioned in content.
-        3. Tool name alone mentioned (unique across all servers).
-        4. Server name alone mentioned (single-tool server).
-        """
-        if not project:
-            return None
-
-        content_lower = content.lower()
-
-        # Build index: (server_name, tool_name, schema)
-        server_tools: list[tuple[str, str, dict]] = []
-        for server in project.mcp_servers:
-            if not server.tools or server.id == SYSTEM_TOOLS_SERVER_ID:
-                continue
-            for tool in server.tools:
-                server_tools.append((server.name, tool.name, tool.input_schema or {}))
-
-        if not server_tools:
-            return None
-
-        def _call(server_name: str, tool_name: str, schema: dict) -> str:
-            required = schema.get("required", [])
-            props = schema.get("properties", {})
-            if required:
-                param_names = required
-            else:
-                import re as _re
-                from smartloop.agents.mcp.argument_extractor import (
-                    ID_PARAM_PATTERNS, CURSOR_PARAM_PATTERNS,
-                )
-                def _is_skip(p: str) -> bool:
-                    return (
-                        any(_re.match(pat, p) for pat in ID_PARAM_PATTERNS)
-                        or any(_re.match(pat, p) for pat in CURSOR_PARAM_PATTERNS)
-                    )
-                param_names = [p for p in props if not _is_skip(p)]
-            # Bare tokens → inferred_args (LLM extracts values at runtime)
-            params = ", ".join(param_names)
-            return f"```mcp\n{server_name}.{tool_name}({params})\n```"
-
-        def _tool_words_in_content(tool_name: str) -> bool:
-            """Check if ALL words of a tool name appear in the content.
-
-            Splits on ``_`` and ``-`` and requires every word (len >= 3) to
-            appear individually in the content.  This handles "save issue"
-            matching ``save_issue`` even though the exact substring
-            ``"save_issue"`` does not appear.
-            """
-            words = [w for w in re.split(r'[_\-]', tool_name.lower()) if len(w) >= 3]
-            return bool(words) and all(w in content_lower for w in words)
-
-        # 1. Exact dotted reference already in content
-        for server_name, tool_name, schema in server_tools:
-            if f"{server_name.lower()}.{tool_name.lower()}" in content_lower:
-                return _call(server_name, tool_name, schema)
-
-        # 2. Both server name AND tool name mentioned (exact substring)
-        matches = [
-            (sn, tn, sc) for sn, tn, sc in server_tools
-            if sn.lower() in content_lower and tn.lower() in content_lower
-        ]
-        if len(matches) == 1:
-            return _call(*matches[0])
-
-        # 2b. Both server name AND tool words mentioned
-        if not matches:
-            matches = [
-                (sn, tn, sc) for sn, tn, sc in server_tools
-                if sn.lower() in content_lower and _tool_words_in_content(tn)
-            ]
-            if len(matches) == 1:
-                return _call(*matches[0])
-
-        # 3. Tool name alone — exact substring, unique across all servers
-        tool_matches = [
-            (sn, tn, sc) for sn, tn, sc in server_tools
-            if tn.lower() in content_lower
-        ]
-        if len(tool_matches) == 1:
-            return _call(*tool_matches[0])
-
-        # 3b. Tool words alone — all words present, unique across all servers
-        if not tool_matches:
-            tool_matches = [
-                (sn, tn, sc) for sn, tn, sc in server_tools
-                if _tool_words_in_content(tn)
-            ]
-            if len(tool_matches) == 1:
-                return _call(*tool_matches[0])
-
-        # 4. Server name alone — only one tool on that server
-        server_matches = [
-            (sn, tn, sc) for sn, tn, sc in server_tools
-            if sn.lower() in content_lower
-        ]
-        mentioned_servers = {sn for sn, _, _ in server_matches}
-        if len(mentioned_servers) == 1:
-            tools_for_server = [(sn, tn, sc) for sn, tn, sc in server_matches]
-            if len(tools_for_server) == 1:
-                return _call(*tools_for_server[0])
-
-        return None
-
-    @staticmethod
-    def _build_mcp_tools_catalogue(project: Optional["Project"], input_text: str = "") -> str:
-        """Return a formatted list of available MCP tools for the prompt.
-
-        A tool is only offered when the user's input **explicitly references
-        it** by name. Skills should never silently acquire an MCP call the user
-        did not ask for; small models otherwise over-trigger on incidental
-        words like "fetch", "get" or "data" in the skill body and bolt on a
-        spurious ``server.tool(...)`` block. When nothing is explicitly
-        referenced this returns "" so no MCP block is generated.
-        """
-        if not project:
-            return ""
-        text_lc = input_text.lower()
-
-        def _mentioned(name: str) -> bool:
-            """True when a server/tool identifier is referenced in the input.
-
-            Matches whole tokens so ``fetch`` doesn't hit ``fetched`` inside a
-            sentence; underscores/hyphens in tool names are treated as word
-            characters (e.g. ``get_forecast``).
-            """
-            name = (name or "").strip().lower()
-            if not name:
-                return False
-            return re.search(rf'(?<!\w){re.escape(name)}(?!\w)', text_lc) is not None
-
-        lines = []
-        for server in project.mcp_servers:
-            # Exclude the internal Smartloop system tools (bash, file-ops, explore)
-            # but include fetch and all user-registered servers.
-            if not server.tools or server.id == SYSTEM_TOOLS_SERVER_ID:
-                continue
-
-            is_web_fetch = any(
-                kw in server.name.lower() for kw in ("fetch", "browse", "scrape")
-            )
-            for tool in server.tools:
-                # Only surface the tool when the user explicitly referenced it.
-                # Tools are invoked as ``server_name.tool_name``, so the
-                # qualified form is the unambiguous signal and always counts.
-                referenced = _mentioned(f"{server.name}.{tool.name}")
-                if not is_web_fetch:
-                    # Non web-fetch tools have distinctive names unlikely to
-                    # collide with prose, so a bare tool/server mention is
-                    # enough. Web-fetch tools ("fetch"/"scrape") share their
-                    # name with common English verbs, so they require the
-                    # qualified form above — never a bare-word match.
-                    referenced = referenced or _mentioned(tool.name) or _mentioned(server.name)
-                if not referenced:
-                    continue
-
-                desc = tool.description or ""
-                # Summarise required parameters from the input schema
-                params = ""
-                schema = tool.input_schema or {}
-                required = schema.get("required", [])
-                props = schema.get("properties", {})
-                if required:
-                    params = ", ".join(
-                        f"{p}=<{props.get(p, {}).get('type', 'value')}>"
-                        for p in required
-                    )
-                elif props:
-                    params = ", ".join(
-                        f"{p}=<{info.get('type', 'value')}>"
-                        for p, info in list(props.items())[:4]
-                    )
-                lines.append(
-                    f"  {server.name}.{tool.name}({params}) — {desc}"
-                )
-        if not lines:
-            return ""
-        return "Available MCP tools:\n" + "\n".join(lines)
-
-    def _generate_skill_metadata(
-        self,
-        content: str,
-        project: Optional["Project"] = None,
-    ) -> dict:
-        """Generate skill name, description, elaborated body and optional MCP call block.
-
-        Returns ``{"name": str, "description": str, "body": str, "mcp_block": str | None}``.
-        """
-        if self._llm is None:
-            logger.warning("No LLM available for skill metadata generation")
-            return {}
-
-        mcp_catalogue = self._build_mcp_tools_catalogue(project, input_text=content)
-        already_has_mcp = "```mcp" in content
-
-        mcp_field = ""
-        if mcp_catalogue and not already_has_mcp:
-            mcp_field = (
-                '- "mcp_call": the single best matching tool call as a plain string '
-                'in the exact form server_name.tool_name(param). '
-                'The server_name prefix is REQUIRED — always include it. '
-                'Copy both the server_name and tool_name EXACTLY as they appear in the '
-                'available MCP tools list below (for example, if the list shows '
-                'weather.get_forecast, write weather.get_forecast(city=Paris)). '
-                'Do NOT wrap them in angle brackets and do NOT invent or rename the server. '
-                'Use fixed values for params known from context; bare param names for runtime values. '
-                'If the skill says "save" or "create", pick a create/save tool, NOT a list/read tool. '
-                'Omit if no tool clearly matches.\n\n'
-                f'{mcp_catalogue}\n'
-            )
-
-        prompt = (
-            "<system>\n"
-            "You are a skill generator. Given raw user input, output a JSON object.\n"
-            "Reply with ONLY the JSON — no markdown, no explanation.\n"
-            "</system>\n"
-            "<user>\n"
-            "Generate a JSON object with:\n"
-            '- "name": 1-2 word lowercase hyphen-separated identifier derived from the input.\n'
-            '- "description": one sentence in the format "When the user asks to <action>, '
-            '<what this skill does>." that clearly describes when this skill should be '
-            "selected and what it accomplishes.\n"
-            '- "body": expand the input into clear, structured skill instructions. '
-            "Preserve all specific values mentioned. Do NOT invent facts.\n"
-            + mcp_field
-            + f"User input:\n{content[:2000]}\n"
-            "</user>"
-        )
-
-        skill_llm = self._get_large_llm() or self._llm
-        try:
-            with self._inference_lock:
-                raw = str(skill_llm.invoke(prompt)).strip()
-            logger.info("Skill metadata LLM response: %s", raw[:200])
-
-            # Strip markdown fences
-            if raw.startswith("```"):
-                raw = "\n".join(ln for ln in raw.split("\n") if not ln.strip().startswith("```")).strip()
-
-            # Extract JSON object
-            start, end = raw.find("{"), raw.rfind("}") + 1
-            if start >= 0 and end > start:
-                raw = raw[start:end]
-
-            # Fix invalid JSON escapes that LLMs produce (e.g. \_ \*)
-            raw = re.sub(r'\\([^"\\/bfnrtu])', r'\1', raw)
-            meta = json.loads(raw)
-
-            # Wrap mcp_call string into a fenced ```mcp block
-            mcp_call = meta.pop("mcp_call", None)
-            if mcp_call:
-                mcp_call = re.sub(r'```\w*', '', mcp_call).strip()
-                # The LLM may emit a hallucinated server name. Re-bind the call
-                # to the server that actually owns the matching tool.
-                mcp_call = self._correct_mcp_call_server(mcp_call, project)
-                meta["mcp_block"] = f"```mcp\n{mcp_call}\n```"
-            else:
-                meta.pop("mcp_block", None)
-
-            return meta
-        except Exception as e:
-            logger.warning("Failed to generate skill metadata: %s", e)
-            return {}
-
-    @staticmethod
-    def _correct_mcp_call_server(mcp_call: str, project: Optional["Project"]) -> str:
-        """Re-bind a generated ``Server.tool(args)`` call to the real server.
-
-        The skill-generation LLM is free-text and frequently emits a server
-        name that does not match any registered MCP server. Since tool names
-        are unambiguous within a project, we look the call's tool up in the
-        registered servers and, when found, rewrite the server portion to the
-        server that actually owns that tool. Returns the call unchanged when
-        no registered server exposes the tool.
-        """
-        if not project:
-            return mcp_call
-
-        # Split the call head ("server.tool") from its argument list. The model
-        # sometimes wraps the head in angle brackets/backticks (e.g.
-        # "<server.tool>(args)") — strip those from the head only, leaving any
-        # "<value>" runtime-param markers inside the parens untouched.
-        head, sep, tail = mcp_call.partition("(")
-        if sep:
-            head = head.strip().strip("<>`").strip()
-            mcp_call = f"{head}{sep}{tail}"
-
-        # Parse "[server.]tool(args)" — the tool is the identifier directly
-        # before the argument list; everything before the last dot, if present,
-        # is the (possibly wrong) server name. The model sometimes omits the
-        # server prefix entirely, so it is optional here.
-        m = re.match(r'^\s*(?:(.+)\.)?([\w-]+)\s*\((.*)\)\s*$', mcp_call, re.DOTALL)
-        if not m:
-            return mcp_call
-
-        emitted_server, tool_name, args_str = m.group(1), m.group(2), m.group(3)
-
-        # Find the registered server that actually owns this tool.
-        for server in project.mcp_servers:
-            if not server.tools or server.id == SYSTEM_TOOLS_SERVER_ID:
-                continue
-            if any(t.name == tool_name for t in server.tools):
-                if not emitted_server:
-                    logger.info(
-                        "Bound generated mcp_call (no server prefix) to server "
-                        "'%s' (owns tool '%s')", server.name, tool_name,
-                    )
-                elif server.name != emitted_server:
-                    logger.info(
-                        "Re-bound generated mcp_call from server '%s' to '%s' "
-                        "(owns tool '%s')",
-                        emitted_server, server.name, tool_name,
-                    )
-                return f"{server.name}.{tool_name}({args_str})"
-
-        logger.warning(
-            "Generated mcp_call references tool '%s' not found on any "
-            "registered server; leaving as-is", tool_name,
-        )
-        return mcp_call
 
     @staticmethod
     def _visible_project_dir(project: "Project") -> str:
@@ -2436,6 +2096,25 @@ class ModelService:
             return DEFAULT_MAX_CONTEXT_TOKENS
         try:
             return self._llm.get_max_tokens()
+        except Exception:
+            return DEFAULT_MAX_CONTEXT_TOKENS
+
+    def get_response_max_context_tokens(self, capability: Optional[str] = None) -> int:
+        """Max context window (tokens) of the model that will synthesize the
+        final response — capability-tagged → largest → default.
+
+        The default model's window (see ``get_max_context_tokens``) is often
+        larger than the capability model that actually consumes the prompt.
+        Sizing the response context against it lets web/document context
+        overflow the response model: generation aborts, the request falls back
+        to the default model, and the search content never reaches the LLM.
+        Return 0 when no model is loaded.
+        """
+        llm = self._llm_for_response(capability)
+        if llm is None:
+            return self.get_max_context_tokens()
+        try:
+            return llm.get_max_tokens()
         except Exception:
             return DEFAULT_MAX_CONTEXT_TOKENS
 
@@ -3646,6 +3325,21 @@ class ModelService:
             "server_tools": server_tools,
         }
 
+    # --------------------------------------------------------- web search (pro)
+
+    def get_web_search_config(self, project_id: str) -> dict:
+        """Return whether web search is enabled for the given project."""
+        project = self._get_project(project_id)
+        return {"project_id": project.id, "enabled": bool(project.web_search_enabled)}
+
+    def set_web_search_enabled(self, project_id: str, enabled: bool) -> dict:
+        """Enable/disable web search (Pro feature) for the given project."""
+        project = self._get_project(project_id)
+        project.web_search_enabled = enabled
+        self._model.save()
+        logger.info("[web-search] project %s enabled=%s", project.id, enabled)
+        return {"project_id": project.id, "enabled": bool(project.web_search_enabled)}
+
     def _write_mcp_doc(
         self,
         project: "Project",
@@ -3822,6 +3516,7 @@ class ModelService:
         progress_callback: Optional[Callable[[str, str, str], None]] = None,
         cancelled: Optional[threading.Event] = None,
         requested_skill: Optional[str] = None,
+        current_date: Optional[str] = None,
     ) -> tuple[Optional[str], bool, Optional[str], Optional[list], Optional[str], bool]:
         """Full orchestrator entry point for a user message.
 
@@ -4042,6 +3737,7 @@ class ModelService:
                     available_capabilities=available_capabilities or None,
                     progress_callback=progress_callback,
                     requested_skill=requested_skill,
+                    current_date=current_date,
                 )
             finally:
                 if cancelled is not None:

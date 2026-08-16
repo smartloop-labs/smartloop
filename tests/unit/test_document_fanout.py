@@ -24,6 +24,15 @@ def _make_orchestrator():
     return SLPOrchestrator(orchestrator_llm=llm)
 
 
+def test_frame_web_results_instructs_model_not_to_disclaim():
+    orch = _make_orchestrator()
+    framed = orch._frame_web_results("## [1] https://canyon.com\n\nSome bikes")
+    assert "live web search was just performed" in framed
+    assert "real-time search results" in framed
+    assert "do NOT say you lack" in framed.lower() or "Do NOT say you lack" in framed
+    assert "WEB SEARCH RESULTS:\n## [1] https://canyon.com" in framed
+
+
 def _docs(n, size=100):
     return [
         {"document_name": f"doc{i}.pdf", "content": "X" * size + f" body {i}"}
@@ -264,6 +273,114 @@ class TestFanoutHandlers:
         batch_node, batch_handler = nodes_and_handlers[0]
         result = batch_handler({})
         assert "body" in result.data["content"]
+
+    def test_batch_falls_back_to_raw_when_llm_returns_placeholder(self):
+        # llama.cpp's empty-output fallback string must never be surfaced as
+        # extracted document content — treat it like a failure and keep a raw
+        # excerpt so the document isn't silently replaced by placeholder text.
+        orch = _make_orchestrator()
+        orch.agent_llm.invoke = MagicMock(return_value="No response generated")
+
+        sctx = SearchContext(documents=_docs(2))
+        ctx = _ctx(orch)
+        parent = RouteNode()
+        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+
+        batch_node, batch_handler = nodes_and_handlers[0]
+        result = batch_handler({})
+        assert "No response generated" not in result.data["content"]
+        assert "body 0" in result.data["content"]
+
+    def test_batch_skips_llm_when_document_is_json_table(self):
+        import json as _json
+
+        orch = _make_orchestrator()
+        orch.agent_llm.invoke = MagicMock(side_effect=AssertionError("LLM must not run for JSON docs"))
+
+        doc = {
+            "document_name": "stats.json",
+            "content": _json.dumps({
+                "rows": [
+                    {"name": "Drake Maye", "team": "NE", "values": {"epa": 0.296484, "td": 31}},
+                    {"name": "Jordan Love", "team": "GB", "values": {"epa": 0.240092, "td": 23}},
+                ]
+            }),
+        }
+        sctx = SearchContext(documents=[doc])
+        ctx = _ctx(orch)
+        parent = RouteNode()
+        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+
+        batch_node, batch_handler = nodes_and_handlers[0]
+        result = batch_handler({})
+        content = result.data["content"]
+        assert "| name | team | values.epa | values.td |" in content
+        assert "| Drake Maye | NE | 0.2965 | 31 |" in content
+        assert "| Jordan Love | GB | 0.2401 | 23 |" in content
+
+    def test_batch_uses_existing_markdown_table_directly(self):
+        # Content already normalized to a table at index time must be used
+        # as-is — no LLM extraction (which could overflow the model window).
+        orch = _make_orchestrator()
+        orch.agent_llm.invoke = MagicMock(side_effect=AssertionError("LLM must not run for tables"))
+
+        doc = {
+            "document_name": "stats.txt",
+            "content": (
+                "| name | team | td |\n"
+                "|---|---|---|\n"
+                "| Drake Maye | NE | 31 |\n"
+                "| Jordan Love | GB | 23 |\n"
+            ),
+        }
+        sctx = SearchContext(documents=[doc])
+        ctx = _ctx(orch)
+        parent = RouteNode()
+        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+
+        batch_node, batch_handler = nodes_and_handlers[0]
+        result = batch_handler({})
+        assert "| Drake Maye | NE | 31 |" in result.data["content"]
+        assert "| Jordan Love | GB | 23 |" in result.data["content"]
+
+
+# ------------------------------------------------------------------ #
+# _json_to_table                                                      #
+# ------------------------------------------------------------------ #
+
+class TestJsonToTable:
+    def _orch(self):
+        return _make_orchestrator()
+
+    def test_top_level_array(self):
+        table = self._orch()._json_to_table(
+            '[{"name": "A", "v": 1}, {"name": "B", "v": 2}]'
+        )
+        assert "| name | v |" in table
+        assert "| A | 1 |" in table
+        assert "| B | 2 |" in table
+
+    def test_rows_container(self):
+        table = self._orch()._json_to_table('{"rows": [{"name": "A", "v": 1}]}')
+        assert "| name | v |" in table
+        assert "| A | 1 |" in table
+
+    def test_nested_values_flattened_with_dotted_keys(self):
+        table = self._orch()._json_to_table(
+            '[{"name": "A", "values": {"epa": 0.296484, "td": 31}}]'
+        )
+        assert "| name | values.epa | values.td |" in table
+        assert "| A | 0.2965 | 31 |" in table
+
+    def test_float_compaction(self):
+        table = self._orch()._json_to_table('[{"v": 4394.0, "epa": 0.296484}]')
+        assert "| 4394 | 0.2965 |" in table
+
+    def test_returns_none_for_non_json(self):
+        assert self._orch()._json_to_table("just plain text") is None
+
+    def test_returns_none_for_json_without_rows(self):
+        assert self._orch()._json_to_table('{"category": "EPA/play"}') is None
 
 
 # ------------------------------------------------------------------ #

@@ -75,32 +75,35 @@ class AppSettings(BaseSettings):
         validation_alias="slp_n_llm_workers",
         description="Number of LLM worker processes for parallel inference. Defaults to n_parallel.",
     )
-    # Context window for each LLM worker's model copy.  Sized to hold a full
-    # document's extraction input (slp_doc_extract_max_chars) plus room for the
-    # output, so per-document extraction isn't truncated.  Larger = more VRAM
-    # per worker copy (fewer fit on one GPU).
+    # Context window for each LLM worker's model copy.  0 (default) = no cap:
+    # each copy auto-sizes to the device's available memory (the factory picks
+    # the largest window that fits; the worker's load retry halves the window
+    # if it can't fit alongside sibling copies).  Set > 0 to force a fixed
+    # window for every worker copy.
     llm_worker_n_ctx: int = Field(
-        default=8192,
+        default=0,
         validation_alias="slp_llm_worker_n_ctx",
-        description="Context window per LLM worker model copy.",
+        description="Context window per LLM worker model copy; 0 = auto-size to the device.",
     )
     # Cap applied to the MAIN model's (auto-sized) context window when the LLM
     # worker pool is active.  The main model's KV cache otherwise scales to the
     # whole device; capping it leaves room for the worker copies to share the
-    # GPU.  Only caps (never raises) the auto-sized value.
+    # GPU.  0 (default) = no cap — the main model uses its full auto-sized
+    # window.  Only caps (never raises) the auto-sized value.
     llm_main_n_ctx_cap: int = Field(
-        default=4096,
+        default=0,
         validation_alias="slp_llm_main_n_ctx_cap",
-        description="Max context for the main model when the worker pool is active.",
+        description="Max context for the main model when the worker pool is active; 0 = no cap.",
     )
     # Cap applied to the large (agent) model's auto-sized context, and the
     # reserve kept free so loading it doesn't starve the main model + worker
     # pool.  The large model is loaded lazily on first agent use only if its
-    # capped footprint fits in free VRAM after this reserve.
+    # capped footprint fits in free VRAM after this reserve.  0 (default) = no
+    # cap — it uses its full auto-sized window.
     llm_large_n_ctx_cap: int = Field(
-        default=8192,
+        default=0,
         validation_alias="slp_llm_large_n_ctx_cap",
-        description="Max context for the large (agent) model when lazily loaded.",
+        description="Max context for the large (agent) model when lazily loaded; 0 = no cap.",
     )
     llm_large_fit_reserve_gb: float = Field(
         default=1.0,

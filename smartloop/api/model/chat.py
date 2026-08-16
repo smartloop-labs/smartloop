@@ -18,6 +18,23 @@ class ChatMessage(BaseModel):
     )
 
 
+class AdditionalMessageParams(BaseModel):
+    """Client-supplied per-request context (the browser's clock/locale).
+
+    Sent so date/time-aware answers are grounded in the *user's* wall clock and
+    locale instead of the server's — see ``resolve_current_date``.
+    """
+    tz: Optional[str] = Field(
+        default=None, description="IANA timezone, e.g. 'America/New_York'"
+    )
+    locale: Optional[str] = Field(
+        default=None, description="BCP-47 locale, e.g. 'en-US'"
+    )
+    user_date: Optional[int] = Field(
+        default=None, description="Client 'now' as a Unix timestamp in seconds"
+    )
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request"""
     model: str = Field(..., description="ID of the model to use")
@@ -46,6 +63,11 @@ class ChatCompletionRequest(BaseModel):
     )
     stop: Optional[List[str]] = Field(
         default=None, description="Stop sequences"
+    )
+    additional_message_params: Optional[AdditionalMessageParams] = Field(
+        default=None,
+        description="Client context (timezone/locale/current time) used to "
+        "ground date-aware answers in the user's wall clock",
     )
 
 

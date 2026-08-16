@@ -145,7 +145,12 @@ class LLMExecutor:
 
             from smartloop.config.app_settings import AppSettings
             _settings = AppSettings()
-            worker_ctx = _settings.llm_worker_n_ctx
+            # Worker/main context for PROVISIONING the copy count.  When
+            # uncapped (0), the actual models auto-size up at load (with the
+            # worker's halving retry as a safety net), so estimate with the
+            # former default 8192 here — budgeting the device bound instead
+            # would under-provision and disable the pool entirely.
+            worker_ctx = _settings.llm_worker_n_ctx or 8192
             # Per-copy footprint: weights + KV cache + per-process overhead.
             # The estimate is deliberately conservative — under-counting any
             # term makes ``fits`` round up to a worker that then fails
@@ -160,7 +165,8 @@ class LLMExecutor:
             # sized to ``llm_main_n_ctx_cap``), and a flat reserve badly
             # under-counts it — that's what let this over-provision workers and
             # OOM the last copy.  Estimate its footprint the same way as a copy.
-            main_kv_gb = 0.5 * (_settings.llm_main_n_ctx_cap / 4096)
+            main_ctx = _settings.llm_main_n_ctx_cap or 8192
+            main_kv_gb = 0.5 * (main_ctx / 4096)
             main_footprint_gb = model_gb + main_kv_gb + 0.7
 
             # Resolve (device_label, free_gb, total_gb, reserve_gb) for whichever

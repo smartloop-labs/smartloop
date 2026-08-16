@@ -107,6 +107,26 @@ def is_apple_silicon() -> bool:
     return sys.platform == 'darwin'
 
 
+def max_auto_context_tokens() -> int:
+    """Upper bound (tokens) the llama.cpp factory will auto-size a model's
+    context window to on this device when no explicit cap is set.
+
+    Mirrors the Apple Silicon logic in ``LlmFactory.get_llama_cpp_instance``
+    (131072 on ≥32GB, 65536 on ≥16GB, else 32768; the factory then picks the
+    smaller of this bound and the memory-derived estimate).  Memory estimators
+    (worker-pool sizing, large-model fit guard) use this so "no cap" still
+    accounts for a realistic KV-cache footprint instead of zero.
+    """
+    try:
+        if is_apple_silicon():
+            import psutil
+            total_gb = psutil.virtual_memory().total / (1024 ** 3)
+            return 131072 if total_gb >= 32 else 65536 if total_gb >= 16 else 32768
+    except Exception:
+        pass
+    return 8192
+
+
 def is_mps() -> bool:
     """True on Apple Silicon with a llama.cpp Metal (GPU offload) backend."""
     return sys.platform == 'darwin' and llama_gpu_offload()

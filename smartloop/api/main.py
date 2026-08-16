@@ -18,7 +18,7 @@ import re as _re
 import time as _time
 
 from smartloop.api.config import api_settings
-from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router
+from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router, web_search_router, search_provider_router
 from smartloop.api.services import get_model_service, get_api_client
         
 from smartloop.config import AppSettings
@@ -244,6 +244,8 @@ app.include_router(users_router)
 app.include_router(feedback_router)
 app.include_router(project_io_router)
 app.include_router(releases_router)
+app.include_router(web_search_router)
+app.include_router(search_provider_router)
 
 @app.get("/health")
 async def health_check():
@@ -375,14 +377,16 @@ class _PortCapturingServer(uvicorn.Server):
 
     async def startup(self, sockets=None):
         await super().startup(sockets)
-        if self.servers:
-            for srv in self.servers:
-                if srv.sockets:
-                    actual_port = srv.sockets[0].getsockname()[1]
-                    os.makedirs(os.path.dirname(PORT_FILE), exist_ok=True)
-                    with open(PORT_FILE, "w") as f:
-                        f.write(str(actual_port))
-                    break
+        # ``servers`` is unset when the app's lifespan startup signals exit
+        # (uvicorn returns early). Guard so the real startup error surfaces
+        # instead of an AttributeError masking it.
+        for srv in getattr(self, "servers", None) or []:
+            if srv.sockets:
+                actual_port = srv.sockets[0].getsockname()[1]
+                os.makedirs(os.path.dirname(PORT_FILE), exist_ok=True)
+                with open(PORT_FILE, "w") as f:
+                    f.write(str(actual_port))
+                break
 
 
 def _install_centralized_logging() -> None:

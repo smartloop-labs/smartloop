@@ -209,6 +209,10 @@ class Project (BaseModel):
     mcp_servers: List[MCPServer] = []
     adapters: Set[str] = set()
     sessions: List[str] = []
+    # Pro/premium feature: when enabled, the orchestrator runs the
+    # WebSearchAgent (hosted /v1/websearch) for latest-info queries. Off by
+    # default; toggled per project via PATCH /v1/projects/{id}/websearch.
+    web_search_enabled: bool = False
 
     @property
     def visible_dir(self) -> str:
@@ -293,7 +297,11 @@ class Workspace(BaseModel):
                  models: Optional[List[WorkspaceModel]] = None,
                  adapters: Optional[List] = None,
                  config: Optional[dict] = None,
+                 **_legacy,
         ):
+        # ``**_legacy`` swallows keys that were persisted by older builds but
+        # have since been removed from the model (e.g. ``web_search``), so
+        # loading an existing config.json never fails validation.
         super().__init__(id=id, projects=projects or [], merge_model_dir=merge_model_dir, workspace_dir=workspace_dir, models_dir=models_dir, models=models or [], adapters=adapters or [])
 
     @property

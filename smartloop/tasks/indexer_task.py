@@ -30,7 +30,7 @@ from typing import Callable, List, Optional
 
 from smartloop.db import StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer
-from smartloop.utils import DocumentSplitter, normalize_path
+from smartloop.utils import DocumentSplitter, normalize_path, json_to_table
 from smartloop.parsers.parser_factory import BaseLLM, ParserFactory
 from smartloop.tasks.base_task import BaseTask, TaskResult, TaskStatus
 from smartloop.tasks.documents_manifest import DocumentsManifest
@@ -267,6 +267,18 @@ class IndexerTask(BaseTask):
             )
 
             llm = self._ensure_model_loaded()
+
+            # Structured JSON documents (an array of objects) are converted to
+            # a markdown table BEFORE chunking, so the vector index holds clean
+            # table rows instead of fragmented JSON text — and the query-time
+            # extractor can use the normalized table directly (no overflow).
+            table = json_to_table(text_content)
+            if table is not None:
+                self.logger.info(
+                    f"[Indexer] {doc_name}: converted JSON → table "
+                    f"({len(table)} chars)"
+                )
+                text_content = table
 
             # Split the in-memory text — doc.path stays on the original file
             text_chunks = DocumentSplitter(llm=llm, logger=self.logger).split_text(text_content)

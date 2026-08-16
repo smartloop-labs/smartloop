@@ -20,6 +20,7 @@ from .server_selector import (
 )
 from .mcp_tool_caller import MCPToolCaller
 from .argument_extractor import MCPArgumentExtractor
+from .mcp_agent import MCPAgent
 
 if TYPE_CHECKING:
     from smartloop.workspace.workspace import MCPServer
@@ -80,13 +81,21 @@ _QUERY_STOP_WORDS = {
 # ------------------------------------------------------------------ models
 
 class SearchContext(BaseModel):
-    """Collected search results from vector, feedback, workspace, and skill tools."""
+    """Collected explore results: vector, feedback, workspace, and web search."""
 
     vector_context: str = ""
     feedback_context: str = ""
     workspace_context: str = ""
+    # Latest-info content from the hosted web search (Pro feature). Gathered as
+    # part of explore — combined with local folder / workspace / vector results.
+    web_context: str = ""
+    # URLs of the web sources actually used (top reranked links), so the
+    # orchestrator can surface them as links in the final answer.
+    web_sources: List[str] = Field(default_factory=list)
+    # Result of an auto-run read-only MCP tool (a "collect" step). Write /
+    # side-effecting tools are NOT run here — they stay planned execute steps.
+    mcp_context: str = ""
     citations: Optional[List[Dict[str, Any]]] = None
-    skill_tool_results: List[Dict[str, Any]] = Field(default_factory=list)
     # Per-document search results ({"document_name", "content"}), ordered by
     # relevance.  Populated by the parallel vector search and consumed by the
     # orchestrator's document fan-out (one DAG node per document/batch).
@@ -103,7 +112,8 @@ class SearchContext(BaseModel):
             self.vector_context
             or self.feedback_context
             or self.workspace_context
-            or self.skill_tool_results
+            or self.web_context
+            or self.mcp_context
         )
 
 
@@ -149,6 +159,13 @@ class Explorer:
         self._use_llm_history = use_llm_for_history
         from smartloop.agents.fetch_agent import FetchAgent
         self.fetch_agent = FetchAgent()
+        # Web search (Pro) is part of explore: it reuses the fetch agent to pull
+        # each result link's content, combined with vector/workspace/local.
+        from smartloop.agents.web_search_agent import WebSearchAgent
+        self.web_search_agent = WebSearchAgent(fetch_agent=self.fetch_agent, llm=llm)
+        # MCP tool retrieval (vector) for the collect phase. Only read-only
+        # tools are auto-run here; write tools stay planned execute steps.
+        self.mcp_agent = MCPAgent(llm, logger)
 
     # ================================================================== #
     # Skill matching                                                       #
@@ -303,141 +320,6 @@ class Explorer:
 
         return matched
 
-    def extract_tool_names(
-        self,
-        matched_skills: List[Dict[str, str]],
-        mcp_tool_contexts: List[MCPToolContext],
-    ) -> List[str]:
-        available_tools: set = set()
-        for srv in mcp_tool_contexts:
-            for tool in srv.tools:
-                name = tool.get("name", "")
-                if name:
-                    available_tools.add(name)
-
-        referenced: List[str] = []
-        seen: set = set()
-
-        for sk in matched_skills:
-            content = sk.get("content", "")
-            for match in re.findall(r'`([^`]+)`|\*\*([^*]+)\*\*', content):
-                name = (match[0] or match[1]).strip()
-                if name in available_tools and name not in seen:
-                    referenced.append(name)
-                    seen.add(name)
-
-            # Also match plain-text mentions of known tool names in content
-            for tool_name in available_tools:
-                if tool_name not in seen and tool_name in content:
-                    referenced.append(tool_name)
-                    seen.add(tool_name)
-
-            # Extract tool names from ```mcp blocks
-            for m in re.finditer(r'```mcp\s*\n\s*\w+\.(\w+)\(', content):
-                name = m.group(1)
-                if name in available_tools and name not in seen:
-                    referenced.append(name)
-                    seen.add(name)
-
-        return referenced
-
-    # ================================================================== #
-    # Collect: unified search + skill tool execution                       #
-    # ================================================================== #
-
-    def collect(
-        self,
-        query: str,
-        model_service: Optional[Any] = None,
-        cwd: Optional[str] = None,
-        enriched: Optional[EnrichedContext] = None,
-        matched_skills: Optional[List[Dict]] = None,
-        mcp_servers: Optional[List["MCPServer"]] = None,
-        mcp_tool_contexts: Optional[List[MCPToolContext]] = None,
-        conversation_history: Optional[List[Dict[str, str]]] = None,
-    ) -> SearchContext:
-        """Collect all context: vector search, feedback, workspace, and skill tool calls.
-
-        Uses enriched context (from enrich_light) to improve skill tool argument
-        extraction — history insight and MCP catalog inform better tool execution.
-        """
-        ctx = SearchContext()
-
-        if not model_service:
-            return ctx
-
-        # 1. Vector/document search
-        try:
-            doc_result = model_service.get_document_context_with_citations(
-                query=query,
-                conversation_history=conversation_history,
-            )
-            if doc_result is not None:
-                ctx.vector_context = doc_result[0]
-                ctx.citations = doc_result[1]
-                logger.info(
-                    f"[collect] Vector search returned {len(ctx.vector_context)} chars"
-                    f" from {len(ctx.citations)} document(s)"
-                )
-            else:
-                logger.info("[collect] Vector search returned no results")
-        except Exception as e:
-            if isinstance(e, _PROGRAMMING_ERRORS):
-                raise
-            logger.warning(f"[collect] Vector search failed: {e}")
-
-        # 2. Feedback search
-        try:
-            feedback_chunks = model_service.search_feedback(query, n_results=5)
-            if feedback_chunks:
-                ctx.feedback_context = "\n---\n".join(c.text for c in feedback_chunks)
-                logger.info(
-                    f"[collect] Feedback search returned {len(feedback_chunks)} Q&A pair(s)"
-                )
-        except Exception as e:
-            if isinstance(e, _PROGRAMMING_ERRORS):
-                raise
-            logger.warning(f"[collect] Feedback search failed: {e}")
-
-        # 3. Workspace search with dedup
-        if cwd:
-            try:
-                ws_chunks = model_service.search_workspace(query, cwd, n_results=10)
-                if ws_chunks:
-                    seen_files: dict = {}
-                    for chunk in ws_chunks:
-                        fname = chunk.document_name or chunk.document_id
-                        # Skip skill/system files — they are instructions and
-                        # tool metadata, not data (see _is_non_data_file).
-                        if fname and Explorer._is_non_data_file(fname):
-                            continue
-                        if fname not in seen_files or chunk.distance < seen_files[fname].distance:
-                            seen_files[fname] = chunk
-                    ws_texts = []
-                    for fname, chunk in seen_files.items():
-                        ws_texts.append(f"--- {fname} ---\n{chunk.text[:2000]}")
-                    ctx.workspace_context = "\n".join(ws_texts)
-                    logger.info(
-                        f"[collect] Workspace search returned {len(seen_files)} file(s)"
-                    )
-            except Exception as e:
-                if isinstance(e, _PROGRAMMING_ERRORS):
-                    raise
-                logger.warning(f"[collect] Workspace search failed: {e}")
-
-        # 4. Execute skill-referenced tools
-        if matched_skills and mcp_tool_contexts and mcp_servers:
-            skill_tool_names = self.extract_tool_names(matched_skills, mcp_tool_contexts)
-            for tool_name in skill_tool_names:
-                result = self._execute_skill_tool(
-                    tool_name, query, mcp_servers, mcp_tool_contexts,
-                    enriched=enriched,
-                )
-                if result:
-                    ctx.skill_tool_results.append(result)
-
-        return ctx
-
     # ================================================================== #
     # Parallel search primitives                                          #
     # ================================================================== #
@@ -493,6 +375,137 @@ class Explorer:
                 raise
             logger.warning(f"[collect] Feedback search failed: {e}")
         return ""
+
+    def _search_web(self, query: str) -> str:
+        """Hosted web search (Pro), part of explore — thread-safe, I/O bound.
+
+        Runs the WebSearchAgent, which fetches each result link's content. Any
+        failure is a silent skip (returns ``""``) so the model falls back to its
+        own knowledge — no error/upsell is injected.
+        """
+        try:
+            content = self.web_search_agent.search(query)
+            if content:
+                logger.info(f"[collect] Web search returned {len(content)} chars")
+            return content or ""
+        except Exception as e:
+            logger.warning(f"[collect] Web search failed: {e}")
+            return ""
+
+    # Verbs that mark a tool as read-only (safe to auto-run during collect).
+    _READ_ONLY_VERBS = {
+        "get", "list", "search", "read", "fetch", "find", "describe", "view",
+        "show", "query", "lookup", "retrieve", "count", "check", "status",
+        "browse", "scrape",
+    }
+    # Verbs that mark a tool as side-effecting (never auto-run in collect).
+    _WRITE_VERBS = {
+        "create", "update", "delete", "send", "post", "write", "remove", "set",
+        "add", "edit", "modify", "put", "patch", "insert", "cancel", "pay",
+        "deploy", "merge", "close", "assign", "run", "execute", "trigger",
+    }
+
+    # Phrases where the user explicitly asks to go to the web/internet, so web
+    # search is the intent regardless of what local/MCP already returned.
+    _WEB_INTENT_PHRASES = (
+        "web search", "search the web", "search online", "search the internet",
+        "on the web", "on the internet", "look it up", "look up online",
+        "google ", "duckduckgo",
+    )
+    # Tokens that signal the user wants fresh/current information, for which the
+    # web is authoritative even when local/MCP already answered.
+    _TIME_SENSITIVE_TOKENS = frozenset({
+        "latest", "today", "todays", "now", "current", "recent",
+        "news", "breaking", "live", "yesterday", "tonight",
+    })
+
+    @classmethod
+    def _wants_web(cls, query: str) -> bool:
+        """True when the user explicitly asks for the web, or wants fresh info.
+
+        Used to keep web search firing (as a primary source) even when the
+        local KB or an MCP tool already returned something — either because the
+        request names the web/internet outright ("web search canyon bikes") or
+        asks for time-sensitive data ("the latest canyon bike").  Otherwise web
+        search stays a last resort behind the primary sources.
+        """
+        q = (query or "").lower()
+        if any(p in q for p in cls._WEB_INTENT_PHRASES):
+            return True
+        tokens = set(re.findall(r"[a-z']+", q))
+        return bool(tokens & cls._TIME_SENSITIVE_TOKENS)
+
+    @classmethod
+    def _is_read_only_tool(cls, tool_name: str) -> bool:
+        """True only when a tool name clearly reads (no side effects).
+
+        Conservative: unknown/ambiguous verbs are treated as NOT read-only so a
+        side-effecting tool is never auto-run during collect — it stays a
+        planned execute step. (MCP annotations aren't persisted, so this is a
+        leading-verb heuristic over the tool name.)
+        """
+        if not tool_name:
+            return False
+        first = re.split(r"[_\-\s.]+", tool_name.strip().lower())[0]
+        if first in cls._WRITE_VERBS:
+            return False
+        return first in cls._READ_ONLY_VERBS
+
+    def _run_mcp(self, query: str, mcp_servers: Optional[List["MCPServer"]],
+                 project_dir: Optional[str]) -> str:
+        """Auto-run a read-only MCP tool for *query* as a collect step.
+
+        Vector-retrieves the best-matching tool (MCPAgent), and — only when it
+        is read-only — extracts args and executes it, returning the result.
+        Write/side-effecting tools are left for a planned execute step. Any
+        failure is a silent skip (returns ``""``).
+        """
+        if not self.tool_caller or not self.arg_extractor or not mcp_servers or not project_dir:
+            return ""
+        try:
+            picked = self.mcp_agent.select_tool(query, project_dir, mcp_servers)
+            if not picked:
+                return ""
+            server_id, tool_name = picked
+            if not self._is_read_only_tool(tool_name):
+                logger.info(
+                    "[collect] MCP tool '%s' is not read-only — leaving to a "
+                    "planned execute step", tool_name,
+                )
+                return ""
+            server = next((s for s in mcp_servers if getattr(s, "id", None) == server_id), None)
+            if server is None:
+                return ""
+            tool_def = next(
+                (t for t in (server.tools or []) if getattr(t, "name", None) == tool_name),
+                None,
+            )
+            input_schema = (getattr(tool_def, "input_schema", None) or {}) if tool_def else {}
+
+            arguments = self.arg_extractor.invoke(
+                user_input=query, tool_name=tool_name, input_schema=input_schema,
+            )
+            arguments.pop("_missing_params", None)
+
+            access_token = self.tool_caller.get_access_token(server)
+            result = self.tool_caller.call_tool(
+                server=server, tool_name=tool_name,
+                arguments=arguments, access_token=access_token,
+            )
+            if not result.success or not result.content:
+                return ""
+            raw = "\n".join(
+                block.get("text", "") if isinstance(block, dict) and block.get("type") == "text"
+                else str(block)
+                for block in result.content
+            ).strip()
+            if not raw:
+                return ""
+            logger.info("[collect] MCP tool '%s' returned %d chars", tool_name, len(raw))
+            return f"MCP TOOL ({tool_name}):\n{raw}"
+        except Exception as e:
+            logger.warning(f"[collect] MCP tool run failed, skipping: {e}")
+            return ""
 
     @staticmethod
     def _is_non_data_file(fname: str) -> bool:
@@ -563,6 +576,7 @@ class Explorer:
         mcp_tool_contexts: Optional[List["MCPToolContext"]] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         executor: Optional[ThreadPoolExecutor] = None,
+        project_dir: Optional[str] = None,
     ) -> SearchContext:
         """Fan-out vector/feedback/workspace searches in parallel.
 
@@ -577,7 +591,7 @@ class Explorer:
         if not model_service:
             return ctx
 
-        pool = executor or ThreadPoolExecutor(max_workers=3)
+        pool = executor or ThreadPoolExecutor(max_workers=5)
         own_pool = executor is None
 
         try:
@@ -595,8 +609,13 @@ class Explorer:
                 self._search_workspace, query, model_service, cwd,
                 history_for_search,
             ) if cwd else None
+            # MCP (read-only): part of explore — vector-retrieve the best tool
+            # and auto-run it if read-only, returning the result. Write tools
+            # are skipped here (they stay planned execute steps).
+            f_mcp = pool.submit(self._run_mcp, query, mcp_servers, project_dir) \
+                if (mcp_servers and project_dir) else None
 
-            # Collect results
+            # Collect primary results (local retrieval + MCP tools)
             vec_result = f_vec.result()
             if vec_result is not None:
                 ctx.vector_context = vec_result[0]
@@ -608,6 +627,29 @@ class Explorer:
             if f_ws is not None:
                 ctx.workspace_context = f_ws.result()
 
+            if f_mcp is not None:
+                ctx.mcp_context = f_mcp.result()
+
+            # Web search is a *last resort*, not a parallel peer: fire it only
+            # when the primary sources (MCP tools + local retrieval) turned up
+            # nothing relevant, or the query explicitly wants fresh info.  This
+            # stops an unrelated web citation from being attached to a query an
+            # MCP tool (e.g. "list my issues") or the local KB already answered.
+            if self.web_search_agent.is_enabled():
+                has_primary = bool(
+                    ctx.mcp_context or ctx.vector_context
+                    or ctx.workspace_context or ctx.feedback_context
+                )
+                if not has_primary or self._wants_web(query):
+                    ctx.web_context = self._search_web(query)
+                    if self.web_search_agent.last_sources:
+                        ctx.web_sources = list(self.web_search_agent.last_sources)
+                else:
+                    logger.info(
+                        "[collect] Skipping web search — primary sources "
+                        "(MCP/local) already returned relevant content"
+                    )
+
         finally:
             if own_pool:
                 pool.shutdown(wait=False)
@@ -617,113 +659,6 @@ class Explorer:
         # extraction, validation, and result accumulation in reason().
 
         return ctx
-
-    def _execute_skill_tool(
-        self,
-        tool_name: str,
-        query: str,
-        mcp_servers: List["MCPServer"],
-        mcp_tool_contexts: List[MCPToolContext],
-        enriched: Optional[EnrichedContext] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Resolve a skill-referenced tool from servers, extract args, call it, return result."""
-        if not self.tool_caller or not self.arg_extractor:
-            return None
-
-        # Find the tool and its server — first via planning contexts, then
-        # fall back to searching mcp_servers directly (system servers like
-        # __fetch__ are excluded from mcp_tool_contexts).
-        resolved_server = None
-        tool_schema = None
-        for srv_ctx in mcp_tool_contexts:
-            for tool in srv_ctx.tools:
-                if tool.get("name", "") == tool_name:
-                    for srv in mcp_servers:
-                        if srv.id == srv_ctx.server_id:
-                            resolved_server = srv
-                            tool_schema = tool
-                            break
-                    break
-            if resolved_server:
-                break
-
-        if not resolved_server:
-            for srv in mcp_servers:
-                if not srv.enabled or not srv.tools:
-                    continue
-                for t in srv.tools:
-                    if t.name == tool_name:
-                        resolved_server = srv
-                        tool_schema = {
-                            "name": t.name,
-                            "description": t.description,
-                            "input_schema": t.input_schema,
-                        }
-                        break
-                if resolved_server:
-                    break
-
-        if not resolved_server or not tool_schema:
-            logger.info(f"[collect] Skill tool '{tool_name}' not found in servers")
-            return None
-
-        # Skip fetch tools if no URL in query
-        if any(kw in tool_name.lower() for kw in FETCH_TOOL_KEYWORDS):
-            if not re.search(r'https?://[^\s<>\'")\]]+', query):
-                logger.info(
-                    f"[collect] Skill tool '{tool_name}' is a fetch tool "
-                    f"but no URL in query — skipping"
-                )
-                return None
-
-        input_schema = tool_schema.get("input_schema", {}) or {}
-
-        # Build extraction context with enriched info for better arg extraction
-        extraction_input = query
-        if enriched and enriched.history_insight:
-            extraction_input = f"{query}\n\nContext: {enriched.history_insight}"
-
-        try:
-            arguments = self.arg_extractor.invoke(
-                user_input=extraction_input,
-                tool_name=tool_name,
-                input_schema=input_schema,
-            )
-            arguments.pop("_missing_params", None)
-        except Exception as e:
-            logger.warning(f"[collect] Arg extraction failed for '{tool_name}': {e}")
-            return None
-
-        access_token = self.tool_caller.get_access_token(resolved_server)
-
-        try:
-            result = self.tool_caller.call_tool(
-                server=resolved_server,
-                tool_name=tool_name,
-                arguments=arguments,
-                access_token=access_token,
-            )
-        except Exception as e:
-            logger.warning(f"[collect] Tool call failed for '{tool_name}': {e}")
-            return None
-
-        if not result.success or not result.content:
-            logger.warning(f"[collect] Skill tool '{tool_name}' returned no result")
-            return None
-
-        raw_parts = [
-            block.get("text", "") if isinstance(block, dict) and block.get("type") == "text"
-            else str(block)
-            for block in result.content
-        ]
-        raw = "\n".join(raw_parts)
-        logger.info(f"[collect] Skill tool '{tool_name}' returned {len(raw)} chars")
-
-        return {
-            "tool_name": tool_name,
-            "content": raw,
-            "server_name": resolved_server.name,
-        }
 
     # ================================================================== #
     # Context enrichment (pre-planning)                                    #
