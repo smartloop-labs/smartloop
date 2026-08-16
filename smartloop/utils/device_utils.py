@@ -33,8 +33,7 @@ class DeviceConfig:
 
     def _detect_device(self) -> DeviceType:
         """Detect the best available device via llama_cpp"""
-        from llama_cpp import llama_supports_gpu_offload
-        if llama_supports_gpu_offload():
+        if llama_gpu_offload():
             return DeviceType.MPS if sys.platform == 'darwin' else DeviceType.CUDA
         return DeviceType.CPU
 
@@ -89,6 +88,25 @@ def get_device_config() -> DeviceConfig:
     return config
 
 
+def llama_gpu_offload() -> bool:
+    """True when the installed llama.cpp was built with a GPU backend.
+
+    This is the single source of truth for "is a GPU usable" across the app.
+    GPU availability and device memory are managed by llama.cpp / the backend
+    (Vulkan, Metal, CUDA) — VRAM is never probed directly.
+    """
+    try:
+        from llama_cpp import llama_supports_gpu_offload
+        return bool(llama_supports_gpu_offload())
+    except Exception:
+        return False
+
+
 def is_apple_silicon() -> bool:
     """Check if running on Apple Silicon (M1/M2/M3 etc.)"""
     return sys.platform == 'darwin'
+
+
+def is_mps() -> bool:
+    """True on Apple Silicon with a llama.cpp Metal (GPU offload) backend."""
+    return sys.platform == 'darwin' and llama_gpu_offload()

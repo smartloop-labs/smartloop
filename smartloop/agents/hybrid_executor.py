@@ -6,73 +6,22 @@ own model instance).
 """
 import logging
 import os
-import subprocess
-import sys
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 from smartloop.agents.llm_worker import init_worker, run_inference
+from smartloop.utils.device_utils import llama_gpu_offload, is_mps
 
 logger = logging.getLogger(__name__)
 
 
-def _llama_gpu_offload() -> bool:
-    """True when the installed llama.cpp was built with a GPU backend."""
-    try:
-        from llama_cpp import llama_supports_gpu_offload
-        return bool(llama_supports_gpu_offload())
-    except Exception:
-        return False
-
-
-def _nvidia_smi_gpus() -> list:
-    """Return ``[(name, free_gb, total_gb), ...]`` for NVIDIA GPUs, or ``[]``.
-
-    GPU availability is decided by llama.cpp; the backend is Vulkan, so torch's
-    CUDA view is irrelevant (and torch isn't installed by default). nvidia-smi
-    reports the physical NVIDIA GPU(s) directly. Non-NVIDIA Vulkan GPUs
-    (AMD/Intel) have no nvidia-smi → the caller falls back to RAM sizing.
-    """
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.free,memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0:
-            return []
-        gpus = []
-        for line in result.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) == 3:
-                name, free_mib, total_mib = parts
-                gpus.append((name, float(free_mib) / 1024, float(total_mib) / 1024))
-        return gpus
-    except Exception:
-        return []
-
-
 def _gpu_device_cap() -> int | None:
-    """Max concurrent GPU model copies (one per GPU), or None for CPU-only.
+    """Max concurrent GPU model copies, or None for CPU-only.
 
-    One copy per physical NVIDIA GPU; any other llama.cpp GPU backend
-    (Vulkan on AMD/Intel, Metal) caps at a single device.
+    A GPU backend (Vulkan/Metal) isn't enumerable and same-device copies
+    serialize, so cap at a single device whenever GPU offload is available.
     """
-    gpus = _nvidia_smi_gpus()
-    if gpus:
-        return len(gpus)
-    return 1 if _llama_gpu_offload() else None
-
-
-def _cuda_mem_info_gb():
-    """Return ``(name, free_gb, total_gb)`` for NVIDIA GPU 0, or None."""
-    gpus = _nvidia_smi_gpus()
-    return gpus[0] if gpus else None
-
-
-def _is_mps() -> bool:
-    """True on Apple Silicon with a llama.cpp Metal (GPU offload) backend."""
-    return sys.platform == "darwin" and _llama_gpu_offload()
+    return 1 if llama_gpu_offload() else None
 
 
 class LLMExecutor:
@@ -170,13 +119,12 @@ class LLMExecutor:
         above ``requested``.  The estimate is deliberately conservative since
         under-counting a worker's footprint crashes the last copy to load.
 
-        On GPUs the count is also capped at one copy per GPU: separate
-        processes can't run GPU kernels concurrently on the same device (the
-        driver serializes them without CUDA MPS), so the parallel ceiling is
-        the number of physical NVIDIA GPUs (nvidia-smi), or 1 for any other
-        llama.cpp GPU backend (Vulkan, Metal).  A single GPU therefore caps at
-        1 and the caller reuses the shared model.  CPU has no such cap —
-        independent cores give real parallelism, sized by memory below.
+        On a GPU the count is also capped at one copy: separate processes can't
+        run GPU kernels concurrently on the same device (the driver serializes
+        them), and a llama.cpp GPU backend (Vulkan/Metal) isn't enumerable, so
+        the parallel ceiling is a single device.  The caller then reuses the
+        shared model.  CPU has no such cap — independent cores give real
+        parallelism, sized by memory below.
         """
         try:
             # One model copy per GPU is the most that can run in parallel;
@@ -218,15 +166,10 @@ class LLMExecutor:
             # Resolve (device_label, free_gb, total_gb, reserve_gb) for whichever
             # accelerator is active.  reserve keeps memory for the main model,
             # fragmentation headroom and the OS so workers don't claim
-            # everything and crash the last copy that tries to load.
-            cuda_info = _cuda_mem_info_gb()
-            if cuda_info is not None:
-                # mem_get_info()/nvidia-smi is a single snapshot taken before any
-                # worker loads; workers spawn concurrently, so keep a VRAM reserve
-                # (was 0.0) to absorb that drift + allocator fragmentation.
-                name, free_gb, total_gb = cuda_info
-                device, reserve_gb = name, 1.5
-            elif _is_mps():
+            # everything and crash the last copy that tries to load.  VRAM is
+            # not probed — for a discrete GPU the Vulkan backend manages device
+            # memory, so we size workers against system RAM (conservative).
+            if is_mps():
                 # Apple Silicon: unified memory shared with the OS/main model.
                 import psutil
                 vm = psutil.virtual_memory()
@@ -235,15 +178,15 @@ class LLMExecutor:
             else:
                 import psutil
                 vm = psutil.virtual_memory()
-                device, total_gb = "CPU", vm.total / 1024**3
+                device, total_gb = "GPU/CPU (system RAM)" if llama_gpu_offload() else "CPU", vm.total / 1024**3
                 free_gb, reserve_gb = vm.available / 1024**3, 2.0
 
             # Charge for the main model only to the extent it isn't already
-            # resident.  ``mem_get_info`` is timing-dependent: if the executor
-            # is built *after* the model loads, ``free_gb`` already excludes it
-            # (already_used covers it → unaccounted ≈ 0); if built *before*,
-            # already_used ≈ 0 so we reserve the full footprint.  Either way we
-            # never double-charge and never ignore it.
+            # resident.  The free-memory snapshot is timing-dependent: if the
+            # executor is built *after* the model loads, ``free_gb`` already
+            # excludes it (already_used covers it → unaccounted ≈ 0); if built
+            # *before*, already_used ≈ 0 so we reserve the full footprint.
+            # Either way we never double-charge and never ignore it.
             already_used_gb = max(0.0, total_gb - free_gb)
             unaccounted_main_gb = max(0.0, main_footprint_gb - already_used_gb)
 

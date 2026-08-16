@@ -715,28 +715,13 @@ class ModelService:
     def _device_free_total_gb() -> Optional[tuple[float, float]]:
         """Return (free_gb, total_gb) for the active accelerator, or None.
 
-        None on CPU (RAM is plentiful; no fit guard needed) or when the device
-        can't be queried.
+        VRAM is not probed: for a discrete GPU the Vulkan backend manages device
+        memory, so only Apple Silicon (unified memory) reports a fit budget.
+        None otherwise (CPU/discrete GPU) — llama.cpp handles offload/fit.
         """
-        # NVIDIA VRAM: query nvidia-smi directly. GPU availability is decided by
-        # llama.cpp and the backend is Vulkan, so torch's CUDA view is
-        # irrelevant (and torch isn't installed by default).
         try:
-            import subprocess
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.free,memory.total",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                free_mib, total_mib = (x.strip() for x in result.stdout.splitlines()[0].split(","))
-                return float(free_mib) / 1024, float(total_mib) / 1024
-        except Exception:
-            pass
-        # Apple Silicon unified memory (Metal via llama.cpp).
-        try:
-            from llama_cpp import llama_supports_gpu_offload
-            if sys.platform == "darwin" and llama_supports_gpu_offload():
+            from smartloop.utils.device_utils import is_mps
+            if is_mps():
                 import psutil
                 vm = psutil.virtual_memory()
                 return vm.available / 1024**3, vm.total / 1024**3

@@ -9,25 +9,6 @@ from pathlib import Path
 from smartloop.utils.device_utils import get_device_config
 
 
-def _get_cuda_vram_gb() -> float | None:
-    """Return total VRAM in GB for NVIDIA GPU 0, or None if unavailable.
-
-    GPU availability is decided by llama.cpp and the backend is Vulkan, so
-    torch's CUDA view is irrelevant (and torch isn't installed by default).
-    Query nvidia-smi directly for the physical GPU's VRAM.
-    """
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            return float(result.stdout.strip().splitlines()[0]) / 1024  # MiB → GiB
-    except Exception:
-        pass
-    return None
-
-
 def _llama_cpp_has_cuda_backend() -> bool:
     """True when the installed llama.cpp was built with the CUDA backend.
 
@@ -283,38 +264,12 @@ class LlmFactory:
         # Calculate optimal context size based on available memory
         n_ctx = 8192  # Default context size
 
-        # Adjust GPU layers and context based on available memory
-        vram_gb = _get_cuda_vram_gb()
-        if vram_gb is not None:
-            # Calculate available memory after model loading
-            # Reserve memory for: model weights + KV cache + overhead
-            available_for_kv = vram_gb - model_size_gb - 0.5  # 0.5GB overhead
-
-            if available_for_kv > 0:
-                # Estimate context size based on available memory
-                # KV cache memory per 8k tokens (conservative estimates for quantized models)
-                kv_per_8k = 0.25 if model_size_gb < 3 else 0.5 if model_size_gb < 6 else 1.0
-                estimated_ctx = int((available_for_kv / kv_per_8k) * 8192)
-
-                # Allow larger contexts — cap at model's trained context length or hardware limit
-                max_ctx = 32768 if model_size_gb < 3 else 16384 if model_size_gb < 6 else 8192
-                n_ctx = max(2048, min(estimated_ctx, max_ctx))
-                logger.info(f"Calculated optimal context: {n_ctx} tokens for {vram_gb:.1f}GB VRAM, {model_size_gb:.1f}GB model")
-            else:
-                # Limited VRAM - use smaller context
-                n_ctx = 2048
-                logger.warning(f"Limited VRAM ({vram_gb:.1f}GB) for {model_size_gb:.1f}GB model, using context={n_ctx}")
-
-            # If model is larger than available VRAM, reduce GPU layers
-            if model_size_gb > vram_gb * 0.8:  # Use up to 80% VRAM for model weights
-                # Estimate layers that can fit (assuming ~30-40 layers for 4B models)
-                estimated_layers = int((vram_gb * 0.7) / model_size_gb * 35)
-                llama_config.n_gpu_layers = max(0, estimated_layers)
-                logger.warning(
-                    f"Model size ({model_size_gb:.1f}GB) requires conservative GPU allocation. "
-                    f"Using {llama_config.n_gpu_layers} GPU layers (rest on CPU)"
-                )
-        elif device_config.device.value == 'mps':
+        # Adjust GPU layers and context based on available memory. VRAM is not
+        # probed: GPU offload is decided by llama.cpp and device memory is
+        # managed by the Vulkan backend, so discrete-GPU boxes keep full offload
+        # with the default context (the subprocess probe below reduces the
+        # context or falls back to CPU if it doesn't fit).
+        if device_config.device.value == 'mps':
             # Apple Silicon — unified memory shared between CPU and GPU.
             # Metal handles GPU offloading via n_gpu_layers=-1 (already set).
             import psutil
@@ -338,15 +293,13 @@ class LlmFactory:
                 f"{model_size_gb:.1f}GB model — using n_ctx={n_ctx}, n_gpu_layers={llama_config.n_gpu_layers}"
             )
         elif llama_supports_gpu_offload():
-            # GPU backend torch can't see — e.g. Vulkan on an AMD/Intel GPU,
-            # or an NVIDIA card with a CPU-only torch wheel and no nvidia-smi.
-            # Neither torch nor the llama-cpp-python bindings can report this
-            # device's VRAM, so keep the full offload from
-            # get_llama_cpp_config() with the default context; the subprocess
-            # probe below degrades to reduced-context / CPU if it doesn't fit.
+            # GPU offload via the Vulkan (or other) llama.cpp backend. VRAM is
+            # not queryable, so keep the full offload from get_llama_cpp_config()
+            # with the default context; the subprocess probe below degrades to
+            # reduced-context / CPU if it doesn't fit.
             logger.info(
-                f"GPU offload backend available but VRAM unknown (non-CUDA backend, "
-                f"e.g. Vulkan) — using n_ctx={n_ctx}, n_gpu_layers={llama_config.n_gpu_layers}"
+                f"GPU offload backend available (VRAM managed by the backend) — "
+                f"using n_ctx={n_ctx}, n_gpu_layers={llama_config.n_gpu_layers}"
             )
         else:
             # No GPU available — CPU only
