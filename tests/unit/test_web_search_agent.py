@@ -89,3 +89,64 @@ class TestRerank:
         ranked = agent._rerank("query", candidates)
         assert [u for u, _ in ranked] == ["c.com", "a.com", "b.com"]
 
+
+
+class TestEnablement:
+    """The per-project ``web_search_enabled`` flag must actually stop searches."""
+
+    def _write_config(self, tmp_path, enabled, monkeypatch):
+        import json
+
+        from smartloop.workspace.workspace import Workspace
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({
+            "id": "m",
+            "workspace": {
+                "id": "ws",
+                "workspace_dir": str(tmp_path),
+                "models_dir": str(tmp_path),
+                "models": [],
+                "projects": [
+                    {"id": "other", "project_dir": str(tmp_path), "current": False,
+                     "name": "other", "web_search_enabled": True},
+                    {"id": "p1", "project_dir": str(tmp_path), "current": True,
+                     "name": "p1", "web_search_enabled": enabled},
+                ],
+            },
+        }))
+        monkeypatch.setattr(Workspace, "config_file", str(cfg))
+        return Workspace
+
+    def test_disabled_project_skips_search(self, tmp_path, monkeypatch):
+        from smartloop.agents.web_search_agent import WebSearchAgent
+        import smartloop.search.providers as providers
+
+        self._write_config(tmp_path, False, monkeypatch)
+        calls = []
+        monkeypatch.setattr(providers, "get_search_provider",
+                            lambda: type("P", (), {"search": lambda self, q, count: calls.append(q) or ["http://x"]})())
+
+        assert WebSearchAgent.is_enabled() is False
+        assert WebSearchAgent().search("latest canyon bikes") == ""
+        assert calls == []
+
+    def test_enabled_project_reports_enabled(self, tmp_path, monkeypatch):
+        from smartloop.agents.web_search_agent import WebSearchAgent
+
+        self._write_config(tmp_path, True, monkeypatch)
+        assert WebSearchAgent.is_enabled() is True
+
+    def test_disk_state_wins_over_stale_cached_workspace(self, tmp_path, monkeypatch):
+        from smartloop.agents.web_search_agent import WebSearchAgent
+
+        Workspace = self._write_config(tmp_path, False, monkeypatch)
+        # A worker process can hold a singleton loaded before the user toggled
+        # web search off; the on-disk flag is the source of truth.
+        monkeypatch.setattr(Workspace, "_instance", Workspace.model_validate({
+            "id": "ws", "workspace_dir": str(tmp_path), "models_dir": str(tmp_path),
+            "models": [],
+            "projects": [{"id": "p1", "project_dir": str(tmp_path), "current": True,
+                          "name": "p1", "web_search_enabled": True}],
+        }))
+        assert WebSearchAgent.is_enabled() is False
