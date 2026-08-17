@@ -137,6 +137,33 @@ class TestEnablement:
         self._write_config(tmp_path, True, monkeypatch)
         assert WebSearchAgent.is_enabled() is True
 
+    def test_flag_absent_from_disk_defaults_to_enabled(self, tmp_path, monkeypatch):
+        """A project written before the flag existed (or freshly created) is on."""
+        import json
+
+        from smartloop.agents.web_search_agent import WebSearchAgent
+        from smartloop.workspace.workspace import Workspace
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({
+            "id": "m",
+            "workspace": {
+                "id": "ws", "workspace_dir": str(tmp_path), "models_dir": str(tmp_path),
+                "models": [],
+                # No web_search_enabled key at all.
+                "projects": [{"id": "p1", "project_dir": str(tmp_path),
+                              "current": True, "name": "p1"}],
+            },
+        }))
+        monkeypatch.setattr(Workspace, "config_file", str(cfg))
+        assert WebSearchAgent.is_enabled() is True
+
+    def test_new_project_is_enabled_by_default(self):
+        from smartloop.workspace.workspace import Project
+
+        project = Project(id="p1", project_dir="/tmp/p1", current=True, name="p1")
+        assert project.web_search_enabled is True
+
     def test_disk_state_wins_over_stale_cached_workspace(self, tmp_path, monkeypatch):
         from smartloop.agents.web_search_agent import WebSearchAgent
 

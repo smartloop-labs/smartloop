@@ -210,9 +210,13 @@ class Project (BaseModel):
     adapters: Set[str] = set()
     sessions: List[str] = []
     # Pro/premium feature: when enabled, the orchestrator runs the
-    # WebSearchAgent (hosted /v1/websearch) for latest-info queries. Off by
-    # default; toggled per project via PATCH /v1/projects/{id}/websearch.
-    web_search_enabled: bool = False
+    # WebSearchAgent (hosted /v1/websearch) for latest-info queries.
+    # On by default, so new projects — and configs written before this flag
+    # existed — start enabled; only an explicit ``false`` on disk turns it off.
+    # Searching still no-ops without a configured provider/token, so the
+    # default costs nothing until a key is connected.
+    # Toggled per project via PATCH /v1/projects/{id} (or .../websearch).
+    web_search_enabled: bool = True
 
     @property
     def visible_dir(self) -> str:
