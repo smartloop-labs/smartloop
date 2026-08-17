@@ -55,7 +55,8 @@ class ProjectResponse(BaseModel):
     documents: List[DocumentResponse] = []
     current: bool = False
     system: bool = False
-    web_search_enabled: bool = False
+    # Mirrors Project.web_search_enabled — on unless explicitly disabled.
+    web_search_enabled: bool = True
 
 
 class ProjectListResponse(BaseModel):
