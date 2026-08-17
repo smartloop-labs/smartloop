@@ -73,6 +73,7 @@ async def update_project(
             name=request.name,
             description=request.description,
             skills=[Skill(id=md5(s.content.encode()).hexdigest(), name=s.name or f"skill-{md5(s.content.encode()).hexdigest()[:6]}", description=s.description, content=s.content) for s in request.skills],
+            web_search_enabled=request.web_search_enabled,
         )
         return ProjectResponse(**result)
     except ValueError as e:

@@ -326,7 +326,10 @@ class WebSearchAgent:
         try:
             from smartloop.workspace.workspace import Workspace
 
-            ws = Workspace._instance or Workspace.load()
+            # Read the on-disk state first: agents can run in worker processes
+            # whose cached singleton predates the toggle, so trusting the
+            # in-memory copy would keep searching after the user disabled it.
+            ws = Workspace.load() or Workspace._instance
             project = ws.current_project if ws else None
             return bool(project and project.web_search_enabled)
         except Exception as e:

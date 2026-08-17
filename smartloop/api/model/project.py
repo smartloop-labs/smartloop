@@ -41,6 +41,7 @@ class UpdateProjectRequest(BaseModel):
     name: Optional[str] = Field(default=None, description="New project name")
     description: Optional[str] = Field(default=None, description="New project description")
     skills: List[SkillRequest] = Field(default=[], description="Updated list of skills for the project")
+    web_search_enabled: Optional[bool] = Field(default=None, description="Enable/disable web search for this project; omit to leave unchanged")
 
 class ProjectResponse(BaseModel):
     """Single project info"""
@@ -54,6 +55,7 @@ class ProjectResponse(BaseModel):
     documents: List[DocumentResponse] = []
     current: bool = False
     system: bool = False
+    web_search_enabled: bool = False
 
 
 class ProjectListResponse(BaseModel):

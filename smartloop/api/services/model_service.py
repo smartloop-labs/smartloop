@@ -2704,6 +2704,7 @@ class ModelService:
         name: Optional[str] = None,
         description: Optional[str] = None,
         skills: Optional[List[Skill]] = None,
+        web_search_enabled: Optional[bool] = None,
     ) -> dict:
         """Update an existing project."""
         self._ensure_model()
@@ -2735,6 +2736,12 @@ class ModelService:
             for skill in skills:
                 self._write_skill_md(project, skill)
 
+        if web_search_enabled is not None:
+            project.web_search_enabled = web_search_enabled
+            logger.info(
+                "[web-search] project %s enabled=%s", project.id, web_search_enabled
+            )
+
         self._model.save()
 
         return self._project_to_dict(project)
@@ -2754,6 +2761,7 @@ class ModelService:
             "skills": [s.model_dump() for s in skills],
             "mcp": [self._mcp_server_to_dict(s) for s in p.mcp_servers],
             "documents": [doc.to_info().model_dump() for doc in p.documents],
+            "web_search_enabled": bool(p.web_search_enabled),
         }
 
     def list_projects(self) -> list[dict]:
@@ -2819,6 +2827,13 @@ class ModelService:
         target = next((p for p in workspace.projects if p.id == project_id), None)
         if target is None:
             raise ValueError(f"Project not found: {project_id}")
+
+        # Already active — skip the cache teardown and workspace save.  Clients
+        # re-POST /v1/models/load on unrelated setting changes (e.g. toggling
+        # web search), and dropping the indexer/doc-store caches there forces a
+        # needless re-open of the vector stores on the next query.
+        if target.current:
+            return
 
         for p in workspace.projects:
             p.current = (p.id == project_id)
