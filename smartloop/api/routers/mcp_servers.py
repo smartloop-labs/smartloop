@@ -7,15 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from smartloop.api.model import (
-    AddMCPServerRequest,
-    AddRemoteMCPServerRequest,
     MCPServerResponse,
     DeleteMCPServerResponse,
     MCPToolResponse,
     MCPRegisterRequest,
     MCPRegisterResponse,
-    MCPOAuthInitiateRequest,
-    MCPOAuthInitiateResponse,
     MCPOAuthCallbackRequest,
 )
 from smartloop.api.services import ModelService, get_model_service
@@ -334,65 +330,6 @@ async def count_indexed_mcp_tools_for_project(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/projects/{project_id}/mcp", response_model=MCPServerResponse)
-async def add_mcp_server_to_project(
-    project_id: str,
-    request: AddMCPServerRequest,
-    model_service: ModelService = Depends(get_model_service),
-):
-    """Register a local MCP server to a specific project."""
-    try:
-        result = model_service.add_local_mcp_server(
-            command=request.command,
-            args=request.args,
-            name=request.name,
-            env=request.env,
-            cwd=request.cwd,
-            description=request.description,
-            project_id=project_id,
-        )
-        return _build_server_response(result)
-    except MCPDiscoveryError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.exception("Error adding MCP server to project")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/projects/{project_id}/mcp/remote", response_model=MCPServerResponse)
-async def add_remote_mcp_server_to_project(
-    project_id: str,
-    request: AddRemoteMCPServerRequest,
-    model_service: ModelService = Depends(get_model_service),
-):
-    """Register a remote MCP server to a specific project."""
-    try:
-        result = model_service.add_remote_mcp_server(
-            name=request.name or "Remote MCP Server",
-            server_url=request.server_url,
-            auth_type=request.auth_type,
-            tools=request.tools,
-            token=request.token,
-            token_endpoint=request.token_endpoint,
-            authorization_endpoint=request.authorization_endpoint,
-            client_id=request.client_id,
-            client_secret=request.client_secret,
-            access_token=request.access_token,
-            refresh_token=request.refresh_token,
-            expires_at=request.expires_at,
-            token_type=request.token_type,
-            project_id=project_id,
-        )
-        return _build_server_response(result)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.exception("Error adding remote MCP server to project")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.delete("/projects/{project_id}/mcp/{server_id}", response_model=DeleteMCPServerResponse)
 async def delete_mcp_server_from_project(
     project_id: str,
@@ -582,81 +519,6 @@ async def mcp_oauth_callback(
 
 
 # ---- OAuth flow endpoints ----
-
-
-@router.post("/projects/{project_id}/mcp/oauth/initiate", response_model=MCPOAuthInitiateResponse)
-async def initiate_mcp_oauth(
-    project_id: str,
-    request: MCPOAuthInitiateRequest,
-):
-    """Discover OAuth metadata for a remote MCP server and return an auth_url for the user to visit."""
-    from smartloop.mcp import MCPOAuthService
-    from smartloop.mcp.oauth import MCPOAuthError
-
-    try:
-        server_url = request.server_url.strip()
-        callback_url = request.callback_url or "http://localhost:9876/callback"
-
-        with MCPOAuthService() as oauth:
-            # Discover OAuth metadata
-            oauth_metadata = None
-            prm = None
-            try:
-                prm = oauth.discover_protected_resource_metadata(server_url)
-                if prm.authorization_servers:
-                    oauth_metadata = oauth.discover_oauth_metadata(prm.authorization_servers[0])
-            except MCPOAuthError:
-                pass
-            if not oauth_metadata:
-                oauth_metadata = oauth.discover_oauth_metadata(server_url)
-
-            if not oauth_metadata.registration_endpoint:
-                raise HTTPException(
-                    status_code=400,
-                    detail="OAuth server does not support dynamic client registration",
-                )
-
-            # Register client
-            registration = oauth.register_client(
-                oauth_metadata.registration_endpoint, callback_url
-            )
-
-            # Generate PKCE and state
-            code_verifier, code_challenge = MCPOAuthService.generate_pkce()
-            state = MCPOAuthService.generate_state()
-
-            scopes = oauth_metadata.scopes_supported or (
-                prm.scopes_supported if prm else None
-            )
-            scope = " ".join(scopes) if scopes else None
-
-            # Build authorization URL
-            auth_url = oauth.build_authorization_url(
-                authorization_endpoint=oauth_metadata.authorization_endpoint,
-                client_id=registration.client_id,
-                redirect_uri=callback_url,
-                state=state,
-                code_challenge=code_challenge,
-                scope=scope,
-            )
-
-        return MCPOAuthInitiateResponse(
-            auth_url=auth_url,
-            server_url=server_url,
-            state=state,
-            code_verifier=code_verifier,
-            client_id=registration.client_id,
-            client_secret=registration.client_secret,
-            token_endpoint=oauth_metadata.token_endpoint,
-            authorization_endpoint=oauth_metadata.authorization_endpoint,
-        )
-    except HTTPException:
-        raise
-    except MCPOAuthError as e:
-        raise HTTPException(status_code=400, detail=f"OAuth discovery failed: {e}")
-    except Exception as e:
-        logger.exception("Error initiating MCP OAuth")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/projects/{project_id}/mcp/oauth/callback", response_model=MCPServerResponse)
