@@ -1,4 +1,4 @@
-.PHONY: help venv install build run run-debug run-local test test-unit test-cov build-binary sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
+.PHONY: help venv install build run run-debug run-local test test-unit test-cov build-binary check-apple-symbols sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
 
 UNAME_S := $(shell uname -s)
 DIST_DIR := dist/slp
@@ -61,6 +61,38 @@ endif
 JOBS := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 LLAMA_INSTALL_CMD = CMAKE_ARGS="$(LLAMA_CMAKE_ARGS)" CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --find-links wheelhouse --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
 
+# --- macOS: force the OpenBLAS SciPy wheel, not the Accelerate one ------------
+# App Store review rejects any binary that references the deprecated Accelerate
+# LAPACK symbols _dcabs1_ / _lsame_ / _xerbla_array__ ("The app uses or
+# references the following non-public or deprecated APIs"), which blocks the Mac
+# App Store build of Studio that bundles this framework.
+#
+# SciPy publishes two macOS arm64 wheels per release:
+#   macosx_14_0_arm64  linked against /System/.../Accelerate.framework. Its
+#                      scipy/linalg/cython_blas + cython_lapack import exactly
+#                      those three legacy symbols — Accelerate's $NEWLAPACK
+#                      interface has no replacement for them — and pip prefers
+#                      this wheel on the macos-14 runner.
+#   macosx_12_0_arm64  self-contained OpenBLAS in scipy/.dylibs. No Accelerate
+#                      link, no reference to the flagged symbols.
+# Identical SciPy version either way, so pin the OpenBLAS variant by wheel tag.
+# SciPy is a transitive dep (scikit-learn), hence a post-install swap rather
+# than a requirements.txt pin — there is no way to pin a wheel *variant* there.
+# Verified by `make check-apple-symbols`, which CI runs after build-binary.
+ifeq ($(PLATFORM)-$(RAW_ARCH),darwin-arm64)
+SCIPY_OPENBLAS_CMD = set -e; \
+	ver=$$($(PYTHON) -c 'import scipy; print(scipy.__version__)'); \
+	py=$$($(PYTHON) -c 'import sys; print("%d%d" % sys.version_info[:2])'); \
+	rm -rf build/scipy-openblas; \
+	$(PIP) download "scipy==$$ver" --only-binary=:all: --no-deps \
+		--platform macosx_12_0_arm64 --python-version $$py \
+		--index-url=https://pypi.org/simple -d build/scipy-openblas; \
+	$(PIP) install --force-reinstall --no-deps build/scipy-openblas/scipy-*.whl; \
+	$(PYTHON) -c "import scipy.linalg.cython_blas, scipy.linalg.cython_lapack"
+else
+SCIPY_OPENBLAS_CMD = echo "  (not macOS arm64 — nothing to do)"
+endif
+
 
 help:
 	@echo "Available targets:"
@@ -80,6 +112,7 @@ help:
 	@echo ""
 	@echo "  Packaging:"
 	@echo "  build-binary    - Build slp binary with PyInstaller"
+	@echo "  check-apple-symbols - Fail if dist/ references deprecated Accelerate LAPACK APIs (macOS)"
 	@echo "  sign            - Code sign the binary (macOS only)"
 	@echo "  notarize        - Notarize the binary with Apple (macOS only)"
 	@echo "  archive         - Create slp tar.gz from dist/slp"
@@ -109,6 +142,8 @@ build: install
 	$(LLAMA_INSTALL_CMD)
 	@echo "=== Pinning numpy<2.4 (OpenBLAS ELF alignment crash with PyInstaller) ==="
 	$(PIP) install "numpy>=1.24.0,<2.4" --force-reinstall --index-url=https://pypi.org/simple
+	@echo "=== Pinning the OpenBLAS scipy wheel (no deprecated Accelerate LAPACK) ==="
+	@$(SCIPY_OPENBLAS_CMD)
 	@echo "=== Installing PyInstaller ==="
 	$(PIP) install pyinstaller --index-url=https://pypi.org/simple
 	@echo "=== Build complete ==="
@@ -150,6 +185,34 @@ build-binary:
 	@echo "Binary verified successfully."
 	@echo "Compiling .pyc files for faster startup..."
 	@$(PYTHON) -m compileall -q -b $(DIST_DIR)
+
+# Guard against the App Store "non-public or deprecated APIs" rejection that
+# blocks Studio's Mac App Store build, which bundles this framework wholesale.
+# The offenders are the legacy Accelerate LAPACK helpers that have no
+# $NEWLAPACK replacement, pulled in when a dependency links Accelerate rather
+# than shipping its own BLAS (see SCIPY_OPENBLAS_CMD above). Scans every Mach-O
+# in dist/ for an *undefined* reference — a library that defines the symbol
+# itself, as bundled OpenBLAS does, is not an Apple API reference and is fine.
+DEPRECATED_APPLE_SYMS := _dcabs1_|_lsame_|_xerbla_array__
+
+check-apple-symbols:
+ifeq ($(PLATFORM),darwin)
+	@echo "=== Scanning $(DIST_DIR) for deprecated Accelerate LAPACK symbols ==="
+	@hits=$$(find $(DIST_DIR) -type f \( -name "*.so" -o -name "*.dylib" \) -print0 \
+		| xargs -0 -n1 sh -c 'nm -arch all "$$0" 2>/dev/null \
+			| grep -qE "^ +U ($(DEPRECATED_APPLE_SYMS))$$" && echo "$$0"' \
+		| sort); \
+	if [ -n "$$hits" ]; then \
+		echo "FAIL: these binaries reference deprecated Accelerate LAPACK APIs:"; \
+		echo "$$hits" | sed 's/^/  /'; \
+		echo "App Store review will reject the bundle. Rebuild the offending"; \
+		echo "dependency against its own BLAS instead of Accelerate."; \
+		exit 1; \
+	fi
+	@echo "OK: no references to deprecated Accelerate LAPACK APIs."
+else
+	@echo "check-apple-symbols: macOS only — skipped."
+endif
 
 sign:
 ifeq ($(PLATFORM),darwin)

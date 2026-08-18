@@ -155,7 +155,18 @@ jobs:
           find dist/slp/_internal -name "libvulkan*" | grep -q . || { echo "FAIL: Vulkan loader (libvulkan) not bundled"; exit 1; }
           find dist/slp/_internal -name "libMoltenVK*" | grep -q . || { echo "FAIL: MoltenVK not bundled — Vulkan would need a user install"; exit 1; }
           find dist/slp/_internal -name "MoltenVK_icd.json" | grep -q . || { echo "FAIL: MoltenVK ICD manifest not bundled"; exit 1; }
+          # scipy must be the OpenBLAS wheel, not the Accelerate one — see
+          # SCIPY_OPENBLAS_CMD in the Makefile. Its bundled BLAS proves the swap
+          # survived PyInstaller collection; without it scipy fails to import.
+          find dist/slp/_internal -name "libscipy_openblas*" | grep -q . || { echo "FAIL: scipy's bundled OpenBLAS missing — Accelerate-linked scipy wheel leaked in"; exit 1; }
           echo "OK: slp $VER, Metal + Vulkan backends present, MoltenVK bundled."
+
+      # App Store review rejects binaries referencing the deprecated Accelerate
+      # LAPACK symbols _dcabs1_/_lsame_/_xerbla_array__. Studio's Mac App Store
+      # build bundles this framework verbatim, so catch it here rather than in
+      # an ITMS rejection mail days later.
+      - name: Verify no deprecated Apple APIs
+        run: make check-apple-symbols
 
       - name: Sign
         env:
