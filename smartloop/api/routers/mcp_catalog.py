@@ -6,11 +6,10 @@ and exposes it to local clients (TUI, Electron) for one-click install.
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, model_validator
 
-from smartloop.config.app_settings import AppSettings
-from smartloop.platform.client import SLPPlatformClient
+from smartloop.platform import PlatformService, get_platform_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["mcp-catalog"])
@@ -58,20 +57,47 @@ class MCPCatalogEntry(BaseModel):
         return self
 
 
+def _to_entries(raw: list) -> list[MCPCatalogEntry]:
+    return [MCPCatalogEntry(**e) if isinstance(e, dict) else e for e in raw]
+
+
 @router.get("/mcp-catalog", response_model=list[MCPCatalogEntry])
-async def list_mcp_catalog():
-    """List curated MCP server catalog entries from the platform API.
+async def list_mcp_catalog(
+    svc: PlatformService = Depends(get_platform_service),
+):
+    """List curated MCP server catalog entries.
 
     Clients (TUI, Electron) use this to populate the one-click install catalog.
+    Served through the cache-through platform service, so the list survives a
+    platform outage or an expired token instead of leaving the panel empty.
     """
-    settings = AppSettings()
-    client = SLPPlatformClient(settings.slp_api_base)
-
     try:
-        entries = client.list_mcp_catalog()
+        entries = svc.list_mcp_catalog()
     except PermissionError as e:
         raise HTTPException(status_code=401, detail=str(e))
     except ConnectionError:
         raise HTTPException(status_code=502, detail="Platform API unavailable")
 
-    return [MCPCatalogEntry(**e) if isinstance(e, dict) else e for e in entries]
+    return _to_entries(entries)
+
+
+def resolve_catalog_entry(slug: str) -> MCPCatalogEntry | None:
+    """Look up one curated entry by slug, or ``None`` if it can't be resolved.
+
+    Never raises: the caller falls back to the client-supplied server_url and
+    lets enrichment run, so an install is never blocked by a catalog lookup.
+    The platform exposes a list endpoint only, so this is fetch-and-find over
+    the cached list.
+    """
+    if not slug:
+        return None
+    try:
+        entries = get_platform_service().list_mcp_catalog()
+    except Exception as e:
+        logger.warning("Catalog lookup failed for slug '%s': %s", slug, e)
+        return None
+    for entry in _to_entries(entries):
+        if entry.slug == slug:
+            return entry
+    logger.warning("No catalog entry for slug '%s'", slug)
+    return None

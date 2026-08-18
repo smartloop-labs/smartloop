@@ -77,6 +77,9 @@ class MCPServer(BaseModel):
     description: Optional[str] = None
     summary: Optional[str] = None
     tags: List[str] = []
+    # Slug of the curated catalog entry this server was installed from, when it
+    # was. Provenance: it is what marks metadata as ours rather than generated.
+    catalog_slug: Optional[str] = None
     config: Optional[MCPServerConfig] = None
     server_type: MCPServerType = MCPServerType.LOCAL
     remote_config: Optional[RemoteMCPServerConfig] = None
