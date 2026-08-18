@@ -20,6 +20,7 @@ T = TypeVar("T")
 USER_TTL = 5 * 60       # 5 minutes
 MODELS_TTL = 15 * 60    # 15 minutes
 RELEASES_TTL = 60 * 60  # 1 hour
+MCP_CATALOG_TTL = 60 * 60  # 1 hour — the curated catalog changes rarely
 
 
 def _fetch_or_cache(
@@ -116,6 +117,25 @@ class PlatformService:
             get_timestamp=self._db.models_fetched_at,
             fetch_remote=self._client.list_models,
             save_cache=self._db.save_models,
+            force=force,
+        )
+
+    def list_mcp_catalog(self, force: bool = False) -> list[dict]:
+        """Return the curated MCP server catalog (cached or fresh).
+
+        Cached so the Connections list still renders — and a curated install can
+        still resolve its slug — when the platform API is unreachable or the
+        token has gone stale. Neither state implies the user is offline: they
+        can still reach a third-party MCP server and complete OAuth.
+        """
+        if self._db is None:
+            return self._client.list_mcp_catalog()
+        return _fetch_or_cache(
+            ttl=MCP_CATALOG_TTL,
+            get_cached=self._db.list_mcp_catalog,
+            get_timestamp=self._db.mcp_catalog_fetched_at,
+            fetch_remote=self._client.list_mcp_catalog,
+            save_cache=self._db.save_mcp_catalog,
             force=force,
         )
 

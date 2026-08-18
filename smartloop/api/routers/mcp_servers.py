@@ -14,6 +14,7 @@ from smartloop.api.model import (
     MCPRegisterResponse,
     MCPOAuthCallbackRequest,
 )
+from smartloop.api.routers.mcp_catalog import resolve_catalog_entry
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.mcp.client import MCPDiscoveryError
 
@@ -48,6 +49,8 @@ def _build_server_response(result: dict) -> MCPServerResponse:
         id=result["id"],
         name=result["name"],
         description=result.get("description"),
+        tags=result.get("tags", []),
+        catalog_slug=result.get("catalog_slug"),
         command=result.get("command"),
         args=result.get("args", []),
         cwd=result.get("cwd"),
@@ -64,27 +67,38 @@ async def _register_local_mcp_server(
     request: MCPRegisterRequest,
     model_service: ModelService,
     project_id: str,
+    curated=None,
 ) -> MCPRegisterResponse:
     """Register a local (stdio) MCP server from a client-supplied command.
 
     Standard MCP stdio config: the caller provides ``command`` (e.g. ``uvx``,
     ``npx``) plus ``args``; the command must be installed on the host PATH.
+    When *curated* is a resolved catalog entry, its config and metadata win over
+    the request.
     """
-    if not request.command:
+    local_cfg = getattr(curated, "local_config", None) if curated else None
+    command = local_cfg.command if local_cfg else request.command
+    args = list(local_cfg.args) if local_cfg else request.args
+    env = dict(local_cfg.env) if local_cfg and local_cfg.env else (request.env or {})
+
+    if not command:
         raise HTTPException(status_code=400, detail="'command' is required for local servers")
-    if not request.args:
+    if not args:
         raise HTTPException(
             status_code=400,
             detail="'args' is required for local servers (e.g. args=['yahoo-finance-mcp'] for uvx, or args=['-m', 'module'] for python)",
         )
     try:
         result = model_service.add_local_mcp_server(
-            command=request.command,
-            args=request.args,
-            name=request.name,
-            env=request.env or {},
+            command=command,
+            args=args,
+            name=(curated.display_name if curated else request.name),
+            env=env,
             cwd=request.cwd,
             project_id=project_id,
+            description=(curated.description if curated else None),
+            tags=(list(curated.tags) if curated else None),
+            catalog_slug=(curated.slug if curated else None),
         )
     except MCPDiscoveryError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -135,16 +149,32 @@ async def _register_remote_mcp_server(
     model_service: ModelService,
     http_request: Request | None,
     project_id: str,
+    curated=None,
 ) -> MCPRegisterResponse:
-    """Register a remote MCP server. Tries direct connection first, falls back to OAuth."""
+    """Register a remote MCP server. Tries direct connection first, falls back to OAuth.
+
+    When *curated* is a resolved catalog entry, its ``server_url`` and metadata
+    win over the request — the catalog is authoritative for servers we list, so
+    a stale client can't pin an outdated URL under a trusted name.
+    """
     from smartloop.mcp import MCPClient, MCPOAuthService
     from smartloop.mcp.oauth import MCPOAuthError
     from urllib.parse import urlparse, parse_qs
 
-    if not request.server_url:
+    curated_url = (
+        curated.remote_config.server_url
+        if curated and curated.remote_config
+        else None
+    )
+    effective_url = curated_url or request.server_url
+    if not effective_url:
         raise HTTPException(status_code=400, detail="'server_url' is required for remote servers")
 
-    server_url = request.server_url.strip()
+    curated_description = curated.description if curated else None
+    curated_tags = list(curated.tags) if curated else None
+    curated_slug = curated.slug if curated else None
+
+    server_url = effective_url.strip()
 
     # Probe for a Smartloop-hosted /info endpoint before attempting MCP handshake.
     # Any server that exposes /info with a "pkg" field is treated as a Smartloop
@@ -179,7 +209,8 @@ async def _register_remote_mcp_server(
             si = connect_result.server_info
             server_info_dict = _build_server_info_dict(si)
             result = model_service.add_remote_mcp_server(
-                name=request.name
+                name=(curated.display_name if curated else None)
+                or request.name
                 or (si.name if si else parsed.netloc),
                 server_url=clean_url,
                 auth_type="token" if token else "none",
@@ -194,7 +225,9 @@ async def _register_remote_mcp_server(
                 ],
                 project_id=project_id,
                 server_info=server_info_dict,
-                description=si.description if si else None,
+                description=curated_description or (si.description if si else None),
+                tags=curated_tags,
+                catalog_slug=curated_slug,
             )
             server_resp = _build_server_response(result)
             return MCPRegisterResponse(auth_type="none", server=server_resp)
@@ -261,8 +294,13 @@ async def _register_remote_mcp_server(
             "token_endpoint": oauth_metadata.token_endpoint,
             "authorization_endpoint": oauth_metadata.authorization_endpoint,
             "callback_url": callback_url,
-            "name": request.name,
+            "name": (curated.display_name if curated else None) or request.name,
             "return_url": request.return_url,
+            # Curated metadata has to survive the redirect — the record is only
+            # written in the callback, long after this request has returned.
+            "description": curated_description,
+            "tags": curated_tags,
+            "catalog_slug": curated_slug,
         }
 
         return MCPRegisterResponse(
@@ -362,9 +400,18 @@ async def register_mcp_server(
     For remote servers, pass server_url (server_type defaults to "remote").
     For Smartloop-hosted MCP servers, pass server_type="smartloop" and server_url.
     """
-    if request.server_type == "local":
-        return await _register_local_mcp_server(request, model_service, project_id)
-    return await _register_remote_mcp_server(request, model_service, http_request, project_id)
+    # Resolve curated metadata server-side. Dispatch on the *resolved* entry's
+    # type rather than the caller's claim, so a future local catalog listing
+    # works with no client release. A miss leaves curated=None and the install
+    # proceeds on the client-supplied values, enrichment and all.
+    curated = resolve_catalog_entry(request.catalog_slug) if request.catalog_slug else None
+    server_type = curated.server_type if curated else request.server_type
+
+    if server_type == "local":
+        return await _register_local_mcp_server(request, model_service, project_id, curated)
+    return await _register_remote_mcp_server(
+        request, model_service, http_request, project_id, curated,
+    )
 
 
 @router.get("/mcp/oauth/callback", response_class=HTMLResponse)
@@ -471,7 +518,11 @@ async def mcp_oauth_callback(
             token_type=token_response.token_type,
             project_id=session["project_id"],
             server_info=server_info_dict,
-            description=si.description if si else None,
+            # Curated copy stashed at register time wins over whatever the
+            # vendor advertises in its handshake.
+            description=session.get("description") or (si.description if si else None),
+            tags=session.get("tags"),
+            catalog_slug=session.get("catalog_slug"),
         )
 
         server_id = result["id"]
