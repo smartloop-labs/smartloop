@@ -17,12 +17,6 @@ permissions:
 
 env:
   GCS_BUCKET: gs://smartloop-gcp-us-east-releases
-  # Pin docling/EasyOCR/HF model caches to one workspace dir so they can be
-  # cached across runs — the default download step (Makefile) otherwise pulls
-  # from HuggingFace every run and is prone to transient 429 rate-limits.
-  HF_HOME: ${{ github.workspace }}/.model-cache/hf
-  DOCLING_CACHE_DIR: ${{ github.workspace }}/.model-cache/docling
-  EASYOCR_MODULE_PATH: ${{ github.workspace }}/.model-cache/easyocr
 
 jobs:
   build-linux:
@@ -58,14 +52,6 @@ jobs:
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
           sudo apt-get install -y vulkan-sdk
-
-      - name: Cache docling/EasyOCR models
-        uses: actions/cache@v4
-        with:
-          path: .model-cache
-          key: model-cache-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            model-cache-${{ runner.os }}-
 
       - name: Install dependencies
         run: make build
@@ -151,14 +137,6 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: \
             -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH
-
-      - name: Cache docling/EasyOCR models
-        uses: actions/cache@v4
-        with:
-          path: .model-cache
-          key: model-cache-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            model-cache-${{ runner.os }}-
 
       - name: Install dependencies
         run: make build
@@ -271,14 +249,6 @@ jobs:
             --no-binary llama-cpp-python --no-deps \
             --index-url=https://pypi.org/simple \
             -w wheelhouse --no-cache-dir
-
-      - name: Cache docling/EasyOCR models
-        uses: actions/cache@v4
-        with:
-          path: .model-cache
-          key: model-cache-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            model-cache-${{ runner.os }}-
 
       # On a cache hit `make build` installs the prebuilt wheel from wheelhouse/
       # via --find-links (Makefile); otherwise the Makefile builds from source
