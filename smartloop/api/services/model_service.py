@@ -1141,11 +1141,25 @@ class ModelService:
         self._conversation_store.save(session_id, history)
 
     def search_feedback(self, query: str, n_results: int = 5) -> list:
+        """Search stored feedback Q&A using the shared relevance criteria.
+
+        Feedback was the one retrieval path with no quality floor: it recalled
+        its nearest neighbours out to a fixed 0.65 distance and returned them
+        all.  A single stored Q&A on an unrelated topic therefore matched every
+        question, poisoning the context and — because any non-empty local hit
+        counts as a primary source — suppressing web search.  Recall broadly
+        and then apply the same floor/cutoff as documents and workspace files.
+        """
         if self._model is None:
             return []
         try:
             indexer = self._ensure_feedback_indexer()
-            return indexer.search(query, n_results=n_results)
+            chunks = indexer.search(
+                query, n_results=max(n_results, 20),
+                max_distance=_RECALL_MAX_DISTANCE,
+            )
+            kept = _select_relevant_chunks(chunks, label="feedback-search")
+            return kept[:n_results]
         except Exception as e:
             logger.warning(f"[feedback-index] search_feedback failed: {e}")
             self._feedback_indexer = None
