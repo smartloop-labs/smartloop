@@ -405,36 +405,6 @@ class Explorer:
         "deploy", "merge", "close", "assign", "run", "execute", "trigger",
     }
 
-    # Phrases where the user explicitly asks to go to the web/internet, so web
-    # search is the intent regardless of what local/MCP already returned.
-    _WEB_INTENT_PHRASES = (
-        "web search", "search the web", "search online", "search the internet",
-        "on the web", "on the internet", "look it up", "look up online",
-        "google ", "duckduckgo",
-    )
-    # Tokens that signal the user wants fresh/current information, for which the
-    # web is authoritative even when local/MCP already answered.
-    _TIME_SENSITIVE_TOKENS = frozenset({
-        "latest", "today", "todays", "now", "current", "recent",
-        "news", "breaking", "live", "yesterday", "tonight",
-    })
-
-    @classmethod
-    def _wants_web(cls, query: str) -> bool:
-        """True when the user explicitly asks for the web, or wants fresh info.
-
-        Used to keep web search firing (as a primary source) even when the
-        local KB or an MCP tool already returned something — either because the
-        request names the web/internet outright ("web search canyon bikes") or
-        asks for time-sensitive data ("the latest canyon bike").  Otherwise web
-        search stays a last resort behind the primary sources.
-        """
-        q = (query or "").lower()
-        if any(p in q for p in cls._WEB_INTENT_PHRASES):
-            return True
-        tokens = set(re.findall(r"[a-z']+", q))
-        return bool(tokens & cls._TIME_SENSITIVE_TOKENS)
-
     @classmethod
     def _is_read_only_tool(cls, tool_name: str) -> bool:
         """True only when a tool name clearly reads (no side effects).
@@ -630,24 +600,26 @@ class Explorer:
             if f_mcp is not None:
                 ctx.mcp_context = f_mcp.result()
 
-            # Web search is a *last resort*, not a parallel peer: fire it only
-            # when the primary sources (MCP tools + local retrieval) turned up
-            # nothing relevant, or the query explicitly wants fresh info.  This
-            # stops an unrelated web citation from being attached to a query an
-            # MCP tool (e.g. "list my issues") or the local KB already answered.
+            # Web search runs alongside local retrieval, not behind it.
+            # Gating it on "did anything match locally?" made a single indexed
+            # document or stored feedback Q&A — retrieval always returns its
+            # nearest neighbours, related or not — silently cancel the search,
+            # leaving the model to answer a camera question from cat notes.
+            # Deciding which of the collected sources actually answers the
+            # question is the synthesis step's job; collect just gathers.
+            #
+            # The one exception is an MCP tool that already ran for this query:
+            # it was selected and invoked deliberately, so a web citation on
+            # "list my issues" would be noise.
             if self.web_search_agent.is_enabled():
-                has_primary = bool(
-                    ctx.mcp_context or ctx.vector_context
-                    or ctx.workspace_context or ctx.feedback_context
-                )
-                if not has_primary or self._wants_web(query):
+                if not ctx.mcp_context:
                     ctx.web_context = self._search_web(query)
                     if self.web_search_agent.last_sources:
                         ctx.web_sources = list(self.web_search_agent.last_sources)
                 else:
                     logger.info(
-                        "[collect] Skipping web search — primary sources "
-                        "(MCP/local) already returned relevant content"
+                        "[collect] Skipping web search — an MCP tool already "
+                        "answered this query"
                     )
 
         finally:
