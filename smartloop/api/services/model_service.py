@@ -3092,6 +3092,8 @@ class ModelService:
         project_id: str | None = None,
         server_info: dict | None = None,
         description: str | None = None,
+        tags: list[str] | None = None,
+        catalog_slug: str | None = None,
         pkg: str | None = None,
     ) -> dict:
         """Register a remote MCP server to a project (by ID or current)."""
@@ -3124,6 +3126,8 @@ class ModelService:
             name=name,
             pkg=pkg,
             description=description,
+            tags=list(tags or []),
+            catalog_slug=catalog_slug,
             server_type=MCPServerType.REMOTE,
             remote_config=RemoteMCPServerConfig(
                 server_url=server_url,
@@ -3203,6 +3207,8 @@ class ModelService:
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         description: str | None = None,
+        tags: list[str] | None = None,
+        catalog_slug: str | None = None,
         project_id: str | None = None,
     ) -> dict:
         """Register a local (stdio) MCP server to a project (by ID or current).
@@ -3276,6 +3282,8 @@ class ModelService:
             name=name,
             pkg=name,
             description=description,
+            tags=list(tags or []),
+            catalog_slug=catalog_slug,
             config=MCPServerConfig(command=command, args=args, env=resolved_env, cwd=resolved_cwd),
         )
 
@@ -3473,12 +3481,27 @@ class ModelService:
         (server_selector.py builds a "Server summaries" section from it — without
         it the router only has bare tool names to match). Best-effort — never
         raises, so a failure (or no loaded model) leaves the connection as-is.
-        Runs only when tools were discovered and something is actually missing.
+
+        This exists for the hand-added case (``uvx``/``npx`` packages that ship
+        no description and are not in our catalog). Servers installed from the
+        curated catalog arrive with ``description`` and ``tags`` already set, so
+        they skip the LLM entirely — generating metadata for them would burn two
+        inference calls (and possibly a model load) to overwrite curated copy.
         """
         try:
             if not server.tools:
                 return
-            if server.description and server.tags and server.summary:
+            # Curated server — nothing to generate. Two signals: a resolved
+            # catalog_slug is provenance the backend established itself, and is
+            # authoritative even if the entry left a field blank; description +
+            # tags both present means there is simply nothing left to write, so
+            # a third party curating their own metadata isn't billed for an LLM
+            # call either. The catalog has no summary field, so reuse the
+            # description as the selector's capability text rather than paying
+            # to generate one.
+            if server.catalog_slug or (server.description and server.tags):
+                if not server.summary:
+                    server.summary = server.description
                 return
             if self._llm is None:
                 self.load_model()
@@ -3606,6 +3629,7 @@ class ModelService:
             "description": s.description,
             "summary": s.summary,
             "tags": s.tags,
+            "catalog_slug": s.catalog_slug,
             "server_type": s.server_type.value,
             "enabled": s.enabled,
             "system": s.system,

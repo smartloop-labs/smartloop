@@ -1,12 +1,13 @@
-"""Tests for the /v1/mcp-catalog API router."""
+"""Tests for the /v1/mcp-catalog API router.
 
-from unittest.mock import patch
-
-_LIST_CATALOG = "smartloop.platform.client.SLPPlatformClient.list_mcp_catalog"
+The router reads through ``PlatformService``, so the catalog stays available
+when the platform API is down. These drive the shared ``platform_service``
+dependency override rather than the raw client.
+"""
 
 
 class TestListMCPCatalog:
-    def test_returns_catalog_list(self, client):
+    def test_returns_catalog_list(self, client, platform_service):
         mock_data = [
             {
                 "slug": "linear",
@@ -41,8 +42,8 @@ class TestListMCPCatalog:
                 "catalog_version": 1,
             },
         ]
-        with patch(_LIST_CATALOG, return_value=mock_data):
-            resp = client.get("/v1/mcp-catalog")
+        platform_service.list_mcp_catalog.return_value = mock_data
+        resp = client.get("/v1/mcp-catalog")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -55,7 +56,7 @@ class TestListMCPCatalog:
         assert data[1]["hosted_by"] == "local"
         assert data[1]["local_config"]["command"] == "uvx"
 
-    def test_derives_server_type_when_platform_omits_it(self, client):
+    def test_derives_server_type_when_platform_omits_it(self, client, platform_service):
         """The platform catalog does not send server_type; the router derives it
         from hosted_by / config presence rather than 500-ing on validation."""
         mock_data = [
@@ -79,31 +80,31 @@ class TestListMCPCatalog:
                 "catalog_version": 1,
             },
         ]
-        with patch(_LIST_CATALOG, return_value=mock_data):
-            resp = client.get("/v1/mcp-catalog")
+        platform_service.list_mcp_catalog.return_value = mock_data
+        resp = client.get("/v1/mcp-catalog")
 
         assert resp.status_code == 200
         data = resp.json()
         assert data[0]["server_type"] == "remote"
         assert data[1]["server_type"] == "local"
 
-    def test_returns_empty_list(self, client):
-        with patch(_LIST_CATALOG, return_value=[]):
-            resp = client.get("/v1/mcp-catalog")
+    def test_returns_empty_list(self, client, platform_service):
+        platform_service.list_mcp_catalog.return_value = []
+        resp = client.get("/v1/mcp-catalog")
 
         assert resp.status_code == 200
         assert resp.json() == []
 
-    def test_502_when_platform_unavailable(self, client):
-        with patch(_LIST_CATALOG, side_effect=ConnectionError("Connection refused")):
-            resp = client.get("/v1/mcp-catalog")
+    def test_502_when_platform_unavailable(self, client, platform_service):
+        platform_service.list_mcp_catalog.side_effect = ConnectionError("Connection refused")
+        resp = client.get("/v1/mcp-catalog")
 
         assert resp.status_code == 502
         assert resp.json()["detail"] == "Platform API unavailable"
 
-    def test_401_when_unauthorized(self, client):
-        with patch(_LIST_CATALOG, side_effect=PermissionError("Authentication failed.")):
-            resp = client.get("/v1/mcp-catalog")
+    def test_401_when_unauthorized(self, client, platform_service):
+        platform_service.list_mcp_catalog.side_effect = PermissionError("Authentication failed.")
+        resp = client.get("/v1/mcp-catalog")
 
         assert resp.status_code == 401
         assert "Authentication failed" in resp.json()["detail"]

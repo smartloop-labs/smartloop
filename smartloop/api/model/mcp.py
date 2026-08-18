@@ -20,6 +20,8 @@ class MCPServerResponse(BaseModel):
     cwd: Optional[str] = None
     server_type: str = "local"
     server_url: Optional[str] = None
+    # Slug of the curated catalog entry this server came from, when it did.
+    catalog_slug: Optional[str] = None
     enabled: bool = True
     system: bool = False
     tools: List[MCPToolResponse] = []
@@ -49,6 +51,11 @@ class MCPRegisterRequest(BaseModel):
     token: Optional[str] = None
     callback_url: Optional[str] = None
     return_url: Optional[str] = None   # URL to redirect to after successful registration
+    # Install a curated catalog entry: the backend resolves the slug and takes
+    # server_url, description and tags from the catalog rather than the caller,
+    # so curated metadata cannot drift or be spoofed. server_url above is kept
+    # as the fallback for when resolution misses.
+    catalog_slug: Optional[str] = None
 
 
 class MCPRegisterResponse(BaseModel):

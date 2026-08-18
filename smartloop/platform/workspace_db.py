@@ -1,6 +1,7 @@
 """Workspace-level SQLite persistence for cached cloud data.
 
-Stores user profile and model catalog locally so the API can serve
+Stores user profile, model catalog and the curated MCP catalog locally
+so the API can serve
 responses when the cloud platform is unreachable.  Lives at
 ``~/.smartloop/workspace.db``.
 """
@@ -41,6 +42,12 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     is_accessible INTEGER NOT NULL DEFAULT 0,
     sha256        TEXT,
     fetched_at    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mcp_catalog (
+    slug       TEXT PRIMARY KEY,
+    entry      TEXT NOT NULL,   -- JSON of the MCPCatalogEntry
+    fetched_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS release_cache (
@@ -176,6 +183,44 @@ class WorkspaceDB:
         with self._lock:
             row = self._conn.execute(
                 "SELECT MIN(fetched_at) AS ts FROM model_catalog"
+            ).fetchone()
+        return row["ts"] if row and row["ts"] is not None else None
+
+    # ------------------------------------------------------------------
+    # MCP catalog
+    # ------------------------------------------------------------------
+
+    def list_mcp_catalog(self) -> list[dict]:
+        """Return the cached curated MCP catalog, ordered as the cloud sent it."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT entry FROM mcp_catalog ORDER BY rowid"
+            ).fetchall()
+        return [json.loads(r["entry"]) for r in rows]
+
+    def save_mcp_catalog(self, entries: list[dict]) -> None:
+        """Replace the whole cached catalog from a cloud API response.
+
+        Entries are stored as JSON blobs rather than columns: they nest
+        ``remote_config`` / ``local_config`` and carry a ``tags`` list, none of
+        which flatten usefully, and we only ever read them back whole.
+        """
+        now = time.time()
+        with self._lock:
+            self._conn.execute("DELETE FROM mcp_catalog")
+            self._conn.executemany(
+                """INSERT INTO mcp_catalog (slug, entry, fetched_at)
+                   VALUES (?, ?, ?)
+                """,
+                [(e["slug"], json.dumps(e), now) for e in entries if e.get("slug")],
+            )
+            self._conn.commit()
+
+    def mcp_catalog_fetched_at(self) -> Optional[float]:
+        """Return the timestamp of the last catalog fetch, or ``None``."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(fetched_at) AS ts FROM mcp_catalog"
             ).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
 
