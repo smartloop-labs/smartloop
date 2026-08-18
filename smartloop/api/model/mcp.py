@@ -10,15 +10,6 @@ class MCPToolResponse(BaseModel):
     input_schema: Optional[dict] = None
 
 
-class AddMCPServerRequest(BaseModel):
-    name: Optional[str] = None       # optional display name; derived from args if omitted
-    command: str                     # stdio command, e.g. "uvx", "npx" (must be on PATH)
-    args: Optional[List[str]] = []
-    description: Optional[str] = None
-    env: Dict[str, str] = {}
-    cwd: Optional[str] = None
-
-
 class MCPServerResponse(BaseModel):
     id: str
     name: str
@@ -43,22 +34,6 @@ class DeleteMCPServerResponse(BaseModel):
     id: str
     deleted: bool
     message: str
-
-
-class AddRemoteMCPServerRequest(BaseModel):
-    name: Optional[str] = None
-    server_url: str
-    auth_type: str = "none"
-    tools: List[Dict] = []
-    token: Optional[str] = None
-    token_endpoint: Optional[str] = None
-    authorization_endpoint: Optional[str] = None
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    expires_at: Optional[float] = None
-    token_type: str = "Bearer"
 
 
 class MCPRegisterRequest(BaseModel):
@@ -93,22 +68,6 @@ class MCPRegisterResponse(BaseModel):
     token_endpoint: Optional[str] = None
     authorization_endpoint: Optional[str] = None
     server_url: Optional[str] = None
-
-
-class MCPOAuthInitiateRequest(BaseModel):
-    server_url: str
-    callback_url: Optional[str] = None
-
-
-class MCPOAuthInitiateResponse(BaseModel):
-    auth_url: str
-    server_url: str
-    state: str
-    code_verifier: str
-    client_id: str
-    client_secret: Optional[str] = None
-    token_endpoint: str
-    authorization_endpoint: str
 
 
 class MCPOAuthCallbackRequest(BaseModel):

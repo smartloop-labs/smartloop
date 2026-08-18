@@ -34,8 +34,6 @@ from .project import (
 )
 
 from .mcp import (
-    AddMCPServerRequest,
-    AddRemoteMCPServerRequest,
     MCPServerResponse,
     MCPServerListResponse,
     DeleteMCPServerResponse,
@@ -44,8 +42,6 @@ from .mcp import (
     MCPToolResponse,
     MCPRegisterRequest,
     MCPRegisterResponse,
-    MCPOAuthInitiateRequest,
-    MCPOAuthInitiateResponse,
     MCPOAuthCallbackRequest,
 )
 
@@ -75,16 +71,12 @@ __all__ = [
     "ProjectResponse",
     "ProjectListResponse",
     "DeleteProjectResponse",
-    "AddMCPServerRequest",
-    "AddRemoteMCPServerRequest",
     "MCPServerResponse",
     "MCPServerListResponse",
     "DeleteMCPServerResponse",
     "MCPToolCallRequest",
     "MCPToolCallResponse",
     "MCPToolResponse",
-    "MCPOAuthInitiateRequest",
-    "MCPOAuthInitiateResponse",
     "MCPRegisterRequest",
     "MCPRegisterResponse",
     "MCPOAuthCallbackRequest",
