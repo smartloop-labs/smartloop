@@ -264,6 +264,7 @@ async def health_check():
     get_api_client().flush_token_usage()
 
     model_service = get_model_service()
+    workspace = Workspace.get_instance()
     result = {
         "status": "healthy",
         "cwd": workspace.workspace_dir if workspace else os.getcwd(),
