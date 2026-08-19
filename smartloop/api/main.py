@@ -264,11 +264,9 @@ async def health_check():
     get_api_client().flush_token_usage()
 
     model_service = get_model_service()
-    workspace = Workspace.get_instance()
-    current_project = workspace.current_project if workspace else None
     result = {
         "status": "healthy",
-        "cwd": current_project.project_dir if current_project else os.getcwd(),
+        "cwd": workspace.workspace_dir if workspace else os.getcwd(),
         "model_loaded": model_service.is_loaded(),
         "model_name": model_service._model_name,
     }
