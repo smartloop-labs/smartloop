@@ -1013,6 +1013,10 @@ class SLPOrchestrator:
             # instead of anchoring the whole answer on a single source.
             parts: List[str] = []
             surviving_names: List[str] = []  # docs that actually contributed
+            # name -> the extract fed to the model for that document.  Carried
+            # on the citation so the router can check the finished answer
+            # actually drew on it before crediting the source.
+            extract_by_name: Dict[str, str] = {}
             for node_id in batch_node_ids:
                 dep_result = deps.get(node_id)
                 if dep_result and dep_result.success and isinstance(dep_result.data, dict):
@@ -1020,6 +1024,8 @@ class SLPOrchestrator:
                     if content:
                         names = [n for n in dep_result.data.get("doc_names", []) if n]
                         surviving_names.extend(names)
+                        for n in names:
+                            extract_by_name[n] = content
                         header = ", ".join(names) if names else "Unknown source"
                         parts.append(f"=== Source: {header} ===\n{content}")
 
@@ -1046,9 +1052,14 @@ class SLPOrchestrator:
                     name = c.get("document_name")
                     if name and name not in by_name:
                         by_name[name] = c
-                search_ctx.citations = [
-                    by_name.get(name, {"document_name": name}) for name in ordered
-                ]
+                search_ctx.citations = []
+                for name in ordered:
+                    citation = dict(by_name.get(name, {"document_name": name}))
+                    extract = extract_by_name.get(name)
+                    if extract:
+                        # Private, stripped before the citation reaches a client.
+                        citation["_extract"] = extract
+                    search_ctx.citations.append(citation)
 
             logger.info(
                 f"[doc-reduce] merged {len(parts)} batch extract(s) → {len(merged)} chars; "
@@ -2033,6 +2044,7 @@ Is this context relevant to the user's request?
             ready_context = self._format_ready_context(
                 tool_context, skill_instruction, None,
                 ctx.effective_cwd, has_tool_results=True,
+                current_date=self._current_date,
             )
             logger.info(f"[collect] synthesized document: {len(tool_context)} chars")
             return MCPExecutionResult(
@@ -2157,6 +2169,7 @@ Is this context relevant to the user's request?
         ready_context = self._format_ready_context(
             combined, skill_instruction, doc_citations,
             ctx.effective_cwd, has_tool_results=has_tool_results,
+            current_date=self._current_date,
         )
 
         if web_citations:
@@ -2202,6 +2215,7 @@ Is this context relevant to the user's request?
         citations: Optional[List[Dict[str, Any]]],
         cwd: Optional[str],
         has_tool_results: bool = False,
+        current_date: Optional[str] = None,
     ) -> str:
         parts: List[str] = []
         if skill_instruction:
@@ -2218,6 +2232,13 @@ Is this context relevant to the user's request?
                 "only — never as real data:\n"
                 + skill_instruction
             )
+            # Skills routinely key off "today" (a day-specific routine, an
+            # agenda, an age calculation).  The caller's prompt carries the
+            # date too, but a long skill body pushes it far from the point of
+            # use, so restate it here — immediately after the instructions the
+            # model is about to carry out.
+            if current_date:
+                parts.append(f"[Current date: {current_date}]")
         # Tool results and document citations are mutually exclusive contexts.
         # Tool results come from live MCP calls — no citation attribution.
         # Document context comes from indexed documents — cite sources.
@@ -2806,12 +2827,11 @@ Is this context relevant to the user's request?
             raw = "\n\n".join(parts) if parts else directive
 
             if llm is not None and step.capability:
-                from smartloop.constants import SYSTEM_PROMPT
-                from datetime import date as _date
+                from smartloop.constants import SYSTEM_PROMPT, resolve_current_date
                 # The date is runtime grounding the model wasn't trained on, so
                 # it rides with the user turn (next to the request) instead of
                 # the system prompt where a small model is unlikely to use it.
-                date_str = self._current_date or _date.today().strftime("%B %d, %Y")
+                date_str = self._current_date or resolve_current_date()
                 # Include the session's prior turns so a follow-up like
                 # "the top place from that list" can reference the assistant's
                 # earlier reply instead of claiming nothing was provided.

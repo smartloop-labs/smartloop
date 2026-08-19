@@ -8,7 +8,7 @@ Runs a single background thread that blocks on an internal queue.  When a
 document is uploaded, its ID is pushed onto the queue and the loop wakes
 immediately to process it.
 
-Documents always stay in ~/smartloop/<project-name>/documents/ (the user-visible
+Documents always stay in <project_dir>/documents/ (the ingest
 folder).  Conversion to markdown happens in-memory; doc.path is never updated
 to an internal sources/ path.
 
@@ -197,7 +197,7 @@ class IndexerTask(BaseTask):
     def _process_single_document(self, doc: Document, project) -> None:
         """Convert and index a document.
 
-        doc.path always points to the original file in the user-visible
+        doc.path always points to the original file in the project's
         ~/smartloop/<project-name>/documents/ folder and is never changed.
         Conversion to markdown is done in-memory so no intermediate file
         is written and the original is never moved.
@@ -397,8 +397,7 @@ class IndexerTask(BaseTask):
         if not project:
             return
 
-        base = normalize_path(project.visible_dir)
-        inbox_dir = Path(base) / "documents"
+        inbox_dir = Path(normalize_path(project.documents_dir))
         if not inbox_dir.is_dir():
             return
 
@@ -511,7 +510,7 @@ class IndexerTask(BaseTask):
         """Incrementally index the project's working-directory files.
 
         Mirrors ``_scan_documents`` but targets the code/workspace files in
-        the project's visible directory, indexing them into the dedicated
+        the project's own directory, indexing them into the dedicated
         ``workspace_files`` collection.  Indexing here keeps it off the
         request path — ``ModelService.search_workspace`` only queries the
         store.  The underlying :class:`WorkspaceIndexer` is hash-incremental,
@@ -522,7 +521,11 @@ class IndexerTask(BaseTask):
         if not project:
             return
 
-        work_dir = project.visible_dir
+        # Everything the framework knows about lives under project_dir, so
+        # that is what gets scanned.  A client-supplied path is never used to
+        # locate content: it may be unreadable (sandbox) or absent on a copied
+        # install, which would silently empty the index.
+        work_dir = project.project_dir
         if not work_dir or not os.path.isdir(work_dir):
             return
 

@@ -29,9 +29,9 @@ from smartloop.workspace.workspace import (
 def workspace_env(tmp_path):
     """Set up isolated workspace directories and seed a config.json."""
     home_dir = tmp_path / "dot_smartloop"
-    visible_dir = tmp_path / "smartloop"  # simulates ~/smartloop
+    work_dir = tmp_path / "usercode"  # the user's own folder (no framework state)
     home_dir.mkdir()
-    visible_dir.mkdir()
+    work_dir.mkdir()
 
     workspace_id = str(uuid4())
     workspace_dir = home_dir / workspace_id
@@ -46,9 +46,10 @@ def workspace_env(tmp_path):
     (project_dir / "docs").mkdir()
     (project_dir / "docs" / "readme.txt").write_text("hello world")
 
-    # Put a skill file in the visible dir
+    # Skills live under project_dir, keyed by project id — not by name and
+    # not under any client-supplied path.
     project_name = "my-test-project"
-    skill_dir = visible_dir / project_name / "skills" / "greet"
+    skill_dir = project_dir / "skills" / "greet"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\nname: greet\n---\nSay hello")
 
@@ -114,7 +115,7 @@ def workspace_env(tmp_path):
 
     return {
         "home_dir": str(home_dir),
-        "visible_dir": str(visible_dir),
+        "work_dir": str(work_dir),
         "workspace": workspace,
         "project": project,
         "session_id": session_id,
@@ -123,7 +124,7 @@ def workspace_env(tmp_path):
 
 
 def _patch_settings(env):
-    """Return a stack of patches for home_dir and visible dir."""
+    """Return a stack of patches pointing the framework at the temp home."""
     settings = AppSettings()
     settings.slp_home = env["home_dir"]
 
@@ -133,17 +134,13 @@ def _patch_settings(env):
         patch("smartloop.api.services.project_io._settings", settings),
         patch("smartloop.workspace.workspace._settings", settings),
         patch.object(Workspace, "config_file", env["config_file"]),
-        patch(
-            "smartloop.api.services.project_io._visible_project_dir",
-            lambda name: os.path.join(env["visible_dir"], name),
-        ),
     ]
     return patches
 
 
 class TestExportProject:
     def test_export_creates_valid_zip(self, workspace_env):
-        """Export produces a zip with manifest.json, workspace/, project/, and conversations/."""
+        """Export produces a zip with manifest.json, workspace/, and conversations/."""
         from smartloop.api.services.project_io import export_project
 
         env = workspace_env
@@ -167,9 +164,9 @@ class TestExportProject:
                 assert any(n.startswith("workspace/") for n in names)
                 assert "workspace/docs/readme.txt" in names
 
-                # project (visible) files present
-                assert any(n.startswith("project/") for n in names)
-                assert "project/skills/greet/SKILL.md" in names
+                # Skills ride inside the state tree, not a separate one.
+                assert "workspace/skills/greet/SKILL.md" in names
+                assert not any(n.startswith("project/") for n in names)
 
                 # conversation history present
                 conv_name = f"conversations/{env['session_id']}.jsonl"
@@ -234,7 +231,8 @@ class TestImportProject:
             # New ID generated
             assert result["id"] != env["project"].id
             assert result["name"] == "my-test-project"
-            assert result["cwd"].endswith("my-test-project_1")
+            # cwd is machine-local, so an imported project starts without one.
+            assert result["cwd"] == ""
             assert result["description"] == "A test project"
             assert result["current"] is True
 
@@ -252,10 +250,9 @@ class TestImportProject:
             )
             assert os.path.isfile(os.path.join(new_project_dir, "docs", "readme.txt"))
 
-            # Visible dir files copied (uses resolved cwd)
-            visible = result["cwd"]
+            # Skills landed in the new project's state dir.
             assert os.path.isfile(
-                os.path.join(visible, "skills", "greet", "SKILL.md")
+                os.path.join(new_project_dir, "skills", "greet", "SKILL.md")
             )
 
             # Conversation history restored
@@ -276,7 +273,7 @@ class TestImportProject:
                 p.stop()
 
     def test_import_with_rename(self, workspace_env):
-        """Import with a name override renames the project and visible dir."""
+        """Import with a name override renames the project."""
         from smartloop.api.services.project_io import export_project, import_project
 
         env = workspace_env
@@ -291,14 +288,14 @@ class TestImportProject:
 
             assert result["name"] == "renamed-project"
 
-            # Visible dir uses the new name
-            visible = os.path.join(env["visible_dir"], "renamed-project")
-            assert os.path.isfile(
-                os.path.join(visible, "skills", "greet", "SKILL.md")
+            # Renaming changes the label only — state stays keyed by project id.
+            new_project_dir = os.path.join(
+                env["workspace"].workspace_dir, result["id"]
             )
-
-            # Old visible dir should NOT have new files from this import
-            # (original still exists from the fixture setup, but nothing new added)
+            assert os.path.isfile(
+                os.path.join(new_project_dir, "skills", "greet", "SKILL.md")
+            )
+            assert result["skills"][0]["name"] == "greet"
 
             os.unlink(zip_path)
         finally:
@@ -365,7 +362,9 @@ class TestExportImportRoundTrip:
 
             assert result["id"] != original.id
             assert result["name"] == original.name
-            assert result["cwd"].endswith(f"{original.name}_1")
+            # cwd does not survive a round trip — it is a machine-local
+            # working folder, not project state.
+            assert result["cwd"] == ""
             assert result["description"] == original.description
             assert len(result["skills"]) == len(original.skills)
             assert len(result["documents"]) == len(original.documents)
@@ -375,6 +374,53 @@ class TestExportImportRoundTrip:
                 assert doc["status"] == "indexed"
 
             os.unlink(zip_path)
+        finally:
+            for p in patches:
+                p.stop()
+
+
+class TestLegacyArchiveImport:
+    """Archives from builds that stored skills in the user-space folder.
+
+    Those zips carry a separate ``project/`` tree alongside ``workspace/``.
+    Export no longer writes one, but import must still fold it into the new
+    state directory or every previously-exported project loses its skills.
+    """
+
+    def test_legacy_project_tree_is_folded_into_state_dir(self, workspace_env):
+        from smartloop.api.services.project_io import export_project, import_project
+
+        env = workspace_env
+        patches = _patch_settings(env)
+        for p in patches:
+            p.start()
+
+        try:
+            zip_path = export_project(env["project"].id)
+
+            # Rewrite the archive into the old shape: skills under project/.
+            legacy = zip_path.with_name("legacy.zip")
+            with zipfile.ZipFile(zip_path) as src, zipfile.ZipFile(legacy, "w") as dst:
+                for item in src.namelist():
+                    data = src.read(item)
+                    if item == "workspace/skills/greet/SKILL.md":
+                        dst.writestr("project/skills/greet/SKILL.md", data)
+                    else:
+                        dst.writestr(item, data)
+
+            result = import_project(legacy)
+
+            assert len(result["skills"]) == 1
+            assert result["skills"][0]["name"] == "greet"
+            new_project_dir = os.path.join(
+                env["workspace"].workspace_dir, result["id"]
+            )
+            assert os.path.isfile(
+                os.path.join(new_project_dir, "skills", "greet", "SKILL.md")
+            )
+
+            os.unlink(zip_path)
+            os.unlink(legacy)
         finally:
             for p in patches:
                 p.stop()

@@ -59,7 +59,7 @@ endif
 # by CI (actions/cache); when wheelhouse/ is absent or has no matching wheel it
 # is a no-op and pip builds from the PyPI sdist with LLAMA_CMAKE_ARGS.
 JOBS := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
-LLAMA_INSTALL_CMD = CMAKE_ARGS="$(LLAMA_CMAKE_ARGS)" CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --find-links wheelhouse --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
+LLAMA_INSTALL_CMD = CMAKE_ARGS="$(LLAMA_CMAKE_ARGS)" CXXFLAGS="-I$(HOME)/.local/include" CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) $(PIP) install llama-cpp-python==$(LLAMA_VERSION) --find-links wheelhouse --index-url=https://pypi.org/simple --force-reinstall --no-cache-dir
 
 # --- macOS: force the OpenBLAS SciPy wheel, not the Accelerate one ------------
 # App Store review rejects any binary that references the deprecated Accelerate

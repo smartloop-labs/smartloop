@@ -216,17 +216,12 @@ class GenericModel(SLPModel):
             self.logger.error("[error] No current project found.")
             return []
 
-        # Like skills (cwd/skills/), documents go in cwd/documents/.
-        # Use the request cwd first, then the project's stored cwd, then
-        # the default ~/smartloop/<project>/documents/ fallback.
-        effective_cwd = cwd or current_project.cwd
-        if effective_cwd:
-            dest_dir = Path(effective_cwd) / "documents"
-            if not current_project.cwd:
-                current_project.cwd = effective_cwd
-                self.workspace.save()
-        else:
-            dest_dir = Path(current_project.visible_dir) / "documents"
+        # Documents are project state, so they always land under project_dir —
+        # never under a caller-supplied cwd.  ``cwd`` is the user's own folder
+        # for file/bash tools; writing ingested copies there put project state
+        # outside the framework's home, where it could not follow SLP_HOME or
+        # the macOS App Sandbox container.
+        dest_dir = Path(current_project.documents_dir)
 
         documents: list[Document] = []
 

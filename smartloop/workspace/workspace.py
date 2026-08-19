@@ -219,22 +219,41 @@ class Project (BaseModel):
     web_search_enabled: bool = True
 
     @property
-    def visible_dir(self) -> str:
-        """Return the user-visible project directory.
+    def skills_dir(self) -> str:
+        """Where this project's SKILL.md files live.
 
-        Uses ``cwd`` (always set on new projects).  Falls back to
-        ``~/smartloop/<name>`` for legacy projects created before
-        ``cwd`` was persisted unconditionally.
+        Anchored to ``project_dir`` — i.e. under the framework's own home —
+        never to a client-supplied path.  ``project_dir`` derives from
+        ``AppSettings.home_dir``, so it follows ``SLP_HOME`` and, under the
+        macOS App Sandbox, moves into the app container automatically.  A
+        client-supplied absolute path would not: it would keep pointing at the
+        real home the sandbox denies, leaving the app reading one workspace
+        and writing another.
         """
-        if self.cwd:
-            return os.path.expanduser(self.cwd)
-        return os.path.expanduser(
-            os.path.join("~/smartloop", self.name or self.id)
-        )
+        return os.path.join(self.project_dir, "skills")
+
+    @property
+    def documents_dir(self) -> str:
+        """Where this project's ingested documents live (see :meth:`skills_dir`)."""
+        return os.path.join(self.project_dir, "documents")
+
+    @property
+    def work_dir(self) -> Optional[str]:
+        """The client-supplied folder this project was opened on, or None.
+
+        Reported back on the API for reference only — **nothing is located
+        through it**.  Skills, documents, MCP docs and the workspace index all
+        hang off ``project_dir`` so the framework stays self-contained: copy
+        ``<home_dir>`` to another machine, user, or sandbox container and it
+        runs as-is.  Locating anything through a client path would break that,
+        since the path may be unreadable under the App Sandbox or simply
+        absent on the copy.
+        """
+        return os.path.expanduser(self.cwd) if self.cwd else None
 
     def get_skills(self) -> List["Skill"]:
         """Read skills from disk (SKILL.md files), the single source of truth."""
-        skills_dir = os.path.join(self.visible_dir, "skills")
+        skills_dir = self.skills_dir
         if not os.path.isdir(skills_dir):
             return []
         result: List[Skill] = []
@@ -264,11 +283,6 @@ class Project (BaseModel):
                 content=raw,
             ))
         return result
-
-    @property
-    def folder_name(self) -> str:
-        """Basename of the visible directory on disk."""
-        return os.path.basename(self.visible_dir)
 
     def model_build_dir(self) -> str:
         """Per-project directory where the built GGUF is written."""
@@ -515,6 +529,7 @@ class Workspace(BaseModel):
                 # Re-resolve paths against current base_dir
                 workspace.workspace_dir = os.path.join(_settings.home_dir, workspace.id)
                 workspace.models_dir = os.path.join(workspace.workspace_dir, "models")
+                cls._rebase_paths(workspace)
 
                 # Merge config into the requested WorkspaceModel (without changing active)
                 ws_model = workspace.get_model(config.model_name)
@@ -534,6 +549,45 @@ class Workspace(BaseModel):
                 logging.getLogger(__name__).warning(f"Workspace.init: failed to load config.json, creating new workspace: {e}")
                 cls._instance = cls._create_new_workspace(config)
                 return cls._instance
+    @staticmethod
+    def _rebase_paths(workspace: 'Workspace') -> None:
+        """Re-anchor every persisted absolute path onto the current home.
+
+        The framework must be self-contained: copy ``<home_dir>`` somewhere
+        else — another machine, another user, a macOS App Sandbox container —
+        and it has to run as-is.  ``config.json`` stores absolute paths that
+        were correct when written, so nothing persisted may be trusted as a
+        location; it is all re-derived from ``AppSettings.home_dir`` here.
+
+        Covers the paths that would otherwise dangle:
+
+        * ``project_dir`` — ``<workspace_dir>/<project_id>`` by construction,
+          so re-deriving it can never relocate a normally-created project;
+        * ``document.path`` — repointed at the project's own ``documents/``
+          folder whenever the file is actually there, since documents are
+          project state and travel with it.
+
+        ``project.cwd`` is deliberately left alone: it is the user's own
+        folder, not framework state, and a stale one is simply unusable rather
+        than wrong.  MCP server commands need no fixing — built-in servers are
+        always relaunched under the current interpreter (see
+        ``LocalMCPClient._resolve_command``).
+        """
+        for project in workspace.projects or []:
+            if project.id:
+                project.project_dir = os.path.join(workspace.workspace_dir, project.id)
+            docs_dir = project.documents_dir
+            for doc in project.documents or []:
+                if not doc.path:
+                    continue
+                # The framework's own copy always wins, even when the stored
+                # path still resolves.  After a migration both exist, and
+                # leaving the pointer on the old user-space copy would keep the
+                # install dependent on a directory outside <home_dir>.
+                candidate = os.path.join(docs_dir, doc.name or os.path.basename(doc.path))
+                if os.path.isfile(candidate):
+                    doc.path = candidate
+
     @classmethod
     def load(cls) -> Optional['Workspace']:
         """Load the workspace directly from config.json on disk.
@@ -565,6 +619,7 @@ class Workspace(BaseModel):
             # Re-resolve paths against home_dir
             workspace.workspace_dir = os.path.join(_settings.home_dir, workspace.id)
             workspace.models_dir = os.path.join(workspace.workspace_dir, "models")
+            cls._rebase_paths(workspace)
 
             return workspace
         except (json.JSONDecodeError, ValueError):

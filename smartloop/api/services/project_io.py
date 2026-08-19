@@ -22,32 +22,6 @@ logger = logging.getLogger(__name__)
 _settings = AppSettings()
 
 
-def _visible_project_dir(project_name: str) -> str:
-    """Return ``~/smartloop/<project_name>``."""
-    return os.path.expanduser(os.path.join("~/smartloop", project_name))
-
-
-def resolve_visible_dir(project_name: str) -> tuple[str, bool]:
-    """Return a unique visible directory path for *project_name*.
-
-    If ``~/smartloop/<name>`` already exists (leftover from a deleted or
-    different project), appends ``_1``, ``_2``, … until a free path is found.
-
-    Returns ``(path, was_incremented)`` — the caller should persist ``path``
-    as ``project.cwd`` when *was_incremented* is ``True``.
-    """
-    visible = _visible_project_dir(project_name)
-    if not os.path.exists(visible):
-        return visible, False
-    base = visible
-    counter = 1
-    while os.path.exists(visible):
-        visible = f"{base}_{counter}"
-        counter += 1
-    logger.info(f"[resolve_visible_dir] Conflict, using {visible}")
-    return visible, True
-
-
 def _conversations_dir() -> str:
     """Return ``<home_dir>/conversations/``."""
     return os.path.join(_settings.home_dir, "conversations")
@@ -165,15 +139,13 @@ def export_project(project_id: str) -> Path:
         with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("manifest.json", json.dumps(manifest, indent=2))
 
-            # Internal workspace directory
+            # The project's state directory — skills/, documents/, db/ and
+            # the manifest all live here now, so this single tree is the whole
+            # payload.  Archives from older builds additionally carried a
+            # "project" tree (the old ~/smartloop/<name> folder); import still
+            # reads that, but export no longer writes it.
             if project.project_dir and os.path.isdir(project.project_dir):
                 _add_directory_to_zip(zf, project.project_dir, "workspace")
-
-            # Visible project directory (~/smartloop/<name>/)
-            if project.name:
-                visible = _visible_project_dir(project.name)
-                if os.path.isdir(visible):
-                    _add_directory_to_zip(zf, visible, "project")
 
             # Conversation history JSONL files
             conv_dir = _conversations_dir()
@@ -197,7 +169,7 @@ def import_project(zip_path: Path, name: Optional[str] = None) -> dict:
     Args:
         zip_path: Path to the zip file.
         name: Optional new name for the imported project.  When provided the
-              visible directory will use this name instead of the original.
+              imported project is renamed to this instead of the original.
 
     Returns a dict with the new project metadata.
     """
@@ -239,19 +211,21 @@ def import_project(zip_path: Path, name: Optional[str] = None) -> dict:
         # Resolve project name (caller override or original)
         project_name = name or project_data.get("name")
 
-        # Resolve visible directory — pick a unique name when a folder
-        # with the same name already exists on disk.  Always persist
-        # the resolved path so folder lookups never depend on the name.
-        visible_cwd = None
-        if project_name:
-            visible, _ = resolve_visible_dir(project_name)
-            visible_cwd = visible
-
-            # Copy project/ contents → visible dir (if the zip has them)
-            src_project = os.path.join(tmp_dir, "project")
-            if os.path.isdir(src_project):
-                os.makedirs(visible, exist_ok=True)
-                shutil.copytree(src_project, visible, dirs_exist_ok=True)
+        # Archives written by older builds carry the project's skills and
+        # documents in a separate "project" tree (the old ~/smartloop/<name>
+        # folder).  Fold those into the new state directory so a legacy export
+        # imports into the current layout.  Newer archives have them under
+        # "workspace" already, copied above.
+        src_legacy = os.path.join(tmp_dir, "project")
+        if os.path.isdir(src_legacy):
+            for sub in ("skills", "documents"):
+                src_sub = os.path.join(src_legacy, sub)
+                if os.path.isdir(src_sub):
+                    shutil.copytree(
+                        src_sub, os.path.join(new_project_dir, sub),
+                        dirs_exist_ok=True,
+                    )
+            logger.info("[import] Migrated legacy 'project' tree into %s", new_project_dir)
 
         # Copy conversation history JSONL files
         src_conversations = os.path.join(tmp_dir, "conversations")
@@ -277,9 +251,9 @@ def import_project(zip_path: Path, name: Optional[str] = None) -> dict:
             for d in project_data.get("documents", [])
         ]
 
-        # Read skills from the extracted skills directory (authoritative source)
-        imported_skills_dir = os.path.join(tmp_dir, "project", "skills")
-        skills = _read_skills_from_dir(imported_skills_dir)
+        # Read skills from the state directory we just assembled — it holds
+        # both the modern "workspace" payload and any folded-in legacy tree.
+        skills = _read_skills_from_dir(os.path.join(new_project_dir, "skills"))
 
         mcp_servers = [MCPServer(**m) for m in project_data.get("mcp_servers", [])]
 
@@ -294,7 +268,10 @@ def import_project(zip_path: Path, name: Optional[str] = None) -> dict:
             project_dir=new_project_dir,
             current=True,
             name=project_name,
-            cwd=visible_cwd,
+            # ``cwd`` is a machine-local working folder, not project state —
+            # a path from the exporting machine is meaningless here, so an
+            # imported project starts without one until the user picks it.
+            cwd=None,
             description=project_data.get("description"),
             system=project_data.get("system", False),
             documents=documents,
@@ -314,7 +291,7 @@ def import_project(zip_path: Path, name: Optional[str] = None) -> dict:
         return {
             "id": new_project.id,
             "name": new_project.name,
-            "cwd": new_project.visible_dir,
+            "cwd": new_project.work_dir or "",
             "description": new_project.description,
             "current": new_project.current,
             "system": new_project.system,

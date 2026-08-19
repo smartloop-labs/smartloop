@@ -42,13 +42,24 @@ SYSTEM_PROMPT = (
 )
 
 
+#: Prompt rendering for "now".  The weekday leads: skills routinely key off
+#: the day ("today's workout", "Monday standup"), and without ``%A`` the model
+#: cannot derive it from the date alone, so it hedges by enumerating every day
+#: of the week instead of answering for today.
+CURRENT_DATE_FORMAT = "%A, %B %d, %Y"
+
+
 def resolve_current_date(user_date=None, tz=None):
-    """Render the current date as ``Month DD, YYYY`` for the system prompt.
+    """Render the current date as ``Weekday, Month DD, YYYY`` for the prompt.
 
     Prefers the client's wall clock — ``user_date`` (a Unix timestamp in
     seconds) rendered in its IANA ``tz`` — so date-aware answers match the
     user's calendar rather than the server's.  Falls back to the server date
     when the client values are absent or invalid.
+
+    The weekday is always *derived* from the resolved instant rather than taken
+    from the client as a separate field, so the day and the date can never
+    disagree with each other.
     """
     from datetime import datetime, date, timezone
 
@@ -61,8 +72,8 @@ def resolve_current_date(user_date=None, tz=None):
                     dt = dt.astimezone(ZoneInfo(tz))
                 except Exception:
                     pass
-            return dt.strftime("%B %d, %Y")
+            return dt.strftime(CURRENT_DATE_FORMAT)
         except (ValueError, OSError, OverflowError, TypeError):
             pass
-    return date.today().strftime("%B %d, %Y")
+    return date.today().strftime(CURRENT_DATE_FORMAT)
 

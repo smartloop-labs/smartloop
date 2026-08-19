@@ -24,6 +24,7 @@ from smartloop.api.services import get_model_service, get_api_client
 from smartloop.config import AppSettings
 from smartloop.workspace import Workspace
 from smartloop.utils.log_utils import print_logo
+from smartloop.workspace.migrations import migrate_project_state
 from smartloop.platform.token_agent import run_token_refresh_loop
 from smartloop.platform.release_agent import run_release_poll_loop
 from smartloop import __version__
@@ -142,6 +143,16 @@ async def lifespan(app: FastAPI):
     logger.info(f"Debug mode setting: {api_settings.debug_mode}")
 
     workspace = Workspace.load()
+
+    # Skills/documents moved from the user-space folder into project_dir so
+    # they follow the framework's home (SLP_HOME, or the App Sandbox
+    # container).  Fold in anything left at the old location.  Best-effort:
+    # the old path may be unreadable under the sandbox, which is precisely the
+    # case this migration exists for, so it must never block startup.
+    try:
+        migrate_project_state(workspace)
+    except Exception:
+        logger.exception("Project state migration failed; continuing startup")
 
     if api_settings.debug_mode:
         logger.info("🔧 Debug mode enabled - will load base model with LoRA adapters")

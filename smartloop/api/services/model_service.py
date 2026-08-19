@@ -22,7 +22,6 @@ import markdownify
 
 from langchain_core.outputs import GenerationChunk
 
-from smartloop.api.services.project_io import resolve_visible_dir
 from smartloop.model_factory import ModelFactory
 from smartloop.config import ModelConfig, SUPPORTED_MODELS
 from smartloop.llms.base_llm import BaseLLM
@@ -1594,12 +1593,9 @@ class ModelService:
         return "skill"
 
     @staticmethod
-    def _visible_project_dir(project: "Project") -> str:
-        """Return the visible project directory.
-
-        Delegates to ``Project.visible_dir``.
-        """
-        return normalize_path(project.visible_dir)
+    def _project_documents_dir(project: "Project") -> str:
+        """Return the project's documents directory (under ``project_dir``)."""
+        return normalize_path(project.documents_dir)
 
     @staticmethod
     def _render_skill_content(skill: Skill) -> str:
@@ -1615,16 +1611,15 @@ class ModelService:
     @staticmethod
     def _write_skill_md(project: "Project", skill: Skill) -> None:
         """Write a SKILL.md file with YAML frontmatter for the given skill."""
-        base_dir = ModelService._visible_project_dir(project)
-        skill_dir = os.path.join(base_dir, "skills", skill.name)
+        skill_dir = os.path.join(ModelService._skills_dir(project), skill.name)
         os.makedirs(skill_dir, exist_ok=True)
         skill_path = os.path.join(skill_dir, "SKILL.md")
         Path(skill_path).write_text(ModelService._render_skill_content(skill), encoding="utf-8")
 
     @staticmethod
     def _skills_dir(project: "Project") -> str:
-        """Return the skills directory for a project."""
-        return os.path.join(ModelService._visible_project_dir(project), "skills")
+        """Return the skills directory for a project (under ``project_dir``)."""
+        return normalize_path(project.skills_dir)
 
     @staticmethod
     def _read_skills_from_disk(project: "Project") -> List[Skill]:
@@ -2347,7 +2342,7 @@ class ModelService:
                 p.current = (p.id == project_id)
         new_docs = self._model.add_source(source, progress_callback=progress_callback)
         return {
-            "added": [doc.to_info().model_dump() for doc in (new_docs or [])]
+            "added": [doc.to_info(project.project_dir).model_dump() for doc in (new_docs or [])]
         }
 
     def add_document_async(self, source: str, project_id: str | None = None, cwd: str | None = None, generate_filename: bool = False) -> dict:
@@ -2390,7 +2385,7 @@ class ModelService:
         return {
             "status": "pending",
             "message": f"{len(new_docs)} document(s) queued for processing",
-            "documents": [doc.to_info().model_dump() for doc in new_docs],
+            "documents": [doc.to_info(project.project_dir).model_dump() for doc in new_docs],
         }
 
     def upload_document_to_inbox(self, project_id: str, filename: str, file_bytes: bytes, cwd: str = None) -> dict:
@@ -2401,10 +2396,9 @@ class ModelService:
         Returns immediately with ``status=accepted``.
         """
         project = self._get_project(project_id)
-        if cwd and not project.cwd:
-            project.cwd = cwd
-            self._model.workspace.save()
-        inbox_dir = Path(self._visible_project_dir(project)) / "documents"
+        # ``cwd`` is accepted for API compatibility and ignored: uploads always
+        # land in the project's own documents folder.
+        inbox_dir = Path(self._project_documents_dir(project))
         inbox_dir.mkdir(parents=True, exist_ok=True)
 
         safe_name = Path(filename).name or "upload"
@@ -2440,7 +2434,8 @@ class ModelService:
 
         doc_map = {d.id: d for d in project.documents}
         return [
-            doc_map[did].to_info() if did in doc_map else DocumentInfo(id=did, status="unknown")
+            doc_map[did].to_info(project.project_dir) if did in doc_map
+            else DocumentInfo(id=did, status="unknown")
             for did in doc_ids
         ]
 
@@ -2582,19 +2577,20 @@ class ModelService:
         if not current_project:
             return []
 
-        return [doc.to_info().model_dump() for doc in current_project.documents]
+        return [doc.to_info(current_project.project_dir).model_dump()
+                for doc in current_project.documents]
 
     def get_documents_for_project(self, project_id: str) -> list[dict]:
         """List documents for a project.
 
-        Reads the visible ~/smartloop/<project-name>/documents/ folder as the
-        source of truth for which files exist, then enriches each entry with
+        Reads the project's ``documents/`` folder as the source of truth for
+        which files exist, then enriches each entry with
         status information from the workspace config.  Files that have been
         dropped into the folder but not yet picked up by the indexer appear
         with status=pending and no id.
         """
         project = self._get_project(project_id)
-        visible_dir = Path(self._visible_project_dir(project)) / "documents"
+        inbox_dir = Path(self._project_documents_dir(project))
 
         # Index registered docs by their original inbox path for fast lookup.
         # The indexer may update doc.path to a converted sources/ path, so we
@@ -2610,14 +2606,14 @@ class ModelService:
         results: list[dict] = []
         seen_ids: set[str] = set()
 
-        if visible_dir.is_dir():
-            for file_path in sorted(visible_dir.iterdir()):
+        if inbox_dir.is_dir():
+            for file_path in sorted(inbox_dir.iterdir()):
                 if not file_path.is_file():
                     continue
                 doc = registered_by_path.get(str(file_path)) or registered_by_name.get(file_path.name)
                 if doc:
                     seen_ids.add(doc.id)
-                    results.append(doc.to_info().model_dump())
+                    results.append(doc.to_info(project.project_dir).model_dump())
                 else:
                     # File is in the inbox but not yet registered by the indexer
                     results.append({
@@ -2628,11 +2624,11 @@ class ModelService:
                         "summary": None,
                     })
 
-        # Append any registered docs whose source is not in the visible folder
+        # Append any registered docs whose source is not in the inbox folder
         # (e.g. URLs or external paths added before this change).
         for doc in project.documents:
             if doc.id not in seen_ids:
-                results.append(doc.to_info().model_dump())
+                results.append(doc.to_info(project.project_dir).model_dump())
 
         return results
 
@@ -2667,20 +2663,16 @@ class ModelService:
         self._model.workspace.projects.append(project)
         self._model.save()
 
-        # Working directory for the project's file/bash tools.
-        # If the caller supplied a cwd (e.g. the directory the CLI was invoked
-        # from), use it directly so the project operates on the user's actual
-        # folder. Otherwise fall back to a fresh ~/smartloop/<name> folder
-        # (unique-ified to <name>_1, <name>_2, … so we never reuse stale
-        # content from a deleted/same-named project).
+        # A caller-supplied ``cwd`` is recorded for reference only — nothing is
+        # ever located through it.  Skills, documents, MCP docs and the
+        # workspace index all live under ``project_dir``, so the framework
+        # stays self-contained: copy <home_dir> anywhere and it runs as-is.
         if cwd:
-            visible_dir = os.path.abspath(os.path.expanduser(cwd))
-        else:
-            visible_dir, _ = resolve_visible_dir(name)
-        project.cwd = visible_dir
+            project.cwd = os.path.abspath(os.path.expanduser(cwd))
+        os.makedirs(project.skills_dir, exist_ok=True)
+        os.makedirs(project.documents_dir, exist_ok=True)
         self._model.save()
-        os.makedirs(visible_dir, exist_ok=True)
-        logger.info(f"[create_project] Visible dir: {visible_dir}")
+        logger.info(f"[create_project] State dir: {project.project_dir}")
 
         # Reset cached indexers/stores so they get re-created for the new project
         self._workspace_indexer = None
@@ -2728,19 +2720,12 @@ class ModelService:
         if project is None:
             raise ValueError(f"Project not found: {project_id}")
 
-        # Rename the visible project directory when the name changes.
+        # Renaming only changes the label.  Skills and documents live under
+        # ``project_dir`` (keyed by project id, not name), so nothing moves on
+        # disk, and ``cwd`` is the user's own folder — renaming a project must
+        # never relocate it.
         if name and name != project.name:
-            old_visible = self._visible_project_dir(project)
-            new_visible = os.path.expanduser(
-                os.path.join("~/smartloop", name)
-            )
-            if os.path.isdir(old_visible) and not os.path.exists(new_visible):
-                os.rename(old_visible, new_visible)
-                logger.info(
-                    f"Renamed visible project dir: {old_visible} -> {new_visible}"
-                )
             project.name = name
-            project.cwd = new_visible
 
         if description is not None:
             project.description = description
@@ -2763,18 +2748,17 @@ class ModelService:
     def _project_to_dict(self, p: Project) -> dict:
         """Convert a Project to a dict for API responses."""
         skills = self._read_skills_from_disk(p) if p.name else []
-        visible = self._visible_project_dir(p)
         return {
             "id": p.id,
             "name": p.name,
-            "cwd": visible,
+            "cwd": p.work_dir or "",
             "description": p.description,
             "model_name": self._model_name,
             "current": p.current,
             "system": p.system,
             "skills": [s.model_dump() for s in skills],
             "mcp": [self._mcp_server_to_dict(s) for s in p.mcp_servers],
-            "documents": [doc.to_info().model_dump() for doc in p.documents],
+            "documents": [doc.to_info(p.project_dir).model_dump() for doc in p.documents],
             "web_search_enabled": bool(p.web_search_enabled),
         }
 
@@ -2806,11 +2790,10 @@ class ModelService:
             shutil.rmtree(project.project_dir)
             logger.info(f"Deleted project directory: {project.project_dir}")
 
-        # Remove visible project folder (~/smartloop/<folder_name>)
-        visible = self._visible_project_dir(project)
-        if visible and os.path.exists(visible):
-            shutil.rmtree(visible)
-            logger.info(f"Deleted visible project folder: {visible}")
+        # ``cwd`` is the user's own folder (often a code repo they opened the
+        # project on) and holds no framework state — skills and documents live
+        # under ``project_dir``, already removed above.  Deleting a project
+        # must never delete the user's files.
 
         # Remove from workspace
         workspace.projects = [p for p in workspace.projects if p.id != project_id]
@@ -2952,14 +2935,30 @@ class ModelService:
         ``_cap_llm_<name>`` cache except ``keep_model_name`` (the one about to be
         used) plus the on-demand large agent model — then reclaim the GPU.
 
+        The default orchestrator model is never evicted, whether it is reached
+        via ``self._llm`` or via its own ``_cap_llm_<default>`` slot: it is
+        always-resident, so dropping it frees nothing durable, and a live
+        stream may still be decoding on it.
+
         Idempotent; returns True if anything was actually freed. Not held under
         ``_inference_lock``: it runs on the load path, before the requesting
         step infers, and only evicts models other than the one being loaded.
         """
         freed = False
         keep_key = f"_cap_llm_{keep_model_name}" if keep_model_name else None
+        default_key = f"_cap_llm_{self._model_name}" if self._model_name else None
         for attr in list(self.__dict__):
             if not attr.startswith("_cap_llm_") or attr == keep_key:
+                continue
+            # Never evict the default orchestrator model.  When the capability
+            # ranking picks the default, its cache slot holds a *separate*
+            # Llama instance for the same weights, so _free_llm's identity
+            # guard against self._llm does not cover it — closing it here tears
+            # down the context a live stream is still decoding on (a native
+            # use-after-free that takes down the whole process, not just the
+            # request).  It is the always-resident model anyway, so freeing it
+            # buys nothing: the next step reloads it immediately.
+            if attr == default_key:
                 continue
             cached = getattr(self, attr, None)
             if cached is not None and cached is not _GPU_FAULTED:
@@ -3377,7 +3376,8 @@ class ModelService:
     ) -> bool:
         """Write MCP tool description to disk for workspace indexer discovery."""
         try:
-            base_dir = Path(self._visible_project_dir(project))
+            # Framework state, written where the workspace indexer scans.
+            base_dir = Path(project.project_dir)
             base_dir.mkdir(parents=True, exist_ok=True)
 
             safe_name = re.sub(r"[^a-z0-9]+", "-", server.name.lower()).strip("-")
@@ -3715,9 +3715,10 @@ class ModelService:
                 header += "---\n\n"
                 skill_contents.append(header + s.content)
 
-        # Use the visible project directory (~/smartloop/<name>) so the
-        # orchestrator's skill scanner finds SKILL.md files written there.
-        visible_project_dir = self._visible_project_dir(current_project)
+        # The orchestrator resolves its working directory as
+        # ``cwd or project_dir or os.getcwd()``.  Point it at the framework's
+        # own per-project dir so tools and scans stay self-contained.
+        orchestrator_cwd = current_project.project_dir
 
         try:
             orchestrator = SLPOrchestrator(
@@ -3760,7 +3761,7 @@ class ModelService:
                     user_message, eligible_servers,
                     skills=skill_contents, cwd=cwd,
                     has_attachments=has_attachments,
-                    project_dir=visible_project_dir,
+                    project_dir=orchestrator_cwd,
                     model_service=self,
                     conversation_history=conversation_history,
                     available_capabilities=available_capabilities or None,

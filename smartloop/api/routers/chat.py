@@ -9,7 +9,6 @@ from pathlib import Path
 import threading
 import uuid
 
-from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator, List
 
@@ -145,7 +144,7 @@ def format_messages_to_prompt(
     # The current date is runtime grounding the model was never trained on, so
     # it rides with the current user turn (next to the question) rather than
     # buried in the system prompt where a small model is unlikely to attend to it.
-    date_str = current_date or date.today().strftime("%B %d, %Y")
+    date_str = current_date or resolve_current_date()
 
     context_injected = False
     last_user_idx = next(
@@ -195,6 +194,111 @@ def format_messages_to_prompt(
             prompt_parts.append(f"<user>{user_content}</user>")
 
     return "\n".join(prompt_parts)
+
+
+# Tokens too common to prove a document was used.  A response echoing only
+# these shares nothing specific with the source.
+_CITATION_STOPWORDS = frozenset("""
+about above after again against all also any are because been before being
+below between both cannot could does doing down during each few for from
+further had has have having here how into its itself just more most not now
+only other our out over own same should some such than that the their them
+then there these they this those through too under until very was were what
+when where which while who whom why will with would you your
+document documents file files page pages source sources content text data
+information report section summary title name date total number
+""".split())
+
+_CITATION_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._,/-]{2,}")
+
+
+def _distinctive_tokens(text: str) -> set:
+    """Content-bearing tokens from *text*: entities, numbers, rare words.
+
+    Deliberately content-based, never filename-based.  An earlier revalidation
+    checked whether the filename appeared in the answer and silently dropped
+    real sources whose names say nothing about their contents (``sp46.pdf``
+    for a Vanguard fund); the document's own text does not have that problem.
+    """
+    tokens = set()
+    for raw in _CITATION_TOKEN_RE.findall(text.lower()):
+        tok = raw.strip("._,/-")
+        # Short words are noise, but short *numbers* ("4.2", "12") are exactly
+        # the figures an answer echoes when it uses a document, so they get a
+        # lower bar.
+        min_len = 2 if any(ch.isdigit() for ch in tok) else 4
+        if len(tok) < min_len or tok in _CITATION_STOPWORDS:
+            continue
+        tokens.add(tok)
+        # Index a normalised numeric form too, so "$1,000.00" in the source
+        # matches a bare "1000" in the answer.  Stripping to digits alone does
+        # not work — it turns "1,000.00" into "100000".
+        num = re.sub(r"[^0-9.]", "", tok)
+        if num and num.count(".") <= 1 and any(ch.isdigit() for ch in num):
+            try:
+                value = float(num)
+            except ValueError:
+                continue
+            tokens.add(str(int(value)) if value == int(value) else str(value))
+    return tokens
+
+
+def _citation_used(citation: dict, response: str) -> bool:
+    """True when *response* actually drew on this citation's source.
+
+    Retrieval returning a document does not mean the answer used it: nearest
+    neighbour always returns *something*, so a project holding a single
+    document will surface it for any question, however unrelated.  Crediting a
+    source the answer never used is worse than showing no source at all.
+
+    Conservative by design — a citation is dropped only when the answer and the
+    extract share **no** distinctive token whatsoever.  Any genuine use echoes
+    at least one entity, figure, or term, while paraphrase, translation, and
+    reformatting all keep enough overlap to survive.  Citations carrying no
+    extract are always kept; absence of evidence is not evidence of misuse.
+    """
+    extract = citation.get("_extract")
+    if not extract or not response:
+        return True
+    source_tokens = _distinctive_tokens(extract)
+    if not source_tokens:
+        return True
+    return bool(source_tokens & _distinctive_tokens(response))
+
+
+def _verified_citations(citations, response: str) -> list:
+    """Deduplicate by document and drop sources the answer never used."""
+    seen: set = set()
+    out: list = []
+    for c in citations or []:
+        doc_id = c.get("document_id")
+        key = doc_id if doc_id is not None else c.get("document_name")
+        if key in seen:
+            continue
+        if not _citation_used(c, response):
+            logger.info(
+                "[citations] Dropping %r — answer does not draw on it",
+                c.get("document_name"),
+            )
+            continue
+        seen.add(key)
+        out.append({k: v for k, v in c.items() if not k.startswith("_")})
+    return out
+
+
+def _request_cwd(model_service) -> str | None:
+    """The working directory for this request — always framework-level.
+
+    The client sends a ``cwd``, but it is deliberately ignored: it may point
+    outside the sandbox container, or at a folder that does not exist on a
+    copied install, and anything located through it would silently vanish.
+    Everything the framework stores and scans lives under ``project_dir``.
+    """
+    try:
+        project = model_service._model.workspace.current_project
+    except Exception:
+        return None
+    return project.project_dir if project else None
 
 
 def _request_current_date(request) -> str:
@@ -440,7 +544,7 @@ async def stream_chunks(
         orchestrate_future = loop.run_in_executor(
             None,
             lambda: model_service.orchestrate(
-                last_user_msg, skills=project_skills, cwd=request.cwd,
+                last_user_msg, skills=project_skills, cwd=_request_cwd(model_service),
                 conversation_history=conversation_history,
                 has_attachments=has_attachments,
                 images=image_attachments,
@@ -600,7 +704,7 @@ async def stream_chunks(
         # at the model's max_tokens limit.
         output_reserve = 512
         overhead_prompt = format_messages_to_prompt(
-            messages, context="", cwd=request.cwd, project_info=project_info,
+            messages, context="", cwd=_request_cwd(model_service), project_info=project_info,
             current_date=_request_current_date(request),
         )
         overhead_tokens = model_service.count_tokens(overhead_prompt)
@@ -624,7 +728,7 @@ async def stream_chunks(
     prompt = format_messages_to_prompt(
         messages,
         context=orchestrator_context,
-        cwd=request.cwd,
+        cwd=_request_cwd(model_service),
         project_info=project_info,
         current_date=_request_current_date(request),
     )
@@ -827,7 +931,13 @@ async def stream_chunks(
             len(full_response_parts), len(full_response), full_response[:200],
         )
         if request.session_id and full_response:
-            model_service.append_to_session(request.session_id, "assistant", full_response, citations=citations, message_id=message_id)
+            # Persist the same verified set the client is shown — never the raw
+            # list, which still carries the private ``_extract`` payload.
+            model_service.append_to_session(
+                request.session_id, "assistant", full_response,
+                citations=_verified_citations(citations, full_response),
+                message_id=message_id,
+            )
 
         # Response is fully streamed — free the on-demand auxiliary models
         # (vision + large agent) so only the orchestrator stays resident
@@ -835,9 +945,10 @@ async def stream_chunks(
         model_service.unload_auxiliary_models()
 
     # Auto file-write: if user asked to create/generate/write, save LLM response to file
-    if full_response_parts and last_user_msg and request.cwd:
+    _out_cwd = _request_cwd(model_service)
+    if full_response_parts and last_user_msg and _out_cwd:
         full_response = "".join(full_response_parts)
-        written_path = model_service.maybe_write_output(last_user_msg, full_response, request.cwd, session_id=request.session_id)
+        written_path = model_service.maybe_write_output(last_user_msg, full_response, _out_cwd, session_id=request.session_id)
         if written_path:
             yield _status_event("file-write", "completed", written_path)
             # Surface the file path as visible content so the user can click it
@@ -883,19 +994,13 @@ async def stream_chunks(
         yield f"data: {usage_payload}\n\n"
 
     if citations:
-        # Deduplicate citations by document_id.  All cited documents
-        # passed semantic relevance filtering in the discovery step,
-        # so they are legitimate sources.  Previous revalidation
-        # checked whether the filename appeared in the LLM response,
-        # but that silently dropped documents whose filenames differ
-        # from their content (e.g. "sp46.pdf" for a Vanguard fund).
-        seen_ids: set = set()
-        unique_citations = []
-        for c in citations:
-            if c["document_id"] in seen_ids:
-                continue
-            seen_ids.add(c["document_id"])
-            unique_citations.append(c)
+        # Deduplicate, then credit only the sources the answer actually used —
+        # passing the relevance filter means a document was *retrieved*, not
+        # that it informed the response.  Matching is on document content, not
+        # the filename: an earlier filename-based check dropped real sources
+        # whose names say nothing about their contents ("sp46.pdf" for a
+        # Vanguard fund).
+        unique_citations = _verified_citations(citations, "".join(full_response_parts))
         if unique_citations:
             citations_payload = json.dumps({
                 "object": "chat.citations",
@@ -1001,7 +1106,7 @@ async def create_chat_completion(
             orchestrator_context, _, tool_error, citations, _, is_mutation = await loop.run_in_executor(
                 _executor,
                 lambda: model_service.orchestrate(
-                    last_user_msg, skills=project_skills, cwd=request.cwd,
+                    last_user_msg, skills=project_skills, cwd=_request_cwd(model_service),
                     conversation_history=conversation_history,
                     images=image_attachments,
                     current_date=_request_current_date(request),
@@ -1039,7 +1144,7 @@ async def create_chat_completion(
         prompt = format_messages_to_prompt(
             messages,
             context=orchestrator_context,
-            cwd=request.cwd,
+            cwd=_request_cwd(model_service),
             project_info=project_info,
             current_date=_request_current_date(request),
         )
@@ -1058,8 +1163,9 @@ async def create_chat_completion(
         )
 
         # Auto file-write: if user asked to create/generate/write, save LLM response to file
-        if last_user_msg and request.cwd and response_text:
-            written_path = model_service.maybe_write_output(last_user_msg, response_text, request.cwd, session_id=request.session_id)
+        _out_cwd = _request_cwd(model_service)
+        if last_user_msg and _out_cwd and response_text:
+            written_path = model_service.maybe_write_output(last_user_msg, response_text, _out_cwd, session_id=request.session_id)
             if written_path:
                 # Use forward slashes in the URL so the Markdown parser doesn't treat
                 # backslashes as escape characters (e.g. \.out → .out on Windows).
@@ -1068,7 +1174,11 @@ async def create_chat_completion(
         # Store assistant response in session history (after auto-write so the link is included)
         message_id = request.message_id or f"msg-{uuid.uuid4().hex[:8]}"
         if request.session_id and response_text:
-            model_service.append_to_session(request.session_id, "assistant", response_text, citations=citations, message_id=message_id)
+            model_service.append_to_session(
+                request.session_id, "assistant", response_text,
+                citations=_verified_citations(citations, response_text),
+                message_id=message_id,
+            )
 
         prompt_tokens = model_service.count_tokens(prompt)
         completion_tokens = model_service.count_tokens(response_text)
@@ -1082,13 +1192,7 @@ async def create_chat_completion(
 
         citation_models = None
         if citations:
-            seen_ids: set = set()
-            unique_citations = []
-            for c in citations:
-                if c["document_id"] in seen_ids:
-                    continue
-                seen_ids.add(c["document_id"])
-                unique_citations.append(c)
+            unique_citations = _verified_citations(citations, response_text)
             if unique_citations:
                 citation_models = [
                     Citation(document_id=c["document_id"], document_name=c.get("document_name"))
