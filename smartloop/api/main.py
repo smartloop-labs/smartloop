@@ -332,7 +332,7 @@ async def health_check():
         if workspace and workspace.current_project:
             from smartloop.workspace import DocumentStatus
             result["indexing"]["documents"] = [
-                {"id": doc.id, "path": doc.path, "status": doc.status.value}
+                doc.to_info(workspace.current_project.project_dir).model_dump()
                 for doc in workspace.current_project.documents
                 if doc.status == DocumentStatus.INDEXED
             ]
