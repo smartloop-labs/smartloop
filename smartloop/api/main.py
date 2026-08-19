@@ -266,6 +266,7 @@ async def health_check():
     model_service = get_model_service()
     result = {
         "status": "healthy",
+        "cwd": os.getcwd(),
         "model_loaded": model_service.is_loaded(),
         "model_name": model_service._model_name,
     }
