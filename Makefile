@@ -20,6 +20,12 @@ ARCHIVE_NAME := $(SERVER_PLATFORM)-$(SERVER_ARCH)-slp.tar.gz
 DL_GCS_PATH := $(DL_GCS_BUCKET)/$(SLP_VERSION)
 
 RELEASE_GCS_PATH := $(SLP_GCS_BUCKET)/slp/$(SLP_VERSION)
+
+# The embedding GGUF is version-independent — it is named by model, immutable,
+# and shared across releases — so it sits beside slp/ rather than under a
+# version dir.  Served publicly at https://dl.smartloop.ai/embeddings/.
+EMBED_GCS_PATH := $(SLP_GCS_BUCKET)/embeddings
+EMBED_GGUF_FILE := $(shell grep -A 1 'embedding_gguf_file' smartloop/config/app_settings.py | grep 'default=' | sed 's/.*"\(.*\)".*/\1/')
 WIN_ARCHIVE_NAME := windows-amd64-slp.zip
 
 # Detect platform
@@ -120,6 +126,7 @@ help:
 	@echo "  publish-binary  - Build, sign, notarize, archive, and upload slp to GCS"
 	@echo "  release-linux   - Build, archive, and upload linux-amd64-slp.tar.gz to the release bucket"
 	@echo "  release-windows - Build, zip, and upload windows-amd64-slp.zip to the release bucket"
+	@echo "  publish-embeddings - Upload the embedding GGUF (EMBED_GGUF=<path>) to the release bucket"
 	@echo "  clean-server    - Remove PyInstaller build artifacts"
 	@echo "  clean-actions   - Delete all GitHub Actions workflow runs"
 
@@ -301,6 +308,21 @@ publish-binary: build-binary sign notarize archive
 	gsutil cp checksums-sha256.txt $(DL_GCS_PATH)/checksums-sha256.txt
 	@rm -f $(ARCHIVE_NAME) checksums-sha256.txt
 	@echo "Published to $(DL_GCS_PATH)/$(ARCHIVE_NAME)"
+
+publish-embeddings:
+	@if [ -z "$(EMBED_GGUF)" ]; then \
+		echo "ERROR: set EMBED_GGUF=/path/to/$(EMBED_GGUF_FILE)"; \
+		exit 1; \
+	fi
+	@echo "Generating checksum for $(EMBED_GGUF_FILE)..."
+	@shasum -a 256 "$(EMBED_GGUF)" | sed 's| .*/| |' > checksums-sha256.txt
+	@echo "Uploading to $(EMBED_GCS_PATH)/..."
+	gsutil -h "Cache-Control:public, max-age=31536000, immutable" \
+		cp "$(EMBED_GGUF)" $(EMBED_GCS_PATH)/$(EMBED_GGUF_FILE)
+	gsutil -h "Cache-Control:public, max-age=300" \
+		cp checksums-sha256.txt $(EMBED_GCS_PATH)/checksums-sha256.txt
+	@rm -f checksums-sha256.txt
+	@echo "Published to $(EMBED_GCS_PATH)/$(EMBED_GGUF_FILE)"
 
 clean-server:
 	@echo "Cleaning PyInstaller artifacts..."

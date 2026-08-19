@@ -92,6 +92,9 @@ class SearchContext(BaseModel):
     # URLs of the web sources actually used (top reranked links), so the
     # orchestrator can surface them as links in the final answer.
     web_sources: List[str] = Field(default_factory=list)
+    # url -> the fetched page text that source contributed to the prompt, so a
+    # web reference is only credited when the answer actually drew on it.
+    web_source_extracts: Dict[str, str] = Field(default_factory=dict)
     # Result of an auto-run read-only MCP tool (a "collect" step). Write /
     # side-effecting tools are NOT run here — they stay planned execute steps.
     mcp_context: str = ""
@@ -376,6 +379,79 @@ class Explorer:
             logger.warning(f"[collect] Feedback search failed: {e}")
         return ""
 
+    # How much of the transcript the follow-up gate sees.  The decision only
+    # needs the shape of the exchange — what was asked, what came back — not
+    # the full text of a long answer.
+    _GATE_TURNS = 4
+    _GATE_TURN_CHARS = 400
+    _GATE_MAX_TOKENS = 8
+
+    def _needs_web_search(
+        self, query: str, conversation_history: Optional[List[Dict[str, str]]],
+    ) -> bool:
+        """True when *query* needs fresh web results rather than the transcript.
+
+        A follow-up that only reworks what the assistant already produced
+        ("now create a table", "summarise that", "translate it") is answerable
+        from the conversation.  Searching again for it is pure noise: the query
+        carries none of the original subject, so the results come back about
+        tables rather than about whatever was being tabulated, and those pages
+        land in the context and as citations.
+
+        The first message of a session always searches — there is nothing to
+        rework yet.  Fails open: an LLM error or an unreadable verdict
+        searches, so this can only suppress a search it is confident about.
+        """
+        if not conversation_history or self.llm is None:
+            return True
+
+        turns = [t for t in conversation_history if t.get("content")]
+        if not turns:
+            return True
+        transcript = "\n".join(
+            f"{t.get('role', 'user')}: {t['content'][:self._GATE_TURN_CHARS]}"
+            for t in turns[-self._GATE_TURNS:]
+        )
+
+        prompt = f"""\
+<system>
+You decide whether a new web search is needed to answer the user's latest message.
+
+Answer SEARCH when the message asks for information that is not already in the
+conversation: a new topic, different subject, more recent data, or a detail the
+previous answer did not cover.
+
+Answer REUSE when the message only asks to rework what the assistant already
+produced — reformat it (table, list, bullets), shorten it, expand it, sort it,
+translate it, or explain it. Reworking needs no new information.
+
+Respond with exactly one word: SEARCH or REUSE.
+</system>
+<user>
+Conversation so far:
+{transcript}
+
+Latest message: {query}
+
+Does answering the latest message require a new web search?
+</user>"""
+
+        try:
+            verdict = str(
+                self.llm.invoke(prompt, max_tokens=self._GATE_MAX_TOKENS)
+            ).strip().upper()
+        except Exception as exc:
+            logger.warning("[collect] Web-search gate failed, searching: %s", exc)
+            return True
+
+        if "REUSE" in verdict and "SEARCH" not in verdict:
+            logger.info(
+                "[collect] Skipping web search — %r reworks the previous "
+                "answer, no new information needed", query[:80],
+            )
+            return False
+        return True
+
     def _search_web(self, query: str) -> str:
         """Hosted web search (Pro), part of explore — thread-safe, I/O bound.
 
@@ -611,16 +687,23 @@ class Explorer:
             # The one exception is an MCP tool that already ran for this query:
             # it was selected and invoked deliberately, so a web citation on
             # "list my issues" would be noise.
+            #
+            # The other exception is a follow-up that only reworks the answer
+            # already on screen ("now make it a table") — see
+            # :meth:`_needs_web_search`.
             if self.web_search_agent.is_enabled():
-                if not ctx.mcp_context:
-                    ctx.web_context = self._search_web(query)
-                    if self.web_search_agent.last_sources:
-                        ctx.web_sources = list(self.web_search_agent.last_sources)
-                else:
+                if ctx.mcp_context:
                     logger.info(
                         "[collect] Skipping web search — an MCP tool already "
                         "answered this query"
                     )
+                elif self._needs_web_search(query, conversation_history):
+                    ctx.web_context = self._search_web(query)
+                    if self.web_search_agent.last_sources:
+                        ctx.web_sources = list(self.web_search_agent.last_sources)
+                        ctx.web_source_extracts = dict(
+                            getattr(self.web_search_agent, "last_source_extracts", None) or {}
+                        )
 
         finally:
             if own_pool:

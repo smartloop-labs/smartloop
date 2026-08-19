@@ -18,7 +18,7 @@ injected into the answer.
 
 import logging
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from smartloop.search.providers import (
     NoSearchCredentials,
@@ -142,6 +142,11 @@ class WebSearchAgent:
         # order).  Read by the orchestrator so the sources surface as links in
         # the final answer rather than only as context the model may not echo.
         self.last_sources: List[str] = []
+        # url -> the page text handed to the model for that source.  Lets the
+        # router confirm the answer actually drew on a page before crediting
+        # it as a reference.  Empty when the fetches failed and only bare
+        # links were passed through.
+        self.last_source_extracts: Dict[str, str] = {}
 
     @property
     def fetch_agent(self):
@@ -178,6 +183,7 @@ class WebSearchAgent:
         want = top_k or self._top_k
         n = num_candidates or self._num_candidates
         self.last_sources = []
+        self.last_source_extracts = {}
 
         # Search on the distilled subject, not the raw conversational message
         # ("give me a list latest canyon bikes" → "latest canyon bikes").
@@ -256,6 +262,7 @@ class WebSearchAgent:
         ranked = self._rerank(query, fetched)
         kept = ranked[:top_k]
         self.last_sources = [url for url, _ in kept]
+        self.last_source_extracts = {url: content for url, content in kept}
         parts = [f"Web search results for: {query}"]
         for i, (url, content) in enumerate(kept, 1):
             parts.append(f"## [{i}] {url}\n\n{content}")

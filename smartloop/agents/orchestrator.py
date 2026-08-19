@@ -1055,10 +1055,17 @@ class SLPOrchestrator:
                 search_ctx.citations = []
                 for name in ordered:
                     citation = dict(by_name.get(name, {"document_name": name}))
-                    extract = extract_by_name.get(name)
-                    if extract:
-                        # Private, stripped before the citation reaches a client.
-                        citation["_extract"] = extract
+                    # Only fill in an extract when the citation has no source
+                    # text yet.  The retrieval citation already carries the
+                    # document's own words, which is the better evidence: this
+                    # extract is the DP model's answer *to the user's query*,
+                    # so it echoes the query's wording and would match the
+                    # final answer no matter which document it came from.
+                    # Private, stripped before the citation reaches a client.
+                    if not citation.get("_extract"):
+                        extract = extract_by_name.get(name)
+                        if extract:
+                            citation["_extract"] = extract
                     search_ctx.citations.append(citation)
 
             logger.info(
@@ -1372,9 +1379,14 @@ class SLPOrchestrator:
                 # reads them back as citations, so without this a plan that
                 # reaches the web through a WEB_SEARCH step answers from live
                 # pages while surfacing no reference links at all.
+                extracts = getattr(
+                    self._web_search_agent, "last_source_extracts", None
+                ) or {}
                 for url in self._web_search_agent.last_sources:
                     if url not in search_ctx.web_sources:
                         search_ctx.web_sources.append(url)
+                    if url in extracts:
+                        search_ctx.web_source_extracts[url] = extracts[url]
                 logger.info(
                     "[web_search] step %s: %d chars, %d source(s)",
                     step.step, len(content or ""),
@@ -2142,10 +2154,17 @@ Is this context relevant to the user's request?
         # "document_name"}), so the client renders them as clickable links
         # alongside document citations.  Appended last — they're the live
         # sources the answer is grounded in.
-        web_citations = [
-            {"document_id": u, "document_name": u, "url": u}
-            for u in search_ctx.web_sources
-        ]
+        # Each carries the fetched page text privately, so a link is only
+        # credited when the answer actually drew on that page (see
+        # ``_verified_citations``).  Sources whose fetch failed have no text
+        # to check against and are kept as-is.
+        web_citations = []
+        for u in search_ctx.web_sources:
+            web_citation = {"document_id": u, "document_name": u, "url": u}
+            web_extract = search_ctx.web_source_extracts.get(u)
+            if web_extract:
+                web_citation["_extract"] = web_extract
+            web_citations.append(web_citation)
 
         # A conversational route has no tool plan — its ``tool_context`` is the
         # model's own generated answer, not external tool output.  Don't frame

@@ -137,3 +137,102 @@ class TestFeedbackRelevanceFloor:
         indexer.search.return_value = [self._chunk(0.10) for _ in range(10)]
 
         assert len(self._service(indexer).search_feedback("refund window", n_results=3)) == 3
+
+
+class TestFollowUpGate:
+    """A follow-up that reworks the previous answer must not search again.
+
+    "Show me latest local events" → "now create a table".  The second message
+    carries none of the subject, so a fresh search returns pages about tables
+    and drags them into the context and the citation list.
+    """
+
+    def _explorer_with_verdict(self, monkeypatch, searched, verdict):
+        llm = MagicMock()
+        llm.invoke = MagicMock(return_value=verdict)
+        ex = _explorer(monkeypatch, searched)
+        ex.llm = llm
+        return ex, llm
+
+    HISTORY = [
+        {"role": "user", "content": "Show me latest local events"},
+        {"role": "assistant", "content": "Jazz in the Park on Friday, Food Truck Rally Saturday."},
+    ]
+
+    def test_reformat_follow_up_does_not_search(self, monkeypatch, searched):
+        ex, _ = self._explorer_with_verdict(monkeypatch, searched, "REUSE")
+
+        ctx = ex.collect_parallel(
+            "now create a table", model_service=MagicMock(),
+            conversation_history=self.HISTORY,
+        )
+
+        assert searched == []
+        assert not ctx.web_context
+        assert ctx.web_sources == []
+
+    def test_new_information_follow_up_still_searches(self, monkeypatch, searched):
+        ex, _ = self._explorer_with_verdict(monkeypatch, searched, "SEARCH")
+
+        ctx = ex.collect_parallel(
+            "what about next weekend?", model_service=MagicMock(),
+            conversation_history=self.HISTORY,
+        )
+
+        assert searched == ["what about next weekend?"]
+        assert ctx.web_context
+
+    def test_first_message_never_consults_the_gate(self, monkeypatch, searched):
+        ex, llm = self._explorer_with_verdict(monkeypatch, searched, "REUSE")
+
+        ex.collect_parallel("Show me latest local events", model_service=MagicMock())
+
+        assert searched == ["Show me latest local events"]
+        llm.invoke.assert_not_called()
+
+    def test_gate_sees_the_transcript_and_the_latest_message(self, monkeypatch, searched):
+        ex, llm = self._explorer_with_verdict(monkeypatch, searched, "REUSE")
+
+        ex.collect_parallel(
+            "now create a table", model_service=MagicMock(),
+            conversation_history=self.HISTORY,
+        )
+
+        prompt = llm.invoke.call_args.args[0]
+        assert "Show me latest local events" in prompt
+        assert "Jazz in the Park" in prompt
+        assert "Latest message: now create a table" in prompt
+
+    def test_llm_failure_falls_open_to_searching(self, monkeypatch, searched):
+        ex, llm = self._explorer_with_verdict(monkeypatch, searched, "REUSE")
+        llm.invoke.side_effect = RuntimeError("model unavailable")
+
+        ctx = ex.collect_parallel(
+            "now create a table", model_service=MagicMock(),
+            conversation_history=self.HISTORY,
+        )
+
+        assert searched == ["now create a table"]
+        assert ctx.web_context
+
+    @pytest.mark.parametrize("verdict", ["SEARCH", "search", " SEARCH\n", "unclear", ""])
+    def test_anything_but_a_clear_reuse_searches(self, monkeypatch, searched, verdict):
+        ex, _ = self._explorer_with_verdict(monkeypatch, searched, verdict)
+
+        ex.collect_parallel(
+            "now create a table", model_service=MagicMock(),
+            conversation_history=self.HISTORY,
+        )
+
+        assert searched == ["now create a table"]
+
+    def test_empty_history_entries_are_treated_as_no_history(self, monkeypatch, searched):
+        ex, llm = self._explorer_with_verdict(monkeypatch, searched, "REUSE")
+
+        ex.collect_parallel(
+            "now create a table", model_service=MagicMock(),
+            conversation_history=[{"role": "user", "content": ""}],
+        )
+
+        assert searched == ["now create a table"]
+        llm.invoke.assert_not_called()

@@ -174,3 +174,47 @@ class TestLiveContextSurvivesToolOutput:
 
         assert "FEEDBACK Q&A" not in result.content
         assert "WORKSPACE FILES" not in result.content
+
+
+class TestWebCitationExtracts:
+    """A web link is a citation too — credit it only when the answer used it."""
+
+    def test_fetched_page_text_rides_along_as_a_private_extract(self):
+        orch = _make_orchestrator()
+        ctx = _ctx(orch, "who is john hobaika at rhino.ai")
+        search_ctx = SearchContext(
+            web_context="John Hobaika is VP of Engineering at Rhino AI.",
+            web_sources=["https://theorg.com/org/rhino"],
+            web_source_extracts={
+                "https://theorg.com/org/rhino":
+                    "John Hobaika is VP of Engineering at Rhino AI.",
+            },
+        )
+        result = orch._build_final_result(
+            ctx=ctx, search_ctx=search_ctx, tool_names_used=[],
+            vector_context=None, tool_context=None,
+            explore_citations=None, is_conversation=False,
+        )
+
+        assert result.citations == [{
+            "document_id": "https://theorg.com/org/rhino",
+            "document_name": "https://theorg.com/org/rhino",
+            "url": "https://theorg.com/org/rhino",
+            "_extract": "John Hobaika is VP of Engineering at Rhino AI.",
+        }]
+
+    def test_source_with_no_fetched_text_is_left_unverifiable(self):
+        """A failed fetch leaves nothing to check against, so the link stays."""
+        orch = _make_orchestrator()
+        ctx = _ctx(orch, "who is john hobaika at rhino.ai")
+        search_ctx = SearchContext(
+            web_context="Web search results for: john hobaika",
+            web_sources=["https://theorg.com/org/rhino"],
+        )
+        result = orch._build_final_result(
+            ctx=ctx, search_ctx=search_ctx, tool_names_used=[],
+            vector_context=None, tool_context=None,
+            explore_citations=None, is_conversation=False,
+        )
+
+        assert "_extract" not in result.citations[0]

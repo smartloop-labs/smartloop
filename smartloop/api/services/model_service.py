@@ -1937,6 +1937,15 @@ class ModelService:
                         "document_id": chunk.document_id,
                         "document_name": chunk.document_name or meta.get("document_name"),
                     }
+                    # Carry the exact text this document contributed to the
+                    # prompt, privately (``_`` keys are stripped before a
+                    # citation reaches a client).  Being retrieved is not
+                    # evidence a document was used — nearest neighbour always
+                    # returns something — so the router checks the finished
+                    # answer against this extract before crediting the source.
+                    extract = doc_groups.get(chunk.document_name or chunk.document_id)
+                    if extract:
+                        citation["_extract"] = extract
                     if page:
                         citation["page_numbers"] = [page]
                     seen_docs[chunk.document_id] = citation

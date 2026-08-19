@@ -177,3 +177,36 @@ class TestEnablement:
                           "name": "p1", "web_search_enabled": True}],
         }))
         assert WebSearchAgent.is_enabled() is False
+
+
+class TestSourceExtracts:
+    """The kept pages' text is recorded so a link can be verified later."""
+
+    def _agent(self, pages):
+        from smartloop.agents.web_search_agent import WebSearchAgent
+
+        fetch = type("F", (), {
+            "fetch": lambda self, url, max_length=0: pages.get(url, ""),
+        })()
+        return WebSearchAgent(fetch_agent=fetch, top_k=2, num_candidates=2)
+
+    def test_fetch_top_records_text_per_kept_url(self):
+        # Pages must clear the usability floor (>= 200 chars of real text).
+        pages = {
+            "a.com": "Canyon Aeroad CFR weighs 6.8kg. " + "Aero road details. " * 12,
+            "b.com": "Canyon Ultimate CF SLX starts at 4299 euros. " + "Spec notes. " * 16,
+        }
+        agent = self._agent(pages)
+        agent._fetch_top("canyon bikes", ["a.com", "b.com"], 2, 2)
+
+        assert agent.last_sources == ["a.com", "b.com"]
+        assert agent.last_source_extracts == {
+            url: text.strip() for url, text in pages.items()
+        }
+
+    def test_unfetchable_links_leave_no_extracts(self):
+        agent = self._agent({})
+        out = agent._fetch_top("canyon bikes", ["a.com"], 1, 1)
+
+        assert "a.com" in out
+        assert agent.last_source_extracts == {}

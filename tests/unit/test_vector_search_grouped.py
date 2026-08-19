@@ -109,3 +109,21 @@ def test_weak_best_match_returns_none():
         assert svc.get_document_context_with_citations(
             query="places to visit in madrid"
         ) is None
+
+
+def test_citations_carry_the_document_text_as_a_private_extract():
+    """Each citation ships the text its document contributed to the prompt.
+
+    Without it the router has no evidence to check the finished answer
+    against, so every retrieved document gets credited whether or not the
+    answer drew on it.
+    """
+    store = _fake_store()
+    svc = _service_with_store(store)
+    with patch("smartloop.api.services.model_service.StoreFactory.create_store",
+               return_value=store):
+        _, citations = svc.get_document_groups(query="alpha beta")
+
+    by_name = {c["document_name"]: c for c in citations}
+    assert by_name["alpha.pdf"]["_extract"] == "Alpha body"
+    assert by_name["beta.pdf"]["_extract"] == "Beta body"

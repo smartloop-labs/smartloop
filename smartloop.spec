@@ -34,16 +34,28 @@ if _skills_dir.exists():
 # Bundle the GGUF embedding model so a packaged install works offline with no
 # first-run download.  Placed at <bundle>/embeddings/<file>, which
 # smartloop.db.llama_embeddings._bundled_gguf_path() resolves via sys._MEIPASS.
-# Repo/file mirror the app defaults (override via SLP_EMBEDDING_GGUF_* to match a
-# customised default).  Best-effort: if the download fails the app still fetches
-# it at runtime, so the build doesn't hard-fail on a transient HF outage.
+# Pulled from our own public bucket rather than the HuggingFace Hub, which
+# gates GGUF downloads behind a user token — the build machine should not need
+# one.  Base URL/file mirror the app defaults (override via
+# SLP_EMBEDDING_GGUF_* to match a customised default).  Best-effort: if the
+# download fails the app still fetches it at runtime, so the build doesn't
+# hard-fail on a transient outage.
 try:
-    from huggingface_hub import hf_hub_download
-    _emb_repo = os.environ.get('SLP_EMBEDDING_GGUF_REPO', 'gpustack/bge-m3-GGUF')
+    import tempfile
+    import urllib.request
+
+    _emb_base = os.environ.get(
+        'SLP_EMBEDDING_GGUF_BASE_URL', 'https://dl.smartloop.ai/embeddings'
+    )
     _emb_file = os.environ.get('SLP_EMBEDDING_GGUF_FILE', 'bge-m3-Q4_K_M.gguf')
-    _emb_gguf = hf_hub_download(repo_id=_emb_repo, filename=_emb_file)
+    _emb_url = f"{_emb_base.rstrip('/')}/{_emb_file}"
+    _emb_gguf = str(Path(tempfile.gettempdir()) / _emb_file)
+    if not Path(_emb_gguf).is_file():
+        print(f"[spec] Downloading embedding model from {_emb_url}")
+        urllib.request.urlretrieve(_emb_url, _emb_gguf + '.part')
+        os.replace(_emb_gguf + '.part', _emb_gguf)
     datas.append((_emb_gguf, 'embeddings'))
-    print(f"[spec] Bundled embedding model {_emb_repo}/{_emb_file}")
+    print(f"[spec] Bundled embedding model {_emb_url}")
 except Exception as _emb_exc:
     print(
         f"[spec] WARNING: could not bundle embedding GGUF ({_emb_exc}); "

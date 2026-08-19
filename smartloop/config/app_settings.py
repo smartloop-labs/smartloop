@@ -147,6 +147,18 @@ class AppSettings(BaseSettings):
         validation_alias="slp_embedding_gguf_file",
         description="GGUF filename within the repo.",
     )
+    # Where the GGUF is fetched from on first run.  Our own public bucket is
+    # tried before HuggingFace: the Hub gates downloads behind a token and is
+    # slow from most regions, while this is an unauthenticated GCS object next
+    # to the release archives.  Set to "" to skip it and go straight to HF.
+    embedding_gguf_base_url: str = Field(
+        default="https://dl.smartloop.ai/embeddings",
+        validation_alias="slp_embedding_gguf_base_url",
+        description=(
+            "Base URL the embedding GGUF is downloaded from "
+            "(<base>/<embedding_gguf_file>); empty falls back to HuggingFace."
+        ),
+    )
     # Document parsing uses MarkItDown for fast text extraction and pushes OCR /
     # image understanding to a vision-capable model (selected by the "vision"
     # capability, like the orchestrator) loaded in-process via get_vision_llm().

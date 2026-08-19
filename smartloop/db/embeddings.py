@@ -82,6 +82,7 @@ def _get_model(base_dir: Optional[str] = None):
             settings.embedding_gguf_repo,
             settings.embedding_gguf_file,
             device=settings.embedding_device,
+            base_url=settings.embedding_gguf_base_url,
         )
         return _model
 

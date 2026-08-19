@@ -37,6 +37,13 @@ _POOLING_TYPE_UNSPECIFIED = -1
 # chunks are far shorter, but sizing to the model's max avoids silent truncation.
 _EMBED_N_CTX = 8192
 
+# First-run GGUF download.  The read timeout bounds the idle gap between
+# received bytes (a stalled transfer is detected instead of hanging), not the
+# total transfer time — a ~400MB model is allowed to take as long as it takes.
+_DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+_DOWNLOAD_CONNECT_TIMEOUT = 30.0
+_DOWNLOAD_READ_TIMEOUT = 60.0
+
 
 class LlamaEmbedder:
     """Adapts a llama.cpp embedding ``Llama`` to the ``.encode()`` call site."""
@@ -117,15 +124,107 @@ def _bundled_gguf_path(filename: str) -> Optional[str]:
     return path if os.path.isfile(path) else None
 
 
+def _hf_cached_gguf_path(
+    cache_dir: Optional[str], repo_id: str, filename: str
+) -> Optional[str]:
+    """An already-downloaded copy in the HuggingFace cache layout, or ``None``.
+
+    Installs that predate the bucket download hold the GGUF under
+    ``<cache_dir>/models--<org>--<repo>/snapshots/<rev>/<filename>``.  Reusing
+    it keeps upgrades from re-fetching ~400MB that is already on disk.  This is
+    a filesystem lookup only — no Hub call, no token.
+    """
+    if not cache_dir:
+        return None
+    repo_dir = os.path.join(cache_dir, "models--" + repo_id.replace("/", "--"))
+    snapshots = os.path.join(repo_dir, "snapshots")
+    if not os.path.isdir(snapshots):
+        return None
+    for rev in sorted(os.listdir(snapshots)):
+        candidate = os.path.join(snapshots, rev, filename)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _cdn_gguf_path(cache_dir: Optional[str], base_url: str, filename: str) -> Optional[str]:
+    """Download *filename* from our public bucket into *cache_dir*, or ``None``.
+
+    Preferred over the HuggingFace Hub: the Hub gates GGUF downloads behind a
+    user token and is slow from most regions, whereas this is an
+    unauthenticated GCS object served from the same bucket as the release
+    archives.  Falls through (returns ``None``) on any failure so the caller
+    can still try HF.
+
+    The file lands via a ``.part`` file renamed on success, so an interrupted
+    download never leaves a truncated GGUF that llama.cpp would later fail to
+    load — and the size is checked against ``Content-Length`` first.
+    """
+    if not cache_dir or not base_url:
+        return None
+
+    target = os.path.join(cache_dir, filename)
+    if os.path.isfile(target):
+        logger.info("[embeddings] Using cached GGUF %s", target)
+        return target
+
+    url = f"{base_url.rstrip('/')}/{filename}"
+    partial = f"{target}.part"
+    try:
+        import httpx
+
+        os.makedirs(cache_dir, exist_ok=True)
+        logger.info("[embeddings] Downloading GGUF from %s", url)
+        written = 0
+        expected = None
+        timeout = httpx.Timeout(
+            connect=_DOWNLOAD_CONNECT_TIMEOUT,
+            read=_DOWNLOAD_READ_TIMEOUT,
+            write=_DOWNLOAD_CONNECT_TIMEOUT,
+            pool=_DOWNLOAD_CONNECT_TIMEOUT,
+        )
+        with httpx.stream(
+            "GET", url, follow_redirects=True, timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+            length = response.headers.get("content-length")
+            expected = int(length) if length and length.isdigit() else None
+            with open(partial, "wb") as fh:
+                for chunk in response.iter_bytes(_DOWNLOAD_CHUNK_SIZE):
+                    fh.write(chunk)
+                    written += len(chunk)
+
+        if expected is not None and written != expected:
+            raise OSError(
+                f"truncated download: got {written} of {expected} bytes"
+            )
+
+        os.replace(partial, target)
+        logger.info("[embeddings] Downloaded GGUF %s (%d bytes)", filename, written)
+        return target
+    except Exception as exc:
+        logger.warning("[embeddings] Failed to fetch GGUF from %s: %s", url, exc)
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        return None
+
+
 def load_embedder(
     cache_dir: Optional[str],
     repo_id: str,
     filename: str,
     device: str = "cpu",
+    base_url: str = "",
 ) -> Optional[LlamaEmbedder]:
     """Load the GGUF embedding model — bundled copy first, else download.
 
-    Returns ``None`` on any failure so callers fall back to TF-IDF, matching the
+    Resolution order is bundled → an existing HuggingFace-cache copy on disk →
+    our public bucket (*base_url*).  The Hub itself is deliberately not called:
+    it gates GGUF downloads behind a user token and is slow from most regions,
+    which is the whole reason the model is mirrored to our bucket.  Returns
+    ``None`` on any failure so callers fall back to TF-IDF, matching the
     sentence-transformers path's contract.
     """
     try:
@@ -141,19 +240,16 @@ def load_embedder(
     if model_path:
         logger.info("[embeddings] Using bundled GGUF %s", filename)
     else:
-        try:
-            from huggingface_hub import hf_hub_download
-
-            model_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                cache_dir=cache_dir,
-            )
-        except Exception as exc:
-            logger.warning(
-                f"[embeddings] Failed to fetch GGUF {repo_id}/{filename}: {exc}"
-            )
-            return None
+        model_path = (
+            _hf_cached_gguf_path(cache_dir, repo_id, filename)
+            or _cdn_gguf_path(cache_dir, base_url, filename)
+        )
+    if not model_path:
+        logger.warning(
+            "[embeddings] No GGUF available for %s — falling back to TF-IDF",
+            filename,
+        )
+        return None
 
     try:
         model = Llama(

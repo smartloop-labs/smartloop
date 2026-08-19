@@ -196,51 +196,79 @@ def format_messages_to_prompt(
     return "\n".join(prompt_parts)
 
 
-# Tokens too common to prove a document was used.  A response echoing only
-# these shares nothing specific with the source.
-_CITATION_STOPWORDS = frozenset("""
-about above after again against all also any are because been before being
-below between both cannot could does doing down during each few for from
-further had has have having here how into its itself just more most not now
-only other our out over own same should some such than that the their them
-then there these they this those through too under until very was were what
-when where which while who whom why will with would you your
-document documents file files page pages source sources content text data
-information report section summary title name date total number
-""".split())
+# A shared run of this many consecutive words is the evidence that an answer
+# actually drew on a source.  Single shared words prove nothing: measured
+# against real transcripts, a workout answer and an unrelated fund prospectus
+# share 7-12 ordinary words ("available", "different", "perform", "three"),
+# which is why a one-word rule credited five Vanguard PDFs to a `good-morning`
+# routine.  No pair of unrelated texts in that sample shared a 3-word run.
+_PHRASE_LEN = 3
 
-_CITATION_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._,/-]{2,}")
+_WORD_RE = re.compile(r"[a-z0-9][a-z0-9.,%/-]*")
+_NUMBER_RE = re.compile(r"\b\d[\d.,]*\b")
+# Figures below this many significant digits are not evidence of anything: an
+# answer saying "3 sets of 10 reps" would otherwise match any document that
+# happens to contain a 3.
+_FIGURE_MIN_DIGITS = 3
 
 
-def _distinctive_tokens(text: str) -> set:
-    """Content-bearing tokens from *text*: entities, numbers, rare words.
+def _phrases(text: str) -> set:
+    """Every ``_PHRASE_LEN``-word run in *text*, normalised for comparison."""
+    words = [w.strip(".,%/-") for w in _WORD_RE.findall(text.lower())]
+    words = [w for w in words if w]
+    return {
+        " ".join(words[i:i + _PHRASE_LEN])
+        for i in range(len(words) - _PHRASE_LEN + 1)
+    }
 
-    Deliberately content-based, never filename-based.  An earlier revalidation
-    checked whether the filename appeared in the answer and silently dropped
-    real sources whose names say nothing about their contents (``sp46.pdf``
-    for a Vanguard fund); the document's own text does not have that problem.
+
+def _figures(text: str) -> set:
+    """Precise numbers in *text*, normalised so formatting doesn't matter.
+
+    "$1,000.00" in a document and a bare "1000" in the answer are the same
+    figure, so both reduce to ``"1000"``.  These survive rewording: a
+    translated or heavily paraphrased answer keeps no phrasing from its source
+    but still carries its numbers.
     """
-    tokens = set()
-    for raw in _CITATION_TOKEN_RE.findall(text.lower()):
-        tok = raw.strip("._,/-")
-        # Short words are noise, but short *numbers* ("4.2", "12") are exactly
-        # the figures an answer echoes when it uses a document, so they get a
-        # lower bar.
-        min_len = 2 if any(ch.isdigit() for ch in tok) else 4
-        if len(tok) < min_len or tok in _CITATION_STOPWORDS:
+    out = set()
+    for raw in _NUMBER_RE.findall(text):
+        core = raw.rstrip(".,")
+        if len(core.replace(".", "").replace(",", "")) < _FIGURE_MIN_DIGITS:
             continue
-        tokens.add(tok)
-        # Index a normalised numeric form too, so "$1,000.00" in the source
-        # matches a bare "1000" in the answer.  Stripping to digits alone does
-        # not work — it turns "1,000.00" into "100000".
-        num = re.sub(r"[^0-9.]", "", tok)
-        if num and num.count(".") <= 1 and any(ch.isdigit() for ch in num):
-            try:
-                value = float(num)
-            except ValueError:
-                continue
-            tokens.add(str(int(value)) if value == int(value) else str(value))
-    return tokens
+        try:
+            value = float(core.replace(",", ""))
+        except ValueError:
+            continue
+        out.add(str(int(value)) if value == int(value) else str(value))
+    return out
+
+
+class _AnswerEvidence:
+    """What a finished answer contains, for checking sources against it."""
+
+    def __init__(self, response: str):
+        self.blank = not (response or "").strip()
+        self.phrases = _phrases(response or "")
+        self.figures = _figures(response or "")
+
+    def drew_on(self, source: str) -> bool:
+        """True when the answer shows evidence of having used *source*.
+
+        Conservative in the one direction that matters: when there is nothing
+        to check (no source text, no answer), the source is kept.  Crediting a
+        source the answer never used is the failure being prevented here, but
+        silently dropping a real one is also a bug — so a reworded answer that
+        keeps none of the source's phrasing can still qualify on a shared
+        figure.
+        """
+        if self.blank or not source:
+            return True
+        source_phrases = _phrases(source)
+        if not source_phrases:
+            return True
+        if source_phrases & self.phrases:
+            return True
+        return bool(_figures(source) & self.figures)
 
 
 def _citation_used(citation: dict, response: str) -> bool:
@@ -251,23 +279,15 @@ def _citation_used(citation: dict, response: str) -> bool:
     document will surface it for any question, however unrelated.  Crediting a
     source the answer never used is worse than showing no source at all.
 
-    Conservative by design — a citation is dropped only when the answer and the
-    extract share **no** distinctive token whatsoever.  Any genuine use echoes
-    at least one entity, figure, or term, while paraphrase, translation, and
-    reformatting all keep enough overlap to survive.  Citations carrying no
-    extract are always kept; absence of evidence is not evidence of misuse.
+    Citations carrying no extract are always kept; absence of evidence is not
+    evidence of misuse.
     """
-    extract = citation.get("_extract")
-    if not extract or not response:
-        return True
-    source_tokens = _distinctive_tokens(extract)
-    if not source_tokens:
-        return True
-    return bool(source_tokens & _distinctive_tokens(response))
+    return _AnswerEvidence(response).drew_on(citation.get("_extract") or "")
 
 
 def _verified_citations(citations, response: str) -> list:
     """Deduplicate by document and drop sources the answer never used."""
+    evidence = _AnswerEvidence(response)
     seen: set = set()
     out: list = []
     for c in citations or []:
@@ -275,7 +295,7 @@ def _verified_citations(citations, response: str) -> list:
         key = doc_id if doc_id is not None else c.get("document_name")
         if key in seen:
             continue
-        if not _citation_used(c, response):
+        if not evidence.drew_on(c.get("_extract") or ""):
             logger.info(
                 "[citations] Dropping %r — answer does not draw on it",
                 c.get("document_name"),
