@@ -77,3 +77,23 @@ def resolve_current_date(user_date=None, tz=None):
             pass
     return date.today().strftime(CURRENT_DATE_FORMAT)
 
+# ---------------------------------------------------------------------------
+# Public-facing model names
+# ---------------------------------------------------------------------------
+# The internal id keys the on-disk model directory, the workspace records and
+# the HuggingFace repo, so it can't be renamed without breaking existing
+# installs.  Streams a user actually reads — the chat SSE chunks and the
+# /v1/init progress events — show the short public name instead.
+MODEL_DISPLAY_NAMES = {
+    "slp-orchestra-mini": "sl-mini",
+}
+
+
+def display_model_name(name):
+    """Return the public-facing name for an internal model id.
+
+    Unknown ids (user-added workspace models) pass through unchanged.
+    """
+    if not name:
+        return name
+    return MODEL_DISPLAY_NAMES.get(name, name)

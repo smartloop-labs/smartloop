@@ -19,6 +19,7 @@ Used by:
 
 from __future__ import annotations
 
+import gc
 import logging
 import logging.handlers
 import multiprocessing
@@ -137,6 +138,58 @@ def start_listener(
     )
     listener.start()
     return listener
+
+
+def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) -> None:
+    """Stop the listener and release the shared log queue's OS resources.
+
+    A ``multiprocessing.Queue`` owns three POSIX semaphores that are unlinked
+    by finalizers which only run on a *clean* interpreter exit.  A server that
+    is SIGKILLed — ``slp agent stop`` escalates to SIGKILL when SIGTERM hasn't
+    landed within 10s — never runs them, and the resource tracker then prints
+    ``resource_tracker: There appear to be 3 leaked semaphore objects to clean
+    up at shutdown``.  Releasing the queue during the lifespan shutdown means
+    the semaphores are already gone by the time that window opens.
+
+    Safe to call more than once, and safe when the fallback ``queue.Queue``
+    (macOS App Sandbox) is in use — that one owns no OS resources.
+    """
+    global _LOG_QUEUE
+
+    if listener is not None:
+        try:
+            listener.stop()
+        except Exception:
+            pass
+
+    # Detach the QueueHandler first: a record emitted after the queue closes
+    # would raise inside logging.  Root falls back to logging.lastResort,
+    # which still puts WARNING+ on stderr.
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if isinstance(h, logging.handlers.QueueHandler):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+
+    queue, _LOG_QUEUE = _LOG_QUEUE, None
+    # queue.Queue has no close(); only the multiprocessing one holds semaphores.
+    if queue is not None and hasattr(queue, "close"):
+        try:
+            queue.close()
+            queue.join_thread()
+        except Exception:
+            pass
+
+    # close() only tears down the pipe — the semaphores are unlinked by the
+    # finalizers that fire when the Queue is collected.  Drop the last
+    # reference and force that collection now, while we still control the
+    # exit path.  Callers must clear their own references (e.g.
+    # ``app.state.log_queue``) before calling.
+    del queue
+    gc.collect()
 
 
 def worker_setup_logging(queue: Optional["multiprocessing.queues.Queue"]) -> None:

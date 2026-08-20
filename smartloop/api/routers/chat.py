@@ -28,7 +28,7 @@ from smartloop.api.model import (
     Usage,
 )
 from smartloop.api.services import ModelService, get_model_service, get_api_client
-from smartloop.constants import SYSTEM_PROMPT, resolve_current_date
+from smartloop.constants import SYSTEM_PROMPT, display_model_name, resolve_current_date
 from smartloop.types import ModelCapability
 
 
@@ -477,6 +477,11 @@ async def stream_chunks(
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
 
+    # The SSE chunks are read by a user-facing client, so they carry the short
+    # public model name.  Telemetry (``push_token_usage``) keeps the internal
+    # id it was requested with.
+    stream_model = display_model_name(request.model)
+
     # Switch project if specified
     if request.project_id:
         try:
@@ -599,7 +604,7 @@ async def stream_chunks(
                     f"Orchestration timed out after {_orch_timeout:.0f}s",
                 )
                 timeout_chunk = ChatCompletionChunk(
-                    model=request.model,
+                    model=stream_model,
                     choices=[ChunkChoice(
                         index=0,
                         delta=DeltaContent(
@@ -645,7 +650,7 @@ async def stream_chunks(
         message_id = request.message_id or f"msg-{uuid.uuid4().hex[:8]}"
         yield _status_event("streaming", "processing", "Generating response...")
         initial_chunk = ChatCompletionChunk(
-            model=request.model,
+            model=stream_model,
             choices=[ChunkChoice(
                 index=0,
                 delta=DeltaContent(role="assistant"),
@@ -658,7 +663,7 @@ async def stream_chunks(
         _STREAM_CHUNK_SIZE = 12
         for i in range(0, len(orchestrator_context), _STREAM_CHUNK_SIZE):
             content_chunk = ChatCompletionChunk(
-                model=request.model,
+                model=stream_model,
                 choices=[ChunkChoice(
                     index=0,
                     delta=DeltaContent(content=orchestrator_context[i:i + _STREAM_CHUNK_SIZE]),
@@ -668,7 +673,7 @@ async def stream_chunks(
             yield f"data: {content_chunk.model_dump_json()}\n\n"
             await asyncio.sleep(0.01)
         done_chunk = ChatCompletionChunk(
-            model=request.model,
+            model=stream_model,
             choices=[ChunkChoice(
                 index=0,
                 delta=DeltaContent(),
@@ -893,7 +898,7 @@ async def stream_chunks(
     # Initial chunk with role (OpenAI-compatible raw data format)
     message_id = request.message_id or f"msg-{uuid.uuid4().hex[:8]}"
     initial_chunk = ChatCompletionChunk(
-        model=request.model,
+        model=stream_model,
         choices=[ChunkChoice(
             index=0,
             delta=DeltaContent(role="assistant"),
@@ -920,7 +925,7 @@ async def stream_chunks(
                 yield _status_event("error", "error", error_msg)
                 # Surface the error as a visible content chunk so the user sees it
                 error_chunk = ChatCompletionChunk(
-                    model=request.model,
+                    model=stream_model,
                     choices=[ChunkChoice(
                         index=0,
                         delta=DeltaContent(content=f"\n\n**Error:** {error_msg}"),
@@ -932,7 +937,7 @@ async def stream_chunks(
 
             full_response_parts.append(item)
             chunk = ChatCompletionChunk(
-                model=request.model,
+                model=stream_model,
                 choices=[ChunkChoice(
                     index=0,
                     delta=DeltaContent(content=item),
@@ -976,7 +981,7 @@ async def stream_chunks(
             # backslashes as escape characters (e.g. \.out → .out on Windows).
             file_link = f"\n\n[{Path(written_path).name}]({Path(written_path).as_posix()})"
             write_chunk = ChatCompletionChunk(
-                model=request.model,
+                model=stream_model,
                 choices=[ChunkChoice(
                     index=0,
                     delta=DeltaContent(content=file_link),
@@ -1032,7 +1037,7 @@ async def stream_chunks(
 
     # Final chunk with finish_reason (OpenAI-compatible raw data format)
     final_chunk = ChatCompletionChunk(
-        model=request.model,
+        model=stream_model,
         choices=[ChunkChoice(
             index=0,
             delta=DeltaContent(),

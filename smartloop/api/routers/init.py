@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from smartloop.api.config import api_settings
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.config import SUPPORTED_MODELS
+from smartloop.constants import display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
 from smartloop.platform import auth as platform_auth, get_platform_service
@@ -87,7 +88,7 @@ async def _download_and_stream(downloader, model_id: str, model_name: str,
             d["message"] = f"Downloading {progress.filename}... {d['percent']}%"
         progress_queue.put(d)
 
-    yield _sse_event({"status": "downloading", "message": f"Downloading model {model_name}..."})
+    yield _sse_event({"status": "downloading", "message": f"Downloading model {display_model_name(model_name)}..."})
 
     loop = asyncio.get_event_loop()
 
@@ -122,7 +123,7 @@ async def _download_and_stream(downloader, model_id: str, model_name: str,
 
     download_task.result()
 
-    yield _sse_event({"status": "download_complete", "message": f"Model {model_name} downloaded."})
+    yield _sse_event({"status": "download_complete", "message": f"Model {display_model_name(model_name)} downloaded."})
 
 
 async def _load_orchestrator_and_stream(model_service):
@@ -134,7 +135,7 @@ async def _load_orchestrator_and_stream(model_service):
     downloaded model is loaded lazily on demand for ModelTier.LARGE steps.
     """
     name = api_settings.default_model
-    yield _sse_event({"status": "loading", "message": f"Loading orchestrator model {name}..."})
+    yield _sse_event({"status": "loading", "message": f"Loading orchestrator model {display_model_name(name)}..."})
 
     loop = asyncio.get_event_loop()
     load_task = loop.run_in_executor(None, model_service.load_model)
@@ -146,7 +147,7 @@ async def _load_orchestrator_and_stream(model_service):
     load_task.result()  # propagate any load error to the stream
     yield _sse_event({
         "status": "model_loaded",
-        "message": f"Orchestrator model {model_service._model_name} loaded.",
+        "message": f"Orchestrator model {display_model_name(model_service._model_name)} loaded.",
     })
 
 
@@ -230,7 +231,7 @@ async def init(
         try:
             # 1. Download if needed
             if _gguf_exists(model_dir):
-                yield _sse_event({"status": "model_ready", "message": f"Model {target} already available."})
+                yield _sse_event({"status": "model_ready", "message": f"Model {display_model_name(target)} already available."})
                 if not ws_model.downloaded:
                     ws_model.downloaded = True
                 model_service._model.save()
@@ -259,9 +260,9 @@ async def init(
 
             # 5. Load model (only if a GGUF is available)
             if not _gguf_exists(model_dir):
-                yield _sse_event({"status": "download_complete", "message": f"Model {target} downloaded. Build a GGUF to load it."})
+                yield _sse_event({"status": "download_complete", "message": f"Model {display_model_name(target)} downloaded. Build a GGUF to load it."})
             elif model_service._llm is not None and model_service._model_name == api_settings.default_model:
-                yield _sse_event({"status": "model_loaded", "message": f"Orchestrator model {model_service._model_name} already loaded."})
+                yield _sse_event({"status": "model_loaded", "message": f"Orchestrator model {display_model_name(model_service._model_name)} already loaded."})
             else:
                 async for event in _load_orchestrator_and_stream(model_service):
                     yield event
@@ -340,7 +341,7 @@ async def bootstrap(
                         break
 
             if existing_model_name:
-                yield _sse_event({"status": "model_ready", "message": f"Model {existing_model_name} already available."})
+                yield _sse_event({"status": "model_ready", "message": f"Model {display_model_name(existing_model_name)} already available."})
             else:
                 # 3. Bootstrap download (GGUF only, no build needed)
                 downloader = SLPArtifactDownloader(workspace, logger)

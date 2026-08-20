@@ -11,14 +11,22 @@ import io
 import logging
 import logging.handlers
 import multiprocessing
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
 
+import pytest
+
+import smartloop.utils.logging_setup as logging_setup
 from smartloop.utils.logging_setup import (
     DEFAULT_FORMAT,
+    get_log_queue,
     make_log_queue,
     setup_root_logging,
+    shutdown_logging,
     start_listener,
     worker_setup_logging,
 )
@@ -173,3 +181,61 @@ def test_log_level_debug_lifts_smartloop_gag(monkeypatch, tmp_path):
         assert logging.getLogger("smartloop").level == logging.DEBUG
     finally:
         listener.stop()
+
+
+# --------------------------------------------------------------------------
+# Shutdown releases the queue's OS resources
+# --------------------------------------------------------------------------
+
+def test_shutdown_logging_closes_queue_and_detaches_handler(monkeypatch):
+    """``shutdown_logging`` drops the QueueHandler and closes the mp queue."""
+    monkeypatch.setattr(logging_setup, "_LOG_QUEUE", None)
+    queue = make_log_queue()
+    setup_root_logging(queue, level="DEBUG")
+    listener, _ = _make_capturing_listener(queue)
+
+    shutdown_logging(listener)
+
+    root = logging.getLogger()
+    assert not [h for h in root.handlers
+                if isinstance(h, logging.handlers.QueueHandler)]
+    assert get_log_queue() is None
+    # A closed multiprocessing.Queue refuses further writes.
+    with pytest.raises(ValueError):
+        queue.put("after close")
+
+
+def test_shutdown_logging_is_idempotent(monkeypatch):
+    """Called twice (lifespan shutdown + a retry path) it must not raise."""
+    monkeypatch.setattr(logging_setup, "_LOG_QUEUE", None)
+    queue = make_log_queue()
+    setup_root_logging(queue, level="DEBUG")
+    shutdown_logging()
+    shutdown_logging()
+    assert get_log_queue() is None
+
+
+def test_shutdown_logging_prevents_leaked_semaphores():
+    """No ``leaked semaphore objects`` warning when the process dies abruptly.
+
+    A ``multiprocessing.Queue`` holds three POSIX semaphores that are unlinked
+    by exit finalizers.  ``slp agent stop`` escalates to SIGKILL, which skips
+    them — ``os._exit`` reproduces that here.  ``shutdown_logging`` must have
+    already released them, so the resource tracker finds nothing to warn about.
+    """
+    prog = textwrap.dedent(
+        """
+        import os
+        from smartloop.utils.logging_setup import (
+            get_log_queue, make_log_queue, setup_root_logging, shutdown_logging,
+        )
+        make_log_queue()
+        setup_root_logging(get_log_queue())
+        shutdown_logging()
+        os._exit(0)
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", prog], capture_output=True, text=True, timeout=120,
+    )
+    assert "leaked semaphore" not in proc.stderr, proc.stderr
