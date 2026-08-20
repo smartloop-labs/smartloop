@@ -1,4 +1,5 @@
 """Llama Cpp wrapper class"""
+import threading
 import time
 import re
 import logging
@@ -12,12 +13,49 @@ from llama_cpp import Llama
 
 from .base_llm import BaseLLM
 
+# Attribute the per-context lock is stashed under on the ``Llama`` object, and
+# the guard that makes creating it race-free.
+_LOCK_ATTR = "_slp_context_lock"
+_LOCK_REGISTRY_LOCK = threading.Lock()
+
 class LlamaCpp(BaseLLM[Llama]):
     """Llama wrapper"""
     temperature: float = 0.3
     def __init__(self, model: Llama, tokenizer: Any, logger: logging.Logger, project_id: str, is_training: bool = False):
         super().__init__(model=model, tokenizer=tokenizer, logger=logger, project_id=project_id, is_training=is_training)
     
+    def _context_lock(self) -> "threading.RLock":
+        """The lock serializing generation on this llama.cpp context.
+
+        A ``Llama`` context is NOT thread-safe — one KV cache, one token
+        buffer, one sampler — so two concurrent ``create_chat_completion``
+        calls corrupt the heap and segfault the process.  Callers reach the
+        model from many threads: the DAG's node pool, the collect fan-out in
+        :meth:`Explorer.collect_parallel`, MCP tool selection and argument
+        extraction.  Their own locks — ``DAGExecutor._llm_lock`` and
+        ``ModelService._inference_lock`` — are separate objects guarding
+        different subsets of those callers, so neither excludes the other, and
+        several call sites take no lock at all.  Serializing here is what makes
+        the model safe whoever calls it, mirroring
+        :class:`~smartloop.db.llama_embeddings.LlamaEmbedder`.
+
+        Held only around generation.  ``tokenize``/``detokenize`` run on the
+        vocab (``Llama._model``) rather than the context and need no guard.
+
+        The lock lives on the ``Llama`` object, not on this wrapper, so two
+        wrappers over one context still share one lock.  It is reentrant:
+        generation tokenizes through :meth:`_fit_prompt` and
+        :meth:`get_num_tokens` while already holding it.
+        """
+        lock = getattr(self.model, _LOCK_ATTR, None)
+        if lock is None:
+            with _LOCK_REGISTRY_LOCK:
+                lock = getattr(self.model, _LOCK_ATTR, None)
+                if lock is None:
+                    lock = threading.RLock()
+                    setattr(self.model, _LOCK_ATTR, lock)
+        return lock
+
     def __del__(self):
         """Clean up model resources, handling llama-cpp-python cleanup issues"""
         try:
@@ -119,67 +157,68 @@ class LlamaCpp(BaseLLM[Llama]):
         **kwargs: Any,
     ) -> str:
         """Run the LLM on the given input."""
-        start_time = time.time()
-        prompt = self._fit_prompt(prompt)
-        prompt_tokens = self.get_num_tokens(prompt)
-        self.logger.info(f"Generating response | prompt_tokens={prompt_tokens}")
+        with self._context_lock():
+            start_time = time.time()
+            prompt = self._fit_prompt(prompt)
+            prompt_tokens = self.get_num_tokens(prompt)
+            self.logger.info(f"Generating response | prompt_tokens={prompt_tokens}")
 
-        try:
-            messages = self.create_messages_from_prompt(prompt)
-            requested_max = kwargs.get("max_tokens")
-            available_tokens = (
-                requested_max if requested_max is not None
-                else self._get_available_tokens(prompt)
-            )
-            # Stream internally so generation can be interrupted between
-            # tokens when the request is cancelled. stream=False is a single
-            # blocking call that cannot be halted once started.
-            stream = self.model.create_chat_completion(
-                messages=messages,
-                max_tokens=available_tokens,
-                temperature=self.temperature,
-                repeat_penalty=1.2,
-                frequency_penalty=0.1,
-                presence_penalty=0.1,
-                stream=True
-            )
+            try:
+                messages = self.create_messages_from_prompt(prompt)
+                requested_max = kwargs.get("max_tokens")
+                available_tokens = (
+                    requested_max if requested_max is not None
+                    else self._get_available_tokens(prompt)
+                )
+                # Stream internally so generation can be interrupted between
+                # tokens when the request is cancelled. stream=False is a single
+                # blocking call that cannot be halted once started.
+                stream = self.model.create_chat_completion(
+                    messages=messages,
+                    max_tokens=available_tokens,
+                    temperature=self.temperature,
+                    repeat_penalty=1.2,
+                    frequency_penalty=0.1,
+                    presence_penalty=0.1,
+                    stream=True
+                )
 
-            parts: List[str] = []
-            chunk_count = 0
-            cancelled = False
-            for chunk in stream:
-                # Check for cancellation between chunks.
-                if self._cancelled is not None and self._cancelled.is_set():
-                    cancelled = True
-                    break
+                parts: List[str] = []
+                chunk_count = 0
+                cancelled = False
+                for chunk in stream:
+                    # Check for cancellation between chunks.
+                    if self._cancelled is not None and self._cancelled.is_set():
+                        cancelled = True
+                        break
 
-                text = ""
-                if isinstance(chunk, dict) and chunk.get('choices'):
-                    choice = chunk['choices'][0]
-                    if 'delta' in choice and 'content' in choice['delta']:
-                        text = choice['delta']['content'] or ""
-                    elif 'message' in choice and 'content' in choice['message']:
-                        text = choice['message']['content'] or ""
-                    elif 'text' in choice:
-                        text = choice['text'] or ""
+                    text = ""
+                    if isinstance(chunk, dict) and chunk.get('choices'):
+                        choice = chunk['choices'][0]
+                        if 'delta' in choice and 'content' in choice['delta']:
+                            text = choice['delta']['content'] or ""
+                        elif 'message' in choice and 'content' in choice['message']:
+                            text = choice['message']['content'] or ""
+                        elif 'text' in choice:
+                            text = choice['text'] or ""
 
-                if text:
-                    parts.append(text)
-                    chunk_count += 1
+                    if text:
+                        parts.append(text)
+                        chunk_count += 1
 
-            elapsed = time.time() - start_time
-            self.logger.info(
-                f"{'Cancelled' if cancelled else 'Completed'} | "
-                f"chunks={chunk_count} elapsed={elapsed:.3f}s"
-            )
-            return re.sub(r'[\t]+', "", "".join(parts).strip())
-        except Exception as ex:
-            self.logger.error(f"Generation failed: {ex}")
-        finally:
-            elapsed = time.time() - start_time
-            self.logger.info(f"Total elapsed={elapsed:.3f}s")
+                elapsed = time.time() - start_time
+                self.logger.info(
+                    f"{'Cancelled' if cancelled else 'Completed'} | "
+                    f"chunks={chunk_count} elapsed={elapsed:.3f}s"
+                )
+                return re.sub(r'[\t]+', "", "".join(parts).strip())
+            except Exception as ex:
+                self.logger.error(f"Generation failed: {ex}")
+            finally:
+                elapsed = time.time() - start_time
+                self.logger.info(f"Total elapsed={elapsed:.3f}s")
 
-        return ""
+            return ""
 
     def _stream(
         self,
@@ -193,60 +232,61 @@ class LlamaCpp(BaseLLM[Llama]):
         Returns:
             An iterator of GenerationChunks.
         """
+        with self._context_lock():
 
-        # Use create_chat_completion with stream=True to get streaming response
-        # This automatically applies the model's chat template
-        prompt = self._fit_prompt(prompt)
-        messages = self.create_messages_from_prompt(prompt)
-        available_tokens = self._get_available_tokens(prompt)
+            # Use create_chat_completion with stream=True to get streaming response
+            # This automatically applies the model's chat template
+            prompt = self._fit_prompt(prompt)
+            messages = self.create_messages_from_prompt(prompt)
+            available_tokens = self._get_available_tokens(prompt)
 
-        stream = self.model.create_chat_completion(
-            messages=messages,
-            max_tokens=available_tokens,
-            temperature=self.temperature,
-            repeat_penalty=1.1,
-            frequency_penalty=0.0,
-            presence_penalty=0.0,
-            stream=True
-        )
+            stream = self.model.create_chat_completion(
+                messages=messages,
+                max_tokens=available_tokens,
+                temperature=self.temperature,
+                repeat_penalty=1.1,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                stream=True
+            )
 
-        chunk_count = 0
-        for chunk in stream:
-            # Check for cancellation between chunks
-            if self._cancelled is not None and self._cancelled.is_set():
-                break
+            chunk_count = 0
+            for chunk in stream:
+                # Check for cancellation between chunks
+                if self._cancelled is not None and self._cancelled.is_set():
+                    break
 
-            chunk_count += 1
-            # Extract text from llama_cpp CreateChatCompletionStreamResponse format
-            text = ""
+                chunk_count += 1
+                # Extract text from llama_cpp CreateChatCompletionStreamResponse format
+                text = ""
 
-            if isinstance(chunk, dict) and 'choices' in chunk:
-                if chunk['choices'] and len(chunk['choices']) > 0:
-                    choice = chunk['choices'][0]
-                    # For chat completion streaming, text is in delta.content
-                    if 'delta' in choice and 'content' in choice['delta']:
-                        text = choice['delta']['content']
-                    elif 'message' in choice and 'content' in choice['message']:
-                        text = choice['message']['content']
-                    # Fallback to text field for compatibility
-                    elif 'text' in choice:
-                        text = choice['text']
-            else:
-                text = str(chunk)
+                if isinstance(chunk, dict) and 'choices' in chunk:
+                    if chunk['choices'] and len(chunk['choices']) > 0:
+                        choice = chunk['choices'][0]
+                        # For chat completion streaming, text is in delta.content
+                        if 'delta' in choice and 'content' in choice['delta']:
+                            text = choice['delta']['content']
+                        elif 'message' in choice and 'content' in choice['message']:
+                            text = choice['message']['content']
+                        # Fallback to text field for compatibility
+                        elif 'text' in choice:
+                            text = choice['text']
+                else:
+                    text = str(chunk)
 
-            # Only yield non-empty text chunks
-            if text:
-                # Create GenerationChunk from the text
-                generation_chunk = GenerationChunk(text=text)
+                # Only yield non-empty text chunks
+                if text:
+                    # Create GenerationChunk from the text
+                    generation_chunk = GenerationChunk(text=text)
 
-                # Notify run manager if available
-                if run_manager:
-                    run_manager.on_llm_new_token(generation_chunk.text, chunk=generation_chunk)
+                    # Notify run manager if available
+                    if run_manager:
+                        run_manager.on_llm_new_token(generation_chunk.text, chunk=generation_chunk)
 
-                yield generation_chunk
+                    yield generation_chunk
 
-        if chunk_count == 0:
-            self.logger.warning("No chunks received from stream")
+            if chunk_count == 0:
+                self.logger.warning("No chunks received from stream")
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:
