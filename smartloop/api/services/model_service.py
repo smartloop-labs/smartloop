@@ -518,9 +518,11 @@ class ModelService:
 
         from smartloop.llms.llm_factory import LlmFactory
         workspace = self._model.workspace
+        project = workspace.current_project
         candidates = [
             m for m in workspace.models
-            if m.enabled and m.downloaded
+            if workspace.effective_model_enabled(m.model_name, project)
+            and workspace.effective_model_downloaded(m.model_name)
             and ModelCapability.VISION in m.effective_capabilities
         ]
         # Smallest first: lowest latency OCR; same-size ties broken by cap overlap then version.
@@ -643,15 +645,13 @@ class ModelService:
             )
             return None
         workspace = self._model.workspace
-        cap_lower = capability.lower()
-        _candidates = [
-            m for m in workspace.models
-            if m.enabled and m.downloaded and m.param_size_b > 0
-            and cap_lower in [c.lower() for c in m.effective_capabilities]
-        ]
-        for m in _candidates:
-            m.models_dir = workspace.models_dir
-        ranked = self._ranked_candidates(_candidates, ref_caps={capability})
+        # Candidate selection is project-scoped (per-project model settings
+        # override the workspace defaults); re-rank so same-size models with
+        # broader capability coverage lead.
+        ranked = self._ranked_candidates(
+            workspace.ranked_models_for(capability, workspace.current_project),
+            ref_caps={capability},
+        )
         if not ranked:
             logger.warning(
                 "[capability-model] No enabled+downloaded model declares "
@@ -857,6 +857,7 @@ class ModelService:
             return
         try:
             workspace = self._model.workspace
+            project = workspace.current_project
             # Compare against the orchestrator model (the loaded small model),
             # not the workspace-active model: the large model is whatever
             # downloaded model is bigger than the orchestrator model (e.g. the
@@ -872,7 +873,8 @@ class ModelService:
             _text_caps = {ModelCapability.GENERAL, ModelCapability.SKILLS, ModelCapability.DP}
             agent_models = [
                 m for m in workspace.models
-                if m.enabled and m.downloaded
+                if workspace.effective_model_enabled(m.model_name, project)
+                and workspace.effective_model_downloaded(m.model_name)
                 and m.model_name != self._model_name
                 and _text_caps & set(m.effective_capabilities)
             ]
@@ -2695,6 +2697,9 @@ class ModelService:
             system=system,
             skills=skills or [],
         )
+        # Seed the project's model settings from the workspace (app-default)
+        # model registry so the project sidebar starts from the defaults.
+        workspace.sync_project_models(project)
         self._model.workspace.projects.append(project)
         self._model.save()
 
@@ -2890,6 +2895,18 @@ class ModelService:
                 llm.model.close()
         except Exception:
             pass
+
+    def mark_model_downloaded(self, model_name: str) -> None:
+        """Record that *model_name*'s weights are present in the workspace.
+
+        Weights live in one shared ``models_dir`` and are added or removed for
+        the whole workspace, so this is a single workspace-level flag — there
+        is no per-project download state to keep in step with it.
+        """
+        workspace = self._model.workspace if self._model is not None else self._ensure_workspace()
+        ws = workspace.get_model(model_name)
+        if ws is not None:
+            ws.downloaded = True
 
     def _cleanup_gpu_cache(self):
         """Clear GPU cache to free up memory after unloading models."""
@@ -3960,14 +3977,19 @@ class ModelService:
                 executor=self._get_llm_executor(),
             )
             workspace = self._model.workspace
+            project = workspace.current_project
             caps: list[str] = []
             for m in workspace.models:
-                if m.enabled and m.downloaded:
+                if (workspace.effective_model_enabled(m.model_name, project)
+                        and workspace.effective_model_downloaded(m.model_name)):
                     caps.extend(m.effective_capabilities)
             available_capabilities = list(dict.fromkeys(caps))
             logger.info(
                 "[caps] models=%s available_capabilities=%s",
-                [(m.model_name, m.enabled, m.downloaded, m.effective_capabilities)
+                [(m.model_name,
+                  workspace.effective_model_enabled(m.model_name, project),
+                  workspace.effective_model_downloaded(m.model_name),
+                  m.effective_capabilities)
                  for m in workspace.models],
                 available_capabilities,
             )
