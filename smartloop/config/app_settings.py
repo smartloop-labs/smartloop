@@ -8,6 +8,7 @@ from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from smartloop.auth import credential_store     
+from smartloop.constants import BOOTSTRAP_MODEL, canonical_model_name
 
 class AppSettings(BaseSettings):
     """Application settings using Pydantic"""
@@ -20,7 +21,7 @@ class AppSettings(BaseSettings):
     )
 
     # LLM Configuration
-    model_name: str = Field(default='slp-orchestra-mini', validation_alias='slp_base_model_name')
+    model_name: str = Field(default=BOOTSTRAP_MODEL, validation_alias='slp_base_model_name')
     # Project ID
     project_id: Optional[str] = Field(default="d4c8f5a2-7b3e-4f91-a6d2-8e9c1b4a7f3d", validation_alias="slp_project_id")
     # Load quantized model
@@ -54,7 +55,7 @@ class AppSettings(BaseSettings):
     api_port: int = Field(default=38540, validation_alias="slp_api_port")
     # Model Configuration
     preload_model: bool = Field(default=True, validation_alias="slp_api_preload_model")
-    default_model: str = Field(default="slp-orchestra-mini", validation_alias="slp_api_base_model_name")
+    default_model: str = Field(default=BOOTSTRAP_MODEL, validation_alias="slp_api_base_model_name")
     debug_mode: bool = Field(default=False, validation_alias="slp_api_debug_mode")
     # CORS Configuration
     cors_origins: str = Field(default="*", validation_alias="slp_api_cors_origins")
@@ -208,6 +209,11 @@ class AppSettings(BaseSettings):
             self.developer_token = credential_store.get_active_token()
         if self.n_llm_workers is None:
             self.n_llm_workers = self.n_parallel
+        # An existing .env may still name the orchestrator model by its old id;
+        # normalize here so the rest of the framework only ever sees the
+        # canonical name.
+        self.model_name = canonical_model_name(self.model_name)
+        self.default_model = canonical_model_name(self.default_model)
         return self
 
     @property

@@ -10,9 +10,10 @@ from typing import Any, ClassVar, Dict, Optional, Set, List
 from pathlib import Path
 
 from uuid import uuid4
-from pydantic import BaseModel, computed_field, ConfigDict, Field
+from pydantic import BaseModel, computed_field, ConfigDict, Field, field_validator
 from smartloop.config import ModelConfig, AppSettings
 from smartloop.config import SUPPORTED_MODELS
+from smartloop.constants import canonical_model_name
 from smartloop.types import ModelCapability
 from smartloop.workspace.types import Document, DocumentInfo, DocumentStatus, Skill
 
@@ -90,14 +91,27 @@ class WorkspaceModel(BaseModel):
     """A model registered in the workspace."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    model_name: str        # key name e.g. "gemma3_it_text"
-    model_id: str          # HF id e.g. "google/gemma-3-1b-it"
+    model_name: str        # short name e.g. "sl-mini"
+    model_id: str          # HF id e.g. "smartloop-ai/slp-orchestra-mini"
     downloaded: bool = False
     is_active: bool = False
     enabled: bool = True
     capabilities: List[str] = Field(default_factory=list)
     config: Optional[ModelConfig] = None
     models_dir: str = Field(default="", exclude=True)
+
+    @field_validator("model_name")
+    @classmethod
+    def _canonicalize_model_name(cls, value: str) -> str:
+        """Migrate a record written under a model's old short name.
+
+        Runs on every load of an existing ``config.json``, so a workspace
+        created before ``slp-orchestra-mini`` was renamed to ``sl-mini`` reports
+        the current name and picks up the new one on the next save.  ``model_id``
+        is deliberately left alone — it names the on-disk model directory, so
+        rewriting it would orphan already-downloaded weights.
+        """
+        return canonical_model_name(value)
 
     @property
     def model_dir(self) -> str:
@@ -329,36 +343,56 @@ class Workspace(BaseModel):
 
     def set_active_model(self, model_name: str) -> None:
         """Mark the given model as active, deactivating all others."""
+        target = canonical_model_name(model_name)
         for m in self.models:
-            m.is_active = (m.model_name == model_name)
+            m.is_active = (canonical_model_name(m.model_name) == target)
 
     def set_model_enabled(self, model_name: str, enabled: bool) -> None:
         """Enable or disable a model. Raises ValueError if not found."""
+        target = canonical_model_name(model_name)
         for m in self.models:
-            if m.model_name == model_name:
+            if canonical_model_name(m.model_name) == target:
                 m.enabled = enabled
                 return
         raise ValueError(f"Model not found: {model_name}")
 
     def get_model(self, model_name: Optional[str] = None) -> Optional[WorkspaceModel]:
         """Look up a registered model by its short name.
-        If *model_name* is ``None``, returns the default model.
+
+        If *model_name* is ``None``, returns the default model.  Matching is
+        alias-aware, so a record written under a model's old name (e.g. a
+        workspace from before ``slp-orchestra-mini`` became ``sl-mini``) is found
+        by its current name and vice versa.
         """
-        result = None
         if model_name is None:
             model_name = AppSettings().default_model
-        model_name = SUPPORTED_MODELS.get(model_name)
+        target = canonical_model_name(model_name)
+        target_cls = SUPPORTED_MODELS.get(target)
+
+        result = None
         for m in self.models:
-            if SUPPORTED_MODELS.get(m.model_name) == model_name:
+            # Compare by class where both sides are known models, so two names
+            # for the same model still match; otherwise fall back to the name,
+            # which keeps unknown (user-added) models from colliding with each
+            # other on a shared ``None`` class.
+            if canonical_model_name(m.model_name) == target:
+                result = m
+                break
+            if target_cls is not None and SUPPORTED_MODELS.get(m.model_name) is target_cls:
                 result = m
                 break
         if result is not None:
             result.models_dir = self.models_dir
-        
+
         return result
 
     def add_model(self, model_name: str, model_id: str, config: Optional[ModelConfig] = None) -> WorkspaceModel:
-        """Register a model in the workspace without changing the active model."""
+        """Register a model in the workspace without changing the active model.
+
+        The record is stored under the canonical name, so a legacy name coming
+        from the cloud catalog is not written back into ``config.json``.
+        """
+        model_name = canonical_model_name(model_name)
         existing = self.get_model(model_name)
         if existing is not None:
             if config is not None:

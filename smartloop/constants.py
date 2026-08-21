@@ -78,22 +78,70 @@ def resolve_current_date(user_date=None, tz=None):
     return date.today().strftime(CURRENT_DATE_FORMAT)
 
 # ---------------------------------------------------------------------------
-# Public-facing model names
+# Model names
 # ---------------------------------------------------------------------------
-# The internal id keys the on-disk model directory, the workspace records and
-# the HuggingFace repo, so it can't be renamed without breaking existing
-# installs.  Streams a user actually reads — the chat SSE chunks and the
-# /v1/init progress events — show the short public name instead.
-MODEL_DISPLAY_NAMES = {
-    "slp-orchestra-mini": "sl-mini",
+# Three distinct identifiers exist for a model and they are NOT interchangeable:
+#
+#   canonical name  the short id used across the framework — SUPPORTED_MODELS
+#                   keys, workspace records, settings, API request/response
+#                   fields.  ``sl-mini``.
+#   platform name   what the cloud catalog and the release bucket publish.
+#                   Still ``slp-orchestra-mini``: the upstream artifacts have
+#                   not been renamed, so downloads must keep asking for the old
+#                   name (see :func:`platform_model_name`).
+#   model_id        the HuggingFace-style repo id, which also names the on-disk
+#                   model directory (``smartloop-ai/slp-orchestra-mini``).
+#                   Renaming it would orphan every already-downloaded model, so
+#                   it stays put — see ``GemmaItTextModel.model_id``.
+#
+# The orchestrator model was renamed ``slp-orchestra-mini`` -> ``sl-mini``.  The
+# old name still arrives from existing workspace ``config.json`` records, user
+# ``.env`` overrides and the cloud catalog, so it is accepted everywhere as an
+# alias and normalized on the way in by :func:`canonical_model_name`.
+BOOTSTRAP_MODEL = "sl-mini"
+
+# Legacy (or otherwise deprecated) short name -> canonical short name.
+MODEL_NAME_ALIASES = {
+    "slp-orchestra-mini": BOOTSTRAP_MODEL,
+}
+
+# Canonical short name -> the name the platform API / bucket still publishes.
+# Only needed while the two disagree; drop an entry once upstream is renamed.
+PLATFORM_MODEL_NAMES = {
+    BOOTSTRAP_MODEL: "slp-orchestra-mini",
 }
 
 
-def display_model_name(name):
-    """Return the public-facing name for an internal model id.
+def canonical_model_name(name):
+    """Normalize a short model name to its canonical form.
 
-    Unknown ids (user-added workspace models) pass through unchanged.
+    Accepts legacy names so config written by an older build, an ``.env``
+    override or the cloud catalog keeps resolving.  Unknown names (user-added
+    workspace models) pass through unchanged.
     """
     if not name:
         return name
-    return MODEL_DISPLAY_NAMES.get(name, name)
+    return MODEL_NAME_ALIASES.get(name, name)
+
+
+def platform_model_name(name):
+    """Return the name to use when talking to the platform API / bucket.
+
+    ``sl-mini`` does not exist upstream yet, so its artifacts are still fetched
+    under ``slp-orchestra-mini``.  Names without a mapping pass through, after
+    canonicalization, unchanged.
+    """
+    if not name:
+        return name
+    canonical = canonical_model_name(name)
+    return PLATFORM_MODEL_NAMES.get(canonical, canonical)
+
+
+def display_model_name(name):
+    """Return the public-facing name for a short model name.
+
+    Streams a user actually reads — the chat SSE chunks and the /v1/init
+    progress events — go through this, so a legacy name recorded in an existing
+    workspace is still shown as ``sl-mini``.
+    """
+    return canonical_model_name(name)

@@ -1,9 +1,12 @@
 """The public model name shown in SSE streams.
 
-The internal id ``slp-orchestra-mini`` keys the on-disk model directory, the
-workspace records and the HuggingFace repo, so it can't be renamed.  Anything
-a user reads — the chat completion chunks and the /v1/init progress events —
-shows the short public name ``sl-mini`` instead.
+The orchestrator model is now named ``sl-mini`` throughout the framework, but
+the old ``slp-orchestra-mini`` still turns up — in workspace records written by
+an earlier build, in ``.env`` overrides, and inside the ``model_id`` that keys
+the on-disk model directory and the HuggingFace repo (which is deliberately
+never renamed).  Anything a user reads — the chat completion chunks and the
+/v1/init progress events — shows ``sl-mini`` regardless.  See
+tests/unit/test_model_name_aliases.py for the rest of the rename.
 """
 import ast
 import json
