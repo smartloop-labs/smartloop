@@ -274,6 +274,15 @@ async def _register_remote_mcp_server(
             )
             scope = " ".join(scopes) if scopes else None
 
+            # RFC 8707 resource indicator, required by MCP auth (rev 2025-06-18).
+            # Prefer the identifier the resource server publishes for itself; fall
+            # back to the canonical server URL when it publishes no PRM. Servers
+            # that predate the requirement ignore the extra parameter (RFC 6749
+            # §3.1 and §3.2 both mandate ignoring unrecognized ones).
+            resource = (prm.resource if prm else None) or oauth.canonical_resource(
+                clean_url
+            )
+
             auth_url = oauth.build_authorization_url(
                 authorization_endpoint=oauth_metadata.authorization_endpoint,
                 client_id=registration.client_id,
@@ -281,6 +290,7 @@ async def _register_remote_mcp_server(
                 state=state,
                 code_challenge=code_challenge,
                 scope=scope,
+                resource=resource,
             )
 
         # Store session for the GET callback to use
@@ -293,6 +303,7 @@ async def _register_remote_mcp_server(
             "client_secret": registration.client_secret,
             "token_endpoint": oauth_metadata.token_endpoint,
             "authorization_endpoint": oauth_metadata.authorization_endpoint,
+            "resource": resource,
             "callback_url": callback_url,
             "name": (curated.display_name if curated else None) or request.name,
             "return_url": request.return_url,
@@ -313,6 +324,7 @@ async def _register_remote_mcp_server(
             client_secret=registration.client_secret,
             token_endpoint=oauth_metadata.token_endpoint,
             authorization_endpoint=oauth_metadata.authorization_endpoint,
+            resource=resource,
         )
     except HTTPException:
         raise
@@ -468,6 +480,7 @@ async def mcp_oauth_callback(
                 client_id=session["client_id"],
                 code_verifier=session["code_verifier"],
                 client_secret=session.get("client_secret"),
+                resource=session.get("resource"),
             )
 
         expires_at = (
@@ -510,6 +523,7 @@ async def mcp_oauth_callback(
             ],
             token_endpoint=session["token_endpoint"],
             authorization_endpoint=session["authorization_endpoint"],
+            resource=session.get("resource"),
             client_id=session["client_id"],
             client_secret=session.get("client_secret"),
             access_token=token_response.access_token,
@@ -594,6 +608,7 @@ async def complete_mcp_oauth(
                 client_id=request.client_id,
                 code_verifier=request.code_verifier,
                 client_secret=request.client_secret,
+                resource=request.resource,
             )
 
         expires_at = (
@@ -625,6 +640,7 @@ async def complete_mcp_oauth(
             ],
             token_endpoint=request.token_endpoint,
             authorization_endpoint=request.authorization_endpoint,
+            resource=request.resource,
             client_id=request.client_id,
             client_secret=request.client_secret,
             access_token=token_response.access_token,

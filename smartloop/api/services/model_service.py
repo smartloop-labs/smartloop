@@ -3083,6 +3083,7 @@ class ModelService:
         token: str | None = None,
         token_endpoint: str | None = None,
         authorization_endpoint: str | None = None,
+        resource: str | None = None,
         client_id: str | None = None,
         client_secret: str | None = None,
         access_token: str | None = None,
@@ -3135,6 +3136,7 @@ class ModelService:
                 token=token,
                 token_endpoint=token_endpoint,
                 authorization_endpoint=authorization_endpoint,
+                resource=resource,
             ),
             oauth_credentials=oauth_creds,
             tools=[
