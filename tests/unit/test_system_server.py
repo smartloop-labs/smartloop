@@ -2,7 +2,9 @@
 file-write/grep), invoked the same way the orchestrator invokes it — a real
 stdio subprocess via LocalMCPClient, with ``cwd`` set to the work dir."""
 
+import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -118,3 +120,31 @@ def test_bash_timeout_is_error(tmp_path):
         r = c.call_tool("bash", {"command": "sleep 5", "timeout": 1})
         assert r.is_error
         assert "timed out" in _text(r)
+
+
+def test_bash_cwd_relative_subdir_is_honoured(tmp_path):
+    """A relative cwd resolves against the work dir and is used as-is."""
+    (tmp_path / "sub").mkdir()
+    with _client(tmp_path) as c:
+        r = c.call_tool("bash", {"command": "pwd", "cwd": "sub"})
+        assert r.success
+        assert os.path.realpath(tmp_path / "sub") in _text(r)
+
+
+@pytest.mark.parametrize("escape", ["..", "../..", "/", "~", str(Path.home())])
+def test_bash_cwd_outside_work_dir_is_clamped(tmp_path, escape):
+    """A cwd pointing outside the project dir — traversal, absolute, or the
+    user's home — is dropped in favour of the work dir itself."""
+    with _client(tmp_path) as c:
+        r = c.call_tool("bash", {"command": "pwd", "cwd": escape})
+        assert r.success
+        assert _text(r).strip().endswith(os.path.realpath(tmp_path))
+
+
+def test_bash_cwd_missing_dir_falls_back_to_work_dir(tmp_path):
+    """An in-bounds path that does not exist still runs, from the work dir,
+    rather than failing to spawn."""
+    with _client(tmp_path) as c:
+        r = c.call_tool("bash", {"command": "pwd", "cwd": "no/such/dir"})
+        assert r.success
+        assert _text(r).strip().endswith(os.path.realpath(tmp_path))

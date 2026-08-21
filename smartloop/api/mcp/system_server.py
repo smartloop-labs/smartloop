@@ -31,16 +31,46 @@ def _extract_fenced_content(text: str) -> str:
     return text
 
 
+def _clamp_cwd(cwd: Optional[str]) -> str:
+    """Resolve a model-supplied ``cwd`` inside the project dir.
+
+    The server's own working directory *is* ``project_dir`` — LocalMCPClient
+    spawns this subprocess with ``cwd`` set to it — so it is the containment
+    root.  A relative path resolves against it; an absolute or ``~`` path that
+    lands outside it is dropped in favour of the root rather than honoured,
+    the same way the API layer ignores the client-supplied ``cwd`` (it may
+    point outside the sandbox container, or at a folder absent on a copied
+    install).  A path inside the root that does not exist falls back to the
+    root too, so bash still runs instead of failing to spawn.
+    """
+    root = os.path.realpath(os.getcwd())
+    if not cwd:
+        return root
+
+    candidate = os.path.realpath(os.path.join(root, os.path.expanduser(cwd)))
+    if candidate != root and not candidate.startswith(root + os.sep):
+        logger.warning(
+            "[bash] cwd %r resolves outside the project dir — using %s", cwd, root
+        )
+        return root
+    if not os.path.isdir(candidate):
+        logger.warning("[bash] cwd %r is not a directory — using %s", cwd, root)
+        return root
+    return candidate
+
+
 @mcp.tool(name="bash")
 async def bash(command: str, cwd: Optional[str] = None, timeout: int = 30) -> str:
     """Execute a bash command.
 
     Args:
         command: The bash command to execute.
-        cwd: Working directory for the command.
+        cwd: Working directory, relative to the project dir. Paths outside
+            it are ignored and the project dir is used instead.
         timeout: Timeout in seconds.
     """
-    logger.info(f"[bash] Executing: {command[:200]}, cwd={cwd}")
+    work_dir = _clamp_cwd(cwd)
+    logger.info(f"[bash] Executing: {command[:200]}, cwd={work_dir}")
     # A command that ran to completion is a real result even with a nonzero
     # exit code — its output (e.g. failing tests) belongs in the answer.
     # Only failures to produce a result at all (timeout, spawn error) raise.
@@ -50,7 +80,7 @@ async def bash(command: str, cwd: Optional[str] = None, timeout: int = 30) -> st
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=cwd,
+            cwd=work_dir,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"command timed out after {timeout}s")
