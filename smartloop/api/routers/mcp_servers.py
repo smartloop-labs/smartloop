@@ -2,6 +2,7 @@
 
 import logging
 import time
+from html import escape
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -233,6 +234,13 @@ async def _register_remote_mcp_server(
             return MCPRegisterResponse(auth_type="none", server=server_resp)
     except Exception:
         logger.debug("Direct connection failed for %s, trying OAuth", clean_url)
+    if connect_result is not None and not connect_result.success:
+        # A 401 here is the normal prelude to OAuth, but the detail also carries
+        # the WWW-Authenticate header and body — the only clue when the failure
+        # is a dead endpoint rather than a missing token.
+        logger.info(
+            "Direct connect to %s failed: %s", clean_url, connect_result.error
+        )
 
     # Fall back to OAuth
     try:
@@ -441,7 +449,7 @@ async def mcp_oauth_callback(
 
     if error:
         return HTMLResponse(
-            f"<html><body><h2>Authorization failed</h2><p>{error}</p>"
+            f"<html><body><h2>Authorization failed</h2><p>{escape(error)}</p>"
             "<p>You can close this window.</p></body></html>",
             status_code=400,
         )
@@ -499,9 +507,23 @@ async def mcp_oauth_callback(
 
         tools = connect_result.tools if connect_result.success else []
         if not tools:
+            # Two very different failures reach this point — the handshake was
+            # refused, or it succeeded and the server offered nothing. Collapsing
+            # both into "no tools available" hides the reason (a dead transport,
+            # a rejected token, a grant with no product scopes), so name it.
+            reason = connect_result.error or (
+                "The server completed the MCP handshake but exposes no tools. "
+                "This usually means the authorization granted no scopes."
+            )
+            logger.error(
+                "Tool discovery failed after OAuth for %s: %s",
+                session["server_url"],
+                reason,
+            )
             return HTMLResponse(
                 "<html><body><h2>Registration failed</h2>"
-                "<p>MCP server has no tools available.</p></body></html>",
+                f"<p>Could not list tools on {escape(session['server_url'])}.</p>"
+                f"<pre>{escape(reason)}</pre></body></html>",
                 status_code=400,
             )
         si = connect_result.server_info if connect_result.success else None

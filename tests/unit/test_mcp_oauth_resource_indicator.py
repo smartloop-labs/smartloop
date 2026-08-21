@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from smartloop.api.model.mcp import MCPRegisterRequest
+from smartloop.mcp.client import MCPConnectResult
 from smartloop.mcp.oauth import MCPOAuthService, ProtectedResourceMetadata, OAuthMetadata
 
 
@@ -258,3 +259,83 @@ class TestRegisterFlowPlumbing:
         _, recorded, session = self._register(None, server_url="https://mcp.example.com/mcp")
         assert recorded["resource"] == "https://mcp.example.com/mcp"
         assert session["resource"] == "https://mcp.example.com/mcp"
+
+
+class TestPostAuthDiscoveryDiagnostics:
+    """A grant can succeed and tool discovery still fail. The callback used to
+    report every such case as "MCP server has no tools available", which hid the
+    only thing that identifies the cause — Atlassian's catalog URL pointed at the
+    retired ``/v1/sse`` transport, and the 401/dead-endpoint detail was dropped.
+    """
+
+    def _callback(self, connect_result):
+        from smartloop.api.routers import mcp_servers as router_mod
+
+        class _FakeOAuth:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def exchange_code_for_tokens(self, **kwargs):
+                return MagicMock(
+                    access_token="at", token_type="Bearer",
+                    refresh_token=None, expires_in=None,
+                )
+
+        client = MagicMock()
+        client.__enter__ = MagicMock(return_value=client)
+        client.__exit__ = MagicMock(return_value=False)
+        client.connect_and_discover_tools = MagicMock(return_value=connect_result)
+
+        router_mod._pending_oauth_sessions.clear()
+        router_mod._completed_oauth_responses.clear()
+        router_mod._pending_oauth_sessions["st"] = {
+            "project_id": "p1",
+            "server_url": "https://mcp.atlassian.com/v1/sse",
+            "state": "st",
+            "code_verifier": "cv",
+            "client_id": "cid",
+            "client_secret": None,
+            "token_endpoint": "https://mcp.atlassian.com/v1/token",
+            "authorization_endpoint": "https://mcp.atlassian.com/v1/authorize",
+            "resource": "https://mcp.atlassian.com/v1/sse",
+            "callback_url": "http://localhost:38540/v1/mcp/oauth/callback",
+            "name": "Atlassian",
+            "return_url": None,
+            "description": None,
+            "tags": None,
+            "catalog_slug": "atlassian",
+        }
+        with patch("smartloop.mcp.MCPOAuthService", _FakeOAuth), patch(
+            "smartloop.mcp.MCPClient", return_value=client
+        ):
+            resp = asyncio.run(
+                router_mod.mcp_oauth_callback(
+                    code="c", state="st", model_service=MagicMock()
+                )
+            )
+        return resp.status_code, resp.body.decode()
+
+    def test_handshake_failure_reports_the_transport_error(self):
+        status, body = self._callback(
+            MCPConnectResult(success=False, error="HTTP error: 404")
+        )
+        assert status == 400
+        assert "HTTP error: 404" in body
+        assert "https://mcp.atlassian.com/v1/sse" in body
+
+    def test_empty_tool_list_says_so_rather_than_blaming_the_transport(self):
+        """Handshake fine, nothing offered — most often a grant with no scopes."""
+        status, body = self._callback(MCPConnectResult(success=True, tools=[]))
+        assert status == 400
+        assert "no tools" in body
+        assert "scopes" in body
+
+    def test_server_url_is_escaped_into_the_page(self):
+        status, body = self._callback(
+            MCPConnectResult(success=False, error="<script>x</script>")
+        )
+        assert "<script>" not in body
+        assert "&lt;script&gt;" in body
