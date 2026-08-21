@@ -74,6 +74,8 @@ class MCPRegisterResponse(BaseModel):
     client_secret: Optional[str] = None
     token_endpoint: Optional[str] = None
     authorization_endpoint: Optional[str] = None
+    # RFC 8707 resource indicator the client must echo back on the token request.
+    resource: Optional[str] = None
     server_url: Optional[str] = None
 
 
@@ -86,6 +88,7 @@ class MCPOAuthCallbackRequest(BaseModel):
     client_secret: Optional[str] = None
     token_endpoint: str
     authorization_endpoint: str
+    resource: Optional[str] = None
     callback_url: Optional[str] = None
 
 

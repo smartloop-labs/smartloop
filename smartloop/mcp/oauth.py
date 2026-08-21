@@ -250,6 +250,20 @@ class MCPOAuthService:
             ) from e
 
     @staticmethod
+    def canonical_resource(server_url: str) -> str:
+        """Canonical resource indicator (RFC 8707 §2) for an MCP server URL.
+
+        Used when the server publishes no PRM ``resource`` of its own. Lowercases
+        scheme/host and drops the fragment, which RFC 8707 forbids; the path and
+        query are significant (``/mcp`` vs ``/sse`` are distinct resources) so
+        they are preserved verbatim.
+        """
+        parsed = urlparse(server_url.strip())
+        path = "" if parsed.path == "/" else parsed.path
+        canonical = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+        return f"{canonical}?{parsed.query}" if parsed.query else canonical
+
+    @staticmethod
     def generate_pkce() -> Tuple[str, str]:
         code_verifier = secrets.token_urlsafe(32)
         digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
@@ -346,7 +360,8 @@ class MCPOAuthService:
         token_endpoint: str,
         refresh_token: str,
         client_id: str,
-        client_secret: Optional[str] = None
+        client_secret: Optional[str] = None,
+        resource: Optional[str] = None,
     ) -> TokenResponse:
         token_data = {
             "grant_type": "refresh_token",
@@ -355,6 +370,8 @@ class MCPOAuthService:
         }
         if client_secret:
             token_data["client_secret"] = client_secret
+        if resource:
+            token_data["resource"] = resource
 
         try:
             response = self._http_client.post(

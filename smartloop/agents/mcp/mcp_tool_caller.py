@@ -146,6 +146,10 @@ class MCPToolCaller:
             }
             if creds.client_secret:
                 payload["client_secret"] = creds.client_secret
+            # RFC 8707: a refresh must carry the same resource indicator as the
+            # grant it descends from, or strict servers (monday.com) reject it.
+            if remote.resource:
+                payload["resource"] = remote.resource
 
             with httpx.Client(timeout=30.0) as http:
                 resp = http.post(remote.token_endpoint, data=payload)

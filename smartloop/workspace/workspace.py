@@ -58,6 +58,9 @@ class RemoteMCPServerConfig(BaseModel):
     token_endpoint: Optional[str] = None
     authorization_endpoint: Optional[str] = None
     token: Optional[str] = None
+    # RFC 8707 resource indicator negotiated at connect time. Persisted because
+    # refresh requests must carry the same indicator as the original grant.
+    resource: Optional[str] = None
 
 
 class MCPOAuthCredentials(BaseModel):
