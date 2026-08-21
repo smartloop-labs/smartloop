@@ -3,8 +3,12 @@
 from typing import Optional
 from .model_service import ModelService
 from .api_client import SLPAPIClient
+from .storage_service import compute_usage, run_cleanup
 
-__all__ = ["ModelService", "get_model_service", "SLPAPIClient", "get_api_client"]
+__all__ = [
+    "ModelService", "get_model_service", "SLPAPIClient", "get_api_client",
+    "compute_usage", "run_cleanup",
+]
 
 
 # Global singleton instances

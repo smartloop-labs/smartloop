@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import queue as _queue
 import sys
 from pathlib import Path
@@ -30,6 +31,11 @@ from typing import Optional
 
 # Process-wide singleton — set by make_log_queue().
 _LOG_QUEUE: Optional[_queue.Queue] = None
+
+# The parent-process listener that owns the real handlers — stashed here by
+# start_listener() so callers that need to act on those handlers (see
+# truncate_log_file) can reach them without threading the object through.
+_LISTENER: Optional["logging.handlers.QueueListener"] = None
 
 DEFAULT_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -129,6 +135,8 @@ def start_listener(
         queue, *handlers, respect_handler_level=True
     )
     listener.start()
+    global _LISTENER
+    _LISTENER = listener
     return listener
 
 
@@ -142,7 +150,7 @@ def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) 
 
     Safe to call more than once.
     """
-    global _LOG_QUEUE
+    global _LOG_QUEUE, _LISTENER
 
     if listener is not None:
         try:
@@ -151,6 +159,10 @@ def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) 
             pass
         # stop() joins the listener thread but leaves listener.queue bound.
         listener.queue = None
+
+    # Drop our reference to the stopped listener so nothing tries to act on
+    # its handlers afterwards (see truncate_log_file).
+    _LISTENER = None
 
     root = logging.getLogger()
     for h in list(root.handlers):
@@ -165,3 +177,44 @@ def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) 
             h.queue = None
 
     _LOG_QUEUE = None
+
+def truncate_log_file(home_dir: str) -> int:
+    """Empty ``<home_dir>/server.log`` and return the bytes reclaimed.
+
+    Truncating the file alone is not enough while the server is running: the
+    ``RotatingFileHandler`` keeps writing at its own offset, so the next line
+    lands past a hole and the file reads back at its old size.  When the
+    listener is up we close its stream, truncate, and reopen — the handler
+    opens in append mode, so writing resumes at zero.  Falls back to a plain
+    truncate when no listener is registered (CLI, tests).
+    """
+    log_path = Path(home_dir) / "server.log"
+    try:
+        freed = log_path.stat().st_size
+    except OSError:
+        return 0
+
+    handlers = []
+    if _LISTENER is not None:
+        handlers = [
+            h for h in getattr(_LISTENER, "handlers", ())
+            if isinstance(h, logging.handlers.RotatingFileHandler)
+            and os.path.realpath(h.baseFilename) == os.path.realpath(str(log_path))
+        ]
+
+    for h in handlers:
+        h.acquire()
+    try:
+        for h in handlers:
+            if h.stream is not None:
+                h.stream.close()
+                h.stream = None
+        with open(log_path, "r+") as f:
+            f.truncate(0)
+        for h in handlers:
+            h.stream = h._open()
+    finally:
+        for h in handlers:
+            h.release()
+
+    return freed
