@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from smartloop.api.config import api_settings
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.config import SUPPORTED_MODELS
-from smartloop.constants import display_model_name
+from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
 from smartloop.platform import auth as platform_auth, get_platform_service
@@ -207,7 +207,7 @@ async def init(
     Returns a streaming SSE response with real-time download progress.
     """
     workspace = model_service._ensure_workspace()
-    target = request.model_name or api_settings.default_model
+    target = canonical_model_name(request.model_name) or api_settings.default_model
 
     # Register the model in the workspace if not already present
     ws_model = workspace.get_model(target)

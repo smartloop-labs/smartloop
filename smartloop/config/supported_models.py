@@ -1,8 +1,16 @@
 from collections import OrderedDict
 
+from smartloop.constants import BOOTSTRAP_MODEL, canonical_model_name
+
 
 class _LazyModelDict:
-    """Loads model classes on first access to avoid circular imports at module load time."""
+    """Loads model classes on first access to avoid circular imports at module load time.
+
+    Lookups canonicalize the key (see :func:`canonical_model_name`), so a legacy
+    model name from an existing workspace record or ``.env`` override resolves to
+    the same class as its current name.  Iteration yields only canonical names,
+    so aliases never show up as extra models.
+    """
     _data = None
 
     def _load(self):
@@ -14,7 +22,7 @@ class _LazyModelDict:
             from smartloop.model.qwen2_vl_2b import Qwen2VL_2bModel
             from smartloop.model.ministral_3b import Ministral3bModel
             self._data = OrderedDict({
-                "slp-orchestra-mini": GemmaItTextModel,
+                BOOTSTRAP_MODEL: GemmaItTextModel,
                 "gemma3-4b": GemmaItModel,
                 "gemma4-e2b": Gemma4_2bModel,
                 "gemma4-e4b": Gemma4_4bModel,
@@ -24,13 +32,13 @@ class _LazyModelDict:
         return self._data
 
     def get(self, key, default=None):
-        return self._load().get(key, default)
+        return self._load().get(canonical_model_name(key), default)
 
     def __getitem__(self, key):
-        return self._load()[key]
+        return self._load()[canonical_model_name(key)]
 
     def __contains__(self, key):
-        return key in self._load()
+        return canonical_model_name(key) in self._load()
 
     def __iter__(self):
         return iter(self._load())

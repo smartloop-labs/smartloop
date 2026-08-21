@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.config.app_settings import AppSettings
+from smartloop.constants import canonical_model_name
 from smartloop.platform import PlatformService, get_platform_service
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ async def unload_model(model_service: ModelService = Depends(get_model_service))
 class AccessLevel(str, Enum):
     free = "free"
     paid = "pro"
+    premium = "premium"
 
 class ModelEntry(BaseModel):
     name: str
@@ -81,7 +83,19 @@ async def list_models(
     model_service: ModelService = Depends(get_model_service),
     svc: PlatformService = Depends(get_platform_service),
 ):
-    """List available models from the cloud API (cached locally), enriched with workspace state."""
+    """List available models from the cloud API (cached locally), enriched with workspace state.
+
+    Paid models (Pro/premium) are listed only when the account's plan grants
+    them: the cloud computes ``is_accessible`` per-user (see
+    ``_refresh_platform_cache`` in the auth router), so a free account never
+    sees a Pro-only model.  Free models are always listed — anonymous callers
+    get ``is_accessible=False`` on everything, so gating them on that flag
+    would leave a logged-out user with an empty catalog.
+
+    A model already downloaded into this workspace is always listed too,
+    whatever its access level: the weights are on disk and stay usable after a
+    plan downgrade or a logout.
+    """
     try:
         models = svc.list_models()
     except ConnectionError:
@@ -99,9 +113,16 @@ async def list_models(
     result = []
     for m in models:
         entry = ModelEntry(**m) if isinstance(m, dict) else m
+        # The cloud catalog may still publish a model under its old name.
+        entry.name = canonical_model_name(entry.name)
         if entry.name == bootstrap_model:
             continue
         ws_model = ws_lookup.get(entry.name)
+        # An unset access_level means the cloud didn't classify the model —
+        # treat it as free rather than hiding it.
+        is_paid = entry.access_level not in (None, AccessLevel.free)
+        if is_paid and not entry.is_accessible and not (ws_model and ws_model.downloaded):
+            continue
         if ws_model:
             entry.enabled = ws_model.enabled
             entry.capabilities = ws_model.effective_capabilities
@@ -136,7 +157,8 @@ async def list_workspace_models(
         workspace = model_service._ensure_workspace()
         # Best model first: largest size, then newer version (see _rank).
         models = sorted(
-            (m for m in workspace.models if m.model_name != bootstrap_model),
+            (m for m in workspace.models
+             if canonical_model_name(m.model_name) != bootstrap_model),
             key=lambda m: m._rank, reverse=True,
         )
         return [
@@ -173,6 +195,8 @@ async def update_workspace_model(
     model class (see ``WorkspaceModel.effective_capabilities``).
     """
     try:
+        # An older client may still address the model by its previous name.
+        model_name = canonical_model_name(model_name)
         workspace = model_service._ensure_workspace()
         model = workspace.get_model(model_name)
         if model is None:

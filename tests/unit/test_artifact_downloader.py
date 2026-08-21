@@ -44,10 +44,19 @@ class TestParseRemoteMd5:
 class TestResolveModelName:
     def test_known_model_roundtrip(self):
         # _resolve_model_id and _resolve_model_name should be inverses
-        model_id = SLPArtifactDownloader._resolve_model_id("slp-orchestra-mini")
-        if model_id != "slp-orchestra-mini":  # only if the model is in SUPPORTED_MODELS
+        model_id = SLPArtifactDownloader._resolve_model_id("sl-mini")
+        if model_id != "sl-mini":  # only if the model is in SUPPORTED_MODELS
             name = SLPArtifactDownloader._resolve_model_name(model_id)
-            assert name == "slp-orchestra-mini"
+            assert name == "sl-mini"
+
+    def test_legacy_name_resolves_to_same_model_id(self):
+        # An existing workspace still records the pre-rename name.
+        assert (SLPArtifactDownloader._resolve_model_id("slp-orchestra-mini")
+                == SLPArtifactDownloader._resolve_model_id("sl-mini"))
+
+    def test_reverse_lookup_returns_canonical_name(self):
+        model_id = SLPArtifactDownloader._resolve_model_id("sl-mini")
+        assert SLPArtifactDownloader._resolve_model_name(model_id) == "sl-mini"
 
     def test_unknown_model_passthrough(self):
         assert SLPArtifactDownloader._resolve_model_name("unknown/model") == "unknown/model"

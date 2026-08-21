@@ -13,6 +13,7 @@ from typing import Callable, TypeVar
 from smartloop.platform import SLPPlatformClient
 from smartloop.platform import auth as platform_auth
 from smartloop.config import AppSettings
+from smartloop.constants import canonical_model_name, display_model_name, platform_model_name
 from smartloop.model.downloader.artifact_source import SLPModelSource, SLPBootstrapSource
 from smartloop.model.downloader.slp_downloader import SLPDownloader, DownloadProgress, ProgressCallback, AggregateProgress
 from smartloop.workspace import Workspace
@@ -461,19 +462,23 @@ class SLPArtifactDownloader(SLPDownloader):
         """
         models = self._bootstrap_source.list_models()
         if model_name:
-            target = next((m for m in models if m.get("name") == model_name), None)
+            # The bootstrap endpoint publishes upstream names, which can lag a
+            # local rename — match on the published name for the request.
+            wanted = platform_model_name(model_name)
+            target = next((m for m in models if m.get("name") == wanted), None)
             if not target:
                 available = ", ".join(m.get("name", "?") for m in models)
                 raise ValueError(
-                    f"Model '{model_name}' not found in bootstrap. "
+                    f"Model '{display_model_name(model_name)}' not found in bootstrap. "
                     f"Available: {available}"
                 )
         else:
             target = models[0]
 
-        resolved_name = target.get("name", "unknown")
+        published_name = target.get("name", "unknown")
+        resolved_name = canonical_model_name(published_name)
         model_id = self._resolve_model_id(resolved_name)
-        artifacts = self._bootstrap_source.get_artifacts(resolved_name)
+        artifacts = self._bootstrap_source.get_artifacts(published_name)
 
         artifacts = _select_gguf_artifacts(artifacts)
 
@@ -483,18 +488,19 @@ class SLPArtifactDownloader(SLPDownloader):
         local_dir = os.path.join(self.workspace.models_dir, model_id)
         os.makedirs(local_dir, exist_ok=True)
 
-        self.logger.info(f"Bootstrap downloading model: {resolved_name}")
+        self.logger.info(f"Bootstrap downloading model: {display_model_name(resolved_name)}")
 
         return self._download_artifacts(artifacts, local_dir, progress_callback,
                                         log_prefix="Bootstrap model", log_dir=local_dir,
-                                        label=resolved_name)
+                                        label=display_model_name(resolved_name))
 
     @staticmethod
     def _resolve_model_id(model_name: str) -> str:
         """Lookup the HuggingFace model_id from a short model name.
 
-        E.g. "slp-orchestra-mini" → "google/gemma-3-1b-it".
-        Falls back to model_name if no mapping is found.
+        E.g. "sl-mini" → "smartloop-ai/slp-orchestra-mini".  Legacy short names
+        resolve too (``SUPPORTED_MODELS`` canonicalizes its keys).  Falls back to
+        model_name if no mapping is found.
         """
         from smartloop.config import SUPPORTED_MODELS
         model_type = SUPPORTED_MODELS.get(model_name)
@@ -504,10 +510,12 @@ class SLPArtifactDownloader(SLPDownloader):
 
     @staticmethod
     def _resolve_model_name(model_id: str) -> str:
-        """Reverse-lookup the short model name from a HuggingFace model_id.
+        """Reverse-lookup the canonical short model name from a HuggingFace model_id.
 
-        E.g. "google/gemma-3-1b-it" → "slp-orchestra-mini".
-        Falls back to model_id if no mapping is found.
+        E.g. "smartloop-ai/slp-orchestra-mini" → "sl-mini".  Returns the
+        canonical name, NOT the name the platform publishes — callers hitting the
+        API must pass it through :func:`platform_model_name` first.  Falls back
+        to model_id if no mapping is found.
         """
         from smartloop.config import SUPPORTED_MODELS
         for name, model_type in SUPPORTED_MODELS.items():
@@ -533,10 +541,12 @@ class SLPArtifactDownloader(SLPDownloader):
         local_dir = os.path.join(self.workspace.models_dir, model_id)
         os.makedirs(local_dir, exist_ok=True)
 
-        self.logger.info(f"Downloading model: {model_name}")
+        self.logger.info(f"Downloading model: {display_model_name(model_name)}")
         print()
 
-        artifacts = self._model_source.get_artifacts(model_name)
+        # The catalog is keyed by the name the platform publishes, which can lag
+        # a local rename (sl-mini is still served as slp-orchestra-mini).
+        artifacts = self._model_source.get_artifacts(platform_model_name(model_name))
 
         artifacts = _select_gguf_artifacts(artifacts)
 
@@ -546,4 +556,4 @@ class SLPArtifactDownloader(SLPDownloader):
 
         return self._download_artifacts(artifacts, local_dir, progress_callback,
                                         log_prefix="Model", log_dir=local_dir,
-                                        label=model_name)
+                                        label=display_model_name(model_name))
