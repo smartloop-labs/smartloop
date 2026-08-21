@@ -27,6 +27,9 @@ from smartloop.api.model import (
     DeltaContent,
     Usage,
 )
+from smartloop.agents.tool_call_guard import (
+    NO_TOOL_CALL_DIRECTIVE, is_tool_call_only, may_be_tool_call_prefix,
+)
 from smartloop.api.services import ModelService, get_model_service, get_api_client
 from smartloop.constants import SYSTEM_PROMPT, display_model_name, resolve_current_date
 from smartloop.types import ModelCapability
@@ -116,6 +119,37 @@ def _escape_role_tags(text: str) -> str:
     for tag, esc in _TAG_ESCAPE.items():
         text = text.replace(tag, esc)
     return text
+
+
+#: Shown when the response model cannot produce an answer from the assembled
+#: context — a degenerate output, or a tool call it keeps emitting instead of
+#: prose.  Points at the fix (a more capable model) rather than the symptom.
+_NO_ANSWER_GUIDANCE = (
+    "**No response generated.**\n\n"
+    "The current model wasn't able to synthesize the "
+    "fetched content. This usually means the loaded "
+    "model doesn't have the capabilities needed for "
+    "document reading or skill-based synthesis.\n\n"
+    "To fix this, open **Settings → Models** and enable "
+    "a model tagged with **DP** (document processing) or "
+    "**skills** capability. Larger knowledge-capable "
+    "models handle URL fetches, document Q&A, and "
+    "long-context summaries much more reliably than "
+    "the small default router model."
+)
+
+
+def _append_to_last_user_turn(prompt: str, extra: str) -> str:
+    """Append ``extra`` inside the final ``<user>`` turn of ``prompt``.
+
+    Small models weight the tail of the prompt most heavily, so a corrective
+    directive only lands if it rides with the question rather than trailing
+    the turn structure.  Falls back to a new turn if the shape is unexpected.
+    """
+    if prompt.rstrip().endswith("</user>"):
+        head, _, tail = prompt.rstrip().rpartition("</user>")
+        return f"{head}\n\n{extra}</user>{tail}"
+    return f"{prompt}\n<user>{extra}</user>"
 
 
 def format_messages_to_prompt(
@@ -767,6 +801,10 @@ async def stream_chunks(
     # `cancelled` is created earlier (before orchestration) and reused here so
     # the same signal covers both the planning phase and the response stream.
 
+    # Alphanumeric characters of real content that prove the opening of a
+    # stream is an answer rather than a stray fence or a tool call.
+    _ALNUM_STREAM_THRESHOLD = 20
+
     def _is_degenerate(text: str) -> bool:
         """True when the model produced no meaningful content.
 
@@ -780,24 +818,28 @@ async def stream_chunks(
         alnum = sum(ch.isalnum() for ch in stripped)
         return alnum < 3
 
-    def run_sync_stream():
-        """Run the sync stream in a thread and put chunks in queue.
+    def _generate_guarded(gen_prompt: str) -> tuple[bool, str, Exception | None]:
+        """Stream *gen_prompt* into the queue, holding back its opening.
 
-        When tool context is present we buffer only the OPENING of the
-        stream so a degenerate output (small models often emit just ```)
-        can be detected and replaced by a non-streaming retry.  Once we
-        see enough real content we flush the buffer and stream normally
-        so larger, capable models don't lose streaming UX.
+        When tool context is present the OPENING of the stream is buffered so
+        a degenerate output (small models often emit just ```) or a leaked
+        tool call can be detected and replaced before the user sees it.  Once
+        enough real content proves the response is prose, the buffer is
+        flushed and the rest streams live, so capable models keep their
+        streaming UX.
+
+        Returns ``(streamed, text, error)``: ``streamed`` is True when the
+        buffer was flushed and the text has already gone out to the client,
+        in which case the caller must not re-emit or replace it.
         """
         collected: list[str] = []
         # Only buffer for tool-synthesis; regular chat streams immediately.
         buffered = orchestrator_context is not None
         opening_chars = 0
-        _ALNUM_STREAM_THRESHOLD = 20
 
         try:
             for chunk in model_service.stream_completion(
-                prompt, request.model, cancelled=cancelled,
+                gen_prompt, request.model, cancelled=cancelled,
                 capability=response_capability,
             ):
                 if cancelled.is_set():
@@ -814,14 +856,30 @@ async def stream_chunks(
                 # Still in the opening-buffer window.
                 opening_chars += sum(ch.isalnum() for ch in text)
                 if opening_chars >= _ALNUM_STREAM_THRESHOLD:
+                    # A hallucinated tool call clears the alnum threshold on
+                    # the tool name alone, so keep holding while the opening
+                    # still looks like one — otherwise half the fence streams
+                    # to the user before the full response can be judged.
+                    if may_be_tool_call_prefix("".join(collected)):
+                        continue
                     # Enough real content — flush buffered chunks and
                     # switch to normal streaming mode for the remainder.
                     for t in collected:
                         loop.call_soon_threadsafe(queue.put_nowait, t)
                     buffered = False
         except Exception as e:
-            logger.error(f"Error in sync stream: {e}")
-            loop.call_soon_threadsafe(queue.put_nowait, Exception(str(e)))
+            return (not buffered), "".join(collected), e
+
+        return (not buffered), "".join(collected), None
+
+    def run_sync_stream():
+        """Run the sync stream in a thread and put chunks in queue."""
+        streamed, response, error = _generate_guarded(prompt)
+
+        if error is not None:
+            logger.error(f"Error in sync stream: {error}")
+            if not streamed:
+                loop.call_soon_threadsafe(queue.put_nowait, Exception(str(error)))
             loop.call_soon_threadsafe(queue.put_nowait, None)
             return
 
@@ -829,25 +887,53 @@ async def stream_chunks(
             loop.call_soon_threadsafe(queue.put_nowait, None)
             return
 
-        response = "".join(collected)
-
-        # If we already flushed the buffer we've been streaming — done.
-        if not buffered:
+        # If the buffer was flushed we've been streaming — done.
+        if streamed:
             loop.call_soon_threadsafe(queue.put_nowait, None)
             return
 
-        if orchestrator_context and _is_degenerate(response):
+        leaked_tool_call = bool(orchestrator_context) and is_tool_call_only(response)
+        if orchestrator_context and (_is_degenerate(response) or leaked_tool_call):
             logger.warning(
-                "[stream] Degenerate response (%r) — retrying with simplified prompt",
-                response[:40],
+                "[stream] %s response (%r) — retrying",
+                "Leaked tool-call" if leaked_tool_call else "Degenerate",
+                response[:80],
             )
+            retry = ""
+            if leaked_tool_call:
+                # The context is fine — the model just answered in its
+                # tool-calling format instead of prose (common when a skill
+                # names an action, e.g. "recommend a workout routine").  Retry
+                # with the SAME context so the skill instructions survive,
+                # plus an explicit no-tools directive.  Streamed, not
+                # generated whole: this is the answer the user waits on, and
+                # a second full generation delivered as one chunk reads as a
+                # long freeze followed by a wall of text.
+                streamed, retry, retry_error = _generate_guarded(
+                    _append_to_last_user_turn(prompt, NO_TOOL_CALL_DIRECTIVE)
+                )
+                if retry_error is not None:
+                    logger.error(f"[stream] No-tool-call retry failed: {retry_error}")
+                if streamed:
+                    # The retry proved to be prose and has already gone out.
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
+                    return
+                if retry_error is not None or (retry and is_tool_call_only(retry)):
+                    logger.warning(
+                        "[stream] Retry unusable (%r) — falling back",
+                        (retry or "")[:80],
+                    )
+                    retry = ""
+                if cancelled.is_set():
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
+                    return
+
             # Strip the TOOL RESULTS wrapper and its rules, ask the model
             # to answer with a minimal prompt structure.  Same-prompt
             # retries produce the same output at low temperature, so we
             # only bother with an input that's actually different.
             raw_content = _extract_tool_content(orchestrator_context)
-            retry = ""
-            if raw_content:
+            if not retry and raw_content:
                 simple_prompt = (
                     f"<system>You are a helpful assistant.</system>\n"
                     f"<user>{_escape_role_tags(last_user_msg or 'Summarize the content below.')}\n\n"
@@ -862,26 +948,14 @@ async def stream_chunks(
                     logger.error(f"[stream] Simplified retry failed: {e}")
                     retry = ""
 
-            if retry and not _is_degenerate(retry):
+            if retry and not _is_degenerate(retry) and not is_tool_call_only(retry):
                 response = retry
             else:
                 logger.warning(
                     "[stream] Simplified retry also degenerate (%r) — returning guidance message",
                     (retry or "")[:40],
                 )
-                response = (
-                    "**No response generated.**\n\n"
-                    "The current model wasn't able to synthesize the "
-                    "fetched content. This usually means the loaded "
-                    "model doesn't have the capabilities needed for "
-                    "document reading or skill-based synthesis.\n\n"
-                    "To fix this, open **Settings → Models** and enable "
-                    "a model tagged with **DP** (document processing) or "
-                    "**skills** capability. Larger knowledge-capable "
-                    "models handle URL fetches, document Q&A, and "
-                    "long-context summaries much more reliably than "
-                    "the small default router model."
-                )
+                response = _NO_ANSWER_GUIDANCE
 
         if orchestrator_context and response:
             # Emit the (possibly retried) full response as one chunk.
@@ -1186,6 +1260,27 @@ async def create_chat_completion(
                 prompt, request.model, capability=response_capability,
             ),
         )
+
+        # A hallucinated tool call is not an answer — the tools already ran
+        # and their output is in the prompt.  Retry once with an explicit
+        # no-tools directive rather than handing the user a JSON blob.
+        if orchestrator_context and is_tool_call_only(response_text):
+            logger.warning(
+                "[chat] Leaked tool-call response (%r) — retrying",
+                response_text[:80],
+            )
+            retry_prompt = _append_to_last_user_turn(prompt, NO_TOOL_CALL_DIRECTIVE)
+            retry_text = await loop.run_in_executor(
+                _executor,
+                lambda: model_service.generate_completion(
+                    retry_prompt, request.model, capability=response_capability,
+                ),
+            )
+            if retry_text and not is_tool_call_only(retry_text):
+                response_text = retry_text
+            else:
+                logger.warning("[chat] Retry still a tool call — returning guidance")
+                response_text = _NO_ANSWER_GUIDANCE
 
         # Auto file-write: if user asked to create/generate/write, save LLM response to file
         _out_cwd = _request_cwd(model_service)
