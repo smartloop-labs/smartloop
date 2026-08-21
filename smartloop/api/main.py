@@ -25,7 +25,7 @@ from smartloop.supervisor.service import (
     supervision_enabled,
 )
 
-from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, mcp_catalog_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router, web_search_router
+from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, mcp_catalog_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router, web_search_router, storage_router
 
 from smartloop.api.services import get_model_service, get_api_client
 from smartloop.config import AppSettings
@@ -360,6 +360,7 @@ app.include_router(feedback_router)
 app.include_router(project_io_router)
 app.include_router(releases_router)
 app.include_router(web_search_router)
+app.include_router(storage_router)
 
 @app.get("/health")
 async def health_check():
