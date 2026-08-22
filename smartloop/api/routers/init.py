@@ -32,6 +32,7 @@ class InitRequest(BaseModel):
     model_name: Optional[str] = Field(default=None, description="Model to initialize")
     developer_token: Optional[str] = Field(default=None, description="Developer token for model download")
     cwd: Optional[str] = Field(default=None, description="Working directory for the default project; defaults to ~/smartloop/<name> when omitted")
+    project_id: Optional[str] = Field(default=None, description="Project the download was requested for; scopes the resulting enablement to it")
 
 
 def _sse_event(data: dict, event: str = "progress") -> str:
@@ -215,7 +216,12 @@ async def init(
         model_cls = SUPPORTED_MODELS.get(target)
         if not model_cls:
             raise HTTPException(status_code=400, detail=f"Unknown model: {target}")
-        ws_model = workspace.add_model(target, model_cls.model_id())
+        # A project-scoped init enables the model for that project alone (the
+        # caller PATCHes it), so don't write an app-default of "on" that every
+        # other project would inherit via sync_project_models. A project-less
+        # init (CLI/TUI) still registers workspace-wide.
+        ws_model = workspace.add_model(target, model_cls.model_id(),
+                                       enabled=request.project_id is None)
 
     model_dir = ws_model.model_dir
     needs_download = not _gguf_exists(model_dir)

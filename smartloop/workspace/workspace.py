@@ -553,11 +553,16 @@ class Workspace(BaseModel):
 
         return result
 
-    def add_model(self, model_name: str, model_id: str, config: Optional[ModelConfig] = None) -> WorkspaceModel:
+    def add_model(self, model_name: str, model_id: str, config: Optional[ModelConfig] = None,
+                  enabled: bool = True) -> WorkspaceModel:
         """Register a model in the workspace without changing the active model.
 
         The record is stored under the canonical name, so a legacy name coming
         from the cloud catalog is not written back into ``config.json``.
+
+        ``enabled`` seeds the app-default that ``sync_project_models`` copies
+        into every project, so a caller registering a model on one project's
+        behalf should pass ``False`` and enable it on that project itself.
         """
         model_name = canonical_model_name(model_name)
         existing = self.get_model(model_name)
@@ -573,7 +578,12 @@ class Workspace(BaseModel):
                     existing.config = config
             return existing
         has_active = any(m.is_active for m in self.models)
-        entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, is_active=not has_active, models_dir=self.models_dir)
+        # The bootstrap model gets no per-project entry, so its always-on state
+        # resolves through this record (see is_bootstrap_model) — never register
+        # it disabled.
+        if self.is_bootstrap_model(model_name):
+            enabled = True
+        entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, enabled=enabled, is_active=not has_active, models_dir=self.models_dir)
         self.models.append(entry)
         return entry
 
