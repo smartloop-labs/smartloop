@@ -352,8 +352,10 @@ async def health_check():
         total_model_bytes = 0
         workspace = Workspace.get_instance()
         if workspace:
+            project = workspace.current_project
             for m in workspace.models:
-                if not (m.enabled and m.downloaded):
+                if not (workspace.effective_model_enabled(m.model_name, project)
+                        and workspace.effective_model_downloaded(m.model_name)):
                     continue
                 try:
                     model_dir = workspace.model_dir_for(m.model_id)

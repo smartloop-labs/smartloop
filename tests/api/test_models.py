@@ -1,20 +1,20 @@
 """Tests for the /v1/models API router."""
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from smartloop.api.main import app
 from smartloop.api.services import get_model_service
+from smartloop.workspace.workspace import Workspace, WorkspaceModel
 
 
 def _ws_model(model_name: str, *, downloaded: bool, enabled: bool = True):
-    return SimpleNamespace(
+    return WorkspaceModel(
         model_name=model_name,
+        model_id=f"test/{model_name}",
         downloaded=downloaded,
         enabled=enabled,
-        effective_capabilities=[],
     )
 
 
@@ -22,14 +22,21 @@ def _ws_model(model_name: str, *, downloaded: bool, enabled: bool = True):
 def workspace_models():
     """Override the model service so /v1/models sees a known workspace.
 
-    Yields a list the test appends workspace models to; the override reads it
-    lazily so appends after client creation still take effect.
+    Yields the workspace's ``models`` list for the test to append to; the
+    override returns the same workspace every call, so appends made after the
+    client is created still take effect.  This is a real ``Workspace`` rather
+    than a stub because the router resolves ``enabled`` through
+    ``effective_model_enabled`` (project override -> workspace default).
     """
-    models: list = []
+    workspace = Workspace(
+        id="ws-test",
+        workspace_dir="/tmp/ws-test",
+        models_dir="/tmp/ws-test/models",
+    )
     svc = MagicMock()
-    svc._ensure_workspace.return_value = SimpleNamespace(models=models)
+    svc._ensure_workspace.return_value = workspace
     app.dependency_overrides[get_model_service] = lambda: svc
-    yield models
+    yield workspace.models
     app.dependency_overrides.pop(get_model_service, None)
 
 

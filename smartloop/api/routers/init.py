@@ -232,15 +232,14 @@ async def init(
             # 1. Download if needed
             if _gguf_exists(model_dir):
                 yield _sse_event({"status": "model_ready", "message": f"Model {display_model_name(target)} already available."})
-                if not ws_model.downloaded:
-                    ws_model.downloaded = True
+                model_service.mark_model_downloaded(target)
                 model_service._model.save()
             else:
                 downloader = SLPArtifactDownloader(workspace, logger)
                 async for event in _download_and_stream(downloader, ws_model.model_id, target):
                     yield event
 
-                ws_model.downloaded = True
+                model_service.mark_model_downloaded(target)
                 model_service._model.save()
 
             # Workspace config.json exists after the save above, so the
@@ -339,7 +338,6 @@ async def bootstrap(
                         if not wm.downloaded:
                             wm.downloaded = True
                         break
-
             if existing_model_name:
                 yield _sse_event({"status": "model_ready", "message": f"Model {display_model_name(existing_model_name)} already available."})
             else:
@@ -357,7 +355,7 @@ async def bootstrap(
                 async for event in _download_and_stream(downloader, bootstrap_model_id, bootstrap_name, is_bootstrap=True):
                     yield event
 
-                ws_model.downloaded = True
+                model_service.mark_model_downloaded(bootstrap_name)
                 existing_model_name = bootstrap_name
                 workspace.save()
 
