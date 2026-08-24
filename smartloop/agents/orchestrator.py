@@ -1166,6 +1166,8 @@ class SLPOrchestrator:
             matched_sources.append("web")
         if search_ctx.mcp_context:
             matched_sources.append("mcp")
+        if search_ctx.mcp_document_context:
+            matched_sources.append("mcp-content")
         has_indexed_context = bool(matched_sources)
 
         if classification.intent == IntentType.CONVERSATION:
@@ -1405,6 +1407,10 @@ class SLPOrchestrator:
                     parts.append(self._frame_web_results(search_ctx.web_context))
                 if search_ctx.mcp_context:
                     parts.append(search_ctx.mcp_context)
+                if search_ctx.mcp_document_context:
+                    parts.append(
+                        f"MCP CONTENT:\n{search_ctx.mcp_document_context}"
+                    )
                 if search_ctx.feedback_context:
                     parts.append(search_ctx.feedback_context)
                 content = "\n\n---\n\n".join(parts) if parts else ""
@@ -1938,13 +1944,15 @@ Assess whether these search results are relevant to the user's request. If relev
         ctx: _OrchestratorContext,
         search_ctx: SearchContext,
     ) -> Callable:
-        """Create handler that gates irrelevant feedback/workspace context."""
+        """Create handler that gates irrelevant feedback/workspace/MCP-content context."""
         def handler(deps: Dict) -> NodeResult:
             parts_to_check = []
             if search_ctx.feedback_context:
                 parts_to_check.append(("feedback", search_ctx.feedback_context))
             if search_ctx.workspace_context:
                 parts_to_check.append(("workspace", search_ctx.workspace_context))
+            if search_ctx.mcp_document_context:
+                parts_to_check.append(("mcp content", search_ctx.mcp_document_context))
 
             if not parts_to_check:
                 return NodeResult(node_id="context_gate", success=True, data={})
@@ -1973,7 +1981,11 @@ Is this context relevant to the user's request?
                 if "NOT_RELEVANT" in result:
                     search_ctx.feedback_context = ""
                     search_ctx.workspace_context = ""
-                    logger.info("[context_gate] Cleared irrelevant feedback/workspace context")
+                    search_ctx.mcp_document_context = ""
+                    logger.info(
+                        "[context_gate] Cleared irrelevant "
+                        "feedback/workspace/mcp-content context"
+                    )
             except Exception:
                 pass  # On failure, keep context (safe default)
 
@@ -2039,6 +2051,7 @@ Is this context relevant to the user's request?
             or search_ctx.workspace_context
             or search_ctx.web_context
             or search_ctx.mcp_context
+            or search_ctx.mcp_document_context
         ):
             logger.info(
                 "[collect] indexed match found — overriding conversation "
@@ -2104,6 +2117,7 @@ Is this context relevant to the user's request?
         workspace_context = search_ctx.workspace_context
         web_context = search_ctx.web_context
         mcp_context = search_ctx.mcp_context
+        mcp_document_context = search_ctx.mcp_document_context
 
         if not tool_context and vector_context and not is_conversation:
             context_parts.append(vector_context)
@@ -2129,6 +2143,15 @@ Is this context relevant to the user's request?
             if workspace_context and not is_conversation:
                 context_parts.append(f"WORKSPACE FILES:\n{workspace_context}")
                 logger.info(f"[collect] workspace: {len(workspace_context)} chars")
+
+            # Crawled MCP content is stored content, like documents and
+            # workspace files — a live tool result for this query outranks it,
+            # which is why it sits behind the same `not tool_context` gate.
+            if mcp_document_context and not is_conversation:
+                context_parts.append(f"MCP CONTENT:\n{mcp_document_context}")
+                logger.info(
+                    f"[collect] mcp content: {len(mcp_document_context)} chars"
+                )
 
         if not context_parts and not has_skill:
             logger.info("[collect] No context gathered — conversation only")

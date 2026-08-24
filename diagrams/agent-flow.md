@@ -41,11 +41,17 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    subgraph REG["MCP registration (side path)"]
+    subgraph REG["MCP registration (side path — non-blocking)"]
         direction TB
-        ADD["add_local/remote_mcp_server"] --> IDX["MCPToolIndexer.index_server"]
+        ADD["add_local/remote_mcp_server<br/>persist + return (status=pending)"] --> QUEUE["MCPTask queue"]
+        QUEUE --> PROV["_provision_mcp_server<br/>discover → enrich (LLM) → index → crawl"]
+        PROV --> IDX["MCPToolIndexer.index_server"]
         IDX --> VEC[("mcp_tools<br/>vector collection<br/>name · description · schema · tool-call")]
+        PROV --> CRAWL["MCPDocumentIndexer.crawl_server<br/>(crawl plan: list → detail → fan-out)"]
+        CRAWL --> DOCS[("mcp_documents<br/>vector collection<br/>crawled pages · issues · cards")]
+        CYCLE["MCPTask refresh cycle<br/>(start + every slp_mcp_crawl_interval_s)"] --> CRAWL
         DEL["delete_mcp_server"] -->|remove_server| VEC
+        DEL -->|remove_server| DOCS
     end
 
     subgraph RESOLVE["MCP step resolution (_resolve_tool_args)"]
@@ -58,6 +64,7 @@ flowchart LR
     end
 
     VEC -. "candidate tools" .-> Q
+    DOCS -. "crawled content (Explorer.collect_parallel)" .-> STEP
 ```
 
 ## Notes
@@ -67,6 +74,18 @@ flowchart LR
   so a skill invoking an MCP is the same code path as a direct trigger.
 - **MCPAgent** only performs *selection*; the existing resolve→execute handlers
   call the tool and feed the result back (mirrors `FetchAgent`).
+- **Registration never blocks**: `add_*_mcp_server` persists the connection and
+  returns `status="pending"`. Tool discovery (a process launch or a remote
+  handshake), LLM enrichment, tool indexing and the first content crawl all run
+  on `MCPTask`, which records `ready`/`failed` + `last_error` for clients to poll.
+- **Document-type servers are crawled, not just called**: a crawl plan
+  (`smartloop/mcp/crawl_plans.py`) walks a Notion/Linear/Trello connection's
+  listing tools — with per-record detail calls and parent→child fan-out — and
+  vectorizes the results into `mcp_documents`. `Explorer.collect_parallel`
+  searches that collection alongside documents/workspace/feedback, so the
+  content is in context without depending on the router picking the right live
+  call. The cycle re-crawls at startup and on an interval; hashes in
+  `.mcp_documents_manifest.json` keep a refresh to what actually changed.
 - **WebSearchAgent** is a stub — the search backend is still to be defined.
 - `DAGExecutor` runs nodes with satisfied dependencies in parallel; the single
   local llama.cpp model instance serializes `LLMDecisionNode`s via a lock.

@@ -9,6 +9,8 @@ import re
 import shutil
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 import gc
 import sys
 
@@ -27,10 +29,11 @@ from smartloop.config import ModelConfig, SUPPORTED_MODELS
 from smartloop.llms.base_llm import BaseLLM
 from smartloop.types import ModelCapability
 from smartloop.workspace import DocumentInfo, DocumentStatus, MCPServer, Workspace
-from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
+from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPServerStatus, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
 from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
 from smartloop.db.feedback_indexer import FeedbackIndexer
+from smartloop.db.mcp_document_indexer import MCPDocumentIndexer
 from smartloop.feedback_store import FeedbackStore, FeedbackEntry, ConversationTurn
 from smartloop.model.model_manager import Model
 from smartloop.mcp.local_client import LocalMCPClient
@@ -52,6 +55,7 @@ from smartloop.tasks import (
     BuildTask,
     TrainTask,
     IndexerTask,
+    MCPTask,
 )
 from smartloop.utils import normalize_path
 
@@ -151,12 +155,21 @@ class ModelService:
         self._llm_executor = None
         # Use a semaphore sized to n_parallel so agents can run concurrently
         # when the model is loaded with n_parallel > 1 (continuous batching).
+        # Always taken through :meth:`_inference_slot`, which is what makes
+        # "is the model answering someone right now" an answerable question —
+        # background work (the MCP content crawl) waits for a quiet moment
+        # rather than competing with a reply the user is watching stream.
         self._inference_lock = threading.Semaphore(_settings.n_parallel)
+        self._inference_active = 0
+        self._inference_state_lock = threading.Lock()
+        self._last_inference_at = 0.0
         self._sessions: dict[str, List[MessageInput]] = {}  # session_id -> chat history (in-memory cache)
         self._conversation_store = ConversationStore(_settings.home_dir)
         self._task_queue = TaskQueue(logger)
         self._workspace_indexer: Optional[WorkspaceIndexer] = None
         self._feedback_indexer: Optional[FeedbackIndexer] = None
+        self._mcp_document_indexer: Optional[MCPDocumentIndexer] = None
+        self._mcp_document_indexer_dir: Optional[str] = None
         self._doc_store: Optional[Any] = None
         self._doc_store_project_id: Optional[str] = None
         self._initialized = True
@@ -2288,7 +2301,7 @@ class ModelService:
         )
 
         # Lock around inference - llama-cpp is not thread-safe
-        with self._inference_lock:
+        with self._inference_slot():
             emitted = 0
             try:
                 # Propagate cancellation event so the LLM can stop mid-inference.
@@ -2350,7 +2363,7 @@ class ModelService:
         if llm is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        with self._inference_lock:
+        with self._inference_slot():
             try:
                 return llm.invoke(prompt)
             except Exception as ex:
@@ -2534,6 +2547,19 @@ class ModelService:
         indexer = IndexerTask(workspace=workspace, logger=logger)
         self._task_queue.register(indexer)
 
+        # MCP task (auto=True — owns background provisioning of newly
+        # registered servers and the periodic content refresh cycle)
+        mcp = MCPTask(
+            logger=logger,
+            provisioner=self._provision_mcp_server,
+            crawler=self._crawl_mcp_cycle,
+            crawl_interval=_settings.mcp_crawl_interval_s,
+            idle_crawl_interval=_settings.mcp_idle_crawl_interval_s,
+            pending_provider=self.pending_mcp_servers,
+            idle_provider=self.idle_seconds,
+        )
+        self._task_queue.register(mcp)
+
         # Build task (auto=False — triggered explicitly)
         if BuildTask is not None:
             build = BuildTask(workspace=workspace, logger=logger)
@@ -2549,6 +2575,11 @@ class ModelService:
 
         # Start the indexer watcher thread
         indexer.start_watcher()
+
+        # Start the MCP loop: it adopts any server left pending by a previous
+        # run and runs the first content refresh cycle immediately, so a
+        # session opens with content that tracks the source.
+        mcp.start_loop()
 
         logger.info("All tasks initialized and auto-tasks started")
 
@@ -2717,6 +2748,7 @@ class ModelService:
         # Reset cached indexers/stores so they get re-created for the new project
         self._workspace_indexer = None
         self._feedback_indexer = None
+        self._mcp_document_indexer = None
         self._doc_store = None
         self._doc_store_project_id = None
 
@@ -2845,6 +2877,7 @@ class ModelService:
         # Reset cached indexers/stores since the project they pointed to may be gone
         self._workspace_indexer = None
         self._feedback_indexer = None
+        self._mcp_document_indexer = None
         self._doc_store = None
         self._doc_store_project_id = None
 
@@ -2878,6 +2911,7 @@ class ModelService:
         # Reset cached indexers/stores so they get re-created for the new project
         self._workspace_indexer = None
         self._feedback_indexer = None
+        self._mcp_document_indexer = None
         self._doc_store = None
         self._doc_store_project_id = None
 
@@ -2948,7 +2982,7 @@ class ModelService:
         """
         if self._vision_llm is None:
             return
-        with self._inference_lock:
+        with self._inference_slot():
             if self._vision_llm is None:
                 return
             logger.info("[vision] Unloading vision model %s — freeing VRAM",
@@ -2968,7 +3002,7 @@ class ModelService:
         """
         if self._large_llm is None:
             return
-        with self._inference_lock:
+        with self._inference_slot():
             if self._large_llm is None:
                 return
             logger.info("[large-model] Unloading large agent model — freeing VRAM")
@@ -3057,7 +3091,7 @@ class ModelService:
         any per-capability (``_cap_llm_<name>``) cache — then reclaims the GPU.
         Idempotent; returns True if anything was actually unloaded.
         """
-        with self._inference_lock:
+        with self._inference_slot():
             unloaded = False
 
             if self._large_llm is not None and self._large_model_name == model_name:
@@ -3166,15 +3200,17 @@ class ModelService:
             ],
             server_info=server_info,
         )
-        self._enrich_mcp_server(server)
-
+        # Registration persists the connection and returns.  Filling in any
+        # missing tools, generating metadata with the LLM, embedding the tool
+        # vectors and crawling the server's content all happen on the MCP task
+        # (see :meth:`_provision_mcp_server`), so no client waits on the
+        # network or the model to add a connection.
+        server.status = MCPServerStatus.PENDING
         current_project.mcp_servers.append(server)
         self._model.save()
-        self._index_mcp_tools(current_project, server)
+        self._queue_mcp_provisioning(current_project, server)
 
-        result = self._mcp_server_to_dict(server)
-
-        return result
+        return self._mcp_server_to_dict(server)
 
     @staticmethod
     def _mcp2_incompat_error(msg: str) -> bool:
@@ -3194,6 +3230,17 @@ class ModelService:
             or "mcp.shared" in low
             or re.search(r"cannot import name .* from ['\"]?mcp(\.|['\" ])", low) is not None
             or re.search(r"module ['\"]?mcp['\"]? has no attribute", low) is not None
+            # 2.x also *kept* the low-level Server class and removed the
+            # decorators every 1.x server hangs its handlers off, so a package
+            # can import cleanly and then die registering its tools.  That
+            # failure names no module at all, which is why the import patterns
+            # above miss it.
+            or re.search(
+                r"'(?:server|fastmcp)' object has no attribute "
+                r"'(?:list_tools|call_tool|list_resources|read_resource|"
+                r"list_prompts|get_prompt)'",
+                low,
+            ) is not None
         )
 
     @staticmethod
@@ -3306,9 +3353,45 @@ class ModelService:
             config=MCPServerConfig(command=command, args=args, env=resolved_env, cwd=resolved_cwd),
         )
 
-        # Discover tools by launching the process and doing the MCP handshake.
-        # Any failure here is fatal: we do not persist a server whose tools we
-        # could not enumerate, and the error is surfaced to the API caller.
+        # Registration persists the connection and returns immediately.  Tool
+        # discovery launches a process, enrichment calls the LLM and indexing
+        # embeds vectors — none of that belongs in front of a UI click, so it
+        # runs on the MCP task (see :meth:`_provision_mcp_server`).  A server
+        # stays ``pending`` until that pass finishes and records ``ready`` or
+        # ``failed`` with a reason clients can show.
+        server.status = MCPServerStatus.PENDING
+        current_project.mcp_servers.append(server)
+        self._model.save()
+        self._queue_mcp_provisioning(current_project, server)
+
+        return self._mcp_server_to_dict(server)
+
+
+
+    def _discover_local_mcp_tools(self, server: "MCPServer") -> None:
+        """Launch a local MCP server and record the tools it advertises.
+
+        Runs on the MCP task, never on the registration request: the handshake
+        means starting a process (often a ``uvx``/``npx`` install first), which
+        is seconds at best and a hung subprocess at worst.
+
+        Mutates *server* in place — ``tools``, ``server_info``, and, when a
+        retry fixed the launch, ``config``/``name``/``pkg``.  Raises
+        :class:`MCPDiscoveryError` with a human-readable reason when the tools
+        cannot be enumerated at all.
+        """
+        config = server.config
+        if config is None:
+            raise MCPDiscoveryError("This connection has no launch command.")
+        command = config.command
+        args = list(config.args or [])
+        resolved_env = dict(config.env or {})
+        resolved_cwd = config.cwd
+        name = server.name
+        # Launch the process and do the MCP handshake.  A server whose tools
+        # we cannot enumerate is left registered but marked ``failed`` with the
+        # reason, so the client can show it and offer a retry — the connection
+        # the user typed is not silently discarded.
         discovery_error: str | None = None
         try:
             with LocalMCPClient(command=command, args=args, env=resolved_env, cwd=resolved_cwd) as client:
@@ -3410,15 +3493,566 @@ class ModelService:
             )
             raise MCPDiscoveryError(self._friendly_discovery_error(discovery_error))
 
+    # ------------------------------------------------- background provisioning
+
+    def _mcp_task(self) -> Optional["MCPTask"]:
+        """Return the registered MCP task, or None before setup_tasks() ran."""
+        task = self._task_queue.get_task("mcp")
+        return task if isinstance(task, MCPTask) else None
+
+    def _queue_mcp_provisioning(self, project: "Project", server: "MCPServer") -> None:
+        """Hand a freshly registered server to the MCP task.
+
+        Falls back to provisioning inline on a thread when the task isn't
+        registered (CLI use, tests): the point is that the caller doesn't wait,
+        not that a particular task exists.
+        """
+        task = self._mcp_task()
+        if task is not None:
+            task.enqueue(project.id, server.id)
+            return
+        threading.Thread(
+            target=self._provision_mcp_server,
+            args=(project.id, server.id),
+            name=f"mcp-provision-{server.id}",
+            daemon=True,
+        ).start()
+
+    def pending_mcp_servers(self) -> list[tuple[str, str]]:
+        """``(project_id, server_id)`` for every server still awaiting provisioning.
+
+        Used by the MCP task at startup to adopt servers whose provisioning was
+        interrupted (the app quit between registration and discovery).
+        """
+        self._initialize_workspace()
+        pending: list[tuple[str, str]] = []
+        for project in self._model.workspace.projects:
+            for server in project.mcp_servers:
+                if server.system:
+                    continue
+                if server.status == MCPServerStatus.PENDING:
+                    pending.append((project.id, server.id))
+        return pending
+
+    def _provision_mcp_server(self, project_id: str, server_id: str) -> dict:
+        """Discover, enrich, index and crawl one registered server.
+
+        The whole slow half of registration, run off the request path:
+
+        1. discover the tools when registration couldn't supply them (a local
+           process launch, or a remote handshake);
+        2. enrich blank metadata via the LLM (skipped for curated catalog
+           entries, which already carry it);
+        3. embed the tool vectors so the router can retrieve them;
+        4. crawl the server's content when it is a document-type connection.
+
+        Records ``ready`` or ``failed`` + ``last_error`` on the server, so the
+        state a client polls always reflects a finished pass.
+        """
+        try:
+            project = self._get_project(project_id)
+        except Exception:
+            logger.warning("[mcp-provision] Project %s is gone — skipping", project_id)
+            return {"status": "skipped", "reason": "project not found"}
+
+        server = next((s for s in project.mcp_servers if s.id == server_id), None)
+        if server is None:
+            # Registered by another process, or deleted before we got to it.
+            self._model.workspace.reload()
+            project = self._get_project(project_id)
+            server = next((s for s in project.mcp_servers if s.id == server_id), None)
+        if server is None:
+            logger.info("[mcp-provision] Server %s is gone — skipping", server_id)
+            return {"status": "skipped", "reason": "server not found"}
+
+        logger.info(
+            "[mcp-provision] Provisioning '%s' (%s, %d tool(s) known)",
+            server.name, server.server_type.value, len(server.tools or []),
+        )
+
+        try:
+            if not server.tools:
+                self._discover_mcp_tools(server)
+        except MCPDiscoveryError as exc:
+            server.status = MCPServerStatus.FAILED
+            server.last_error = str(exc)
+            self._model.save()
+            logger.warning(
+                "[mcp-provision] '%s' failed: %s", server.name, server.last_error,
+            )
+            return {"status": "failed", "error": server.last_error}
+        except Exception as exc:
+            server.status = MCPServerStatus.FAILED
+            server.last_error = self._friendly_discovery_error(str(exc))
+            self._model.save()
+            logger.warning(
+                "[mcp-provision] '%s' failed: %s", server.name, exc,
+            )
+            return {"status": "failed", "error": server.last_error}
+
+        # Metadata for the UI and the tool router.  An LLM call, which is why it
+        # is here and not on the registration request.
         self._enrich_mcp_server(server)
 
-        current_project.mcp_servers.append(server)
+        server.status = MCPServerStatus.READY
+        server.last_error = None
         self._model.save()
-        self._index_mcp_tools(current_project, server)
 
-        result = self._mcp_server_to_dict(server)
+        self._index_mcp_tools(project, server)
+        self._probe_mcp_account(server)
 
-        return result
+        crawl = self._crawl_mcp_server(project, server, force=True)
+
+        logger.info(
+            "[mcp-provision] '%s' ready — %d tool(s) indexed%s",
+            server.name, len(server.tools or []),
+            f", {crawl.get('indexed', 0)} content document(s) crawled" if crawl else "",
+        )
+        return {
+            "status": "ready",
+            "tools": len(server.tools or []),
+            "crawl": crawl,
+        }
+
+    def _probe_mcp_account(self, server: "MCPServer") -> None:
+        """Record which account *server* is linked as, when it can say.
+
+        One read-only call on the provisioning pass — so it costs a request per
+        connect or re-index, never per page load.  Best-effort: a server with no
+        identity tool leaves the field alone.
+        """
+        try:
+            from smartloop.mcp.account import probe_account
+            account = probe_account(server)
+        except Exception as e:
+            logger.debug("[mcp-account] probe failed for '%s': %s", server.name, e)
+            return
+        if account and account != server.account:
+            server.account = account
+            self._model.save()
+
+    def _discover_mcp_tools(self, server: "MCPServer") -> None:
+        """Fill in a server's tools, launching or connecting as needed."""
+        if server.server_type == MCPServerType.LOCAL:
+            self._discover_local_mcp_tools(server)
+            return
+
+        server_url = server.remote_config.server_url if server.remote_config else None
+        if not server_url:
+            raise MCPDiscoveryError("This connection has no server URL.")
+
+        from smartloop.mcp import MCPClient
+        token = None
+        if server.oauth_credentials and server.oauth_credentials.access_token:
+            token = server.oauth_credentials.access_token
+        elif server.remote_config and server.remote_config.token:
+            token = server.remote_config.token
+
+        with MCPClient() as client:
+            result = client.connect_and_discover_tools(server_url, access_token=token)
+        if not result or not result.success:
+            raise MCPDiscoveryError(
+                self._friendly_discovery_error(
+                    (result.error if result else None) or "tool discovery failed"
+                )
+            )
+        server.tools = result.tools
+        si = result.server_info
+        if si:
+            if not server.description and si.description:
+                server.description = si.description
+            si_dict = {"name": si.name, "title": si.title, "version": si.version}
+            if si.description:
+                si_dict["description"] = si.description
+            if si.icons:
+                si_dict["icons"] = si.icons
+            server.server_info = si_dict
+        logger.info(
+            "Discovered %d tool(s) from remote MCP server '%s'",
+            len(result.tools), server.name,
+        )
+
+    # ---------------------------------------------------------- busy / idle
+
+    @contextmanager
+    def _inference_slot(self):
+        """Hold an inference slot, and record that the model is in use.
+
+        Wraps ``_inference_lock`` so the count is maintained wherever the lock
+        is taken.  Background work reads it through :meth:`idle_seconds`.
+        """
+        with self._inference_lock:
+            with self._inference_state_lock:
+                self._inference_active += 1
+            try:
+                yield
+            finally:
+                with self._inference_state_lock:
+                    self._inference_active -= 1
+                    self._last_inference_at = time.time()
+
+    def idle_seconds(self) -> float:
+        """Seconds since the model last finished answering; 0.0 while it is.
+
+        The MCP crawl uses this to stay out of the way: it competes for CPU,
+        network and the same MCP connections a live tool call needs, and none
+        of that should land on a reply the user is waiting for.
+        """
+        with self._inference_state_lock:
+            if self._inference_active > 0:
+                return 0.0
+            if not self._last_inference_at:
+                # Nothing has run this session — idle since startup.
+                return float("inf")
+            return max(0.0, time.time() - self._last_inference_at)
+
+    # ------------------------------------------------------ mcp content crawl
+
+    def _ensure_mcp_document_indexer(self, project: "Project") -> MCPDocumentIndexer:
+        """Return the crawl indexer for *project*, rebuilding it on a switch."""
+        if (
+            self._mcp_document_indexer is None
+            or self._mcp_document_indexer_dir != project.project_dir
+        ):
+            self._mcp_document_indexer = MCPDocumentIndexer(
+                project_dir=project.project_dir,
+                logger=logger,
+                base_dir=self._model.workspace.workspace_dir,
+            )
+            self._mcp_document_indexer_dir = project.project_dir
+        return self._mcp_document_indexer
+
+    def _crawl_mcp_server(
+        self,
+        project: "Project",
+        server: "MCPServer",
+        force: bool = False,
+        ttl: float = 0.0,
+    ) -> dict:
+        """Crawl one server's content into the project's ``mcp_documents`` index.
+
+        Best-effort: a server that is unreachable, rate-limited or simply not a
+        document-type connection leaves the existing index in place and the next
+        cycle tries again.
+        """
+        from smartloop.mcp.crawl_plans import should_crawl
+
+        if not should_crawl(server):
+            return {}
+        try:
+            indexer = self._ensure_mcp_document_indexer(project)
+            return indexer.crawl_server(
+                server, ttl=ttl, force=force,
+                on_server_updated=lambda _s: self._model.save(),
+            )
+        except Exception as e:
+            logger.warning(
+                "[mcp-crawl] Crawl of '%s' failed: %s", server.name, e,
+            )
+            return {}
+
+    def crawl_mcp_content(
+        self,
+        project_id: str | None = None,
+        server_id: str | None = None,
+        force: bool = False,
+        ttl: float = 0.0,
+    ) -> dict:
+        """Refresh the crawled content of a project's document-type servers.
+
+        This is the periodic cycle the MCP task drives, and the same entry point
+        a client's explicit "refresh" hits.  Only the active project is walked
+        unless *project_id* names one: it is the project whose index retrieval
+        actually consults.
+
+        Returns ``{"project", "servers": {name: stats}, "chunks"}``.
+        """
+        self._initialize_workspace()
+        project = (
+            self._get_project(project_id) if project_id
+            else self._model.workspace.current_project
+        )
+        if project is None:
+            return {"servers": {}, "chunks": 0}
+
+        servers = [
+            s for s in project.mcp_servers
+            if not s.system and s.status != MCPServerStatus.FAILED
+            and (server_id is None or s.id == server_id)
+        ]
+        results: dict[str, dict] = {}
+        for server in servers:
+            stats = self._crawl_mcp_server(
+                project, server, force=force,
+                ttl=self._mcp_server_ttl(server, ttl),
+            )
+            if stats:
+                results[server.name] = stats
+
+        chunks = 0
+        if results:
+            try:
+                chunks = self._ensure_mcp_document_indexer(project).count()
+            except Exception:
+                chunks = 0
+        return {"project": project.name, "servers": results, "chunks": chunks}
+
+    @staticmethod
+    def _mcp_server_ttl(server: "MCPServer", default_ttl: float) -> float:
+        """How stale this server's content may be before the cycle re-walks it.
+
+        A connection's file can set its own ``index_every``, because the right
+        cadence belongs to the source rather than to the app: an air-quality
+        reading is stale within the hour and a reference wiki is the same next
+        week.  The task still ticks on the app-wide schedule; this decides
+        whether a given server is due when it does.
+        """
+        try:
+            from smartloop.mcp.crawl_plans import resolve_plan
+            from smartloop.mcp.plan_loader import definitions
+
+            plan = resolve_plan(server)
+            definition = definitions().get(plan.slug)
+            interval = definition.index_interval if definition else None
+        except Exception:
+            interval = None
+        return default_ttl if interval is None else interval
+
+    def _crawl_mcp_cycle(self) -> dict:
+        """The MCP task's periodic refresh cycle.
+
+        Walks the active project's document-type servers with a TTL just under
+        the cycle interval, so a server crawled moments ago during provisioning
+        (or by an explicit refresh) is not walked twice.
+        """
+        interval = float(_settings.mcp_crawl_interval_s or 0)
+        ttl = max(0.0, interval - 60.0)
+        return self.crawl_mcp_content(ttl=ttl)
+
+    def retry_mcp_server(
+        self, server_id: str, project_id: str | None = None
+    ) -> dict:
+        """Re-run provisioning for a server (a failed discovery, or a refresh).
+
+        Returns as soon as the work is queued — the pass itself runs on the MCP
+        task, and its outcome shows up in the server's ``status``.
+        """
+        self._initialize_workspace()
+        project = (
+            self._get_project(project_id) if project_id
+            else self._model.workspace.current_project
+        )
+        if project is None:
+            raise ValueError("No current project found")
+        server = next((s for s in project.mcp_servers if s.id == server_id), None)
+        if server is None:
+            raise ValueError(f"MCP server not found: {server_id}")
+
+        server.status = MCPServerStatus.PENDING
+        server.last_error = None
+        self._model.save()
+        self._queue_mcp_provisioning(project, server)
+        return self._mcp_server_to_dict(server)
+
+    @staticmethod
+    def _mcp_indexing_state(server: MCPServer, entry: dict) -> dict:
+        """Whether a connection's content is still being indexed.
+
+        Two background passes stand between registering a server and being able
+        to answer from it: provisioning (discover its tools, vectorize them) and
+        the content crawl (walk the server, vectorize what it returns).  Both
+        run off the request path, so a client that just registered a Notion
+        connection sees an empty one until they finish.  They collapse into a
+        single ``state`` here because the question a UI asks is one question:
+        is this still working, and if not, did it work?
+
+        ``in_progress`` is the flag to drive a spinner off — while it is true,
+        the counts alongside it are not final.
+        """
+        from smartloop.mcp.crawl_plans import resolve_plan, should_crawl
+
+        crawl_enabled = should_crawl(server)
+        crawled_at = entry.get("crawled_at") or server.last_crawl_at
+
+        if server.status == MCPServerStatus.FAILED:
+            state = "failed"
+        elif server.status == MCPServerStatus.PENDING:
+            state = "provisioning"
+        elif entry.get("crawling"):
+            state = "indexing"
+        elif not crawl_enabled:
+            # Not every server has "content": a shell or weather connection is
+            # complete once its tools are indexed.
+            state = "disabled"
+        elif crawled_at:
+            state = "indexed"
+        else:
+            state = "queued"
+
+        return {
+            "state": state,
+            "in_progress": state in ("provisioning", "indexing", "queued"),
+            "crawl_enabled": crawl_enabled,
+            "plan": entry.get("plan") or resolve_plan(server).slug,
+            "documents": entry.get("documents", 0),
+            "records": entry.get("records", 0),
+            "crawled_at": crawled_at,
+            "error": server.last_error,
+        }
+
+    def list_mcp_servers_with_status(self, project_id: str) -> list[dict]:
+        """Every non-system server in a project, each with its indexing state.
+
+        The list view is where a just-registered connection is watched, so the
+        state travels with the list rather than costing one request per server.
+        """
+        project = self._get_project(project_id)
+        indexer = self._ensure_mcp_document_indexer(project)
+        return [
+            {
+                **self._mcp_server_to_dict(server),
+                "indexing": self._mcp_indexing_state(
+                    server, indexer.server_status(server.id)
+                ),
+            }
+            for server in project.mcp_servers
+            if not server.system
+        ]
+
+    def mcp_server_status(self, server_id: str, project_id: str | None = None) -> dict:
+        """One server, with the indexing state a client polls it for."""
+        self._initialize_workspace()
+        project = (
+            self._get_project(project_id) if project_id
+            else self._model.workspace.current_project
+        )
+        if project is None:
+            raise ValueError("No current project found")
+
+        server = next(
+            (s for s in project.mcp_servers if s.id == server_id), None
+        )
+        if server is None:
+            raise ValueError(f"MCP server not found: {server_id}")
+
+        indexer = self._ensure_mcp_document_indexer(project)
+        return {
+            **self._mcp_server_to_dict(server),
+            "indexing": self._mcp_indexing_state(
+                server, indexer.server_status(server.id)
+            ),
+        }
+
+    def mcp_content_status(self, project_id: str | None = None) -> dict:
+        """Crawl state for a project: chunk count and per-server crawl info."""
+        self._initialize_workspace()
+        project = (
+            self._get_project(project_id) if project_id
+            else self._model.workspace.current_project
+        )
+        if project is None:
+            raise ValueError("No current project found")
+
+        indexer = self._ensure_mcp_document_indexer(project)
+        status = indexer.status()
+        servers = []
+        for server in project.mcp_servers:
+            if server.system:
+                continue
+            servers.append({
+                "id": server.id,
+                "name": server.name,
+                "status": server.status.value,
+                **self._mcp_indexing_state(
+                    server, status["servers"].get(server.id, {})
+                ),
+            })
+        return {
+            "project": project.name,
+            "chunks": status["chunks"],
+            "servers": servers,
+        }
+
+    def set_mcp_crawl_enabled(
+        self, server_id: str, enabled: bool, project_id: str | None = None
+    ) -> dict:
+        """Opt a server's content in or out of the crawl cycle."""
+        self._initialize_workspace()
+        project = (
+            self._get_project(project_id) if project_id
+            else self._model.workspace.current_project
+        )
+        if project is None:
+            raise ValueError("No current project found")
+        server = next((s for s in project.mcp_servers if s.id == server_id), None)
+        if server is None:
+            raise ValueError(f"MCP server not found: {server_id}")
+
+        server.crawl = enabled
+        self._model.save()
+        if enabled:
+            task = self._mcp_task()
+            if task is not None:
+                task.request_crawl()
+        else:
+            self._unindex_mcp_documents(project, server_id)
+        return {"id": server_id, "crawl": enabled}
+
+    def search_mcp_documents(
+        self,
+        query: str,
+        n_results: int = 8,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ) -> list:
+        """Search content crawled from the project's MCP servers.
+
+        The retrieval half of the crawl: Notion pages, Linear issues and Trello
+        cards are already embedded, so a question about them is answered from
+        the index instead of hoping the tool router picks the right call.  Uses
+        the same history-enriched query and relevance floor as document and
+        workspace search, so one source cannot dominate on a looser threshold.
+        """
+        if self._model is None:
+            return []
+        try:
+            project = self._model.workspace.current_project
+            if not project:
+                return []
+            indexer = self._ensure_mcp_document_indexer(project)
+
+            search_query = query
+            if conversation_history:
+                search_query = self._build_history_search_query(query, conversation_history)
+
+            recall = max(n_results, 20)
+            chunks = indexer.search(
+                search_query, n_results=recall, max_distance=_RECALL_MAX_DISTANCE,
+            )
+            if not chunks and search_query != query:
+                chunks = indexer.search(
+                    query, n_results=recall, max_distance=_RECALL_MAX_DISTANCE,
+                )
+            return _select_relevant_chunks(chunks, label="mcp-content-search")
+        except Exception as e:
+            logger.warning(f"[mcp-crawl] search_mcp_documents failed: {e}")
+            self._mcp_document_indexer = None
+            return []
+
+    def _unindex_mcp_documents(self, project: "Project", server_id: str) -> None:
+        """Drop a server's crawled content from the project's index."""
+        try:
+            indexer = self._ensure_mcp_document_indexer(project)
+            removed = indexer.remove_server(server_id)
+            if removed:
+                logger.info(
+                    "[mcp-crawl] Removed %d crawled document(s) for server %s",
+                    removed, server_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "[mcp-crawl] Failed to remove crawled content for %s: %s",
+                server_id, e,
+            )
 
     def _index_mcp_tools(self, project: "Project", server: "MCPServer") -> None:
         """Vectorize a server's tools into the project's ``mcp_tools`` collection.
@@ -3537,7 +4171,7 @@ class ModelService:
                 return
             from smartloop.agents.mcp.server_summarizer import MCPServerSummarizer
             summarizer = MCPServerSummarizer(llm)
-            with self._inference_lock:
+            with self._inference_slot():
                 # Description + tags (UI) — one JSON call when either is missing.
                 if not server.description or not server.tags:
                     meta = summarizer.generate_metadata(server)
@@ -3661,6 +4295,13 @@ class ModelService:
             "enabled": s.enabled,
             "system": s.system,
             "tools": [t.model_dump() for t in s.tools],
+            # Background provisioning state — clients poll this instead of
+            # blocking on discovery at registration time.
+            "status": s.status.value,
+            "last_error": s.last_error,
+            "crawl": s.crawl,
+            "last_crawl_at": s.last_crawl_at,
+            "account": s.account,
         }
         if s.config:
             result["command"] = s.config.command
@@ -3719,12 +4360,50 @@ class ModelService:
         ]
         self._model.save()
         self._unindex_mcp_tools(current_project, server_id)
+        self._unindex_mcp_documents(current_project, server_id)
+        self._remove_mcp_definition_file(server)
 
         return {
             "id": server_id,
             "deleted": True,
             "message": "MCP server deleted successfully",
         }
+
+    def _remove_mcp_definition_file(self, server: "MCPServer") -> None:
+        """Delete the dropped-in file that defined *server*, if it was one.
+
+        Without this a deleted connection leaves its plan behind: the crawl
+        registry keeps listing it, and re-adding a server by the same name
+        silently inherits the old file's steps and cadence.  Deleting a
+        connection should leave nothing of it.
+
+        Only files under ``mcp.d`` are touched, and only when no remaining
+        server still resolves to that plan — two connections can share one.
+        """
+        try:
+            from smartloop.mcp.crawl_plans import resolve_plan
+            from smartloop.mcp.plan_loader import (
+                USER_PLANS_DIR, definitions, reload_plans,
+            )
+
+            key = resolve_plan(server).slug
+            if key not in definitions():
+                return
+
+            for project in self._model.workspace.projects:
+                for other in project.mcp_servers:
+                    if other.id != server.id and resolve_plan(other).slug == key:
+                        return
+
+            path = os.path.join(
+                _settings.home_dir, USER_PLANS_DIR, f"{key}.toml",
+            )
+            if os.path.isfile(path):
+                os.remove(path)
+                reload_plans()
+                logger.info("[mcp-definition] Removed %s", path)
+        except Exception as e:
+            logger.debug("[mcp-definition] Could not remove the plan file: %s", e)
 
     # --------------------------------------------------------------- MCP agents
 
@@ -4467,7 +5146,7 @@ class ModelService:
         ]
 
         def _ask(vision_llm):
-            with self._inference_lock:
+            with self._inference_slot():
                 return vision_llm.model.create_chat_completion(
                     messages=messages, max_tokens=max_tokens,
                     temperature=0.0, stream=False,

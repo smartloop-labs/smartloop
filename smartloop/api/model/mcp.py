@@ -26,6 +26,22 @@ class MCPServerResponse(BaseModel):
     system: bool = False
     tools: List[MCPToolResponse] = []
     server_info: Optional[Dict] = None
+    # Background provisioning state: "pending" while discovery, enrichment and
+    # indexing run on the MCP task, then "ready" or "failed" with a reason.
+    # Registration returns immediately, so clients watch this rather than
+    # waiting on the response.
+    status: str = "ready"
+    last_error: Optional[str] = None
+    # Content crawl opt-in: None = automatic (on for document-type servers).
+    crawl: Optional[bool] = None
+    last_crawl_at: Optional[float] = None
+    # Account this connection is linked as, when the server can say.
+    account: Optional[str] = None
+
+
+class MCPCrawlRequest(BaseModel):
+    """Opt a server's content in or out of the crawl cycle."""
+    enabled: bool = True
 
 
 class MCPServerListResponse(BaseModel):
@@ -50,12 +66,24 @@ class MCPRegisterRequest(BaseModel):
     server_url: Optional[str] = None
     token: Optional[str] = None
     callback_url: Optional[str] = None
-    return_url: Optional[str] = None   # URL to redirect to after successful registration
+    # Offered as a link on the OAuth success page (no automatic navigation —
+    # see _oauth_success_page).
+    return_url: Optional[str] = None
     # Install a curated catalog entry: the backend resolves the slug and takes
     # server_url, description and tags from the catalog rather than the caller,
     # so curated metadata cannot drift or be spoofed. server_url above is kept
     # as the fallback for when resolution misses.
     catalog_slug: Optional[str] = None
+
+
+class MCPDefinitionRequest(BaseModel):
+    """A connection described by a dropped-in TOML file.
+
+    ``toml`` is the file's text; ``filename`` names the copy kept under
+    ``~/.smartloop/mcp.d/`` so the crawl plan it declares survives the install.
+    """
+    toml: str
+    filename: Optional[str] = None
 
 
 class MCPRegisterResponse(BaseModel):

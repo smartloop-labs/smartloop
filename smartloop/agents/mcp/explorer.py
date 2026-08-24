@@ -4,6 +4,7 @@ conversation history/context, filesystem walk, and URL fetch.
 """
 import logging
 import os
+import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -80,6 +81,32 @@ _QUERY_STOP_WORDS = {
 
 # ------------------------------------------------------------------ models
 
+def _crawl_age(chunk: Any) -> str:
+    """`` (indexed 12m ago)`` for a crawled record, or ``""``.
+
+    A crawled record is a snapshot, and this content is now used *instead of*
+    calling the server — so the age has to travel with it. Without it the model
+    states a fifteen-minute-old quote as the current price, with nothing in the
+    prompt to suggest otherwise.
+    """
+    try:
+        crawled_at = float((chunk.metadata or {}).get("crawled_at") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not crawled_at:
+        return ""
+    seconds = max(0.0, time.time() - crawled_at)
+    if seconds < 90:
+        return " (indexed just now)"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f" (indexed {minutes}m ago)"
+    hours = minutes // 60
+    if hours < 24:
+        return f" (indexed {hours}h ago)"
+    return f" (indexed {hours // 24}d ago)"
+
+
 class SearchContext(BaseModel):
     """Collected explore results: vector, feedback, workspace, and web search."""
 
@@ -98,6 +125,12 @@ class SearchContext(BaseModel):
     # Result of an auto-run read-only MCP tool (a "collect" step). Write /
     # side-effecting tools are NOT run here — they stay planned execute steps.
     mcp_context: str = ""
+    # Content crawled from document-type MCP servers (Notion pages, Linear
+    # issues, Trello cards) and vectorized ahead of the query — the indexed
+    # counterpart to mcp_context's live call. Kept separate because it is
+    # stored content, not a fresh fetch: it must not suppress a web search the
+    # way a live tool result does.
+    mcp_document_context: str = ""
     citations: Optional[List[Dict[str, Any]]] = None
     # Per-document search results ({"document_name", "content"}), ordered by
     # relevance.  Populated by the parallel vector search and consumed by the
@@ -117,6 +150,7 @@ class SearchContext(BaseModel):
             or self.workspace_context
             or self.web_context
             or self.mcp_context
+            or self.mcp_document_context
         )
 
 
@@ -611,6 +645,44 @@ Does answering the latest message require a new web search?
             logger.warning(f"[collect] Workspace search failed: {e}")
         return ""
 
+    @staticmethod
+    def _search_mcp_documents(
+        query: str,
+        model_service: Any,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        """Crawled MCP content search — thread-safe, I/O bound.
+
+        The indexed half of MCP retrieval: content a crawl already pulled from
+        Notion/Linear/Trello is searched like any other collection, so the
+        answer doesn't depend on the router selecting the right live tool call
+        for this particular phrasing.
+        """
+        try:
+            chunks = model_service.search_mcp_documents(
+                query, n_results=8, conversation_history=conversation_history,
+            )
+            if not chunks:
+                return ""
+            best: dict = {}
+            for chunk in chunks:
+                name = chunk.document_name or chunk.document_id
+                if name not in best or chunk.distance < best[name].distance:
+                    best[name] = chunk
+            text = "\n\n".join(
+                f"--- {name}{_crawl_age(chunk)} ---\n{chunk.text[:2000]}"
+                for name, chunk in best.items()
+            )
+            logger.info(
+                f"[collect] MCP content search returned {len(best)} record(s)"
+            )
+            return text
+        except Exception as e:
+            if isinstance(e, _PROGRAMMING_ERRORS):
+                raise
+            logger.warning(f"[collect] MCP content search failed: {e}")
+        return ""
+
     def collect_parallel(
         self,
         query: str,
@@ -637,7 +709,7 @@ Does answering the latest message require a new web search?
         if not model_service:
             return ctx
 
-        pool = executor or ThreadPoolExecutor(max_workers=5)
+        pool = executor or ThreadPoolExecutor(max_workers=6)
         own_pool = executor is None
 
         try:
@@ -658,8 +730,38 @@ Does answering the latest message require a new web search?
             # MCP (read-only): part of explore — vector-retrieve the best tool
             # and auto-run it if read-only, returning the result. Write tools
             # are skipped here (they stay planned execute steps).
-            f_mcp = pool.submit(self._run_mcp, query, mcp_servers, project_dir) \
-                if (mcp_servers and project_dir) else None
+            # Crawled MCP content: already embedded, so it is a vector search
+            # like any other — no tool call, no server round-trip.
+            f_mcp_docs = pool.submit(
+                self._search_mcp_documents, query, model_service, history_for_search,
+            )
+
+            # Resolved before the live call is even submitted, because its
+            # answer decides whether that call is needed: a crawl already
+            # pulled this server's content, so asking the server again returns
+            # what is already in hand at the cost of a network round-trip that
+            # can also fail.  The ordering costs nothing — this is a local
+            # vector query against a collection that is already open.
+            #
+            # The content carries its age into the prompt (see `_crawl_age`),
+            # which is what keeps the trade honest: the model can say how old
+            # the snapshot is instead of presenting it as this second's truth.
+            ctx.mcp_document_context = f_mcp_docs.result()
+
+            # MCP (read-only): part of explore — vector-retrieve the best tool
+            # and auto-run it if read-only, returning the result. Write tools
+            # are skipped here (they stay planned execute steps).
+            f_mcp = None
+            if mcp_servers and project_dir:
+                if ctx.mcp_document_context:
+                    logger.info(
+                        "[collect] Crawled MCP content matched — skipping the "
+                        "live tool call"
+                    )
+                else:
+                    f_mcp = pool.submit(
+                        self._run_mcp, query, mcp_servers, project_dir,
+                    )
 
             # Collect primary results (local retrieval + MCP tools)
             vec_result = f_vec.result()

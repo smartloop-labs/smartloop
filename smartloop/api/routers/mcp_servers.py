@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import logging
+import os
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from smartloop.api.model import (
+    MCPCrawlRequest,
+    MCPDefinitionRequest,
     MCPServerResponse,
     DeleteMCPServerResponse,
     MCPToolResponse,
@@ -131,6 +134,51 @@ def _build_server_response(result: dict) -> MCPServerResponse:
         system=result.get("system", False),
         tools=[MCPToolResponse(**t) for t in result["tools"]],
         server_info=result.get("server_info"),
+        status=result.get("status", "ready"),
+        last_error=result.get("last_error"),
+        crawl=result.get("crawl"),
+        last_crawl_at=result.get("last_crawl_at"),
+        account=result.get("account"),
+    )
+
+
+def _oauth_success_page(
+    server_name: str,
+    tool_count: int,
+    server_id: str,
+    return_url: str | None = None,
+) -> HTMLResponse:
+    """Render the "connected" page shown in the browser after OAuth.
+
+    It reports what was connected and stops there.  It used to navigate to the
+    app's ``smartloop://`` deep link automatically, which made the last step of
+    every install feel slow: the browser hands the URL to the OS, which decides
+    whether to prompt, then wakes the app — all while the user watches a
+    "Redirecting..." page that may never go away if no handler is registered.
+    The app already learns about the server from the API, so the browser has
+    nothing left to deliver: the page states the tool count and lets the user
+    close the window.  When a return URL was supplied it is offered as a link,
+    so going back to the app stays one click away without being forced.
+    """
+    tools_label = "tool" if tool_count == 1 else "tools"
+    link = ""
+    if return_url:
+        from urllib.parse import urlencode
+        separator = "&" if "?" in return_url else "?"
+        href = f"{return_url}{separator}{urlencode({'server_id': server_id})}"
+        link = f'<p><a href="{escape(href, quote=True)}">Return to Smartloop</a></p>'
+
+    return HTMLResponse(
+        "<html><head><title>MCP server connected</title></head>"
+        '<body style="font-family:system-ui,sans-serif;max-width:34rem;margin:4rem auto">'
+        "<h2>MCP server connected</h2>"
+        f"<p><strong>{escape(server_name)}</strong> registered with "
+        f"{tool_count} {tools_label}.</p>"
+        "<p>Indexing and metadata finish in the background — you can close "
+        "this window.</p>"
+        f"{link}"
+        '<p><button onclick="window.close()">Close window</button></p>'
+        "</body></html>"
     )
 
 
@@ -146,6 +194,12 @@ async def _register_local_mcp_server(
     ``npx``) plus ``args``; the command must be installed on the host PATH.
     When *curated* is a resolved catalog entry, its config and metadata win over
     the request.
+
+    Returns as soon as the connection is persisted, with ``status="pending"``:
+    launching the process, enumerating tools, generating metadata and indexing
+    all happen on the MCP background task.  Clients follow the server's
+    ``status``/``last_error`` (via ``GET /projects/{id}/mcp``) instead of
+    waiting here, and can re-run a failed pass with ``.../mcp/{id}/refresh``.
     """
     local_cfg = getattr(curated, "local_config", None) if curated else None
     command = local_cfg.command if local_cfg else request.command
@@ -444,15 +498,13 @@ async def list_mcp_servers_for_project(
     project_id: str,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """List MCP servers for a specific project."""
+    """List MCP servers for a specific project.
+
+    Each server carries an ``indexing`` block — provisioning and content-crawl
+    state — so a client can show "still indexing" without a request per server.
+    """
     try:
-        project = model_service._get_project(project_id)
-        servers = [
-            model_service._mcp_server_to_dict(s)
-            for s in project.mcp_servers
-            if not s.system
-        ]
-        return {"servers": servers}
+        return {"servers": model_service.list_mcp_servers_with_status(project_id)}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -478,6 +530,118 @@ async def count_indexed_mcp_tools_for_project(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.exception("Error counting indexed MCP tools")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/projects/{project_id}/mcp/content")
+async def mcp_content_status_for_project(
+    project_id: str,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Crawled MCP content state for the project.
+
+    Reports the number of indexed content chunks and, per server, the crawl
+    plan that matched, how many records/documents it produced and when it last
+    ran — the content counterpart to ``mcp/tools/count``.
+    """
+    try:
+        return model_service.mcp_content_status(project_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error reading MCP content status")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/projects/{project_id}/mcp/{server_id}")
+async def get_mcp_server(
+    project_id: str,
+    server_id: str,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """One MCP server, with whether its content is still being indexed.
+
+    Registration returns before the server is usable: tool discovery and the
+    content crawl both run on the MCP task.  ``indexing.state`` is what a
+    client polls — ``provisioning`` → ``queued`` → ``indexing`` → ``indexed``,
+    or ``failed`` with ``indexing.error``, or ``disabled`` for a server whose
+    content isn't crawled.  ``indexing.in_progress`` is the single flag to
+    drive a spinner off.
+
+    Declared after the literal ``mcp/tools/count`` and ``mcp/content`` routes:
+    a path parameter here would otherwise swallow them.
+    """
+    try:
+        return model_service.mcp_server_status(server_id, project_id=project_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error reading MCP server status")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/projects/{project_id}/mcp/content/refresh")
+async def refresh_mcp_content_for_project(
+    project_id: str,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Re-crawl every document-type server in the project now.
+
+    The crawl also runs at startup and on the periodic cycle; this is the
+    manual "fetch it again" for when the source just changed.
+    """
+    try:
+        return model_service.crawl_mcp_content(project_id=project_id, force=True)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error refreshing MCP content")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/projects/{project_id}/mcp/{server_id}/refresh", response_model=MCPServerResponse)
+async def refresh_mcp_server(
+    project_id: str,
+    server_id: str,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Re-run background provisioning for one server (retry a failed discovery).
+
+    Returns the server with ``status="pending"``; the pass itself runs on the
+    MCP task.
+    """
+    try:
+        result = model_service.retry_mcp_server(server_id, project_id=project_id)
+        return _build_server_response(result)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error refreshing MCP server")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/projects/{project_id}/mcp/{server_id}/crawl")
+async def set_mcp_server_crawl(
+    project_id: str,
+    server_id: str,
+    request: MCPCrawlRequest,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Opt one server's content in or out of the crawl cycle.
+
+    Document-type servers (Notion, Linear, Trello, …) crawl by default; this
+    turns it on for a server we don't recognise as one, or off for a server
+    whose content shouldn't be indexed.  Disabling also drops what was already
+    indexed for it.
+    """
+    try:
+        return model_service.set_mcp_crawl_enabled(
+            server_id, request.enabled, project_id=project_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error updating MCP crawl setting")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -524,6 +688,91 @@ async def register_mcp_server(
         return await _register_local_mcp_server(request, model_service, project_id, curated)
     return await _register_remote_mcp_server(
         request, model_service, http_request, project_id, curated,
+    )
+
+
+@router.post("/projects/{project_id}/mcp/definition", response_model=MCPRegisterResponse)
+async def register_mcp_from_definition(
+    project_id: str,
+    request: MCPDefinitionRequest,
+    http_request: Request = None,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Install a connection from a dropped-in TOML file.
+
+    The file is the whole definition: what the server is called, how to reach
+    it, and — optionally — how to index its content.  Both halves are kept: the
+    file is saved under ``~/.smartloop/mcp.d/`` so its crawl plan is there for
+    every later refresh, and the connection itself goes through the ordinary
+    registration path, so a remote server needing OAuth returns an ``auth_url``
+    exactly as it would if the URL had been typed in.
+    """
+    from smartloop.mcp.plan_loader import (
+        USER_PLANS_DIR, parse_definitions, reload_plans,
+    )
+
+    try:
+        found = parse_definitions(request.toml, request.filename or "upload")
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Could not read this connection file: {e}",
+        )
+    if not found:
+        raise HTTPException(
+            status_code=400,
+            detail="No [[mcp]] entry in this file — it needs at least a name "
+                   "and either a local command or a remote url.",
+        )
+    if len(found) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This file describes {len(found)} connections "
+                   f"({', '.join(sorted(found))}); drop one file per connection.",
+        )
+
+    definition = next(iter(found.values()))
+    if not definition.kind:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{definition.name}' has no connection: add a url for a "
+                   f"remote server, or a package name for one to run locally.",
+        )
+
+    # Persist before registering: the plan has to be on disk by the time the
+    # provisioning pass runs its first crawl, and that is queued by the
+    # registration below.
+    try:
+        from smartloop.config.app_settings import AppSettings
+        drop_in_dir = os.path.join(AppSettings().home_dir, USER_PLANS_DIR)
+        os.makedirs(drop_in_dir, exist_ok=True)
+        # Named after the connection, not after whatever the file was called on
+        # the way in — that is what makes re-dropping an edited file replace
+        # the old plan instead of stacking a second copy beside it.
+        target = os.path.join(drop_in_dir, f"{definition.key}.toml")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(request.toml)
+        reload_plans()
+        logger.info("[mcp-definition] Saved '%s' to %s", definition.key, target)
+    except Exception as e:
+        # The connection is still worth installing without its plan; the crawl
+        # falls back to a derived one.
+        logger.warning("[mcp-definition] Could not save the plan file: %s", e)
+
+    command, args = definition.launch
+    register = MCPRegisterRequest(
+        name=definition.name,
+        server_type=definition.kind,
+        command=command,
+        args=args,
+        env=dict(definition.env),
+        cwd=definition.cwd,
+        server_url=definition.url,
+        token=definition.token,
+        return_url="smartloop://mcp-authorization",
+    )
+    return await register_mcp_server(
+        project_id=project_id, request=register,
+        http_request=http_request, model_service=model_service,
     )
 
 
@@ -658,28 +907,12 @@ async def mcp_oauth_callback(
 
         server_id = result["id"]
         tool_count = len(result.get("tools", []))
-        return_url = session.get("return_url")
-
-        if return_url:
-            from urllib.parse import urlencode
-            separator = "&" if "?" in return_url else "?"
-            redirect_url = f"{return_url}{separator}{urlencode({'server_id': server_id})}"
-            response = HTMLResponse(
-                f"<html><body>"
-                f"<h2>MCP server connected</h2>"
-                f"<p><strong>{result['name']}</strong> registered with {tool_count} tools.</p>"
-                f"<p>Redirecting...</p>"
-                f"<script>window.location.href = '{redirect_url}';</script>"
-                f"</body></html>"
-            )
-        else:
-            response = HTMLResponse(
-                f"<html><body>"
-                f"<h2>MCP server connected</h2>"
-                f"<p><strong>{result['name']}</strong> registered with {tool_count} tools.</p>"
-                f"<p>You can close this window.</p>"
-                f"</body></html>"
-            )
+        response = _oauth_success_page(
+            server_name=result["name"],
+            tool_count=tool_count,
+            server_id=server_id,
+            return_url=session.get("return_url"),
+        )
 
         # Cache response for duplicate browser requests
         _completed_oauth_responses[state] = (
