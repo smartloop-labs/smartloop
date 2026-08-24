@@ -124,8 +124,8 @@ class TestEnablement:
 
         self._write_config(tmp_path, False, monkeypatch)
         calls = []
-        monkeypatch.setattr(providers, "get_search_provider",
-                            lambda: type("P", (), {"search": lambda self, q, count: calls.append(q) or ["http://x"]})())
+        monkeypatch.setattr(providers, "resolve_provider",
+                            lambda: type("P", (), {"name": "hosted", "search": lambda self, q, count: calls.append(q) or ["http://x"]})())
 
         assert WebSearchAgent.is_enabled() is False
         assert WebSearchAgent().search("latest canyon bikes") == ""
