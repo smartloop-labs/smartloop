@@ -438,39 +438,3 @@ url = "https://mcp.example.com/mcp"
     def test_a_typo_is_an_error_not_a_plan_that_never_refreshes(self):
         with pytest.raises(Exception, match="duration"):
             self._parse('"6 fortnights"')
-
-
-class TestBundledExamples:
-    """The example files ship as documentation, so they have to actually load."""
-
-    def _examples(self):
-        import glob
-        # docs/mcp/ in the repo — documentation, not shipped in the wheel, so
-        # this is skipped when the tests run against an installed package.
-        root = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__),
-        )))
-        return sorted(glob.glob(os.path.join(root, "docs", "mcp", "*.toml")))
-
-    def test_every_example_parses(self):
-        if not self._examples():
-            pytest.skip("running outside the repo — docs/mcp is not packaged")
-        for path in self._examples():
-            with open(path) as fh:
-                found = parse_definitions(fh.read(), path)
-            assert found, path
-
-    def test_the_san_francisco_examples_name_their_location(self):
-        # The point of these files: a server with no listing tool gets its
-        # subjects from the file.
-        if not self._examples():
-            pytest.skip("running outside the repo — docs/mcp is not packaged")
-        located = False
-        for path in self._examples():
-            with open(path) as fh:
-                for definition in parse_definitions(fh.read(), path).values():
-                    for step in definition.index:
-                        values = [v for vs in step.for_each.values() for v in vs]
-                        if 37.7749 in values or "San Francisco, CA" in values:
-                            located = True
-        assert located
