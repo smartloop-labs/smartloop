@@ -734,9 +734,8 @@ async def register_mcp_from_definition(
     if not definition.kind:
         raise HTTPException(
             status_code=400,
-            detail=f"'{definition.name}' has no connection: add a "
-                   f"command (and args) for a local server, or a url for a "
-                   f"remote one.",
+            detail=f"'{definition.name}' has no connection: add a url for a "
+                   f"remote server, or a package name for one to run locally.",
         )
 
     # Persist before registering: the plan has to be on disk by the time the
@@ -759,11 +758,12 @@ async def register_mcp_from_definition(
         # falls back to a derived one.
         logger.warning("[mcp-definition] Could not save the plan file: %s", e)
 
+    command, args = definition.launch
     register = MCPRegisterRequest(
         name=definition.name,
         server_type=definition.kind,
-        command=definition.command,
-        args=list(definition.args),
+        command=command,
+        args=args,
         env=dict(definition.env),
         cwd=definition.cwd,
         server_url=definition.url,

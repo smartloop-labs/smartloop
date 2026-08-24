@@ -9,9 +9,7 @@
 
 [[mcp]]
 name = "weather-san-francisco"
-type = "local"
-command = "uvx"
-args = ["mcp-weather"]
+package = "mcp-weather"
 match = ["weather"]
 
 # Current conditions go stale fast; a forecast does not. An hour is the

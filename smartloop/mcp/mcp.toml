@@ -30,8 +30,7 @@
 #
 #      [[mcp]]
 #      name = "yahoo-finance"
-#      command = "uvx"
-#      args = ["yahoo-finance-mcp"]
+#      package = "yahoo-finance-mcp"
 #
 #  ── Fields ─────────────────────────────────────────────────────────────────
 #
@@ -42,18 +41,20 @@
 #    match           extra substrings tried (case-insensitively) against an
 #                    installed server's name, package and URL. `name` and `slug`
 #                    are always tried, so this is for aliases.
-#    type            "local" or "remote". Optional — inferred from whichever of
-#                    `command` / `url` is present, so a file that says it
-#                    plainly doesn't have to say it twice.
-#    command, args   a server run as a process. `command` is whatever launches
-#    env, cwd        it — uvx, npx, python, a path.
-#                      command = "uvx"
-#                      args = ["yahoo-finance-mcp"]
-#    url, token      a server reached over HTTP. OAuth is negotiated at install
-#                    time; `token` is for the servers that take a bearer token.
+#    url             a server reached over HTTP:
 #                      url = "https://mcp.linear.app/mcp"
-#                    A definition is local or remote, never both, and the
-#                    curated entries below are neither — the backend already
+#                    OAuth is negotiated at install time; `token` is for the
+#                    servers that take a bearer token instead.
+#    package         a server to run locally, by package name:
+#                      package = "yahoo-finance-mcp"
+#                    Shorthand for `command = "uvx"`, `args = ["<package>"]` —
+#                    the same thing typing it into "Add your own" does.
+#    command, args   for the servers a package name can't express: npx, python,
+#    env, cwd        a path.
+#                      command = "npx"
+#                      args = ["-y", "some-mcp"]
+#                    A url and a package name are alternatives; the curated
+#                    entries below have neither, because the backend already
 #                    holds their connection details.
 #    crawl           optional. true/false to force indexing on or off; omitted
 #                    means indexed when this file declares index steps.

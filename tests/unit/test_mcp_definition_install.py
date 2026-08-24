@@ -21,8 +21,7 @@ from smartloop.api.routers.mcp_servers import register_mcp_from_definition
 _LOCAL = '''
 [[mcp]]
 name = "yahoo-finance"
-command = "uvx"
-args = ["yahoo-finance-mcp"]
+package = "yahoo-finance-mcp"
 
 [[mcp.index]]
 label = "profile"
@@ -142,8 +141,7 @@ tools = ["list_things"]
         toml = '''
 [[mcp]]
 name = "acme"
-command = "uvx"
-args = ["acme"]
+package = "acme"
 
 [[mcp.index]]
 label = "child"

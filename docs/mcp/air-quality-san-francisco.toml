@@ -15,8 +15,7 @@
 
 [[mcp]]
 name = "air-quality"
-command = "uvx"
-args = ["mcp-open-meteo"]
+package = "mcp-open-meteo"
 match = ["open-meteo", "air-quality", "airquality"]
 
 # A reading from this morning is not an answer to "how is the air right now".

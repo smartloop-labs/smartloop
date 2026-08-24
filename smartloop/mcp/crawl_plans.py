@@ -242,17 +242,20 @@ class MCPDefinition(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     name: str = Field(min_length=1)
-    # Inferred from whichever of `url` / `command` is present, so a file that
-    # says one thing plainly doesn't have to say it twice.
-    type: Optional[str] = None
-    # Local: whatever launches the server — uvx, npx, python, a path.
+    # A URL or a package name — the same two things the "Add your own" field
+    # takes, because they are the two ways anyone actually names a server.
+    # Which one is present is what makes a connection remote or local; there is
+    # no third thing to declare.
+    url: Optional[str] = None
+    package: Optional[str] = None
+    # For the servers a package name can't express: npx, python, a path.
+    # `package = "x"` is shorthand for `command = "uvx"`, `args = ["x"]`.
     command: Optional[str] = None
     args: Tuple[str, ...] = ()
     env: Dict[str, str] = Field(default_factory=dict)
     cwd: Optional[str] = None
-    # Remote: the endpoint.  OAuth is negotiated at install time; `token` is
-    # for the servers that take a bearer token instead.
-    url: Optional[str] = None
+    # For the remote servers that take a bearer token; OAuth is negotiated at
+    # install time and needs nothing here.
     token: Optional[str] = None
     # Defaults to `name`: a file usually describes one server and names it once.
     slug: Optional[str] = None
@@ -282,44 +285,41 @@ class MCPDefinition(BaseModel):
         parse_duration(value)
         return str(value)
 
-    @field_validator("type", mode="before")
-    @classmethod
-    def _normalize_type(cls, value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        kind = str(value).strip().lower()
-        if kind not in ("local", "remote"):
-            raise ValueError(f"type must be 'local' or 'remote', got '{value}'")
-        return kind
-
     @model_validator(mode="after")
     def _check_connection(self) -> "MCPDefinition":
-        """Settle what kind of server this is, and reject the contradictions."""
-        if self.url and self.command:
+        """A server is named one way, not two."""
+        if self.url and (self.package or self.command):
             raise ValueError(
-                f"'{self.name}': a server is local (command) or remote (url), "
-                f"not both"
+                f"'{self.name}': a url and a package name are alternatives — "
+                f"a server is reached over HTTP or run as a process, not both"
             )
-        if self.type == "remote" and self.command:
-            raise ValueError(f"'{self.name}': type is remote but a command is set")
-        if self.type == "local" and self.url:
-            raise ValueError(f"'{self.name}': type is local but a url is set")
-        if self.type == "remote" and not self.url:
-            raise ValueError(f"'{self.name}': type is remote but no url is set")
-        if self.type == "local" and not self.command:
-            raise ValueError(f"'{self.name}': type is local but no command is set")
+        if self.package and self.command:
+            raise ValueError(
+                f"'{self.name}': package is shorthand for command + args, so "
+                f"setting both says the same thing twice"
+            )
         return self
 
     @property
     def kind(self) -> Optional[str]:
         """``"local"``, ``"remote"``, or None when the file declares no connection."""
-        if self.type:
-            return self.type
         if self.url:
             return "remote"
-        if self.command:
+        if self.package or self.command:
             return "local"
         return None
+
+    @property
+    def launch(self) -> Tuple[Optional[str], List[str]]:
+        """``(command, args)`` for a local server.
+
+        A bare package name becomes ``uvx <package>`` — the same thing typing
+        it into "Add your own" does, so a file and the field install the same
+        server rather than two subtly different ones.
+        """
+        if self.package:
+            return "uvx", [self.package]
+        return self.command, list(self.args)
 
     @property
     def index_interval(self) -> Optional[float]:

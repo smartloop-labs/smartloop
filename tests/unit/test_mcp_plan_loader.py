@@ -302,12 +302,11 @@ class TestServerDefinitions:
         text = """
 [[mcp]]
 name = "yahoo-finance"
-command = "uvx"
-args = ["yahoo-finance-mcp"]
+package = "yahoo-finance-mcp"
 """
         d = parse_definitions(text, "test")["yahoo-finance"]
-        assert d.command == "uvx"
-        assert d.args == ("yahoo-finance-mcp",)
+        assert d.launch == ("uvx", ["yahoo-finance-mcp"])
+        assert d.package == "yahoo-finance-mcp"
         assert d.kind == "local"
 
     def test_a_remote_server_carries_its_url(self):
@@ -326,21 +325,52 @@ url = "https://mcp.example.com/mcp"
         text = """
 [[mcp]]
 name = "weather"
-command = "uvx"
-args = ["weather-mcp"]
+package = "weather-mcp"
 """
         d = parse_definitions(text, "test")["weather"]
         assert d.index == ()
         assert d.plan.steps == ()
 
+    def test_a_package_name_becomes_a_uvx_launch(self):
+        # The same thing typing it into "Add your own" does, so a file and the
+        # field install the same server rather than two subtly different ones.
+        text = """
+[[mcp]]
+name = "yahoo-finance"
+package = "yahoo-finance-mcp"
+"""
+        d = parse_definitions(text, "test")["yahoo-finance"]
+        assert d.kind == "local"
+        assert d.launch == ("uvx", ["yahoo-finance-mcp"])
+
+    def test_a_command_is_there_for_what_a_package_name_cannot_say(self):
+        text = """
+[[mcp]]
+name = "custom"
+command = "npx"
+args = ["-y", "some-mcp"]
+"""
+        d = parse_definitions(text, "test")["custom"]
+        assert d.launch == ("npx", ["-y", "some-mcp"])
+
+    def test_a_package_and_a_command_say_the_same_thing_twice(self):
+        text = """
+[[mcp]]
+name = "confused"
+package = "x"
+command = "npx"
+"""
+        with pytest.raises(Exception, match="twice"):
+            parse_definitions(text, "test")
+
     def test_a_server_is_local_or_remote_not_both(self):
         text = """
 [[mcp]]
 name = "confused"
-command = "uvx"
+package = "x"
 url = "https://x"
 """
-        with pytest.raises(Exception, match="not both"):
+        with pytest.raises(Exception, match="alternatives"):
             parse_definitions(text, "test")
 
     def test_the_name_becomes_the_key_and_a_match(self):
@@ -348,8 +378,7 @@ url = "https://x"
 [[mcp]]
 name = "Yahoo-Finance"
 match = ["yfinance"]
-command = "uvx"
-args = ["yahoo-finance-mcp"]
+package = "yahoo-finance-mcp"
 """
         d = parse_definitions(text, "test")["yahoo-finance"]
         assert d.key == "yahoo-finance"
@@ -364,8 +393,7 @@ watchlist = ["AAPL", "MSFT"]
 
 [[mcp]]
 name = "yahoo-finance"
-command = "uvx"
-args = ["yahoo-finance-mcp"]
+package = "yahoo-finance-mcp"
 
 [[mcp.index]]
 label = "profile"
@@ -385,8 +413,7 @@ class TestIndexInterval:
         text = f"""
 [[mcp]]
 name = "air-quality"
-command = "uvx"
-args = ["mcp-open-meteo"]
+package = "mcp-open-meteo"
 index_every = {every}
 """
         return parse_definitions(text, "test")["air-quality"]
