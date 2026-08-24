@@ -4,6 +4,7 @@ conversation history/context, filesystem walk, and URL fetch.
 """
 import logging
 import os
+import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -79,6 +80,32 @@ _QUERY_STOP_WORDS = {
 
 
 # ------------------------------------------------------------------ models
+
+def _crawl_age(chunk: Any) -> str:
+    """`` (indexed 12m ago)`` for a crawled record, or ``""``.
+
+    A crawled record is a snapshot, and this content is now used *instead of*
+    calling the server — so the age has to travel with it. Without it the model
+    states a fifteen-minute-old quote as the current price, with nothing in the
+    prompt to suggest otherwise.
+    """
+    try:
+        crawled_at = float((chunk.metadata or {}).get("crawled_at") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not crawled_at:
+        return ""
+    seconds = max(0.0, time.time() - crawled_at)
+    if seconds < 90:
+        return " (indexed just now)"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f" (indexed {minutes}m ago)"
+    hours = minutes // 60
+    if hours < 24:
+        return f" (indexed {hours}h ago)"
+    return f" (indexed {hours // 24}d ago)"
+
 
 class SearchContext(BaseModel):
     """Collected explore results: vector, feedback, workspace, and web search."""
@@ -643,7 +670,7 @@ Does answering the latest message require a new web search?
                 if name not in best or chunk.distance < best[name].distance:
                     best[name] = chunk
             text = "\n\n".join(
-                f"--- {name} ---\n{chunk.text[:2000]}"
+                f"--- {name}{_crawl_age(chunk)} ---\n{chunk.text[:2000]}"
                 for name, chunk in best.items()
             )
             logger.info(
@@ -703,13 +730,38 @@ Does answering the latest message require a new web search?
             # MCP (read-only): part of explore — vector-retrieve the best tool
             # and auto-run it if read-only, returning the result. Write tools
             # are skipped here (they stay planned execute steps).
-            f_mcp = pool.submit(self._run_mcp, query, mcp_servers, project_dir) \
-                if (mcp_servers and project_dir) else None
             # Crawled MCP content: already embedded, so it is a vector search
             # like any other — no tool call, no server round-trip.
             f_mcp_docs = pool.submit(
                 self._search_mcp_documents, query, model_service, history_for_search,
             )
+
+            # Resolved before the live call is even submitted, because its
+            # answer decides whether that call is needed: a crawl already
+            # pulled this server's content, so asking the server again returns
+            # what is already in hand at the cost of a network round-trip that
+            # can also fail.  The ordering costs nothing — this is a local
+            # vector query against a collection that is already open.
+            #
+            # The content carries its age into the prompt (see `_crawl_age`),
+            # which is what keeps the trade honest: the model can say how old
+            # the snapshot is instead of presenting it as this second's truth.
+            ctx.mcp_document_context = f_mcp_docs.result()
+
+            # MCP (read-only): part of explore — vector-retrieve the best tool
+            # and auto-run it if read-only, returning the result. Write tools
+            # are skipped here (they stay planned execute steps).
+            f_mcp = None
+            if mcp_servers and project_dir:
+                if ctx.mcp_document_context:
+                    logger.info(
+                        "[collect] Crawled MCP content matched — skipping the "
+                        "live tool call"
+                    )
+                else:
+                    f_mcp = pool.submit(
+                        self._run_mcp, query, mcp_servers, project_dir,
+                    )
 
             # Collect primary results (local retrieval + MCP tools)
             vec_result = f_vec.result()
@@ -725,8 +777,6 @@ Does answering the latest message require a new web search?
 
             if f_mcp is not None:
                 ctx.mcp_context = f_mcp.result()
-
-            ctx.mcp_document_context = f_mcp_docs.result()
 
             # Web search runs alongside local retrieval, not behind it.
             # Gating it on "did anything match locally?" made a single indexed
