@@ -117,6 +117,11 @@ class MCPServer(BaseModel):
     crawl: Optional[bool] = None
     # Epoch seconds of the last completed content crawl, for the refresh cycle.
     last_crawl_at: Optional[float] = None
+    # Which account this connection is authenticated as ("mehfuz@smartloop.ai",
+    # "Smartloop HQ"), probed at provisioning time.  It is what distinguishes
+    # two connections to the same product; None when the server ships no
+    # identity tool.  See :mod:`smartloop.mcp.account`.
+    account: Optional[str] = None
 
 
 class ProjectModel(BaseModel):

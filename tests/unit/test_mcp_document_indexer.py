@@ -79,6 +79,7 @@ def _indexer(tmp_dir, caller):
     idx._manifest = {}
     import threading
     idx._lock = threading.Lock()
+    idx._crawling = set()
     idx._tool_caller = caller
     return idx
 
@@ -299,6 +300,223 @@ class TestFanOut:
             idx = _indexer(td, caller)
             idx.crawl_server(server, force=True)
             assert ("get_lists", {"board_id": "b1"}) in caller.calls
+
+    def test_linear_walks_teams_then_issues_per_team(self):
+        """list_teams → list_issues(teamId), the tree walk the plan is built on.
+
+        The unscoped `list_issues` returns one page of the workspace; the
+        per-team calls are what reach the issues that page cut off.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(name="linear", slug="linear", tools=[
+                _tool("list_teams"),
+                _tool("list_issues", {"properties": {
+                    "teamId": {"type": "string"}, "limit": {"type": "number"},
+                }}),
+            ])
+            issues = {
+                "core": [{"id": "i-core", "title": "Core issue"}],
+                "web": [{"id": "i-web", "title": "Web issue"}],
+            }
+            caller = FakeCaller({
+                "list_teams": _result([
+                    {"id": "core", "name": "Core"}, {"id": "web", "name": "Web"},
+                ]),
+                "list_issues": lambda args: _result(
+                    issues.get(args.get("teamId"), [{"id": "i0", "title": "Workspace issue"}])
+                ),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            assert ("list_issues", {"teamId": "core", "limit": 50}) in caller.calls
+            assert ("list_issues", {"teamId": "web", "limit": 50}) in caller.calls
+            text = "\n".join(_indexed_docs(idx._store).values())
+            assert "Core issue" in text and "Web issue" in text
+            assert "Workspace issue" in text
+
+    def test_a_step_pools_the_records_of_every_parent_it_names(self):
+        """Comments hang off whichever issue listing found the issue."""
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(name="linear", slug="linear", tools=[
+                _tool("list_teams"),
+                _tool("list_issues", {"properties": {"teamId": {}, "limit": {}}}),
+                _tool("list_comments", {"properties": {"issueId": {"type": "string"}}}),
+            ])
+            caller = FakeCaller({
+                "list_teams": _result([{"id": "core", "name": "Core"}]),
+                "list_issues": lambda args: _result(
+                    [{"id": "i-core", "title": "Scoped"}] if args.get("teamId")
+                    else [{"id": "i-all", "title": "Unscoped"}]
+                ),
+                "list_comments": lambda args: _result(
+                    [{"id": f"c-{args['issueId']}", "body": f"note on {args['issueId']}"}]
+                ),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            commented = {
+                args["issueId"] for tool, args in caller.calls if tool == "list_comments"
+            }
+            # `issues` found i-all, `team-issues` found i-core: both feed the walk.
+            assert commented == {"i-all", "i-core"}
+
+    def test_the_same_parent_is_only_walked_once_across_pooled_parents(self):
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(name="linear", slug="linear", tools=[
+                _tool("list_teams"),
+                _tool("list_issues", {"properties": {"teamId": {}, "limit": {}}}),
+                _tool("list_comments", {"properties": {"issueId": {}}}),
+            ])
+            caller = FakeCaller({
+                "list_teams": _result([{"id": "core", "name": "Core"}]),
+                # Every listing returns the same issue, as the real overlap does.
+                "list_issues": _result([{"id": "i1", "title": "Shared"}]),
+                "list_comments": _result([{"id": "c1", "body": "note"}]),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+            assert [c[0] for c in caller.calls].count("list_comments") == 1
+
+    def test_a_fan_out_retry_keeps_the_parent_id(self):
+        """A failed per-team call must not be retried as an unscoped one.
+
+        Dropping the parent id turns the retry into a different question, asked
+        once per parent — the plan's own arguments are what get dropped.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(name="linear", slug="linear", tools=[
+                _tool("list_teams"),
+                _tool("list_issues", {"properties": {"teamId": {}, "limit": {}}}),
+            ])
+            caller = FakeCaller({
+                "list_teams": _result([{"id": "core", "name": "Core"}]),
+                "list_issues": lambda args: (
+                    _result("", success=False, error="limit is not supported")
+                    if "limit" in args else _result([{"id": "i1", "title": "Issue"}])
+                ),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            issue_calls = [args for tool, args in caller.calls if tool == "list_issues"]
+            # The team step drops `limit` and keeps `teamId`...
+            assert {"teamId": "core"} in issue_calls
+            # ...while the one genuinely unscoped step is the only bare retry.
+            assert issue_calls.count({}) == 1
+
+    def test_a_rejected_fan_out_is_not_proved_once_per_parent(self):
+        """The failure that made 30 of 36 crawl calls useless.
+
+        `notion-get-comments` rejected the shape of the call, not the page id
+        in it — so every remaining page was the identical rejected call.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-get-comments", {"properties": {"page_id": {}}}),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result(
+                    [{"id": f"p{i}", "title": f"Page {i}"} for i in range(20)]
+                ),
+                "notion-get-comments": _result(
+                    '{"code":"validation_error","message":"body failed validation"}',
+                    success=True, is_error=True,
+                ),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            assert [c[0] for c in caller.calls].count("notion-get-comments") == 1
+
+    def test_a_step_gives_up_after_repeated_transient_failures(self):
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-get-comments", {"properties": {"page_id": {}}}),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result(
+                    [{"id": f"p{i}", "title": f"Page {i}"} for i in range(20)]
+                ),
+                # Not a recognisably permanent reason, so it takes a few tries
+                # before the step concludes the tool isn't going to answer.
+                "notion-get-comments": _result("", success=False, error="socket timeout"),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            assert [c[0] for c in caller.calls].count("notion-get-comments") == 3
+
+    def test_one_failed_parent_does_not_end_a_working_fan_out(self):
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-get-comments", {"properties": {"page_id": {}}}),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result(
+                    [{"id": f"p{i}", "title": f"Page {i}"} for i in range(5)]
+                ),
+                # Only p1 is missing its comments; the rest still answer.
+                "notion-get-comments": lambda args: (
+                    _result("", success=False, error="socket timeout")
+                    if args.get("page_id") == "p1"
+                    else _result([{"id": f"c-{args['page_id']}", "body": "note"}])
+                ),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+            assert [c[0] for c in caller.calls].count("notion-get-comments") == 5
+
+    def test_a_rejected_step_stays_skipped_next_cycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = [
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-get-comments", {"properties": {"page_id": {}}}),
+            ]
+            responses = {
+                "notion-list-recent-pages": _result([{"id": "p1", "title": "A"}]),
+                "notion-get-comments": _result(
+                    '{"code":"validation_error"}', success=True, is_error=True,
+                ),
+            }
+            idx = _indexer(td, FakeCaller(responses))
+            idx.crawl_server(_server(tools=tools), force=True)
+
+            caller = FakeCaller(responses)
+            idx._tool_caller = caller
+            idx.crawl_server(_server(tools=tools))
+            assert "notion-get-comments" not in [c[0] for c in caller.calls]
+
+    def test_the_crawl_stops_at_its_call_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            from smartloop.db import mcp_document_indexer as mod
+            server = _server(name="linear", slug="linear", tools=[
+                _tool("list_teams"),
+                _tool("list_issues", {"properties": {"teamId": {}, "limit": {}}}),
+                _tool("get_issue", {"properties": {"id": {}}}),
+            ])
+            caller = FakeCaller({
+                "list_teams": _result([{"id": f"t{i}"} for i in range(25)]),
+                "list_issues": _result([{"id": f"i{i}", "title": f"Issue {i}"} for i in range(40)]),
+                "get_issue": _result("body"),
+            })
+            idx = _indexer(td, caller)
+            original = mod.MAX_CRAWL_CALLS
+            mod.MAX_CRAWL_CALLS = 5
+            try:
+                stats = idx.crawl_server(server, force=True)
+            finally:
+                mod.MAX_CRAWL_CALLS = original
+
+            assert len(caller.calls) == 5
+            assert stats["truncated"] is True
+            # What it did reach still lands, and nothing is remembered as blocked.
+            assert stats["records"] > 0
+            assert not idx._manifest[server.id]["blocked"]
 
     def test_child_step_is_skipped_when_the_parent_returned_nothing(self):
         with tempfile.TemporaryDirectory() as td:

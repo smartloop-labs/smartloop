@@ -136,6 +136,7 @@ def _build_server_response(result: dict) -> MCPServerResponse:
         last_error=result.get("last_error"),
         crawl=result.get("crawl"),
         last_crawl_at=result.get("last_crawl_at"),
+        account=result.get("account"),
     )
 
 
@@ -495,15 +496,13 @@ async def list_mcp_servers_for_project(
     project_id: str,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """List MCP servers for a specific project."""
+    """List MCP servers for a specific project.
+
+    Each server carries an ``indexing`` block — provisioning and content-crawl
+    state — so a client can show "still indexing" without a request per server.
+    """
     try:
-        project = model_service._get_project(project_id)
-        servers = [
-            model_service._mcp_server_to_dict(s)
-            for s in project.mcp_servers
-            if not s.system
-        ]
-        return {"servers": servers}
+        return {"servers": model_service.list_mcp_servers_with_status(project_id)}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -549,6 +548,33 @@ async def mcp_content_status_for_project(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.exception("Error reading MCP content status")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/projects/{project_id}/mcp/{server_id}")
+async def get_mcp_server(
+    project_id: str,
+    server_id: str,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """One MCP server, with whether its content is still being indexed.
+
+    Registration returns before the server is usable: tool discovery and the
+    content crawl both run on the MCP task.  ``indexing.state`` is what a
+    client polls — ``provisioning`` → ``queued`` → ``indexing`` → ``indexed``,
+    or ``failed`` with ``indexing.error``, or ``disabled`` for a server whose
+    content isn't crawled.  ``indexing.in_progress`` is the single flag to
+    drive a spinner off.
+
+    Declared after the literal ``mcp/tools/count`` and ``mcp/content`` routes:
+    a path parameter here would otherwise swallow them.
+    """
+    try:
+        return model_service.mcp_server_status(server_id, project_id=project_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error reading MCP server status")
         raise HTTPException(status_code=500, detail=str(e))
 
 

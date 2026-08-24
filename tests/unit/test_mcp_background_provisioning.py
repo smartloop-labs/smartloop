@@ -136,7 +136,10 @@ class TestProvisioningPass:
         assert server.last_error is None
         svc._enrich_mcp_server.assert_called_once()
         svc._index_mcp_tools.assert_called_once()
+        # Forced, not TTL-gated: a connection made a moment ago has to be
+        # searchable now, not at the next refresh cycle.
         svc._crawl_mcp_server.assert_called_once()
+        assert svc._crawl_mcp_server.call_args.kwargs.get("force") is True
         assert result["status"] == "ready"
 
     def test_failed_discovery_is_recorded_on_the_server_not_raised(self):
@@ -189,6 +192,24 @@ class TestProvisioningPass:
         assert server.status == MCPServerStatus.PENDING
         assert server.last_error is None
         assert result["status"] == "pending"
+        assert svc._queue_mcp_provisioning.call_count == 2
+
+    def test_re_indexing_a_healthy_server_still_requeues_it(self):
+        # The "re-index" button in the connections list: nothing is wrong with
+        # the server, the user just wants its content walked again.
+        project = _project()
+        svc = _svc(project)
+        ModelService.add_remote_mcp_server(
+            svc, name="notion", server_url="https://mcp.notion.com/mcp",
+            project_id="p1",
+        )
+        server = project.mcp_servers[0]
+        server.status = MCPServerStatus.READY
+
+        ModelService.retry_mcp_server(svc, server.id, project_id="p1")
+
+        # Pending is what the card polls to show the pass as running.
+        assert server.status == MCPServerStatus.PENDING
         assert svc._queue_mcp_provisioning.call_count == 2
 
 
@@ -263,6 +284,55 @@ class TestMCPTaskSchedule:
         task._crawl_requested = True
         assert task._crawl_due(1_000_000.0) is True
 
+    def _task(self, idle_seconds, interval=3600, idle_interval=600):
+        task = MCPTask(
+            logger=MagicMock(),
+            crawler=lambda: {},
+            crawl_interval=interval,
+            idle_crawl_interval=idle_interval,
+            idle_provider=lambda: idle_seconds,
+        )
+        task._crawl_requested = False
+        task._last_crawl_cycle = 0.0
+        return task
+
+    def test_an_idle_app_refreshes_every_ten_minutes(self):
+        task = self._task(idle_seconds=30.0)
+        assert task._crawl_due(599.0) is False
+        assert task._crawl_due(601.0) is True
+
+    def test_the_idle_cadence_waits_while_the_model_is_answering(self):
+        # Background indexing competes for CPU, network and the same MCP
+        # connections a live tool call needs; none of that belongs on a reply
+        # someone is watching stream.
+        task = self._task(idle_seconds=0.0)
+        assert task._crawl_due(700.0) is False
+
+    def test_an_hour_refreshes_even_mid_conversation(self):
+        # The backstop: without it a long working session would never refresh.
+        task = self._task(idle_seconds=0.0)
+        assert task._crawl_due(3601.0) is True
+
+    def test_a_busy_app_crawls_as_soon_as_it_goes_quiet(self):
+        assert self._task(idle_seconds=5.0)._crawl_due(700.0) is True
+
+    def test_idle_does_not_mean_continuously(self):
+        task = self._task(idle_seconds=99_999.0)
+        assert task._crawl_due(60.0) is False
+
+    def test_an_explicit_request_ignores_both_thresholds(self):
+        # A just-connected server is indexed now, not at the next cadence.
+        task = self._task(idle_seconds=0.0)
+        task._crawl_requested = True
+        assert task._crawl_due(0.0) is True
+
+    def test_without_an_idle_signal_the_ceiling_is_the_whole_schedule(self):
+        task = MCPTask(logger=MagicMock(), crawler=lambda: {}, crawl_interval=3600)
+        task._crawl_requested = False
+        task._last_crawl_cycle = 0.0
+        assert task._crawl_due(700.0) is False
+        assert task._crawl_due(3601.0) is True
+
     def test_enqueued_server_is_provisioned_off_the_caller_thread(self):
         seen = []
         done = threading.Event()
@@ -308,3 +378,41 @@ class TestMCPTaskSchedule:
         assert status["crawl_interval_seconds"] == 900
         assert status["queued"] == 0
         assert status["crawling"] is False
+
+
+class TestIdleSignal:
+    """What tells background indexing to stay out of the user's way."""
+
+    def _svc(self):
+        svc = ModelService.__new__(ModelService)
+        svc._inference_lock = threading.Semaphore(1)
+        svc._inference_active = 0
+        svc._inference_state_lock = threading.Lock()
+        svc._last_inference_at = 0.0
+        return svc
+
+    def test_a_fresh_session_is_idle(self):
+        assert ModelService.idle_seconds(self._svc()) == float("inf")
+
+    def test_holding_an_inference_slot_reads_as_busy(self):
+        svc = self._svc()
+        with ModelService._inference_slot(svc):
+            assert ModelService.idle_seconds(svc) == 0.0
+
+    def test_idle_time_starts_when_the_answer_finishes(self):
+        svc = self._svc()
+        with ModelService._inference_slot(svc):
+            pass
+        idle = ModelService.idle_seconds(svc)
+        assert 0.0 <= idle < 5.0
+
+    def test_a_raising_inference_still_releases_the_slot(self):
+        # Otherwise one failed generation leaves the app "busy" forever and the
+        # content crawl never runs again.
+        svc = self._svc()
+        try:
+            with ModelService._inference_slot(svc):
+                raise RuntimeError("generation failed")
+        except RuntimeError:
+            pass
+        assert ModelService.idle_seconds(svc) != 0.0

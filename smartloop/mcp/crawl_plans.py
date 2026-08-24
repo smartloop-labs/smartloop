@@ -33,8 +33,9 @@ breaking servers that expose only some of them.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Argument names a per-record detail call takes the record's identifier under.
 ID_ARGS: Tuple[str, ...] = (
@@ -59,44 +60,71 @@ RECORD_LIST_KEYS: Tuple[str, ...] = (
 )
 
 
-@dataclass(frozen=True)
-class CrawlStep:
+class CrawlStep(BaseModel):
     """One read-only listing call in a crawl plan.
 
     ``tools`` are candidate tool names, first match on the server wins.
     ``arguments`` are filtered against the resolved tool's input schema, so an
     argument the server doesn't declare is dropped rather than rejected.
 
-    A step with ``parent`` set fans out over the records an earlier step
+    A step with ``parent`` set fans out over the records earlier steps
     produced, passing each parent record's id as the first of ``parent_args``
-    the tool declares — that is how boards → lists → cards is expressed.
+    the tool declares — that is how boards → lists → cards, or teams →
+    projects → issues → comments, is expressed.  ``parent`` may name several
+    steps, in which case their records are pooled and deduped by id: a Linear
+    issue's comments hang off whichever issue listing found the issue, and the
+    workspace-wide, per-team and per-project listings all feed the same
+    ``list_comments`` fan-out.
 
     ``detail_tools`` fetch the full body of each record (a Notion page's
     content behind a search hit), again by whichever of ``detail_args`` the
     tool declares.
+
+    Plans are authored in TOML (see :mod:`smartloop.mcp.plan_loader`), so this
+    model is what a hand-written file is validated against — ``extra="forbid"``
+    turns a misspelled key into an error naming it, rather than a field that
+    silently does nothing.
     """
 
-    label: str
-    tools: Tuple[str, ...]
-    arguments: Dict[str, Any] = field(default_factory=dict)
-    parent: Optional[str] = None
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    label: str = Field(min_length=1)
+    tools: Tuple[str, ...] = Field(min_length=1)
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    parent: Optional[Union[str, Tuple[str, ...]]] = None
     parent_args: Tuple[str, ...] = ID_ARGS
     detail_tools: Tuple[str, ...] = ()
     detail_args: Tuple[str, ...] = ID_ARGS
+    # Arguments without which this step is pointless.  Unknown arguments are
+    # normally dropped so a step still runs in reduced form, but a step that
+    # exists *because* of one argument — the same search narrowed to databases
+    # — degrades into a duplicate of another step when it is dropped, so it is
+    # skipped instead.
+    needs_arguments: Tuple[str, ...] = ()
     # Records kept from this step's listing calls.  A crawl is a background
     # refresh, not an export: the cap bounds both the embedding work and the
     # number of follow-up detail calls.
-    max_records: int = 40
+    max_records: int = Field(default=40, ge=1)
     # Parent records fanned out over, when ``parent`` is set.
-    max_parents: int = 8
+    max_parents: int = Field(default=8, ge=1)
+
+    @property
+    def parent_labels(self) -> Tuple[str, ...]:
+        """The step labels this step fans out over, ``()`` for a root step."""
+        if not self.parent:
+            return ()
+        if isinstance(self.parent, str):
+            return (self.parent,)
+        return tuple(self.parent)
 
 
-@dataclass(frozen=True)
-class CrawlPlan:
+class CrawlPlan(BaseModel):
     """An ordered set of steps that crawls one kind of server."""
 
-    slug: str
-    steps: Tuple[CrawlStep, ...]
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    slug: str = Field(min_length=1)
+    steps: Tuple[CrawlStep, ...] = ()
     # Substrings matched (case-insensitively) against a server's name, package
     # and URL when it carries no catalog slug.
     match: Tuple[str, ...] = ()
@@ -104,138 +132,65 @@ class CrawlPlan:
     # (crawl by default) from a guessed one (crawl only when asked).
     derived: bool = False
 
+    @model_validator(mode="after")
+    def _check_step_graph(self) -> "CrawlPlan":
+        """Reject a plan whose fan-out graph can't run.
+
+        Both failures here are silent at crawl time — the step simply never
+        produces anything — and both are easy to write in a hand-authored
+        file, so they are errors at load time instead:
+
+        * a duplicate label, which would make one step's records overwrite the
+          other's in the fan-out bookkeeping;
+        * a ``parent`` that names a step which doesn't exist, or one declared
+          *later*, since a step can only fan out over records an earlier step
+          already collected.
+        """
+        seen: set = set()
+        for step in self.steps:
+            if step.label in seen:
+                raise ValueError(
+                    f"plan '{self.slug}': duplicate step label '{step.label}'"
+                )
+            for parent in step.parent_labels:
+                if parent not in seen:
+                    raise ValueError(
+                        f"plan '{self.slug}': step '{step.label}' fans out over "
+                        f"'{parent}', which is not an earlier step in this plan"
+                    )
+            seen.add(step.label)
+        return self
+
 
 # --------------------------------------------------------------- curated plans
+#
+# The curated plans are data, not code: they live in ``mcp.toml`` next to this
+# module and are loaded and validated by :mod:`smartloop.mcp.plan_loader`.  A
+# user's own plans are merged over them from ``~/.smartloop/mcp.d/*.toml``,
+# which is what lets a custom server be indexed without a code change.
 
-# Notion's page fetch, shared by every listing step below: a listing returns
-# titles and ids, the body has to be fetched per page.
-_NOTION_FETCH = (
-    "notion-fetch", "notion_fetch", "fetch", "get_page", "retrieve_page",
-    "notion_retrieve_page",
-)
 
-NOTION_PLAN = CrawlPlan(
-    slug="notion",
-    match=("notion",),
-    steps=(
-        # The dedicated listing tools first: they take no required argument, so
-        # they are the reliable way to enumerate what the connection can see.
-        # Their results overlap heavily (a recent page is usually also a private
-        # or shared one) — the crawler dedupes by record id across steps, so the
-        # overlap costs nothing.
-        CrawlStep(
-            label="recent-pages",
-            tools=("notion-list-recent-pages", "list_recent_pages"),
-            arguments={"limit": 50},
-            detail_tools=_NOTION_FETCH,
-        ),
-        CrawlStep(
-            label="private-pages",
-            tools=("notion-list-private-pages", "list_private_pages"),
-            arguments={"limit": 50},
-            detail_tools=_NOTION_FETCH,
-        ),
-        CrawlStep(
-            label="shared-pages",
-            tools=("notion-list-shared-pages", "list_shared_pages"),
-            arguments={"limit": 50},
-            detail_tools=_NOTION_FETCH,
-        ),
-        CrawlStep(
-            label="favorite-pages",
-            tools=("notion-list-favorite-pages", "list_favorite_pages"),
-            arguments={"limit": 50},
-            detail_tools=_NOTION_FETCH,
-        ),
-        # Search last, and only as a fallback for the Notion servers that ship
-        # no listing tools: the hosted server makes `query` required, so an
-        # empty-query call there simply fails and the step is skipped.
-        CrawlStep(
-            label="pages",
-            tools=("search", "notion-search", "notion_search", "search_pages"),
-            arguments={"query": ""},
-            detail_tools=_NOTION_FETCH,
-        ),
-        CrawlStep(
-            label="databases",
-            tools=("list_databases", "notion_list_databases", "get_databases",
-                   "notion-list-databases"),
-        ),
-        CrawlStep(
-            label="meeting-notes",
-            tools=("notion-query-meeting-notes", "query_meeting_notes"),
-            detail_tools=_NOTION_FETCH,
-        ),
-    ),
-)
-
-LINEAR_PLAN = CrawlPlan(
-    slug="linear",
-    match=("linear",),
-    steps=(
-        CrawlStep(
-            label="teams",
-            tools=("list_teams", "linear_list_teams", "get_teams"),
-            max_records=20,
-        ),
-        CrawlStep(
-            label="projects",
-            tools=("list_projects", "linear_list_projects", "get_projects"),
-            detail_tools=("get_project", "linear_get_project"),
-        ),
-        CrawlStep(
-            label="issues",
-            tools=("list_issues", "linear_list_issues", "get_issues",
-                   "list_my_issues"),
-            arguments={"limit": 50},
-            detail_tools=("get_issue", "linear_get_issue"),
-        ),
-        CrawlStep(
-            label="documents",
-            tools=("list_documents", "linear_list_documents", "get_documents"),
-            detail_tools=("get_document", "linear_get_document"),
-        ),
-    ),
-)
-
-TRELLO_PLAN = CrawlPlan(
-    slug="trello",
-    match=("trello",),
-    steps=(
-        CrawlStep(
-            label="boards",
-            tools=("list_boards", "get_boards", "trello_list_boards",
-                   "get_my_boards", "list_boards_by_user"),
-            max_records=20,
-        ),
-        CrawlStep(
-            label="lists",
-            tools=("get_lists", "list_lists", "trello_get_lists",
-                   "get_lists_by_board_id", "get_board_lists"),
-            parent="boards",
-            parent_args=("board_id", "boardId", "idBoard", "id"),
-        ),
-        CrawlStep(
-            label="cards",
-            tools=("get_cards_by_list_id", "list_cards", "get_cards",
-                   "trello_get_cards", "get_list_cards"),
-            parent="lists",
-            parent_args=("list_id", "listId", "idList", "id"),
-            max_records=60,
-        ),
-    ),
-)
-
-PLANS: Dict[str, CrawlPlan] = {
-    plan.slug: plan for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN)
-}
+def plans() -> Dict[str, "CrawlPlan"]:
+    """Every curated plan, by slug.  Reloaded when a plan file changes."""
+    from smartloop.mcp.plan_loader import plans as _plans
+    return _plans()
 
 
 # ------------------------------------------------------------- tool resolution
 
-def _normalize(name: str) -> str:
-    """Lowercase *name* with separators stripped: ``notion-search`` → ``notionsearch``."""
+def normalize_name(name: str) -> str:
+    """Lowercase *name* with separators stripped: ``notion-search`` → ``notionsearch``.
+
+    The one place tool-name spelling is normalised.  Anything comparing tool or
+    argument names goes through it, so ``notion-search``/``notion_search``/
+    ``NotionSearch`` are one name everywhere rather than in each caller's own
+    approximation of the rule.
+    """
     return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+# Internal alias, kept because this module reads better with the short name.
+_normalize = normalize_name
 
 
 def resolve_tool(
@@ -310,6 +265,22 @@ def resolve_argument(
     return None
 
 
+def declares_argument(schema: Dict[str, Any], candidates: Sequence[str]) -> bool:
+    """True when the tool declares any of *candidates* as a property.
+
+    Unlike :func:`resolve_argument` this never falls back to "the single
+    required property": the question here is whether the tool really
+    understands this specific argument, not what a record id could go in.
+    """
+    props = schema_properties(schema)
+    if not props:
+        # An empty schema tells us nothing; assume the argument is understood
+        # rather than skipping a step on no evidence.
+        return True
+    by_norm = {_normalize(k) for k in props}
+    return any(_normalize(c) in by_norm for c in candidates)
+
+
 def filter_arguments(
     schema: Dict[str, Any], arguments: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -345,7 +316,13 @@ _LIST_VERBS = frozenset({
 # calls, so they are never crawl entry points.
 _DETAIL_VERBS = frozenset({"get", "fetch", "read", "retrieve", "describe", "show"})
 
+# Root steps (a listing that needs no argument) and child steps (a listing
+# whose one required argument is a parent record's id) are capped separately:
+# the children are the tree walk, and it is worth some budget of its own.
 _MAX_GENERIC_STEPS = 6
+_MAX_GENERIC_CHILD_STEPS = 6
+
+_QUERY_ARGS = ("query", "q", "searchquery", "text")
 
 
 def _leading_verb(tool_name: str) -> str:
@@ -360,19 +337,49 @@ def _is_plural_getter(tool_name: str) -> bool:
     return norm.endswith("s") or "all" in norm
 
 
+def _entity_of_id_arg(arg_name: str) -> str:
+    """``teamId`` → ``team``; ``''`` for an argument that isn't an entity id.
+
+    A bare ``id`` names no entity, so it says nothing about which listing could
+    supply it and is not a link the walk can follow.
+    """
+    norm = _normalize(arg_name)
+    if not norm.endswith("id") or norm in ("id", "uuid", "guid", "gid"):
+        return ""
+    return norm[:-2]
+
+
+def _tool_names(server: Any) -> List[str]:
+    names = []
+    for tool in getattr(server, "tools", None) or []:
+        name = tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)
+        if name:
+            names.append(name)
+    return names
+
+
 def generic_plan(server: Any) -> CrawlPlan:
     """Derive a crawl plan from the tools *server* reported.
 
-    Used for a server with no curated plan.  Only listing/search tools that can
-    be called with no required arguments become steps (a required argument we
-    can't fill would just error), capped at :data:`_MAX_GENERIC_STEPS` so an
-    unusually large server can't turn one refresh cycle into hundreds of calls.
+    Used for a server with no curated plan, and built in two passes so the
+    derived plan walks the server's tree the way a curated one does:
+
+    1. *roots* — listing/search tools callable with no required argument.  A
+       required argument we can't fill would just error, so those are not entry
+       points.
+    2. *children* — listings whose one required argument is another entity's id
+       (``list_issues(teamId)``), linked to the root step whose name carries
+       that entity (``list_teams``).  Without this pass the whole per-team,
+       per-board, per-project half of a server is unreachable: those tools are
+       exactly the ones pass 1 has to reject.
+
+    Each pass is capped so an unusually large server can't turn one refresh
+    cycle into hundreds of calls.
     """
     steps: List[CrawlStep] = []
-    for tool in getattr(server, "tools", None) or []:
-        name = tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)
-        if not name:
-            continue
+    deferred: List[Tuple[str, str, Dict[str, Any]]] = []
+
+    for name in _tool_names(server):
         verb = _leading_verb(name)
         if verb not in _LIST_VERBS and not (
             verb in _DETAIL_VERBS and _is_plural_getter(name)
@@ -383,15 +390,48 @@ def generic_plan(server: Any) -> CrawlPlan:
         arguments: Dict[str, Any] = {}
         if isinstance(required, list) and required:
             # A search tool whose only requirement is the query string can be
-            # called with an empty query; anything else needs an argument we
-            # would have to invent, so it is not a crawl entry point.
-            query_args = [r for r in required if _normalize(r) in ("query", "q", "searchquery", "text")]
-            if len(required) > len(query_args) or not query_args:
+            # called with an empty query.
+            query_args = [r for r in required if _normalize(r) in _QUERY_ARGS]
+            others = [r for r in required if r not in query_args]
+            if others:
+                # Everything else has to come from somewhere.  A single id-shaped
+                # requirement can come from a parent listing, so the tool is held
+                # back for pass 2 rather than dropped.
+                entity = _entity_of_id_arg(others[0]) if len(others) == 1 else ""
+                if entity:
+                    deferred.append((
+                        name, entity,
+                        {query_args[0]: ""} if query_args else {},
+                    ))
+                continue
+            if not query_args:
                 continue
             arguments = {query_args[0]: ""}
-        steps.append(CrawlStep(label=name, tools=(name,), arguments=arguments))
-        if len(steps) >= _MAX_GENERIC_STEPS:
+        if len(steps) < _MAX_GENERIC_STEPS:
+            steps.append(CrawlStep(label=name, tools=(name,), arguments=arguments))
+
+    children = 0
+    for name, entity, arguments in deferred:
+        if children >= _MAX_GENERIC_CHILD_STEPS:
             break
+        # The parent is the root listing whose own name is about that entity:
+        # `teamId` → `list_teams`, `board_id` → `get_boards`.
+        parents = tuple(
+            step.label for step in steps
+            if entity in _normalize(step.label) and step.label != name
+        )
+        if not parents:
+            continue
+        steps.append(CrawlStep(
+            label=name,
+            tools=(name,),
+            arguments=arguments,
+            parent=parents,
+            # The entity name is the only reliable hint; the schema resolver
+            # picks whichever spelling the tool declares.
+            parent_args=(f"{entity}_id", f"{entity}Id", f"{entity}id", entity),
+        ))
+        children += 1
 
     return CrawlPlan(
         slug=f"generic:{getattr(server, 'name', 'server')}",
@@ -415,12 +455,13 @@ def _server_haystack(server: Any) -> str:
 
 def resolve_plan(server: Any) -> CrawlPlan:
     """Return the crawl plan for *server* — curated when one matches, else derived."""
+    registry = plans()
     slug = (getattr(server, "catalog_slug", None) or "").strip().lower()
-    if slug in PLANS:
-        return PLANS[slug]
+    if slug in registry:
+        return registry[slug]
 
     haystack = _server_haystack(server)
-    for plan in PLANS.values():
+    for plan in registry.values():
         if any(token in haystack for token in plan.match):
             return plan
 

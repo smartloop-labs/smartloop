@@ -48,11 +48,17 @@ from smartloop.mcp.crawl_plans import (
     RECORD_TITLE_KEYS,
     CrawlPlan,
     CrawlStep,
+    declares_argument,
     filter_arguments,
     resolve_argument,
     resolve_plan,
     resolve_tool,
     tool_schema,
+)
+from smartloop.mcp.read_only_calls import (
+    ToolCallResult,
+    call_read_only,
+    ensure_tool_caller,
 )
 from smartloop.utils.mcp_result_formatter import ResultFormatter
 
@@ -71,6 +77,19 @@ CHUNK_OVERLAP = 200
 # server's content, not a mirror of it: a single 2MB Notion page would otherwise
 # dominate a project's index.
 MAX_RECORD_CHARS = 20_000
+
+# Tool calls one server's crawl may make in a cycle.  A plan walks a tree — a
+# listing per team, a detail fetch per issue, a comment listing per issue — and
+# the per-step caps bound each branch but not their product.  This bounds the
+# whole walk, so an unusually large workspace costs a bounded number of
+# requests and the rest is picked up on the next cycle.
+MAX_CRAWL_CALLS = 400
+
+# Consecutive failed calls within one step before the step gives up for this
+# cycle.  A fan-out asks the same tool the same question once per parent, so a
+# tool that rejects the shape of the call rejects all of them — walking the
+# remaining parents just spends the budget on a known answer.
+MAX_STEP_FAILURES = 3
 
 
 # ------------------------------------------------------------------ helpers
@@ -95,22 +114,6 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
         chunks.append(text[start:start + size])
         start += size - overlap
     return chunks
-
-
-def _content_to_text(content: Optional[Sequence[dict]]) -> str:
-    """Join an MCP tool result's content blocks into one string."""
-    if not content:
-        return ""
-    parts: List[str] = []
-    for block in content:
-        if isinstance(block, dict):
-            if block.get("type") == "text":
-                parts.append(block.get("text") or "")
-            else:
-                parts.append(json.dumps(block, default=str))
-        else:
-            parts.append(str(block))
-    return "\n".join(p for p in parts if p).strip()
 
 
 def _first_str(data: Dict[str, Any], keys: Sequence[str]) -> Optional[str]:
@@ -246,6 +249,7 @@ def _merge_listing_and_detail(listing: str, detail: str) -> str:
 _PERMANENT_FAILURE_RE = re.compile(
     r"requires a .* plan|upgrade your plan|not entitled|"
     r"input validation error|invalid arguments|"
+    r"validation_error|failed validation|"
     r"unauthorized|forbidden|permission denied|not found",
     re.IGNORECASE,
 )
@@ -322,6 +326,10 @@ class MCPDocumentIndexer:
         self._manifest: Dict[str, dict] = self._load_manifest()
         self._lock = threading.Lock()
         self._tool_caller = tool_caller
+        # Server ids with a crawl in flight.  The crawl runs on a background
+        # task, so "is this server still being indexed?" is a question the API
+        # can only answer if the walk says so while it is happening.
+        self._crawling: set = set()
 
     # ---------------------------------------------------------------- public
 
@@ -345,8 +353,14 @@ class MCPDocumentIndexer:
         Returns ``{"indexed", "skipped", "removed", "records", "steps",
         "plan", "reason"}``.
         """
+        server_id = getattr(server, "id", None)
         with self._lock:
-            return self._crawl_server(server, ttl, force, on_server_updated)
+            if server_id:
+                self._crawling.add(server_id)
+            try:
+                return self._crawl_server(server, ttl, force, on_server_updated)
+            finally:
+                self._crawling.discard(server_id)
 
     def search(
         self,
@@ -390,18 +404,33 @@ class MCPDocumentIndexer:
             self._logger.warning(f"[mcp-crawl] count failed: {e}")
             return 0
 
+    def is_crawling(self, server_id: str) -> bool:
+        """True while a crawl of *server_id* is in flight."""
+        return server_id in self._crawling
+
+    def server_status(self, server_id: str) -> Dict[str, Any]:
+        """Crawl state for one server.
+
+        Kept separate from :meth:`status` because the per-server view is read
+        on every poll of a connection's detail page, and counting the whole
+        collection to answer it would be wasted work.
+        """
+        entry = self._manifest.get(server_id) or {}
+        return {
+            "crawled_at": entry.get("crawled_at"),
+            "documents": len(entry.get("docs", {})),
+            "records": entry.get("records", 0),
+            "plan": entry.get("plan"),
+            "crawling": self.is_crawling(server_id),
+        }
+
     def status(self) -> Dict[str, Any]:
         """Per-server crawl state, for the /health and diagnostics endpoints."""
         return {
             "chunks": self.count(),
             "servers": {
-                server_id: {
-                    "crawled_at": entry.get("crawled_at"),
-                    "documents": len(entry.get("docs", {})),
-                    "records": entry.get("records", 0),
-                    "plan": entry.get("plan"),
-                }
-                for server_id, entry in self._manifest.items()
+                server_id: self.server_status(server_id)
+                for server_id in self._manifest
             },
         }
 
@@ -421,6 +450,7 @@ class MCPDocumentIndexer:
         stats: Dict[str, Any] = {
             "indexed": 0, "skipped": 0, "removed": 0,
             "records": 0, "steps": 0, "plan": None, "reason": None,
+            "calls": 0, "truncated": False,
             # One entry per plan step: which tool it resolved to, how many
             # records it produced, and why it produced none.  A crawl that
             # silently indexes nothing is the failure mode that matters here,
@@ -475,6 +505,21 @@ class MCPDocumentIndexer:
         # its body fetched once per listing.
         seen_records: set = set()
 
+        def call(tool_name: str, arguments: Dict[str, Any]):
+            """Spend one unit of the crawl's call budget.
+
+            Past the budget the walk stops making requests rather than
+            failing: what it already indexed stands, and the branches it did
+            not reach are picked up on the next cycle.  The exhaustion reason
+            is deliberately not one ``_is_permanent_failure`` recognises — a
+            step cut short by the budget must not be remembered as blocked.
+            """
+            if stats["calls"] >= MAX_CRAWL_CALLS:
+                stats["truncated"] = True
+                return None, False, "call budget for this cycle used up"
+            stats["calls"] += 1
+            return self._call_tool(server, tool_name, arguments)
+
         for step in plan.steps:
             tool = resolve_tool(tool_names, step.tools)
             if not tool:
@@ -493,12 +538,22 @@ class MCPDocumentIndexer:
                 continue
 
             schema = tool_schema(server, tool)
+            if step.needs_arguments and not declares_argument(schema, step.needs_arguments):
+                stats["details"].append({
+                    "step": step.label, "tool": tool, "records": 0,
+                    "reason": f"tool declares none of {list(step.needs_arguments)}, "
+                              f"which is the only thing this step adds",
+                })
+                continue
+
             arg_sets, parents = self._step_arguments(step, schema, records_by_step)
             if arg_sets is None:
                 stats["details"].append({
                     "step": step.label, "tool": tool, "records": 0,
-                    "reason": f"nothing to fan out from '{step.parent}'"
-                              if step.parent else "no arguments could be built",
+                    "reason": f"nothing to fan out from "
+                              f"'{'/'.join(step.parent_labels)}'"
+                              if step.parent_labels
+                              else "no arguments could be built",
                 })
                 continue
 
@@ -524,20 +579,48 @@ class MCPDocumentIndexer:
                 })
                 continue
 
+            # What a failed call is retried with: the plan's own arguments may
+            # not fit this server's variant of the tool.  A fan-out step keeps
+            # the parent id — without it the retry is a different, unscoped
+            # question, asked once per parent.
+            retry_keys = set(step.arguments) | set(filter_arguments(schema, step.arguments))
+
             records: List[CrawlRecord] = []
             failure: Optional[str] = None
+            consecutive_failures = 0
             for arguments in arg_sets:
-                payload, changed, error = self._call_tool(server, tool, arguments)
+                payload, changed, error = call(tool, arguments)
                 credentials_changed = credentials_changed or changed
-                if payload is None and arguments and not _has_required(schema):
-                    # The plan's arguments may not fit this server's variant of
-                    # the tool.  Only worth retrying bare when the tool declares
-                    # nothing as required — otherwise the retry fails for sure.
-                    payload, changed, error = self._call_tool(server, tool, {})
+                retry_args = {
+                    k: v for k, v in arguments.items() if k not in retry_keys
+                }
+                if payload is None and retry_args != arguments and not _has_required(schema):
+                    # Only worth retrying when the tool declares nothing as
+                    # required — otherwise the retry fails for sure.
+                    payload, changed, error = call(tool, retry_args)
                     credentials_changed = credentials_changed or changed
                 if not payload:
-                    failure = failure or error or "no content returned"
+                    reason = error or "no content returned"
+                    failure = failure or reason
+                    consecutive_failures += 1
+                    # The tool rejected the call itself, not this parent: the
+                    # next parent is the identical call with a different id in
+                    # it.  Stop rather than proving it once per parent.
+                    if _is_permanent_failure(reason):
+                        self._logger.info(
+                            "[mcp-crawl] step '%s' abandoned after %s",
+                            step.label, reason,
+                        )
+                        break
+                    if consecutive_failures >= MAX_STEP_FAILURES:
+                        self._logger.info(
+                            "[mcp-crawl] step '%s' abandoned after %d consecutive "
+                            "failures (last: %s)",
+                            step.label, consecutive_failures, reason,
+                        )
+                        break
                     continue
+                consecutive_failures = 0
                 records.extend(_parse_records(payload))
                 if len(records) >= step.max_records:
                     break
@@ -558,11 +641,13 @@ class MCPDocumentIndexer:
             # over, but only document what hasn't been seen yet.
             fresh = []
             for record in records:
-                key = record.record_id or record.title
-                if key and key in seen_records:
+                # Ids first; a record with neither id nor title (a plain-text
+                # listing) still falls back to its own content, so two steps
+                # that resolved to the same tool don't index it twice.
+                key = record.record_id or record.title or _content_hash(record.text)
+                if key in seen_records:
                     continue
-                if key:
-                    seen_records.add(key)
+                seen_records.add(key)
                 fresh.append(record)
 
             stats["steps"] += 1
@@ -582,8 +667,8 @@ class MCPDocumentIndexer:
             for index, record in enumerate(fresh):
                 text = record.text
                 if detail_tool and detail_arg and record.record_id:
-                    detail_payload, changed, _ = self._call_tool(
-                        server, detail_tool, {detail_arg: record.record_id}
+                    detail_payload, changed, _ = call(
+                        detail_tool, {detail_arg: record.record_id}
                     )
                     credentials_changed = credentials_changed or changed
                     detail_text = self._detail_text(detail_payload)
@@ -643,10 +728,12 @@ class MCPDocumentIndexer:
                 self._logger.debug(f"[mcp-crawl] server update callback failed: {e}")
 
         self._logger.info(
-            "[mcp-crawl] %s (plan=%s): %d record(s) over %d step(s) — "
-            "indexed=%d, unchanged=%d, removed=%d",
+            "[mcp-crawl] %s (plan=%s): %d record(s) over %d step(s) in %d call(s)%s "
+            "— indexed=%d, unchanged=%d, removed=%d",
             getattr(server, "name", server_id), plan.slug, stats["records"],
-            stats["steps"], stats["indexed"], stats["skipped"], stats["removed"],
+            stats["steps"], stats["calls"],
+            " (call budget reached)" if stats["truncated"] else "",
+            stats["indexed"], stats["skipped"], stats["removed"],
         )
         if not stats["records"]:
             # Nothing indexed is the failure that matters, so the reason each
@@ -677,10 +764,21 @@ class MCPDocumentIndexer:
         parent id could go in.
         """
         base = filter_arguments(schema, step.arguments)
-        if not step.parent:
+        if not step.parent_labels:
             return [base], 0
 
-        parents = records_by_step.get(step.parent) or []
+        # A step may name several parents (an issue's comments hang off
+        # whichever listing found the issue).  Pool them in the order the plan
+        # lists them and dedupe by id, so the fan-out budget is spent on
+        # distinct records rather than on the overlap between listings.
+        parents: List[CrawlRecord] = []
+        seen: set = set()
+        for label in step.parent_labels:
+            for record in records_by_step.get(label) or []:
+                if not record.record_id or record.record_id in seen:
+                    continue
+                seen.add(record.record_id)
+                parents.append(record)
         if not parents:
             return None, 0
         parent_arg = resolve_argument(schema, step.parent_args)
@@ -694,7 +792,6 @@ class MCPDocumentIndexer:
         arg_sets = [
             {**base, parent_arg: parent.record_id}
             for parent in parents[:step.max_parents]
-            if parent.record_id
         ]
         return (arg_sets or None), len(arg_sets)
 
@@ -708,84 +805,21 @@ class MCPDocumentIndexer:
 
     def _call_tool(
         self, server: Any, tool_name: str, arguments: Dict[str, Any]
-    ) -> Tuple[Optional[str], bool, Optional[str]]:
-        """Call one read-only tool.
+    ) -> ToolCallResult:
+        """Call one read-only tool, through the shared background-call path.
 
-        Returns ``(payload, credentials_changed, error)``.  A failure is a skip,
-        not an exception: a crawl covers what it can reach and the next cycle
-        tries again — but the reason travels back to the caller so a crawl that
-        indexes nothing can say why.  An expired OAuth token is refreshed once
-        and the call retried, mirroring the live tool path.
+        The 401 retry, the failure-reason extraction and the transport itself
+        all live in :mod:`smartloop.mcp.read_only_calls`, so a crawl and the
+        account probe reach a server the same way.
         """
-        caller = self._ensure_tool_caller()
-        if caller is None:
-            return None, False, "no MCP tool caller available"
-        try:
-            access_token = caller.get_access_token(server)
-            result = caller.call_tool(
-                server=server, tool_name=tool_name,
-                arguments=arguments, access_token=access_token,
-            )
-            credentials_changed = False
-            if not result.success and result.error and "401" in str(result.error):
-                new_token = caller.refresh_access_token(server)
-                if new_token:
-                    credentials_changed = True
-                    result = caller.call_tool(
-                        server=server, tool_name=tool_name,
-                        arguments=arguments, access_token=new_token,
-                    )
-            if not result.success or result.is_error or not result.content:
-                reason = self._failure_reason(result)
-                self._logger.info(
-                    "[mcp-crawl] %s.%s(%s) returned nothing: %s",
-                    getattr(server, "name", "?"), tool_name,
-                    ", ".join(arguments) or "-", reason,
-                )
-                return None, credentials_changed, reason
-            return _content_to_text(result.content) or None, credentials_changed, None
-        except Exception as e:
-            self._logger.info(
-                "[mcp-crawl] %s.%s raised: %s",
-                getattr(server, "name", "?"), tool_name, e,
-            )
-            return None, False, str(e)[:200]
-
-    @staticmethod
-    def _failure_reason(result: Any) -> str:
-        """Short reason a tool call produced nothing, for the step report.
-
-        MCP servers report an argument rejection as a *successful* call with
-        ``is_error`` set and the message in the content, so the content is read
-        too — otherwise the most common crawl failure ("query is required")
-        shows up as a bare "no content".
-        """
-        if getattr(result, "error", None):
-            return str(result.error)[:200]
-        content = getattr(result, "content", None)
-        if content:
-            text = _content_to_text(content)
-            if text:
-                return text[:200]
-        return "empty result"
+        return call_read_only(
+            self._ensure_tool_caller(), server, tool_name, arguments,
+            self._logger, label="mcp-crawl",
+        )
 
     def _ensure_tool_caller(self):
-        """Return the MCP tool caller, building the default one lazily.
-
-        Only its transport-level helpers are used (``call_tool``,
-        ``get_access_token``, ``refresh_access_token``); the argument extractor
-        and result mapper it takes for the live path are LLM-backed and have no
-        place in a crawl, so they are left unset.
-        """
-        if self._tool_caller is None:
-            try:
-                from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
-                self._tool_caller = MCPToolCaller(
-                    arg_extractor=None, result_mapper=None,
-                )
-            except Exception as e:
-                self._logger.warning(f"[mcp-crawl] No MCP tool caller available: {e}")
-                return None
+        """Return the MCP tool caller, building the default one lazily."""
+        self._tool_caller = ensure_tool_caller(self._tool_caller, self._logger)
         return self._tool_caller
 
     # ---------------------------------------------------------------- index

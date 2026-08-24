@@ -13,10 +13,16 @@ rest out of band:
 * **Provisioning** — a queued server is discovered, enriched, tool-indexed and
   crawled.  Its ``status`` moves ``pending`` → ``ready``/``failed`` with
   ``last_error`` set, which is what clients poll instead of blocking.
-* **Refresh cycle** — every ``crawl_interval`` seconds, document-type servers
-  (Notion, Linear, Trello, …) are re-crawled so their vectorized content keeps
-  up with the source.  The first cycle runs at startup, so a session begins
-  with fresh content rather than whatever was indexed days ago.
+* **Refresh cycle** — document-type servers (Notion, Linear, Trello, …) are
+  re-crawled so their vectorized content keeps up with the source.  A newly
+  connected server is crawled immediately as the last step of its provisioning
+  pass; after that the schedule takes over: every ``idle_crawl_interval``
+  (ten minutes) while the model is idle, and every ``crawl_interval`` (an hour)
+  regardless.  The idle rule is the important one — a crawl competes for CPU,
+  network and the same MCP connections a live tool call needs, so it should
+  land in a gap rather than on a reply someone is watching.  The first cycle
+  runs at startup, so a session begins with fresh content rather than whatever
+  was indexed days ago.
 
 The work itself belongs to :class:`~smartloop.api.services.model_service.ModelService`
 (it owns the workspace, the LLM and the indexers); this task owns only the
@@ -40,8 +46,14 @@ _QUEUE_POLL_SECONDS = 1.0
 class MCPTask(BaseTask):
     """Background MCP server provisioning and periodic content crawl."""
 
-    # Default refresh cadence; overridden from AppSettings at construction.
-    DEFAULT_CRAWL_INTERVAL = 1800.0
+    # Two thresholds, both overridden from AppSettings at construction.
+    #
+    # The idle cadence is the usual one: while nothing is being answered, the
+    # content is refreshed every ten minutes.  The ceiling is the backstop —
+    # after an hour the index is stale enough to be worth refreshing even in
+    # the middle of a conversation, so a long working session can't starve it.
+    DEFAULT_IDLE_CRAWL_INTERVAL = 600.0
+    DEFAULT_CRAWL_INTERVAL = 3600.0
 
     def __init__(
         self,
@@ -49,15 +61,25 @@ class MCPTask(BaseTask):
         provisioner: Optional[Callable[[str, str], dict]] = None,
         crawler: Optional[Callable[..., dict]] = None,
         crawl_interval: Optional[float] = None,
+        idle_crawl_interval: Optional[float] = None,
         pending_provider: Optional[Callable[[], list]] = None,
+        idle_provider: Optional[Callable[[], float]] = None,
         **kwargs,
     ):
         super().__init__(name="mcp", logger=logger, auto=True, **kwargs)
         self._provisioner = provisioner
         self._crawler = crawler
         self._pending_provider = pending_provider
+        # Returns seconds since the model last finished answering (0.0 while it
+        # is answering).  Unset — in tests, or wherever nothing can report it —
+        # leaves the schedule on the interval alone.
+        self._idle_provider = idle_provider
         self._crawl_interval = float(
             crawl_interval if crawl_interval is not None else self.DEFAULT_CRAWL_INTERVAL
+        )
+        self._idle_crawl_interval = float(
+            idle_crawl_interval if idle_crawl_interval is not None
+            else self.DEFAULT_IDLE_CRAWL_INTERVAL
         )
         if self._crawl_interval <= 0:
             self.logger.info(
@@ -116,6 +138,8 @@ class MCPTask(BaseTask):
             "last_crawl_at": self._last_cycle_at,
             "last_crawl_stats": self._last_cycle_stats,
             "crawl_interval_seconds": self._crawl_interval,
+            "idle_crawl_interval_seconds": self._idle_crawl_interval,
+            "idle_seconds": self._idle_seconds(),
         }
 
     # ------------------------------------------------------------------
@@ -179,18 +203,50 @@ class MCPTask(BaseTask):
             self._executor = None
         self._set_status(TaskStatus.COMPLETED, "Event loop stopped")
 
+    def _idle_seconds(self) -> Optional[float]:
+        """Seconds the app has been idle, or None when nothing reports it."""
+        if self._idle_provider is None:
+            return None
+        try:
+            return float(self._idle_provider())
+        except Exception:
+            return None
+
     def _crawl_due(self, now: float) -> bool:
         """True when a content crawl should start on this tick.
 
-        An explicit request always runs.  Otherwise the interval decides, and
-        an interval of 0 means the periodic refresh is switched off entirely —
-        never that it is due on every tick.
+        An explicit request always runs — that is how a just-connected server
+        gets indexed without waiting for a cycle.  Otherwise two thresholds
+        decide:
+
+        * **idle** — the model isn't answering anyone and it has been
+          ``idle_crawl_interval`` (ten minutes) since the last crawl.  This is
+          how most refreshes happen: in a gap, not on a reply someone is
+          watching stream.
+        * **ceiling** — ``crawl_interval`` (an hour) has passed, whatever the
+          app is doing.  Without it a long working session would never refresh.
+
+        An interval of 0 switches the periodic refresh off entirely — never
+        that it is due on every tick.
         """
         if self._crawl_requested:
             return True
         if self._crawl_interval <= 0:
             return False
-        return (now - self._last_crawl_cycle) >= self._crawl_interval
+
+        elapsed = now - self._last_crawl_cycle
+        if elapsed >= self._crawl_interval:
+            # The ceiling, and the only case that overrides a busy model: an
+            # hour-old index is stale enough that refreshing it beats staying
+            # out of the way.
+            return True
+
+        idle_for = self._idle_seconds()
+        if idle_for is None or idle_for <= 0:
+            # Answering someone, or nothing can report it — in which case the
+            # ceiling above is the whole schedule.
+            return False
+        return elapsed >= self._idle_crawl_interval
 
     def _seed_pending_once(self) -> None:
         """Queue servers left ``pending`` by a previous run, once per loop start.

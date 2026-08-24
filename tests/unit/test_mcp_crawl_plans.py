@@ -8,9 +8,7 @@ weather connection gets walked every refresh cycle for nothing.
 from types import SimpleNamespace
 
 from smartloop.mcp.crawl_plans import (
-    LINEAR_PLAN,
-    NOTION_PLAN,
-    TRELLO_PLAN,
+    declares_argument,
     filter_arguments,
     generic_plan,
     resolve_argument,
@@ -18,6 +16,11 @@ from smartloop.mcp.crawl_plans import (
     resolve_tool,
     should_crawl,
 )
+from smartloop.mcp.plan_loader import plans as _plans
+
+NOTION_PLAN = _plans()["notion"]
+LINEAR_PLAN = _plans()["linear"]
+TRELLO_PLAN = _plans()["trello"]
 
 
 def _tool(name, schema=None):
@@ -37,17 +40,17 @@ def _server(name="demo", tools=(), **fields):
 class TestPlanResolution:
     def test_catalog_slug_selects_the_curated_plan(self):
         server = _server(name="My Workspace", catalog_slug="notion")
-        assert resolve_plan(server) is NOTION_PLAN
+        assert resolve_plan(server).slug == "notion"
 
     def test_hand_added_server_matches_on_name(self):
-        assert resolve_plan(_server(name="linear-mcp")) is LINEAR_PLAN
+        assert resolve_plan(_server(name="linear-mcp")).slug == "linear"
 
     def test_match_can_come_from_the_remote_url(self):
         server = _server(
             name="tasks",
             remote_config=SimpleNamespace(server_url="https://mcp.trello.com/mcp"),
         )
-        assert resolve_plan(server) is TRELLO_PLAN
+        assert resolve_plan(server).slug == "trello"
 
     def test_unknown_server_falls_back_to_a_derived_plan(self):
         plan = resolve_plan(_server(name="weather", tools=[_tool("get_forecast")]))
@@ -110,6 +113,75 @@ class TestArgumentResolution:
         assert filter_arguments({}, {"query": ""}) == {"query": ""}
 
 
+class TestCuratedPlanShape:
+    """The curated plans are tree walks, so the tree has to hold together."""
+
+    def _steps(self, plan):
+        return {step.label: step for step in plan.steps}
+
+    def test_every_parent_is_produced_by_an_earlier_step(self):
+        # A step can only fan out over records another step already collected,
+        # so a parent named later (or misspelled) silently never runs.
+        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN):
+            seen = set()
+            for step in plan.steps:
+                for parent in step.parent_labels:
+                    assert parent in seen, f"{plan.slug}/{step.label} -> {parent}"
+                seen.add(step.label)
+
+    def test_step_labels_are_unique(self):
+        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN):
+            labels = [s.label for s in plan.steps]
+            assert len(labels) == len(set(labels)), plan.slug
+
+    def test_linear_reaches_issues_through_teams(self):
+        steps = self._steps(LINEAR_PLAN)
+        assert steps["teams"].parent_labels == ()
+        assert steps["team-issues"].parent_labels == ("teams",)
+        assert "list_issues" in steps["team-issues"].tools
+        assert "teamId" in steps["team-issues"].parent_args
+
+    def test_linear_comments_pool_every_issue_listing(self):
+        comments = self._steps(LINEAR_PLAN)["issue-comments"]
+        assert set(comments.parent_labels) == {
+            "issues", "my-issues", "team-issues", "project-issues",
+        }
+
+    def test_notion_reaches_database_rows(self):
+        pages = self._steps(NOTION_PLAN)["database-pages"]
+        assert set(pages.parent_labels) == {"databases", "database-search"}
+        assert pages.detail_tools, "a database row still needs its page body"
+
+    def test_notion_covers_both_tool_vocabularies(self):
+        # The hosted server and the OpenAPI package name nothing alike, and the
+        # loose matcher pairs on affixes — `retrieve-a-page` matches neither
+        # `retrieve_page` nor `get_page`, so both spellings are listed.
+        search = self._steps(NOTION_PLAN)["pages"]
+        assert resolve_tool(["notion-search"], search.tools) == "notion-search"
+        assert resolve_tool(["API-post-search"], search.tools) == "API-post-search"
+        assert resolve_tool(["notion-fetch"], search.detail_tools) == "notion-fetch"
+        assert resolve_tool(
+            ["API-get-block-children"], search.detail_tools
+        ) == "API-get-block-children"
+
+    def test_a_step_that_only_exists_for_one_argument_declares_it(self):
+        # `database-search` is the `pages` search narrowed to databases; with
+        # the filter dropped it would be a duplicate call.
+        assert self._steps(NOTION_PLAN)["database-search"].needs_arguments == ("filter",)
+
+
+class TestNeedsArguments:
+    def test_declared_argument_lets_the_step_run(self):
+        schema = {"properties": {"query": {}, "filter": {}}}
+        assert declares_argument(schema, ("filter",)) is True
+
+    def test_undeclared_argument_stops_the_step(self):
+        assert declares_argument({"properties": {"query": {}}}, ("filter",)) is False
+
+    def test_an_empty_schema_is_not_evidence_against_the_step(self):
+        assert declares_argument({}, ("filter",)) is True
+
+
 class TestGenericPlan:
     def test_listing_tools_become_steps(self):
         server = _server(tools=[
@@ -140,3 +212,38 @@ class TestGenericPlan:
     def test_step_count_is_capped(self):
         server = _server(tools=[_tool(f"list_thing{i}") for i in range(20)])
         assert len(generic_plan(server).steps) <= 6
+
+    def test_a_tool_needing_a_parent_id_becomes_a_child_step(self):
+        # The half of a server that is only reachable per-parent: without this
+        # `list_issues` is dropped for requiring an argument, and every issue
+        # on the server stays invisible.
+        server = _server(tools=[
+            _tool("list_teams"),
+            _tool("list_issues", {"properties": {"teamId": {}}, "required": ["teamId"]}),
+        ])
+        steps = {s.label: s for s in generic_plan(server).steps}
+        assert steps["list_issues"].parent_labels == ("list_teams",)
+        assert "teamId" in steps["list_issues"].parent_args
+
+    def test_a_child_step_comes_after_the_parent_it_walks(self):
+        server = _server(tools=[
+            _tool("list_cards", {"properties": {"board_id": {}}, "required": ["board_id"]}),
+            _tool("list_boards"),
+        ])
+        labels = [s.label for s in generic_plan(server).steps]
+        assert labels == ["list_boards", "list_cards"]
+
+    def test_a_bare_id_names_no_parent_so_it_stays_dropped(self):
+        # `id` says nothing about which listing could supply it.
+        server = _server(tools=[
+            _tool("list_teams"),
+            _tool("list_items", {"properties": {"id": {}}, "required": ["id"]}),
+        ])
+        assert [s.label for s in generic_plan(server).steps] == ["list_teams"]
+
+    def test_a_child_with_no_matching_parent_listing_is_dropped(self):
+        server = _server(tools=[
+            _tool("list_teams"),
+            _tool("list_cards", {"properties": {"board_id": {}}, "required": ["board_id"]}),
+        ])
+        assert [s.label for s in generic_plan(server).steps] == ["list_teams"]

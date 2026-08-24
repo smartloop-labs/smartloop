@@ -9,6 +9,8 @@ import re
 import shutil
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 import gc
 import sys
 
@@ -153,7 +155,14 @@ class ModelService:
         self._llm_executor = None
         # Use a semaphore sized to n_parallel so agents can run concurrently
         # when the model is loaded with n_parallel > 1 (continuous batching).
+        # Always taken through :meth:`_inference_slot`, which is what makes
+        # "is the model answering someone right now" an answerable question —
+        # background work (the MCP content crawl) waits for a quiet moment
+        # rather than competing with a reply the user is watching stream.
         self._inference_lock = threading.Semaphore(_settings.n_parallel)
+        self._inference_active = 0
+        self._inference_state_lock = threading.Lock()
+        self._last_inference_at = 0.0
         self._sessions: dict[str, List[MessageInput]] = {}  # session_id -> chat history (in-memory cache)
         self._conversation_store = ConversationStore(_settings.home_dir)
         self._task_queue = TaskQueue(logger)
@@ -2292,7 +2301,7 @@ class ModelService:
         )
 
         # Lock around inference - llama-cpp is not thread-safe
-        with self._inference_lock:
+        with self._inference_slot():
             emitted = 0
             try:
                 # Propagate cancellation event so the LLM can stop mid-inference.
@@ -2354,7 +2363,7 @@ class ModelService:
         if llm is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        with self._inference_lock:
+        with self._inference_slot():
             try:
                 return llm.invoke(prompt)
             except Exception as ex:
@@ -2545,7 +2554,9 @@ class ModelService:
             provisioner=self._provision_mcp_server,
             crawler=self._crawl_mcp_cycle,
             crawl_interval=_settings.mcp_crawl_interval_s,
+            idle_crawl_interval=_settings.mcp_idle_crawl_interval_s,
             pending_provider=self.pending_mcp_servers,
+            idle_provider=self.idle_seconds,
         )
         self._task_queue.register(mcp)
 
@@ -2971,7 +2982,7 @@ class ModelService:
         """
         if self._vision_llm is None:
             return
-        with self._inference_lock:
+        with self._inference_slot():
             if self._vision_llm is None:
                 return
             logger.info("[vision] Unloading vision model %s — freeing VRAM",
@@ -2991,7 +3002,7 @@ class ModelService:
         """
         if self._large_llm is None:
             return
-        with self._inference_lock:
+        with self._inference_slot():
             if self._large_llm is None:
                 return
             logger.info("[large-model] Unloading large agent model — freeing VRAM")
@@ -3080,7 +3091,7 @@ class ModelService:
         any per-capability (``_cap_llm_<name>``) cache — then reclaims the GPU.
         Idempotent; returns True if anything was actually unloaded.
         """
-        with self._inference_lock:
+        with self._inference_slot():
             unloaded = False
 
             if self._large_llm is not None and self._large_model_name == model_name:
@@ -3577,6 +3588,7 @@ class ModelService:
         self._model.save()
 
         self._index_mcp_tools(project, server)
+        self._probe_mcp_account(server)
 
         crawl = self._crawl_mcp_server(project, server, force=True)
 
@@ -3590,6 +3602,23 @@ class ModelService:
             "tools": len(server.tools or []),
             "crawl": crawl,
         }
+
+    def _probe_mcp_account(self, server: "MCPServer") -> None:
+        """Record which account *server* is linked as, when it can say.
+
+        One read-only call on the provisioning pass — so it costs a request per
+        connect or re-index, never per page load.  Best-effort: a server with no
+        identity tool leaves the field alone.
+        """
+        try:
+            from smartloop.mcp.account import probe_account
+            account = probe_account(server)
+        except Exception as e:
+            logger.debug("[mcp-account] probe failed for '%s': %s", server.name, e)
+            return
+        if account and account != server.account:
+            server.account = account
+            self._model.save()
 
     def _discover_mcp_tools(self, server: "MCPServer") -> None:
         """Fill in a server's tools, launching or connecting as needed."""
@@ -3631,6 +3660,40 @@ class ModelService:
             "Discovered %d tool(s) from remote MCP server '%s'",
             len(result.tools), server.name,
         )
+
+    # ---------------------------------------------------------- busy / idle
+
+    @contextmanager
+    def _inference_slot(self):
+        """Hold an inference slot, and record that the model is in use.
+
+        Wraps ``_inference_lock`` so the count is maintained wherever the lock
+        is taken.  Background work reads it through :meth:`idle_seconds`.
+        """
+        with self._inference_lock:
+            with self._inference_state_lock:
+                self._inference_active += 1
+            try:
+                yield
+            finally:
+                with self._inference_state_lock:
+                    self._inference_active -= 1
+                    self._last_inference_at = time.time()
+
+    def idle_seconds(self) -> float:
+        """Seconds since the model last finished answering; 0.0 while it is.
+
+        The MCP crawl uses this to stay out of the way: it competes for CPU,
+        network and the same MCP connections a live tool call needs, and none
+        of that should land on a reply the user is waiting for.
+        """
+        with self._inference_state_lock:
+            if self._inference_active > 0:
+                return 0.0
+            if not self._last_inference_at:
+                # Nothing has run this session — idle since startup.
+                return float("inf")
+            return max(0.0, time.time() - self._last_inference_at)
 
     # ------------------------------------------------------ mcp content crawl
 
@@ -3756,6 +3819,95 @@ class ModelService:
         self._queue_mcp_provisioning(project, server)
         return self._mcp_server_to_dict(server)
 
+    @staticmethod
+    def _mcp_indexing_state(server: MCPServer, entry: dict) -> dict:
+        """Whether a connection's content is still being indexed.
+
+        Two background passes stand between registering a server and being able
+        to answer from it: provisioning (discover its tools, vectorize them) and
+        the content crawl (walk the server, vectorize what it returns).  Both
+        run off the request path, so a client that just registered a Notion
+        connection sees an empty one until they finish.  They collapse into a
+        single ``state`` here because the question a UI asks is one question:
+        is this still working, and if not, did it work?
+
+        ``in_progress`` is the flag to drive a spinner off — while it is true,
+        the counts alongside it are not final.
+        """
+        from smartloop.mcp.crawl_plans import resolve_plan, should_crawl
+
+        crawl_enabled = should_crawl(server)
+        crawled_at = entry.get("crawled_at") or server.last_crawl_at
+
+        if server.status == MCPServerStatus.FAILED:
+            state = "failed"
+        elif server.status == MCPServerStatus.PENDING:
+            state = "provisioning"
+        elif entry.get("crawling"):
+            state = "indexing"
+        elif not crawl_enabled:
+            # Not every server has "content": a shell or weather connection is
+            # complete once its tools are indexed.
+            state = "disabled"
+        elif crawled_at:
+            state = "indexed"
+        else:
+            state = "queued"
+
+        return {
+            "state": state,
+            "in_progress": state in ("provisioning", "indexing", "queued"),
+            "crawl_enabled": crawl_enabled,
+            "plan": entry.get("plan") or resolve_plan(server).slug,
+            "documents": entry.get("documents", 0),
+            "records": entry.get("records", 0),
+            "crawled_at": crawled_at,
+            "error": server.last_error,
+        }
+
+    def list_mcp_servers_with_status(self, project_id: str) -> list[dict]:
+        """Every non-system server in a project, each with its indexing state.
+
+        The list view is where a just-registered connection is watched, so the
+        state travels with the list rather than costing one request per server.
+        """
+        project = self._get_project(project_id)
+        indexer = self._ensure_mcp_document_indexer(project)
+        return [
+            {
+                **self._mcp_server_to_dict(server),
+                "indexing": self._mcp_indexing_state(
+                    server, indexer.server_status(server.id)
+                ),
+            }
+            for server in project.mcp_servers
+            if not server.system
+        ]
+
+    def mcp_server_status(self, server_id: str, project_id: str | None = None) -> dict:
+        """One server, with the indexing state a client polls it for."""
+        self._initialize_workspace()
+        project = (
+            self._get_project(project_id) if project_id
+            else self._model.workspace.current_project
+        )
+        if project is None:
+            raise ValueError("No current project found")
+
+        server = next(
+            (s for s in project.mcp_servers if s.id == server_id), None
+        )
+        if server is None:
+            raise ValueError(f"MCP server not found: {server_id}")
+
+        indexer = self._ensure_mcp_document_indexer(project)
+        return {
+            **self._mcp_server_to_dict(server),
+            "indexing": self._mcp_indexing_state(
+                server, indexer.server_status(server.id)
+            ),
+        }
+
     def mcp_content_status(self, project_id: str | None = None) -> dict:
         """Crawl state for a project: chunk count and per-server crawl info."""
         self._initialize_workspace()
@@ -3768,21 +3920,17 @@ class ModelService:
 
         indexer = self._ensure_mcp_document_indexer(project)
         status = indexer.status()
-        from smartloop.mcp.crawl_plans import resolve_plan, should_crawl
         servers = []
         for server in project.mcp_servers:
             if server.system:
                 continue
-            entry = status["servers"].get(server.id, {})
             servers.append({
                 "id": server.id,
                 "name": server.name,
                 "status": server.status.value,
-                "crawl_enabled": should_crawl(server),
-                "plan": entry.get("plan") or resolve_plan(server).slug,
-                "documents": entry.get("documents", 0),
-                "records": entry.get("records", 0),
-                "crawled_at": entry.get("crawled_at") or server.last_crawl_at,
+                **self._mcp_indexing_state(
+                    server, status["servers"].get(server.id, {})
+                ),
             })
         return {
             "project": project.name,
@@ -3988,7 +4136,7 @@ class ModelService:
                 return
             from smartloop.agents.mcp.server_summarizer import MCPServerSummarizer
             summarizer = MCPServerSummarizer(llm)
-            with self._inference_lock:
+            with self._inference_slot():
                 # Description + tags (UI) — one JSON call when either is missing.
                 if not server.description or not server.tags:
                     meta = summarizer.generate_metadata(server)
@@ -4118,6 +4266,7 @@ class ModelService:
             "last_error": s.last_error,
             "crawl": s.crawl,
             "last_crawl_at": s.last_crawl_at,
+            "account": s.account,
         }
         if s.config:
             result["command"] = s.config.command
@@ -4925,7 +5074,7 @@ class ModelService:
         ]
 
         def _ask(vision_llm):
-            with self._inference_lock:
+            with self._inference_slot():
                 return vision_llm.model.create_chat_completion(
                     messages=messages, max_tokens=max_tokens,
                     temperature=0.0, stream=False,

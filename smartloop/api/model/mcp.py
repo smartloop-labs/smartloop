@@ -35,6 +35,8 @@ class MCPServerResponse(BaseModel):
     # Content crawl opt-in: None = automatic (on for document-type servers).
     crawl: Optional[bool] = None
     last_crawl_at: Optional[float] = None
+    # Account this connection is linked as, when the server can say.
+    account: Optional[str] = None
 
 
 class MCPCrawlRequest(BaseModel):
