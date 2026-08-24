@@ -73,6 +73,20 @@ class MCPOAuthCredentials(BaseModel):
     token_type: str = "Bearer"
 
 
+class MCPServerStatus(str, Enum):
+    """Provisioning state of a registered MCP server.
+
+    Registration only persists the connection; discovery, metadata enrichment
+    and indexing run in the background (see :class:`MCPTask`), so a server is
+    ``PENDING`` until that pass finishes.  ``READY`` is the default so servers
+    written before this field existed — already discovered and indexed — are
+    not re-queued on upgrade.
+    """
+    PENDING = "pending"
+    READY = "ready"
+    FAILED = "failed"
+
+
 class MCPServer(BaseModel):
     """An MCP server registered to a project, persisted in config.json."""
     id: str
@@ -92,6 +106,17 @@ class MCPServer(BaseModel):
     system: bool = False
     tools: List[MCPToolDefinition] = []
     server_info: Optional[Dict[str, Any]] = None
+    # Background provisioning state (discovery → enrichment → tool index →
+    # content crawl).  Registration returns as soon as the connection is
+    # persisted, so clients poll this instead of blocking on the handshake.
+    status: MCPServerStatus = MCPServerStatus.READY
+    # Human-readable reason the last provisioning pass failed, if it did.
+    last_error: Optional[str] = None
+    # Content crawl (see smartloop.mcp.crawl_plans): None = auto (crawl when a
+    # curated plan matches this server), True/False = explicit opt in/out.
+    crawl: Optional[bool] = None
+    # Epoch seconds of the last completed content crawl, for the refresh cycle.
+    last_crawl_at: Optional[float] = None
 
 
 class ProjectModel(BaseModel):
@@ -351,6 +376,9 @@ class Workspace(BaseModel):
 
     _instance: ClassVar[Optional['Workspace']] = None
     _lock: ClassVar[threading.Lock] = threading.Lock()
+    # Serializes save(): background tasks (document indexing, MCP provisioning
+    # and the MCP content crawl) each persist from their own thread.
+    _save_lock: ClassVar[threading.Lock] = threading.Lock()
     config_file: ClassVar[str] = os.path.join(_settings.home_dir, "config.json")
 
     id: str
@@ -723,16 +751,29 @@ class Workspace(BaseModel):
         return exact
 
     def save(self) -> None:
-        """Persist workspace state to config.json."""
-        ws_data = self.model_dump(mode="json")
-        ws_data.pop("model_dir", None)
-        ws_data.pop("model_path", None)
-        ws_data.pop("current_project", None)
-        ws_data.pop("model_id", None)
-        active = self.active_model
-        data = {"id": active.model_id if active else "", "workspace": ws_data}
-        with open(self.config_file, "w") as f:
-            json.dump(data, f, indent=4)
+        """Persist workspace state to config.json.
+
+        Serialized and atomic.  Several background tasks now write the
+        workspace from their own threads — document indexing, MCP provisioning,
+        the MCP content crawl — and two of them writing the same file directly
+        would interleave into a truncated or half-updated config.  The snapshot
+        is taken under the lock and swapped in with a rename, so a reader (or a
+        crash) sees either the old file or the new one.
+        """
+        with self._save_lock:
+            ws_data = self.model_dump(mode="json")
+            ws_data.pop("model_dir", None)
+            ws_data.pop("model_path", None)
+            ws_data.pop("current_project", None)
+            ws_data.pop("model_id", None)
+            active = self.active_model
+            data = {"id": active.model_id if active else "", "workspace": ws_data}
+            tmp_file = f"{self.config_file}.tmp"
+            with open(tmp_file, "w") as f:
+                json.dump(data, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, self.config_file)
     
     @classmethod
     def _create_new_workspace(cls, config: ModelConfig) -> 'Workspace':

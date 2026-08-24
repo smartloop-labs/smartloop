@@ -202,6 +202,16 @@ class AppSettings(BaseSettings):
         validation_alias="slp_orchestrate_timeout_s",
         description="Max seconds for one orchestration pass before it is cancelled; 0 disables.",
     )
+    # How often registered document-type MCP servers (Notion, Linear, Trello, …)
+    # are re-crawled so their vectorized content tracks the source.  The first
+    # cycle always runs at startup; this is the cadence after that.  0 disables
+    # the periodic refresh (a crawl then only happens on registration or when a
+    # client asks for one).
+    mcp_crawl_interval_s: float = Field(
+        default=1800.0,
+        validation_alias="slp_mcp_crawl_interval_s",
+        description="Seconds between MCP content refresh cycles; 0 disables the periodic crawl.",
+    )
     @model_validator(mode="after")
     def _resolve_defaults(self) -> "AppSettings":
         """Resolve defaults that depend on other fields."""

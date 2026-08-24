@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from smartloop.api.model import (
+    MCPCrawlRequest,
     MCPServerResponse,
     DeleteMCPServerResponse,
     MCPToolResponse,
@@ -131,6 +132,50 @@ def _build_server_response(result: dict) -> MCPServerResponse:
         system=result.get("system", False),
         tools=[MCPToolResponse(**t) for t in result["tools"]],
         server_info=result.get("server_info"),
+        status=result.get("status", "ready"),
+        last_error=result.get("last_error"),
+        crawl=result.get("crawl"),
+        last_crawl_at=result.get("last_crawl_at"),
+    )
+
+
+def _oauth_success_page(
+    server_name: str,
+    tool_count: int,
+    server_id: str,
+    return_url: str | None = None,
+) -> HTMLResponse:
+    """Render the "connected" page shown in the browser after OAuth.
+
+    It reports what was connected and stops there.  It used to navigate to the
+    app's ``smartloop://`` deep link automatically, which made the last step of
+    every install feel slow: the browser hands the URL to the OS, which decides
+    whether to prompt, then wakes the app — all while the user watches a
+    "Redirecting..." page that may never go away if no handler is registered.
+    The app already learns about the server from the API, so the browser has
+    nothing left to deliver: the page states the tool count and lets the user
+    close the window.  When a return URL was supplied it is offered as a link,
+    so going back to the app stays one click away without being forced.
+    """
+    tools_label = "tool" if tool_count == 1 else "tools"
+    link = ""
+    if return_url:
+        from urllib.parse import urlencode
+        separator = "&" if "?" in return_url else "?"
+        href = f"{return_url}{separator}{urlencode({'server_id': server_id})}"
+        link = f'<p><a href="{escape(href, quote=True)}">Return to Smartloop</a></p>'
+
+    return HTMLResponse(
+        "<html><head><title>MCP server connected</title></head>"
+        '<body style="font-family:system-ui,sans-serif;max-width:34rem;margin:4rem auto">'
+        "<h2>MCP server connected</h2>"
+        f"<p><strong>{escape(server_name)}</strong> registered with "
+        f"{tool_count} {tools_label}.</p>"
+        "<p>Indexing and metadata finish in the background — you can close "
+        "this window.</p>"
+        f"{link}"
+        '<p><button onclick="window.close()">Close window</button></p>'
+        "</body></html>"
     )
 
 
@@ -146,6 +191,12 @@ async def _register_local_mcp_server(
     ``npx``) plus ``args``; the command must be installed on the host PATH.
     When *curated* is a resolved catalog entry, its config and metadata win over
     the request.
+
+    Returns as soon as the connection is persisted, with ``status="pending"``:
+    launching the process, enumerating tools, generating metadata and indexing
+    all happen on the MCP background task.  Clients follow the server's
+    ``status``/``last_error`` (via ``GET /projects/{id}/mcp``) instead of
+    waiting here, and can re-run a failed pass with ``.../mcp/{id}/refresh``.
     """
     local_cfg = getattr(curated, "local_config", None) if curated else None
     command = local_cfg.command if local_cfg else request.command
@@ -481,6 +532,91 @@ async def count_indexed_mcp_tools_for_project(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/projects/{project_id}/mcp/content")
+async def mcp_content_status_for_project(
+    project_id: str,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Crawled MCP content state for the project.
+
+    Reports the number of indexed content chunks and, per server, the crawl
+    plan that matched, how many records/documents it produced and when it last
+    ran — the content counterpart to ``mcp/tools/count``.
+    """
+    try:
+        return model_service.mcp_content_status(project_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error reading MCP content status")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/projects/{project_id}/mcp/content/refresh")
+async def refresh_mcp_content_for_project(
+    project_id: str,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Re-crawl every document-type server in the project now.
+
+    The crawl also runs at startup and on the periodic cycle; this is the
+    manual "fetch it again" for when the source just changed.
+    """
+    try:
+        return model_service.crawl_mcp_content(project_id=project_id, force=True)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error refreshing MCP content")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/projects/{project_id}/mcp/{server_id}/refresh", response_model=MCPServerResponse)
+async def refresh_mcp_server(
+    project_id: str,
+    server_id: str,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Re-run background provisioning for one server (retry a failed discovery).
+
+    Returns the server with ``status="pending"``; the pass itself runs on the
+    MCP task.
+    """
+    try:
+        result = model_service.retry_mcp_server(server_id, project_id=project_id)
+        return _build_server_response(result)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error refreshing MCP server")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/projects/{project_id}/mcp/{server_id}/crawl")
+async def set_mcp_server_crawl(
+    project_id: str,
+    server_id: str,
+    request: MCPCrawlRequest,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Opt one server's content in or out of the crawl cycle.
+
+    Document-type servers (Notion, Linear, Trello, …) crawl by default; this
+    turns it on for a server we don't recognise as one, or off for a server
+    whose content shouldn't be indexed.  Disabling also drops what was already
+    indexed for it.
+    """
+    try:
+        return model_service.set_mcp_crawl_enabled(
+            server_id, request.enabled, project_id=project_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Error updating MCP crawl setting")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/projects/{project_id}/mcp/{server_id}", response_model=DeleteMCPServerResponse)
 async def delete_mcp_server_from_project(
     project_id: str,
@@ -658,28 +794,12 @@ async def mcp_oauth_callback(
 
         server_id = result["id"]
         tool_count = len(result.get("tools", []))
-        return_url = session.get("return_url")
-
-        if return_url:
-            from urllib.parse import urlencode
-            separator = "&" if "?" in return_url else "?"
-            redirect_url = f"{return_url}{separator}{urlencode({'server_id': server_id})}"
-            response = HTMLResponse(
-                f"<html><body>"
-                f"<h2>MCP server connected</h2>"
-                f"<p><strong>{result['name']}</strong> registered with {tool_count} tools.</p>"
-                f"<p>Redirecting...</p>"
-                f"<script>window.location.href = '{redirect_url}';</script>"
-                f"</body></html>"
-            )
-        else:
-            response = HTMLResponse(
-                f"<html><body>"
-                f"<h2>MCP server connected</h2>"
-                f"<p><strong>{result['name']}</strong> registered with {tool_count} tools.</p>"
-                f"<p>You can close this window.</p>"
-                f"</body></html>"
-            )
+        response = _oauth_success_page(
+            server_name=result["name"],
+            tool_count=tool_count,
+            server_id=server_id,
+            return_url=session.get("return_url"),
+        )
 
         # Cache response for duplicate browser requests
         _completed_oauth_responses[state] = (

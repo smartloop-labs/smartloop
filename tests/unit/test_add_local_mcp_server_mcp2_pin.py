@@ -1,4 +1,4 @@
-"""Auto-fix for MCP SDK 2.x breakage in add_local_mcp_server.
+"""Auto-fix for MCP SDK 2.x breakage in local MCP server discovery.
 
 ``mcp`` 2.0.0 removed ``mcp.server.fastmcp``, so legacy PyPI servers that
 declare an unbounded ``mcp>=1.x`` dependency die at startup with
@@ -69,6 +69,21 @@ def _project():
     return SimpleNamespace(id="p1", mcp_servers=[])
 
 
+def _register_and_discover(svc, **kwargs):
+    """Register a local server, then run the discovery pass.
+
+    Registration is non-blocking: it normalises the launch config, persists the
+    connection and queues provisioning.  The launch retries under test live in
+    the discovery step the MCP task runs, so both halves are exercised here the
+    way they run in sequence in production.
+    """
+    ModelService.add_local_mcp_server(svc, **kwargs)
+    project = svc._get_project.return_value
+    server = project.mcp_servers[-1]
+    ModelService._discover_local_mcp_tools(svc, server)
+    return server
+
+
 def _patch_client(side_effect):
     patcher = patch("smartloop.api.services.model_service.LocalMCPClient")
     mock_cls = patcher.start()
@@ -83,7 +98,7 @@ def test_mcp2_breakage_retries_with_mcp_pin():
     svc = _svc(project)
     patcher, mock_cls = _patch_client([MCPLaunchError(_MCP2_TRACEBACK), _OK])
     try:
-        ModelService.add_local_mcp_server(
+        _register_and_discover(
             svc,
             command="uv",
             args=["tool", "run", "--from", "weather-mcp-pypi", "weather-mcp-pypi"],
@@ -106,7 +121,7 @@ def test_uvx_bare_command_gets_pin_at_front():
     svc = _svc(project)
     patcher, mock_cls = _patch_client([MCPLaunchError(_MCP2_TRACEBACK), _OK])
     try:
-        ModelService.add_local_mcp_server(
+        _register_and_discover(
             svc,
             command="uvx",
             args=["weather-mcp-pypi"],
@@ -130,7 +145,7 @@ def test_no_pin_when_with_flag_already_present():
     patcher, mock_cls = _patch_client([MCPLaunchError(_MCP2_TRACEBACK), _OK])
     try:
         with pytest.raises(MCPDiscoveryError):
-            ModelService.add_local_mcp_server(
+            _register_and_discover(
                 svc, command="uv", args=args, project_id="p1",
             )
     finally:
@@ -145,7 +160,7 @@ def test_non_uv_launcher_not_pinned():
     patcher, mock_cls = _patch_client([MCPLaunchError(_MCP2_TRACEBACK)])
     try:
         with pytest.raises(MCPDiscoveryError):
-            ModelService.add_local_mcp_server(
+            _register_and_discover(
                 svc, command="python", args=["-m", "my_server"], project_id="p1",
             )
     finally:
@@ -159,7 +174,7 @@ def test_mcperror_import_breakage_retries_with_mcp_pin():
     svc = _svc(project)
     patcher, mock_cls = _patch_client([MCPLaunchError(_MCP2_MCPERROR_TRACEBACK), _OK])
     try:
-        ModelService.add_local_mcp_server(
+        _register_and_discover(
             svc,
             command="uv",
             args=["tool", "run", "--from", "mcp-weather-server", "mcp-weather-server"],
@@ -183,7 +198,7 @@ def test_mcp_types_missing_not_pinned():
     patcher, mock_cls = _patch_client([MCPLaunchError(_MCP_TYPES_MISSING)])
     try:
         with pytest.raises(MCPDiscoveryError):
-            ModelService.add_local_mcp_server(
+            _register_and_discover(
                 svc, command="uv", args=["tool", "run", "--from", "pkg", "pkg"], project_id="p1",
             )
     finally:
@@ -203,7 +218,7 @@ def test_hint_fix_then_mcperror_retries_with_pin():
         [MCPLaunchError(_UVX_HINT_EXEC_MISMATCH), MCPLaunchError(_MCP2_MCPERROR_TRACEBACK), _OK]
     )
     try:
-        ModelService.add_local_mcp_server(
+        _register_and_discover(
             svc,
             command="uv",
             args=["tool", "run", "mcp-weather-server"],
