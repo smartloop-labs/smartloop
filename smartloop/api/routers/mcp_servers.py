@@ -1,7 +1,11 @@
 """MCP server management router"""
 
+import asyncio
+import functools
 import logging
 import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from html import escape
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -22,10 +26,76 @@ from smartloop.mcp.client import MCPDiscoveryError
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["mcp"])
 
-# In-memory store for pending MCP OAuth sessions (keyed by state)
+# Registration spawns a subprocess, waits on the MCP handshake, may run local
+# inference and an embedding pass — all synchronous.  A single worker keeps
+# that off the event loop without letting two registrations race the workspace
+# record or the lazily-loaded model caches.
+_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mcp-register")
+
+# In-memory store for pending MCP OAuth sessions (keyed by state).  Entries are
+# popped by the callback, but an abandoned flow (user closes the browser tab)
+# never gets one — and the session holds a client_secret and code_verifier, so
+# it must not live for the life of the process.  Hence the TTL sweep below.
+_OAUTH_SESSION_TTL_S = 600.0
+# Completed callback responses are cached only to absorb the browser's
+# duplicate GET of the redirect, which arrives within seconds.
+_OAUTH_RESPONSE_TTL_S = 120.0
+_OAUTH_RESPONSE_MAX = 32
+
 _pending_oauth_sessions: dict[str, dict] = {}
-# Cache of completed OAuth callback responses (keyed by state) to handle duplicate browser requests
-_completed_oauth_responses: dict[str, HTMLResponse] = {}
+_completed_oauth_responses: "OrderedDict[str, tuple[float, HTMLResponse]]" = OrderedDict()
+
+
+def _purge_oauth_state(now: float | None = None) -> None:
+    """Drop expired pending OAuth sessions and cached callback responses.
+
+    Piggybacked on request handling rather than run as a background task: the
+    dicts only grow when a registration happens, so sweeping on the same events
+    keeps them bounded without any extra machinery.
+    """
+    now = time.time() if now is None else now
+    for state, session in list(_pending_oauth_sessions.items()):
+        created = session.get("created_at")
+        if created is None:
+            # Written by a path that predates the timestamp (or seeded by a
+            # test).  Stamp it here so it still expires one TTL from now,
+            # rather than reading as infinitely old and vanishing instantly.
+            session["created_at"] = now
+            continue
+        if now - created > _OAUTH_SESSION_TTL_S:
+            logger.info("Evicting expired OAuth session state=%s", state)
+            _pending_oauth_sessions.pop(state, None)
+    for state in [st for st, (exp, _) in _completed_oauth_responses.items() if now > exp]:
+        _completed_oauth_responses.pop(state, None)
+    while len(_completed_oauth_responses) > _OAUTH_RESPONSE_MAX:
+        _completed_oauth_responses.popitem(last=False)
+
+
+async def _offload(fn, *args, **kwargs):
+    """Run a blocking call on ``_executor`` and await it.
+
+    Every MCP service/network call below is synchronous — subprocess spawns
+    with a 2s startup poll, HTTP handshakes, local inference, an embedding
+    pass.  Left on the event loop they stall every other request (and every
+    open SSE stream) for the duration.  Exceptions propagate through the await
+    unchanged, so the callers' HTTPException mapping still works.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor, functools.partial(fn, *args, **kwargs))
+
+
+def _exchange_oauth_code(**kwargs):
+    """Blocking OAuth token exchange, for use via _offload."""
+    from smartloop.mcp import MCPOAuthService
+    with MCPOAuthService() as oauth:
+        return oauth.exchange_code_for_tokens(**kwargs)
+
+
+def _discover_remote_tools(server_url: str, **kwargs):
+    """Blocking remote MCP handshake + tool discovery, for use via _offload."""
+    from smartloop.mcp import MCPClient
+    with MCPClient() as client:
+        return client.connect_and_discover_tools(server_url, **kwargs)
 
 
 def _build_server_info_dict(si) -> dict | None:
@@ -90,7 +160,8 @@ async def _register_local_mcp_server(
             detail="'args' is required for local servers (e.g. args=['yahoo-finance-mcp'] for uvx, or args=['-m', 'module'] for python)",
         )
     try:
-        result = model_service.add_local_mcp_server(
+        result = await _offload(
+            model_service.add_local_mcp_server,
             command=command,
             args=args,
             name=(curated.display_name if curated else request.name),
@@ -122,16 +193,21 @@ async def _try_register_smartloop_mcp_server(
     import httpx
 
     info_url = server_url.rstrip("/") + "/info"
-    try:
+
+    def _probe():
         resp = httpx.get(info_url, timeout=10.0)
         resp.raise_for_status()
-        info = resp.json()
+        return resp.json()
+
+    try:
+        info = await _offload(_probe)
         if "pkg" not in info:
             return None
     except Exception:
         return None
 
-    result = model_service.add_remote_mcp_server(
+    result = await _offload(
+        model_service.add_remote_mcp_server,
         name=info.get("name", "smartloop-fetch"),
         server_url=server_url,
         auth_type="none",
@@ -158,7 +234,7 @@ async def _register_remote_mcp_server(
     win over the request — the catalog is authoritative for servers we list, so
     a stale client can't pin an outdated URL under a trusted name.
     """
-    from smartloop.mcp import MCPClient, MCPOAuthService
+    from smartloop.mcp import MCPOAuthService
     from smartloop.mcp.oauth import MCPOAuthError
     from urllib.parse import urlparse, parse_qs
 
@@ -194,12 +270,12 @@ async def _register_remote_mcp_server(
     # Try direct connection (no auth or token)
     connect_result = None
     try:
-        with MCPClient() as client:
-            connect_result = client.connect_and_discover_tools(
-                clean_url,
-                access_token=token,
-                token_type="Bearer",
-            )
+        connect_result = await _offload(
+            _discover_remote_tools,
+            clean_url,
+            access_token=token,
+            token_type="Bearer",
+        )
 
         if connect_result.success:
             if not connect_result.tools:
@@ -209,7 +285,8 @@ async def _register_remote_mcp_server(
                 )
             si = connect_result.server_info
             server_info_dict = _build_server_info_dict(si)
-            result = model_service.add_remote_mcp_server(
+            result = await _offload(
+                model_service.add_remote_mcp_server,
                 name=(curated.display_name if curated else None)
                 or request.name
                 or (si.name if si else parsed.netloc),
@@ -247,62 +324,78 @@ async def _register_remote_mcp_server(
         base_url = str(http_request.base_url).rstrip("/") if http_request else "http://localhost:38540"
         callback_url = request.callback_url or f"{base_url}/v1/mcp/oauth/callback"
 
-        with MCPOAuthService() as oauth:
-            oauth_metadata = None
-            prm = None
-            try:
-                prm = oauth.discover_protected_resource_metadata(
-                    clean_url,
-                    metadata_url=getattr(connect_result, "resource_metadata_url", None),
-                )
-                if prm.authorization_servers:
-                    oauth_metadata = oauth.discover_oauth_metadata(
-                        prm.authorization_servers[0]
+        def _oauth_discover():
+            """Blocking OAuth discovery + dynamic client registration.
+
+            Every call in here is a synchronous HTTP round-trip to a third
+            party, so the whole sequence runs on the executor rather than the
+            event loop.  Returns everything the caller needs after the
+            MCPOAuthService context has closed.
+            """
+            with MCPOAuthService() as oauth:
+                oauth_metadata = None
+                prm = None
+                try:
+                    prm = oauth.discover_protected_resource_metadata(
+                        clean_url,
+                        metadata_url=getattr(connect_result, "resource_metadata_url", None),
                     )
-            except MCPOAuthError:
-                pass
-            if not oauth_metadata:
-                oauth_metadata = oauth.discover_oauth_metadata(clean_url)
+                    if prm.authorization_servers:
+                        oauth_metadata = oauth.discover_oauth_metadata(
+                            prm.authorization_servers[0]
+                        )
+                except MCPOAuthError:
+                    pass
+                if not oauth_metadata:
+                    oauth_metadata = oauth.discover_oauth_metadata(clean_url)
 
-            if not oauth_metadata.registration_endpoint:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Server requires authentication but does not support OAuth dynamic client registration",
+                if not oauth_metadata.registration_endpoint:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Server requires authentication but does not support OAuth dynamic client registration",
+                    )
+
+                registration = oauth.register_client(
+                    oauth_metadata.registration_endpoint, callback_url
                 )
 
-            registration = oauth.register_client(
-                oauth_metadata.registration_endpoint, callback_url
-            )
+                code_verifier, code_challenge = MCPOAuthService.generate_pkce()
+                state = MCPOAuthService.generate_state()
 
-            code_verifier, code_challenge = MCPOAuthService.generate_pkce()
-            state = MCPOAuthService.generate_state()
+                scopes = oauth_metadata.scopes_supported or (
+                    prm.scopes_supported if prm else None
+                )
+                scope = " ".join(scopes) if scopes else None
 
-            scopes = oauth_metadata.scopes_supported or (
-                prm.scopes_supported if prm else None
-            )
-            scope = " ".join(scopes) if scopes else None
+                # RFC 8707 resource indicator, required by MCP auth (rev 2025-06-18).
+                # Prefer the identifier the resource server publishes for itself; fall
+                # back to the canonical server URL when it publishes no PRM. Servers
+                # that predate the requirement ignore the extra parameter (RFC 6749
+                # §3.1 and §3.2 both mandate ignoring unrecognized ones).
+                resource = (prm.resource if prm else None) or oauth.canonical_resource(
+                    clean_url
+                )
 
-            # RFC 8707 resource indicator, required by MCP auth (rev 2025-06-18).
-            # Prefer the identifier the resource server publishes for itself; fall
-            # back to the canonical server URL when it publishes no PRM. Servers
-            # that predate the requirement ignore the extra parameter (RFC 6749
-            # §3.1 and §3.2 both mandate ignoring unrecognized ones).
-            resource = (prm.resource if prm else None) or oauth.canonical_resource(
-                clean_url
-            )
+                auth_url = oauth.build_authorization_url(
+                    authorization_endpoint=oauth_metadata.authorization_endpoint,
+                    client_id=registration.client_id,
+                    redirect_uri=callback_url,
+                    state=state,
+                    code_challenge=code_challenge,
+                    scope=scope,
+                    resource=resource,
+                )
 
-            auth_url = oauth.build_authorization_url(
-                authorization_endpoint=oauth_metadata.authorization_endpoint,
-                client_id=registration.client_id,
-                redirect_uri=callback_url,
-                state=state,
-                code_challenge=code_challenge,
-                scope=scope,
-                resource=resource,
-            )
+            return (oauth_metadata, registration, code_verifier,
+                    state, resource, auth_url)
+
+        (oauth_metadata, registration, code_verifier,
+         state, resource, auth_url) = await _offload(_oauth_discover)
 
         # Store session for the GET callback to use
+        _purge_oauth_state()
         _pending_oauth_sessions[state] = {
+            "created_at": time.time(),
             "project_id": project_id,
             "server_url": clean_url,
             "state": state,
@@ -444,7 +537,6 @@ async def mcp_oauth_callback(
     """OAuth callback endpoint. The OAuth provider redirects here with the authorization code.
     Exchanges the code for tokens, discovers tools, and registers the MCP server.
     """
-    from smartloop.mcp import MCPClient, MCPOAuthService
     from smartloop.mcp.oauth import MCPOAuthError
 
     if error:
@@ -465,9 +557,11 @@ async def mcp_oauth_callback(
     logger.debug("OAuth callback received: state=%s", state)
 
     # Return cached response for duplicate browser requests
-    if state in _completed_oauth_responses:
+    _purge_oauth_state()
+    cached = _completed_oauth_responses.get(state)
+    if cached is not None:
         logger.info("Returning cached OAuth response for state=%s", state)
-        return _completed_oauth_responses[state]
+        return cached[1]
 
     session = _pending_oauth_sessions.pop(state, None)
     if not session:
@@ -480,16 +574,16 @@ async def mcp_oauth_callback(
 
     try:
         # Exchange code for tokens
-        with MCPOAuthService() as oauth:
-            token_response = oauth.exchange_code_for_tokens(
-                token_endpoint=session["token_endpoint"],
-                code=code,
-                redirect_uri=session["callback_url"],
-                client_id=session["client_id"],
-                code_verifier=session["code_verifier"],
-                client_secret=session.get("client_secret"),
-                resource=session.get("resource"),
-            )
+        token_response = await _offload(
+            _exchange_oauth_code,
+            token_endpoint=session["token_endpoint"],
+            code=code,
+            redirect_uri=session["callback_url"],
+            client_id=session["client_id"],
+            code_verifier=session["code_verifier"],
+            client_secret=session.get("client_secret"),
+            resource=session.get("resource"),
+        )
 
         expires_at = (
             time.time() + token_response.expires_in
@@ -498,12 +592,12 @@ async def mcp_oauth_callback(
         )
 
         # Discover tools
-        with MCPClient() as client:
-            connect_result = client.connect_and_discover_tools(
-                session["server_url"],
-                access_token=token_response.access_token,
-                token_type=token_response.token_type,
-            )
+        connect_result = await _offload(
+            _discover_remote_tools,
+            session["server_url"],
+            access_token=token_response.access_token,
+            token_type=token_response.token_type,
+        )
 
         tools = connect_result.tools if connect_result.success else []
         if not tools:
@@ -535,7 +629,8 @@ async def mcp_oauth_callback(
         server_info_dict = _build_server_info_dict(si)
 
         # Register the server
-        result = model_service.add_remote_mcp_server(
+        result = await _offload(
+            model_service.add_remote_mcp_server,
             name=server_name,
             server_url=session["server_url"],
             auth_type="oauth",
@@ -587,7 +682,9 @@ async def mcp_oauth_callback(
             )
 
         # Cache response for duplicate browser requests
-        _completed_oauth_responses[state] = response
+        _completed_oauth_responses[state] = (
+            time.time() + _OAUTH_RESPONSE_TTL_S, response,
+        )
         return response
     except MCPOAuthError as e:
         logger.exception("MCP OAuth callback error")
@@ -615,23 +712,22 @@ async def complete_mcp_oauth(
     model_service: ModelService = Depends(get_model_service),
 ):
     """Exchange OAuth authorization code for tokens and register the remote MCP server."""
-    from smartloop.mcp import MCPClient, MCPOAuthService
     from smartloop.mcp.oauth import MCPOAuthError
 
     try:
         callback_url = request.callback_url or "http://localhost:9876/callback"
 
         # Exchange code for tokens
-        with MCPOAuthService() as oauth:
-            token_response = oauth.exchange_code_for_tokens(
-                token_endpoint=request.token_endpoint,
-                code=request.code,
-                redirect_uri=callback_url,
-                client_id=request.client_id,
-                code_verifier=request.code_verifier,
-                client_secret=request.client_secret,
-                resource=request.resource,
-            )
+        token_response = await _offload(
+            _exchange_oauth_code,
+            token_endpoint=request.token_endpoint,
+            code=request.code,
+            redirect_uri=callback_url,
+            client_id=request.client_id,
+            code_verifier=request.code_verifier,
+            client_secret=request.client_secret,
+            resource=request.resource,
+        )
 
         expires_at = (
             time.time() + token_response.expires_in
@@ -640,19 +736,20 @@ async def complete_mcp_oauth(
         )
 
         # Discover tools
-        with MCPClient() as client:
-            connect_result = client.connect_and_discover_tools(
-                request.server_url,
-                access_token=token_response.access_token,
-                token_type=token_response.token_type,
-            )
+        connect_result = await _offload(
+            _discover_remote_tools,
+            request.server_url,
+            access_token=token_response.access_token,
+            token_type=token_response.token_type,
+        )
 
         tools = connect_result.tools if connect_result.success else []
         si = connect_result.server_info if connect_result.success else None
         server_info_dict = _build_server_info_dict(si)
 
         # Save the remote MCP server
-        result = model_service.add_remote_mcp_server(
+        result = await _offload(
+            model_service.add_remote_mcp_server,
             name=si.name if si else "Remote MCP Server",
             server_url=request.server_url,
             auth_type="oauth",
