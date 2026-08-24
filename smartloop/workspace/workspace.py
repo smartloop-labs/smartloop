@@ -486,6 +486,44 @@ class Workspace(BaseModel):
         ws = self.get_model(model_name)
         return ws.is_active if ws is not None else False
 
+    def pin_model_for_existing_projects(self, model_name: str) -> None:
+        """Freeze what *model_name* currently resolves to, per project.
+
+        A project with no ``ProjectModel`` entry reads through to the workspace
+        app-default (see :meth:`effective_model_enabled`), so changing that
+        default would retroactively change the project.  Writing today's answer
+        down first means the new default only reaches projects created after.
+
+        Only this model is pinned: a blanket ``sync_project_models`` would also
+        detach every unrelated model in every project from future defaults.
+        """
+        if self.is_bootstrap_model(model_name):
+            return  # holds no per-project entry by design
+        for project in self.projects:
+            if self.project_model(project, model_name) is not None:
+                continue
+            project.model_settings.append(ProjectModel(
+                model_name=model_name,
+                enabled=self.effective_model_enabled(model_name, project),
+                is_active=self.effective_model_active(model_name, project),
+            ))
+
+    def promote_model_to_workspace_default(self, model_name: str) -> None:
+        """Make *model_name* an app-default for projects created from now on.
+
+        One-way: enabling a model in a project promotes it, disabling never
+        demotes it, so the default set only grows as models are downloaded.
+        Existing projects are pinned first and keep whatever they resolve to
+        today — a user who wanted the model there would have enabled it.
+        """
+        if self.is_bootstrap_model(model_name):
+            return  # always enabled, not a configurable default
+        ws = self.get_model(model_name)
+        if ws is None or ws.enabled:
+            return  # nothing to leak, skip the pin
+        self.pin_model_for_existing_projects(model_name)
+        ws.enabled = True
+
     def set_project_model_enabled(self, project: Project, model_name: str, enabled: bool) -> Optional[ProjectModel]:
         """Set *model_name*'s enabled state on *project*, upserting an entry.
 

@@ -169,6 +169,86 @@ class TestProjectSetters:
         assert ws.effective_model_active("gemma3-4b", p2) is False
 
 
+class TestPromoteToWorkspaceDefault:
+    """Enabling a model in one project makes it a default for future ones."""
+
+    def test_promote_flips_the_workspace_default(self):
+        ws = _make_workspace()
+        assert ws.get_model("qwen2-vl-2b").enabled is False
+
+        ws.promote_model_to_workspace_default("qwen2-vl-2b")
+
+        assert ws.get_model("qwen2-vl-2b").enabled is True
+
+    def test_existing_project_without_an_entry_is_pinned_off(self):
+        """An untouched project is 'unspecified', not 'off' — write it down.
+
+        Without the pin it would read through to the new default and silently
+        gain a model the user never enabled there.
+        """
+        ws = _make_workspace()
+        p2 = Project(id="p2", project_dir="/tmp/p2", current=False, name="p2")
+        ws.projects.append(p2)
+        assert ws.project_model(p2, "qwen2-vl-2b") is None
+
+        ws.promote_model_to_workspace_default("qwen2-vl-2b")
+
+        assert ws.project_model(p2, "qwen2-vl-2b").enabled is False
+        assert ws.effective_model_enabled("qwen2-vl-2b", p2) is False
+        # …and a later lazy sync must not undo the pin.
+        ws.sync_project_models(p2)
+        assert ws.effective_model_enabled("qwen2-vl-2b", p2) is False
+
+    def test_project_created_after_promotion_inherits_it(self):
+        ws = _make_workspace()
+        ws.promote_model_to_workspace_default("qwen2-vl-2b")
+
+        fresh = Project(id="p3", project_dir="/tmp/p3", current=False, name="p3")
+        ws.projects.append(fresh)
+        ws.sync_project_models(fresh)
+
+        assert ws.effective_model_enabled("qwen2-vl-2b", fresh) is True
+
+    def test_pin_touches_only_the_promoted_model(self):
+        """Pinning one model must not detach the rest from future defaults."""
+        ws = _make_workspace()
+        p2 = Project(id="p2", project_dir="/tmp/p2", current=False, name="p2")
+        ws.projects.append(p2)
+
+        ws.promote_model_to_workspace_default("qwen2-vl-2b")
+
+        assert {m.model_name for m in p2.model_settings} == {"qwen2-vl-2b"}
+
+    def test_bootstrap_model_is_not_promotable(self):
+        ws = _make_workspace()
+        project = ws.projects[0]
+
+        ws.promote_model_to_workspace_default(BOOTSTRAP_MODEL)
+
+        # Already always-on, and it still gets no per-project entry.
+        assert ws.get_model(BOOTSTRAP_MODEL).enabled is True
+        assert ws.project_model(project, BOOTSTRAP_MODEL) is None
+
+    def test_already_enabled_model_writes_nothing(self):
+        """The early return keeps a no-op enable from pinning every project."""
+        ws = _make_workspace()
+        p2 = Project(id="p2", project_dir="/tmp/p2", current=False, name="p2")
+        ws.projects.append(p2)
+
+        ws.promote_model_to_workspace_default("gemma3-4b")
+
+        assert ws.get_model("gemma3-4b").enabled is True
+        assert p2.model_settings == []
+
+    def test_unknown_model_is_a_noop(self):
+        ws = _make_workspace()
+        project = ws.projects[0]
+
+        ws.promote_model_to_workspace_default("nope")
+
+        assert project.model_settings == []
+
+
 class TestProjectAwareSelection:
     def test_largest_downloaded_respects_project_override(self):
         ws = _make_workspace()

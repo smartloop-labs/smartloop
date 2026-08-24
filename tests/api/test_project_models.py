@@ -259,3 +259,73 @@ class TestBootstrapModelIsNotConfigurablePerProject:
         for project in saved["workspace"]["projects"]:
             names = {m["model_name"] for m in project.get("model_settings", [])}
             assert bootstrap not in names
+
+
+class TestEnablePromotesWorkspaceDefault:
+    """Enabling a model in a project makes it a default for future projects.
+
+    Downloads are workspace-wide, so a model pulled for one project should be
+    on offer to the ones created afterwards without a second download.  The
+    projects that already exist are left alone: had the user wanted the model
+    there, they would have enabled it and triggered the download themselves.
+    """
+
+    def test_enable_flips_the_workspace_default(self, isolated_workspace, client):
+        assert client.patch(
+            "/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": True}
+        ).status_code == 200
+
+        ws = {m["model_name"]: m for m in client.get("/v1/models/workspace").json()}
+        assert ws["qwen2-vl-2b"]["enabled"] is True
+
+    def test_existing_projects_are_pinned_not_promoted(self, isolated_workspace, client):
+        client.patch("/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": True})
+
+        p2 = {m["model_name"]: m for m in client.get("/v1/projects/p2/models").json()}
+        assert p2["qwen2-vl-2b"]["enabled"] is False
+
+        # p2 had no entry for the model before the enable; it must have gained an
+        # explicit one, otherwise it would read through to the new default.
+        saved = json.loads(pathlib.Path(isolated_workspace["config_file"]).read_text())
+        p2_saved = next(p for p in saved["workspace"]["projects"] if p["id"] == "p2")
+        entry = next(m for m in p2_saved["model_settings"] if m["model_name"] == "qwen2-vl-2b")
+        assert entry["enabled"] is False
+
+    def test_project_created_afterwards_inherits_the_model(self, isolated_workspace, client):
+        from smartloop.api.services import get_model_service
+
+        client.patch("/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": True})
+
+        # Each request reloads config.json, so the new project has to be saved.
+        workspace = get_model_service()._ensure_workspace()
+        workspace.projects.append(
+            Project(id="p3", project_dir="/tmp/p3", current=False, name="p3")
+        )
+        workspace.save()
+
+        p3 = {m["model_name"]: m for m in client.get("/v1/projects/p3/models").json()}
+        assert p3["qwen2-vl-2b"]["enabled"] is True
+
+    def test_disable_does_not_demote_the_default(self, isolated_workspace, client):
+        """Promotion is one-way — one project opting out keeps the default."""
+        client.patch("/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": True})
+        client.patch("/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": False})
+
+        ws = {m["model_name"]: m for m in client.get("/v1/models/workspace").json()}
+        assert ws["qwen2-vl-2b"]["enabled"] is True
+
+
+class TestWorkspaceDefaultEdit:
+    def test_workspace_toggle_leaves_existing_projects_alone(self, isolated_workspace, client):
+        """The Settings-level editor sets the default for future projects only.
+
+        p1 and p2 have no entry for gemma3-4b and read through to the workspace
+        default, so disabling it there would otherwise switch it off for both.
+        """
+        assert client.patch(
+            "/v1/models/workspace/gemma3-4b", json={"enabled": False}
+        ).status_code == 200
+
+        for project_id in ("p1", "p2"):
+            models = {m["model_name"]: m for m in client.get(f"/v1/projects/{project_id}/models").json()}
+            assert models["gemma3-4b"]["enabled"] is True

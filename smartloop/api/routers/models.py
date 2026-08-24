@@ -210,6 +210,11 @@ async def update_workspace_model(
         if model is None:
             raise ValueError(f"Model not found: {model_name}")
         if request.enabled is not None:
+            # This edits the app-default that new projects are seeded from.  A
+            # project with no entry for the model reads through to that default,
+            # so pin the current answer everywhere before moving it — the change
+            # is meant for projects created later, not existing ones.
+            workspace.pin_model_for_existing_projects(model_name)
             model.enabled = request.enabled
             # Deselecting a model must also free any VRAM it still holds — the
             # enabled flag only gates future loads, not an already-resident
@@ -339,9 +344,15 @@ async def update_project_model(
 
         if request.enabled is not None:
             pm.enabled = request.enabled
-            # Deselecting must also free any VRAM it still holds — the enabled
-            # flag only gates future loads, not an already-resident instance.
-            if request.enabled is False:
+            if request.enabled:
+                # Enabling here also makes the model an app-default, so projects
+                # created later start with it.  Existing projects are pinned
+                # first and keep what they resolve to today.
+                workspace.promote_model_to_workspace_default(model_name)
+            else:
+                # Deselecting must also free any VRAM it still holds — the
+                # enabled flag only gates future loads, not an already-resident
+                # instance.
                 model_service.unload_model_by_name(model_name)
 
         if request.is_active is not None:

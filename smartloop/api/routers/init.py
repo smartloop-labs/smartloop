@@ -216,10 +216,11 @@ async def init(
         model_cls = SUPPORTED_MODELS.get(target)
         if not model_cls:
             raise HTTPException(status_code=400, detail=f"Unknown model: {target}")
-        # A project-scoped init enables the model for that project alone (the
-        # caller PATCHes it), so don't write an app-default of "on" that every
-        # other project would inherit via sync_project_models. A project-less
-        # init (CLI/TUI) still registers workspace-wide.
+        # Register a project-scoped download disabled: the caller's follow-up
+        # PATCH enables it and promotes the app-default from there (see
+        # Workspace.promote_model_to_workspace_default), so a cancelled
+        # download strands nothing. A project-less init (CLI/TUI) sends no
+        # PATCH, so it registers enabled workspace-wide.
         ws_model = workspace.add_model(target, model_cls.model_id(),
                                        enabled=request.project_id is None)
 
