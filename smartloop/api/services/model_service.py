@@ -3230,6 +3230,17 @@ class ModelService:
             or "mcp.shared" in low
             or re.search(r"cannot import name .* from ['\"]?mcp(\.|['\" ])", low) is not None
             or re.search(r"module ['\"]?mcp['\"]? has no attribute", low) is not None
+            # 2.x also *kept* the low-level Server class and removed the
+            # decorators every 1.x server hangs its handlers off, so a package
+            # can import cleanly and then die registering its tools.  That
+            # failure names no module at all, which is why the import patterns
+            # above miss it.
+            or re.search(
+                r"'(?:server|fastmcp)' object has no attribute "
+                r"'(?:list_tools|call_tool|list_resources|read_resource|"
+                r"list_prompts|get_prompt)'",
+                low,
+            ) is not None
         )
 
     @staticmethod

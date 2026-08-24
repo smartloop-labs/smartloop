@@ -236,3 +236,31 @@ def test_hint_fix_then_mcperror_retries_with_pin():
     ]
     assert project.mcp_servers[0].config.args == calls[2]
     assert project.mcp_servers[0].name == "mcp-weather-server"
+
+
+def test_removed_decorator_api_is_recognised_as_mcp2_breakage():
+    """The other shape of the 2.x break, and the one the import patterns miss.
+
+    2.x kept the low-level ``Server`` class and removed the decorators every
+    1.x server hangs its handlers off, so a package imports cleanly and then
+    dies registering its tools. The traceback names no module at all —
+    ``mcp-yahoo-finance`` failed exactly this way and got reported to the user
+    as "broken or incompatible" instead of being retried under mcp<2.
+    """
+    assert ModelService._mcp2_incompat_error(
+        "AttributeError: 'Server' object has no attribute 'list_tools'"
+    ) is True
+    assert ModelService._mcp2_incompat_error(
+        "AttributeError: 'FastMCP' object has no attribute 'call_tool'"
+    ) is True
+
+
+def test_an_unrelated_attribute_error_is_not_mcp2_breakage():
+    # Pinning mcp<2 for every AttributeError would hide real bugs behind a
+    # dependency downgrade that has nothing to do with them.
+    assert ModelService._mcp2_incompat_error(
+        "AttributeError: 'Server' object has no attribute 'frobnicate'"
+    ) is False
+    assert ModelService._mcp2_incompat_error(
+        "AttributeError: 'Widget' object has no attribute 'list_tools'"
+    ) is False
