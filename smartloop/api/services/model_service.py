@@ -4350,12 +4350,49 @@ class ModelService:
         self._model.save()
         self._unindex_mcp_tools(current_project, server_id)
         self._unindex_mcp_documents(current_project, server_id)
+        self._remove_mcp_definition_file(server)
 
         return {
             "id": server_id,
             "deleted": True,
             "message": "MCP server deleted successfully",
         }
+
+    def _remove_mcp_definition_file(self, server: "MCPServer") -> None:
+        """Delete the dropped-in file that defined *server*, if it was one.
+
+        Without this a deleted connection leaves its plan behind: the crawl
+        registry keeps listing it, and re-adding a server by the same name
+        silently inherits the old file's steps and cadence.  Deleting a
+        connection should leave nothing of it.
+
+        Only files under ``mcp.d`` are touched, and only when no remaining
+        server still resolves to that plan — two connections can share one.
+        """
+        try:
+            from smartloop.mcp.crawl_plans import resolve_plan
+            from smartloop.mcp.plan_loader import (
+                USER_PLANS_DIR, definitions, reload_plans,
+            )
+
+            key = resolve_plan(server).slug
+            if key not in definitions():
+                return
+
+            for project in self._model.workspace.projects:
+                for other in project.mcp_servers:
+                    if other.id != server.id and resolve_plan(other).slug == key:
+                        return
+
+            path = os.path.join(
+                _settings.home_dir, USER_PLANS_DIR, f"{key}.toml",
+            )
+            if os.path.isfile(path):
+                os.remove(path)
+                reload_plans()
+                logger.info("[mcp-definition] Removed %s", path)
+        except Exception as e:
+            logger.debug("[mcp-definition] Could not remove the plan file: %s", e)
 
     # --------------------------------------------------------------- MCP agents
 
