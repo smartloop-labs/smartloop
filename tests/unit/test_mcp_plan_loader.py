@@ -14,6 +14,7 @@ import pytest
 from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
 from smartloop.mcp.plan_loader import (
     BUNDLED_PLANS_PATH,
+    parse_definitions,
     load_plans,
     parse_plans,
     plans,
@@ -80,6 +81,42 @@ tools = ["@common", "c"]
 '''
         (plan, _), = parse_plans(text, "test")
         assert plan.steps[0].tools == ("a", "b", "c")
+
+    def test_a_named_fan_out_parses_and_expands_its_alias(self):
+        # A watchlist is exactly the kind of list worth naming once and reusing
+        # across every step that needs it.
+        text = """
+[alias]
+watchlist = ["AAPL", "MSFT"]
+
+[[plan]]
+slug = "yahoo-finance"
+
+[[plan.step]]
+label = "profile"
+tools = ["get_stock_info"]
+for_each = { ticker = ["@watchlist"] }
+"""
+        (plan, _), = parse_plans(text, "test")
+        assert plan.steps[0].for_each == {"ticker": ("AAPL", "MSFT")}
+
+    def test_a_step_cannot_fan_out_both_ways(self):
+        text = """
+[[plan]]
+slug = "x"
+
+[[plan.step]]
+label = "root"
+tools = ["t"]
+
+[[plan.step]]
+label = "both"
+tools = ["t"]
+parent = "root"
+for_each = { ticker = ["AAPL"] }
+"""
+        with pytest.raises(Exception, match="for_each"):
+            parse_plans(text, "test")
 
     def test_an_unknown_alias_is_an_error_naming_it(self):
         text = _MINIMAL.replace('tools = ["list_widgets"]', 'tools = ["@nope"]')
@@ -255,3 +292,158 @@ class TestModelsAreStillUsableDirectly:
     def test_a_step_without_tools_is_rejected(self):
         with pytest.raises(Exception):
             CrawlStep(label="a", tools=())
+
+
+class TestServerDefinitions:
+    """A file describes the server, not just how to index it — which is what
+    makes a dropped-in file enough to add a connection."""
+
+    def test_a_local_server_carries_its_command(self):
+        text = """
+[[mcp]]
+name = "yahoo-finance"
+command = "uvx"
+args = ["yahoo-finance-mcp"]
+"""
+        d = parse_definitions(text, "test")["yahoo-finance"]
+        assert d.command == "uvx"
+        assert d.args == ("yahoo-finance-mcp",)
+        assert d.kind == "local"
+
+    def test_a_remote_server_carries_its_url(self):
+        text = """
+[[mcp]]
+name = "my-wiki"
+url = "https://mcp.example.com/mcp"
+"""
+        d = parse_definitions(text, "test")["my-wiki"]
+        assert d.url == "https://mcp.example.com/mcp"
+        assert d.kind == "remote"
+
+    def test_indexing_is_optional(self):
+        # Most servers have no content to enumerate; connecting is the whole
+        # point, and the tools get indexed either way.
+        text = """
+[[mcp]]
+name = "weather"
+command = "uvx"
+args = ["weather-mcp"]
+"""
+        d = parse_definitions(text, "test")["weather"]
+        assert d.index == ()
+        assert d.plan.steps == ()
+
+    def test_a_server_is_local_or_remote_not_both(self):
+        text = """
+[[mcp]]
+name = "confused"
+command = "uvx"
+url = "https://x"
+"""
+        with pytest.raises(Exception, match="not both"):
+            parse_definitions(text, "test")
+
+    def test_the_name_becomes_the_key_and_a_match(self):
+        text = """
+[[mcp]]
+name = "Yahoo-Finance"
+match = ["yfinance"]
+command = "uvx"
+args = ["yahoo-finance-mcp"]
+"""
+        d = parse_definitions(text, "test")["yahoo-finance"]
+        assert d.key == "yahoo-finance"
+        assert "yfinance" in d.plan.match
+
+    def test_a_definition_with_index_steps_still_produces_a_plan(self, tmp_path):
+        path = tmp_path / "mcp.d"
+        path.mkdir()
+        (path / "yf.toml").write_text("""
+[alias]
+watchlist = ["AAPL", "MSFT"]
+
+[[mcp]]
+name = "yahoo-finance"
+command = "uvx"
+args = ["yahoo-finance-mcp"]
+
+[[mcp.index]]
+label = "profile"
+tools = ["get_stock_info"]
+for_each = { ticker = ["@watchlist"] }
+""")
+        registry = load_plans(home_dir=str(tmp_path))
+        plan = registry["yahoo-finance"]
+        assert [s.label for s in plan.steps] == ["profile"]
+        assert plan.steps[0].for_each == {"ticker": ("AAPL", "MSFT")}
+
+
+class TestIndexInterval:
+    """How often a connection re-indexes belongs to the source, not the app."""
+
+    def _parse(self, every):
+        text = f"""
+[[mcp]]
+name = "air-quality"
+command = "uvx"
+args = ["mcp-open-meteo"]
+index_every = {every}
+"""
+        return parse_definitions(text, "test")["air-quality"]
+
+    def test_durations_carry_their_unit(self):
+        assert self._parse('"30s"').index_interval == 30
+        assert self._parse('"30m"').index_interval == 1800
+        assert self._parse('"6h"').index_interval == 21600
+        assert self._parse('"1d"').index_interval == 86400
+
+    def test_a_bare_number_is_seconds(self):
+        assert self._parse("900").index_interval == 900
+
+    def test_unset_follows_the_app_wide_schedule(self):
+        text = """
+[[mcp]]
+name = "wiki"
+url = "https://mcp.example.com/mcp"
+"""
+        assert parse_definitions(text, "test")["wiki"].index_interval is None
+
+    def test_a_typo_is_an_error_not_a_plan_that_never_refreshes(self):
+        with pytest.raises(Exception, match="duration"):
+            self._parse('"6 fortnights"')
+
+
+class TestBundledExamples:
+    """The example files ship as documentation, so they have to actually load."""
+
+    def _examples(self):
+        import glob
+        # docs/mcp/ in the repo — documentation, not shipped in the wheel, so
+        # this is skipped when the tests run against an installed package.
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__),
+        )))
+        return sorted(glob.glob(os.path.join(root, "docs", "mcp", "*.toml")))
+
+    def test_every_example_parses(self):
+        if not self._examples():
+            pytest.skip("running outside the repo — docs/mcp is not packaged")
+        for path in self._examples():
+            with open(path) as fh:
+                found = parse_definitions(fh.read(), path)
+            assert found, path
+
+    def test_the_san_francisco_examples_name_their_location(self):
+        # The point of these files: a server with no listing tool gets its
+        # subjects from the file.
+        if not self._examples():
+            pytest.skip("running outside the repo — docs/mcp is not packaged")
+        located = False
+        for path in self._examples():
+            with open(path) as fh:
+                for definition in parse_definitions(fh.read(), path).values():
+                    for step in definition.index:
+                        values = [v for vs in step.for_each.values() for v in vs]
+                        if 37.7749 in values or "San Francisco, CA" in values:
+                            located = True
+        assert located

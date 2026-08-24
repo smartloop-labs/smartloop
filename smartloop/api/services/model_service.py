@@ -3771,7 +3771,10 @@ class ModelService:
         ]
         results: dict[str, dict] = {}
         for server in servers:
-            stats = self._crawl_mcp_server(project, server, force=force, ttl=ttl)
+            stats = self._crawl_mcp_server(
+                project, server, force=force,
+                ttl=self._mcp_server_ttl(server, ttl),
+            )
             if stats:
                 results[server.name] = stats
 
@@ -3782,6 +3785,27 @@ class ModelService:
             except Exception:
                 chunks = 0
         return {"project": project.name, "servers": results, "chunks": chunks}
+
+    @staticmethod
+    def _mcp_server_ttl(server: "MCPServer", default_ttl: float) -> float:
+        """How stale this server's content may be before the cycle re-walks it.
+
+        A connection's file can set its own ``index_every``, because the right
+        cadence belongs to the source rather than to the app: an air-quality
+        reading is stale within the hour and a reference wiki is the same next
+        week.  The task still ticks on the app-wide schedule; this decides
+        whether a given server is due when it does.
+        """
+        try:
+            from smartloop.mcp.crawl_plans import resolve_plan
+            from smartloop.mcp.plan_loader import definitions
+
+            plan = resolve_plan(server)
+            definition = definitions().get(plan.slug)
+            interval = definition.index_interval if definition else None
+        except Exception:
+            interval = None
+        return default_ttl if interval is None else interval
 
     def _crawl_mcp_cycle(self) -> dict:
         """The MCP task's periodic refresh cycle.

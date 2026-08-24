@@ -31,7 +31,7 @@ import threading
 import tomllib
 from typing import Any, Dict, List, Optional, Tuple
 
-from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
+from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep, MCPDefinition
 
 logger = logging.getLogger(__name__)
 
@@ -88,17 +88,45 @@ def _step_from_toml(raw: Dict[str, Any], aliases: Dict[str, List[str]]) -> Crawl
     for key in _ALIASABLE:
         if key in data:
             data[key] = _expand_aliases(data[key], aliases)
+    # `for_each` holds its list one level down, and a shared watchlist is
+    # exactly the kind of thing worth naming once.
+    if isinstance(data.get("for_each"), dict):
+        data["for_each"] = {
+            name: _expand_aliases(values, aliases)
+            for name, values in data["for_each"].items()
+        }
     # `parent` takes one label or several; TOML has no scalar-or-list type, so
     # both spellings are accepted and normalized by the model.
     return CrawlStep(**data)
 
 
-def parse_plans(text: str, source: str) -> List[Tuple[CrawlPlan, bool]]:
+def parse_definitions(text: str, source: str) -> Dict[str, MCPDefinition]:
+    """Parse one TOML document into ``{key: MCPDefinition}``.
+
+    Only ``[[mcp]]`` entries carry connection details, so a file written in the
+    older indexing-only ``[[plan]]`` shape yields nothing here.
+    """
+    found: Dict[str, MCPDefinition] = {}
+    parse_plans(text, source, definitions=found)
+    return found
+
+
+def parse_plans(
+    text: str,
+    source: str,
+    definitions: Optional[Dict[str, MCPDefinition]] = None,
+) -> List[Tuple[CrawlPlan, bool]]:
     """Parse one TOML document into ``(plan, extend)`` pairs.
+
+    *definitions*, when given, collects the full server definitions alongside —
+    the crawl only needs the plans, but installing a server from a file needs
+    the connection too.
 
     Raises on a malformed document — callers decide whether one bad file is
     fatal (it isn't, for the drop-in directory) or worth surfacing.
     """
+    if definitions is None:
+        definitions = {}
     document = tomllib.loads(text)
     aliases_raw = document.get("alias") or {}
     if not isinstance(aliases_raw, dict):
@@ -109,6 +137,29 @@ def parse_plans(text: str, source: str) -> List[Tuple[CrawlPlan, bool]]:
     }
 
     plans: List[Tuple[CrawlPlan, bool]] = []
+
+    # `[[mcp]]` is the shape a file uses to describe a server: what it is called,
+    # how to reach it, and — optionally — how to index it.  `[[plan]]` is the
+    # earlier indexing-only spelling, still accepted so a file written against
+    # it keeps working.
+    for raw in document.get("mcp") or []:
+        if not isinstance(raw, dict):
+            raise ValueError("each [[mcp]] must be a table")
+        entry = dict(raw)
+        extend = bool(entry.pop("extend", False))
+        raw_steps = entry.pop("index", None) or entry.pop("step", None) or []
+        entry["index"] = [_step_from_toml(s, aliases) for s in raw_steps]
+        definition = MCPDefinition(**entry)
+        definitions[definition.key] = definition
+        plans.append((
+            CrawlPlan.model_construct(
+                slug=definition.key, steps=definition.index,
+                match=definition.plan.match, derived=False,
+            ) if extend else definition.plan,
+            extend,
+        ))
+        logger.debug("[mcp-plans] %s: loaded '%s'", source, definition.key)
+
     for raw_plan in document.get("plan") or []:
         if not isinstance(raw_plan, dict):
             raise ValueError("each [[plan]] must be a table")
@@ -161,8 +212,16 @@ def _merge(registry: Dict[str, CrawlPlan], plan: CrawlPlan, extend: bool, source
     )
 
 
-def load_plans(home_dir: Optional[str] = None) -> Dict[str, CrawlPlan]:
-    """Build the plan registry from the bundled file plus any user files."""
+def load_plans(
+    home_dir: Optional[str] = None,
+    definitions: Optional[Dict[str, MCPDefinition]] = None,
+) -> Dict[str, CrawlPlan]:
+    """Build the plan registry from the bundled file plus any user files.
+
+    *definitions*, when given, collects the server definitions from the same
+    files — the same pass, since re-reading them separately would be a second
+    place for the two views to disagree.
+    """
     registry: Dict[str, CrawlPlan] = {}
     paths = [BUNDLED_PLANS_PATH, *user_plan_paths(home_dir)]
 
@@ -170,7 +229,7 @@ def load_plans(home_dir: Optional[str] = None) -> Dict[str, CrawlPlan]:
         try:
             with open(path, "rb") as fh:
                 text = fh.read().decode("utf-8")
-            for plan, extend in parse_plans(text, path):
+            for plan, extend in parse_plans(text, path, definitions=definitions):
                 _merge(registry, plan, extend, path)
         except FileNotFoundError:
             if path == BUNDLED_PLANS_PATH:
@@ -190,6 +249,7 @@ def load_plans(home_dir: Optional[str] = None) -> Dict[str, CrawlPlan]:
 
 _lock = threading.Lock()
 _cache: Optional[Dict[str, CrawlPlan]] = None
+_definitions: Dict[str, MCPDefinition] = {}
 _cache_stamp: Optional[Tuple[Tuple[str, float], ...]] = None
 
 
@@ -210,17 +270,29 @@ def _stamp(home_dir: Optional[str]) -> Tuple[Tuple[str, float], ...]:
 
 def plans(home_dir: Optional[str] = None) -> Dict[str, CrawlPlan]:
     """The plan registry, reloaded when any plan file has changed."""
-    global _cache, _cache_stamp
+    global _cache, _cache_stamp, _definitions
     stamp = _stamp(home_dir)
     with _lock:
         if _cache is None or stamp != _cache_stamp:
-            _cache = load_plans(home_dir)
+            found: Dict[str, MCPDefinition] = {}
+            _cache = load_plans(home_dir, definitions=found)
+            _definitions = found
             _cache_stamp = stamp
             logger.info(
                 "[mcp-plans] %d crawl plan(s) loaded: %s",
                 len(_cache), ", ".join(sorted(_cache)) or "none",
             )
         return _cache
+
+
+def definitions(home_dir: Optional[str] = None) -> Dict[str, MCPDefinition]:
+    """Server definitions from the same files, by key.
+
+    Only entries written as ``[[mcp]]`` appear — those are the ones that carry
+    a connection.
+    """
+    plans(home_dir)
+    return _definitions
 
 
 def reload_plans() -> Dict[str, CrawlPlan]:

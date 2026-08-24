@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Argument names a per-record detail call takes the record's identifier under.
 ID_ARGS: Tuple[str, ...] = (
@@ -93,6 +93,14 @@ class CrawlStep(BaseModel):
     arguments: Dict[str, Any] = Field(default_factory=dict)
     parent: Optional[Union[str, Tuple[str, ...]]] = None
     parent_args: Tuple[str, ...] = ID_ARGS
+    # Fan out over values the plan names, rather than over another step's
+    # records: ``{"ticker": ["AAPL", "MSFT"]}`` runs the step once per ticker.
+    #
+    # Not every useful server is enumerable.  A Notion or Linear connection can
+    # be asked what it holds; a market-data or weather server only answers
+    # questions you already know to ask, so there is no walk to derive — the
+    # subjects have to come from the person who wants them indexed.
+    for_each: Dict[str, Tuple[Any, ...]] = Field(default_factory=dict)
     detail_tools: Tuple[str, ...] = ()
     detail_args: Tuple[str, ...] = ID_ARGS
     # Arguments without which this step is pointless.  Unknown arguments are
@@ -116,6 +124,33 @@ class CrawlStep(BaseModel):
         if isinstance(self.parent, str):
             return (self.parent,)
         return tuple(self.parent)
+
+    @model_validator(mode="after")
+    def _check_fan_out(self) -> "CrawlStep":
+        """A step fans out one way or the other, never both.
+
+        ``parent`` takes its values from what the server returned; ``for_each``
+        from what the plan says.  Combining them would be a cross-product with
+        no sensible cap, and no plan has ever wanted one.
+        """
+        if self.for_each and self.parent:
+            raise ValueError(
+                f"step '{self.label}': for_each and parent are alternatives — "
+                f"a step fans out over a parent's records or over named values, "
+                f"not both"
+            )
+        if len(self.for_each) > 1:
+            raise ValueError(
+                f"step '{self.label}': for_each takes one argument name, got "
+                f"{sorted(self.for_each)}"
+            )
+        for name, values in self.for_each.items():
+            if not values:
+                raise ValueError(
+                    f"step '{self.label}': for_each.{name} is empty, so the "
+                    f"step would never run"
+                )
+        return self
 
 
 class CrawlPlan(BaseModel):
@@ -160,6 +195,150 @@ class CrawlPlan(BaseModel):
                     )
             seen.add(step.label)
         return self
+
+
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.IGNORECASE)
+_DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "": 1.0}
+
+
+def parse_duration(value: Any) -> Optional[float]:
+    """Seconds from ``"15m"`` / ``"6h"`` / ``900``, or None.
+
+    A config file reads far better with a unit than with four zeroes, and
+    ``900`` versus ``9000`` is the kind of typo nobody catches by eye.  A bare
+    number is still accepted and means seconds.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("a duration is a number or a string like '15m'")
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = _DURATION_RE.match(str(value))
+    if not match:
+        raise ValueError(
+            f"'{value}' is not a duration — use 30s, 15m, 6h, 1d, or a number "
+            f"of seconds"
+        )
+    return float(match.group(1)) * _DURATION_UNITS[match.group(2).lower()]
+
+
+class MCPDefinition(BaseModel):
+    """One MCP server, as a file describes it.
+
+    Three parts, and only the first is required:
+
+    * **identity** — ``name``, plus the ``slug``/``match`` that tie the file to
+      a server already installed;
+    * **connection** — ``type`` (``local`` or ``remote``) with ``command``/
+      ``args`` or ``url``.  Omitted for the curated catalog entries, whose
+      connection details the backend already holds; supplied for a server
+      someone wants to add from a file.
+    * **index** — the crawl steps and how often to re-run them.  Optional:
+      plenty of servers are worth connecting and have no content to enumerate,
+      and for those the tools are indexed and nothing else.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(min_length=1)
+    # Inferred from whichever of `url` / `command` is present, so a file that
+    # says one thing plainly doesn't have to say it twice.
+    type: Optional[str] = None
+    # Local: whatever launches the server — uvx, npx, python, a path.
+    command: Optional[str] = None
+    args: Tuple[str, ...] = ()
+    env: Dict[str, str] = Field(default_factory=dict)
+    cwd: Optional[str] = None
+    # Remote: the endpoint.  OAuth is negotiated at install time; `token` is
+    # for the servers that take a bearer token instead.
+    url: Optional[str] = None
+    token: Optional[str] = None
+    # Defaults to `name`: a file usually describes one server and names it once.
+    slug: Optional[str] = None
+    # Extra substrings matched against an installed server's name, package and
+    # URL.  `name` and `slug` are always tried, so this is for the aliases.
+    match: Tuple[str, ...] = ()
+    # Explicit crawl opt-in/out.  None = automatic: crawl when this definition
+    # declares index steps.
+    crawl: Optional[bool] = None
+    # How often this connection's content is re-indexed, as a duration:
+    # ``index_every = "6h"``.  Unset follows the app-wide schedule.
+    #
+    # The right cadence is a property of the source, not of the app: a Notion
+    # workspace changes through the day, an air-quality reading is stale within
+    # the hour, and a reference wiki is the same next week.  One global interval
+    # either wastes calls on the slow sources or lets the fast ones go stale.
+    index_every: Optional[str] = None
+    index: Tuple[CrawlStep, ...] = ()
+
+    @field_validator("index_every", mode="before")
+    @classmethod
+    def _coerce_duration(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        # Validated here so a typo is an error naming the field, not a plan that
+        # quietly never refreshes.
+        parse_duration(value)
+        return str(value)
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _normalize_type(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        kind = str(value).strip().lower()
+        if kind not in ("local", "remote"):
+            raise ValueError(f"type must be 'local' or 'remote', got '{value}'")
+        return kind
+
+    @model_validator(mode="after")
+    def _check_connection(self) -> "MCPDefinition":
+        """Settle what kind of server this is, and reject the contradictions."""
+        if self.url and self.command:
+            raise ValueError(
+                f"'{self.name}': a server is local (command) or remote (url), "
+                f"not both"
+            )
+        if self.type == "remote" and self.command:
+            raise ValueError(f"'{self.name}': type is remote but a command is set")
+        if self.type == "local" and self.url:
+            raise ValueError(f"'{self.name}': type is local but a url is set")
+        if self.type == "remote" and not self.url:
+            raise ValueError(f"'{self.name}': type is remote but no url is set")
+        if self.type == "local" and not self.command:
+            raise ValueError(f"'{self.name}': type is local but no command is set")
+        return self
+
+    @property
+    def kind(self) -> Optional[str]:
+        """``"local"``, ``"remote"``, or None when the file declares no connection."""
+        if self.type:
+            return self.type
+        if self.url:
+            return "remote"
+        if self.command:
+            return "local"
+        return None
+
+    @property
+    def index_interval(self) -> Optional[float]:
+        """``index_every`` in seconds, or None to follow the app-wide schedule."""
+        return parse_duration(self.index_every)
+
+    @property
+    def key(self) -> str:
+        """The slug this definition is registered and looked up under."""
+        return (self.slug or self.name).strip().lower()
+
+    @property
+    def plan(self) -> "CrawlPlan":
+        """The crawl plan this definition declares (possibly empty)."""
+        return CrawlPlan(
+            slug=self.key,
+            steps=self.index,
+            match=tuple(dict.fromkeys((self.key, self.name.lower(), *self.match))),
+        )
 
 
 # --------------------------------------------------------------- curated plans

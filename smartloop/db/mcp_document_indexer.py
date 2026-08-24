@@ -764,6 +764,25 @@ class MCPDocumentIndexer:
         parent id could go in.
         """
         base = filter_arguments(schema, step.arguments)
+
+        if step.for_each:
+            # Fan out over values the plan named.  Filtered like any other
+            # argument, so a plan that names an argument this server's variant
+            # of the tool doesn't declare is skipped rather than rejected once
+            # per value.
+            (name, values), = step.for_each.items()
+            if not declares_argument(schema, (name,)):
+                self._logger.debug(
+                    "[mcp-crawl] step '%s': tool does not declare '%s'",
+                    step.label, name,
+                )
+                return None, 0
+            arg_name = resolve_argument(schema, (name,)) or name
+            return (
+                [{**base, arg_name: value} for value in values[:step.max_parents]],
+                min(len(values), step.max_parents),
+            )
+
         if not step.parent_labels:
             return [base], 0
 

@@ -76,6 +76,16 @@ class MCPRegisterRequest(BaseModel):
     catalog_slug: Optional[str] = None
 
 
+class MCPDefinitionRequest(BaseModel):
+    """A connection described by a dropped-in TOML file.
+
+    ``toml`` is the file's text; ``filename`` names the copy kept under
+    ``~/.smartloop/mcp.d/`` so the crawl plan it declares survives the install.
+    """
+    toml: str
+    filename: Optional[str] = None
+
+
 class MCPRegisterResponse(BaseModel):
     """Unified response for MCP server registration.
     If auth_type is 'oauth', auth_url and oauth session fields are returned.

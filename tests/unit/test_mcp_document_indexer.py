@@ -11,7 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -517,6 +517,60 @@ class TestFanOut:
             # What it did reach still lands, and nothing is remembered as blocked.
             assert stats["records"] > 0
             assert not idx._manifest[server.id]["blocked"]
+
+    def test_a_step_can_fan_out_over_values_the_plan_names(self):
+        """Servers that can't be enumerated.
+
+        A market-data server has no `list_*` tool — every call needs a ticker —
+        so there is no walk to derive. The subjects come from the plan instead.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
+
+            plan = CrawlPlan(slug="yfinance", steps=(CrawlStep(
+                label="quotes",
+                tools=("get_stock_info",),
+                for_each={"ticker": ("AAPL", "MSFT")},
+            ),))
+            server = _server(name="yahoo-finance", slug=None, tools=[
+                _tool("get_stock_info", {
+                    "properties": {"ticker": {"type": "string"}},
+                    "required": ["ticker"],
+                }),
+            ])
+            caller = FakeCaller({
+                "get_stock_info": lambda args: _result(
+                    {"symbol": args["ticker"], "name": f"{args['ticker']} Inc"}
+                ),
+            })
+            idx = _indexer(td, caller)
+            with patch("smartloop.db.mcp_document_indexer.resolve_plan", return_value=plan):
+                idx.crawl_server(server, force=True)
+
+            assert ("get_stock_info", {"ticker": "AAPL"}) in caller.calls
+            assert ("get_stock_info", {"ticker": "MSFT"}) in caller.calls
+            text = "\n".join(_indexed_docs(idx._store).values())
+            assert "AAPL Inc" in text and "MSFT Inc" in text
+
+    def test_a_named_fan_out_is_skipped_when_the_tool_has_no_such_argument(self):
+        # Otherwise the plan's argument is dropped and the same bare call is
+        # made once per value.
+        with tempfile.TemporaryDirectory() as td:
+            from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
+
+            plan = CrawlPlan(slug="yfinance", steps=(CrawlStep(
+                label="quotes",
+                tools=("get_stock_info",),
+                for_each={"ticker": ("AAPL", "MSFT")},
+            ),))
+            server = _server(name="yahoo-finance", slug=None, tools=[
+                _tool("get_stock_info", {"properties": {"symbol": {}}}),
+            ])
+            caller = FakeCaller({"get_stock_info": _result([{"id": "x"}])})
+            idx = _indexer(td, caller)
+            with patch("smartloop.db.mcp_document_indexer.resolve_plan", return_value=plan):
+                idx.crawl_server(server, force=True)
+            assert caller.calls == []
 
     def test_child_step_is_skipped_when_the_parent_returned_nothing(self):
         with tempfile.TemporaryDirectory() as td:

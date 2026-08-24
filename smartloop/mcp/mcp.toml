@@ -9,23 +9,66 @@
 #  ── Adding your own ────────────────────────────────────────────────────────
 #
 #  Drop a .toml file into  ~/.smartloop/mcp.d/  (or write ~/.smartloop/mcp.toml)
-#  using the same shape.  Files are read in name order and merged over this one,
-#  so a plan whose `slug` matches a built-in replaces it — unless it sets
-#  `extend = true`, which appends its steps to the built-in instead.  A file
-#  that fails to parse or validate is skipped with a logged reason; the rest
-#  still load.
+#  using the same shape — one file per connection, named after it. Files are
+#  read in name order and merged over this one, so an entry whose key matches a
+#  built-in replaces it, unless it sets `extend = true`, which appends its index
+#  steps instead. A file that fails to parse or validate is skipped with a
+#  logged reason; the rest still load.
+#
+#  A minimal file, for a server with content worth indexing:
+#
+#      [[mcp]]
+#      name = "my-wiki"
+#      url = "https://mcp.example.com/mcp"
+#
+#      [[mcp.index]]
+#      label = "pages"
+#      tools = ["list_pages", "search"]
+#      detail_tools = ["get_page"]
+#
+#  And one for a server that just needs connecting, with nothing to enumerate:
+#
+#      [[mcp]]
+#      name = "yahoo-finance"
+#      command = "uvx"
+#      args = ["yahoo-finance-mcp"]
 #
 #  ── Fields ─────────────────────────────────────────────────────────────────
 #
-#  [[plan]]
-#    slug            required. Matches the curated catalog slug a server was
-#                    installed from; also the plan's name for `extend`.
-#    match           substrings tried (case-insensitively) against a server's
-#                    name, package and URL when it carries no catalog slug.
-#    extend          append to the plan with this slug instead of replacing it.
+#  [[mcp]]
+#    name            required. What the connection is called.
+#    slug            optional. Defaults to `name`; set it to match the curated
+#                    catalog slug a server was installed from.
+#    match           extra substrings tried (case-insensitively) against an
+#                    installed server's name, package and URL. `name` and `slug`
+#                    are always tried, so this is for aliases.
+#    type            "local" or "remote". Optional — inferred from whichever of
+#                    `command` / `url` is present, so a file that says it
+#                    plainly doesn't have to say it twice.
+#    command, args   a server run as a process. `command` is whatever launches
+#    env, cwd        it — uvx, npx, python, a path.
+#                      command = "uvx"
+#                      args = ["yahoo-finance-mcp"]
+#    url, token      a server reached over HTTP. OAuth is negotiated at install
+#                    time; `token` is for the servers that take a bearer token.
+#                      url = "https://mcp.linear.app/mcp"
+#                    A definition is local or remote, never both, and the
+#                    curated entries below are neither — the backend already
+#                    holds their connection details.
+#    crawl           optional. true/false to force indexing on or off; omitted
+#                    means indexed when this file declares index steps.
+#    index_every     how often to re-index this connection: "30s", "15m", "6h",
+#                    "1d", or a number of seconds. Unset follows the app-wide
+#                    schedule (every 10 min while idle, hourly regardless).
+#                    The right cadence belongs to the source: an air-quality
+#                    reading is stale within the hour, a reference wiki is the
+#                    same next week.
+#    extend          append to the entry with this key instead of replacing it.
 #
-#  [[plan.step]]
-#    label           required, unique within the plan. Names the step in logs
+#  [[mcp.index]]     OPTIONAL. Without any, the server's tools are indexed and
+#                    nothing else — which is right for the many servers that
+#                    have no content to enumerate.
+#    label           required, unique within the entry. Names the step in logs
 #                    and in each indexed document's id.
 #    tools           required. Candidate tool names, first match on the server
 #                    wins. Matched loosely (`search` finds `notion-search`),
@@ -40,14 +83,22 @@
 #    parent          one step label, or several. This step then runs once per
 #                    record those steps produced, with the record's id passed
 #                    as whichever of `parent_args` the tool declares. Parents
-#                    must be declared earlier in the plan.
+#                    must be declared earlier in the entry.
+#    for_each        fan out over values you name instead of over another
+#                    step's records: `for_each = { ticker = ["AAPL", "MSFT"] }`
+#                    runs the step once per ticker. For servers that can't be
+#                    enumerated — a market-data or weather server answers
+#                    questions you already know to ask, so the subjects have to
+#                    come from you. Alternative to `parent`, not combinable;
+#                    `max_parents` caps how many values are used.
 #    detail_tools    fetch the full body of each record (a page's content
 #                    behind a search hit), by whichever of `detail_args` the
 #                    tool declares.
 #    max_records     records kept from this step (default 40). A crawl is a
 #                    refresh, not an export: this bounds the embedding work and
 #                    the number of follow-up detail calls.
-#    max_parents     parent records fanned out over (default 8).
+#    max_parents     parent records (or named values) fanned out over,
+#                    default 8.
 #
 #  Anywhere a list of names is expected, "@name" expands to an alias below.
 
@@ -103,36 +154,36 @@ linear_issue_args = ["issueId", "issue_id", "issue"]
 # exist, an unfiltered search otherwise), fetch each page's body, then walk into
 # each database for the rows a page listing never returns.
 
-[[plan]]
-slug = "notion"
+[[mcp]]
+name = "notion"
 match = ["notion"]
 
 # The dedicated listing tools first: they take no required argument, so they are
 # the reliable way to enumerate what the connection can see.  Their results
 # overlap heavily (a recent page is usually also a private or shared one) — the
 # crawler dedupes by record id across steps, so the overlap costs nothing.
-[[plan.step]]
+[[mcp.index]]
 label = "recent-pages"
 tools = ["notion-list-recent-pages", "list_recent_pages"]
 arguments = { limit = 50 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
 
-[[plan.step]]
+[[mcp.index]]
 label = "private-pages"
 tools = ["notion-list-private-pages", "list_private_pages"]
 arguments = { limit = 50 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
 
-[[plan.step]]
+[[mcp.index]]
 label = "shared-pages"
 tools = ["notion-list-shared-pages", "list_shared_pages"]
 arguments = { limit = 50 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
 
-[[plan.step]]
+[[mcp.index]]
 label = "favorite-pages"
 tools = ["notion-list-favorite-pages", "list_favorite_pages"]
 arguments = { limit = 50 }
@@ -143,7 +194,7 @@ detail_args = ["@notion_page_args"]
 # that ship no listing tools: an unfiltered search is the OpenAPI server's
 # "everything shared with this integration".  The hosted server makes `query`
 # required, so the empty-query call there simply fails and the step is skipped.
-[[plan.step]]
+[[mcp.index]]
 label = "pages"
 tools = ["@notion_search"]
 arguments = { query = "", page_size = 100 }
@@ -154,7 +205,7 @@ max_records = 60
 # Databases have to be enumerated separately: a page-shaped search result set
 # doesn't contain them, and their rows are the part of a Notion workspace a page
 # listing never reaches.
-[[plan.step]]
+[[mcp.index]]
 label = "databases"
 tools = ["list_databases", "notion_list_databases", "get_databases", "notion-list-databases"]
 max_records = 25
@@ -163,7 +214,7 @@ max_records = 25
 # enumerates databases, since it has no listing tool for them.  Where the filter
 # isn't declared it is dropped and this would repeat the `pages` call, so
 # `needs_arguments` skips the step instead.
-[[plan.step]]
+[[mcp.index]]
 label = "database-search"
 tools = ["@notion_search"]
 arguments = { query = "", page_size = 100, filter = { property = "object", value = "database" } }
@@ -172,7 +223,7 @@ max_records = 25
 
 # A database listing is a list of table names; the rows are behind a query per
 # database, so the walk continues into each one.
-[[plan.step]]
+[[mcp.index]]
 label = "database-pages"
 tools = ["API-post-database-query", "post_database_query", "query_database", "notion_query_database", "notion-query-database"]
 parent = ["databases", "database-search"]
@@ -182,7 +233,7 @@ detail_args = ["@notion_page_args"]
 max_records = 60
 max_parents = 25
 
-[[plan.step]]
+[[mcp.index]]
 label = "meeting-notes"
 tools = ["notion-query-meeting-notes", "query_meeting_notes"]
 detail_tools = ["@notion_fetch"]
@@ -190,7 +241,7 @@ detail_args = ["@notion_page_args"]
 
 # Comments hold the decisions and corrections that never make it back into the
 # page body, so they are pulled per page the walk found.
-[[plan.step]]
+[[mcp.index]]
 label = "page-comments"
 tools = ["notion-get-comments", "notion_retrieve_comments", "API-retrieve-a-comment", "retrieve_comments", "get_comments", "list_comments"]
 parent = ["recent-pages", "private-pages", "shared-pages", "favorite-pages", "pages", "database-pages"]
@@ -199,7 +250,7 @@ max_records = 60
 max_parents = 30
 
 # One call, and it is what lets a page's `created_by` id read back as a name.
-[[plan.step]]
+[[mcp.index]]
 label = "users"
 tools = ["notion-get-users", "API-get-users", "get_users", "list_users"]
 max_records = 50
@@ -212,14 +263,14 @@ max_records = 50
 # tree is what reaches the rest: `list_issues` with no argument returns one page
 # of the workspace, `list_issues` once per team returns a page *per team*.
 
-[[plan]]
-slug = "linear"
+[[mcp]]
+name = "linear"
 match = ["linear"]
 
 # The root of the walk.  `list_teams` takes no required argument, so it is the
 # one call that works on any Linear connection, and every team-scoped step below
 # fans out over what it returns.
-[[plan.step]]
+[[mcp.index]]
 label = "teams"
 tools = ["list_teams", "linear_list_teams", "get_teams"]
 detail_tools = ["get_team", "linear_get_team"]
@@ -228,13 +279,13 @@ max_records = 25
 # Workspace-wide listings run first so their (usually richer) rows win the
 # dedupe, and so a server that only exposes the unscoped variants still gets
 # crawled.
-[[plan.step]]
+[[mcp.index]]
 label = "projects"
 tools = ["@linear_project_tools"]
 arguments = { limit = 50 }
 detail_tools = ["@linear_project_detail"]
 
-[[plan.step]]
+[[mcp.index]]
 label = "team-projects"
 tools = ["@linear_project_tools"]
 parent = "teams"
@@ -244,7 +295,7 @@ max_parents = 25
 
 # `list_my_issues` trails the unscoped names as a last resort, for the Linear
 # packagings that ship no workspace-wide issue listing.
-[[plan.step]]
+[[mcp.index]]
 label = "issues"
 tools = ["list_issues", "linear_list_issues", "get_issues", "list_my_issues"]
 arguments = { limit = 50 }
@@ -252,14 +303,14 @@ detail_tools = ["@linear_issue_detail"]
 
 # Kept separate from `issues`: on the hosted server `list_my_issues` is the
 # assignee-scoped view, which surfaces work the unscoped page cut off.
-[[plan.step]]
+[[mcp.index]]
 label = "my-issues"
 tools = ["list_my_issues", "linear_list_my_issues"]
 arguments = { limit = 50 }
 detail_tools = ["@linear_issue_detail"]
 
 # The widest branch of the walk: one page of issues per team.
-[[plan.step]]
+[[mcp.index]]
 label = "team-issues"
 tools = ["@linear_issue_tools"]
 arguments = { limit = 50 }
@@ -269,7 +320,7 @@ detail_tools = ["@linear_issue_detail"]
 max_records = 80
 max_parents = 25
 
-[[plan.step]]
+[[mcp.index]]
 label = "project-issues"
 tools = ["@linear_issue_tools"]
 arguments = { limit = 50 }
@@ -279,7 +330,7 @@ detail_tools = ["@linear_issue_detail"]
 max_records = 60
 max_parents = 20
 
-[[plan.step]]
+[[mcp.index]]
 label = "cycles"
 tools = ["list_cycles", "linear_list_cycles", "get_cycles"]
 parent = "teams"
@@ -288,7 +339,7 @@ max_parents = 25
 
 # The discussion on an issue is often where the actual answer lives, so comments
 # are pulled from whichever listing found each issue.
-[[plan.step]]
+[[mcp.index]]
 label = "issue-comments"
 tools = ["list_comments", "linear_list_comments", "get_comments"]
 parent = ["issues", "my-issues", "team-issues", "project-issues"]
@@ -296,14 +347,14 @@ parent_args = ["@linear_issue_args"]
 max_records = 60
 max_parents = 30
 
-[[plan.step]]
+[[mcp.index]]
 label = "documents"
 tools = ["list_documents", "linear_list_documents", "get_documents"]
 detail_tools = ["get_document", "linear_get_document"]
 
 # Not content, but it is what lets "what is Sam working on" resolve a name to
 # the assignee the issue rows carry.
-[[plan.step]]
+[[mcp.index]]
 label = "users"
 tools = ["list_users", "linear_list_users", "get_users"]
 max_records = 50
@@ -311,16 +362,16 @@ max_records = 50
 
 # ── Trello ─────────────────────────────────────────────────────────────────
 
-[[plan]]
-slug = "trello"
+[[mcp]]
+name = "trello"
 match = ["trello"]
 
-[[plan.step]]
+[[mcp.index]]
 label = "boards"
 tools = ["list_boards", "get_boards", "trello_list_boards", "get_my_boards", "list_boards_by_user"]
 max_records = 20
 
-[[plan.step]]
+[[mcp.index]]
 label = "lists"
 tools = ["get_lists", "list_lists", "trello_get_lists", "get_lists_by_board_id", "get_board_lists"]
 parent = "boards"
@@ -329,7 +380,7 @@ max_parents = 20
 
 # A card row carries the name but usually not the description or checklists,
 # which is the part worth answering from.
-[[plan.step]]
+[[mcp.index]]
 label = "cards"
 tools = ["get_cards_by_list_id", "list_cards", "get_cards", "trello_get_cards", "get_list_cards"]
 parent = "lists"

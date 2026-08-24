@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import logging
+import os
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,7 @@ from fastapi.responses import HTMLResponse
 
 from smartloop.api.model import (
     MCPCrawlRequest,
+    MCPDefinitionRequest,
     MCPServerResponse,
     DeleteMCPServerResponse,
     MCPToolResponse,
@@ -686,6 +688,91 @@ async def register_mcp_server(
         return await _register_local_mcp_server(request, model_service, project_id, curated)
     return await _register_remote_mcp_server(
         request, model_service, http_request, project_id, curated,
+    )
+
+
+@router.post("/projects/{project_id}/mcp/definition", response_model=MCPRegisterResponse)
+async def register_mcp_from_definition(
+    project_id: str,
+    request: MCPDefinitionRequest,
+    http_request: Request = None,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Install a connection from a dropped-in TOML file.
+
+    The file is the whole definition: what the server is called, how to reach
+    it, and — optionally — how to index its content.  Both halves are kept: the
+    file is saved under ``~/.smartloop/mcp.d/`` so its crawl plan is there for
+    every later refresh, and the connection itself goes through the ordinary
+    registration path, so a remote server needing OAuth returns an ``auth_url``
+    exactly as it would if the URL had been typed in.
+    """
+    from smartloop.mcp.plan_loader import (
+        USER_PLANS_DIR, parse_definitions, reload_plans,
+    )
+
+    try:
+        found = parse_definitions(request.toml, request.filename or "upload")
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Could not read this connection file: {e}",
+        )
+    if not found:
+        raise HTTPException(
+            status_code=400,
+            detail="No [[mcp]] entry in this file — it needs at least a name "
+                   "and either a local command or a remote url.",
+        )
+    if len(found) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This file describes {len(found)} connections "
+                   f"({', '.join(sorted(found))}); drop one file per connection.",
+        )
+
+    definition = next(iter(found.values()))
+    if not definition.kind:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{definition.name}' has no connection: add a "
+                   f"command (and args) for a local server, or a url for a "
+                   f"remote one.",
+        )
+
+    # Persist before registering: the plan has to be on disk by the time the
+    # provisioning pass runs its first crawl, and that is queued by the
+    # registration below.
+    try:
+        from smartloop.config.app_settings import AppSettings
+        drop_in_dir = os.path.join(AppSettings().home_dir, USER_PLANS_DIR)
+        os.makedirs(drop_in_dir, exist_ok=True)
+        # Named after the connection, not after whatever the file was called on
+        # the way in — that is what makes re-dropping an edited file replace
+        # the old plan instead of stacking a second copy beside it.
+        target = os.path.join(drop_in_dir, f"{definition.key}.toml")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(request.toml)
+        reload_plans()
+        logger.info("[mcp-definition] Saved '%s' to %s", definition.key, target)
+    except Exception as e:
+        # The connection is still worth installing without its plan; the crawl
+        # falls back to a derived one.
+        logger.warning("[mcp-definition] Could not save the plan file: %s", e)
+
+    register = MCPRegisterRequest(
+        name=definition.name,
+        server_type=definition.kind,
+        command=definition.command,
+        args=list(definition.args),
+        env=dict(definition.env),
+        cwd=definition.cwd,
+        server_url=definition.url,
+        token=definition.token,
+        return_url="smartloop://mcp-authorization",
+    )
+    return await register_mcp_server(
+        project_id=project_id, request=register,
+        http_request=http_request, model_service=model_service,
     )
 
 
