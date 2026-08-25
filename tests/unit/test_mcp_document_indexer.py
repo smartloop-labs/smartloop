@@ -986,6 +986,98 @@ class TestEnvelopeUnwrapping:
             assert reasons["workspace-boards"] is None
 
 
+class TestRecordIdentity:
+    """Finding the id and the body when the server buries them.
+
+    A record with no id is a record nothing can fan out from, and one keyed by
+    a hash of its own text is a record a second listing will document all over
+    again.  Both showed up on Canva, whose two listings of the same design
+    disagree about where its identity lives.
+    """
+
+    def test_an_entity_qualified_id_is_still_the_record_id(self):
+        # search-designs answers with `design_id` and no `id`, so the fan-out
+        # over designs had nothing to walk and the comments were never reached.
+        from smartloop.db.mcp_document_indexer import _parse_records
+
+        records = _parse_records(json.dumps({"items": [
+            {"title": "Canva MCP TESTING", "design_id": "DAHS4TDHiec",
+             "edit_url": "https://www.canva.com/d/c7n9T"},
+        ]}))
+        assert [r.record_id for r in records] == ["DAHS4TDHiec"]
+        assert records[0].url == "https://www.canva.com/d/c7n9T"
+
+    def test_a_record_wrapped_in_a_type_discriminator_is_unwrapped(self):
+        # list-folder-items answers with {"type": "design", "design": {...}}:
+        # id, title and body all one level down.  Read as-is the record has no
+        # identity, so the same design a search already indexed is documented
+        # a second time under a content hash.
+        from smartloop.db.mcp_document_indexer import _parse_records
+
+        records = _parse_records(json.dumps({"items": [
+            {"type": "design", "design": {
+                "id": "DAHS4TDHiec", "title": "Canva MCP TESTING",
+                "page_count": 2,
+            }},
+        ]}))
+        assert [r.record_id for r in records] == ["DAHS4TDHiec"]
+        assert records[0].title == "Canva MCP TESTING"
+
+    def test_a_record_that_merely_carries_a_nested_object_keeps_its_shape(self):
+        # The unwrap only fires when the outer object has no identity and the
+        # inner one does — otherwise a Trello card would unwrap into its list.
+        from smartloop.db.mcp_document_indexer import _unwrap_record
+
+        card = {"id": "c1", "name": "Card",
+                "list": {"id": "l1", "name": "To Do"}}
+        assert _unwrap_record(card) == card
+
+    def test_an_id_less_wrapper_around_an_id_less_object_is_left_alone(self):
+        from smartloop.db.mcp_document_indexer import _unwrap_record
+
+        item = {"type": "design", "design": {"title": "no id here"}}
+        assert _unwrap_record(item) == item
+
+    def test_two_listings_of_one_design_are_indexed_once(self):
+        """The end of the story: Canva's search and folder walk agree."""
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(name="Canva", slug="canva", tools=[
+                _tool("search-designs", {"properties": {
+                    "ownership": {}, "sort_by": {}, "limit": {},
+                    "design_types": {}, "user_intent": {},
+                }}),
+                _tool("get-design-content", {
+                    "properties": {"design_id": {}, "content_types": {},
+                                   "user_intent": {}},
+                    "required": ["design_id", "content_types"],
+                }),
+                _tool("list-folder-items", {
+                    "properties": {"folder_id": {}, "item_types": {},
+                                   "sort_by": {}, "user_intent": {}},
+                    "required": ["folder_id"],
+                }),
+            ])
+            design = {"title": "Canva MCP TESTING", "design_id": "DAHS4TDHiec"}
+            caller = FakeCaller({
+                "search-designs": _result({"items": [design]}),
+                "get-design-content": _result("the design body text"),
+                "list-folder-items": _result({"items": [
+                    {"type": "design", "design": {
+                        "id": "DAHS4TDHiec", "title": "Canva MCP TESTING"}},
+                ]}),
+            })
+            idx = _indexer(td, caller)
+            stats = idx.crawl_server(server, force=True)
+
+            docs = _indexed_docs(idx._store)
+            assert len(docs) == 1, docs
+            # And the one document is the one that fetched the body.
+            assert "the design body text" in next(iter(docs.values()))
+            by_step = {d["step"]: d for d in stats["details"]}
+            assert by_step["designs"]["new"] == 1
+            assert by_step["root-items"]["new"] == 0
+
+
 class TestDetailArguments:
     """A detail call is not always just the record's id.
 

@@ -143,6 +143,10 @@ linear_team_args = ["teamId", "team_id", "team", "teamIds"]
 linear_project_args = ["projectId", "project_id", "project"]
 linear_issue_args = ["issueId", "issue_id", "issue"]
 
+# Canva names a design's id `design_id` in its listings and takes it under the
+# same name everywhere; the bare spellings trail it for the packaged variants.
+canva_design_args = ["design_id", "designId", "id"]
+
 
 # ── Notion ─────────────────────────────────────────────────────────────────
 #
@@ -476,3 +480,102 @@ label = "me"
 tools = ["trelloReadMember", "get_me", "get_member", "list_members"]
 arguments = { action = "get_me" }
 max_records = 5
+
+
+# ── Canva ──────────────────────────────────────────────────────────────────
+#
+# A design tool, so most of an account is pixels.  What can actually answer a
+# question is the titles, the rich text inside a design, the speaker notes, and
+# the comment threads — so that is what this walks, and thumbnails, exports and
+# autofill schemas are left alone.
+#
+# Three things the schemas decide rather than the author:
+#
+#   * `search-designs` must not be given a `query`.  Canva rejects one unless
+#     `sort_by = "relevance"`, and no query means "everything" anyway.
+#   * `list-folder-items` *requires* `folder_id`; "root" is the top level.
+#   * `list-comments` and `get-presenter-notes` constrain `design_id` to
+#     `^D[a-zA-Z0-9_-]+$` at exactly 11 characters, so a folder or image id in
+#     their fan-out is a guaranteed error per record.  The item listings are
+#     filtered to designs for that reason.
+#
+# Every step passes `user_intent`, which Canva's schemas describe as mandatory
+# for clients.
+
+[[mcp]]
+name = "canva"
+match = ["canva"]
+
+[[mcp.index]]
+label = "folders"
+tools = ["search-folders", "search_folders", "list_folders"]
+arguments = { ownership = "any", limit = 50, user_intent = "Index folder names so the designs inside them can be crawled" }
+max_records = 25
+
+# The text inside a design is the whole point of crawling Canva, and
+# `get-design-content` takes `content_types` alongside the id — which is what
+# `detail_arguments` is for.  Preferred over `get-design`, whose fields the
+# listing row already carries.
+#
+# This step runs ahead of the folder listings on purpose.  Records are deduped
+# by id across steps, and only the step that *first* documents a record fetches
+# its body — so with a folder listing in front, every design would be indexed
+# as a title and a thumbnail and its text never asked for.
+[[mcp.index]]
+label = "designs"
+tools = ["search-designs", "search_designs", "list_designs"]
+arguments = { ownership = "any", sort_by = "modified_descending", limit = 50, user_intent = "Index every design so its content can be retrieved" }
+detail_tools = ["get-design-content", "get_design_content"]
+detail_arguments = { content_types = ["richtexts"], user_intent = "Read the text content of a design" }
+detail_args = ["@canva_design_args"]
+max_records = 50
+
+# Speaker notes exist only on presentations.  Narrowing the search and hanging
+# the notes off *that* is what keeps the call off the designs it cannot work on,
+# rather than running it over everything and absorbing the failures.  These rows
+# are all duplicates of `designs` by id, so this step is a fan-out source and
+# indexes nothing of its own.
+[[mcp.index]]
+label = "presentations"
+tools = ["search-designs", "search_designs"]
+arguments = { design_types = ["presentation"], ownership = "any", sort_by = "modified_descending", limit = 25, user_intent = "Find presentations so their speaker notes can be crawled" }
+needs_arguments = ["design_types"]
+max_records = 25
+
+[[mcp.index]]
+label = "presenter-notes"
+tools = ["get-presenter-notes", "get_presenter_notes"]
+arguments = { user_intent = "Index the speaker notes attached to each presentation" }
+parent = "presentations"
+parent_args = ["@canva_design_args"]
+max_records = 40
+max_parents = 20
+
+# The folder walk trails the search: it reaches the designs a capped search cut
+# off, and it is the only thing that does, but everything it finds that the
+# search already returned is deduped away.
+[[mcp.index]]
+label = "root-items"
+tools = ["list-folder-items", "list_folder_items"]
+arguments = { folder_id = "root", item_types = ["design"], sort_by = "modified_descending", user_intent = "Index the designs at the top level of the account" }
+max_records = 50
+
+[[mcp.index]]
+label = "folder-items"
+tools = ["list-folder-items", "list_folder_items"]
+arguments = { item_types = ["design"], sort_by = "modified_descending", user_intent = "Index the designs inside each folder" }
+parent = "folders"
+parent_args = ["folder_id", "folderId", "id"]
+max_records = 60
+max_parents = 20
+
+# Where the feedback on a design is written down; the design itself rarely says
+# any of it.
+[[mcp.index]]
+label = "design-comments"
+tools = ["list-comments", "list_comments", "get_comments"]
+arguments = { limit = 50, user_intent = "Index the comment threads on each design" }
+parent = ["designs", "root-items", "folder-items"]
+parent_args = ["@canva_design_args"]
+max_records = 60
+max_parents = 25

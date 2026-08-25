@@ -194,6 +194,27 @@ def _record_text(record: Any) -> str:
         return json.dumps(record, default=str)[:MAX_RECORD_CHARS]
 
 
+def _unwrap_record(item: Any) -> Any:
+    """Unwrap a record the server wrapped in a type discriminator.
+
+    Canva's folder listing answers with ``{"type": "design", "design": {...}}``
+    — the identity, the title and the body all one level down.  Read as-is such
+    a record has no id to fan out from and no title to name a document by, so it
+    is keyed by a hash of its own text and the same design reached from a search
+    is documented a second time.
+
+    Unwrapped only when the outer object has no identity of its own *and* the
+    inner one does, so a record that merely happens to carry a nested object
+    keeps its own shape.
+    """
+    if not isinstance(item, dict) or _first_str(item, RECORD_ID_KEYS):
+        return item
+    nested = [value for value in item.values() if isinstance(value, dict)]
+    if len(nested) == 1 and _first_str(nested[0], RECORD_ID_KEYS):
+        return nested[0]
+    return item
+
+
 def _parse_records(payload: str) -> List[CrawlRecord]:
     """Parse a tool result payload into crawl records.
 
@@ -217,6 +238,7 @@ def _parse_records(payload: str) -> List[CrawlRecord]:
 
     records: List[CrawlRecord] = []
     for item in _unwrap_records(data):
+        item = _unwrap_record(item)
         text = _record_text(item)
         if not text:
             continue
@@ -224,7 +246,9 @@ def _parse_records(payload: str) -> List[CrawlRecord]:
         if isinstance(item, dict):
             record_id = _first_str(item, RECORD_ID_KEYS)
             title = _first_str(item, RECORD_TITLE_KEYS)
-            url = _first_str(item, ("url", "uri", "link", "shortUrl", "html_url"))
+            url = _first_str(
+                item, ("url", "uri", "link", "shortUrl", "html_url", "edit_url"),
+            )
         records.append(CrawlRecord(
             record_id=record_id,
             title=title,

@@ -42,9 +42,14 @@ ID_ARGS: Tuple[str, ...] = (
     "id", "page_id", "pageId", "url", "uri", "identifier", "key", "gid",
 )
 
-# Keys a record's identifier is read from, in order of preference.
+# Keys a record's identifier is read from, in order of preference.  The
+# entity-qualified spellings trail the bare ones: a server that returns both
+# means `id` by the record and `<entity>_id` by something it points at, but the
+# ones that return only `design_id` / `page_id` have no other identity to offer,
+# and a record without an id is a record nothing can fan out from.
 RECORD_ID_KEYS: Tuple[str, ...] = (
-    "id", "uuid", "gid", "key", "identifier", "url", "uri", "page_id", "shortLink",
+    "id", "uuid", "gid", "key", "identifier", "url", "uri",
+    "page_id", "design_id", "shortLink",
 )
 
 # Keys a record's human-readable title is read from, in order of preference.
