@@ -33,7 +33,7 @@ class DAGExecutor:
 
     def _wrap_handler(self, node, handler: Callable) -> Callable:
         """Serialize shared-model inference nodes; pass others through."""
-        if not isinstance(node, LLMDecisionNode) or node.parallel_inference:
+        if not isinstance(node, LLMDecisionNode):
             return handler
 
         def locked(deps):

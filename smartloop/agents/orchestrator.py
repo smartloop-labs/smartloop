@@ -240,19 +240,12 @@ class SLPOrchestrator:
         # steps (no separate server selector, no keyword-scan fallback).
         self._mcp_agent = MCPAgent(self.agent_llm, logger)
 
-        # Prefer a shared, long-lived executor (its LLM worker processes load
-        # the model once and are reused across requests).  Fall back to a
-        # per-instance executor when none is supplied (e.g. in tests).
+        # Prefer a shared, long-lived executor.  Fall back to a per-instance
+        # one when none is supplied (e.g. in tests).
         if executor is not None:
             self._executor = executor
         else:
-            _settings = AppSettings()
-            self._executor = LLMExecutor(
-                max_io_workers=6,
-                n_llm_workers=_settings.n_llm_workers if model_path else 0,
-                model_path=model_path,
-                project_id=project_id,
-            )
+            self._executor = LLMExecutor(max_io_workers=6)
         self._dag_executor = DAGExecutor(max_workers=6)
         # Optional per-request progress sink set by execute(); surfaces live
         # step activity (search, tool calls, ...) to the streaming API layer.
@@ -768,24 +761,18 @@ class SLPOrchestrator:
         """
         skill_instruction = ctx.skill_context
 
-        use_pool = bool(getattr(self._executor, "has_llm_pool", False))
-
         batches = self._batch_documents(search_ctx.documents)
         logger.info(
             f"[doc-fanout] {len(search_ctx.documents)} document(s) → "
-            f"{len(batches)} batch node(s) "
-            f"({'parallel via worker pool' if use_pool else 'serialized in-thread'})"
+            f"{len(batches)} batch node(s) (serialized in-thread)"
         )
 
         nodes_and_handlers: List[tuple] = []
         batch_nodes: List[LLMDecisionNode] = []
         for i, batch in enumerate(batches):
-            node = LLMDecisionNode(
-                depends_on=[parent],
-                parallel_inference=use_pool,
-            )
+            node = LLMDecisionNode(depends_on=[parent])
             handler = self._make_doc_batch_handler(
-                ctx, node.node_id, batch, skill_instruction, use_pool,
+                ctx, node.node_id, batch, skill_instruction,
             )
             nodes_and_handlers.append((node, handler))
             batch_nodes.append(node)
@@ -850,13 +837,11 @@ class SLPOrchestrator:
         node_id: str,
         batch: List[Dict[str, Any]],
         skill_instruction: Optional[str],
-        use_pool: bool = False,
     ) -> Callable:
         """Create a handler that extracts query-relevant content from one batch.
 
-        When ``use_pool`` is set, inference is dispatched to a dedicated LLM
-        worker process (its own model copy) so batches run in parallel;
-        otherwise it uses the shared in-thread model (serialized upstream).
+        Inference uses the shared in-process model, serialized upstream by
+        the DAG executor's LLM lock.
         """
         # Reserve room for prompt scaffolding + output.  The chars/token
         # estimate is a conservative floor for data-dense content (stats,
@@ -909,26 +894,16 @@ class SLPOrchestrator:
             # Size the extraction input to the EXTRACTION model's actual
             # context window — not the router's.  The router's max_tokens can
             # exceed the DP model's window (e.g. 8192 vs 6080), so sizing from
-            # it overflows the extractor and generation silently fails.  Worker
-            # pool → the worker copy's context; otherwise the resolved DP
-            # model's own window.
+            # it overflows the extractor and generation silently fails.
             dp_llm = None
             max_chars = 16000
             try:
-                if use_pool:
-                    ctx_tokens = int(AppSettings().llm_worker_n_ctx)
-                    if ctx_tokens <= 0:
-                        # 0 = auto-sized worker context — the worker copy loads
-                        # at the device's bound, so size the input to that.
-                        from smartloop.utils.device_utils import max_auto_context_tokens
-                        ctx_tokens = int(max_auto_context_tokens())
-                else:
-                    dp_llm = self._llm_for_tier(ModelTier.LARGE, capability=ModelCapability.DP)
-                    logger.info(
-                        "[doc-batch] %s → %s",
-                        node_id, self._model_label(dp_llm),
-                    )
-                    ctx_tokens = int(dp_llm.get_max_tokens() or 0)
+                dp_llm = self._llm_for_tier(ModelTier.LARGE, capability=ModelCapability.DP)
+                logger.info(
+                    "[doc-batch] %s → %s",
+                    node_id, self._model_label(dp_llm),
+                )
+                ctx_tokens = int(dp_llm.get_max_tokens() or 0)
                 if ctx_tokens > 0:
                     usable = max(512, ctx_tokens - _OUTPUT_RESERVE_TOKENS)
                     max_chars = int(usable * _CHARS_PER_TOKEN)
@@ -956,10 +931,7 @@ class SLPOrchestrator:
             extract = ""
             llm_failed = False
             try:
-                if use_pool:
-                    extract = str(self._executor.submit_llm(prompt).result()).strip()
-                else:
-                    extract = str(dp_llm.invoke(prompt)).strip()
+                extract = str(dp_llm.invoke(prompt)).strip()
             except Exception as e:
                 llm_failed = True
                 logger.warning(f"[doc-batch] {node_id} extraction failed: {e}")

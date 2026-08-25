@@ -212,8 +212,7 @@ async def lifespan(app: FastAPI):
     logger.info("Model unloaded, shutdown complete")
 
     # Tear down centralized logging last so the lines above still flush
-    # through the rotating file handler.  The worker pool's mp queue (and its
-    # semaphores) went with model_service.shutdown_tasks() above.
+    # through the rotating file handler.
     from smartloop.utils.logging_setup import shutdown_logging
     _listener = getattr(app.state, "log_listener", None)
     app.state.log_listener = None
@@ -408,11 +407,7 @@ class _PortCapturingServer(uvicorn.Server):
 def _install_centralized_logging() -> None:
     """Install the shared log queue, root QueueHandler, and parent listener.
 
-    The queue is a plain thread queue; ``LLMExecutor`` picks it up via
-    ``logging_setup.get_log_queue`` and bridges a multiprocessing queue into
-    it when (and only when) it spawns worker processes, so those records reach
-    this same listener.  Stashes the listener on ``app.state`` so the lifespan
-    shutdown can stop it.
+    Stashes the listener on ``app.state`` so the lifespan shutdown can stop it.
     """
     from smartloop.utils.logging_setup import (
         make_log_queue, setup_root_logging, start_listener,
@@ -522,9 +517,9 @@ def start_server_foreground(host: str, port: int, service: bool = True) -> None:
             if not service:
                 break
 
-            # The lifespan shutdown tore logging down (it closes the shared
-            # multiprocessing log queue so its semaphores can't outlive us),
-            # so bring it back up before logging anything about the restart.
+            # The lifespan shutdown tore logging down (it detaches the root
+            # QueueHandler from a listener that no longer drains), so bring it
+            # back up before logging anything about the restart.
             _install_centralized_logging()
 
             uptime = _time.monotonic() - start_ts

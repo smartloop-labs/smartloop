@@ -219,16 +219,16 @@ class LlmFactory:
     ):
         """Returns an instance of the configured LlamaCpp wrapper class.
 
-        ``probe``: when True (default, main process) the model is first
-        test-loaded in a throwaway subprocess so a hard crash (SIGABRT/
-        segfault) can't take down the caller.  Set False inside a dedicated
-        LLM worker process — the worker IS disposable, and spawning a nested
-        probe there only adds another concurrent model load.
+        ``probe``: when True (default) the model is first test-loaded in a
+        throwaway subprocess so a hard crash (SIGABRT/segfault) can't take
+        down the caller.  Set False only from a caller that is itself
+        disposable, where a nested probe would just add another concurrent
+        model load.
 
-        ``max_n_ctx``: upper bound for the auto-sized context window.  Worker
-        copies pass a small value so several models' KV caches fit on one GPU
-        (the context auto-sizing otherwise assumes the model is alone on the
-        device and reserves nearly all VRAM for a single copy).
+        ``max_n_ctx``: upper bound for the auto-sized context window.  The
+        context auto-sizing otherwise assumes the model is alone on the device
+        and reserves nearly all VRAM for it, which starves the on-demand
+        large/vision models.
 
         ``mmproj_path``: path to a CLIP/mmproj GGUF.  When set, the model is
         loaded as a multimodal (vision) instance with a vision chat handler so
@@ -351,9 +351,9 @@ class LlmFactory:
         # Use a minimal context for the probe — we only need to know if the
         # model can be loaded at all, not whether the full context fits.
         # Returns: True (success), False (crash/signal), None (Python exception)
-        # Skipped inside LLM worker processes (probe=False): the worker is
-        # already a disposable subprocess, so a nested probe only adds another
-        # concurrent model load competing for the GPU.
+        # Skipped when probe=False: a caller that is already a disposable
+        # subprocess gains nothing from a nested probe, which would only add
+        # another concurrent model load competing for the GPU.
         probe_config = {**config, 'n_ctx': 512}
         probe_result = LlmFactory._probe_model_load(path, probe_config, logger) if probe else None
         if probe_result is False:

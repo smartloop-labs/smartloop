@@ -1,16 +1,21 @@
 """
 Centralized logging plumbing:
 
-* A thread inside the parent process emits through the root QueueHandler,
-  the listener picks it up, and the record reaches the attached handler.
-* A spawn worker process configured via ``worker_setup_logging`` emits
-  through the same queue and its records land in the same handler — which
-  is the whole point of routing through ``multiprocessing.Queue``.
+* A thread emits through the root QueueHandler, the listener picks it up, and
+  the record reaches the attached handler.
+* ``start_listener`` always writes to ``<home>/server.log``.
+* The queue owns no OS resources, so a process that dies abruptly leaves
+  nothing behind for the resource tracker to report.
+
+The spawn-worker path is gone with the LLM worker pool (see
+``smartloop.agents.hybrid_executor``), so there is no ``multiprocessing.Queue``
+and no cross-process forwarding left to cover.
 """
 import io
 import logging
 import logging.handlers
-import multiprocessing
+import multiprocessing.queues
+import queue as _queue
 import subprocess
 import sys
 import textwrap
@@ -20,8 +25,6 @@ from pathlib import Path
 
 import pytest
 
-from conftest import _release_queue
-
 import smartloop.utils.logging_setup as logging_setup
 from smartloop.utils.logging_setup import (
     DEFAULT_FORMAT,
@@ -30,7 +33,6 @@ from smartloop.utils.logging_setup import (
     setup_root_logging,
     shutdown_logging,
     start_listener,
-    worker_setup_logging,
 )
 
 
@@ -51,9 +53,7 @@ def _reset_log_queue_singleton():
     try:
         yield
     finally:
-        leaked, ls._LOG_QUEUE = ls._LOG_QUEUE, None
-        if leaked is not None:
-            _release_queue(leaked)
+        ls._LOG_QUEUE = None
 
 
 def _drain_listener(listener) -> None:
@@ -85,7 +85,7 @@ def _make_capturing_listener(queue):
 
 def test_thread_log_records_reach_listener_handler():
     """A worker thread logging via the root logger lands in the listener sink."""
-    queue = multiprocessing.Queue(-1)
+    queue = _queue.Queue(-1)
     setup_root_logging(queue, level="DEBUG")
     listener, buf = _make_capturing_listener(queue)
 
@@ -109,7 +109,7 @@ def test_thread_log_records_reach_listener_handler():
 
 def test_start_listener_creates_rotating_file_handler(tmp_path):
     """``start_listener`` should always attach a rotating file handler to <home>/server.log."""
-    queue = multiprocessing.Queue(-1)
+    queue = _queue.Queue(-1)
     setup_root_logging(queue, level="DEBUG")
     listener = start_listener(
         queue,
@@ -130,35 +130,6 @@ def test_start_listener_creates_rotating_file_handler(tmp_path):
     log_path = Path(tmp_path) / "server.log"
     assert log_path.exists()
     assert "file probe" in log_path.read_text(encoding="utf-8")
-
-
-# --------------------------------------------------------------------------
-# Spawn-process → parent listener
-# --------------------------------------------------------------------------
-
-def _spawn_emit(queue):
-    """Body of the spawn child: configure via worker_setup_logging, emit, exit."""
-    worker_setup_logging(queue)
-    logging.getLogger("spawn.test").info("hello from spawn")
-
-
-def test_spawn_process_records_reach_parent_listener():
-    """Records emitted from a spawn child must arrive at the parent listener."""
-    ctx = multiprocessing.get_context("spawn")
-    queue = ctx.Queue(-1)
-    listener, buf = _make_capturing_listener(queue)
-
-    try:
-        proc = ctx.Process(target=_spawn_emit, args=(queue,), name="probe-worker")
-        proc.start()
-        proc.join(timeout=10)
-        assert proc.exitcode == 0
-    finally:
-        _drain_listener(listener)
-        _release_queue(queue)
-
-    assert "hello from spawn" in buf.getvalue()
-    assert "spawn.test" in buf.getvalue()
 
 
 # --------------------------------------------------------------------------
@@ -261,26 +232,29 @@ def _tracker_stderr(prog, tmp_path, *argv):
 def test_make_log_queue_owns_no_os_resources():
     """The shared queue must be a thread queue — no semaphores, no sem_open.
 
-    A multiprocessing.Queue here costs three POSIX semaphores on every
-    startup, for a worker pool that is skipped whenever GPU offload is
-    available or n_llm_workers <= 1 (the default).  It also can't be created
-    at all under the macOS App Sandbox, which denies sem_open.
+    A multiprocessing.Queue here cost three POSIX semaphores on every startup,
+    which had to be unlinked before the process died or the resource tracker
+    reported them leaked — and sem_open is denied under the macOS App Sandbox.
+    Nothing writes to this queue from another process any more.
     """
-    import queue as _queue
-
     assert isinstance(make_log_queue(), _queue.Queue)
     assert not isinstance(make_log_queue(), multiprocessing.queues.Queue)
     assert make_log_queue() is make_log_queue()  # idempotent singleton
 
 
 def test_server_logging_setup_leaks_no_semaphores(tmp_path):
-    """A server that dies abruptly mid-run must leave no semaphores behind.
+    """A server that dies abruptly must leave nothing for the tracker to warn about.
 
     ``os._exit`` stands in for the SIGKILL ``slp agent stop`` escalates to,
     which skips every exit finalizer.  Nothing is torn down here on purpose:
-    the default arrangement must hold no OS resources in the first place.
+    the arrangement must hold no OS resources in the first place.
+
+    The warning would come from the resource-tracker process, not the child, so
+    stderr goes to a file both inherit — a ``capture_output`` pipe closes too
+    early to catch it — and is polled after the child exits.
     """
-    prog = """
+    prog = textwrap.dedent(
+        """
         import os, sys
         from smartloop.utils.logging_setup import (
             make_log_queue, setup_root_logging, start_listener,
@@ -290,66 +264,19 @@ def test_server_logging_setup_leaks_no_semaphores(tmp_path):
         listener = start_listener(queue, home_dir=sys.argv[1], force_console=False)
         os._exit(0)
         """
-    stderr = _tracker_stderr(prog, tmp_path, str(tmp_path))
-    assert "leaked semaphore" not in stderr, stderr
-
-
-def test_worker_log_bridge_releases_semaphores(tmp_path):
-    """``WorkerLogBridge.close()`` must unlink its queue's three semaphores.
-
-    The bridge is the one place an mp queue still exists.  Its semaphores are
-    unlinked by finalizers that only fire on a clean exit, so ``close()`` has
-    to release them itself — the child holds the bridge and the shared queue
-    throughout, proving the release doesn't depend on dropping references.
-    """
-    prog = """
-        import os, sys
-        from smartloop.utils.logging_setup import (
-            make_log_queue, make_worker_log_bridge, setup_root_logging,
+    )
+    err_path = tmp_path / "child-stderr.txt"
+    with err_path.open("wb") as err:
+        subprocess.run(
+            [sys.executable, "-c", prog, str(tmp_path)],
+            stdout=subprocess.DEVNULL, stderr=err, timeout=120,
         )
-        setup_root_logging(make_log_queue(), level="DEBUG")
-        bridge = make_worker_log_bridge()
-        assert bridge is not None
-        bridge.close()
-        os._exit(0)
-        """
-    stderr = _tracker_stderr(prog, tmp_path)
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        stderr = err_path.read_text()
+        if "leaked semaphore" in stderr:
+            break
+        time.sleep(0.1)
+
     assert "leaked semaphore" not in stderr, stderr
-
-
-def test_worker_log_bridge_forwards_spawn_records(monkeypatch):
-    """A spawn child's records must cross the bridge into the shared queue.
-
-    This is the whole point of the bridge: worker processes can't write to a
-    thread queue, so records have to arrive by this path or be lost.
-    """
-    monkeypatch.setattr(logging_setup, "_LOG_QUEUE", None)
-    shared = make_log_queue()
-    listener, buf = _make_capturing_listener(shared)
-    bridge = logging_setup.make_worker_log_bridge()
-    assert bridge is not None
-
-    try:
-        ctx = multiprocessing.get_context("spawn")
-        proc = ctx.Process(
-            target=_spawn_emit, args=(bridge.queue,), name="probe-worker"
-        )
-        proc.start()
-        proc.join(timeout=30)
-        assert proc.exitcode == 0
-
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and "hello from spawn" not in buf.getvalue():
-            time.sleep(0.05)
-    finally:
-        bridge.close()
-        _drain_listener(listener)
-
-    assert "hello from spawn" in buf.getvalue()
-    assert "spawn.test" in buf.getvalue()
-
-
-def test_bridge_returns_none_without_a_target(monkeypatch):
-    """No shared queue means nothing to forward into — and no mp queue built."""
-    monkeypatch.setattr(logging_setup, "_LOG_QUEUE", None)
-    assert logging_setup.make_worker_log_bridge() is None
