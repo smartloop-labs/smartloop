@@ -207,6 +207,118 @@ class TestGetLatestRelease:
             client.get_latest_release("stable")
 
 
+class TestWebSearch:
+    """401/403 must stay distinguishable from every other failure: the first
+    means search is off for the account, the rest are transient."""
+
+    def test_returns_links(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (200, ["http://a", "http://b"])}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {"Authorization": "Bearer jwt"})
+        assert client.web_search("bikes", 5) == ["http://a", "http://b"]
+
+    def test_drops_non_string_and_blank_entries(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (200, ["http://a", "", None, 3, "  "])}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        assert client.web_search("bikes", 5) == ["http://a"]
+
+    def test_non_list_body_returns_empty(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (200, {"results": []})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        assert client.web_search("bikes", 5) == []
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_auth_failure_raises_permission_error(self, stub_server, status):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (status, {"detail": "nope"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(PermissionError, match=str(status)):
+            client.web_search("bikes", 5)
+
+    def test_server_error_raises_connection_error(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (500, {"detail": "boom"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError, match="API error"):
+            client.web_search("bikes", 5)
+
+    def test_unreachable_raises_connection_error(self):
+        client = SLPPlatformClient("http://127.0.0.1:1", auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError):
+            client.web_search("bikes", 5)
+
+
+class TestWebSearchStatus:
+    def test_enabled(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch/status": (200, {"enabled": True})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        assert client.web_search_status() is True
+
+    def test_disabled(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch/status": (200, {"enabled": False})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        assert client.web_search_status() is False
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_auth_failure_raises_permission_error(self, stub_server, status):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch/status": (status, {"detail": "nope"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(PermissionError, match=str(status)):
+            client.web_search_status()
+
+    def test_server_error_raises_connection_error(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch/status": (500, {"detail": "boom"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError, match="API error"):
+            client.web_search_status()
+
+
+class TestRequestHeaders:
+    def test_user_agent_is_sent_with_and_without_auth(self, stub_server):
+        """The account access log would otherwise show python-httpx for every
+        call — including the unauthenticated ones."""
+        base_url, handler = stub_server
+        seen = []
+
+        original_do_GET = handler.do_GET
+
+        def recording_do_GET(self_handler):
+            seen.append(dict(self_handler.headers))
+            original_do_GET(self_handler)
+
+        handler.do_GET = recording_do_GET
+        handler.routes = {
+            "/v1/users/me": (200, {"email": "a@b.c"}),
+            "/v1/bootstrap/models": (200, [{"name": "sl-mini"}]),
+        }
+        try:
+            client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {"Authorization": "Bearer jwt"})
+            client.get_current_user()
+            client.list_bootstrap_models()
+        finally:
+            handler.do_GET = original_do_GET
+
+        assert len(seen) == 2
+        assert all(h.get("User-Agent", "").startswith("smartloop/") for h in seen)
+        assert seen[0].get("Authorization") == "Bearer jwt"
+        assert "Authorization" not in seen[1], "bootstrap is deliberately unauthenticated"
+
+
 class TestGetCurrentUser:
     def test_returns_user_profile(self, stub_server):
         base_url, handler = stub_server
