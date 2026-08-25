@@ -221,9 +221,6 @@ def test_shutdown_logging_closes_queue_and_detaches_handler(monkeypatch):
     assert not [h for h in root.handlers
                 if isinstance(h, logging.handlers.QueueHandler)]
     assert get_log_queue() is None
-    # A closed multiprocessing.Queue refuses further writes.
-    with pytest.raises(ValueError):
-        queue.put("after close")
 
 
 def test_shutdown_logging_is_idempotent(monkeypatch):
@@ -236,50 +233,123 @@ def test_shutdown_logging_is_idempotent(monkeypatch):
     assert get_log_queue() is None
 
 
-def test_shutdown_logging_prevents_leaked_semaphores(tmp_path):
-    """No ``leaked semaphore objects`` warning when the process dies abruptly.
+def _tracker_stderr(prog, tmp_path, *argv):
+    """Run *prog* in a child and return the stderr its resource tracker wrote.
 
-    A ``multiprocessing.Queue`` holds three POSIX semaphores that are unlinked
-    by exit finalizers.  ``slp agent stop`` escalates to SIGKILL, which skips
-    them — ``os._exit`` reproduces that here.  ``shutdown_logging`` must have
-    already released them, so the resource tracker finds nothing to warn about.
-
-    The child runs the *full* server arrangement — a started listener, still
-    referenced after the call, as ``main.lifespan`` leaves it — because it is
-    ``listener.queue`` that used to pin the queue past teardown.
-
-    The warning is emitted by the resource-tracker process, not the child, so
-    stderr goes to a file both inherit and is polled after the child exits
-    (a ``capture_output`` pipe closes too early to see it).
+    The leaked-semaphore warning comes from the resource-tracker *process*,
+    not the child, so stderr must go to a file both inherit — a
+    ``capture_output`` pipe closes before the tracker gets to write. The
+    tracker writes as soon as it sees EOF on the child's pipe; poll anyway so
+    a slow write can't turn a real leak into a passing test.
     """
-    prog = textwrap.dedent(
-        """
-        import os, sys
-        from smartloop.utils.logging_setup import (
-            make_log_queue, setup_root_logging, shutdown_logging, start_listener,
-        )
-        queue = make_log_queue()
-        setup_root_logging(queue, level="DEBUG")
-        listener = start_listener(queue, home_dir=sys.argv[1], force_console=False)
-        shutdown_logging(listener)
-        os._exit(0)
-        """
-    )
     err_path = tmp_path / "child-stderr.txt"
     with err_path.open("wb") as err:
         subprocess.run(
-            [sys.executable, "-c", prog, str(tmp_path)],
+            [sys.executable, "-c", textwrap.dedent(prog), *argv],
             stdout=subprocess.DEVNULL, stderr=err, timeout=120,
         )
 
-    # The tracker writes as soon as it sees EOF on the child's pipe; poll
-    # briefly so a slow write can't turn a real leak into a passing test.
     deadline = time.monotonic() + 5
-    stderr = ""
     while time.monotonic() < deadline:
         stderr = err_path.read_text()
         if "leaked semaphore" in stderr:
             break
         time.sleep(0.1)
+    return stderr
 
+
+def test_make_log_queue_owns_no_os_resources():
+    """The shared queue must be a thread queue — no semaphores, no sem_open.
+
+    A multiprocessing.Queue here costs three POSIX semaphores on every
+    startup, for a worker pool that is skipped whenever GPU offload is
+    available or n_llm_workers <= 1 (the default).  It also can't be created
+    at all under the macOS App Sandbox, which denies sem_open.
+    """
+    import queue as _queue
+
+    assert isinstance(make_log_queue(), _queue.Queue)
+    assert not isinstance(make_log_queue(), multiprocessing.queues.Queue)
+    assert make_log_queue() is make_log_queue()  # idempotent singleton
+
+
+def test_server_logging_setup_leaks_no_semaphores(tmp_path):
+    """A server that dies abruptly mid-run must leave no semaphores behind.
+
+    ``os._exit`` stands in for the SIGKILL ``slp agent stop`` escalates to,
+    which skips every exit finalizer.  Nothing is torn down here on purpose:
+    the default arrangement must hold no OS resources in the first place.
+    """
+    prog = """
+        import os, sys
+        from smartloop.utils.logging_setup import (
+            make_log_queue, setup_root_logging, start_listener,
+        )
+        queue = make_log_queue()
+        setup_root_logging(queue, level="DEBUG")
+        listener = start_listener(queue, home_dir=sys.argv[1], force_console=False)
+        os._exit(0)
+        """
+    stderr = _tracker_stderr(prog, tmp_path, str(tmp_path))
     assert "leaked semaphore" not in stderr, stderr
+
+
+def test_worker_log_bridge_releases_semaphores(tmp_path):
+    """``WorkerLogBridge.close()`` must unlink its queue's three semaphores.
+
+    The bridge is the one place an mp queue still exists.  Its semaphores are
+    unlinked by finalizers that only fire on a clean exit, so ``close()`` has
+    to release them itself — the child holds the bridge and the shared queue
+    throughout, proving the release doesn't depend on dropping references.
+    """
+    prog = """
+        import os, sys
+        from smartloop.utils.logging_setup import (
+            make_log_queue, make_worker_log_bridge, setup_root_logging,
+        )
+        setup_root_logging(make_log_queue(), level="DEBUG")
+        bridge = make_worker_log_bridge()
+        assert bridge is not None
+        bridge.close()
+        os._exit(0)
+        """
+    stderr = _tracker_stderr(prog, tmp_path)
+    assert "leaked semaphore" not in stderr, stderr
+
+
+def test_worker_log_bridge_forwards_spawn_records(monkeypatch):
+    """A spawn child's records must cross the bridge into the shared queue.
+
+    This is the whole point of the bridge: worker processes can't write to a
+    thread queue, so records have to arrive by this path or be lost.
+    """
+    monkeypatch.setattr(logging_setup, "_LOG_QUEUE", None)
+    shared = make_log_queue()
+    listener, buf = _make_capturing_listener(shared)
+    bridge = logging_setup.make_worker_log_bridge()
+    assert bridge is not None
+
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(
+            target=_spawn_emit, args=(bridge.queue,), name="probe-worker"
+        )
+        proc.start()
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and "hello from spawn" not in buf.getvalue():
+            time.sleep(0.05)
+    finally:
+        bridge.close()
+        _drain_listener(listener)
+
+    assert "hello from spawn" in buf.getvalue()
+    assert "spawn.test" in buf.getvalue()
+
+
+def test_bridge_returns_none_without_a_target(monkeypatch):
+    """No shared queue means nothing to forward into — and no mp queue built."""
+    monkeypatch.setattr(logging_setup, "_LOG_QUEUE", None)
+    assert logging_setup.make_worker_log_bridge() is None

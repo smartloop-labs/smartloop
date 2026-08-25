@@ -7,6 +7,7 @@ own model instance).
 import logging
 import os
 import multiprocessing
+import multiprocessing.queues  # not bound by `import multiprocessing` alone
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 from smartloop.agents.llm_worker import init_worker, run_inference
@@ -41,6 +42,11 @@ class LLMExecutor:
         Path to the GGUF model file.  Required when *n_llm_workers* > 0.
     project_id:
         Project identifier passed to the worker initializer.
+    log_queue:
+        Optional override for where worker log records go.  A
+        ``multiprocessing.Queue`` is handed to the workers directly; anything
+        else is bridged (see :meth:`_worker_log_queue`).  Defaults to the
+        shared queue from ``logging_setup``.
     """
 
     def __init__(
@@ -53,18 +59,13 @@ class LLMExecutor:
     ):
         self._io_pool = ThreadPoolExecutor(max_workers=max_io_workers, thread_name_prefix="io")
         self._llm_pool: ProcessPoolExecutor | None = None
+        self._log_bridge = None
 
-        # When the parent process has set up centralized logging, hand the
-        # shared queue to spawn workers so their records flow back to the
-        # listener.  Fall back to looking it up from logging_setup so callers
-        # don't have to thread it through.
-        if log_queue is None:
-            try:
-                from smartloop.utils.logging_setup import get_log_queue
-                log_queue = get_log_queue()
-            except Exception:
-                log_queue = None
-        self._log_queue = log_queue
+        # Where this executor's spawn workers should send their log records.
+        # The shared queue is a plain thread queue, which can't cross a
+        # process boundary — the bridge below supplies a picklable
+        # multiprocessing.Queue instead, but only if a pool is actually built.
+        self._log_target = log_queue
 
         if n_llm_workers > 0 and model_path:
             # ``n_llm_workers`` is the on/off switch + preferred count; the
@@ -100,12 +101,44 @@ class LLMExecutor:
                 f"Creating ProcessPoolExecutor with {effective_workers} LLM worker(s) "
                 f"(model={model_path}, start_method=spawn)"
             )
+            # Only now — with workers actually being spawned — is a
+            # multiprocessing.Queue worth its three POSIX semaphores.  It is
+            # owned by the bridge and released in shutdown(), so it can't
+            # outlive the pool and be reported as leaked.  ``None`` means
+            # logging was never set up (or sem_open is denied under the App
+            # Sandbox); workers then log to their own stderr.
+            worker_queue = self._worker_log_queue()
             self._llm_pool = ProcessPoolExecutor(
                 max_workers=effective_workers,
                 mp_context=mp_context,
                 initializer=init_worker,
-                initargs=(model_path, project_id or "", self._log_queue),
+                initargs=(model_path, project_id or "", worker_queue),
             )
+
+    def _worker_log_queue(self):
+        """Return a picklable log queue for the spawn workers, or ``None``.
+
+        An explicitly-supplied ``multiprocessing.Queue`` is passed straight
+        through — the caller already owns a cross-process queue.  Anything
+        else (a thread queue, or the shared one) is reached via a bridge,
+        since handing a ``queue.Queue`` to ``ProcessPoolExecutor`` would fail
+        to pickle and kill the initializer.
+        """
+        from smartloop.utils.logging_setup import (
+            get_log_queue, make_worker_log_bridge,
+        )
+
+        target = self._log_target
+        if target is None:
+            try:
+                target = get_log_queue()
+            except Exception:
+                return None
+        if isinstance(target, multiprocessing.queues.Queue):
+            return target
+
+        self._log_bridge = make_worker_log_bridge(target)
+        return self._log_bridge.queue if self._log_bridge is not None else None
 
     @staticmethod
     def _resolve_worker_count(model_path: str, requested: int) -> int:
@@ -260,8 +293,11 @@ class LLMExecutor:
         if self._llm_pool is not None:
             self._llm_pool.shutdown(wait=wait)
             self._llm_pool = None
-        # Release the shared log queue: it is a multiprocessing.Queue whose
-        # POSIX semaphores are only unlinked once the last reference goes
-        # away (see logging_setup.shutdown_logging).  An executor that
-        # outlives the server's logging teardown would otherwise pin it.
-        self._log_queue = None
+        # The bridge's multiprocessing.Queue exists only to feed those
+        # workers, so it dies with them — otherwise its three POSIX
+        # semaphores survive until exit, and `slp agent stop` escalates to
+        # SIGKILL, which never gets there.
+        if self._log_bridge is not None:
+            self._log_bridge.close()
+            self._log_bridge = None
+        self._log_target = None

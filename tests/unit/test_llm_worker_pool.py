@@ -199,3 +199,78 @@ def test_resolve_reserves_main_model_when_not_yet_resident():
     assert _resolve(
         free_gb=5.8, total_gb=8.0, requested=2, model_gb=0.8
     ) == 1
+
+
+# --------------------------------------------------------------------------
+# Worker log queue: what actually gets handed to ProcessPoolExecutor
+# --------------------------------------------------------------------------
+
+def _idle_executor(log_queue=None):
+    """An executor with no pool — enough to exercise _worker_log_queue()."""
+    return LLMExecutor(max_io_workers=1, n_llm_workers=0, log_queue=log_queue)
+
+
+def test_worker_log_queue_bridges_a_thread_queue():
+    """A thread queue must never reach ProcessPoolExecutor(initargs=...).
+
+    ``queue.Queue`` isn't picklable, so passing one through would fail to
+    pickle and kill the pool initializer — which would take every worker with
+    it.  The shared log queue *is* a thread queue, so this is the normal path,
+    not an edge case.
+    """
+    import multiprocessing.queues
+    import queue as _queue
+
+    shared = _queue.Queue(-1)
+    ex = _idle_executor(log_queue=shared)
+    try:
+        worker_queue = ex._worker_log_queue()
+        assert not isinstance(worker_queue, _queue.Queue)
+        assert isinstance(worker_queue, multiprocessing.queues.Queue)
+        assert ex._log_bridge is not None
+    finally:
+        ex.shutdown()
+
+
+def test_worker_log_queue_passes_an_mp_queue_straight_through():
+    """An explicit mp queue already crosses processes — don't wrap it."""
+    import multiprocessing
+
+    mp_queue = multiprocessing.Queue(-1)
+    ex = _idle_executor(log_queue=mp_queue)
+    try:
+        assert ex._worker_log_queue() is mp_queue
+        assert ex._log_bridge is None  # no second queue, no extra semaphores
+    finally:
+        ex.shutdown()
+        from smartloop.utils.logging_setup import _release_mp_queue
+        _release_mp_queue(mp_queue)
+
+
+def test_worker_log_queue_is_none_without_logging_setup(monkeypatch):
+    """No shared queue → workers get None and log to their own stderr."""
+    import smartloop.utils.logging_setup as ls
+
+    monkeypatch.setattr(ls, "_LOG_QUEUE", None)
+    ex = _idle_executor()
+    try:
+        assert ex._worker_log_queue() is None
+        assert ex._log_bridge is None
+    finally:
+        ex.shutdown()
+
+
+def test_shutdown_closes_the_log_bridge():
+    """The bridge's mp queue must die with the pool it was built to feed."""
+    import queue as _queue
+
+    ex = _idle_executor(log_queue=_queue.Queue(-1))
+    ex._worker_log_queue()
+    bridge = ex._log_bridge
+    assert bridge is not None
+
+    ex.shutdown()
+
+    assert ex._log_bridge is None
+    assert bridge.queue._closed
+    assert not bridge._thread.is_alive()
