@@ -81,6 +81,27 @@ _QUERY_STOP_WORDS = {
 
 # ------------------------------------------------------------------ models
 
+def _mcp_source(name: str, chunk: Any) -> str:
+    """Source line for a crawled MCP chunk.
+
+    The crawl already records which tool produced each record, but the header
+    only carried ``<server>/<step>/<title>`` — so the model saw content with no
+    way to say where it came from, and could not name the tool when asked. The
+    tool is the source for MCP content, so it leads.
+
+    Read from metadata rather than baked into ``document_name`` at index time,
+    so content already crawled gains the attribution without a re-index.
+    """
+    meta = getattr(chunk, "metadata", None) or {}
+    tool = meta.get("tool_name")
+    server = meta.get("server_name")
+    if tool and server:
+        return f"{server} · {tool} — {name}"
+    if tool:
+        return f"{tool} — {name}"
+    return name
+
+
 def _crawl_age(chunk: Any) -> str:
     """`` (indexed 12m ago)`` for a crawled record, or ``""``.
 
@@ -670,7 +691,8 @@ Does answering the latest message require a new web search?
                 if name not in best or chunk.distance < best[name].distance:
                     best[name] = chunk
             text = "\n\n".join(
-                f"--- {name}{_crawl_age(chunk)} ---\n{chunk.text[:2000]}"
+                f"--- {_mcp_source(name, chunk)}{_crawl_age(chunk)} ---\n"
+                f"{chunk.text[:2000]}"
                 for name, chunk in best.items()
             )
             logger.info(

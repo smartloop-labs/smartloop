@@ -33,9 +33,26 @@ _BUNDLE_SUBDIR = "embeddings"
 # wrong vectors for CLS models like BGE-M3.
 _POOLING_TYPE_UNSPECIFIED = -1
 
-# Context window for the embedding model.  BGE-M3 trains to 8192; retrieval
-# chunks are far shorter, but sizing to the model's max avoids silent truncation.
-_EMBED_N_CTX = 8192
+# Context window for the embedding model.
+#
+# BGE-M3 trains to 8192, and this was sized to match — but llama.cpp allocates
+# its compute buffer for n_ubatch tokens at load and holds it, so a context
+# sized to the model's maximum cost gigabytes resident regardless of what was
+# actually being embedded.  Retrieval chunks are capped at 2000 characters by
+# both indexers (CHUNK_SIZE), which is well under 2048 tokens even for scripts
+# that tokenize near one-to-one, so the extra headroom bought nothing.
+#
+# Lowering this is only safe because encode() now truncates to _MAX_INPUT_CHARS:
+# BGE-M3 is a non-causal encoder, so llama.cpp runs each sequence in a single
+# micro-batch and ggml_abort()s if one exceeds n_ubatch.
+_EMBED_N_CTX = 2048
+
+# Hard cap on a single input, in characters.  Chosen so the worst-case token
+# count stays under _EMBED_N_CTX even when a text tokenizes at roughly one
+# token per character (CJK, dense code).  Both chunkers already cap at this, so
+# in practice nothing is truncated — this exists to make the abort impossible
+# rather than to reshape normal input.
+_MAX_INPUT_CHARS = 2000
 
 # Chunks handed to llama.cpp per embed() call.  The whole list used to go in
 # one call, so indexing a large document (an MCP crawl can produce hundreds of
@@ -77,6 +94,20 @@ class LlamaEmbedder:
         batch = [texts] if single else list(texts)
         if not batch:
             return np.empty((0, 0), dtype=np.float32)
+
+        # Guarantee no sequence exceeds n_ubatch. Exceeding it is not a bad
+        # embedding, it is ggml_abort() taking the process down, so this is
+        # enforced here rather than trusted to every caller.
+        clipped = 0
+        for i, text in enumerate(batch):
+            if len(text) > _MAX_INPUT_CHARS:
+                batch[i] = text[:_MAX_INPUT_CHARS]
+                clipped += 1
+        if clipped:
+            logger.warning(
+                "[embeddings] truncated %d input(s) to %d chars",
+                clipped, _MAX_INPUT_CHARS,
+            )
 
         # embed() returns one vector per input (pooling is enabled).  Sliced
         # so peak memory tracks _MAX_ENCODE_BATCH rather than len(batch).
@@ -271,8 +302,8 @@ def load_embedder(
             n_ctx=_EMBED_N_CTX,
             # BGE-M3 is a non-causal encoder: llama.cpp processes each sequence
             # in a single micro-batch (no KV-cache splitting), so n_ubatch must
-            # be >= the longest input or ggml_abort()s in set_inputs.  Retrieval
-            # chunks can exceed the 512 default, so size both to the context.
+            # be >= the longest input or ggml_abort()s in set_inputs.  encode()
+            # truncates to _MAX_INPUT_CHARS to hold that invariant.
             n_batch=_EMBED_N_CTX,
             n_ubatch=_EMBED_N_CTX,
             verbose=False,

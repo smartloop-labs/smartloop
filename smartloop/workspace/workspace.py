@@ -393,13 +393,6 @@ class Workspace(BaseModel):
     models_dir: str = ""
     workspace_dir: str = ""
     merge_model_dir: Optional[str] = None
-    # Workspace-wide web search switch, above the per-project flag. Both must
-    # be true for the orchestrator to search (see WebSearchAgent.is_enabled):
-    # this one turns the feature off everywhere, while the per-project flag —
-    # bound to the Cmd/Ctrl+Alt+S shortcut — silences it for one project.
-    # On by default, so a config written before this flag existed stays
-    # enabled; only an explicit ``false`` on disk turns it off.
-    web_search_enabled: bool = True
 
     def __init__(self, id: str, *,
                  projects: List[Project] = None,
@@ -409,7 +402,6 @@ class Workspace(BaseModel):
                  models: Optional[List[WorkspaceModel]] = None,
                  adapters: Optional[List] = None,
                  config: Optional[dict] = None,
-                 web_search_enabled: bool = True,
                  **_legacy,
         ):
         # ``**_legacy`` swallows keys that were persisted by older builds but
@@ -417,7 +409,7 @@ class Workspace(BaseModel):
         # loading an existing config.json never fails validation. Anything
         # still supported has to be named explicitly here — a field left to
         # _legacy is silently dropped and reverts to its default on every load.
-        super().__init__(id=id, projects=projects or [], merge_model_dir=merge_model_dir, workspace_dir=workspace_dir, models_dir=models_dir, models=models or [], adapters=adapters or [], web_search_enabled=web_search_enabled)
+        super().__init__(id=id, projects=projects or [], merge_model_dir=merge_model_dir, workspace_dir=workspace_dir, models_dir=models_dir, models=models or [], adapters=adapters or [])
 
     @property
     def active_model(self) -> Optional[WorkspaceModel]:

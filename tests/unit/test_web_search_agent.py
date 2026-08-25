@@ -94,19 +94,19 @@ class TestRerank:
 
 
 class TestEnablement:
-    """The workspace and project ``web_search_enabled`` flags must actually
-    stop searches."""
+    """The project flag and the hosted status must both allow a search."""
 
     @pytest.fixture(autouse=True)
-    def _signed_in(self, monkeypatch):
-        """Pretend a token is present unless a test says otherwise.
+    def _hosted_available(self, monkeypatch):
+        """Say the account can search unless a test says otherwise.
 
-        is_enabled() requires one, and without this stub the result would
-        depend on whether whoever runs the suite happens to be signed in.
+        is_enabled() consults the hosted status endpoint; without this stub the
+        result would depend on the network and on whoever runs the suite being
+        signed in.
         """
-        from smartloop.auth import credential_store
+        import smartloop.search.providers as providers
 
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
+        monkeypatch.setattr(providers, "hosted_search_available", lambda: True)
 
     def _write_config(self, tmp_path, enabled, monkeypatch, workspace_enabled=True):
         import json
@@ -193,63 +193,41 @@ class TestEnablement:
         }))
         assert WebSearchAgent.is_enabled() is False
 
-    def test_workspace_switch_overrides_an_enabled_project(self, tmp_path, monkeypatch):
-        """Off at the workspace level cannot be undone per project."""
+    def test_enabled_project_with_an_available_account(self, tmp_path, monkeypatch):
         from smartloop.agents.web_search_agent import WebSearchAgent
 
-        self._write_config(tmp_path, True, monkeypatch, workspace_enabled=False)
-        assert WebSearchAgent.is_enabled() is False
-
-    def test_both_switches_on_is_enabled(self, tmp_path, monkeypatch):
-        from smartloop.agents.web_search_agent import WebSearchAgent
-
-        self._write_config(tmp_path, True, monkeypatch, workspace_enabled=True)
+        self._write_config(tmp_path, True, monkeypatch)
         assert WebSearchAgent.is_enabled() is True
 
-    def test_project_switch_still_wins_when_workspace_is_on(self, tmp_path, monkeypatch):
+    def test_hosted_status_can_veto_an_enabled_project(self, tmp_path, monkeypatch):
+        """Signed out, or no provider registered — the endpoint decides, and
+        the orchestrator skips instead of calling and discarding a 403."""
+        import smartloop.search.providers as providers
         from smartloop.agents.web_search_agent import WebSearchAgent
 
-        self._write_config(tmp_path, False, monkeypatch, workspace_enabled=True)
-        assert WebSearchAgent.is_enabled() is False
-
-    def test_signed_out_is_disabled_however_the_switches_are_set(
-        self, tmp_path, monkeypatch
-    ):
-        """The endpoint authenticates every call, so no token means no search."""
-        from smartloop.agents.web_search_agent import WebSearchAgent
-        from smartloop.auth import credential_store
-
-        self._write_config(tmp_path, True, monkeypatch, workspace_enabled=True)
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: None)
+        self._write_config(tmp_path, True, monkeypatch)
+        monkeypatch.setattr(providers, "hosted_search_available", lambda: False)
 
         assert WebSearchAgent.is_enabled() is False
 
-    def test_workspace_flag_absent_from_disk_defaults_to_enabled(
+    def test_project_switch_wins_without_asking_the_endpoint(
         self, tmp_path, monkeypatch
     ):
-        """A config written before the workspace flag existed stays on."""
-        import json
-
+        """The user's own switch is free to read, so it is checked first — a
+        disabled project must not cost a network round-trip."""
+        import smartloop.search.providers as providers
         from smartloop.agents.web_search_agent import WebSearchAgent
-        from smartloop.workspace.workspace import Workspace
 
-        cfg = tmp_path / "config.json"
-        cfg.write_text(json.dumps({
-            "id": "m",
-            "workspace": {
-                "id": "ws",
-                "workspace_dir": str(tmp_path),
-                "models_dir": str(tmp_path),
-                "models": [],
-                "projects": [
-                    {"id": "p1", "project_dir": str(tmp_path), "current": True,
-                     "name": "p1"},
-                ],
-            },
-        }))
-        monkeypatch.setattr(Workspace, "config_file", str(cfg))
+        self._write_config(tmp_path, False, monkeypatch)
 
-        assert WebSearchAgent.is_enabled() is True
+        asked = []
+        monkeypatch.setattr(
+            providers, "hosted_search_available",
+            lambda: asked.append(True) or True,
+        )
+
+        assert WebSearchAgent.is_enabled() is False
+        assert asked == []
 
 
 class TestSourceExtracts:

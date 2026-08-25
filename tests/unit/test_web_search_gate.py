@@ -236,3 +236,98 @@ class TestFollowUpGate:
 
         assert searched == ["now create a table"]
         llm.invoke.assert_not_called()
+
+
+class TestHostedStatusCache:
+    """The status check sits in front of every query, so it must be cheap and
+    must never suppress a search it cannot verify."""
+
+    def setup_method(self):
+        from smartloop.search import providers
+
+        providers.reset_status_cache()
+
+    def teardown_method(self):
+        from smartloop.search import providers
+
+        providers.reset_status_cache()
+
+    def test_result_is_cached_across_calls(self, monkeypatch):
+        from smartloop.auth import credential_store
+        from smartloop.search import providers
+
+        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
+
+        calls = []
+
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self): pass
+
+            def json(self): return {"enabled": True}
+
+        class _Client:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def get(self, *a, **k):
+                calls.append(a)
+                return _Resp()
+
+        monkeypatch.setattr(providers.httpx, "Client", lambda **k: _Client())
+
+        assert providers.hosted_search_available() is True
+        assert providers.hosted_search_available() is True
+        assert len(calls) == 1, "second call should come from the cache"
+
+    def test_signed_out_short_circuits_without_a_request(self, monkeypatch):
+        from smartloop.auth import credential_store
+        from smartloop.search import providers
+
+        monkeypatch.setattr(credential_store, "get_active_token", lambda: None)
+
+        def _boom(**k):
+            raise AssertionError("must not call the endpoint without a token")
+
+        monkeypatch.setattr(providers.httpx, "Client", _boom)
+
+        assert providers.hosted_search_available() is False
+
+    def test_a_failed_check_fails_open(self, monkeypatch):
+        """A health check that cannot complete says nothing about whether
+        search works, and the search itself already skips on a 403."""
+        from smartloop.auth import credential_store
+        from smartloop.search import providers
+
+        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
+
+        class _Client:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def get(self, *a, **k): raise RuntimeError("network down")
+
+        monkeypatch.setattr(providers.httpx, "Client", lambda **k: _Client())
+
+        assert providers.hosted_search_available() is True
+
+    def test_forbidden_reports_unavailable(self, monkeypatch):
+        from smartloop.auth import credential_store
+        from smartloop.search import providers
+
+        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
+
+        class _Resp:
+            status_code = 403
+
+            def raise_for_status(self): raise AssertionError("not reached")
+
+            def json(self): return {}
+
+        class _Client:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def get(self, *a, **k): return _Resp()
+
+        monkeypatch.setattr(providers.httpx, "Client", lambda **k: _Client())
+
+        assert providers.hosted_search_available() is False

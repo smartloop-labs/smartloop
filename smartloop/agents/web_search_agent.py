@@ -9,9 +9,10 @@ up-to-date information.
 
 Enablement is per project (``Project.web_search_enabled``), toggled via
 ``PATCH /v1/projects/{id}/websearch``. Whether the endpoint will actually serve
-a search is decided entirely server-side — whether a search provider is
-registered on the account (managed from the web app) — and comes back as a
-401/403. This side never sees a provider name or an API key. Web search is part
+a search is decided entirely server-side — signed in, with a search provider
+registered on the account (managed from the web app) — and is read up front
+from ``GET /v1/websearch/status`` so a search that cannot run is skipped rather
+than attempted and discarded. This side never sees a provider name or an API key. Web search is part
 of explore: any failure (disabled, 401/403, no credentials, request error, no
 results) is a silent skip that returns ``""`` so the model simply falls back to
 its own knowledge — no error or upsell is injected into the answer.
@@ -326,38 +327,34 @@ class WebSearchAgent:
 
     @staticmethod
     def is_enabled() -> bool:
-        """True when web search is enabled at both workspace and project level.
+        """True when the orchestrator should run a web search.
 
-        Two switches, deliberately. The workspace flag turns the feature off
-        everywhere (Settings); the project flag silences it for one project
-        and is what the Cmd/Ctrl+Alt+S shortcut toggles. Searching requires
-        both, so turning it off in Settings cannot be undone by a per-project
-        toggle.
+        Two questions, in cost order. The project flag is the user's own
+        choice, read off disk and free — it is what the Cmd/Ctrl+Alt+S
+        shortcut toggles. Then the account's own state, from
+        ``GET /v1/websearch/status``: signed in, with a provider registered.
 
-        Signing out disables it too: the hosted endpoint authenticates every
-        call, so without a token there is nothing to search with. Reporting
-        that as disabled — rather than enabled-but-failing — keeps the toggle
-        honest about what will actually happen.
+        Asking the endpoint up front is the point. Web search is otherwise
+        discovered to be unavailable only after normalizing the query, calling
+        the endpoint and throwing away a 403 — work done every turn to reach
+        the same answer. The status answer is cached briefly, and fails open,
+        so a health check that cannot complete never suppresses a search that
+        would have worked.
         """
         try:
-            from smartloop.auth import credential_store
             from smartloop.workspace.workspace import Workspace
-
-            if not credential_store.get_active_token():
-                logger.info("[web_search] not signed in — web search unavailable")
-                return False
 
             # Read the on-disk state first: agents can run in worker processes
             # whose cached singleton predates the toggle, so trusting the
             # in-memory copy would keep searching after the user disabled it.
             ws = Workspace.load() or Workspace._instance
-            if ws is None:
+            project = ws.current_project if ws else None
+            if not (project and project.web_search_enabled):
                 return False
-            if not ws.web_search_enabled:
-                logger.info("[web_search] disabled for the workspace")
-                return False
-            project = ws.current_project
-            return bool(project and project.web_search_enabled)
+
+            from smartloop.search.providers import hosted_search_available
+
+            return hosted_search_available()
         except Exception as e:
             logger.warning("[web_search] enablement check failed: %s", e)
             return False

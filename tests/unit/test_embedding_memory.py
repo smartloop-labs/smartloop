@@ -150,3 +150,34 @@ class TestCrawlUnloadsEmbeddings:
             indexer.crawl_server(object())
 
         assert calls == ["unload"]
+
+
+class TestInputClamp:
+    """No sequence may exceed n_ubatch — llama.cpp ggml_abort()s rather than
+    degrading, which takes the process with it."""
+
+    def test_oversized_input_is_truncated_before_reaching_the_model(self):
+        from smartloop.db.llama_embeddings import (
+            LlamaEmbedder,
+            _MAX_INPUT_CHARS,
+        )
+
+        model = _FakeModel()
+        seen = []
+        model.embed = lambda b: (seen.extend(len(t) for t in b),
+                                 [[1.0, 0.0] for _ in b])[1]
+
+        LlamaEmbedder(model, "test").encode(["x" * (_MAX_INPUT_CHARS * 3), "short"])
+
+        assert max(seen) <= _MAX_INPUT_CHARS
+
+    def test_context_is_large_enough_for_a_full_chunk(self):
+        """The clamp and the indexers' CHUNK_SIZE must stay consistent: a
+        chunk that fits the indexer must fit the embedder untruncated."""
+        from smartloop.db.llama_embeddings import _EMBED_N_CTX, _MAX_INPUT_CHARS
+        from smartloop.db.workspace_indexer import CHUNK_SIZE
+
+        assert _MAX_INPUT_CHARS >= CHUNK_SIZE
+        # Worst case is roughly one token per character; the context must still
+        # cover it or llama.cpp aborts.
+        assert _EMBED_N_CTX >= _MAX_INPUT_CHARS

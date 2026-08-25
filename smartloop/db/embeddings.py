@@ -11,6 +11,7 @@ public functions gracefully return ``None`` so callers fall back to TF-IDF.
 """
 
 import atexit
+import contextlib
 import logging
 import os
 import threading
@@ -115,6 +116,41 @@ def unload() -> None:
         logger.info("[embeddings] model unloaded")
     except Exception as e:
         logger.warning("[embeddings] unload failed: %s", e)
+
+
+# Depth of nested indexing_burst() scopes. Only the outermost unloads: an
+# indexer that calls another would otherwise drop the model out from under its
+# caller and force a mid-burst reload.
+_burst_depth = 0
+_burst_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def indexing_burst():
+    """Release the embedding model when this indexing scope finishes.
+
+    Indexing is bursty — a crawl or a workspace pass embeds a few hundred
+    chunks and then nothing touches the model for minutes — so holding a GGUF
+    and its llama.cpp context resident afterwards is pure cost. Wrapping the
+    entry points keeps that decision in one place; adding an indexer means
+    wrapping it, not remembering to call unload().
+
+    Unloads in a finally: an indexing pass that raised has still loaded the
+    model. Search is deliberately *not* wrapped — it queries repeatedly, and
+    unloading between queries would just thrash.
+    """
+    global _burst_depth
+
+    with _burst_lock:
+        _burst_depth += 1
+    try:
+        yield
+    finally:
+        with _burst_lock:
+            _burst_depth -= 1
+            outermost = _burst_depth == 0
+        if outermost:
+            unload()
 
 
 @atexit.register
