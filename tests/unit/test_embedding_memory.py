@@ -1,0 +1,152 @@
+"""Embedding memory behaviour: bounded encode batches, and unload after a crawl.
+
+Adding an MCP server used to push memory over: the crawl embedded every chunk
+in a single llama.cpp call, and the model then stayed resident with nothing to
+do. These cover both halves.
+"""
+import numpy as np
+import pytest
+
+
+class _FakeModel:
+    """Records the size of each embed() call."""
+
+    def __init__(self):
+        self.calls = []
+        self.closed = False
+
+    def embed(self, batch):
+        self.calls.append(len(batch))
+        return [[float(len(t)), 1.0] for t in batch]
+
+    def close(self):
+        self.closed = True
+
+
+class TestEncodeBatching:
+    def test_large_input_is_sliced_into_bounded_calls(self):
+        from smartloop.db.llama_embeddings import LlamaEmbedder, _MAX_ENCODE_BATCH
+
+        model = _FakeModel()
+        embedder = LlamaEmbedder(model, "test")
+
+        n = _MAX_ENCODE_BATCH * 2 + 5
+        out = embedder.encode([f"chunk {i}" for i in range(n)])
+
+        assert max(model.calls) <= _MAX_ENCODE_BATCH
+        assert sum(model.calls) == n
+        assert out.shape == (n, 2)
+
+    def test_slicing_does_not_change_the_result(self):
+        """Vectors must come back in input order, one per text, normalized."""
+        from smartloop.db.llama_embeddings import LlamaEmbedder, _MAX_ENCODE_BATCH
+
+        texts = [f"{'x' * i}" for i in range(1, _MAX_ENCODE_BATCH * 2)]
+        embedder = LlamaEmbedder(_FakeModel(), "test")
+
+        out = embedder.encode(texts)
+
+        assert out.shape[0] == len(texts)
+        assert np.allclose(np.linalg.norm(out, axis=1), 1.0)
+        # The fake encodes length in the first component, so order is checkable
+        # after normalization by comparing the ratio it implies.
+        assert out[0][0] < out[-1][0]
+
+    def test_single_string_still_returns_one_vector(self):
+        from smartloop.db.llama_embeddings import LlamaEmbedder
+
+        out = LlamaEmbedder(_FakeModel(), "test").encode("hello")
+        assert out.ndim == 1
+
+    def test_empty_input_does_not_call_the_model(self):
+        from smartloop.db.llama_embeddings import LlamaEmbedder
+
+        model = _FakeModel()
+        out = LlamaEmbedder(model, "test").encode([])
+
+        assert model.calls == []
+        assert out.shape[0] == 0
+
+
+class TestUnload:
+    @pytest.fixture(autouse=True)
+    def _restore(self):
+        """Never leave a fake in the module singleton."""
+        from smartloop.db import embeddings
+
+        before = (embeddings._model, embeddings._model_load_attempted)
+        yield
+        embeddings._model, embeddings._model_load_attempted = before
+
+    def test_unload_closes_and_clears_the_singleton(self):
+        from smartloop.db import embeddings
+
+        model = _FakeModel()
+        embeddings._model = model
+        embeddings._model_load_attempted = True
+
+        embeddings.unload()
+
+        assert model.closed is True
+        assert embeddings._model is None
+
+    def test_unload_allows_a_later_reload(self):
+        """The 'already tried' flag must be cleared, or unloading is permanent
+        and everything afterwards silently falls back to TF-IDF."""
+        from smartloop.db import embeddings
+
+        embeddings._model = _FakeModel()
+        embeddings._model_load_attempted = True
+
+        embeddings.unload()
+
+        assert embeddings._model_load_attempted is False
+
+    def test_unload_is_safe_when_nothing_is_loaded(self):
+        from smartloop.db import embeddings
+
+        embeddings._model = None
+        embeddings._model_load_attempted = False
+
+        embeddings.unload()  # must not raise
+
+    def test_unload_survives_a_failing_close(self):
+        from smartloop.db import embeddings
+
+        class Broken:
+            def close(self):
+                raise RuntimeError("metal teardown blew up")
+
+        embeddings._model = Broken()
+        embeddings.unload()
+
+        assert embeddings._model is None
+
+
+class TestCrawlUnloadsEmbeddings:
+    def test_crawl_server_unloads_even_when_the_crawl_raises(self, monkeypatch):
+        """A crawl that failed has still loaded the model."""
+        from smartloop.db import mcp_document_indexer as mod
+
+        calls = []
+        monkeypatch.setattr(
+            "smartloop.db.embeddings.unload", lambda: calls.append("unload")
+        )
+
+        indexer = object.__new__(mod.MCPDocumentIndexer)
+        import logging
+        import threading
+
+        indexer._lock = threading.RLock()
+        indexer._crawling = set()
+        indexer._logger = logging.getLogger("test")
+
+        def boom(*a, **k):
+            raise RuntimeError("crawl failed")
+
+        monkeypatch.setattr(indexer, "_crawl_server", boom, raising=False)
+
+        with pytest.raises(RuntimeError):
+            indexer.crawl_server(object())
+
+        assert calls == ["unload"]

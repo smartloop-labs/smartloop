@@ -87,6 +87,36 @@ def _get_model(base_dir: Optional[str] = None):
         return _model
 
 
+def unload() -> None:
+    """Release the embedding model, freeing its weights and llama.cpp context.
+
+    Indexing is bursty — an MCP crawl embeds a few hundred chunks and then
+    nothing touches the model for minutes — but the singleton held the GGUF
+    resident for the life of the process. Dropping it after a burst returns
+    that memory; the next search reloads it lazily.
+
+    ``_model_load_attempted`` is cleared as well as ``_model``. It exists to
+    stop retrying a load that failed, and leaving it set here would make the
+    unload permanent: every later call would see the "already tried" flag and
+    fall back to TF-IDF for the rest of the process.
+    """
+    global _model, _model_load_attempted
+
+    with _load_lock:
+        m, _model = _model, None
+        _model_load_attempted = False
+
+    if m is None:
+        return
+    try:
+        close = getattr(m, "close", None)
+        if close is not None:
+            close()
+        logger.info("[embeddings] model unloaded")
+    except Exception as e:
+        logger.warning("[embeddings] unload failed: %s", e)
+
+
 @atexit.register
 def _shutdown_embeddings() -> None:
     """Close the GPU-offloaded embedder at interpreter exit.

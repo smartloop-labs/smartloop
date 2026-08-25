@@ -361,6 +361,18 @@ class MCPDocumentIndexer:
                 return self._crawl_server(server, ttl, force, on_server_updated)
             finally:
                 self._crawling.discard(server_id)
+                # A crawl embeds a burst of chunks and then leaves the model
+                # resident with nothing to do. Release it here: the next search
+                # reloads lazily, and holding a GGUF plus its llama.cpp context
+                # idle is what pushed memory over when adding a server.
+                # In the finally block on purpose — a crawl that raised has
+                # still loaded the model.
+                try:
+                    from smartloop.db import embeddings
+
+                    embeddings.unload()
+                except Exception as e:  # never let cleanup fail the crawl
+                    self._logger.warning("[mcp-index] embedding unload failed: %s", e)
 
     def search(
         self,

@@ -37,6 +37,14 @@ _POOLING_TYPE_UNSPECIFIED = -1
 # chunks are far shorter, but sizing to the model's max avoids silent truncation.
 _EMBED_N_CTX = 8192
 
+# Chunks handed to llama.cpp per embed() call.  The whole list used to go in
+# one call, so indexing a large document (an MCP crawl can produce hundreds of
+# chunks) allocated for every chunk at once — with n_ubatch sized to the full
+# 8192-token context, that is what pushed memory over.  Slicing bounds the peak
+# to a fixed cost regardless of how much is being indexed; the model is loaded
+# once either way, so the only price is a few more calls.
+_MAX_ENCODE_BATCH = 16
+
 # First-run GGUF download.  The read timeout bounds the idle gap between
 # received bytes (a stalled transfer is detected instead of hanging), not the
 # total transfer time — a ~400MB model is allowed to take as long as it takes.
@@ -70,9 +78,12 @@ class LlamaEmbedder:
         if not batch:
             return np.empty((0, 0), dtype=np.float32)
 
-        # embed() returns one vector per input (pooling is enabled).
+        # embed() returns one vector per input (pooling is enabled).  Sliced
+        # so peak memory tracks _MAX_ENCODE_BATCH rather than len(batch).
+        vecs: List[list] = []
         with self._lock:
-            vecs = self._model.embed(batch)
+            for i in range(0, len(batch), _MAX_ENCODE_BATCH):
+                vecs.extend(self._model.embed(batch[i:i + _MAX_ENCODE_BATCH]))
         arr = np.asarray(vecs, dtype=np.float32)
 
         # L2-normalize so cosine similarity == dot product (the sqlite store
