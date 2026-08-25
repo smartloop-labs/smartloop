@@ -181,3 +181,37 @@ class TestInputClamp:
         # Worst case is roughly one token per character; the context must still
         # cover it or llama.cpp aborts.
         assert _EMBED_N_CTX >= _MAX_INPUT_CHARS
+
+
+class TestUnloadAfterResponse:
+    def test_auxiliary_unload_also_drops_the_embedder(self, monkeypatch):
+        """Retrieval finishes long before the response does, so the embedder is
+        idle from then until the next question — same as the auxiliary LLMs."""
+        from smartloop.api.services.model_service import ModelService
+
+        calls = []
+        monkeypatch.setattr("smartloop.db.embeddings.unload", lambda: calls.append("unload"))
+
+        svc = object.__new__(ModelService)
+        monkeypatch.setattr(svc, "unload_vision_model", lambda: None, raising=False)
+        monkeypatch.setattr(svc, "unload_large_model", lambda: None, raising=False)
+        monkeypatch.setattr(svc, "_evict_capability_models", lambda: None, raising=False)
+
+        svc.unload_auxiliary_models()
+
+        assert calls == ["unload"]
+
+    def test_a_failing_unload_does_not_break_the_response(self, monkeypatch):
+        from smartloop.api.services.model_service import ModelService
+
+        def _boom():
+            raise RuntimeError("teardown blew up")
+
+        monkeypatch.setattr("smartloop.db.embeddings.unload", _boom)
+
+        svc = object.__new__(ModelService)
+        monkeypatch.setattr(svc, "unload_vision_model", lambda: None, raising=False)
+        monkeypatch.setattr(svc, "unload_large_model", lambda: None, raising=False)
+        monkeypatch.setattr(svc, "_evict_capability_models", lambda: None, raising=False)
+
+        svc.unload_auxiliary_models()  # must not raise
