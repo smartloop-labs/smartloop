@@ -259,3 +259,9 @@ class LLMExecutor:
         self._io_pool.shutdown(wait=wait)
         if self._llm_pool is not None:
             self._llm_pool.shutdown(wait=wait)
+            self._llm_pool = None
+        # Release the shared log queue: it is a multiprocessing.Queue whose
+        # POSIX semaphores are only unlinked once the last reference goes
+        # away (see logging_setup.shutdown_logging).  An executor that
+        # outlives the server's logging teardown would otherwise pin it.
+        self._log_queue = None

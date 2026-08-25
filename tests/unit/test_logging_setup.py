@@ -236,27 +236,50 @@ def test_shutdown_logging_is_idempotent(monkeypatch):
     assert get_log_queue() is None
 
 
-def test_shutdown_logging_prevents_leaked_semaphores():
+def test_shutdown_logging_prevents_leaked_semaphores(tmp_path):
     """No ``leaked semaphore objects`` warning when the process dies abruptly.
 
     A ``multiprocessing.Queue`` holds three POSIX semaphores that are unlinked
     by exit finalizers.  ``slp agent stop`` escalates to SIGKILL, which skips
     them — ``os._exit`` reproduces that here.  ``shutdown_logging`` must have
     already released them, so the resource tracker finds nothing to warn about.
+
+    The child runs the *full* server arrangement — a started listener, still
+    referenced after the call, as ``main.lifespan`` leaves it — because it is
+    ``listener.queue`` that used to pin the queue past teardown.
+
+    The warning is emitted by the resource-tracker process, not the child, so
+    stderr goes to a file both inherit and is polled after the child exits
+    (a ``capture_output`` pipe closes too early to see it).
     """
     prog = textwrap.dedent(
         """
-        import os
+        import os, sys
         from smartloop.utils.logging_setup import (
-            get_log_queue, make_log_queue, setup_root_logging, shutdown_logging,
+            make_log_queue, setup_root_logging, shutdown_logging, start_listener,
         )
-        make_log_queue()
-        setup_root_logging(get_log_queue())
-        shutdown_logging()
+        queue = make_log_queue()
+        setup_root_logging(queue, level="DEBUG")
+        listener = start_listener(queue, home_dir=sys.argv[1], force_console=False)
+        shutdown_logging(listener)
         os._exit(0)
         """
     )
-    proc = subprocess.run(
-        [sys.executable, "-c", prog], capture_output=True, text=True, timeout=120,
-    )
-    assert "leaked semaphore" not in proc.stderr, proc.stderr
+    err_path = tmp_path / "child-stderr.txt"
+    with err_path.open("wb") as err:
+        subprocess.run(
+            [sys.executable, "-c", prog, str(tmp_path)],
+            stdout=subprocess.DEVNULL, stderr=err, timeout=120,
+        )
+
+    # The tracker writes as soon as it sees EOF on the child's pipe; poll
+    # briefly so a slow write can't turn a real leak into a passing test.
+    deadline = time.monotonic() + 5
+    stderr = ""
+    while time.monotonic() < deadline:
+        stderr = err_path.read_text()
+        if "leaked semaphore" in stderr:
+            break
+        time.sleep(0.1)
+
+    assert "leaked semaphore" not in stderr, stderr

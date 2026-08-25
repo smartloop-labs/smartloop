@@ -161,6 +161,11 @@ def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) 
             listener.stop()
         except Exception:
             pass
+        # ``stop()`` joins the listener thread but keeps ``listener.queue``
+        # set, and the caller still holds the listener itself — that single
+        # strong reference is enough to keep the Queue (and therefore its
+        # semaphores) alive past this function.  Drop it explicitly.
+        listener.queue = None
 
     # Detach the QueueHandler first: a record emitted after the queue closes
     # would raise inside logging.  Root falls back to logging.lastResort,
@@ -173,6 +178,9 @@ def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) 
                 h.close()
             except Exception:
                 pass
+            # Handler.close() only deregisters the handler from logging's
+            # internal tables; ``h.queue`` stays bound, so clear it too.
+            h.queue = None
 
     queue, _LOG_QUEUE = _LOG_QUEUE, None
     # queue.Queue has no close(); only the multiprocessing one holds semaphores.
@@ -183,12 +191,27 @@ def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) 
         except Exception:
             pass
 
-    # close() only tears down the pipe — the semaphores are unlinked by the
-    # finalizers that fire when the Queue is collected.  Drop the last
-    # reference and force that collection now, while we still control the
-    # exit path.  Callers must clear their own references (e.g.
-    # ``app.state.log_queue``) before calling.
-    del queue
+    # close() only tears down the pipe.  Each of the three semaphores is
+    # unlinked by a ``util.Finalize`` that fires when its ``SemLock`` is
+    # collected — so waiting for the *queue* to become unreachable makes
+    # cleanup hostage to every reference anywhere in the process (a caller's
+    # local, an ``LLMExecutor`` that outlived teardown).  Detaching the locks
+    # makes them unreachable on their own, so the standard finalizers run
+    # here, under our control, whoever else still holds the queue.  Safe
+    # because the queue is closed: ``put``/``get`` check ``_closed`` and
+    # raise ValueError before they ever reach these locks.
+    locks, lock = [], None  # bound up front: the loop may not run at all
+    for attr in ("_rlock", "_wlock", "_sem"):
+        lock = getattr(queue, attr, None)
+        if lock is None:
+            continue
+        locks.append(lock)
+        try:
+            setattr(queue, attr, None)
+        except Exception:
+            locks.pop()
+
+    del queue, locks, lock
     gc.collect()
 
 

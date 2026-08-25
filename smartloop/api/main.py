@@ -217,8 +217,6 @@ async def lifespan(app: FastAPI):
     # only released by exit finalizers, which a SIGKILLed server never runs.
     from smartloop.utils.logging_setup import shutdown_logging
     _listener = getattr(app.state, "log_listener", None)
-    # Drop our references first — shutdown_logging can only release the
-    # semaphores once nothing else holds the queue alive.
     app.state.log_listener = None
     app.state.log_queue = None
     shutdown_logging(_listener)
