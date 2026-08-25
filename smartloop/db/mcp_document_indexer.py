@@ -51,6 +51,7 @@ from smartloop.mcp.crawl_plans import (
     declares_argument,
     filter_arguments,
     resolve_argument,
+    render_url,
     resolve_plan,
     resolve_tool,
     tool_schema,
@@ -770,7 +771,12 @@ class MCPDocumentIndexer:
                     "step": step.label,
                     "tool_name": tool,
                     "record_id": record.record_id or "",
-                    "source_url": record.url or "",
+                    # A step may know a durable address for its records where
+                    # the listing only handed back an ephemeral one.
+                    "source_url": (
+                        render_url(step.url_template, record.record_id)
+                        or record.url or ""
+                    ),
                     "title": title,
                 }
 

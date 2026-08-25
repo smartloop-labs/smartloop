@@ -101,6 +101,11 @@
 #                    servers where one tool covers several operations and an
 #                    argument says which one:
 #                      detail_arguments = { action = "get" }
+#    url_template    a durable web address for each record, built from its id:
+#                      url_template = "https://example.com/d/{id}"
+#                    For the servers whose listings hand back a URL that is not
+#                    stable. Preferred over that URL when set; unset leaves it
+#                    alone, which is right for most servers.
 #    max_records     records kept from this step (default 40). A crawl is a
 #                    refresh, not an export: this bounds the embedding work and
 #                    the number of follow-up detail calls.
@@ -524,6 +529,11 @@ max_records = 25
 [[mcp.index]]
 label = "designs"
 tools = ["search-designs", "search_designs", "list_designs"]
+# The listing's own `edit_url` is a share link minted per call — the same design
+# came back with five different `/d/<token>` values across five crawls. Canva's
+# tool descriptions document the stable form, and it is built from the id the
+# record already carries.
+url_template = "https://www.canva.com/design/{id}"
 arguments = { ownership = "any", sort_by = "modified_descending", limit = 50, user_intent = "Index every design so its content can be retrieved" }
 detail_tools = ["get-design-content", "get_design_content"]
 detail_arguments = { content_types = ["richtexts"], user_intent = "Read the text content of a design" }

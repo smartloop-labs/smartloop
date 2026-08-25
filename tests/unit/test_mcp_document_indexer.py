@@ -1078,6 +1078,87 @@ class TestRecordIdentity:
             assert by_step["root-items"]["new"] == 0
 
 
+class TestDurableUrls:
+    """A stored URL outlives the crawl that found it, so it has to be stable.
+
+    Canva mints a fresh ``/d/<token>`` share link on every call — five crawls of
+    one design produced five different tokens — so snapshotting one stores a
+    link that may rot, and a share link is a capability rather than an address.
+    """
+
+    def test_a_template_is_filled_with_the_record_id(self):
+        from smartloop.mcp.crawl_plans import render_url
+
+        assert render_url(
+            "https://www.canva.com/design/{id}", "DAHS4TDHiec"
+        ) == "https://www.canva.com/design/DAHS4TDHiec"
+
+    def test_nothing_is_rendered_when_it_would_be_a_broken_link(self):
+        # Each of these would otherwise emit a URL with a literal {id} in it,
+        # or a URL for a record that has no id to identify.
+        from smartloop.mcp.crawl_plans import render_url
+
+        assert render_url("https://x/{id}", None) is None
+        assert render_url(None, "DAHS4TDHiec") is None
+        assert render_url("https://x/{wrong}", "DAHS4TDHiec") is None
+        assert render_url("https://x/no-placeholder", "DAHS4TDHiec") is None
+
+    def _crawl(self, td, url_template, payload_url="https://canva.com/d/EPHEMERAL"):
+        from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
+
+        plan = CrawlPlan(slug="c", steps=(CrawlStep(
+            label="designs", tools=("search-designs",),
+            url_template=url_template,
+        ),))
+        server = _server(name="Canva", slug="canva", tools=[
+            _tool("search-designs", {"properties": {}}),
+        ])
+        caller = FakeCaller({"search-designs": _result({"items": [
+            {"design_id": "DAHS4TDHiec", "title": "Deck", "url": payload_url},
+        ]})})
+        idx = _indexer(td, caller)
+        with patch(
+            "smartloop.db.mcp_document_indexer.resolve_plan", return_value=plan
+        ):
+            idx.crawl_server(server, force=True)
+        chunk = idx._store.add_chunks.call_args_list[0][0][0][0]
+        return chunk["source_url"]
+
+    def test_the_template_beats_the_url_the_listing_returned(self):
+        with tempfile.TemporaryDirectory() as td:
+            assert self._crawl(
+                td, "https://www.canva.com/design/{id}"
+            ) == "https://www.canva.com/design/DAHS4TDHiec"
+
+    def test_without_a_template_the_listing_url_is_kept(self):
+        # The common case, and what Notion/Linear/Trello rely on.
+        with tempfile.TemporaryDirectory() as td:
+            assert self._crawl(td, None) == "https://canva.com/d/EPHEMERAL"
+
+    def test_a_template_that_cannot_be_filled_falls_back(self):
+        from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
+
+        with tempfile.TemporaryDirectory() as td:
+            plan = CrawlPlan(slug="c", steps=(CrawlStep(
+                label="designs", tools=("search-designs",),
+                url_template="https://www.canva.com/design/{id}",
+            ),))
+            server = _server(name="Canva", slug="canva", tools=[
+                _tool("search-designs", {"properties": {}}),
+            ])
+            # No id anywhere, so there is nothing to build a URL from.
+            caller = FakeCaller({"search-designs": _result({"items": [
+                {"title": "Untitled", "url": "https://canva.com/d/FALLBACK"},
+            ]})})
+            idx = _indexer(td, caller)
+            with patch(
+                "smartloop.db.mcp_document_indexer.resolve_plan", return_value=plan
+            ):
+                idx.crawl_server(server, force=True)
+            chunk = idx._store.add_chunks.call_args_list[0][0][0][0]
+            assert chunk["source_url"] == "https://canva.com/d/FALLBACK"
+
+
 class TestDetailArguments:
     """A detail call is not always just the record's id.
 

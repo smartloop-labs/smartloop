@@ -252,6 +252,20 @@ class TestCuratedPlanShape:
         assert steps["presentations"].needs_arguments == ("design_types",)
         assert steps["presentations"].arguments["design_types"] == ["presentation"]
 
+    def test_canva_builds_a_durable_design_url_from_the_id(self):
+        # The listing's own edit_url is a share link minted per call — the same
+        # design came back with five different /d/<token> values across five
+        # crawls.  Canva documents the stable form, built from the id.
+        designs = self._steps(CANVA_PLAN)["designs"]
+        assert designs.url_template == "https://www.canva.com/design/{id}"
+
+    def test_only_the_step_that_needs_a_template_declares_one(self):
+        # Notion, Linear and Trello hand back durable URLs already; a template
+        # there would replace a good URL with a guess.
+        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN):
+            for step in plan.steps:
+                assert step.url_template is None, f"{plan.slug}/{step.label}"
+
     def test_canva_fetches_the_body_before_the_folder_walk_dedupes_it_away(self):
         # Records are deduped by id across steps and only the step that first
         # documents a record fetches its body.  With a folder listing ahead of
