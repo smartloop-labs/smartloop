@@ -4158,15 +4158,14 @@ class ModelService:
                 return
             if self._llm is None:
                 self.load_model()
-            # Opportunistic only: use the large model when an earlier request
-            # already left it resident, but never *trigger* the load here.
-            # _get_large_llm() would load a multi-GB model with an auto-sized
-            # context (up to 131072 on Apple Silicon, ~10GB of KV cache) that
-            # nothing on the registration path ever unloads —
-            # unload_large_model() is only reached from the chat router. The
-            # two prompts below are a few thousand tokens over a tool list;
-            # the resident router model is the right size for them.
-            llm = self._large_llm or self._llm
+            # Always the small router model, never the large one — even when a
+            # prior chat request left it resident. The two prompts below are a
+            # few thousand tokens over a tool list producing a one-line
+            # description, three tags and a short capability blurb; the mini is
+            # the right size for that, and reaching for the large model here
+            # means competing for memory (and the inference slot) with whatever
+            # the user is actually doing.
+            llm = self._llm
             if llm is None:
                 return
             from smartloop.agents.mcp.server_summarizer import MCPServerSummarizer

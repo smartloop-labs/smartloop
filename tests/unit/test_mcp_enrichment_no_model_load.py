@@ -9,9 +9,10 @@ cache — and nothing on the registration path ever unloads it
 ``POST /v1/projects/{id}/mcp/register`` permanently parked ~10GB in the API
 process in order to run two short summarization prompts over a tool list.
 
-Enrichment now reads ``_large_llm`` directly: it uses the large model when an
-earlier request already left it resident, and otherwise falls back to the
-always-resident router model without triggering any load.
+Enrichment now uses the small router model unconditionally — it never reads
+``_large_llm`` at all.  The prompts are short and low-stakes (a one-line
+description, three tags, a capability blurb), so they are not worth the large
+model's memory even when a prior chat request already left it resident.
 """
 
 import inspect
@@ -54,14 +55,15 @@ class TestEnrichmentNeverTriggersAModelLoad:
         svc._get_large_llm.assert_not_called()
         svc._detect_large_model.assert_not_called()
 
-    def test_resident_large_model_is_used_for_free(self):
-        """When a prior chat request already loaded it, prefer it — that costs
-        nothing and produces better copy."""
+    def test_resident_large_model_is_still_not_used(self):
+        """Even when a prior chat request left the large model resident,
+        enrichment sticks to the router model — these prompts never justify the
+        larger model's memory or its share of the inference slot."""
         svc = MagicMock()
         svc._llm = MagicMock(name="router")
         svc._large_llm = MagicMock(name="large")
 
-        assert _run_enrichment(svc) is svc._large_llm
+        assert _run_enrichment(svc) is svc._llm
         svc._get_large_llm.assert_not_called()
 
     def test_router_model_is_loaded_when_absent(self):
@@ -90,3 +92,4 @@ class TestEnrichmentNeverTriggersAModelLoad:
             if not line.lstrip().startswith("#")
         )
         assert "_get_large_llm" not in code
+        assert "_large_llm" not in code
