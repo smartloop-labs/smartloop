@@ -73,7 +73,15 @@ class TestWebSearchRunsAlongsideLocalContext:
 
 
 class TestWebSearchStillGated:
-    def test_mcp_tool_result_suppresses_web_search(self, monkeypatch, searched):
+    def test_mcp_tool_result_no_longer_suppresses_web_search(self, monkeypatch, searched):
+        """A live tool result used to cancel the search outright.
+
+        "Deliberately invoked" only meant the router picked the tool, not that
+        its output answered the question — so a query spanning both ("how does
+        our roadmap compare to what they announced") lost half its context.
+        Both are collected now; which one actually answers is synthesis's call,
+        and the explore assembly puts the local source first.
+        """
         ex = _explorer(monkeypatch, searched)
         monkeypatch.setattr(Explorer, "_run_mcp", lambda self, *a: "MCP TOOL (list_issues):\n#1 open")
 
@@ -82,8 +90,8 @@ class TestWebSearchStillGated:
             mcp_servers=[MagicMock()], project_dir="/tmp/p",
         )
 
-        assert searched == []
-        assert ctx.web_context == ""
+        assert searched == ["list my issues"]
+        assert ctx.web_context
         assert ctx.mcp_context
 
     def test_disabled_project_never_searches(self, monkeypatch, searched):

@@ -808,20 +808,19 @@ Does answering the latest message require a new web search?
             # Deciding which of the collected sources actually answers the
             # question is the synthesis step's job; collect just gathers.
             #
-            # The one exception is an MCP tool that already ran for this query:
-            # it was selected and invoked deliberately, so a web citation on
-            # "list my issues" would be noise.
+            # That applies to a live MCP tool result too. It used to cancel the
+            # web search outright, on the reasoning that a deliberately invoked
+            # tool had already answered — but "deliberately invoked" only means
+            # the router picked it, not that its output answered the question,
+            # and a query spanning both ("how does our roadmap compare to what
+            # they announced") lost half its context. Both are gathered now and
+            # the ordering above puts the local one first.
             #
-            # The other exception is a follow-up that only reworks the answer
-            # already on screen ("now make it a table") — see
+            # The remaining exception is a follow-up that only reworks the
+            # answer already on screen ("now make it a table") — see
             # :meth:`_needs_web_search`.
             if self.web_search_agent.is_enabled():
-                if ctx.mcp_context:
-                    logger.info(
-                        "[collect] Skipping web search — an MCP tool already "
-                        "answered this query"
-                    )
-                elif self._needs_web_search(query, conversation_history):
+                if self._needs_web_search(query, conversation_history):
                     ctx.web_context = self._search_web(query)
                     if self.web_search_agent.last_sources:
                         ctx.web_sources = list(self.web_search_agent.last_sources)
