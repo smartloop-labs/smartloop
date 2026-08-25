@@ -1,1 +1,1 @@
-"""Web search provider abstraction — see :mod:`smartloop.search.providers`."""
+"""Web search client — see :mod:`smartloop.search.providers`."""

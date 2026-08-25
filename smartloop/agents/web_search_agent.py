@@ -8,12 +8,13 @@ to the query, and returns the top ``top_k`` sources so the LLM can reason over
 up-to-date information.
 
 Enablement is per project (``Project.web_search_enabled``), toggled via
-``PATCH /v1/projects/{id}/websearch``. The hosted endpoint is itself gated by
-the caller's plan — a 401/403 means the account isn't on a plan that includes
-web search. Web search is part of explore: any failure (disabled, 401/403,
-no credentials, request error, no results) is a silent skip that returns ``""``
-so the model simply falls back to its own knowledge — no error or upsell is
-injected into the answer.
+``PATCH /v1/projects/{id}/websearch``. Whether the endpoint will actually serve
+a search is decided entirely server-side — whether a search provider is
+registered on the account (managed from the web app) — and comes back as a
+401/403. This side never sees a provider name or an API key. Web search is part
+of explore: any failure (disabled, 401/403, no credentials, request error, no
+results) is a silent skip that returns ``""`` so the model simply falls back to
+its own knowledge — no error or upsell is injected into the answer.
 """
 
 import logging
@@ -168,16 +169,13 @@ class WebSearchAgent:
         """Search the web for *query* and return fetched result content.
 
         Returns ``""`` (never raises, never a notice) when web search is
-        disabled, forbidden (401/403 — plan gate), unauthenticated, or fails —
+        disabled for the project, forbidden (401/403 — no plan or no provider
+        registered on the account), unauthenticated, or fails —
         so it silently skips and the model falls back to its own knowledge
         instead of surfacing an error/upsell in the answer.
         """
         if not self.is_enabled():
             logger.info("[web_search] disabled for this project — skipping")
-            return ""
-
-        if not self.is_configured():
-            logger.info("[web_search] no search provider/token configured — skipping")
             return ""
 
         want = top_k or self._top_k
@@ -210,12 +208,11 @@ class WebSearchAgent:
     # ---------------------------------------------------------------- endpoint
 
     def _fetch_links(self, query: str, count: int) -> List[str]:
-        """Return result URLs for *query* from the configured search provider.
+        """Return result URLs for *query* from the hosted endpoint.
 
-        Uses the user-registered provider (e.g. Brave) when one is configured,
-        otherwise the hosted ``/v1/websearch`` endpoint.  Raises
-        ``SearchAuthError`` when the provider rejects the credentials, and
-        ``NoSearchCredentials`` when none are available.
+        Raises ``SearchAuthError`` when the endpoint refuses the request
+        (no plan or no registered provider) and ``NoSearchCredentials`` when
+        we have no Smartloop token to call it with.
         """
         from smartloop.search.providers import resolve_provider
 
@@ -341,19 +338,4 @@ class WebSearchAgent:
             return bool(project and project.web_search_enabled)
         except Exception as e:
             logger.warning("[web_search] enablement check failed: %s", e)
-            return False
-
-    @staticmethod
-    def is_configured() -> bool:
-        """True when a search provider with a token (e.g. Brave) is configured.
-
-        Without a configured provider/token there is nothing to search with, so
-        ``search`` skips silently rather than calling the hosted endpoint.
-        """
-        try:
-            from smartloop.search.providers import get_search_provider
-
-            return get_search_provider() is not None
-        except Exception as e:
-            logger.warning("[web_search] provider config check failed: %s", e)
             return False
