@@ -3088,14 +3088,20 @@ class ModelService:
         turn and is finished well before the response is; holding its weights
         and llama.cpp context until the next question is the same idle cost as
         the auxiliary LLMs. It reloads lazily on the next search.
+
+        Each unload is guarded on its own so one failure still returns the
+        other models' VRAM instead of skipping the rest of the cleanup.
         """
-        try:
-            self.unload_vision_model()
-            self.unload_large_model()
-            self._evict_capability_models()
-            self.unload_embedding_model()
-        except Exception as e:  # cleanup must never fail a response
-            logger.warning("[models] auxiliary models unload failed: %s", e)
+        for name, unload in (
+            ("vision", self.unload_vision_model),
+            ("large", self.unload_large_model),
+            ("capability", self._evict_capability_models),
+            ("embedding", self.unload_embedding_model),
+        ):
+            try:
+                unload()
+            except Exception as e:  # cleanup must never fail a response
+                logger.warning("[models] %s unload failed: %s", name, e)
 
     def unload_model_by_name(self, model_name: str) -> bool:
         """Free VRAM held by a specific model, e.g. when it's deselected.
