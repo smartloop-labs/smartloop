@@ -1234,6 +1234,49 @@ class TestMcpSourceAttribution:
         assert _mcp_source("plain/doc", self._chunk({})) == "plain/doc"
         assert _mcp_source("plain/doc", self._chunk(None)) == "plain/doc"
 
+    def test_the_record_url_travels_in_the_source_line(self):
+        """The one thing in the header the model cannot reconstruct.
+
+        Answering from a live tool call handed the user a link they could click
+        straight through to the design; answering from the index handed them
+        `<server>/<step>/<title>`, which reads like a file path and opens
+        nothing.  The URL is deliberately stripped from the embedded text — a
+        link is noise in an embedding — so the header is the only place it can
+        travel.
+        """
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "Canva/designs/Canva MCP TESTING",
+            self._chunk({
+                "tool_name": "search-designs", "server_name": "Canva",
+                "source_url": "https://www.canva.com/d/0_Dv9PwBsQmYOOc",
+            }),
+        )
+        assert out.endswith("https://www.canva.com/d/0_Dv9PwBsQmYOOc")
+        assert "search-designs" in out
+
+    def test_a_record_without_a_url_gains_no_empty_separator(self):
+        # source_url is stored as "" when the record had none, and a trailing
+        # " — " would read as a truncated link.
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "notion/pages/Roadmap",
+            self._chunk({"tool_name": "search_pages", "server_name": "Notion",
+                         "source_url": ""}),
+        )
+        assert out == "Notion · search_pages — notion/pages/Roadmap"
+
+    def test_indexed_chunks_carry_the_record_url(self):
+        """The read path can only surface what indexing stored."""
+        import inspect
+
+        from smartloop.db import mcp_document_indexer as mod
+
+        src = inspect.getsource(mod)
+        assert '"source_url": doc["source_url"]' in src
+
     def test_indexed_chunks_carry_the_tool_name(self):
         """The read path can only surface what indexing stored."""
         import inspect

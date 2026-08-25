@@ -89,17 +89,26 @@ def _mcp_source(name: str, chunk: Any) -> str:
     way to say where it came from, and could not name the tool when asked. The
     tool is the source for MCP content, so it leads.
 
-    Read from metadata rather than baked into ``document_name`` at index time,
-    so content already crawled gains the attribution without a re-index.
+    The record's own URL comes next, and it is the one thing here the model
+    cannot reconstruct.  A live tool call returns raw JSON, so answering from
+    one gave the user a link they could click straight through to the Canva
+    design or Notion page; answering from the index gave them
+    ``<server>/<step>/<title>``, which reads like a file path and opens
+    nothing.  The URL is stripped from the embedded text on purpose — a link is
+    noise in an embedding, and ``ResultFormatter.is_noisy_value`` drops every
+    ``*_url`` key — so the header is where it has to travel.
+
+    All read from metadata rather than baked into ``document_name`` at index
+    time, so content already crawled gains both without a re-index.
     """
     meta = getattr(chunk, "metadata", None) or {}
     tool = meta.get("tool_name")
     server = meta.get("server_name")
-    if tool and server:
-        return f"{server} · {tool} — {name}"
-    if tool:
-        return f"{tool} — {name}"
-    return name
+    url = (meta.get("source_url") or "").strip()
+    parts = [p for p in (f"{server} · {tool}" if tool and server else tool, name) if p]
+    if url:
+        parts.append(url)
+    return " — ".join(parts) if parts else name
 
 
 def _crawl_age(chunk: Any) -> str:
