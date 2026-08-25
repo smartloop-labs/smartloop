@@ -326,15 +326,37 @@ class WebSearchAgent:
 
     @staticmethod
     def is_enabled() -> bool:
-        """True when web search is enabled on the current project."""
+        """True when web search is enabled at both workspace and project level.
+
+        Two switches, deliberately. The workspace flag turns the feature off
+        everywhere (Settings); the project flag silences it for one project
+        and is what the Cmd/Ctrl+Alt+S shortcut toggles. Searching requires
+        both, so turning it off in Settings cannot be undone by a per-project
+        toggle.
+
+        Signing out disables it too: the hosted endpoint authenticates every
+        call, so without a token there is nothing to search with. Reporting
+        that as disabled — rather than enabled-but-failing — keeps the toggle
+        honest about what will actually happen.
+        """
         try:
+            from smartloop.auth import credential_store
             from smartloop.workspace.workspace import Workspace
+
+            if not credential_store.get_active_token():
+                logger.info("[web_search] not signed in — web search unavailable")
+                return False
 
             # Read the on-disk state first: agents can run in worker processes
             # whose cached singleton predates the toggle, so trusting the
             # in-memory copy would keep searching after the user disabled it.
             ws = Workspace.load() or Workspace._instance
-            project = ws.current_project if ws else None
+            if ws is None:
+                return False
+            if not ws.web_search_enabled:
+                logger.info("[web_search] disabled for the workspace")
+                return False
+            project = ws.current_project
             return bool(project and project.web_search_enabled)
         except Exception as e:
             logger.warning("[web_search] enablement check failed: %s", e)

@@ -4247,12 +4247,47 @@ class ModelService:
         return {"project_id": project.id, "enabled": bool(project.web_search_enabled)}
 
     def set_web_search_enabled(self, project_id: str, enabled: bool) -> dict:
-        """Enable/disable web search (Pro feature) for the given project."""
+        """Enable/disable web search for the given project."""
         project = self._get_project(project_id)
         project.web_search_enabled = enabled
         self._model.save()
         logger.info("[web-search] project %s enabled=%s", project.id, enabled)
         return {"project_id": project.id, "enabled": bool(project.web_search_enabled)}
+
+    def _web_search_state(self) -> dict:
+        """Workspace switch, plus why it may not do anything.
+
+        ``signed_in`` is reported separately from ``available`` because the
+        client treats them differently: signed out is a precondition the user
+        cannot toggle their way out of, so the control is disabled rather than
+        left on with a warning beside it.
+        """
+        from smartloop.agents.web_search_agent import WebSearchAgent
+        from smartloop.auth import credential_store
+
+        workspace = self._model.workspace
+        return {
+            "enabled": bool(workspace.web_search_enabled),
+            "signed_in": bool(credential_store.get_active_token()),
+            "available": WebSearchAgent.is_enabled(),
+        }
+
+    def get_workspace_web_search_config(self) -> dict:
+        """Return the workspace-wide web search switch."""
+        self._ensure_model()
+        return self._web_search_state()
+
+    def set_workspace_web_search_enabled(self, enabled: bool) -> dict:
+        """Enable/disable web search across the whole workspace.
+
+        Sits above the per-project flag: the orchestrator searches only when
+        both are on, so turning this off cannot be undone per project.
+        """
+        self._ensure_model()
+        self._model.workspace.web_search_enabled = enabled
+        self._model.save()
+        logger.info("[web-search] workspace enabled=%s", enabled)
+        return self._web_search_state()
 
     def _write_mcp_doc(
         self,
