@@ -51,6 +51,7 @@ from smartloop.mcp.crawl_plans import (
     declares_argument,
     filter_arguments,
     resolve_argument,
+    render_url,
     resolve_plan,
     resolve_tool,
     tool_schema,
@@ -158,6 +159,21 @@ def _unwrap_records(data: Any) -> List[Any]:
             nested = _unwrap_records(only)
             if nested:
                 return nested
+    # An envelope that names its list with a word this module has not seen:
+    # ``{"workspaces": [...], "nextCursor": ..., "hasMore": false}``.  Every
+    # server pluralizes its own entities, so enumerating the names is a losing
+    # game — one list-of-objects key and no identity of its own is taken as the
+    # envelope it is.  The identity check is what keeps ``{"id": ...,
+    # "labels": [...]}`` a single record: a record has an id, an envelope
+    # doesn't.
+    if not _first_str(data, RECORD_ID_KEYS):
+        listed = [
+            value for value in data.values()
+            if isinstance(value, list)
+            and all(isinstance(item, dict) for item in value)
+        ]
+        if len(listed) == 1:
+            return listed[0]
     return [data]
 
 
@@ -177,6 +193,27 @@ def _record_text(record: Any) -> str:
         return ResultFormatter.flatten_to_text(compacted).strip()
     except Exception:
         return json.dumps(record, default=str)[:MAX_RECORD_CHARS]
+
+
+def _unwrap_record(item: Any) -> Any:
+    """Unwrap a record the server wrapped in a type discriminator.
+
+    Canva's folder listing answers with ``{"type": "design", "design": {...}}``
+    — the identity, the title and the body all one level down.  Read as-is such
+    a record has no id to fan out from and no title to name a document by, so it
+    is keyed by a hash of its own text and the same design reached from a search
+    is documented a second time.
+
+    Unwrapped only when the outer object has no identity of its own *and* the
+    inner one does, so a record that merely happens to carry a nested object
+    keeps its own shape.
+    """
+    if not isinstance(item, dict) or _first_str(item, RECORD_ID_KEYS):
+        return item
+    nested = [value for value in item.values() if isinstance(value, dict)]
+    if len(nested) == 1 and _first_str(nested[0], RECORD_ID_KEYS):
+        return nested[0]
+    return item
 
 
 def _parse_records(payload: str) -> List[CrawlRecord]:
@@ -202,6 +239,7 @@ def _parse_records(payload: str) -> List[CrawlRecord]:
 
     records: List[CrawlRecord] = []
     for item in _unwrap_records(data):
+        item = _unwrap_record(item)
         text = _record_text(item)
         if not text:
             continue
@@ -209,7 +247,9 @@ def _parse_records(payload: str) -> List[CrawlRecord]:
         if isinstance(item, dict):
             record_id = _first_str(item, RECORD_ID_KEYS)
             title = _first_str(item, RECORD_TITLE_KEYS)
-            url = _first_str(item, ("url", "uri", "link", "shortUrl", "html_url"))
+            url = _first_str(
+                item, ("url", "uri", "link", "shortUrl", "html_url", "edit_url"),
+            )
         records.append(CrawlRecord(
             record_id=record_id,
             title=title,
@@ -290,6 +330,41 @@ def _has_required(schema: Dict[str, Any]) -> bool:
     """
     required = schema.get("required") if isinstance(schema, dict) else None
     return bool(required)
+
+
+# Characters kept from one step's failure reason in the per-step log line.  A
+# server's validation error can run to hundreds of characters of JSON; the part
+# that names the offending field comes first, and the rest turns a summary of
+# twelve steps into an unreadable wall.
+MAX_STEP_REASON_CHARS = 120
+
+
+def _format_step_details(details: Sequence[dict]) -> str:
+    """Render a crawl's per-step outcomes as one log line.
+
+    ``step/tool: <records>`` for a step that produced something, with the fresh
+    count when it differs (a listing whose records another step already
+    documented is not the same event as a listing that returned nothing), and
+    ``step/tool: 0 (why)`` for one that didn't.
+    """
+    parts: List[str] = []
+    for detail in details:
+        label = detail.get("step") or "?"
+        tool = detail.get("tool")
+        prefix = f"{label}/{tool}" if tool else label
+        records = detail.get("records") or 0
+        if records:
+            fresh = detail.get("new")
+            suffix = str(records)
+            if fresh is not None and fresh != records:
+                suffix = f"{records} ({fresh} new)"
+        else:
+            reason = " ".join(str(detail.get("reason") or "").split())
+            if len(reason) > MAX_STEP_REASON_CHARS:
+                reason = reason[:MAX_STEP_REASON_CHARS] + "..."
+            suffix = f"0 ({reason})" if reason else "0"
+        parts.append(f"{prefix}: {suffix}")
+    return "; ".join(parts) or "plan had no steps"
 
 
 def _doc_id(server_id: str, step_label: str, key: str) -> str:
@@ -662,16 +737,20 @@ class MCPDocumentIndexer:
                 continue
 
             detail_tool = resolve_tool(tool_names, step.detail_tools) if step.detail_tools else None
+            detail_schema = tool_schema(server, detail_tool) if detail_tool else {}
             detail_arg = (
-                resolve_argument(tool_schema(server, detail_tool), step.detail_args)
+                resolve_argument(detail_schema, step.detail_args)
                 if detail_tool else None
             )
+            # The record id is not always the whole call: a tool that dispatches
+            # on an `action` needs to be told which operation this is.
+            detail_base = filter_arguments(detail_schema, step.detail_arguments)
 
             for index, record in enumerate(fresh):
                 text = record.text
                 if detail_tool and detail_arg and record.record_id:
                     detail_payload, changed, _ = call(
-                        detail_tool, {detail_arg: record.record_id}
+                        detail_tool, {**detail_base, detail_arg: record.record_id}
                     )
                     credentials_changed = credentials_changed or changed
                     detail_text = self._detail_text(detail_payload)
@@ -692,7 +771,12 @@ class MCPDocumentIndexer:
                     "step": step.label,
                     "tool_name": tool,
                     "record_id": record.record_id or "",
-                    "source_url": record.url or "",
+                    # A step may know a durable address for its records where
+                    # the listing only handed back an ephemeral one.
+                    "source_url": (
+                        render_url(step.url_template, record.record_id)
+                        or record.url or ""
+                    ),
                     "title": title,
                 }
 
@@ -738,18 +822,21 @@ class MCPDocumentIndexer:
             " (call budget reached)" if stats["truncated"] else "",
             stats["indexed"], stats["skipped"], stats["removed"],
         )
-        if not stats["records"]:
-            # Nothing indexed is the failure that matters, so the reason each
-            # step gave is logged rather than left in a return value nobody
-            # reads.
+        # Unconditionally, because a crawl where one step of twelve quietly
+        # stopped producing logs exactly like a healthy one otherwise — the
+        # summary above counts the steps that worked and says nothing about the
+        # rest.  Escalated to a warning only when the whole crawl came back
+        # empty, which is still the failure that matters most.
+        steps = _format_step_details(stats["details"])
+        if stats["records"]:
+            self._logger.info(
+                "[mcp-crawl] %s steps: %s",
+                getattr(server, "name", server_id), steps,
+            )
+        else:
             self._logger.warning(
                 "[mcp-crawl] %s produced no content — steps: %s",
-                getattr(server, "name", server_id),
-                "; ".join(
-                    f"{d['step']}"
-                    f"{'/' + d['tool'] if d.get('tool') else ''}: {d.get('reason')}"
-                    for d in stats["details"]
-                ) or "plan had no steps",
+                getattr(server, "name", server_id), steps,
             )
         return stats
 

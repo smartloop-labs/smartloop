@@ -370,7 +370,9 @@ async def _register_remote_mcp_server(
         # the WWW-Authenticate header and body — the only clue when the failure
         # is a dead endpoint rather than a missing token.
         logger.info(
-            "Direct connect to %s failed: %s", clean_url, connect_result.error
+            "Direct connect to %s returned no usable session, falling back to OAuth: %s",
+            clean_url,
+            connect_result.error,
         )
 
     # Fall back to OAuth

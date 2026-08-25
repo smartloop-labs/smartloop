@@ -89,17 +89,44 @@ def _mcp_source(name: str, chunk: Any) -> str:
     way to say where it came from, and could not name the tool when asked. The
     tool is the source for MCP content, so it leads.
 
-    Read from metadata rather than baked into ``document_name`` at index time,
-    so content already crawled gains the attribution without a re-index.
+    The record's own URL comes next, and it is the one thing here the model
+    cannot reconstruct.  A live tool call returns raw JSON, so answering from
+    one gave the user a link they could click straight through to the Canva
+    design or Notion page; answering from the index gave them
+    ``<server>/<step>/<title>``, which reads like a file path and opens
+    nothing.  The URL is stripped from the embedded text on purpose — a link is
+    noise in an embedding, and ``ResultFormatter.is_noisy_value`` drops every
+    ``*_url`` key — so the header is where it has to travel.
+
+    The record's id is here for a different reason: it is the handle a *next*
+    tool call needs.  "List my designs, then comment on that one" only works if
+    the id came back with the listing, and without it the model has to re-run a
+    live search purely to recover what the crawl already knew — which is the
+    thing indexing exists to avoid.  Labelled ``id:`` rather than left for the
+    URL to imply, because deriving an id from a URL is wrong on at least one
+    server already: a Trello card's id is its ARI, while its URL carries the
+    shortLink, and ``trelloReadCard`` rejects the latter.
+
+    Like the URL it is stripped from the embedded text, and for the same reason
+    — ``is_noisy_value`` drops every key ending in ``_id``, so ``design_id``
+    never survives into a chunk.
+
+    All read from metadata rather than baked into ``document_name`` at index
+    time, so content already crawled gains them without a re-index.
     """
     meta = getattr(chunk, "metadata", None) or {}
     tool = meta.get("tool_name")
     server = meta.get("server_name")
-    if tool and server:
-        return f"{server} · {tool} — {name}"
-    if tool:
-        return f"{tool} — {name}"
-    return name
+    record_id = (meta.get("record_id") or "").strip()
+    url = (meta.get("source_url") or "").strip()
+    parts = [p for p in (f"{server} · {tool}" if tool and server else tool, name) if p]
+    # A record with no title of its own is already named by its id, and saying
+    # it twice reads like two different records.
+    if record_id and record_id not in name:
+        parts.append(f"id: {record_id}")
+    if url:
+        parts.append(url)
+    return " — ".join(parts) if parts else name
 
 
 def _crawl_age(chunk: Any) -> str:

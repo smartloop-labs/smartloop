@@ -737,6 +737,89 @@ class TestOverlapAndReporting:
             reasons = [d["reason"] for d in stats["details"] if d["step"] == "recent-pages"]
             assert "query is required" in reasons[0]
 
+    def test_step_outcomes_are_logged_even_when_the_crawl_succeeded(self):
+        """A partly-working crawl used to log exactly like a healthy one.
+
+        The summary line counts the steps that produced records and says nothing
+        about the rest, and the per-step reasons were logged only when the whole
+        crawl came back empty — so one step of twelve quietly stopping was
+        invisible.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-list-shared-pages", {"properties": {"limit": {}}}),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result([{"id": "p1", "title": "A"}]),
+                "notion-list-shared-pages": _result([]),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            logged = " ".join(
+                str(call[0]) for call in idx._logger.info.call_args_list
+            )
+            assert "steps:" in logged
+            # The step that worked and the one that returned nothing both named.
+            assert "recent-pages" in logged
+            assert "shared-pages" in logged
+            # The crawl did index something, so this is not a warning.
+            idx._logger.warning.assert_not_called()
+
+    def test_the_step_line_names_the_tool_and_the_fresh_count(self):
+        from smartloop.db.mcp_document_indexer import _format_step_details
+
+        line = _format_step_details([
+            {"step": "boards", "tool": "trelloReadBoard", "records": 5, "new": 5},
+            # A listing whose records another step already documented is not the
+            # same event as a listing that returned nothing.
+            {"step": "workspace-boards", "tool": "trelloReadBoard",
+             "records": 5, "new": 0},
+            {"step": "inbox-cards", "tool": "trelloReadInbox", "records": 0,
+             "reason": "returned no records"},
+            {"step": "databases", "tool": None, "records": 0,
+             "reason": "no matching tool on this server"},
+        ])
+        assert line == (
+            "boards/trelloReadBoard: 5; "
+            "workspace-boards/trelloReadBoard: 5 (0 new); "
+            "inbox-cards/trelloReadInbox: 0 (returned no records); "
+            "databases: 0 (no matching tool on this server)"
+        )
+
+    def test_a_long_failure_reason_is_truncated_in_the_step_line(self):
+        # A server's validation error runs to hundreds of characters of JSON.
+        # The field name comes first; the rest would bury the other eleven steps.
+        from smartloop.db.mcp_document_indexer import (
+            MAX_STEP_REASON_CHARS,
+            _format_step_details,
+        )
+
+        line = _format_step_details([
+            {"step": "page-comments", "tool": "notion-get-comments",
+             "records": 0, "reason": "body failed validation: " + "x" * 900},
+        ])
+        assert line.startswith("page-comments/notion-get-comments: 0 (body failed")
+        assert line.endswith("...)")
+        assert len(line) < MAX_STEP_REASON_CHARS + 80
+
+    def test_a_multiline_reason_becomes_one_line(self):
+        # Reasons arrive as raw server output, newlines and all; one step must
+        # not break the line the other steps share.
+        from smartloop.db.mcp_document_indexer import _format_step_details
+
+        line = _format_step_details([
+            {"step": "pages", "tool": "notion-search", "records": 0,
+             "reason": "query is\n  required\n"},
+        ])
+        assert line == "pages/notion-search: 0 (query is required)"
+
+    def test_a_plan_with_no_steps_still_says_something(self):
+        from smartloop.db.mcp_document_indexer import _format_step_details
+
+        assert _format_step_details([]) == "plan had no steps"
+
 
 class TestWastedCallsAreAvoided:
     def test_step_whose_required_argument_cannot_be_filled_is_not_called(self):
@@ -829,6 +912,309 @@ class TestWastedCallsAreAvoided:
             idx._tool_caller = caller
             idx.crawl_server(server)
             assert "notion-list-favorite-pages" in [c[0] for c in caller.calls]
+
+
+class TestEnvelopeUnwrapping:
+    """Finding the record list inside whatever the server wrapped it in.
+
+    Every server pluralizes its own entities, so a fixed list of envelope key
+    names is always one server behind.  Trello answers `trelloReadWorkspace`
+    with `{"workspaces": [...], "nextCursor": ..., "hasMore": false}`, and
+    before this the whole envelope became one id-less record — which read as a
+    successful step and left the boards fan-out with nothing to walk.
+    """
+
+    def test_an_unknown_plural_key_is_still_the_record_list(self):
+        from smartloop.db.mcp_document_indexer import _unwrap_records
+
+        records = _unwrap_records({
+            "workspaces": [{"id": "w1", "name": "One"}, {"id": "w2", "name": "Two"}],
+            "nextCursor": "abc",
+            "hasMore": False,
+        })
+        assert [r["id"] for r in records] == ["w1", "w2"]
+
+    def test_a_record_with_a_list_field_is_not_mistaken_for_an_envelope(self):
+        # The discriminator is identity: a record carries an id, an envelope
+        # doesn't.  Without it a single card would unwrap into its own labels.
+        from smartloop.db.mcp_document_indexer import _unwrap_records
+
+        card = {"id": "c1", "name": "Card", "labels": [{"name": "urgent"}]}
+        assert _unwrap_records(card) == [card]
+
+    def test_an_empty_listing_produces_no_records_rather_than_the_envelope(self):
+        # An empty Trello inbox is `{"cards": [], ...}`.  Returning the envelope
+        # would index a document whose whole content is "hasMore: false".
+        from smartloop.db.mcp_document_indexer import _unwrap_records
+
+        assert _unwrap_records({"cards": [], "nextCursor": None, "hasMore": False}) == []
+
+    def test_a_step_fans_out_over_an_unknown_envelope(self):
+        """The end of the same story: workspaces → boards actually walks."""
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(name="Trello", slug="trello", tools=[
+                _tool("trelloReadWorkspace", {
+                    "properties": {"action": {}, "limit": {}}, "required": ["action"],
+                }),
+                _tool("trelloReadBoard", {
+                    "properties": {
+                        "action": {}, "workspaceId": {}, "filter": {}, "limit": {},
+                    },
+                    "required": ["action"],
+                }),
+            ])
+            caller = FakeCaller({
+                "trelloReadWorkspace": _result({
+                    "workspaces": [{"id": "ari:...workspace/w1", "name": "Team"}],
+                    "hasMore": False,
+                }),
+                "trelloReadBoard": lambda args: _result({
+                    "boards": [{"id": "b1", "name": "Board One"}],
+                    "hasMore": False,
+                }),
+            })
+            idx = _indexer(td, caller)
+            stats = idx.crawl_server(server, force=True)
+
+            by_workspace = [
+                args for tool, args in caller.calls
+                if args.get("action") == "list_by_workspace"
+            ]
+            assert by_workspace, "workspace-boards never fanned out"
+            assert by_workspace[0]["workspaceId"] == "ari:...workspace/w1"
+            reasons = {d["step"]: d.get("reason") for d in stats["details"]}
+            assert reasons["workspace-boards"] is None
+
+
+class TestRecordIdentity:
+    """Finding the id and the body when the server buries them.
+
+    A record with no id is a record nothing can fan out from, and one keyed by
+    a hash of its own text is a record a second listing will document all over
+    again.  Both showed up on Canva, whose two listings of the same design
+    disagree about where its identity lives.
+    """
+
+    def test_an_entity_qualified_id_is_still_the_record_id(self):
+        # search-designs answers with `design_id` and no `id`, so the fan-out
+        # over designs had nothing to walk and the comments were never reached.
+        from smartloop.db.mcp_document_indexer import _parse_records
+
+        records = _parse_records(json.dumps({"items": [
+            {"title": "Canva MCP TESTING", "design_id": "DAHS4TDHiec",
+             "edit_url": "https://www.canva.com/d/c7n9T"},
+        ]}))
+        assert [r.record_id for r in records] == ["DAHS4TDHiec"]
+        assert records[0].url == "https://www.canva.com/d/c7n9T"
+
+    def test_a_record_wrapped_in_a_type_discriminator_is_unwrapped(self):
+        # list-folder-items answers with {"type": "design", "design": {...}}:
+        # id, title and body all one level down.  Read as-is the record has no
+        # identity, so the same design a search already indexed is documented
+        # a second time under a content hash.
+        from smartloop.db.mcp_document_indexer import _parse_records
+
+        records = _parse_records(json.dumps({"items": [
+            {"type": "design", "design": {
+                "id": "DAHS4TDHiec", "title": "Canva MCP TESTING",
+                "page_count": 2,
+            }},
+        ]}))
+        assert [r.record_id for r in records] == ["DAHS4TDHiec"]
+        assert records[0].title == "Canva MCP TESTING"
+
+    def test_a_record_that_merely_carries_a_nested_object_keeps_its_shape(self):
+        # The unwrap only fires when the outer object has no identity and the
+        # inner one does — otherwise a Trello card would unwrap into its list.
+        from smartloop.db.mcp_document_indexer import _unwrap_record
+
+        card = {"id": "c1", "name": "Card",
+                "list": {"id": "l1", "name": "To Do"}}
+        assert _unwrap_record(card) == card
+
+    def test_an_id_less_wrapper_around_an_id_less_object_is_left_alone(self):
+        from smartloop.db.mcp_document_indexer import _unwrap_record
+
+        item = {"type": "design", "design": {"title": "no id here"}}
+        assert _unwrap_record(item) == item
+
+    def test_two_listings_of_one_design_are_indexed_once(self):
+        """The end of the story: Canva's search and folder walk agree."""
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(name="Canva", slug="canva", tools=[
+                _tool("search-designs", {"properties": {
+                    "ownership": {}, "sort_by": {}, "limit": {},
+                    "design_types": {}, "user_intent": {},
+                }}),
+                _tool("get-design-content", {
+                    "properties": {"design_id": {}, "content_types": {},
+                                   "user_intent": {}},
+                    "required": ["design_id", "content_types"],
+                }),
+                _tool("list-folder-items", {
+                    "properties": {"folder_id": {}, "item_types": {},
+                                   "sort_by": {}, "user_intent": {}},
+                    "required": ["folder_id"],
+                }),
+            ])
+            design = {"title": "Canva MCP TESTING", "design_id": "DAHS4TDHiec"}
+            caller = FakeCaller({
+                "search-designs": _result({"items": [design]}),
+                "get-design-content": _result("the design body text"),
+                "list-folder-items": _result({"items": [
+                    {"type": "design", "design": {
+                        "id": "DAHS4TDHiec", "title": "Canva MCP TESTING"}},
+                ]}),
+            })
+            idx = _indexer(td, caller)
+            stats = idx.crawl_server(server, force=True)
+
+            docs = _indexed_docs(idx._store)
+            assert len(docs) == 1, docs
+            # And the one document is the one that fetched the body.
+            assert "the design body text" in next(iter(docs.values()))
+            by_step = {d["step"]: d for d in stats["details"]}
+            assert by_step["designs"]["new"] == 1
+            assert by_step["root-items"]["new"] == 0
+
+
+class TestDurableUrls:
+    """A stored URL outlives the crawl that found it, so it has to be stable.
+
+    Canva mints a fresh ``/d/<token>`` share link on every call — five crawls of
+    one design produced five different tokens — so snapshotting one stores a
+    link that may rot, and a share link is a capability rather than an address.
+    """
+
+    def test_a_template_is_filled_with_the_record_id(self):
+        from smartloop.mcp.crawl_plans import render_url
+
+        assert render_url(
+            "https://www.canva.com/design/{id}", "DAHS4TDHiec"
+        ) == "https://www.canva.com/design/DAHS4TDHiec"
+
+    def test_nothing_is_rendered_when_it_would_be_a_broken_link(self):
+        # Each of these would otherwise emit a URL with a literal {id} in it,
+        # or a URL for a record that has no id to identify.
+        from smartloop.mcp.crawl_plans import render_url
+
+        assert render_url("https://x/{id}", None) is None
+        assert render_url(None, "DAHS4TDHiec") is None
+        assert render_url("https://x/{wrong}", "DAHS4TDHiec") is None
+        assert render_url("https://x/no-placeholder", "DAHS4TDHiec") is None
+
+    def _crawl(self, td, url_template, payload_url="https://canva.com/d/EPHEMERAL"):
+        from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
+
+        plan = CrawlPlan(slug="c", steps=(CrawlStep(
+            label="designs", tools=("search-designs",),
+            url_template=url_template,
+        ),))
+        server = _server(name="Canva", slug="canva", tools=[
+            _tool("search-designs", {"properties": {}}),
+        ])
+        caller = FakeCaller({"search-designs": _result({"items": [
+            {"design_id": "DAHS4TDHiec", "title": "Deck", "url": payload_url},
+        ]})})
+        idx = _indexer(td, caller)
+        with patch(
+            "smartloop.db.mcp_document_indexer.resolve_plan", return_value=plan
+        ):
+            idx.crawl_server(server, force=True)
+        chunk = idx._store.add_chunks.call_args_list[0][0][0][0]
+        return chunk["source_url"]
+
+    def test_the_template_beats_the_url_the_listing_returned(self):
+        with tempfile.TemporaryDirectory() as td:
+            assert self._crawl(
+                td, "https://www.canva.com/design/{id}"
+            ) == "https://www.canva.com/design/DAHS4TDHiec"
+
+    def test_without_a_template_the_listing_url_is_kept(self):
+        # The common case, and what Notion/Linear/Trello rely on.
+        with tempfile.TemporaryDirectory() as td:
+            assert self._crawl(td, None) == "https://canva.com/d/EPHEMERAL"
+
+    def test_a_template_that_cannot_be_filled_falls_back(self):
+        from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
+
+        with tempfile.TemporaryDirectory() as td:
+            plan = CrawlPlan(slug="c", steps=(CrawlStep(
+                label="designs", tools=("search-designs",),
+                url_template="https://www.canva.com/design/{id}",
+            ),))
+            server = _server(name="Canva", slug="canva", tools=[
+                _tool("search-designs", {"properties": {}}),
+            ])
+            # No id anywhere, so there is nothing to build a URL from.
+            caller = FakeCaller({"search-designs": _result({"items": [
+                {"title": "Untitled", "url": "https://canva.com/d/FALLBACK"},
+            ]})})
+            idx = _indexer(td, caller)
+            with patch(
+                "smartloop.db.mcp_document_indexer.resolve_plan", return_value=plan
+            ):
+                idx.crawl_server(server, force=True)
+            chunk = idx._store.add_chunks.call_args_list[0][0][0][0]
+            assert chunk["source_url"] == "https://canva.com/d/FALLBACK"
+
+
+class TestDetailArguments:
+    """A detail call is not always just the record's id.
+
+    A server that dispatches on a discriminator — one `trelloReadCard` tool for
+    both "list a list's cards" and "get a card" — rejects a detail call that
+    carries only the id, once per record.  Expressing the fetch as a child step
+    instead doesn't work either: `seen_records` dedupes by record id, and a
+    detail listing returns the ids the parent step already produced.
+    """
+
+    def _run(self, td, detail_arguments):
+        from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
+
+        plan = CrawlPlan(slug="dispatch", steps=(CrawlStep(
+            label="cards",
+            tools=("readCard",),
+            arguments={"action": "list"},
+            detail_tools=("readCard",),
+            detail_arguments=detail_arguments,
+            detail_args=("cardId",),
+        ),))
+        server = _server(name="dispatch", slug="dispatch", tools=[
+            _tool("readCard", {
+                "properties": {"action": {}, "cardId": {}},
+                "required": ["action"],
+            }),
+        ])
+        caller = FakeCaller({
+            "readCard": lambda args: (
+                _result({"body": "the full card body"})
+                if args.get("cardId")
+                else _result([{"id": "c1", "name": "Card"}])
+            ),
+        })
+        idx = _indexer(td, caller)
+        with patch(
+            "smartloop.db.mcp_document_indexer.resolve_plan", return_value=plan
+        ):
+            idx.crawl_server(server, force=True)
+        return caller, idx
+
+    def test_fixed_arguments_travel_with_the_detail_call(self):
+        with tempfile.TemporaryDirectory() as td:
+            caller, idx = self._run(td, {"action": "get"})
+            detail = [args for _, args in caller.calls if "cardId" in args]
+            assert detail == [{"action": "get", "cardId": "c1"}]
+            body = "\n".join(_indexed_docs(idx._store).values())
+            assert "the full card body" in body
+
+    def test_an_argument_the_detail_tool_does_not_declare_is_dropped(self):
+        # Filtered like `arguments` is, so one plan can name the discriminator
+        # for the servers that need it without breaking the ones that don't.
+        with tempfile.TemporaryDirectory() as td:
+            caller, _ = self._run(td, {"action": "get", "verbosity": "full"})
+            detail = [args for _, args in caller.calls if "cardId" in args]
+            assert detail == [{"action": "get", "cardId": "c1"}]
 
 
 class TestRefreshCycle:
@@ -929,6 +1315,124 @@ class TestMcpSourceAttribution:
         assert _mcp_source("plain/doc", self._chunk({})) == "plain/doc"
         assert _mcp_source("plain/doc", self._chunk(None)) == "plain/doc"
 
+    def test_the_record_url_travels_in_the_source_line(self):
+        """The one thing in the header the model cannot reconstruct.
+
+        Answering from a live tool call handed the user a link they could click
+        straight through to the design; answering from the index handed them
+        `<server>/<step>/<title>`, which reads like a file path and opens
+        nothing.  The URL is deliberately stripped from the embedded text — a
+        link is noise in an embedding — so the header is the only place it can
+        travel.
+        """
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "Canva/designs/Canva MCP TESTING",
+            self._chunk({
+                "tool_name": "search-designs", "server_name": "Canva",
+                "source_url": "https://www.canva.com/d/0_Dv9PwBsQmYOOc",
+            }),
+        )
+        assert out.endswith("https://www.canva.com/d/0_Dv9PwBsQmYOOc")
+        assert "search-designs" in out
+
+    def test_a_record_without_a_url_gains_no_empty_separator(self):
+        # source_url is stored as "" when the record had none, and a trailing
+        # " — " would read as a truncated link.
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "notion/pages/Roadmap",
+            self._chunk({"tool_name": "search_pages", "server_name": "Notion",
+                         "source_url": ""}),
+        )
+        assert out == "Notion · search_pages — notion/pages/Roadmap"
+
+    def test_the_record_id_travels_in_the_source_line(self):
+        """The id is the handle a *next* tool call needs.
+
+        "List my designs, then comment on that one" only works if the id came
+        back with the listing; otherwise the model re-runs a live search purely
+        to recover what the crawl already stored.  `is_noisy_value` drops every
+        key ending in `_id`, so `design_id` never survives into a chunk — the
+        header is the only place it can travel.
+        """
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "Canva/designs/Benefits of Local AI",
+            self._chunk({
+                "tool_name": "search-designs", "server_name": "Canva",
+                "record_id": "DAHTRxZG2Qo",
+            }),
+        )
+        assert "id: DAHTRxZG2Qo" in out
+
+    def test_an_id_the_document_name_already_carries_is_not_repeated(self):
+        # A record with no title of its own is already named by its id, and
+        # saying it twice reads like two different records.
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "Canva/design-comments/KAHS4n2FFaA",
+            self._chunk({"tool_name": "list-comments", "server_name": "Canva",
+                         "record_id": "KAHS4n2FFaA"}),
+        )
+        assert out.count("KAHS4n2FFaA") == 1
+        assert "id:" not in out
+
+    def test_the_id_is_the_tool_argument_not_something_read_off_the_url(self):
+        """Deriving an id from a URL is wrong on the servers we crawl.
+
+        A Trello card's id is its ARI; its URL carries the shortLink, which
+        `trelloReadCard` rejects.  Canva is the same story with a pattern:
+        `comment-on-design` requires ^D[a-zA-Z0-9_-]+$ and the /d/ token in the
+        URL does not match it.
+        """
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        ari = "ari:cloud:trello::card/workspace/5fef637f/624b42a03ce1e666"
+        out = _mcp_source(
+            "Trello/cards/Donate Clothes Trip",
+            self._chunk({
+                "tool_name": "trelloReadCard", "server_name": "Trello",
+                "record_id": ari,
+                "source_url": "https://trello.com/c/dQv6OAbC/28-donate",
+            }),
+        )
+        assert f"id: {ari}" in out
+        # Both present and distinct — the shortLink is not offered as the id.
+        assert "dQv6OAbC" in out
+        assert "id: https" not in out
+
+    def test_a_record_without_an_id_gains_no_empty_separator(self):
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "notion/pages/Roadmap",
+            self._chunk({"tool_name": "search_pages", "server_name": "Notion",
+                         "record_id": "", "source_url": ""}),
+        )
+        assert out == "Notion · search_pages — notion/pages/Roadmap"
+
+    def test_indexed_chunks_carry_the_record_id(self):
+        """The read path can only surface what indexing stored."""
+        import inspect
+
+        from smartloop.db import mcp_document_indexer as mod
+
+        assert '"record_id": doc["record_id"]' in inspect.getsource(mod)
+
+    def test_indexed_chunks_carry_the_record_url(self):
+        """The read path can only surface what indexing stored."""
+        import inspect
+
+        from smartloop.db import mcp_document_indexer as mod
+
+        src = inspect.getsource(mod)
+        assert '"source_url": doc["source_url"]' in src
+
     def test_indexed_chunks_carry_the_tool_name(self):
         """The read path can only surface what indexing stored."""
         import inspect
@@ -937,3 +1441,94 @@ class TestMcpSourceAttribution:
 
         src = inspect.getsource(mod)
         assert '"tool_name": doc["tool_name"]' in src
+
+
+class TestNotionComments:
+    """Notion anchors comments to the paragraph they are about.
+
+    `include_all_blocks` and `include_resolved` both default to false, and both
+    defaults are wrong for a crawl.  Probing a real workspace: the defaults
+    returned nothing on all 16 pages, `include_all_blocks` alone reached 6 of a
+    page's 10 threads, and the two together reached all 10.  Resolved threads
+    are kept because "resolved" is usually where the decision is.
+    """
+
+    def test_the_flags_that_reach_block_level_discussions_travel(self):
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-get-comments", {
+                    "properties": {"page_id": {}, "include_all_blocks": {},
+                                   "include_resolved": {}},
+                    "required": ["page_id"],
+                }),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result(
+                    {"results": [{"id": "p1", "title": "The Pitch"}]}
+                ),
+                "notion-get-comments": _result({"text": "<discussions>…"}),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            args = next(
+                a for tool, a in caller.calls if tool == "notion-get-comments"
+            )
+            assert args["include_all_blocks"] is True
+            assert args["include_resolved"] is True
+
+    def test_a_page_fetch_asks_for_the_discussions_with_it(self):
+        """The only route to a comment that works with a URL and no page id.
+
+        `notion-fetch` takes "URL or ID", so it is reachable where
+        `get-comments` is not, and `include_discussions` inlines the comment
+        text into the page body.  A sample rather than the full set — this is
+        partial capture, not a replacement for `page-comments`.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-fetch", {
+                    "properties": {"id": {}, "include_discussions": {}},
+                    "required": ["id"],
+                }),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result({"results": [
+                    {"url": "https://app.notion.com/p/abc", "title": "The Pitch"},
+                ]}),
+                "notion-fetch": _result(
+                    {"text": "<comment>what happened to the model?????</comment>"}
+                ),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            args = next(a for tool, a in caller.calls if tool == "notion-fetch")
+            assert args["include_discussions"] is True
+            body = "\n".join(_indexed_docs(idx._store).values())
+            assert "what happened to the model?????" in body
+
+    def test_the_flags_are_dropped_where_a_server_does_not_declare_them(self):
+        """The OpenAPI server's comment tool takes neither; the step still runs."""
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("API-retrieve-a-comment", {
+                    "properties": {"page_id": {}}, "required": ["page_id"],
+                }),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result(
+                    {"results": [{"id": "p1", "title": "The Pitch"}]}
+                ),
+                "API-retrieve-a-comment": _result({"text": "a comment"}),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            args = next(
+                a for tool, a in caller.calls if tool == "API-retrieve-a-comment"
+            )
+            assert args == {"page_id": "p1"}

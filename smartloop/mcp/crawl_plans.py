@@ -43,8 +43,20 @@ ID_ARGS: Tuple[str, ...] = (
 )
 
 # Keys a record's identifier is read from, in order of preference.
+#
+# Real identifiers first, bare spellings ahead of entity-qualified ones: a
+# server returning both means `id` by the record itself and `<entity>_id` by
+# something it points at, while the ones returning only `design_id` / `page_id`
+# have no other identity to offer.
+#
+# `url` and `uri` come last, and only as a fallback for the listings that carry
+# no id at all (hosted Notion is one).  A URL is a poor identifier — it is not
+# what a tool wants as an argument, and it may not even be stable — so anything
+# id-shaped outranks it.
 RECORD_ID_KEYS: Tuple[str, ...] = (
-    "id", "uuid", "gid", "key", "identifier", "url", "uri", "page_id", "shortLink",
+    "id", "uuid", "gid", "key", "identifier",
+    "page_id", "design_id", "shortLink",
+    "url", "uri",
 )
 
 # Keys a record's human-readable title is read from, in order of preference.
@@ -103,12 +115,35 @@ class CrawlStep(BaseModel):
     for_each: Dict[str, Tuple[Any, ...]] = Field(default_factory=dict)
     detail_tools: Tuple[str, ...] = ()
     detail_args: Tuple[str, ...] = ID_ARGS
+    # Fixed arguments for the detail call, filtered against the detail tool's
+    # schema the way ``arguments`` is.  A detail call is not always just the
+    # record's id: a tool may require a second argument that says nothing about
+    # *which* record is wanted — the content type to return, or the operation
+    # being asked for on a server where one tool covers several.  Without this
+    # the call goes out as ``{id: ...}`` and is rejected once per record, and
+    # expressing it as a child step instead doesn't work either: ``seen_records``
+    # dedupes by id, and a detail listing returns ids the parent step already
+    # produced.
+    detail_arguments: Dict[str, Any] = Field(default_factory=dict)
     # Arguments without which this step is pointless.  Unknown arguments are
     # normally dropped so a step still runs in reduced form, but a step that
     # exists *because* of one argument — the same search narrowed to databases
     # — degrades into a duplicate of another step when it is dropped, so it is
     # skipped instead.
     needs_arguments: Tuple[str, ...] = ()
+    # A record's web address, built from its id: ``"https://example.com/d/{id}"``.
+    #
+    # For the servers whose listings return a URL that is not durable.  Canva
+    # mints a fresh ``/d/<token>`` share link on every call — the same design
+    # came back with five different tokens across five crawls — so storing one
+    # snapshots a link that may rot, and a share link is a capability rather
+    # than an address.  Its own tool descriptions document the stable form as
+    # ``https://www.canva.com/design/{design_id}``, which is exactly the id the
+    # record already carries.
+    #
+    # Preferred over the URL the payload gave when set; unset (the common case)
+    # leaves that URL alone, which is right for Notion, Linear and Trello.
+    url_template: Optional[str] = None
     # Records kept from this step's listing calls.  A crawl is a background
     # refresh, not an export: the cap bounds both the embedding work and the
     # number of follow-up detail calls.
@@ -401,6 +436,27 @@ def resolve_tool(
             if target in norm:
                 return name
     return None
+
+
+def render_url(template: Optional[str], record_id: Optional[str]) -> Optional[str]:
+    """Fill a step's ``url_template`` with a record's id, or None.
+
+    None whenever the result would be a broken link — no template, no id, or a
+    template naming something other than ``{id}`` — so the caller falls back to
+    whatever URL the payload carried rather than emitting a URL with a literal
+    ``{id}`` in it.
+    """
+    if not template or not record_id:
+        return None
+    # An id that is itself a URL is a fallback identity, not something to
+    # interpolate — it would produce `https://host/design/https://...`.
+    if record_id.strip().lower().startswith(("http://", "https://")):
+        return None
+    try:
+        rendered = template.format(id=record_id)
+    except (KeyError, IndexError, ValueError):
+        return None
+    return rendered if rendered != template else None
 
 
 def tool_schema(server: Any, tool_name: str) -> Dict[str, Any]:

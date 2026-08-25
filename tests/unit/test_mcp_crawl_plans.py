@@ -21,6 +21,7 @@ from smartloop.mcp.plan_loader import plans as _plans
 NOTION_PLAN = _plans()["notion"]
 LINEAR_PLAN = _plans()["linear"]
 TRELLO_PLAN = _plans()["trello"]
+CANVA_PLAN = _plans()["canva"]
 
 
 def _tool(name, schema=None):
@@ -122,7 +123,7 @@ class TestCuratedPlanShape:
     def test_every_parent_is_produced_by_an_earlier_step(self):
         # A step can only fan out over records another step already collected,
         # so a parent named later (or misspelled) silently never runs.
-        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN):
+        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN, CANVA_PLAN):
             seen = set()
             for step in plan.steps:
                 for parent in step.parent_labels:
@@ -130,7 +131,7 @@ class TestCuratedPlanShape:
                 seen.add(step.label)
 
     def test_step_labels_are_unique(self):
-        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN):
+        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN, CANVA_PLAN):
             labels = [s.label for s in plan.steps]
             assert len(labels) == len(set(labels)), plan.slug
 
@@ -168,6 +169,118 @@ class TestCuratedPlanShape:
         # `database-search` is the `pages` search narrowed to databases; with
         # the filter dropped it would be a duplicate call.
         assert self._steps(NOTION_PLAN)["database-search"].needs_arguments == ("filter",)
+
+    def test_trello_walks_the_hosted_action_dispatch_tools(self):
+        # mcp.trello.com ships one tool per entity and dispatches on `action`,
+        # so the walk is expressed in arguments rather than in tool names.  The
+        # plan shipped before this was written for a package's `list_boards` /
+        # `get_lists_by_board_id` naming, matched nothing, and reported a clean
+        # zero-record crawl.
+        hosted = [
+            "trelloReadWorkspace", "trelloReadBoard", "trelloReadList",
+            "trelloReadCard", "trelloReadInbox", "trelloReadMember",
+        ]
+        steps = self._steps(TRELLO_PLAN)
+        assert resolve_tool(hosted, steps["boards"].tools) == "trelloReadBoard"
+        assert resolve_tool(hosted, steps["lists"].tools) == "trelloReadList"
+        assert resolve_tool(hosted, steps["cards"].tools) == "trelloReadCard"
+        assert steps["boards"].arguments["action"] == "list"
+        assert steps["lists"].arguments["action"] == "list_by_board"
+        assert steps["cards"].arguments["action"] == "list_by_list"
+
+    def test_trello_reaches_cards_through_boards_and_lists(self):
+        steps = self._steps(TRELLO_PLAN)
+        assert set(steps["lists"].parent_labels) == {"boards", "workspace-boards"}
+        assert steps["cards"].parent_labels == ("lists",)
+        assert "boardId" in steps["lists"].parent_args
+        assert "listId" in steps["cards"].parent_args
+
+    def test_trello_still_matches_a_packaged_server(self):
+        # The snake_case candidates are the self-hosted packages' convention.
+        # They cost nothing when absent, and a plan that only spoke to the
+        # hosted server would drop those users.
+        steps = self._steps(TRELLO_PLAN)
+        assert resolve_tool(["list_boards"], steps["boards"].tools) == "list_boards"
+        assert resolve_tool(
+            ["get_cards_by_list_id"], steps["cards"].tools
+        ) == "get_cards_by_list_id"
+
+    def test_trello_does_not_re_fetch_a_card_the_hosted_row_already_holds(self):
+        # The hosted card row carries description, labels, members, checklists
+        # and the list/board names — its `get` returns the same object.  Listing
+        # `trelloReadCard` as a detail tool would resolve there and spend one
+        # call per card to learn nothing, so only the packaged fetch is named.
+        cards = self._steps(TRELLO_PLAN)["cards"]
+        assert resolve_tool(["trelloReadCard"], cards.detail_tools) is None
+        assert resolve_tool(["get_card"], cards.detail_tools) == "get_card"
+
+    def test_canva_fetches_a_design_body_with_the_argument_it_requires(self):
+        # `get-design-content` requires content_types alongside design_id, so
+        # without detail_arguments it cannot be a detail tool at all — the call
+        # would go out as {design_id: ...} and be rejected once per design.
+        designs = self._steps(CANVA_PLAN)["designs"]
+        assert resolve_tool(
+            ["get-design-content"], designs.detail_tools
+        ) == "get-design-content"
+        assert designs.detail_arguments["content_types"] == ["richtexts"]
+        assert "design_id" in designs.detail_args
+
+    def test_canva_searches_designs_without_a_query(self):
+        # Canva rejects a query unless sort_by is "relevance", and no query
+        # means "everything" anyway.
+        designs = self._steps(CANVA_PLAN)["designs"]
+        assert "query" not in designs.arguments
+        assert designs.arguments["sort_by"] == "modified_descending"
+
+    def test_canva_asks_for_the_folder_id_the_tool_requires(self):
+        # list-folder-items has folder_id in `required`; "root" is the top level.
+        assert self._steps(CANVA_PLAN)["root-items"].arguments["folder_id"] == "root"
+
+    def test_canva_item_listings_ask_only_for_designs(self):
+        # A folder holds designs, folders and images.  design_id is constrained
+        # to ^D[a-zA-Z0-9_-]{10}$, so a folder or image id reaching the
+        # comments fan-out is a guaranteed error per record.
+        steps = self._steps(CANVA_PLAN)
+        for label in ("root-items", "folder-items"):
+            assert steps[label].arguments["item_types"] == ["design"]
+
+    def test_canva_scopes_presenter_notes_to_presentations(self):
+        # The tool only works on presentations; scoping the parent is what
+        # avoids the errors, rather than calling it on every design.
+        steps = self._steps(CANVA_PLAN)
+        assert steps["presenter-notes"].parent_labels == ("presentations",)
+        assert steps["presentations"].needs_arguments == ("design_types",)
+        assert steps["presentations"].arguments["design_types"] == ["presentation"]
+
+    def test_canva_builds_a_durable_design_url_from_the_id(self):
+        # The listing's own edit_url is a share link minted per call — the same
+        # design came back with five different /d/<token> values across five
+        # crawls.  Canva documents the stable form, built from the id.
+        designs = self._steps(CANVA_PLAN)["designs"]
+        assert designs.url_template == "https://www.canva.com/design/{id}"
+
+    def test_only_the_step_that_needs_a_template_declares_one(self):
+        # Notion, Linear and Trello hand back durable URLs already; a template
+        # there would replace a good URL with a guess.
+        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN):
+            for step in plan.steps:
+                assert step.url_template is None, f"{plan.slug}/{step.label}"
+
+    def test_canva_fetches_the_body_before_the_folder_walk_dedupes_it_away(self):
+        # Records are deduped by id across steps and only the step that first
+        # documents a record fetches its body.  With a folder listing ahead of
+        # `designs`, every design would be indexed as a title and a thumbnail
+        # and its text never asked for.
+        labels = [step.label for step in CANVA_PLAN.steps]
+        assert labels.index("designs") < labels.index("root-items")
+        assert labels.index("designs") < labels.index("folder-items")
+
+    def test_every_trello_step_says_which_action_it_wants(self):
+        # `action` is required on every hosted tool, and which *other* arguments
+        # are legal depends on its value — so a step that forgets it is not a
+        # reduced call, it is a rejected one.
+        for step in TRELLO_PLAN.steps:
+            assert "action" in step.arguments, step.label
 
 
 class TestNeedsArguments:

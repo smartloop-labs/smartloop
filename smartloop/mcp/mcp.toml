@@ -95,6 +95,17 @@
 #    detail_tools    fetch the full body of each record (a page's content
 #                    behind a search hit), by whichever of `detail_args` the
 #                    tool declares.
+#    detail_arguments
+#                    fixed arguments for that detail call, filtered against the
+#                    detail tool's schema the way `arguments` is. For the
+#                    servers where one tool covers several operations and an
+#                    argument says which one:
+#                      detail_arguments = { action = "get" }
+#    url_template    a durable web address for each record, built from its id:
+#                      url_template = "https://example.com/d/{id}"
+#                    For the servers whose listings hand back a URL that is not
+#                    stable. Preferred over that URL when set; unset leaves it
+#                    alone, which is right for most servers.
 #    max_records     records kept from this step (default 40). A crawl is a
 #                    refresh, not an export: this bounds the embedding work and
 #                    the number of follow-up detail calls.
@@ -137,6 +148,10 @@ linear_team_args = ["teamId", "team_id", "team", "teamIds"]
 linear_project_args = ["projectId", "project_id", "project"]
 linear_issue_args = ["issueId", "issue_id", "issue"]
 
+# Canva names a design's id `design_id` in its listings and takes it under the
+# same name everywhere; the bare spellings trail it for the packaged variants.
+canva_design_args = ["design_id", "designId", "id"]
+
 
 # ── Notion ─────────────────────────────────────────────────────────────────
 #
@@ -167,8 +182,14 @@ match = ["notion"]
 label = "recent-pages"
 tools = ["notion-list-recent-pages", "list_recent_pages"]
 arguments = { limit = 50 }
+# `include_discussions` on every one of these fetches, because a page's comments
+# are where its corrections and decisions live and the body rarely repeats any of
+# them.  It is a partial capture — the fetch returns a sample of the threads, and
+# `page-comments` is what gets all of them — but it is the only route that works
+# with what a hosted listing hands back, which is a URL and no page id.
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 [[mcp.index]]
 label = "private-pages"
@@ -176,6 +197,7 @@ tools = ["notion-list-private-pages", "list_private_pages"]
 arguments = { limit = 50 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 [[mcp.index]]
 label = "shared-pages"
@@ -183,6 +205,7 @@ tools = ["notion-list-shared-pages", "list_shared_pages"]
 arguments = { limit = 50 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 [[mcp.index]]
 label = "favorite-pages"
@@ -190,6 +213,7 @@ tools = ["notion-list-favorite-pages", "list_favorite_pages"]
 arguments = { limit = 50 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 # Search after them, and it carries the crawl on its own for the Notion servers
 # that ship no listing tools: an unfiltered search is the OpenAPI server's
@@ -201,6 +225,7 @@ tools = ["@notion_search"]
 arguments = { query = "", page_size = 100 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 max_records = 60
 
 # Databases have to be enumerated separately: a page-shaped search result set
@@ -231,6 +256,7 @@ parent = ["databases", "database-search"]
 parent_args = ["database_id", "databaseId", "data_source_id", "id"]
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 max_records = 60
 max_parents = 25
 
@@ -239,12 +265,20 @@ label = "meeting-notes"
 tools = ["notion-query-meeting-notes", "query_meeting_notes"]
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 # Comments hold the decisions and corrections that never make it back into the
 # page body, so they are pulled per page the walk found.
 [[mcp.index]]
 label = "page-comments"
 tools = ["notion-get-comments", "notion_retrieve_comments", "API-retrieve-a-comment", "retrieve_comments", "get_comments", "list_comments"]
+# Both default to false, and both defaults are wrong for a crawl.  A page-level
+# discussion is the rare one: comments get anchored to the paragraph they are
+# about, so `include_all_blocks` is the difference between every comment in a
+# workspace and none of them.  Resolved threads are kept because a crawl is a
+# record of what was decided, and "resolved" is usually where the decision is.
+# Dropped on the servers that don't declare them, like any other argument.
+arguments = { include_all_blocks = true, include_resolved = true }
 parent = ["recent-pages", "private-pages", "shared-pages", "favorite-pages", "pages", "database-pages"]
 parent_args = ["@notion_page_args"]
 max_records = 60
@@ -361,31 +395,216 @@ tools = ["list_users", "linear_list_users", "get_users"]
 max_records = 50
 
 
-# ── Trello ─────────────────────────────────────────────────────────────────
+# ── Trello ──────────────────────────────────────────────────────────
+#
+# The tree is the familiar one — workspace → board → list → card → checklist —
+# but the hosted server (mcp.trello.com) does not expose a tool per operation.
+# It ships one tool per entity and dispatches on a required `action`:
+#
+#   trelloReadWorkspace  list, get
+#   trelloReadBoard      list, list_by_workspace, get, list_labels
+#   trelloReadList       list_by_board, get
+#   trelloReadCard       list_by_board, list_by_list, get
+#   trelloReadChecklist  list_by_card, get
+#   trelloReadInbox      list_cards, get
+#
+# So every step below names the same few tools and differs in `action`. Which
+# other arguments are *allowed* depends on the action too (`filter` is rejected
+# for `get`, `boardId` for anything but `get`), so each step passes only the
+# ones its own action takes — schema filtering can't catch that, because the
+# schema declares the union of all actions' arguments.
+#
+# The snake_case names trailing each candidate list are the convention of the
+# self-hosted Trello MCP packages (`get_cards_by_list_id`). A candidate the
+# server doesn't have costs nothing, so they stay: this plan reaches the hosted
+# server and a packaged one without being two plans.
 
 [[mcp]]
 name = "trello"
 match = ["trello"]
 
+# The root of the walk. Boards the user is a *member* of come back from one
+# unscoped call; boards they merely have access to need the per-workspace
+# listing below, which is why workspaces are enumerated at all.
+[[mcp.index]]
+label = "workspaces"
+tools = ["trelloReadWorkspace", "list_workspaces", "list_organizations", "get_organizations"]
+arguments = { action = "list", limit = 50 }
+max_records = 25
+
 [[mcp.index]]
 label = "boards"
-tools = ["list_boards", "get_boards", "trello_list_boards", "get_my_boards", "list_boards_by_user"]
-max_records = 20
+tools = [
+  "trelloReadBoard", "list_boards", "get_boards", "trello_list_boards",
+  "get_my_boards", "list_boards_by_user",
+]
+arguments = { action = "list", filter = "open", limit = 50 }
+max_records = 25
+
+# `list_by_workspace` returns every board the user can reach in a workspace,
+# membership or not — the shared team boards an "my boards" listing leaves out.
+# Deduped against `boards` by id, so the overlap costs nothing.
+[[mcp.index]]
+label = "workspace-boards"
+tools = ["trelloReadBoard", "list_boards_by_workspace", "get_organization_boards"]
+arguments = { action = "list_by_workspace", filter = "open", limit = 50 }
+parent = "workspaces"
+parent_args = ["workspaceId", "workspace_id", "idOrganization", "organizationId"]
+max_records = 40
+max_parents = 15
 
 [[mcp.index]]
 label = "lists"
-tools = ["get_lists", "list_lists", "trello_get_lists", "get_lists_by_board_id", "get_board_lists"]
-parent = "boards"
-parent_args = ["board_id", "boardId", "idBoard", "id"]
+tools = [
+  "trelloReadList", "get_lists", "list_lists", "trello_get_lists",
+  "get_lists_by_board_id", "get_board_lists",
+]
+arguments = { action = "list_by_board", limit = 50 }
+parent = ["boards", "workspace-boards"]
+parent_args = ["boardId", "board_id", "idBoard", "id"]
+max_records = 80
 max_parents = 20
 
-# A card row carries the name but usually not the description or checklists,
-# which is the part worth answering from.
+# Where the content actually is. The hosted server's card rows are already
+# whole — description, labels, members, the card's checklists, and the list and
+# board names — so there is deliberately no detail fetch and no per-card
+# checklist step for it: both were measured returning exactly what the row
+# already said, 80 calls a cycle for nothing.
+#
+# `detail_tools` names only the packaged servers' card fetch, whose rows really
+# are just a name and an id. `trelloReadCard` is left out of it on purpose —
+# it would resolve on the hosted server and reinstate the redundant call.
 [[mcp.index]]
 label = "cards"
-tools = ["get_cards_by_list_id", "list_cards", "get_cards", "trello_get_cards", "get_list_cards"]
+tools = [
+  "trelloReadCard", "get_cards_by_list_id", "list_cards", "get_cards",
+  "trello_get_cards", "get_list_cards",
+]
+arguments = { action = "list_by_list", filter = "open", limit = 50 }
 parent = "lists"
-parent_args = ["list_id", "listId", "idList", "id"]
+parent_args = ["listId", "list_id", "idList", "id"]
 detail_tools = ["get_card", "trello_get_card", "get_card_by_id"]
+detail_args = ["cardIdOrUrl", "cardId", "card_id", "id"]
+max_records = 100
+max_parents = 25
+
+# The Inbox is a board like any other but is not returned by the board
+# listings, so it needs its own step or the user's quick-capture notes — often
+# the freshest thing in the account — are never indexed.
+[[mcp.index]]
+label = "inbox-cards"
+tools = ["trelloReadInbox", "get_inbox_cards", "list_inbox_cards"]
+arguments = { action = "list_cards", filter = "open", limit = 50 }
+max_records = 40
+
+# Not content, but it is what lets a card's member ids read back as a name, and
+# it carries the timezone a due date has to be read in.
+[[mcp.index]]
+label = "me"
+tools = ["trelloReadMember", "get_me", "get_member", "list_members"]
+arguments = { action = "get_me" }
+max_records = 5
+
+
+# ── Canva ──────────────────────────────────────────────────────────────────
+#
+# A design tool, so most of an account is pixels.  What can actually answer a
+# question is the titles, the rich text inside a design, the speaker notes, and
+# the comment threads — so that is what this walks, and thumbnails, exports and
+# autofill schemas are left alone.
+#
+# Three things the schemas decide rather than the author:
+#
+#   * `search-designs` must not be given a `query`.  Canva rejects one unless
+#     `sort_by = "relevance"`, and no query means "everything" anyway.
+#   * `list-folder-items` *requires* `folder_id`; "root" is the top level.
+#   * `list-comments` and `get-presenter-notes` constrain `design_id` to
+#     `^D[a-zA-Z0-9_-]+$` at exactly 11 characters, so a folder or image id in
+#     their fan-out is a guaranteed error per record.  The item listings are
+#     filtered to designs for that reason.
+#
+# Every step passes `user_intent`, which Canva's schemas describe as mandatory
+# for clients.
+
+[[mcp]]
+name = "canva"
+match = ["canva"]
+
+[[mcp.index]]
+label = "folders"
+tools = ["search-folders", "search_folders", "list_folders"]
+arguments = { ownership = "any", limit = 50, user_intent = "Index folder names so the designs inside them can be crawled" }
+max_records = 25
+
+# The text inside a design is the whole point of crawling Canva, and
+# `get-design-content` takes `content_types` alongside the id — which is what
+# `detail_arguments` is for.  Preferred over `get-design`, whose fields the
+# listing row already carries.
+#
+# This step runs ahead of the folder listings on purpose.  Records are deduped
+# by id across steps, and only the step that *first* documents a record fetches
+# its body — so with a folder listing in front, every design would be indexed
+# as a title and a thumbnail and its text never asked for.
+[[mcp.index]]
+label = "designs"
+tools = ["search-designs", "search_designs", "list_designs"]
+# The listing's own `edit_url` is a share link minted per call — the same design
+# came back with five different `/d/<token>` values across five crawls. Canva's
+# tool descriptions document the stable form, and it is built from the id the
+# record already carries.
+url_template = "https://www.canva.com/design/{id}"
+arguments = { ownership = "any", sort_by = "modified_descending", limit = 50, user_intent = "Index every design so its content can be retrieved" }
+detail_tools = ["get-design-content", "get_design_content"]
+detail_arguments = { content_types = ["richtexts"], user_intent = "Read the text content of a design" }
+detail_args = ["@canva_design_args"]
+max_records = 50
+
+# Speaker notes exist only on presentations.  Narrowing the search and hanging
+# the notes off *that* is what keeps the call off the designs it cannot work on,
+# rather than running it over everything and absorbing the failures.  These rows
+# are all duplicates of `designs` by id, so this step is a fan-out source and
+# indexes nothing of its own.
+[[mcp.index]]
+label = "presentations"
+tools = ["search-designs", "search_designs"]
+arguments = { design_types = ["presentation"], ownership = "any", sort_by = "modified_descending", limit = 25, user_intent = "Find presentations so their speaker notes can be crawled" }
+needs_arguments = ["design_types"]
+max_records = 25
+
+[[mcp.index]]
+label = "presenter-notes"
+tools = ["get-presenter-notes", "get_presenter_notes"]
+arguments = { user_intent = "Index the speaker notes attached to each presentation" }
+parent = "presentations"
+parent_args = ["@canva_design_args"]
+max_records = 40
+max_parents = 20
+
+# The folder walk trails the search: it reaches the designs a capped search cut
+# off, and it is the only thing that does, but everything it finds that the
+# search already returned is deduped away.
+[[mcp.index]]
+label = "root-items"
+tools = ["list-folder-items", "list_folder_items"]
+arguments = { folder_id = "root", item_types = ["design"], sort_by = "modified_descending", user_intent = "Index the designs at the top level of the account" }
+max_records = 50
+
+[[mcp.index]]
+label = "folder-items"
+tools = ["list-folder-items", "list_folder_items"]
+arguments = { item_types = ["design"], sort_by = "modified_descending", user_intent = "Index the designs inside each folder" }
+parent = "folders"
+parent_args = ["folder_id", "folderId", "id"]
 max_records = 60
 max_parents = 20
+
+# Where the feedback on a design is written down; the design itself rarely says
+# any of it.
+[[mcp.index]]
+label = "design-comments"
+tools = ["list-comments", "list_comments", "get_comments"]
+arguments = { limit = 50, user_intent = "Index the comment threads on each design" }
+parent = ["designs", "root-items", "folder-items"]
+parent_args = ["@canva_design_args"]
+max_records = 60
+max_parents = 25
