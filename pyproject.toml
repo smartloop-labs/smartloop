@@ -90,3 +90,5 @@ include = ["smartloop*"]
 
 [tool.setuptools.package-data]
 "smartloop.skills" = ["*.md"]
+# The curated MCP crawl plans. Data, not code — see smartloop/mcp/plan_loader.py.
+"smartloop.mcp" = ["*.toml"]

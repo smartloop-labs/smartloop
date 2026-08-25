@@ -49,6 +49,12 @@ class MCPToolIndexer:
         ``tools`` list of ``MCPToolDefinition`` (``name``, ``description``,
         ``input_schema``).  Returns the number of tools indexed.
         """
+        from smartloop.db.embeddings import indexing_burst
+
+        with indexing_burst():
+            return self._index_server(server)
+
+    def _index_server(self, server) -> int:
         # Clear any stale tools for this server before re-adding (re-register
         # with a changed tool set must not leave orphans behind).
         try:

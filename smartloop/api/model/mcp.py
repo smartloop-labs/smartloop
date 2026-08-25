@@ -10,28 +10,38 @@ class MCPToolResponse(BaseModel):
     input_schema: Optional[dict] = None
 
 
-class AddMCPServerRequest(BaseModel):
-    name: Optional[str] = None       # optional display name; derived from args if omitted
-    command: str                     # stdio command, e.g. "uvx", "npx" (must be on PATH)
-    args: Optional[List[str]] = []
-    description: Optional[str] = None
-    env: Dict[str, str] = {}
-    cwd: Optional[str] = None
-
-
 class MCPServerResponse(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
+    tags: List[str] = []
     command: Optional[str] = None
     args: List[str] = []
     cwd: Optional[str] = None
     server_type: str = "local"
     server_url: Optional[str] = None
+    # Slug of the curated catalog entry this server came from, when it did.
+    catalog_slug: Optional[str] = None
     enabled: bool = True
     system: bool = False
     tools: List[MCPToolResponse] = []
     server_info: Optional[Dict] = None
+    # Background provisioning state: "pending" while discovery, enrichment and
+    # indexing run on the MCP task, then "ready" or "failed" with a reason.
+    # Registration returns immediately, so clients watch this rather than
+    # waiting on the response.
+    status: str = "ready"
+    last_error: Optional[str] = None
+    # Content crawl opt-in: None = automatic (on for document-type servers).
+    crawl: Optional[bool] = None
+    last_crawl_at: Optional[float] = None
+    # Account this connection is linked as, when the server can say.
+    account: Optional[str] = None
+
+
+class MCPCrawlRequest(BaseModel):
+    """Opt a server's content in or out of the crawl cycle."""
+    enabled: bool = True
 
 
 class MCPServerListResponse(BaseModel):
@@ -42,22 +52,6 @@ class DeleteMCPServerResponse(BaseModel):
     id: str
     deleted: bool
     message: str
-
-
-class AddRemoteMCPServerRequest(BaseModel):
-    name: Optional[str] = None
-    server_url: str
-    auth_type: str = "none"
-    tools: List[Dict] = []
-    token: Optional[str] = None
-    token_endpoint: Optional[str] = None
-    authorization_endpoint: Optional[str] = None
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    expires_at: Optional[float] = None
-    token_type: str = "Bearer"
 
 
 class MCPRegisterRequest(BaseModel):
@@ -72,7 +66,24 @@ class MCPRegisterRequest(BaseModel):
     server_url: Optional[str] = None
     token: Optional[str] = None
     callback_url: Optional[str] = None
-    return_url: Optional[str] = None   # URL to redirect to after successful registration
+    # Offered as a link on the OAuth success page (no automatic navigation —
+    # see _oauth_success_page).
+    return_url: Optional[str] = None
+    # Install a curated catalog entry: the backend resolves the slug and takes
+    # server_url, description and tags from the catalog rather than the caller,
+    # so curated metadata cannot drift or be spoofed. server_url above is kept
+    # as the fallback for when resolution misses.
+    catalog_slug: Optional[str] = None
+
+
+class MCPDefinitionRequest(BaseModel):
+    """A connection described by a dropped-in TOML file.
+
+    ``toml`` is the file's text; ``filename`` names the copy kept under
+    ``~/.smartloop/mcp.d/`` so the crawl plan it declares survives the install.
+    """
+    toml: str
+    filename: Optional[str] = None
 
 
 class MCPRegisterResponse(BaseModel):
@@ -91,23 +102,9 @@ class MCPRegisterResponse(BaseModel):
     client_secret: Optional[str] = None
     token_endpoint: Optional[str] = None
     authorization_endpoint: Optional[str] = None
+    # RFC 8707 resource indicator the client must echo back on the token request.
+    resource: Optional[str] = None
     server_url: Optional[str] = None
-
-
-class MCPOAuthInitiateRequest(BaseModel):
-    server_url: str
-    callback_url: Optional[str] = None
-
-
-class MCPOAuthInitiateResponse(BaseModel):
-    auth_url: str
-    server_url: str
-    state: str
-    code_verifier: str
-    client_id: str
-    client_secret: Optional[str] = None
-    token_endpoint: str
-    authorization_endpoint: str
 
 
 class MCPOAuthCallbackRequest(BaseModel):
@@ -119,6 +116,7 @@ class MCPOAuthCallbackRequest(BaseModel):
     client_secret: Optional[str] = None
     token_endpoint: str
     authorization_endpoint: str
+    resource: Optional[str] = None
     callback_url: Optional[str] = None
 
 

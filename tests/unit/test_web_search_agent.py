@@ -1,3 +1,5 @@
+import pytest
+
 from smartloop.agents.web_search_agent import normalize_search_query
 
 
@@ -92,9 +94,21 @@ class TestRerank:
 
 
 class TestEnablement:
-    """The per-project ``web_search_enabled`` flag must actually stop searches."""
+    """The project flag and the hosted status must both allow a search."""
 
-    def _write_config(self, tmp_path, enabled, monkeypatch):
+    @pytest.fixture(autouse=True)
+    def _hosted_available(self, monkeypatch):
+        """Say the account can search unless a test says otherwise.
+
+        is_enabled() consults the hosted status endpoint; without this stub the
+        result would depend on the network and on whoever runs the suite being
+        signed in.
+        """
+        import smartloop.search.providers as providers
+
+        monkeypatch.setattr(providers, "hosted_search_available", lambda: True)
+
+    def _write_config(self, tmp_path, enabled, monkeypatch, workspace_enabled=True):
         import json
 
         from smartloop.workspace.workspace import Workspace
@@ -107,6 +121,7 @@ class TestEnablement:
                 "workspace_dir": str(tmp_path),
                 "models_dir": str(tmp_path),
                 "models": [],
+                "web_search_enabled": workspace_enabled,
                 "projects": [
                     {"id": "other", "project_dir": str(tmp_path), "current": False,
                      "name": "other", "web_search_enabled": True},
@@ -124,8 +139,8 @@ class TestEnablement:
 
         self._write_config(tmp_path, False, monkeypatch)
         calls = []
-        monkeypatch.setattr(providers, "get_search_provider",
-                            lambda: type("P", (), {"search": lambda self, q, count: calls.append(q) or ["http://x"]})())
+        monkeypatch.setattr(providers, "resolve_provider",
+                            lambda: type("P", (), {"name": "hosted", "search": lambda self, q, count: calls.append(q) or ["http://x"]})())
 
         assert WebSearchAgent.is_enabled() is False
         assert WebSearchAgent().search("latest canyon bikes") == ""
@@ -177,6 +192,42 @@ class TestEnablement:
                           "name": "p1", "web_search_enabled": True}],
         }))
         assert WebSearchAgent.is_enabled() is False
+
+    def test_enabled_project_with_an_available_account(self, tmp_path, monkeypatch):
+        from smartloop.agents.web_search_agent import WebSearchAgent
+
+        self._write_config(tmp_path, True, monkeypatch)
+        assert WebSearchAgent.is_enabled() is True
+
+    def test_hosted_status_can_veto_an_enabled_project(self, tmp_path, monkeypatch):
+        """Signed out, or no provider registered — the endpoint decides, and
+        the orchestrator skips instead of calling and discarding a 403."""
+        import smartloop.search.providers as providers
+        from smartloop.agents.web_search_agent import WebSearchAgent
+
+        self._write_config(tmp_path, True, monkeypatch)
+        monkeypatch.setattr(providers, "hosted_search_available", lambda: False)
+
+        assert WebSearchAgent.is_enabled() is False
+
+    def test_project_switch_wins_without_asking_the_endpoint(
+        self, tmp_path, monkeypatch
+    ):
+        """The user's own switch is free to read, so it is checked first — a
+        disabled project must not cost a network round-trip."""
+        import smartloop.search.providers as providers
+        from smartloop.agents.web_search_agent import WebSearchAgent
+
+        self._write_config(tmp_path, False, monkeypatch)
+
+        asked = []
+        monkeypatch.setattr(
+            providers, "hosted_search_available",
+            lambda: asked.append(True) or True,
+        )
+
+        assert WebSearchAgent.is_enabled() is False
+        assert asked == []
 
 
 class TestSourceExtracts:

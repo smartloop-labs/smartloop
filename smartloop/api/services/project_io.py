@@ -285,6 +285,10 @@ def import_project(zip_path: Path, name: Optional[str] = None) -> dict:
             p.current = False
 
         workspace.projects.append(new_project)
+        # Snapshot the workspace model defaults, same as create_project does —
+        # an archive carries no model_settings, so without this the project's
+        # defaults would be decided lazily at its first models read.
+        workspace.sync_project_models(new_project)
         workspace.save()
         Workspace.reset()
 

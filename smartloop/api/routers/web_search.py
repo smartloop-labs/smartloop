@@ -1,8 +1,11 @@
-"""Web search enablement router (project-level).
+"""Web search enablement (project-level).
 
-Web search is a Pro feature. This router only toggles whether the
-orchestrator runs the WebSearchAgent for a project; the search itself is served
-by the hosted ``/v1/websearch`` endpoint (gated by the account's plan).
+``PATCH /v1/projects/{id}/websearch`` is the user's own switch, toggled by the
+Cmd/Ctrl+Alt+S shortcut. It says nothing about whether a search can actually
+run: that depends on the account being signed in with a provider registered,
+which the hosted ``GET /v1/websearch/status`` answers and the orchestrator
+checks before searching. There is deliberately no second local switch — it
+would only duplicate what the endpoint already knows.
 """
 import logging
 

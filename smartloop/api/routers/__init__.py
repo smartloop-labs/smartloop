@@ -6,6 +6,7 @@ from .documents import router as documents_router
 from .projects import router as projects_router
 from .assets import router as assets_router
 from .mcp_servers import router as mcp_servers_router
+from .mcp_catalog import router as mcp_catalog_router
 from .models import router as models_router
 from .init import router as init_router
 from .skills import router as skills_router
@@ -14,6 +15,5 @@ from .feedback import router as feedback_router
 from .project_io import router as project_io_router
 from .releases import router as releases_router
 from .web_search import router as web_search_router
-from .search_provider import router as search_provider_router
 
-__all__ = ["auth_router", "chat_router", "documents_router", "projects_router", "assets_router", "mcp_servers_router", "models_router", "init_router", "skills_router", "users_router", "feedback_router", "project_io_router", "releases_router", "web_search_router", "search_provider_router"]
+__all__ = ["auth_router", "chat_router", "documents_router", "projects_router", "assets_router", "mcp_servers_router", "mcp_catalog_router", "models_router", "init_router", "skills_router", "users_router", "feedback_router", "project_io_router", "releases_router", "web_search_router"]

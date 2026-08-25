@@ -88,6 +88,7 @@ class MCPOAuthService:
     """Sync service for handling OAuth flows with remote MCP servers."""
 
     WELL_KNOWN_PATH = "/.well-known/oauth-authorization-server"
+    WELL_KNOWN_OIDC_PATH = "/.well-known/openid-configuration"
     WELL_KNOWN_PRM_PATH = "/.well-known/oauth-protected-resource"
 
     def __init__(self, http_client: Optional[httpx.Client] = None):
@@ -115,10 +116,21 @@ class MCPOAuthService:
         base_url = self._get_base_url(server_url)
         path_suffix = self._get_path_suffix(server_url)
 
-        urls = [f"{base_url}{self.WELL_KNOWN_PATH}"]
-        if path_suffix:
-            urls.append(f"{base_url}{self.WELL_KNOWN_PATH}/{path_suffix}")
-        return urls
+        bare = f"{base_url}{self.WELL_KNOWN_PATH}"
+        if not path_suffix:
+            return [bare]
+
+        # For a path-scoped issuer, try the path-bearing well-known forms first. The bare
+        # (path-stripped) URL frequently describes a *different* root authorization server
+        # that lacks a registration_endpoint (e.g. Atlassian/Trello), so demote it to a
+        # last resort rather than letting it shadow the correct tenant metadata.
+        issuer = f"{base_url}/{path_suffix}"
+        return [
+            f"{base_url}{self.WELL_KNOWN_PATH}/{path_suffix}",  # RFC 8414 well-known-inserted
+            f"{issuer}{self.WELL_KNOWN_PATH}",                  # OIDC-style path-append (oauth)
+            f"{issuer}{self.WELL_KNOWN_OIDC_PATH}",             # OIDC-style path-append (openid)
+            bare,                                               # last-resort fallback
+        ]
 
     def _get_prm_urls_to_try(self, server_url: str) -> list[str]:
         base_url = self._get_base_url(server_url)
@@ -129,87 +141,64 @@ class MCPOAuthService:
             urls.append(f"{base_url}{self.WELL_KNOWN_PRM_PATH}/{path_suffix}")
         return urls
 
-    def discover_protected_resource_metadata(self, server_url: str) -> ProtectedResourceMetadata:
-        urls_to_try = self._get_prm_urls_to_try(server_url)
+    def _fetch_first_metadata(self, urls: list[str], error_cls, label: str) -> dict:
+        """GET each URL in order, returning the first that yields a valid JSON body.
+
+        Falls through to the next candidate on ANY error (HTTP status such as 503,
+        connection/transport errors, or invalid JSON) — not just 404 — so a transient
+        failure on an earlier candidate never aborts discovery. Raises ``error_cls``
+        only once every candidate has been exhausted.
+        """
         last_error = None
-
-        for prm_url in urls_to_try:
+        for url in urls:
             try:
-                response = self._http_client.get(prm_url)
+                response = self._http_client.get(url)
                 response.raise_for_status()
-                data = response.json()
-
-                return ProtectedResourceMetadata(
-                    resource=data.get("resource"),
-                    authorization_servers=data.get("authorization_servers", []),
-                    scopes_supported=data.get("scopes_supported", []),
-                )
+                return response.json()
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404 and prm_url != urls_to_try[-1]:
-                    last_error = e
-                    continue
-                raise ResourceMetadataDiscoveryError(
-                    f"Failed to fetch PRM from {prm_url}: HTTP {e.response.status_code}"
-                ) from e
+                last_error = f"{url}: HTTP {e.response.status_code}"
             except httpx.RequestError as e:
-                if prm_url != urls_to_try[-1]:
-                    last_error = e
-                    continue
-                raise ResourceMetadataDiscoveryError(
-                    f"Failed to connect to {prm_url}: {str(e)}"
-                ) from e
-            except (KeyError, ValueError) as e:
-                raise ResourceMetadataDiscoveryError(
-                    f"Invalid PRM format from {prm_url}: {str(e)}"
-                ) from e
+                last_error = f"{url}: {str(e)}"
+            except ValueError as e:
+                last_error = f"{url}: invalid JSON ({str(e)})"
 
-        raise ResourceMetadataDiscoveryError(
-            f"Failed to discover PRM from any endpoint. Last error: {last_error}"
+        raise error_cls(
+            f"Failed to discover {label} from any endpoint. Last error: {last_error}"
+        )
+
+    def discover_protected_resource_metadata(
+        self, server_url: str, metadata_url: Optional[str] = None
+    ) -> ProtectedResourceMetadata:
+        # RFC 9728 §5.1: honor the metadata URL advertised in the 401 WWW-Authenticate
+        # header when present, then fall back to guessing the well-known locations.
+        urls_to_try = self._get_prm_urls_to_try(server_url)
+        if metadata_url and metadata_url not in urls_to_try:
+            urls_to_try = [metadata_url, *urls_to_try]
+
+        data = self._fetch_first_metadata(
+            urls_to_try, ResourceMetadataDiscoveryError, "PRM"
+        )
+        return ProtectedResourceMetadata(
+            resource=data.get("resource"),
+            authorization_servers=data.get("authorization_servers", []),
+            scopes_supported=data.get("scopes_supported", []),
         )
 
     def discover_oauth_metadata(self, server_url: str) -> OAuthMetadata:
         urls_to_try = self._get_metadata_urls_to_try(server_url)
-        last_error = None
-
-        for metadata_url in urls_to_try:
-            try:
-                response = self._http_client.get(metadata_url)
-                response.raise_for_status()
-                data = response.json()
-
-                return OAuthMetadata(
-                    issuer=data.get("issuer"),
-                    authorization_endpoint=data.get("authorization_endpoint", ""),
-                    token_endpoint=data.get("token_endpoint", ""),
-                    registration_endpoint=data.get("registration_endpoint"),
-                    scopes_supported=data.get("scopes_supported", []),
-                    response_types_supported=data.get("response_types_supported", []),
-                    grant_types_supported=data.get("grant_types_supported", []),
-                    code_challenge_methods_supported=data.get("code_challenge_methods_supported", []),
-                    resource=data.get("resource"),
-                )
-            except httpx.HTTPStatusError as e:
-                status_code = e.response.status_code
-                if status_code == 404 and metadata_url != urls_to_try[-1]:
-                    last_error = e
-                    continue
-                raise MetadataDiscoveryError(
-                    f"Failed to fetch OAuth metadata from {metadata_url}: HTTP {status_code}"
-                ) from e
-            except httpx.RequestError as e:
-                if metadata_url != urls_to_try[-1]:
-                    last_error = e
-                    continue
-                raise MetadataDiscoveryError(
-                    f"Failed to connect to {metadata_url}: {str(e)}"
-                ) from e
-            except (KeyError, ValueError) as e:
-                raise MetadataDiscoveryError(
-                    f"Invalid OAuth metadata from {metadata_url}: {str(e)}"
-                ) from e
-
-        raise MetadataDiscoveryError(
-            f"Failed to discover OAuth metadata from any endpoint. Last error: {last_error}"
+        data = self._fetch_first_metadata(
+            urls_to_try, MetadataDiscoveryError, "OAuth metadata"
+        )
+        return OAuthMetadata(
+            issuer=data.get("issuer"),
+            authorization_endpoint=data.get("authorization_endpoint", ""),
+            token_endpoint=data.get("token_endpoint", ""),
+            registration_endpoint=data.get("registration_endpoint"),
+            scopes_supported=data.get("scopes_supported", []),
+            response_types_supported=data.get("response_types_supported", []),
+            grant_types_supported=data.get("grant_types_supported", []),
+            code_challenge_methods_supported=data.get("code_challenge_methods_supported", []),
+            resource=data.get("resource"),
         )
 
     def register_client(
@@ -259,6 +248,20 @@ class MCPOAuthService:
             raise ClientRegistrationError(
                 f"Invalid registration response - missing {str(e)}"
             ) from e
+
+    @staticmethod
+    def canonical_resource(server_url: str) -> str:
+        """Canonical resource indicator (RFC 8707 §2) for an MCP server URL.
+
+        Used when the server publishes no PRM ``resource`` of its own. Lowercases
+        scheme/host and drops the fragment, which RFC 8707 forbids; the path and
+        query are significant (``/mcp`` vs ``/sse`` are distinct resources) so
+        they are preserved verbatim.
+        """
+        parsed = urlparse(server_url.strip())
+        path = "" if parsed.path == "/" else parsed.path
+        canonical = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+        return f"{canonical}?{parsed.query}" if parsed.query else canonical
 
     @staticmethod
     def generate_pkce() -> Tuple[str, str]:
@@ -357,7 +360,8 @@ class MCPOAuthService:
         token_endpoint: str,
         refresh_token: str,
         client_id: str,
-        client_secret: Optional[str] = None
+        client_secret: Optional[str] = None,
+        resource: Optional[str] = None,
     ) -> TokenResponse:
         token_data = {
             "grant_type": "refresh_token",
@@ -366,6 +370,8 @@ class MCPOAuthService:
         }
         if client_secret:
             token_data["client_secret"] = client_secret
+        if resource:
+            token_data["resource"] = resource
 
         try:
             response = self._http_client.post(

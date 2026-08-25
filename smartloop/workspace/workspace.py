@@ -58,6 +58,9 @@ class RemoteMCPServerConfig(BaseModel):
     token_endpoint: Optional[str] = None
     authorization_endpoint: Optional[str] = None
     token: Optional[str] = None
+    # RFC 8707 resource indicator negotiated at connect time. Persisted because
+    # refresh requests must carry the same indicator as the original grant.
+    resource: Optional[str] = None
 
 
 class MCPOAuthCredentials(BaseModel):
@@ -70,6 +73,20 @@ class MCPOAuthCredentials(BaseModel):
     token_type: str = "Bearer"
 
 
+class MCPServerStatus(str, Enum):
+    """Provisioning state of a registered MCP server.
+
+    Registration only persists the connection; discovery, metadata enrichment
+    and indexing run in the background (see :class:`MCPTask`), so a server is
+    ``PENDING`` until that pass finishes.  ``READY`` is the default so servers
+    written before this field existed — already discovered and indexed — are
+    not re-queued on upgrade.
+    """
+    PENDING = "pending"
+    READY = "ready"
+    FAILED = "failed"
+
+
 class MCPServer(BaseModel):
     """An MCP server registered to a project, persisted in config.json."""
     id: str
@@ -77,6 +94,10 @@ class MCPServer(BaseModel):
     pkg: Optional[str] = None
     description: Optional[str] = None
     summary: Optional[str] = None
+    tags: List[str] = []
+    # Slug of the curated catalog entry this server was installed from, when it
+    # was. Provenance: it is what marks metadata as ours rather than generated.
+    catalog_slug: Optional[str] = None
     config: Optional[MCPServerConfig] = None
     server_type: MCPServerType = MCPServerType.LOCAL
     remote_config: Optional[RemoteMCPServerConfig] = None
@@ -85,6 +106,54 @@ class MCPServer(BaseModel):
     system: bool = False
     tools: List[MCPToolDefinition] = []
     server_info: Optional[Dict[str, Any]] = None
+    # Background provisioning state (discovery → enrichment → tool index →
+    # content crawl).  Registration returns as soon as the connection is
+    # persisted, so clients poll this instead of blocking on the handshake.
+    status: MCPServerStatus = MCPServerStatus.READY
+    # Human-readable reason the last provisioning pass failed, if it did.
+    last_error: Optional[str] = None
+    # Content crawl (see smartloop.mcp.crawl_plans): None = auto (crawl when a
+    # curated plan matches this server), True/False = explicit opt in/out.
+    crawl: Optional[bool] = None
+    # Epoch seconds of the last completed content crawl, for the refresh cycle.
+    last_crawl_at: Optional[float] = None
+    # Which account this connection is authenticated as ("mehfuz@smartloop.ai",
+    # "Smartloop HQ"), probed at provisioning time.  It is what distinguishes
+    # two connections to the same product; None when the server ships no
+    # identity tool.  See :mod:`smartloop.mcp.account`.
+    account: Optional[str] = None
+
+
+class ProjectModel(BaseModel):
+    """A model's settings scoped to a single project.
+
+    Seeded from the workspace defaults (the app-default template) when the
+    project is created (see ``Workspace.sync_project_models``), then diverges
+    independently per project.  ``settings`` is a catch-all dict for
+    project-level inference defaults (temperature, top_p, top_k, …) that will
+    be added later.
+
+    Download state deliberately lives only on :class:`WorkspaceModel`: weights
+    are downloaded and removed for the whole workspace, so a per-project copy
+    would be a cache of a global fact with nothing to invalidate it.  See
+    :meth:`Workspace.effective_model_downloaded`.
+    """
+    model_name: str
+    enabled: bool = True
+    is_active: bool = False
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("model_name")
+    @classmethod
+    def _canonicalize_model_name(cls, value: str) -> str:
+        """Migrate an entry written under a model's old short name.
+
+        Mirrors :meth:`WorkspaceModel._canonicalize_model_name` so a project
+        whose ``model_settings`` were written before a rename still resolves
+        against the workspace registry instead of silently falling back to the
+        workspace default.
+        """
+        return canonical_model_name(value)
 
 
 class WorkspaceModel(BaseModel):
@@ -231,6 +300,7 @@ class Project (BaseModel):
     # default costs nothing until a key is connected.
     # Toggled per project via PATCH /v1/projects/{id} (or .../websearch).
     web_search_enabled: bool = True
+    model_settings: List[ProjectModel] = []
 
     @property
     def skills_dir(self) -> str:
@@ -311,6 +381,9 @@ class Workspace(BaseModel):
 
     _instance: ClassVar[Optional['Workspace']] = None
     _lock: ClassVar[threading.Lock] = threading.Lock()
+    # Serializes save(): background tasks (document indexing, MCP provisioning
+    # and the MCP content crawl) each persist from their own thread.
+    _save_lock: ClassVar[threading.Lock] = threading.Lock()
     config_file: ClassVar[str] = os.path.join(_settings.home_dir, "config.json")
 
     id: str
@@ -333,7 +406,9 @@ class Workspace(BaseModel):
         ):
         # ``**_legacy`` swallows keys that were persisted by older builds but
         # have since been removed from the model (e.g. ``web_search``), so
-        # loading an existing config.json never fails validation.
+        # loading an existing config.json never fails validation. Anything
+        # still supported has to be named explicitly here — a field left to
+        # _legacy is silently dropped and reverts to its default on every load.
         super().__init__(id=id, projects=projects or [], merge_model_dir=merge_model_dir, workspace_dir=workspace_dir, models_dir=models_dir, models=models or [], adapters=adapters or [])
 
     @property
@@ -355,6 +430,171 @@ class Workspace(BaseModel):
                 m.enabled = enabled
                 return
         raise ValueError(f"Model not found: {model_name}")
+
+    # ------------------------------------------------------------- per-project
+
+    def is_bootstrap_model(self, model_name: str) -> bool:
+        """True for the always-on bootstrap/orchestrator model.
+
+        That model is always enabled, can't be turned off, and is filtered out
+        of every models list response, so it deliberately gets no per-project
+        entry: a per-project ``enabled=False`` would shadow its always-on
+        workspace state everywhere selection resolves through
+        ``effective_model_enabled`` (``ranked_models_for``, the vision and
+        agent-model sweeps, the capability sweep).  With no entry it keeps
+        falling through to the workspace record, which is the real answer.
+        """
+        return canonical_model_name(model_name) == canonical_model_name(
+            AppSettings().default_model
+        )
+
+    def sync_project_models(self, project: Project) -> None:
+        """Seed a project's ``model_settings`` from the workspace defaults.
+
+        Adds a ``ProjectModel`` for every registered workspace model the
+        project doesn't already have an entry for, copying the workspace-level
+        (app-default) enabled/downloaded/active state.  Existing project
+        entries are left untouched so per-project overrides survive.  Called
+        at project creation and lazily before reads/writes so models added to
+        the catalog after a project was created show up too.
+
+        The bootstrap model is excluded (see :meth:`is_bootstrap_model`), and
+        any entry a previous build already wrote for it is pruned here so
+        existing workspaces heal on next access.
+        """
+        project.model_settings = [
+            m for m in project.model_settings if not self.is_bootstrap_model(m.model_name)
+        ]
+        existing = {canonical_model_name(m.model_name) for m in project.model_settings}
+        for wm in self.models:
+            if (canonical_model_name(wm.model_name) in existing
+                    or self.is_bootstrap_model(wm.model_name)):
+                continue
+            project.model_settings.append(ProjectModel(
+                model_name=wm.model_name,
+                enabled=wm.enabled,
+                is_active=wm.is_active,
+            ))
+
+    def project_model(self, project: Optional[Project], model_name: str) -> Optional[ProjectModel]:
+        """Return a project's ``ProjectModel`` entry for *model_name*, or None.
+
+        No fallback to the workspace default here — callers that want the
+        merged view use ``effective_*`` below.
+        """
+        if project is None:
+            return None
+        target = canonical_model_name(model_name)
+        for m in project.model_settings:
+            if canonical_model_name(m.model_name) == target:
+                return m
+        return None
+
+    def effective_model_enabled(self, model_name: str, project: Optional[Project] = None) -> bool:
+        """Whether *model_name* is enabled for *project* (or the workspace default).
+
+        Resolution: project override → workspace (app-default) entry → True.
+        """
+        pm = self.project_model(project, model_name)
+        if pm is not None:
+            return pm.enabled
+        ws = self.get_model(model_name)
+        return ws.enabled if ws is not None else True
+
+    def effective_model_downloaded(self, model_name: str) -> bool:
+        """Whether *model_name*'s weights are present in the workspace.
+
+        Downloads are workspace-wide — the weights live in one shared
+        ``models_dir`` and are added or removed for every project at once — so
+        this takes no ``project`` argument.  Kept alongside the
+        ``effective_model_*`` accessors that do vary per project so callers
+        filtering on "enabled and downloaded" read consistently.
+        """
+        ws = self.get_model(model_name)
+        return ws.downloaded if ws is not None else False
+
+    def effective_model_active(self, model_name: str, project: Optional[Project] = None) -> bool:
+        """Whether *model_name* is the active selection for *project*."""
+        pm = self.project_model(project, model_name)
+        if pm is not None:
+            return pm.is_active
+        ws = self.get_model(model_name)
+        return ws.is_active if ws is not None else False
+
+    def pin_model_for_existing_projects(self, model_name: str) -> None:
+        """Freeze what *model_name* currently resolves to, per project.
+
+        A project with no ``ProjectModel`` entry reads through to the workspace
+        app-default (see :meth:`effective_model_enabled`), so changing that
+        default would retroactively change the project.  Writing today's answer
+        down first means the new default only reaches projects created after.
+
+        Only this model is pinned: a blanket ``sync_project_models`` would also
+        detach every unrelated model in every project from future defaults.
+        """
+        if self.is_bootstrap_model(model_name):
+            return  # holds no per-project entry by design
+        for project in self.projects:
+            if self.project_model(project, model_name) is not None:
+                continue
+            project.model_settings.append(ProjectModel(
+                model_name=model_name,
+                enabled=self.effective_model_enabled(model_name, project),
+                is_active=self.effective_model_active(model_name, project),
+            ))
+
+    def promote_model_to_workspace_default(self, model_name: str) -> None:
+        """Make *model_name* an app-default for projects created from now on.
+
+        One-way: enabling a model in a project promotes it, disabling never
+        demotes it, so the default set only grows as models are downloaded.
+        Existing projects are pinned first and keep whatever they resolve to
+        today — a user who wanted the model there would have enabled it.
+        """
+        if self.is_bootstrap_model(model_name):
+            return  # always enabled, not a configurable default
+        ws = self.get_model(model_name)
+        if ws is None or ws.enabled:
+            return  # nothing to leak, skip the pin
+        self.pin_model_for_existing_projects(model_name)
+        ws.enabled = True
+
+    def set_project_model_enabled(self, project: Project, model_name: str, enabled: bool) -> Optional[ProjectModel]:
+        """Set *model_name*'s enabled state on *project*, upserting an entry.
+
+        Returns ``None`` without writing anything for the bootstrap model,
+        which has no per-project entry (see :meth:`is_bootstrap_model`).
+        """
+        if self.is_bootstrap_model(model_name):
+            return None
+        self.sync_project_models(project)
+        pm = self.project_model(project, model_name)
+        if pm is None:
+            pm = ProjectModel(model_name=model_name, enabled=enabled)
+            project.model_settings.append(pm)
+        else:
+            pm.enabled = enabled
+        return pm
+
+    def set_project_model_active(self, project: Project, model_name: str, active: bool) -> Optional[ProjectModel]:
+        """Set *model_name* as active on *project*, deactivating the others.
+
+        Returns ``None`` without writing anything for the bootstrap model,
+        which has no per-project entry (see :meth:`is_bootstrap_model`).
+        """
+        if self.is_bootstrap_model(model_name):
+            return None
+        self.sync_project_models(project)
+        pm = self.project_model(project, model_name)
+        if pm is None:
+            pm = ProjectModel(model_name=model_name, is_active=active)
+            project.model_settings.append(pm)
+        if active:
+            for other in project.model_settings:
+                other.is_active = (other is pm)
+        else:
+            pm.is_active = False
+        return pm
 
     def get_model(self, model_name: Optional[str] = None) -> Optional[WorkspaceModel]:
         """Look up a registered model by its short name.
@@ -386,11 +626,16 @@ class Workspace(BaseModel):
 
         return result
 
-    def add_model(self, model_name: str, model_id: str, config: Optional[ModelConfig] = None) -> WorkspaceModel:
+    def add_model(self, model_name: str, model_id: str, config: Optional[ModelConfig] = None,
+                  enabled: bool = True) -> WorkspaceModel:
         """Register a model in the workspace without changing the active model.
 
         The record is stored under the canonical name, so a legacy name coming
         from the cloud catalog is not written back into ``config.json``.
+
+        ``enabled`` seeds the app-default that ``sync_project_models`` copies
+        into every project, so a caller registering a model on one project's
+        behalf should pass ``False`` and enable it on that project itself.
         """
         model_name = canonical_model_name(model_name)
         existing = self.get_model(model_name)
@@ -406,17 +651,28 @@ class Workspace(BaseModel):
                     existing.config = config
             return existing
         has_active = any(m.is_active for m in self.models)
-        entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, is_active=not has_active, models_dir=self.models_dir)
+        # The bootstrap model gets no per-project entry, so its always-on state
+        # resolves through this record (see is_bootstrap_model) — never register
+        # it disabled.
+        if self.is_bootstrap_model(model_name):
+            enabled = True
+        entry = WorkspaceModel(model_name=model_name, model_id=model_id, config=config, enabled=enabled, is_active=not has_active, models_dir=self.models_dir)
         self.models.append(entry)
         return entry
 
-    def largest_downloaded_model(self) -> Optional[WorkspaceModel]:
-        """Return the best enabled, downloaded model, or None.
+    def largest_downloaded_model(self, project: Optional[Project] = None) -> Optional[WorkspaceModel]:
+        """Return the best enabled, downloaded model for *project*, or None.
 
         Ranks by parameter count first (the largest model wins), then by model
-        version as a tie-breaker between same-size models.
+        version as a tie-breaker between same-size models.  When *project* is
+        given, its per-project model settings override the workspace defaults.
         """
-        candidates = [m for m in self.models if m.enabled and m.downloaded and m.param_size_b > 0]
+        candidates = [
+            m for m in self.models
+            if self.effective_model_enabled(m.model_name, project)
+            and self.effective_model_downloaded(m.model_name)
+            and m.param_size_b > 0
+        ]
         if not candidates:
             return None
         candidates.sort(key=lambda m: m._rank, reverse=True)
@@ -424,19 +680,22 @@ class Workspace(BaseModel):
         best.models_dir = self.models_dir
         return best
 
-    def ranked_models_for(self, capability: str) -> List["WorkspaceModel"]:
+    def ranked_models_for(self, capability: str, project: Optional[Project] = None) -> List["WorkspaceModel"]:
         """Enabled, downloaded models declaring *capability*, best-first.
 
         Ranked by :attr:`WorkspaceModel._rank` (larger size first, then newer
         version), so the most capable model leads. Callers walk this list down to
         a smaller same-capability model when the largest doesn't fit in memory,
         rather than dropping straight to the tiny default. Empty when no
-        downloaded model declares the capability.
+        downloaded model declares the capability.  Per-project settings
+        (``project=``) override the workspace defaults.
         """
         cap = capability.lower()
         candidates = [
             m for m in self.models
-            if m.enabled and m.downloaded and m.param_size_b > 0
+            if self.effective_model_enabled(m.model_name, project)
+            and self.effective_model_downloaded(m.model_name)
+            and m.param_size_b > 0
             and cap in [c.lower() for c in m.effective_capabilities]
         ]
         candidates.sort(key=lambda m: m._rank, reverse=True)
@@ -444,7 +703,7 @@ class Workspace(BaseModel):
             m.models_dir = self.models_dir
         return candidates
 
-    def best_model_for(self, capability: str) -> Optional[WorkspaceModel]:
+    def best_model_for(self, capability: str, project: Optional[Project] = None) -> Optional[WorkspaceModel]:
         """Return the single best model for a capability — the largest (by
         size, then newer version) that declares it — or the largest downloaded
         model when none declares it.
@@ -452,10 +711,10 @@ class Workspace(BaseModel):
         Memory is NOT considered here; callers that must fit the model in VRAM
         use :meth:`ranked_models_for` and walk down to a smaller candidate.
         """
-        ranked = self.ranked_models_for(capability)
+        ranked = self.ranked_models_for(capability, project)
         if ranked:
             return ranked[0]
-        return self.largest_downloaded_model()
+        return self.largest_downloaded_model(project)
 
     def model_dir_for(self, model_id: str) -> str:
         """Return the workspace-level directory for a given model_id."""
@@ -499,16 +758,29 @@ class Workspace(BaseModel):
         return exact
 
     def save(self) -> None:
-        """Persist workspace state to config.json."""
-        ws_data = self.model_dump(mode="json")
-        ws_data.pop("model_dir", None)
-        ws_data.pop("model_path", None)
-        ws_data.pop("current_project", None)
-        ws_data.pop("model_id", None)
-        active = self.active_model
-        data = {"id": active.model_id if active else "", "workspace": ws_data}
-        with open(self.config_file, "w") as f:
-            json.dump(data, f, indent=4)
+        """Persist workspace state to config.json.
+
+        Serialized and atomic.  Several background tasks now write the
+        workspace from their own threads — document indexing, MCP provisioning,
+        the MCP content crawl — and two of them writing the same file directly
+        would interleave into a truncated or half-updated config.  The snapshot
+        is taken under the lock and swapped in with a rename, so a reader (or a
+        crash) sees either the old file or the new one.
+        """
+        with self._save_lock:
+            ws_data = self.model_dump(mode="json")
+            ws_data.pop("model_dir", None)
+            ws_data.pop("model_path", None)
+            ws_data.pop("current_project", None)
+            ws_data.pop("model_id", None)
+            active = self.active_model
+            data = {"id": active.model_id if active else "", "workspace": ws_data}
+            tmp_file = f"{self.config_file}.tmp"
+            with open(tmp_file, "w") as f:
+                json.dump(data, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, self.config_file)
     
     @classmethod
     def _create_new_workspace(cls, config: ModelConfig) -> 'Workspace':

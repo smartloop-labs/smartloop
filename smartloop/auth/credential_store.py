@@ -19,8 +19,6 @@ logger = logging.getLogger(__name__)
 _DEVELOPER_TOKEN = "developer_token"
 _ACCESS_TOKEN = "access_token"
 _REFRESH_TOKEN = "refresh_token"
-_SEARCH_PROVIDER = "search_provider"
-_SEARCH_PROVIDER_TOKEN = "search_provider_token"
 
 
 # -- file-based storage ----------------------------------------------------
@@ -142,25 +140,6 @@ def set_refresh_token(token: str) -> None:
 
 def clear_refresh_token() -> None:
     _clear(_REFRESH_TOKEN)
-
-
-# -- web search provider ----------------------------------------------------
-
-def get_search_provider_config() -> tuple[str | None, str | None]:
-    """Return ``(provider_name, api_token)`` from the credential store."""
-    return _get(_SEARCH_PROVIDER), _get(_SEARCH_PROVIDER_TOKEN)
-
-
-def set_search_provider_config(provider: str, token: str) -> None:
-    """Register a web search provider and its API token (encrypted)."""
-    _set(_SEARCH_PROVIDER, provider.strip().lower())
-    _set(_SEARCH_PROVIDER_TOKEN, token.strip())
-
-
-def clear_search_provider_config() -> None:
-    """Remove the registered web search provider and token."""
-    _clear(_SEARCH_PROVIDER)
-    _clear(_SEARCH_PROVIDER_TOKEN)
 
 
 # -- unified resolver ------------------------------------------------------

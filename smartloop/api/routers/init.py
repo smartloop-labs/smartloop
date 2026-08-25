@@ -32,6 +32,7 @@ class InitRequest(BaseModel):
     model_name: Optional[str] = Field(default=None, description="Model to initialize")
     developer_token: Optional[str] = Field(default=None, description="Developer token for model download")
     cwd: Optional[str] = Field(default=None, description="Working directory for the default project; defaults to ~/smartloop/<name> when omitted")
+    project_id: Optional[str] = Field(default=None, description="Project the download was requested for; scopes the resulting enablement to it")
 
 
 def _sse_event(data: dict, event: str = "progress") -> str:
@@ -215,7 +216,13 @@ async def init(
         model_cls = SUPPORTED_MODELS.get(target)
         if not model_cls:
             raise HTTPException(status_code=400, detail=f"Unknown model: {target}")
-        ws_model = workspace.add_model(target, model_cls.model_id())
+        # Register a project-scoped download disabled: the caller's follow-up
+        # PATCH enables it and promotes the app-default from there (see
+        # Workspace.promote_model_to_workspace_default), so a cancelled
+        # download strands nothing. A project-less init (CLI/TUI) sends no
+        # PATCH, so it registers enabled workspace-wide.
+        ws_model = workspace.add_model(target, model_cls.model_id(),
+                                       enabled=request.project_id is None)
 
     model_dir = ws_model.model_dir
     needs_download = not _gguf_exists(model_dir)
@@ -232,15 +239,14 @@ async def init(
             # 1. Download if needed
             if _gguf_exists(model_dir):
                 yield _sse_event({"status": "model_ready", "message": f"Model {display_model_name(target)} already available."})
-                if not ws_model.downloaded:
-                    ws_model.downloaded = True
+                model_service.mark_model_downloaded(target)
                 model_service._model.save()
             else:
                 downloader = SLPArtifactDownloader(workspace, logger)
                 async for event in _download_and_stream(downloader, ws_model.model_id, target):
                     yield event
 
-                ws_model.downloaded = True
+                model_service.mark_model_downloaded(target)
                 model_service._model.save()
 
             # Workspace config.json exists after the save above, so the
@@ -339,7 +345,6 @@ async def bootstrap(
                         if not wm.downloaded:
                             wm.downloaded = True
                         break
-
             if existing_model_name:
                 yield _sse_event({"status": "model_ready", "message": f"Model {display_model_name(existing_model_name)} already available."})
             else:
@@ -357,7 +362,7 @@ async def bootstrap(
                 async for event in _download_and_stream(downloader, bootstrap_model_id, bootstrap_name, is_bootstrap=True):
                     yield event
 
-                ws_model.downloaded = True
+                model_service.mark_model_downloaded(bootstrap_name)
                 existing_model_name = bootstrap_name
                 workspace.save()
 

@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import _release_queue
+
 import smartloop.utils.logging_setup as logging_setup
 from smartloop.utils.logging_setup import (
     DEFAULT_FORMAT,
@@ -35,6 +37,24 @@ from smartloop.utils.logging_setup import (
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _reset_log_queue_singleton():
+    """Keep ``logging_setup._LOG_QUEUE`` from leaking between tests.
+
+    It is a process-wide singleton, so a queue created here would otherwise be
+    handed to every later caller of ``make_log_queue`` in the same session.
+    """
+    import smartloop.utils.logging_setup as ls
+
+    ls._LOG_QUEUE = None
+    try:
+        yield
+    finally:
+        leaked, ls._LOG_QUEUE = ls._LOG_QUEUE, None
+        if leaked is not None:
+            _release_queue(leaked)
+
 
 def _drain_listener(listener) -> None:
     """Block briefly until the listener's queue is drained, then stop it."""
@@ -135,6 +155,7 @@ def test_spawn_process_records_reach_parent_listener():
         assert proc.exitcode == 0
     finally:
         _drain_listener(listener)
+        _release_queue(queue)
 
     assert "hello from spawn" in buf.getvalue()
     assert "spawn.test" in buf.getvalue()

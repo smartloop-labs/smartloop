@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from typing import Optional
 
 from smartloop.workspace import MCPToolDefinition
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 _PROTOCOL_VERSION = "2024-11-05"
 _CLIENT_INFO = {"name": "smartloop-cli", "version": "1.0.0"}
+
+
+# Lines of stderr retained per client (see _stderr_chunks).
+_STDERR_MAX_LINES = 200
 
 
 class LocalMCPClient:
@@ -53,7 +58,12 @@ class LocalMCPClient:
         # used on pipe handles on Windows (WinError 10038 "not a socket"), so we
         # read on daemon threads and apply timeouts via Queue.get instead.
         self._stdout_queue: "queue.Queue[Optional[str]]" = queue.Queue()
-        self._stderr_chunks: list[str] = []
+        # Tail-bounded: _read_stderr_nonblocking only ever returns the last few
+        # hundred bytes, and the callers that classify a failure
+        # (ModelService._mcp2_incompat_error / _friendly_discovery_error) match
+        # the *last* traceback line.  An unbounded list would retain the entire
+        # stream from a chatty launcher (uvx dependency resolution, tracebacks).
+        self._stderr_chunks: "deque[str]" = deque(maxlen=_STDERR_MAX_LINES)
         self._stderr_lock = threading.Lock()
         self._reader_stdout: Optional[threading.Thread] = None
         self._reader_stderr: Optional[threading.Thread] = None
@@ -165,34 +175,45 @@ class LocalMCPClient:
             bufsize=1,
         )
 
-        # For external processes (uvx, npx, …) give the launcher a moment to
-        # either start the MCP server or fail visibly.  Built-in modules start
-        # in-process and don't need this guard.
-        if not self._is_builtin_module():
-            # Poll up to 2 s in 50 ms steps waiting for the process to either
-            # become an MCP server (still alive → break) or exit immediately.
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                time.sleep(0.05)
-                code = self._process.poll()
-                if code is None:
-                    # Still running — assume the MCP server is ready.
-                    break
-                # Process exited — read all available stderr and raise now so
-                # the caller (model_service's hint-retry logic) can inspect it.
-                # No reader threads are running yet, so a direct blocking read is
-                # safe here (the pipe is at EOF).
-                try:
-                    stderr = self._process.stderr.read()
-                except Exception:
-                    stderr = ""
-                raise MCPLaunchError(
-                    f"MCP server process exited during startup (exit code {code})."
-                    + self._startup_hint(stderr)
-                    + (f"\nstderr: {stderr.strip()}" if stderr and stderr.strip() else "")
-                )
+        # Anything that raises past this point must still reap the child and
+        # close its pipes: Python does NOT call __exit__ when __enter__ raises,
+        # so `with LocalMCPClient(...)` would leave the process and its three
+        # pipe FDs alive for as long as the exception's traceback holds this
+        # frame — which, for MCPLaunchError, is the whole of
+        # ModelService.add_local_mcp_server's retry ladder (up to two more
+        # spawns on top of this one).
+        try:
+            # For external processes (uvx, npx, …) give the launcher a moment to
+            # either start the MCP server or fail visibly.  Built-in modules start
+            # in-process and don't need this guard.
+            if not self._is_builtin_module():
+                # Poll up to 2 s in 50 ms steps waiting for the process to either
+                # become an MCP server (still alive → break) or exit immediately.
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    time.sleep(0.05)
+                    code = self._process.poll()
+                    if code is None:
+                        # Still running — assume the MCP server is ready.
+                        break
+                    # Process exited — read all available stderr and raise now so
+                    # the caller (model_service's hint-retry logic) can inspect it.
+                    # No reader threads are running yet, so a direct blocking read is
+                    # safe here (the pipe is at EOF).
+                    try:
+                        stderr = self._process.stderr.read()
+                    except Exception:
+                        stderr = ""
+                    raise MCPLaunchError(
+                        f"MCP server process exited during startup (exit code {code})."
+                        + self._startup_hint(stderr)
+                        + (f"\nstderr: {stderr.strip()}" if stderr and stderr.strip() else "")
+                    )
 
-        self._start_readers()
+            self._start_readers()
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
         return self
 
     # ------------------------------------------------------------------
@@ -235,6 +256,7 @@ class LocalMCPClient:
             pass
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        # Must stay idempotent — __enter__ calls this on its own failure path.
         if self._process:
             try:
                 self._process.stdin.close()
@@ -248,7 +270,23 @@ class LocalMCPClient:
                     self._process.kill()
                 except Exception:
                     pass
+            # Close the pipes explicitly rather than leaving them to the GC.
+            # This also unblocks a reader thread still parked in readline() if
+            # the child ignored terminate(), so the join below can't hang.
+            for pipe in (self._process.stdout, self._process.stderr):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except Exception:
+                    pass
             self._process = None
+        # Retire the readers so they can't outlive the client.  They're daemons,
+        # so the bounded join is belt-and-braces, not a correctness requirement.
+        for thread in (self._reader_stdout, self._reader_stderr):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=1.0)
+        self._reader_stdout = None
+        self._reader_stderr = None
         self._initialized = False
 
     # ------------------------------------------------------------------
@@ -263,14 +301,16 @@ class LocalMCPClient:
         """Return up to *max_bytes* of stderr collected by the reader thread.
 
         Gives the pump a brief moment to flush any pending diagnostic output so
-        error messages can carry a useful stderr tail.
+        error messages can carry a useful stderr tail. Keeps the *tail* rather
+        than the head — for a Python traceback the actual exception (e.g. the
+        ModuleNotFoundError) is on the last line, which is what callers classify.
         """
         try:
             if self._reader_stderr is not None:
                 self._reader_stderr.join(timeout=0.5)
             with self._stderr_lock:
                 data = "".join(self._stderr_chunks)
-            return data.strip()[:max_bytes]
+            return data.strip()[-max_bytes:]
         except Exception as e:
             logger.debug("Error reading stderr: %s", e, exc_info=True)
         return ""

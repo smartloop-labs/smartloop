@@ -48,6 +48,11 @@ SKIP_DIRS = frozenset({
 
 _MANIFEST_FILENAME = ".workspace_manifest.json"
 
+# Directories holding the framework's own state, skipped when they sit at the
+# root of the scan.  The scan root *is* ``project_dir`` (see IndexerTask), so
+# the vector store's own files are always inside it.
+SKIP_ROOT_DIRS = frozenset({"db"})
+
 
 # ------------------------------------------------------------------ helpers
 
@@ -125,7 +130,9 @@ class WorkspaceIndexer:
         Returns a stats dict: ``{"indexed": N, "skipped": N, "removed": N}``.
         Thread-safe — concurrent calls are serialised.
         """
-        with self._lock:
+        from smartloop.db.embeddings import indexing_burst
+
+        with self._lock, indexing_burst():
             return self._index(work_dir)
 
     def search(
@@ -178,11 +185,19 @@ class WorkspaceIndexer:
         # Collect all current candidate files
         current_files: Dict[str, str] = {}  # rel_path -> abs_path
         for root, dirs, files in os.walk(work_dir, topdown=True):
+            at_root = os.path.realpath(root) == work_dir
             dirs[:] = sorted(
                 d for d in dirs
                 if d not in SKIP_DIRS and not d.endswith(".egg-info")
+                and not (at_root and d in SKIP_ROOT_DIRS)
             )
             for fname in files:
+                # Hidden files are state, not content — and one of them is this
+                # indexer's own manifest, written at the end of every run.
+                # Indexing it made every run dirty the input to the next one: a
+                # file re-embedded every scan, forever, for nothing.
+                if fname.startswith("."):
+                    continue
                 ext = os.path.splitext(fname)[1].lower()
                 if ext not in INDEX_EXTENSIONS:
                     continue
