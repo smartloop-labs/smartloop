@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Callable, Dict, Optional, Iterator, List
 from uuid import uuid4
 
-import yaml
 import markdownify
 
 from langchain_core.outputs import GenerationChunk
@@ -58,6 +57,7 @@ from smartloop.tasks import (
     MCPTask,
 )
 from smartloop.utils import normalize_path
+from smartloop.db import embeddings
 
 _settings = AppSettings()
 
@@ -3066,6 +3066,13 @@ class ModelService:
             self._cleanup_gpu_cache()
         return freed
 
+    def unload_embedding_model(self) -> None:
+        """Release the embedding model and free its VRAM."""
+        try:
+            embeddings.unload()
+        except Exception as e:  # cleanup must never fail a response
+            logger.warning("[models] embedding unload failed: %s", e)
+
     def unload_auxiliary_models(self) -> None:
         """Release every on-demand auxiliary model, keeping only the resident
         orchestrator.
@@ -3082,16 +3089,13 @@ class ModelService:
         and llama.cpp context until the next question is the same idle cost as
         the auxiliary LLMs. It reloads lazily on the next search.
         """
-        self.unload_vision_model()
-        self.unload_large_model()
-        self._evict_capability_models()
-
         try:
-            from smartloop.db import embeddings
-
-            embeddings.unload()
+            self.unload_vision_model()
+            self.unload_large_model()
+            self._evict_capability_models()
+            self.unload_embedding_model()
         except Exception as e:  # cleanup must never fail a response
-            logger.warning("[models] embedding unload failed: %s", e)
+            logger.warning("[models] auxiliary models unload failed: %s", e)
 
     def unload_model_by_name(self, model_name: str) -> bool:
         """Free VRAM held by a specific model, e.g. when it's deselected.
