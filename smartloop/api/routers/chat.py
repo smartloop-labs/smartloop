@@ -780,7 +780,7 @@ async def stream_chunks(
         alnum = sum(ch.isalnum() for ch in stripped)
         return alnum < 3
 
-    def run_sync_stream():
+    def _stream_into_queue():
         """Run the sync stream in a thread and put chunks in queue.
 
         When tool context is present we buffer only the OPENING of the
@@ -889,6 +889,25 @@ async def stream_chunks(
 
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
+    def run_sync_stream():
+        """Produce the stream, then free the models this thread just used.
+
+        The unload has to happen *here*, not in the consumer's ``finally``.
+        ``cancelled`` is cooperative — it is only observed between tokens — so
+        when the user interrupts, the consumer's ``finally`` runs while this
+        thread is still inside ``llama_sampler_sample``.  Freeing the model
+        there pulls the llama.cpp context out from under a live sampler and
+        segfaults the process.  Running it on this thread, after the generator
+        is done, means nothing is mid-inference when the weights go away.
+        """
+        try:
+            _stream_into_queue()
+        finally:
+            # Frees the on-demand auxiliary models (vision + large agent) and
+            # the embedding model, leaving only the orchestrator resident
+            # between chats.  Never raises — unload_auxiliary_models swallows.
+            model_service.unload_auxiliary_models()
+
     # Start the sync stream in thread pool
     _executor.submit(run_sync_stream)
 
@@ -963,11 +982,9 @@ async def stream_chunks(
                 citations=_verified_citations(citations, full_response),
                 message_id=message_id,
             )
-
-        # Response is fully streamed — free the on-demand auxiliary models
-        # (vision + large agent) so only the orchestrator stays resident
-        # between chats. Runs on normal completion, error, and cancellation.
-        model_service.unload_auxiliary_models()
+        # Model cleanup deliberately does NOT happen here — see
+        # run_sync_stream. This runs on interrupt too, while the producer
+        # thread may still be inside llama.cpp.
 
     # Auto file-write: if user asked to create/generate/write, save LLM response to file
     _out_cwd = _request_cwd(model_service)
