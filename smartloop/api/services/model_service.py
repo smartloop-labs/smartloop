@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Callable, Dict, Optional, Iterator, List
 from uuid import uuid4
 
-import yaml
 import markdownify
 
 from langchain_core.outputs import GenerationChunk
@@ -58,6 +57,7 @@ from smartloop.tasks import (
     MCPTask,
 )
 from smartloop.utils import normalize_path
+from smartloop.db import embeddings
 
 _settings = AppSettings()
 
@@ -3066,6 +3066,13 @@ class ModelService:
             self._cleanup_gpu_cache()
         return freed
 
+    def unload_embedding_model(self) -> None:
+        """Release the embedding model and free its VRAM."""
+        try:
+            embeddings.unload()
+        except Exception as e:  # cleanup must never fail a response
+            logger.warning("[models] embedding unload failed: %s", e)
+
     def unload_auxiliary_models(self) -> None:
         """Release every on-demand auxiliary model, keeping only the resident
         orchestrator.
@@ -3081,17 +3088,20 @@ class ModelService:
         turn and is finished well before the response is; holding its weights
         and llama.cpp context until the next question is the same idle cost as
         the auxiliary LLMs. It reloads lazily on the next search.
+
+        Each unload is guarded on its own so one failure still returns the
+        other models' VRAM instead of skipping the rest of the cleanup.
         """
-        self.unload_vision_model()
-        self.unload_large_model()
-        self._evict_capability_models()
-
-        try:
-            from smartloop.db import embeddings
-
-            embeddings.unload()
-        except Exception as e:  # cleanup must never fail a response
-            logger.warning("[models] embedding unload failed: %s", e)
+        for name, unload in (
+            ("vision", self.unload_vision_model),
+            ("large", self.unload_large_model),
+            ("capability", self._evict_capability_models),
+            ("embedding", self.unload_embedding_model),
+        ):
+            try:
+                unload()
+            except Exception as e:  # cleanup must never fail a response
+                logger.warning("[models] %s unload failed: %s", name, e)
 
     def unload_model_by_name(self, model_name: str) -> bool:
         """Free VRAM held by a specific model, e.g. when it's deselected.

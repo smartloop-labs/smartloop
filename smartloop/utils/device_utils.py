@@ -1,21 +1,17 @@
 """Device detection and configuration utilities for cross-platform compatibility"""
+import sys
 import enum
 import logging
-from typing import TYPE_CHECKING
-from pydantic import BaseModel
-import sys
 
-if TYPE_CHECKING:
-    import flash_attn  # type: ignore
+from pydantic import BaseModel
+from llama_cpp import llama_supports_gpu_offload
 
 logger = logging.getLogger(__name__)
-
 
 class DeviceType(enum.Enum):
     CPU = "cpu"
     CUDA = "cuda"
     MPS = "mps"
-
 
 class LlamaCppConfig(BaseModel):
     """LlamaCpp configuration class"""
@@ -53,7 +49,6 @@ class DeviceConfig:
 
     def get_llama_cpp_config(self, n_parallel: int = 1) -> LlamaCppConfig:
         """Get configuration for llama-cpp-python based on device"""
-        from llama_cpp import llama_supports_gpu_offload
         n_gpu_layers = -1 if llama_supports_gpu_offload() else 0
         return LlamaCppConfig(
             n_gpu_layers=n_gpu_layers,
