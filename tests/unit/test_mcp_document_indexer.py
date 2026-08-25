@@ -1441,3 +1441,94 @@ class TestMcpSourceAttribution:
 
         src = inspect.getsource(mod)
         assert '"tool_name": doc["tool_name"]' in src
+
+
+class TestNotionComments:
+    """Notion anchors comments to the paragraph they are about.
+
+    `include_all_blocks` and `include_resolved` both default to false, and both
+    defaults are wrong for a crawl.  Probing a real workspace: the defaults
+    returned nothing on all 16 pages, `include_all_blocks` alone reached 6 of a
+    page's 10 threads, and the two together reached all 10.  Resolved threads
+    are kept because "resolved" is usually where the decision is.
+    """
+
+    def test_the_flags_that_reach_block_level_discussions_travel(self):
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-get-comments", {
+                    "properties": {"page_id": {}, "include_all_blocks": {},
+                                   "include_resolved": {}},
+                    "required": ["page_id"],
+                }),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result(
+                    {"results": [{"id": "p1", "title": "The Pitch"}]}
+                ),
+                "notion-get-comments": _result({"text": "<discussions>…"}),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            args = next(
+                a for tool, a in caller.calls if tool == "notion-get-comments"
+            )
+            assert args["include_all_blocks"] is True
+            assert args["include_resolved"] is True
+
+    def test_a_page_fetch_asks_for_the_discussions_with_it(self):
+        """The only route to a comment that works with a URL and no page id.
+
+        `notion-fetch` takes "URL or ID", so it is reachable where
+        `get-comments` is not, and `include_discussions` inlines the comment
+        text into the page body.  A sample rather than the full set — this is
+        partial capture, not a replacement for `page-comments`.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-fetch", {
+                    "properties": {"id": {}, "include_discussions": {}},
+                    "required": ["id"],
+                }),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result({"results": [
+                    {"url": "https://app.notion.com/p/abc", "title": "The Pitch"},
+                ]}),
+                "notion-fetch": _result(
+                    {"text": "<comment>what happened to the model?????</comment>"}
+                ),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            args = next(a for tool, a in caller.calls if tool == "notion-fetch")
+            assert args["include_discussions"] is True
+            body = "\n".join(_indexed_docs(idx._store).values())
+            assert "what happened to the model?????" in body
+
+    def test_the_flags_are_dropped_where_a_server_does_not_declare_them(self):
+        """The OpenAPI server's comment tool takes neither; the step still runs."""
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("API-retrieve-a-comment", {
+                    "properties": {"page_id": {}}, "required": ["page_id"],
+                }),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result(
+                    {"results": [{"id": "p1", "title": "The Pitch"}]}
+                ),
+                "API-retrieve-a-comment": _result({"text": "a comment"}),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            args = next(
+                a for tool, a in caller.calls if tool == "API-retrieve-a-comment"
+            )
+            assert args == {"page_id": "p1"}

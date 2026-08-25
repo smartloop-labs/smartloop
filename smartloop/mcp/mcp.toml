@@ -182,8 +182,14 @@ match = ["notion"]
 label = "recent-pages"
 tools = ["notion-list-recent-pages", "list_recent_pages"]
 arguments = { limit = 50 }
+# `include_discussions` on every one of these fetches, because a page's comments
+# are where its corrections and decisions live and the body rarely repeats any of
+# them.  It is a partial capture — the fetch returns a sample of the threads, and
+# `page-comments` is what gets all of them — but it is the only route that works
+# with what a hosted listing hands back, which is a URL and no page id.
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 [[mcp.index]]
 label = "private-pages"
@@ -191,6 +197,7 @@ tools = ["notion-list-private-pages", "list_private_pages"]
 arguments = { limit = 50 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 [[mcp.index]]
 label = "shared-pages"
@@ -198,6 +205,7 @@ tools = ["notion-list-shared-pages", "list_shared_pages"]
 arguments = { limit = 50 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 [[mcp.index]]
 label = "favorite-pages"
@@ -205,6 +213,7 @@ tools = ["notion-list-favorite-pages", "list_favorite_pages"]
 arguments = { limit = 50 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 # Search after them, and it carries the crawl on its own for the Notion servers
 # that ship no listing tools: an unfiltered search is the OpenAPI server's
@@ -216,6 +225,7 @@ tools = ["@notion_search"]
 arguments = { query = "", page_size = 100 }
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 max_records = 60
 
 # Databases have to be enumerated separately: a page-shaped search result set
@@ -246,6 +256,7 @@ parent = ["databases", "database-search"]
 parent_args = ["database_id", "databaseId", "data_source_id", "id"]
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 max_records = 60
 max_parents = 25
 
@@ -254,12 +265,20 @@ label = "meeting-notes"
 tools = ["notion-query-meeting-notes", "query_meeting_notes"]
 detail_tools = ["@notion_fetch"]
 detail_args = ["@notion_page_args"]
+detail_arguments = { include_discussions = true }
 
 # Comments hold the decisions and corrections that never make it back into the
 # page body, so they are pulled per page the walk found.
 [[mcp.index]]
 label = "page-comments"
 tools = ["notion-get-comments", "notion_retrieve_comments", "API-retrieve-a-comment", "retrieve_comments", "get_comments", "list_comments"]
+# Both default to false, and both defaults are wrong for a crawl.  A page-level
+# discussion is the rare one: comments get anchored to the paragraph they are
+# about, so `include_all_blocks` is the difference between every comment in a
+# workspace and none of them.  Resolved threads are kept because a crawl is a
+# record of what was decided, and "resolved" is usually where the decision is.
+# Dropped on the servers that don't declare them, like any other argument.
+arguments = { include_all_blocks = true, include_resolved = true }
 parent = ["recent-pages", "private-pages", "shared-pages", "favorite-pages", "pages", "database-pages"]
 parent_args = ["@notion_page_args"]
 max_records = 60
