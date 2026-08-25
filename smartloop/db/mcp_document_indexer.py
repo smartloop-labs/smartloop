@@ -307,6 +307,41 @@ def _has_required(schema: Dict[str, Any]) -> bool:
     return bool(required)
 
 
+# Characters kept from one step's failure reason in the per-step log line.  A
+# server's validation error can run to hundreds of characters of JSON; the part
+# that names the offending field comes first, and the rest turns a summary of
+# twelve steps into an unreadable wall.
+MAX_STEP_REASON_CHARS = 120
+
+
+def _format_step_details(details: Sequence[dict]) -> str:
+    """Render a crawl's per-step outcomes as one log line.
+
+    ``step/tool: <records>`` for a step that produced something, with the fresh
+    count when it differs (a listing whose records another step already
+    documented is not the same event as a listing that returned nothing), and
+    ``step/tool: 0 (why)`` for one that didn't.
+    """
+    parts: List[str] = []
+    for detail in details:
+        label = detail.get("step") or "?"
+        tool = detail.get("tool")
+        prefix = f"{label}/{tool}" if tool else label
+        records = detail.get("records") or 0
+        if records:
+            fresh = detail.get("new")
+            suffix = str(records)
+            if fresh is not None and fresh != records:
+                suffix = f"{records} ({fresh} new)"
+        else:
+            reason = " ".join(str(detail.get("reason") or "").split())
+            if len(reason) > MAX_STEP_REASON_CHARS:
+                reason = reason[:MAX_STEP_REASON_CHARS] + "..."
+            suffix = f"0 ({reason})" if reason else "0"
+        parts.append(f"{prefix}: {suffix}")
+    return "; ".join(parts) or "plan had no steps"
+
+
 def _doc_id(server_id: str, step_label: str, key: str) -> str:
     """Stable per-record document id, scoped to the server."""
     digest = hashlib.md5(f"{step_label}|{key}".encode("utf-8")).hexdigest()[:16]
@@ -757,18 +792,21 @@ class MCPDocumentIndexer:
             " (call budget reached)" if stats["truncated"] else "",
             stats["indexed"], stats["skipped"], stats["removed"],
         )
-        if not stats["records"]:
-            # Nothing indexed is the failure that matters, so the reason each
-            # step gave is logged rather than left in a return value nobody
-            # reads.
+        # Unconditionally, because a crawl where one step of twelve quietly
+        # stopped producing logs exactly like a healthy one otherwise — the
+        # summary above counts the steps that worked and says nothing about the
+        # rest.  Escalated to a warning only when the whole crawl came back
+        # empty, which is still the failure that matters most.
+        steps = _format_step_details(stats["details"])
+        if stats["records"]:
+            self._logger.info(
+                "[mcp-crawl] %s steps: %s",
+                getattr(server, "name", server_id), steps,
+            )
+        else:
             self._logger.warning(
                 "[mcp-crawl] %s produced no content — steps: %s",
-                getattr(server, "name", server_id),
-                "; ".join(
-                    f"{d['step']}"
-                    f"{'/' + d['tool'] if d.get('tool') else ''}: {d.get('reason')}"
-                    for d in stats["details"]
-                ) or "plan had no steps",
+                getattr(server, "name", server_id), steps,
             )
         return stats
 

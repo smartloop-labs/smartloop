@@ -737,6 +737,89 @@ class TestOverlapAndReporting:
             reasons = [d["reason"] for d in stats["details"] if d["step"] == "recent-pages"]
             assert "query is required" in reasons[0]
 
+    def test_step_outcomes_are_logged_even_when_the_crawl_succeeded(self):
+        """A partly-working crawl used to log exactly like a healthy one.
+
+        The summary line counts the steps that produced records and says nothing
+        about the rest, and the per-step reasons were logged only when the whole
+        crawl came back empty — so one step of twelve quietly stopping was
+        invisible.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(tools=[
+                _tool("notion-list-recent-pages", {"properties": {"limit": {}}}),
+                _tool("notion-list-shared-pages", {"properties": {"limit": {}}}),
+            ])
+            caller = FakeCaller({
+                "notion-list-recent-pages": _result([{"id": "p1", "title": "A"}]),
+                "notion-list-shared-pages": _result([]),
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(server, force=True)
+
+            logged = " ".join(
+                str(call[0]) for call in idx._logger.info.call_args_list
+            )
+            assert "steps:" in logged
+            # The step that worked and the one that returned nothing both named.
+            assert "recent-pages" in logged
+            assert "shared-pages" in logged
+            # The crawl did index something, so this is not a warning.
+            idx._logger.warning.assert_not_called()
+
+    def test_the_step_line_names_the_tool_and_the_fresh_count(self):
+        from smartloop.db.mcp_document_indexer import _format_step_details
+
+        line = _format_step_details([
+            {"step": "boards", "tool": "trelloReadBoard", "records": 5, "new": 5},
+            # A listing whose records another step already documented is not the
+            # same event as a listing that returned nothing.
+            {"step": "workspace-boards", "tool": "trelloReadBoard",
+             "records": 5, "new": 0},
+            {"step": "inbox-cards", "tool": "trelloReadInbox", "records": 0,
+             "reason": "returned no records"},
+            {"step": "databases", "tool": None, "records": 0,
+             "reason": "no matching tool on this server"},
+        ])
+        assert line == (
+            "boards/trelloReadBoard: 5; "
+            "workspace-boards/trelloReadBoard: 5 (0 new); "
+            "inbox-cards/trelloReadInbox: 0 (returned no records); "
+            "databases: 0 (no matching tool on this server)"
+        )
+
+    def test_a_long_failure_reason_is_truncated_in_the_step_line(self):
+        # A server's validation error runs to hundreds of characters of JSON.
+        # The field name comes first; the rest would bury the other eleven steps.
+        from smartloop.db.mcp_document_indexer import (
+            MAX_STEP_REASON_CHARS,
+            _format_step_details,
+        )
+
+        line = _format_step_details([
+            {"step": "page-comments", "tool": "notion-get-comments",
+             "records": 0, "reason": "body failed validation: " + "x" * 900},
+        ])
+        assert line.startswith("page-comments/notion-get-comments: 0 (body failed")
+        assert line.endswith("...)")
+        assert len(line) < MAX_STEP_REASON_CHARS + 80
+
+    def test_a_multiline_reason_becomes_one_line(self):
+        # Reasons arrive as raw server output, newlines and all; one step must
+        # not break the line the other steps share.
+        from smartloop.db.mcp_document_indexer import _format_step_details
+
+        line = _format_step_details([
+            {"step": "pages", "tool": "notion-search", "records": 0,
+             "reason": "query is\n  required\n"},
+        ])
+        assert line == "pages/notion-search: 0 (query is required)"
+
+    def test_a_plan_with_no_steps_still_says_something(self):
+        from smartloop.db.mcp_document_indexer import _format_step_details
+
+        assert _format_step_details([]) == "plan had no steps"
+
 
 class TestWastedCallsAreAvoided:
     def test_step_whose_required_argument_cannot_be_filled_is_not_called(self):
