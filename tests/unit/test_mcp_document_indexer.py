@@ -831,6 +831,136 @@ class TestWastedCallsAreAvoided:
             assert "notion-list-favorite-pages" in [c[0] for c in caller.calls]
 
 
+class TestEnvelopeUnwrapping:
+    """Finding the record list inside whatever the server wrapped it in.
+
+    Every server pluralizes its own entities, so a fixed list of envelope key
+    names is always one server behind.  Trello answers `trelloReadWorkspace`
+    with `{"workspaces": [...], "nextCursor": ..., "hasMore": false}`, and
+    before this the whole envelope became one id-less record — which read as a
+    successful step and left the boards fan-out with nothing to walk.
+    """
+
+    def test_an_unknown_plural_key_is_still_the_record_list(self):
+        from smartloop.db.mcp_document_indexer import _unwrap_records
+
+        records = _unwrap_records({
+            "workspaces": [{"id": "w1", "name": "One"}, {"id": "w2", "name": "Two"}],
+            "nextCursor": "abc",
+            "hasMore": False,
+        })
+        assert [r["id"] for r in records] == ["w1", "w2"]
+
+    def test_a_record_with_a_list_field_is_not_mistaken_for_an_envelope(self):
+        # The discriminator is identity: a record carries an id, an envelope
+        # doesn't.  Without it a single card would unwrap into its own labels.
+        from smartloop.db.mcp_document_indexer import _unwrap_records
+
+        card = {"id": "c1", "name": "Card", "labels": [{"name": "urgent"}]}
+        assert _unwrap_records(card) == [card]
+
+    def test_an_empty_listing_produces_no_records_rather_than_the_envelope(self):
+        # An empty Trello inbox is `{"cards": [], ...}`.  Returning the envelope
+        # would index a document whose whole content is "hasMore: false".
+        from smartloop.db.mcp_document_indexer import _unwrap_records
+
+        assert _unwrap_records({"cards": [], "nextCursor": None, "hasMore": False}) == []
+
+    def test_a_step_fans_out_over_an_unknown_envelope(self):
+        """The end of the same story: workspaces → boards actually walks."""
+        with tempfile.TemporaryDirectory() as td:
+            server = _server(name="Trello", slug="trello", tools=[
+                _tool("trelloReadWorkspace", {
+                    "properties": {"action": {}, "limit": {}}, "required": ["action"],
+                }),
+                _tool("trelloReadBoard", {
+                    "properties": {
+                        "action": {}, "workspaceId": {}, "filter": {}, "limit": {},
+                    },
+                    "required": ["action"],
+                }),
+            ])
+            caller = FakeCaller({
+                "trelloReadWorkspace": _result({
+                    "workspaces": [{"id": "ari:...workspace/w1", "name": "Team"}],
+                    "hasMore": False,
+                }),
+                "trelloReadBoard": lambda args: _result({
+                    "boards": [{"id": "b1", "name": "Board One"}],
+                    "hasMore": False,
+                }),
+            })
+            idx = _indexer(td, caller)
+            stats = idx.crawl_server(server, force=True)
+
+            by_workspace = [
+                args for tool, args in caller.calls
+                if args.get("action") == "list_by_workspace"
+            ]
+            assert by_workspace, "workspace-boards never fanned out"
+            assert by_workspace[0]["workspaceId"] == "ari:...workspace/w1"
+            reasons = {d["step"]: d.get("reason") for d in stats["details"]}
+            assert reasons["workspace-boards"] is None
+
+
+class TestDetailArguments:
+    """A detail call is not always just the record's id.
+
+    A server that dispatches on a discriminator — one `trelloReadCard` tool for
+    both "list a list's cards" and "get a card" — rejects a detail call that
+    carries only the id, once per record.  Expressing the fetch as a child step
+    instead doesn't work either: `seen_records` dedupes by record id, and a
+    detail listing returns the ids the parent step already produced.
+    """
+
+    def _run(self, td, detail_arguments):
+        from smartloop.mcp.crawl_plans import CrawlPlan, CrawlStep
+
+        plan = CrawlPlan(slug="dispatch", steps=(CrawlStep(
+            label="cards",
+            tools=("readCard",),
+            arguments={"action": "list"},
+            detail_tools=("readCard",),
+            detail_arguments=detail_arguments,
+            detail_args=("cardId",),
+        ),))
+        server = _server(name="dispatch", slug="dispatch", tools=[
+            _tool("readCard", {
+                "properties": {"action": {}, "cardId": {}},
+                "required": ["action"],
+            }),
+        ])
+        caller = FakeCaller({
+            "readCard": lambda args: (
+                _result({"body": "the full card body"})
+                if args.get("cardId")
+                else _result([{"id": "c1", "name": "Card"}])
+            ),
+        })
+        idx = _indexer(td, caller)
+        with patch(
+            "smartloop.db.mcp_document_indexer.resolve_plan", return_value=plan
+        ):
+            idx.crawl_server(server, force=True)
+        return caller, idx
+
+    def test_fixed_arguments_travel_with_the_detail_call(self):
+        with tempfile.TemporaryDirectory() as td:
+            caller, idx = self._run(td, {"action": "get"})
+            detail = [args for _, args in caller.calls if "cardId" in args]
+            assert detail == [{"action": "get", "cardId": "c1"}]
+            body = "\n".join(_indexed_docs(idx._store).values())
+            assert "the full card body" in body
+
+    def test_an_argument_the_detail_tool_does_not_declare_is_dropped(self):
+        # Filtered like `arguments` is, so one plan can name the discriminator
+        # for the servers that need it without breaking the ones that don't.
+        with tempfile.TemporaryDirectory() as td:
+            caller, _ = self._run(td, {"action": "get", "verbosity": "full"})
+            detail = [args for _, args in caller.calls if "cardId" in args]
+            assert detail == [{"action": "get", "cardId": "c1"}]
+
+
 class TestRefreshCycle:
     def test_ttl_skips_a_recently_crawled_server(self):
         with tempfile.TemporaryDirectory() as td:

@@ -158,6 +158,21 @@ def _unwrap_records(data: Any) -> List[Any]:
             nested = _unwrap_records(only)
             if nested:
                 return nested
+    # An envelope that names its list with a word this module has not seen:
+    # ``{"workspaces": [...], "nextCursor": ..., "hasMore": false}``.  Every
+    # server pluralizes its own entities, so enumerating the names is a losing
+    # game — one list-of-objects key and no identity of its own is taken as the
+    # envelope it is.  The identity check is what keeps ``{"id": ...,
+    # "labels": [...]}`` a single record: a record has an id, an envelope
+    # doesn't.
+    if not _first_str(data, RECORD_ID_KEYS):
+        listed = [
+            value for value in data.values()
+            if isinstance(value, list)
+            and all(isinstance(item, dict) for item in value)
+        ]
+        if len(listed) == 1:
+            return listed[0]
     return [data]
 
 
@@ -662,16 +677,20 @@ class MCPDocumentIndexer:
                 continue
 
             detail_tool = resolve_tool(tool_names, step.detail_tools) if step.detail_tools else None
+            detail_schema = tool_schema(server, detail_tool) if detail_tool else {}
             detail_arg = (
-                resolve_argument(tool_schema(server, detail_tool), step.detail_args)
+                resolve_argument(detail_schema, step.detail_args)
                 if detail_tool else None
             )
+            # The record id is not always the whole call: a tool that dispatches
+            # on an `action` needs to be told which operation this is.
+            detail_base = filter_arguments(detail_schema, step.detail_arguments)
 
             for index, record in enumerate(fresh):
                 text = record.text
                 if detail_tool and detail_arg and record.record_id:
                     detail_payload, changed, _ = call(
-                        detail_tool, {detail_arg: record.record_id}
+                        detail_tool, {**detail_base, detail_arg: record.record_id}
                     )
                     credentials_changed = credentials_changed or changed
                     detail_text = self._detail_text(detail_payload)

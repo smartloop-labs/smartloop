@@ -103,6 +103,16 @@ class CrawlStep(BaseModel):
     for_each: Dict[str, Tuple[Any, ...]] = Field(default_factory=dict)
     detail_tools: Tuple[str, ...] = ()
     detail_args: Tuple[str, ...] = ID_ARGS
+    # Fixed arguments for the detail call, filtered against the detail tool's
+    # schema the way ``arguments`` is.  A detail call is not always just the
+    # record's id: a tool may require a second argument that says nothing about
+    # *which* record is wanted — the content type to return, or the operation
+    # being asked for on a server where one tool covers several.  Without this
+    # the call goes out as ``{id: ...}`` and is rejected once per record, and
+    # expressing it as a child step instead doesn't work either: ``seen_records``
+    # dedupes by id, and a detail listing returns ids the parent step already
+    # produced.
+    detail_arguments: Dict[str, Any] = Field(default_factory=dict)
     # Arguments without which this step is pointless.  Unknown arguments are
     # normally dropped so a step still runs in reduced form, but a step that
     # exists *because* of one argument — the same search narrowed to databases

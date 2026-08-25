@@ -95,6 +95,12 @@
 #    detail_tools    fetch the full body of each record (a page's content
 #                    behind a search hit), by whichever of `detail_args` the
 #                    tool declares.
+#    detail_arguments
+#                    fixed arguments for that detail call, filtered against the
+#                    detail tool's schema the way `arguments` is. For the
+#                    servers where one tool covers several operations and an
+#                    argument says which one:
+#                      detail_arguments = { action = "get" }
 #    max_records     records kept from this step (default 40). A crawl is a
 #                    refresh, not an export: this bounds the embedding work and
 #                    the number of follow-up detail calls.
@@ -361,31 +367,112 @@ tools = ["list_users", "linear_list_users", "get_users"]
 max_records = 50
 
 
-# ── Trello ─────────────────────────────────────────────────────────────────
+# ── Trello ──────────────────────────────────────────────────────────
+#
+# The tree is the familiar one — workspace → board → list → card → checklist —
+# but the hosted server (mcp.trello.com) does not expose a tool per operation.
+# It ships one tool per entity and dispatches on a required `action`:
+#
+#   trelloReadWorkspace  list, get
+#   trelloReadBoard      list, list_by_workspace, get, list_labels
+#   trelloReadList       list_by_board, get
+#   trelloReadCard       list_by_board, list_by_list, get
+#   trelloReadChecklist  list_by_card, get
+#   trelloReadInbox      list_cards, get
+#
+# So every step below names the same few tools and differs in `action`. Which
+# other arguments are *allowed* depends on the action too (`filter` is rejected
+# for `get`, `boardId` for anything but `get`), so each step passes only the
+# ones its own action takes — schema filtering can't catch that, because the
+# schema declares the union of all actions' arguments.
+#
+# The snake_case names trailing each candidate list are the convention of the
+# self-hosted Trello MCP packages (`get_cards_by_list_id`). A candidate the
+# server doesn't have costs nothing, so they stay: this plan reaches the hosted
+# server and a packaged one without being two plans.
 
 [[mcp]]
 name = "trello"
 match = ["trello"]
 
+# The root of the walk. Boards the user is a *member* of come back from one
+# unscoped call; boards they merely have access to need the per-workspace
+# listing below, which is why workspaces are enumerated at all.
+[[mcp.index]]
+label = "workspaces"
+tools = ["trelloReadWorkspace", "list_workspaces", "list_organizations", "get_organizations"]
+arguments = { action = "list", limit = 50 }
+max_records = 25
+
 [[mcp.index]]
 label = "boards"
-tools = ["list_boards", "get_boards", "trello_list_boards", "get_my_boards", "list_boards_by_user"]
-max_records = 20
+tools = [
+  "trelloReadBoard", "list_boards", "get_boards", "trello_list_boards",
+  "get_my_boards", "list_boards_by_user",
+]
+arguments = { action = "list", filter = "open", limit = 50 }
+max_records = 25
+
+# `list_by_workspace` returns every board the user can reach in a workspace,
+# membership or not — the shared team boards an "my boards" listing leaves out.
+# Deduped against `boards` by id, so the overlap costs nothing.
+[[mcp.index]]
+label = "workspace-boards"
+tools = ["trelloReadBoard", "list_boards_by_workspace", "get_organization_boards"]
+arguments = { action = "list_by_workspace", filter = "open", limit = 50 }
+parent = "workspaces"
+parent_args = ["workspaceId", "workspace_id", "idOrganization", "organizationId"]
+max_records = 40
+max_parents = 15
 
 [[mcp.index]]
 label = "lists"
-tools = ["get_lists", "list_lists", "trello_get_lists", "get_lists_by_board_id", "get_board_lists"]
-parent = "boards"
-parent_args = ["board_id", "boardId", "idBoard", "id"]
+tools = [
+  "trelloReadList", "get_lists", "list_lists", "trello_get_lists",
+  "get_lists_by_board_id", "get_board_lists",
+]
+arguments = { action = "list_by_board", limit = 50 }
+parent = ["boards", "workspace-boards"]
+parent_args = ["boardId", "board_id", "idBoard", "id"]
+max_records = 80
 max_parents = 20
 
-# A card row carries the name but usually not the description or checklists,
-# which is the part worth answering from.
+# Where the content actually is. The hosted server's card rows are already
+# whole — description, labels, members, the card's checklists, and the list and
+# board names — so there is deliberately no detail fetch and no per-card
+# checklist step for it: both were measured returning exactly what the row
+# already said, 80 calls a cycle for nothing.
+#
+# `detail_tools` names only the packaged servers' card fetch, whose rows really
+# are just a name and an id. `trelloReadCard` is left out of it on purpose —
+# it would resolve on the hosted server and reinstate the redundant call.
 [[mcp.index]]
 label = "cards"
-tools = ["get_cards_by_list_id", "list_cards", "get_cards", "trello_get_cards", "get_list_cards"]
+tools = [
+  "trelloReadCard", "get_cards_by_list_id", "list_cards", "get_cards",
+  "trello_get_cards", "get_list_cards",
+]
+arguments = { action = "list_by_list", filter = "open", limit = 50 }
 parent = "lists"
-parent_args = ["list_id", "listId", "idList", "id"]
+parent_args = ["listId", "list_id", "idList", "id"]
 detail_tools = ["get_card", "trello_get_card", "get_card_by_id"]
-max_records = 60
-max_parents = 20
+detail_args = ["cardIdOrUrl", "cardId", "card_id", "id"]
+max_records = 100
+max_parents = 25
+
+# The Inbox is a board like any other but is not returned by the board
+# listings, so it needs its own step or the user's quick-capture notes — often
+# the freshest thing in the account — are never indexed.
+[[mcp.index]]
+label = "inbox-cards"
+tools = ["trelloReadInbox", "get_inbox_cards", "list_inbox_cards"]
+arguments = { action = "list_cards", filter = "open", limit = 50 }
+max_records = 40
+
+# Not content, but it is what lets a card's member ids read back as a name, and
+# it carries the timezone a due date has to be read in.
+[[mcp.index]]
+label = "me"
+tools = ["trelloReadMember", "get_me", "get_member", "list_members"]
+arguments = { action = "get_me" }
+max_records = 5

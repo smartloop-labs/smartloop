@@ -169,6 +169,57 @@ class TestCuratedPlanShape:
         # the filter dropped it would be a duplicate call.
         assert self._steps(NOTION_PLAN)["database-search"].needs_arguments == ("filter",)
 
+    def test_trello_walks_the_hosted_action_dispatch_tools(self):
+        # mcp.trello.com ships one tool per entity and dispatches on `action`,
+        # so the walk is expressed in arguments rather than in tool names.  The
+        # plan shipped before this was written for a package's `list_boards` /
+        # `get_lists_by_board_id` naming, matched nothing, and reported a clean
+        # zero-record crawl.
+        hosted = [
+            "trelloReadWorkspace", "trelloReadBoard", "trelloReadList",
+            "trelloReadCard", "trelloReadInbox", "trelloReadMember",
+        ]
+        steps = self._steps(TRELLO_PLAN)
+        assert resolve_tool(hosted, steps["boards"].tools) == "trelloReadBoard"
+        assert resolve_tool(hosted, steps["lists"].tools) == "trelloReadList"
+        assert resolve_tool(hosted, steps["cards"].tools) == "trelloReadCard"
+        assert steps["boards"].arguments["action"] == "list"
+        assert steps["lists"].arguments["action"] == "list_by_board"
+        assert steps["cards"].arguments["action"] == "list_by_list"
+
+    def test_trello_reaches_cards_through_boards_and_lists(self):
+        steps = self._steps(TRELLO_PLAN)
+        assert set(steps["lists"].parent_labels) == {"boards", "workspace-boards"}
+        assert steps["cards"].parent_labels == ("lists",)
+        assert "boardId" in steps["lists"].parent_args
+        assert "listId" in steps["cards"].parent_args
+
+    def test_trello_still_matches_a_packaged_server(self):
+        # The snake_case candidates are the self-hosted packages' convention.
+        # They cost nothing when absent, and a plan that only spoke to the
+        # hosted server would drop those users.
+        steps = self._steps(TRELLO_PLAN)
+        assert resolve_tool(["list_boards"], steps["boards"].tools) == "list_boards"
+        assert resolve_tool(
+            ["get_cards_by_list_id"], steps["cards"].tools
+        ) == "get_cards_by_list_id"
+
+    def test_trello_does_not_re_fetch_a_card_the_hosted_row_already_holds(self):
+        # The hosted card row carries description, labels, members, checklists
+        # and the list/board names — its `get` returns the same object.  Listing
+        # `trelloReadCard` as a detail tool would resolve there and spend one
+        # call per card to learn nothing, so only the packaged fetch is named.
+        cards = self._steps(TRELLO_PLAN)["cards"]
+        assert resolve_tool(["trelloReadCard"], cards.detail_tools) is None
+        assert resolve_tool(["get_card"], cards.detail_tools) == "get_card"
+
+    def test_every_trello_step_says_which_action_it_wants(self):
+        # `action` is required on every hosted tool, and which *other* arguments
+        # are legal depends on its value — so a step that forgets it is not a
+        # reduced call, it is a rejected one.
+        for step in TRELLO_PLAN.steps:
+            assert "action" in step.arguments, step.label
+
 
 class TestNeedsArguments:
     def test_declared_argument_lets_the_step_run(self):
