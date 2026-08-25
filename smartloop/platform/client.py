@@ -4,6 +4,7 @@ Handles only JSON control-plane calls — no file downloading.
 """
 
 import logging
+import platform
 from typing import Callable, Optional
 
 import httpx
@@ -22,8 +23,34 @@ _MODEL_UPLOAD = "/v1/models/{}/upload"
 _MODELS = "/v1/models"
 _RELEASES_LATEST = "/v1/releases/latest"
 _MCP_CATALOG = "/v1/mcp-catalog"
+_WEBSEARCH = "/v1/websearch"
+_WEBSEARCH_STATUS = "/v1/websearch/status"
 
 _TIMEOUT = 30
+
+#: Web search sits in front of a user-visible turn, so it gets a tighter
+#: budget than the control-plane calls: a slow search is worth abandoning,
+#: and the status check runs ahead of every query.
+_SEARCH_TIMEOUT = 15
+_SEARCH_STATUS_TIMEOUT = 5
+
+
+def _user_agent() -> str:
+    """Identify this client to the API.
+
+    The platform records each call in the account's access log, and httpx's
+    default agent ("python-httpx/x.y") would make every entry look like an
+    anonymous script. Naming ourselves lets the owner tell their own agent
+    apart from anything else using their token.
+
+    Deliberately not "smartloop-cli": these calls come from the local API
+    server, background agents and the downloader as much as from the CLI. What
+    the log needs from this header is the product and version — *which* caller
+    it was is already the path on the same log line.
+    """
+    from smartloop import __version__
+
+    return f"smartloop/{__version__} ({platform.system().lower()})"
 
 
 def _raise_for_status(resp: httpx.Response, error_map: dict[int, str] | None = None,
@@ -57,10 +84,20 @@ class SLPPlatformClient:
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"
 
+    def _headers(self, auth: Optional[dict[str, str]] = None) -> dict[str, str]:
+        """Request headers. Every request identifies itself; *auth* is merged in.
+
+        The endpoints that take no auth pass nothing rather than flipping a
+        flag — they are a minority, and which of them is unauthenticated is
+        worth seeing at the call site.
+        """
+        return {"User-Agent": _user_agent(), **(auth or {})}
+
     def list_bootstrap_models(self) -> list[dict]:
         """GET /v1/bootstrap/models (no auth). Returns the array of model entries."""
         try:
-            resp = httpx.get(self._url(_BOOTSTRAP_MODELS), timeout=_TIMEOUT)
+            resp = httpx.get(self._url(_BOOTSTRAP_MODELS),
+                             headers=self._headers(), timeout=_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
@@ -74,14 +111,15 @@ class SLPPlatformClient:
     def list_models(self) -> list[dict]:
         """GET /v1/models (auth optional). Returns list of model entries."""
         try:
-            resp = httpx.get(self._url(_MODELS), headers=self._auth_headers_fn(),
+            resp = httpx.get(self._url(_MODELS), headers=self._headers(self._auth_headers_fn()),
                              timeout=_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         if resp.status_code == 401:
             try:
-                resp = httpx.get(self._url(_MODELS), timeout=_TIMEOUT)
+                resp = httpx.get(self._url(_MODELS),
+                                 headers=self._headers(), timeout=_TIMEOUT)
             except httpx.TransportError as e:
                 raise ConnectionError(f"Connection error: {e}") from e
 
@@ -98,7 +136,7 @@ class SLPPlatformClient:
         no published release exists for the channel).
         """
         try:
-            resp = httpx.get(self._url(_RELEASES_LATEST),
+            resp = httpx.get(self._url(_RELEASES_LATEST), headers=self._headers(),
                              params={"channel": channel}, timeout=_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
@@ -109,7 +147,7 @@ class SLPPlatformClient:
     def list_mcp_catalog(self) -> list[dict]:
         """GET /v1/mcp-catalog (auth required). Returns list of curated MCP server catalog entries."""
         try:
-            resp = httpx.get(self._url(_MCP_CATALOG), headers=self._auth_headers_fn(),
+            resp = httpx.get(self._url(_MCP_CATALOG), headers=self._headers(self._auth_headers_fn()),
                              timeout=_TIMEOUT)
         except httpx.ConnectError as e:
             raise ConnectionError(f"Connection error: {e}") from e
@@ -126,7 +164,7 @@ class SLPPlatformClient:
         """
         try:
             resp = httpx.get(self._url(_MODEL_DOWNLOAD.format(model_name)),
-                             headers=self._auth_headers_fn(), timeout=_TIMEOUT)
+                             headers=self._headers(self._auth_headers_fn()), timeout=_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
@@ -145,7 +183,7 @@ class SLPPlatformClient:
     def get_current_user(self) -> dict:
         """GET /v1/users/me (auth required). Returns user profile dict."""
         try:
-            resp = httpx.get(self._url(_USERS_ME), headers=self._auth_headers_fn(),
+            resp = httpx.get(self._url(_USERS_ME), headers=self._headers(self._auth_headers_fn()),
                              timeout=_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
@@ -158,7 +196,7 @@ class SLPPlatformClient:
     def update_current_user(self, payload: dict) -> dict:
         """PATCH /v1/users/me (auth required). Returns updated user profile dict."""
         try:
-            resp = httpx.patch(self._url(_USERS_ME), headers=self._auth_headers_fn(),
+            resp = httpx.patch(self._url(_USERS_ME), headers=self._headers(self._auth_headers_fn()),
                                json=payload, timeout=_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
@@ -174,7 +212,7 @@ class SLPPlatformClient:
         Returns dict with ``access_token`` and optionally ``refresh_token``.
         """
         try:
-            resp = httpx.post(self._url(_JWT_REFRESH),
+            resp = httpx.post(self._url(_JWT_REFRESH), headers=self._headers(),
                               json={"refresh_token": refresh_token}, timeout=_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
@@ -192,7 +230,7 @@ class SLPPlatformClient:
         """POST /v1/models/{name}/upload (auth required). Returns {url, blob_path, expires_at}."""
         try:
             resp = httpx.post(self._url(_MODEL_UPLOAD.format(model_name)),
-                              headers=self._auth_headers_fn(),
+                              headers=self._headers(self._auth_headers_fn()),
                               json={"filename": filename}, timeout=_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
@@ -206,8 +244,56 @@ class SLPPlatformClient:
     def push_token_usage(self, record: dict, timeout: int = 10) -> None:
         """POST /v1/usage/tokens (auth required). Fire-and-forget telemetry."""
         try:
-            resp = httpx.post(self._url(_USAGE_TOKENS), headers=self._auth_headers_fn(),
+            resp = httpx.post(self._url(_USAGE_TOKENS), headers=self._headers(self._auth_headers_fn()),
                               json=record, timeout=timeout)
             _raise_for_status(resp)
         except Exception as e:
             logger.error("Failed to push token usage: %s", e)
+
+    def web_search(self, query: str, count: int,
+                   timeout: int = _SEARCH_TIMEOUT) -> list[str]:
+        """GET /v1/websearch (auth required). Returns the result URLs.
+
+        The endpoint resolves the account's registered search provider
+        server-side, so this side never sees a provider name or an API key.
+        A 401/403 means search is unavailable for the account — no plan, or no
+        provider registered — and raises ``PermissionError``; every other
+        failure is a ``ConnectionError``, which callers must be free to treat
+        as transient rather than as "search is off".
+        """
+        try:
+            resp = httpx.get(self._url(_WEBSEARCH), headers=self._headers(self._auth_headers_fn()),
+                             params={"q": query, "count": count}, timeout=timeout)
+        except httpx.TransportError as e:
+            raise ConnectionError(f"Connection error: {e}") from e
+
+        if resp.status_code in (401, 403):
+            raise PermissionError(
+                f"Web search endpoint rejected the token (HTTP {resp.status_code})")
+        _raise_for_status(resp)
+
+        data = resp.json()
+        if not isinstance(data, list):
+            return []
+        return [u for u in data if isinstance(u, str) and u.strip()]
+
+    def web_search_status(self, timeout: int = _SEARCH_STATUS_TIMEOUT) -> bool:
+        """GET /v1/websearch/status (auth required). Whether search would serve.
+
+        Answers for the whole account: signed in, with a provider registered.
+        Raises ``PermissionError`` on 401/403 and ``ConnectionError`` on
+        anything else, keeping "search is off" distinguishable from "the check
+        did not complete" — see :func:`smartloop.search.providers.hosted_search_available`,
+        which fails open on the latter.
+        """
+        try:
+            resp = httpx.get(self._url(_WEBSEARCH_STATUS), headers=self._headers(self._auth_headers_fn()),
+                             timeout=timeout)
+        except httpx.TransportError as e:
+            raise ConnectionError(f"Connection error: {e}") from e
+
+        if resp.status_code in (401, 403):
+            raise PermissionError(
+                f"Web search status rejected the token (HTTP {resp.status_code})")
+        _raise_for_status(resp)
+        return bool(resp.json().get("enabled"))

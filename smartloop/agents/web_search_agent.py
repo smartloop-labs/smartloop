@@ -29,8 +29,6 @@ from smartloop.search.providers import (
 
 logger = logging.getLogger(__name__)
 
-_WEBSEARCH_PATH = "/v1/websearch"
-
 # Leading conversational filler stripped before the search query hits the
 # hosted endpoint.  A raw message like "give me a list latest canyon bikes"
 # otherwise matches on the filler word ("give") and returns dictionary pages

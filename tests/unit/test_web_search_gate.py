@@ -260,82 +260,155 @@ class TestHostedStatusCache:
 
         providers.reset_status_cache()
 
-    def test_result_is_cached_across_calls(self, monkeypatch):
-        from smartloop.auth import credential_store
+    @staticmethod
+    def _signed_in(monkeypatch, has_credentials=True):
+        from smartloop.platform import auth as platform_auth
+
+        monkeypatch.setattr(platform_auth, "has_credentials", lambda: has_credentials)
+
+    @staticmethod
+    def _client(monkeypatch, status, calls=None):
+        """Point providers at a stub platform client whose status call is *status*.
+
+        *status* is a zero-arg callable standing in for
+        ``SLPPlatformClient.web_search_status`` — return a bool or raise.
+        """
         from smartloop.search import providers
 
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
+        class _Stub:
+            def web_search_status(self, *a, **k):
+                if calls is not None:
+                    calls.append(1)
+                return status()
+
+        monkeypatch.setattr(providers, "_platform_client", lambda: _Stub())
+
+    def test_result_is_cached_across_calls(self, monkeypatch):
+        from smartloop.search import providers
 
         calls = []
-
-        class _Resp:
-            status_code = 200
-
-            def raise_for_status(self): pass
-
-            def json(self): return {"enabled": True}
-
-        class _Client:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def get(self, *a, **k):
-                calls.append(a)
-                return _Resp()
-
-        monkeypatch.setattr(providers.httpx, "Client", lambda **k: _Client())
+        self._signed_in(monkeypatch)
+        self._client(monkeypatch, lambda: True, calls)
 
         assert providers.hosted_search_available() is True
         assert providers.hosted_search_available() is True
         assert len(calls) == 1, "second call should come from the cache"
 
     def test_signed_out_short_circuits_without_a_request(self, monkeypatch):
-        from smartloop.auth import credential_store
         from smartloop.search import providers
 
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: None)
+        self._signed_in(monkeypatch, has_credentials=False)
 
-        def _boom(**k):
+        def _boom():
             raise AssertionError("must not call the endpoint without a token")
 
-        monkeypatch.setattr(providers.httpx, "Client", _boom)
+        monkeypatch.setattr(providers, "_platform_client", _boom)
 
         assert providers.hosted_search_available() is False
 
     def test_a_failed_check_fails_open(self, monkeypatch):
         """A health check that cannot complete says nothing about whether
         search works, and the search itself already skips on a 403."""
-        from smartloop.auth import credential_store
         from smartloop.search import providers
 
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
-
-        class _Client:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def get(self, *a, **k): raise RuntimeError("network down")
-
-        monkeypatch.setattr(providers.httpx, "Client", lambda **k: _Client())
+        self._signed_in(monkeypatch)
+        self._client(monkeypatch, _raiser(ConnectionError("network down")))
 
         assert providers.hosted_search_available() is True
 
     def test_forbidden_reports_unavailable(self, monkeypatch):
-        from smartloop.auth import credential_store
+        """Only an explicit 401/403 — surfaced by the client as PermissionError —
+        counts as a real "search is off"."""
         from smartloop.search import providers
 
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
-
-        class _Resp:
-            status_code = 403
-
-            def raise_for_status(self): raise AssertionError("not reached")
-
-            def json(self): return {}
-
-        class _Client:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def get(self, *a, **k): return _Resp()
-
-        monkeypatch.setattr(providers.httpx, "Client", lambda **k: _Client())
+        self._signed_in(monkeypatch)
+        self._client(monkeypatch, _raiser(PermissionError("HTTP 403")))
 
         assert providers.hosted_search_available() is False
+
+
+def _raiser(exc):
+    def _raise():
+        raise exc
+    return _raise
+
+
+class TestHostedSearchProvider:
+    """The search call itself goes through SLPPlatformClient; what stays here
+    is the translation from the client's errors to the agent's skip signals."""
+
+    @staticmethod
+    def _client(monkeypatch, search):
+        from smartloop.search import providers
+
+        class _Stub:
+            def web_search(self, query, count, *a, **k):
+                return search(query, count)
+
+        monkeypatch.setattr(providers, "_platform_client", lambda: _Stub())
+
+    def test_returns_links(self, monkeypatch):
+        from smartloop.platform import auth as platform_auth
+        from smartloop.search import providers
+
+        monkeypatch.setattr(platform_auth, "has_credentials", lambda: True)
+        seen = {}
+
+        def _search(query, count):
+            seen.update(query=query, count=count)
+            return ["http://a", "http://b"]
+
+        self._client(monkeypatch, _search)
+
+        assert providers.HostedSearchProvider().search("bikes", 5) == ["http://a", "http://b"]
+        assert seen == {"query": "bikes", "count": 5}
+
+    def test_count_is_clamped(self, monkeypatch):
+        from smartloop.platform import auth as platform_auth
+        from smartloop.search import providers
+
+        monkeypatch.setattr(platform_auth, "has_credentials", lambda: True)
+        counts = []
+        self._client(monkeypatch, lambda q, c: counts.append(c) or [])
+
+        providers.HostedSearchProvider().search("bikes", 99)
+        providers.HostedSearchProvider().search("bikes", 0)
+        assert counts == [20, 1]
+
+    def test_no_credentials_raises(self, monkeypatch):
+        from smartloop.platform import auth as platform_auth
+        from smartloop.search import providers
+
+        monkeypatch.setattr(platform_auth, "has_credentials", lambda: False)
+
+        def _boom():
+            raise AssertionError("must not call the endpoint without credentials")
+
+        monkeypatch.setattr(providers, "_platform_client", _boom)
+
+        with pytest.raises(providers.NoSearchCredentials):
+            providers.HostedSearchProvider().search("bikes", 5)
+
+    def test_permission_error_becomes_search_auth_error(self, monkeypatch):
+        from smartloop.platform import auth as platform_auth
+        from smartloop.search import providers
+
+        monkeypatch.setattr(platform_auth, "has_credentials", lambda: True)
+        self._client(monkeypatch, lambda q, c: (_ for _ in ()).throw(
+            PermissionError("HTTP 403")))
+
+        with pytest.raises(providers.SearchAuthError):
+            providers.HostedSearchProvider().search("bikes", 5)
+
+    def test_transient_error_is_not_an_auth_error(self, monkeypatch):
+        """A 500 or a dropped connection must stay distinguishable from "off" —
+        the agent skips either way, but only 401/403 means search is disabled."""
+        from smartloop.platform import auth as platform_auth
+        from smartloop.search import providers
+
+        monkeypatch.setattr(platform_auth, "has_credentials", lambda: True)
+        self._client(monkeypatch, lambda q, c: (_ for _ in ()).throw(
+            ConnectionError("boom")))
+
+        with pytest.raises(ConnectionError):
+            providers.HostedSearchProvider().search("bikes", 5)
