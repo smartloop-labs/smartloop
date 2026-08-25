@@ -37,7 +37,6 @@ class NodeResult(BaseModel):
 class AgentNode(BaseModel):
     node_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     depends_on: List[str] = Field(default_factory=list)
-    parallel_inference: bool = False
     decision_type: Optional[DecisionType] = None
 
     @field_validator("depends_on", mode="before")

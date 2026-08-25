@@ -4419,24 +4419,10 @@ class ModelService:
     # --------------------------------------------------------------- MCP agents
 
     def _get_llm_executor(self):
-        """Return the shared LLMExecutor, creating it lazily.
-
-        Worker processes (each loads its own model copy) are spawned lazily
-        by the pool on first use, so this is cheap until a parallel
-        document fan-out actually runs.  The pool is rebuilt after a model
-        load/unload so workers always load the current GGUF.
-        """
+        """Return the shared LLMExecutor (an I/O thread pool), creating it lazily."""
         if self._llm_executor is None:
             from smartloop.agents.hybrid_executor import LLMExecutor
-            from smartloop.config.app_settings import AppSettings
-            settings = AppSettings()
-            model_path = getattr(self, "_model_gguf_path", None)
-            self._llm_executor = LLMExecutor(
-                max_io_workers=6,
-                n_llm_workers=settings.n_llm_workers if model_path else 0,
-                model_path=model_path,
-                project_id=self.get_project_id(),
-            )
+            self._llm_executor = LLMExecutor(max_io_workers=6)
         return self._llm_executor
 
     def _reset_llm_executor(self) -> None:

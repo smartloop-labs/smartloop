@@ -1,66 +1,51 @@
-"""Centralized logging setup for the API server and its spawn workers.
+"""Centralized logging setup for the API server.
 
 All threads (TaskQueue jobs, IndexerTask workers, DAG executor, hybrid
-executor I/O pool) and all spawn worker processes (the LLM
-``ProcessPoolExecutor``) emit through a single ``QueueHandler`` on the
-root logger.  A ``QueueListener`` thread in the parent process owns the
-real handlers (rotating file + optional console) and writes records in
-arrival order so concurrent producers never tear a line.
+executor I/O pool) emit through a single ``QueueHandler`` on the root
+logger.  A ``QueueListener`` thread owns the real handlers (rotating file
++ optional console) and writes records in arrival order so concurrent
+producers never tear a line.
 
-Used by:
-- ``smartloop.api.main.run_server`` / ``start_server_foreground`` — installs
-  the queue + listener.
-- ``smartloop.agents.hybrid_executor.LLMExecutor`` — pulls the shared queue
-  via :func:`get_log_queue` and passes it to the spawn pool initializer.
-- ``smartloop.agents.llm_worker.init_worker`` — each spawned worker calls
-  :func:`worker_setup_logging` so its log records flow back to the parent
-  listener.
+The queue is a plain ``queue.Queue``.  It used to be a
+``multiprocessing.Queue`` so that the LLM ``ProcessPoolExecutor``'s spawn
+workers could write to it from another process, at a cost of three POSIX
+named semaphores per startup — semaphores that had to be unlinked before
+the process died or the resource tracker reported them leaked, and that
+``sem_open`` refuses outright under the macOS App Sandbox.  That worker
+pool is gone (see :mod:`smartloop.agents.hybrid_executor`), so every
+producer is a thread in this process and none of that applies.
+
+Used by ``smartloop.api.main.run_server`` / ``start_server_foreground``,
+which install the queue + listener.
 """
 
 from __future__ import annotations
 
-import gc
 import logging
 import logging.handlers
-import multiprocessing
-import os
+import queue as _queue
 import sys
 from pathlib import Path
 from typing import Optional
 
-# Process-wide singleton — set by make_log_queue() and read by
-# the hybrid executor when it spawns the worker pool.
-_LOG_QUEUE: Optional["multiprocessing.queues.Queue"] = None
+# Process-wide singleton — set by make_log_queue().
+_LOG_QUEUE: Optional[_queue.Queue] = None
 
 DEFAULT_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 DEFAULT_BACKUP_COUNT = 5
 
 
-def make_log_queue() -> "multiprocessing.queues.Queue":
+def make_log_queue() -> _queue.Queue:
     """Create the process-wide log queue. Idempotent — returns the existing
-    queue if one was already created.
-
-    A ``multiprocessing.Queue`` is used so log records from spawn worker
-    processes (the LLM ``ProcessPoolExecutor``) reach the parent listener.
-    It relies on a POSIX named semaphore (``sem_open``), which the macOS App
-    Sandbox (Mac App Store build) denies with ``PermissionError``/``OSError``.
-    When that happens we fall back to a plain thread-safe ``queue.Queue``:
-    under the sandbox the LLM pool isn't spawned anyway (Apple Silicon caps at
-    one worker and reuses the in-process model — see hybrid_executor), so every
-    producer is a thread in this process and the thread queue is sufficient.
-    ``QueueHandler``/``QueueListener`` treat both queues identically."""
+    queue if one was already created."""
     global _LOG_QUEUE
     if _LOG_QUEUE is None:
-        try:
-            _LOG_QUEUE = multiprocessing.Queue(-1)
-        except (PermissionError, OSError):
-            import queue as _queue
-            _LOG_QUEUE = _queue.Queue(-1)
+        _LOG_QUEUE = _queue.Queue(-1)
     return _LOG_QUEUE
 
 
-def get_log_queue() -> Optional["multiprocessing.queues.Queue"]:
+def get_log_queue() -> Optional[_queue.Queue]:
     """Return the shared log queue, or ``None`` if logging hasn't been set up
     yet (e.g. running outside the server, in unit tests, or before startup)."""
     return _LOG_QUEUE
@@ -75,7 +60,7 @@ def _resolve_level(level) -> int:
 
 
 def setup_root_logging(
-    queue: "multiprocessing.queues.Queue",
+    queue: _queue.Queue,
     *,
     level="DEBUG",
 ) -> None:
@@ -92,14 +77,14 @@ def setup_root_logging(
 
 
 def start_listener(
-    queue: "multiprocessing.queues.Queue",
+    queue: _queue.Queue,
     *,
     home_dir: str,
     file_level="INFO",
     console_level="INFO",
     force_console: Optional[bool] = None,
 ) -> logging.handlers.QueueListener:
-    """Start the parent-process listener that owns the real handlers.
+    """Start the listener that owns the real handlers.
 
     Always adds a ``RotatingFileHandler`` writing to ``<home_dir>/server.log``.
     Adds a stdout ``StreamHandler`` when running interactively (TTY and not a
@@ -141,18 +126,14 @@ def start_listener(
 
 
 def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) -> None:
-    """Stop the listener and release the shared log queue's OS resources.
+    """Stop the listener and detach the shared queue.
 
-    A ``multiprocessing.Queue`` owns three POSIX semaphores that are unlinked
-    by finalizers which only run on a *clean* interpreter exit.  A server that
-    is SIGKILLed — ``slp agent stop`` escalates to SIGKILL when SIGTERM hasn't
-    landed within 10s — never runs them, and the resource tracker then prints
-    ``resource_tracker: There appear to be 3 leaked semaphore objects to clean
-    up at shutdown``.  Releasing the queue during the lifespan shutdown means
-    the semaphores are already gone by the time that window opens.
+    The queue owns no OS resources, so this is only about not leaving a
+    ``QueueHandler`` pointing at a listener that no longer drains it — a
+    record emitted after this would otherwise pile up unread.  Root falls
+    back to ``logging.lastResort``, which still puts WARNING+ on stderr.
 
-    Safe to call more than once, and safe when the fallback ``queue.Queue``
-    (macOS App Sandbox) is in use — that one owns no OS resources.
+    Safe to call more than once.
     """
     global _LOG_QUEUE
 
@@ -161,10 +142,9 @@ def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) 
             listener.stop()
         except Exception:
             pass
+        # stop() joins the listener thread but leaves listener.queue bound.
+        listener.queue = None
 
-    # Detach the QueueHandler first: a record emitted after the queue closes
-    # would raise inside logging.  Root falls back to logging.lastResort,
-    # which still puts WARNING+ on stderr.
     root = logging.getLogger()
     for h in list(root.handlers):
         if isinstance(h, logging.handlers.QueueHandler):
@@ -173,42 +153,8 @@ def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) 
                 h.close()
             except Exception:
                 pass
+            # Handler.close() only deregisters the handler from logging's
+            # internal tables; h.queue stays bound, so clear it too.
+            h.queue = None
 
-    queue, _LOG_QUEUE = _LOG_QUEUE, None
-    # queue.Queue has no close(); only the multiprocessing one holds semaphores.
-    if queue is not None and hasattr(queue, "close"):
-        try:
-            queue.close()
-            queue.join_thread()
-        except Exception:
-            pass
-
-    # close() only tears down the pipe — the semaphores are unlinked by the
-    # finalizers that fire when the Queue is collected.  Drop the last
-    # reference and force that collection now, while we still control the
-    # exit path.  Callers must clear their own references (e.g.
-    # ``app.state.log_queue``) before calling.
-    del queue
-    gc.collect()
-
-
-def worker_setup_logging(queue: Optional["multiprocessing.queues.Queue"]) -> None:
-    """Configure the root logger inside a spawn worker process.
-
-    When ``queue`` is provided, all worker log records flow back to the
-    parent's :class:`QueueListener`.  When ``None`` (tests, ad-hoc usage),
-    fall back to a stderr handler so the worker is still observable.
-    """
-    root = logging.getLogger()
-    for h in list(root.handlers):
-        root.removeHandler(h)
-    root.setLevel(logging.DEBUG)
-
-    if queue is not None:
-        root.addHandler(logging.handlers.QueueHandler(queue))
-        return
-
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(DEFAULT_FORMAT))
-    handler.setLevel(logging.INFO)
-    root.addHandler(handler)
+    _LOG_QUEUE = None

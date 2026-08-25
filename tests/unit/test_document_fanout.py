@@ -213,25 +213,20 @@ class TestFanoutHandlers:
         assert cited == {"doc0.pdf"}
         assert sctx.cited_documents == ["doc0.pdf"]
 
-    def test_uses_worker_pool_when_available(self):
-        from concurrent.futures import Future
+    def test_extraction_uses_the_in_process_dp_model(self):
+        """Every batch extracts on the shared in-process model.
 
-        class FakePool:
-            has_llm_pool = True
-
-            def __init__(self):
-                self.calls = 0
-
-            def submit_llm(self, prompt):
-                self.calls += 1
-                f = Future()
-                f.set_result("POOL EXTRACT")
-                return f
-
+        Extraction used to be dispatched to an LLM worker *process* when a
+        pool existed, with ``parallel_inference=True`` to opt the node out of
+        the DAG executor's LLM lock.  The pool is gone (same-device model
+        copies serialize in the driver anyway), so there is one inference path
+        and every LLMDecisionNode is serialized.
+        """
         orch = _make_orchestrator()
-        orch.agent_llm.invoke = MagicMock(side_effect=AssertionError("used in-thread model"))
-        pool = FakePool()
-        orch._executor = pool
+        dp_llm = MagicMock()
+        dp_llm.get_max_tokens = MagicMock(return_value=8192)
+        dp_llm.invoke = MagicMock(return_value="DP EXTRACT")
+        orch._llm_for_tier = MagicMock(return_value=dp_llm)
 
         sctx = SearchContext(documents=_docs(3))
         ctx = _ctx(orch)
@@ -239,13 +234,14 @@ class TestFanoutHandlers:
         nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
 
         batch_nodes = [n for n, _ in nodes_and_handlers if isinstance(n, LLMDecisionNode)]
-        assert all(n.parallel_inference for n in batch_nodes)
+        assert batch_nodes
+        # The opt-out flag is gone, so the executor's lock always applies.
+        assert not any(hasattr(n, "parallel_inference") for n in batch_nodes)
 
         for node, handler in nodes_and_handlers:
             if isinstance(node, LLMDecisionNode):
-                result = handler({})
-                assert result.data["content"] == "POOL EXTRACT"
-        assert pool.calls == len(batch_nodes)
+                assert handler({}).data["content"] == "DP EXTRACT"
+        assert dp_llm.invoke.call_count == len(batch_nodes)
 
     def test_batch_drops_document_when_llm_returns_none(self):
         orch = _make_orchestrator()

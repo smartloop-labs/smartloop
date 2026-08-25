@@ -61,44 +61,25 @@ class AppSettings(BaseSettings):
     cors_origins: str = Field(default="*", validation_alias="slp_api_cors_origins")
     # Parallel inference slots — allows multiple agents to run concurrently
     # in the same model instance via continuous batching (llama.cpp n_parallel).
-    # Increases VRAM/RAM usage proportionally (n_llm_workers defaults to this, so
-    # each extra slot is another resident model copy).  Default 1 keeps VRAM free
-    # for the on-demand skills/agent (large) model and the vision OCR model;
-    # raise it on machines with VRAM headroom.
+    # Increases the KV cache proportionally.  Default 1 keeps VRAM free for the
+    # on-demand skills/agent (large) model and the vision OCR model; raise it on
+    # machines with VRAM headroom.  This is the only parallel-inference knob:
+    # multi-process workers (each with its own model copy) were removed because
+    # same-device copies serialize in the driver anyway.
     n_parallel: int = Field(default=1, validation_alias="slp_n_parallel")
-    # Number of LLM worker processes for parallel inference via
-    # ProcessPoolExecutor.  Each worker loads its own model copy, so
-    # RAM/VRAM usage scales linearly.  Defaults to n_parallel so the
-    # number of workers matches the system's parallelism capacity.
-    # Override via SLP_N_LLM_WORKERS if needed.
-    n_llm_workers: Optional[int] = Field(
-        default=None,
-        validation_alias="slp_n_llm_workers",
-        description="Number of LLM worker processes for parallel inference. Defaults to n_parallel.",
-    )
     # Context window for each LLM worker's model copy.  0 (default) = no cap:
-    # each copy auto-sizes to the device's available memory (the factory picks
-    # the largest window that fits; the worker's load retry halves the window
-    # if it can't fit alongside sibling copies).  Set > 0 to force a fixed
-    # window for every worker copy.
-    llm_worker_n_ctx: int = Field(
-        default=0,
-        validation_alias="slp_llm_worker_n_ctx",
-        description="Context window per LLM worker model copy; 0 = auto-size to the device.",
-    )
-    # Cap applied to the MAIN model's (auto-sized) context window when the LLM
-    # worker pool is active.  The main model's KV cache otherwise scales to the
-    # whole device; capping it leaves room for the worker copies to share the
-    # GPU.  0 (default) = no cap — the main model uses its full auto-sized
-    # window.  Only caps (never raises) the auto-sized value.
+    # Cap applied to the MAIN model's (auto-sized) context window.  Its KV
+    # cache otherwise scales to the whole device, leaving nothing for the
+    # on-demand large/vision models.  0 (default) = no cap — the main model
+    # uses its full auto-sized window.  Only caps (never raises) it.
     llm_main_n_ctx_cap: int = Field(
         default=0,
         validation_alias="slp_llm_main_n_ctx_cap",
-        description="Max context for the main model when the worker pool is active; 0 = no cap.",
+        description="Max context for the main model; 0 = no cap.",
     )
     # Cap applied to the large (agent) model's auto-sized context, and the
-    # reserve kept free so loading it doesn't starve the main model + worker
-    # pool.  The large model is loaded lazily on first agent use only if its
+    # reserve kept free so loading it doesn't starve the main model.  The
+    # large model is loaded lazily on first agent use only if its
     # capped footprint fits in free VRAM after this reserve.  0 (default) = no
     # cap — it uses its full auto-sized window.
     llm_large_n_ctx_cap: int = Field(
@@ -113,8 +94,7 @@ class AppSettings(BaseSettings):
     )
     # Optional hard cap on characters fed to the per-document fan-out extractor.
     # 0 (default) = no fixed cap: the budget is derived from the extraction
-    # model's actual context window (llm_worker_n_ctx for the worker pool, else
-    # the main model's context), reserving room for the output — so a stored
+    # model's actual context window, reserving room for the output — so a stored
     # document/chunk is processed without an arbitrary cutoff.  Set > 0 only to
     # force a smaller cap.
     doc_extract_max_chars: int = Field(
@@ -229,8 +209,6 @@ class AppSettings(BaseSettings):
         """Resolve defaults that depend on other fields."""
         if self.developer_token is None:
             self.developer_token = credential_store.get_active_token()
-        if self.n_llm_workers is None:
-            self.n_llm_workers = self.n_parallel
         # An existing .env may still name the orchestrator model by its old id;
         # normalize here so the rest of the framework only ever sees the
         # canonical name.

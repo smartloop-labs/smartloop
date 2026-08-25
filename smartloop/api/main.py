@@ -212,13 +212,9 @@ async def lifespan(app: FastAPI):
     logger.info("Model unloaded, shutdown complete")
 
     # Tear down centralized logging last so the lines above still flush
-    # through the rotating file handler.  This also closes the shared
-    # multiprocessing log queue — left open, its three POSIX semaphores are
-    # only released by exit finalizers, which a SIGKILLed server never runs.
+    # through the rotating file handler.
     from smartloop.utils.logging_setup import shutdown_logging
     _listener = getattr(app.state, "log_listener", None)
-    # Drop our references first — shutdown_logging can only release the
-    # semaphores once nothing else holds the queue alive.
     app.state.log_listener = None
     app.state.log_queue = None
     shutdown_logging(_listener)
@@ -411,10 +407,7 @@ class _PortCapturingServer(uvicorn.Server):
 def _install_centralized_logging() -> None:
     """Install the shared log queue, root QueueHandler, and parent listener.
 
-    The same queue is later picked up by ``LLMExecutor`` via
-    ``logging_setup.get_log_queue`` so spawn worker processes log through
-    the same listener.  Stashes the listener on ``app.state`` so the
-    lifespan shutdown can stop it.
+    Stashes the listener on ``app.state`` so the lifespan shutdown can stop it.
     """
     from smartloop.utils.logging_setup import (
         make_log_queue, setup_root_logging, start_listener,
@@ -524,9 +517,9 @@ def start_server_foreground(host: str, port: int, service: bool = True) -> None:
             if not service:
                 break
 
-            # The lifespan shutdown tore logging down (it closes the shared
-            # multiprocessing log queue so its semaphores can't outlive us),
-            # so bring it back up before logging anything about the restart.
+            # The lifespan shutdown tore logging down (it detaches the root
+            # QueueHandler from a listener that no longer drains), so bring it
+            # back up before logging anything about the restart.
             _install_centralized_logging()
 
             uptime = _time.monotonic() - start_ts
