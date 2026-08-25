@@ -1268,6 +1268,81 @@ class TestMcpSourceAttribution:
         )
         assert out == "Notion · search_pages — notion/pages/Roadmap"
 
+    def test_the_record_id_travels_in_the_source_line(self):
+        """The id is the handle a *next* tool call needs.
+
+        "List my designs, then comment on that one" only works if the id came
+        back with the listing; otherwise the model re-runs a live search purely
+        to recover what the crawl already stored.  `is_noisy_value` drops every
+        key ending in `_id`, so `design_id` never survives into a chunk — the
+        header is the only place it can travel.
+        """
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "Canva/designs/Benefits of Local AI",
+            self._chunk({
+                "tool_name": "search-designs", "server_name": "Canva",
+                "record_id": "DAHTRxZG2Qo",
+            }),
+        )
+        assert "id: DAHTRxZG2Qo" in out
+
+    def test_an_id_the_document_name_already_carries_is_not_repeated(self):
+        # A record with no title of its own is already named by its id, and
+        # saying it twice reads like two different records.
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "Canva/design-comments/KAHS4n2FFaA",
+            self._chunk({"tool_name": "list-comments", "server_name": "Canva",
+                         "record_id": "KAHS4n2FFaA"}),
+        )
+        assert out.count("KAHS4n2FFaA") == 1
+        assert "id:" not in out
+
+    def test_the_id_is_the_tool_argument_not_something_read_off_the_url(self):
+        """Deriving an id from a URL is wrong on the servers we crawl.
+
+        A Trello card's id is its ARI; its URL carries the shortLink, which
+        `trelloReadCard` rejects.  Canva is the same story with a pattern:
+        `comment-on-design` requires ^D[a-zA-Z0-9_-]+$ and the /d/ token in the
+        URL does not match it.
+        """
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        ari = "ari:cloud:trello::card/workspace/5fef637f/624b42a03ce1e666"
+        out = _mcp_source(
+            "Trello/cards/Donate Clothes Trip",
+            self._chunk({
+                "tool_name": "trelloReadCard", "server_name": "Trello",
+                "record_id": ari,
+                "source_url": "https://trello.com/c/dQv6OAbC/28-donate",
+            }),
+        )
+        assert f"id: {ari}" in out
+        # Both present and distinct — the shortLink is not offered as the id.
+        assert "dQv6OAbC" in out
+        assert "id: https" not in out
+
+    def test_a_record_without_an_id_gains_no_empty_separator(self):
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "notion/pages/Roadmap",
+            self._chunk({"tool_name": "search_pages", "server_name": "Notion",
+                         "record_id": "", "source_url": ""}),
+        )
+        assert out == "Notion · search_pages — notion/pages/Roadmap"
+
+    def test_indexed_chunks_carry_the_record_id(self):
+        """The read path can only surface what indexing stored."""
+        import inspect
+
+        from smartloop.db import mcp_document_indexer as mod
+
+        assert '"record_id": doc["record_id"]' in inspect.getsource(mod)
+
     def test_indexed_chunks_carry_the_record_url(self):
         """The read path can only surface what indexing stored."""
         import inspect
