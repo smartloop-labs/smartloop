@@ -260,29 +260,27 @@ class TestHostedStatusCache:
 
         providers.reset_status_cache()
 
+    @staticmethod
+    def _stub_client(monkeypatch, status, calls=None):
+        """Point providers at a platform client whose status call runs *status*."""
+        from smartloop.search import providers
+
+        class _Client:
+            def get_web_search_status(self):
+                if calls is not None:
+                    calls.append(1)
+                return status()
+
+        monkeypatch.setattr(providers, "_client", lambda: _Client())
+
     def test_result_is_cached_across_calls(self, monkeypatch):
         from smartloop.auth import credential_store
         from smartloop.search import providers
 
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
-
+        monkeypatch.setattr(credential_store, "auth_headers",
+                            lambda: {"Authorization": "Bearer tok"})
         calls = []
-
-        class _Resp:
-            status_code = 200
-
-            def raise_for_status(self): pass
-
-            def json(self): return {"enabled": True}
-
-        class _Client:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def get(self, *a, **k):
-                calls.append(a)
-                return _Resp()
-
-        monkeypatch.setattr(providers.httpx, "Client", lambda **k: _Client())
+        self._stub_client(monkeypatch, lambda: {"enabled": True}, calls)
 
         assert providers.hosted_search_available() is True
         assert providers.hosted_search_available() is True
@@ -292,12 +290,12 @@ class TestHostedStatusCache:
         from smartloop.auth import credential_store
         from smartloop.search import providers
 
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: None)
+        monkeypatch.setattr(credential_store, "auth_headers", lambda: {})
 
-        def _boom(**k):
-            raise AssertionError("must not call the endpoint without a token")
+        def _boom():
+            raise AssertionError("must not build a client without credentials")
 
-        monkeypatch.setattr(providers.httpx, "Client", _boom)
+        monkeypatch.setattr(providers, "_client", _boom)
 
         assert providers.hosted_search_available() is False
 
@@ -307,35 +305,81 @@ class TestHostedStatusCache:
         from smartloop.auth import credential_store
         from smartloop.search import providers
 
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
+        monkeypatch.setattr(credential_store, "auth_headers",
+                            lambda: {"Authorization": "Bearer tok"})
 
-        class _Client:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def get(self, *a, **k): raise RuntimeError("network down")
+        def _down():
+            raise ConnectionError("network down")
 
-        monkeypatch.setattr(providers.httpx, "Client", lambda **k: _Client())
+        self._stub_client(monkeypatch, _down)
 
         assert providers.hosted_search_available() is True
 
     def test_forbidden_reports_unavailable(self, monkeypatch):
+        """A refusal is an answer — unlike a transport failure, it must not
+        fail open."""
         from smartloop.auth import credential_store
         from smartloop.search import providers
 
-        monkeypatch.setattr(credential_store, "get_active_token", lambda: "tok")
+        monkeypatch.setattr(credential_store, "auth_headers",
+                            lambda: {"Authorization": "Bearer tok"})
 
-        class _Resp:
-            status_code = 403
+        def _refused():
+            raise PermissionError("hosted endpoint refused the request (HTTP 403)")
 
-            def raise_for_status(self): raise AssertionError("not reached")
-
-            def json(self): return {}
-
-        class _Client:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def get(self, *a, **k): return _Resp()
-
-        monkeypatch.setattr(providers.httpx, "Client", lambda **k: _Client())
+        self._stub_client(monkeypatch, _refused)
 
         assert providers.hosted_search_available() is False
+
+
+class TestHostedSearchErrors:
+    """The agent skips silently on these, so each platform-client failure has
+    to arrive as the search error the agent catches."""
+
+    def test_a_refusal_becomes_a_search_auth_error(self, monkeypatch):
+        from smartloop.auth import credential_store
+        from smartloop.search import providers
+
+        monkeypatch.setattr(credential_store, "auth_headers",
+                            lambda: {"Authorization": "Bearer tok"})
+
+        class _Client:
+            def search_web(self, query, count):
+                raise PermissionError("hosted endpoint refused the request (HTTP 403)")
+
+        monkeypatch.setattr(providers, "_client", lambda: _Client())
+
+        with pytest.raises(providers.SearchAuthError):
+            providers.HostedSearchProvider().search("q", 5)
+
+    def test_without_credentials_no_call_is_made(self, monkeypatch):
+        from smartloop.auth import credential_store
+        from smartloop.search import providers
+
+        monkeypatch.setattr(credential_store, "auth_headers", lambda: {})
+
+        def _boom():
+            raise AssertionError("must not build a client without credentials")
+
+        monkeypatch.setattr(providers, "_client", _boom)
+
+        with pytest.raises(providers.NoSearchCredentials):
+            providers.HostedSearchProvider().search("q", 5)
+
+    def test_the_count_is_clamped_to_the_endpoint_maximum(self, monkeypatch):
+        from smartloop.auth import credential_store
+        from smartloop.search import providers
+
+        monkeypatch.setattr(credential_store, "auth_headers",
+                            lambda: {"Authorization": "Bearer tok"})
+        seen = []
+
+        class _Client:
+            def search_web(self, query, count):
+                seen.append(count)
+                return ["https://example.com", "", 7, "  "]
+
+        monkeypatch.setattr(providers, "_client", lambda: _Client())
+
+        assert providers.HostedSearchProvider().search("q", 99) == ["https://example.com"]
+        assert seen == [20]

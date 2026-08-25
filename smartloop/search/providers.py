@@ -7,16 +7,19 @@ web search to one machine and left the hosted API unable to tell whether search
 was usable. Registration now lives on the account (managed from the web app),
 so this side stays deliberately blind: it asks for links and treats a 401/403
 as "search is off".
+
+The HTTP calls themselves belong to ``SLPPlatformClient``, the same client
+every other hosted call goes through — that is what injects credentials, so a
+developer token is presented as ``X-Api-Key`` rather than as a bearer token.
+What is left here is search-specific: the enablement cache, and translating the
+client's errors into the silent-skip signals the agent expects.
 """
 from __future__ import annotations
 
 import logging
-import platform
 import threading
 import time
 from typing import List, Optional, Tuple
-
-import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -30,17 +33,18 @@ _status_cache: Optional[Tuple[float, bool]] = None
 _status_lock = threading.Lock()
 
 
-def _user_agent() -> str:
-    """Identify this client to the API.
+def _client():
+    """A platform client bound to the configured API base."""
+    from smartloop.config.app_settings import AppSettings
+    from smartloop.platform.client import SLPPlatformClient
 
-    The hosted endpoint records each call in the account's access log, and
-    httpx's default agent ("python-httpx/x.y") would make every entry look
-    like an anonymous script. Naming ourselves lets the owner tell their own
-    agent apart from anything else using their token.
-    """
-    from smartloop import __version__
+    return SLPPlatformClient(AppSettings().slp_api_base)
 
-    return f"smartloop-cli/{__version__} ({platform.system().lower()})"
+
+def _has_credentials() -> bool:
+    from smartloop.platform import auth as platform_auth
+
+    return platform_auth.has_credentials()
 
 
 class SearchProviderError(Exception):
@@ -64,34 +68,17 @@ class HostedSearchProvider:
     """Smartloop's hosted ``/v1/websearch`` endpoint."""
 
     name = "hosted"
-    _PATH = "/v1/websearch"
 
     def search(self, query: str, count: int) -> List[str]:
         """Return up to *count* result URLs for *query*."""
-        from smartloop.auth import credential_store
-        from smartloop.config.app_settings import AppSettings
-
-        token = credential_store.get_active_token()
-        if not token:
+        if not _has_credentials():
             raise NoSearchCredentials(
                 "no Smartloop credentials available to call the hosted endpoint"
             )
-        base = AppSettings().slp_api_base.rstrip("/")
-        url = f"{base}{self._PATH}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "User-Agent": _user_agent(),
-        }
-        params = {"q": query, "count": max(1, min(count, 20))}
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(url, headers=headers, params=params)
-        if resp.status_code in (401, 403):
-            raise SearchAuthError(
-                f"hosted endpoint rejected the token (HTTP {resp.status_code})"
-            )
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = _client().search_web(query, max(1, min(count, 20)))
+        except PermissionError as e:
+            raise SearchAuthError(str(e)) from e
         links = (
             [u for u in data if isinstance(u, str) and u.strip()]
             if isinstance(data, list)
@@ -104,12 +91,6 @@ class HostedSearchProvider:
 def resolve_provider() -> HostedSearchProvider:
     """Return the search client. Always the hosted endpoint."""
     return HostedSearchProvider()
-
-
-def _status_path() -> str:
-    from smartloop.config.app_settings import AppSettings
-
-    return f"{AppSettings().slp_api_base.rstrip('/')}/v1/websearch/status"
 
 
 def hosted_search_available(ttl: float = _STATUS_TTL_SECONDS) -> bool:
@@ -132,29 +113,15 @@ def hosted_search_available(ttl: float = _STATUS_TTL_SECONDS) -> bool:
         if _status_cache is not None and now - _status_cache[0] < ttl:
             return _status_cache[1]
 
-    from smartloop.auth import credential_store
-
-    token = credential_store.get_active_token()
-    if not token:
+    if not _has_credentials():
         with _status_lock:
             _status_cache = (now, False)
         return False
 
     try:
-        with httpx.Client(timeout=5) as client:
-            resp = client.get(
-                _status_path(),
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/json",
-                    "User-Agent": _user_agent(),
-                },
-            )
-        if resp.status_code in (401, 403):
-            enabled = False
-        else:
-            resp.raise_for_status()
-            enabled = bool(resp.json().get("enabled"))
+        enabled = bool(_client().get_web_search_status().get("enabled"))
+    except PermissionError:
+        enabled = False
     except Exception as e:
         logger.info("[search] status check failed (%s) — assuming available", e)
         return True

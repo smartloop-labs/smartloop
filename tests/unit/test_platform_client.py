@@ -14,9 +14,12 @@ class _StubHandler(BaseHTTPRequestHandler):
 
     # Class-level response config — set by fixtures before each test
     routes: dict = {}
+    #: (path_with_query, headers) per GET, so tests can assert what was sent
+    seen: list = []
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        self.seen.append((self.path, dict(self.headers)))
         if path in self.routes:
             status, body = self.routes[path]
             self.send_response(status)
@@ -35,6 +38,7 @@ class _StubHandler(BaseHTTPRequestHandler):
 def stub_server():
     """Start a local HTTP server with configurable routes, yield (base_url, handler_cls)."""
     server = HTTPServer(("127.0.0.1", 0), _StubHandler)
+    _StubHandler.seen = []
     port = server.server_address[1]
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -232,3 +236,105 @@ class TestGetCurrentUser:
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
         with pytest.raises(PermissionError, match="API error"):
             client.get_current_user()
+
+
+class TestWebSearch:
+    """Web search goes through this client so it gets the same credential
+    injection as every other hosted call."""
+
+    def test_returns_the_link_array(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (200, ["https://a.example", "https://b.example"])}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {"Authorization": "Bearer jwt"})
+        assert client.search_web("canyon bikes", 5) == ["https://a.example", "https://b.example"]
+
+    def test_sends_the_query_and_count(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (200, [])}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        client.search_web("canyon bikes", 7)
+
+        path = handler.seen[-1][0]
+        assert "q=canyon+bikes" in path or "q=canyon%20bikes" in path
+        assert "count=7" in path
+
+    def test_a_developer_token_is_sent_as_an_api_key(self, stub_server):
+        """The regression this path had: formatting the header locally sent a
+        developer token as a bearer token, and the resulting 401 read as
+        "web search is off"."""
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (200, [])}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {"X-Api-Key": "sk-dev"})
+        client.search_web("q", 5)
+
+        headers = handler.seen[-1][1]
+        assert headers["X-Api-Key"] == "sk-dev"
+        assert "Authorization" not in headers
+
+    def test_identifies_itself_in_the_user_agent(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (200, [])}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        client.search_web("q", 5)
+
+        assert handler.seen[-1][1]["User-Agent"].startswith("smartloop-cli/")
+
+    def test_401_raises_permission_error(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (401, {})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(PermissionError):
+            client.search_web("q", 5)
+
+    def test_a_server_error_is_not_a_refusal(self, stub_server):
+        """A 500 must not masquerade as "search is off" — the caller caches
+        that answer, but fails open on a connection error."""
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (500, {})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError):
+            client.search_web("q", 5)
+
+    def test_transport_error_raises_connection_error(self):
+        client = SLPPlatformClient("http://127.0.0.1:1", auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError):
+            client.search_web("q", 5)
+
+
+class TestWebSearchStatus:
+    def test_returns_the_status_body(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch/status": (200, {"enabled": True})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {"Authorization": "Bearer jwt"})
+        assert client.get_web_search_status() == {"enabled": True}
+
+    def test_a_developer_token_is_sent_as_an_api_key(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch/status": (200, {"enabled": True})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {"X-Api-Key": "sk-dev"})
+        client.get_web_search_status()
+
+        headers = handler.seen[-1][1]
+        assert headers["X-Api-Key"] == "sk-dev"
+        assert "Authorization" not in headers
+
+    def test_403_raises_permission_error(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch/status": (403, {})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(PermissionError):
+            client.get_web_search_status()
+
+    def test_transport_error_raises_connection_error(self):
+        client = SLPPlatformClient("http://127.0.0.1:1", auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError):
+            client.get_web_search_status()

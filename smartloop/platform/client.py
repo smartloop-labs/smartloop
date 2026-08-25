@@ -4,6 +4,7 @@ Handles only JSON control-plane calls — no file downloading.
 """
 
 import logging
+import platform as _platform
 from typing import Callable, Optional
 
 import httpx
@@ -22,8 +23,37 @@ _MODEL_UPLOAD = "/v1/models/{}/upload"
 _MODELS = "/v1/models"
 _RELEASES_LATEST = "/v1/releases/latest"
 _MCP_CATALOG = "/v1/mcp-catalog"
+_WEBSEARCH = "/v1/websearch"
+_WEBSEARCH_STATUS = "/v1/websearch/status"
 
 _TIMEOUT = 30
+
+#: Web search runs in front of a chat turn, so it gets its own budgets rather
+#: than the 30s control-plane default: a search the user is waiting on, and a
+#: status check that gates every query and fails open if it cannot finish.
+_SEARCH_TIMEOUT = 15
+_SEARCH_STATUS_TIMEOUT = 5
+
+
+def _user_agent() -> str:
+    """Identify this client to the API, e.g. ``smartloop-cli/1.2.3 (darwin)``."""
+    from smartloop import __version__
+
+    return f"smartloop-cli/{__version__} ({_platform.system().lower()})"
+
+
+def _raise_for_refused_search(resp: httpx.Response) -> None:
+    """Raise ``PermissionError`` if the search endpoint refused the request.
+
+    Only 401/403 means refused. ``_raise_for_status`` would map every failure
+    to whatever class it is given, which would turn a 500 into "search is off"
+    and get that cached — so the auth statuses are singled out here and the
+    rest fall through to a ``ConnectionError``.
+    """
+    if resp.status_code in (401, 403):
+        raise PermissionError(
+            f"hosted endpoint refused the request (HTTP {resp.status_code})"
+        )
 
 
 def _raise_for_status(resp: httpx.Response, error_map: dict[int, str] | None = None,
@@ -211,3 +241,57 @@ class SLPPlatformClient:
             _raise_for_status(resp)
         except Exception as e:
             logger.error("Failed to push token usage: %s", e)
+
+    # -------------------------------------------------------------- web search
+
+    def _search_headers(self) -> dict[str, str]:
+        """Auth headers plus this client's identity, for the search endpoints.
+
+        The search endpoints record each call in the account's access log, and
+        httpx's default agent ("python-httpx/x.y") would make every entry look
+        like an anonymous script; naming ourselves lets the owner tell their
+        own agent apart from anything else using their token. The other calls
+        on this client don't send it yet.
+        """
+        return {
+            **self._auth_headers_fn(),
+            "Accept": "application/json",
+            "User-Agent": _user_agent(),
+        }
+
+    def search_web(self, query: str, count: int) -> list:
+        """GET /v1/websearch (auth required). Returns the raw JSON body.
+
+        The endpoint resolves the account's registered search provider
+        server-side; this client never sees a provider name or an API key.
+        Raises ``PermissionError`` on 401/403 — meaning search is unavailable
+        for this account — and ``ConnectionError`` for anything else.
+        """
+        try:
+            resp = httpx.get(self._url(_WEBSEARCH), headers=self._search_headers(),
+                             params={"q": query, "count": count},
+                             timeout=_SEARCH_TIMEOUT)
+        except httpx.TransportError as e:
+            raise ConnectionError(f"Connection error: {e}") from e
+
+        _raise_for_refused_search(resp)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def get_web_search_status(self) -> dict:
+        """GET /v1/websearch/status (auth required). Returns ``{"enabled": bool}``.
+
+        Answers for the whole account: signed in, with a provider registered.
+        Raises ``PermissionError`` on 401/403 and ``ConnectionError``
+        otherwise, so a caller can tell "search is off" from "could not ask".
+        """
+        try:
+            resp = httpx.get(self._url(_WEBSEARCH_STATUS),
+                             headers=self._search_headers(),
+                             timeout=_SEARCH_STATUS_TIMEOUT)
+        except httpx.TransportError as e:
+            raise ConnectionError(f"Connection error: {e}") from e
+
+        _raise_for_refused_search(resp)
+        _raise_for_status(resp)
+        return resp.json()
