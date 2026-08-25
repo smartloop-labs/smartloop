@@ -3076,10 +3076,22 @@ class ModelService:
         their VRAM is returned between chats rather than left resident. Both
         underlying unloads are idempotent, so this is safe to call whether or
         not either model was actually loaded for the request.
+
+        The embedding model goes with them. Retrieval runs at the start of a
+        turn and is finished well before the response is; holding its weights
+        and llama.cpp context until the next question is the same idle cost as
+        the auxiliary LLMs. It reloads lazily on the next search.
         """
         self.unload_vision_model()
         self.unload_large_model()
         self._evict_capability_models()
+
+        try:
+            from smartloop.db import embeddings
+
+            embeddings.unload()
+        except Exception as e:  # cleanup must never fail a response
+            logger.warning("[models] embedding unload failed: %s", e)
 
     def unload_model_by_name(self, model_name: str) -> bool:
         """Free VRAM held by a specific model, e.g. when it's deselected.
@@ -4246,7 +4258,7 @@ class ModelService:
         return {"project_id": project.id, "enabled": bool(project.web_search_enabled)}
 
     def set_web_search_enabled(self, project_id: str, enabled: bool) -> dict:
-        """Enable/disable web search (Pro feature) for the given project."""
+        """Enable/disable web search for the given project."""
         project = self._get_project(project_id)
         project.web_search_enabled = enabled
         self._model.save()

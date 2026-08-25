@@ -893,3 +893,47 @@ class TestRemoval:
             assert removed == 2
             assert idx._store.delete_document.call_count >= 2
             assert "srv1" not in idx._manifest
+
+
+class TestMcpSourceAttribution:
+    """Crawled MCP content must say which tool produced it — otherwise the
+    model has content it cannot attribute when asked where it came from."""
+
+    @staticmethod
+    def _chunk(metadata):
+        class _C:
+            def __init__(self, m):
+                self.metadata = m
+        return _C(metadata)
+
+    def test_tool_and_server_lead_the_source_line(self):
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source(
+            "notion/pages/Roadmap",
+            self._chunk({"tool_name": "search_pages", "server_name": "Notion"}),
+        )
+        assert "search_pages" in out
+        assert out.startswith("Notion")
+
+    def test_tool_alone_is_enough(self):
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        out = _mcp_source("linear/issues/Bug", self._chunk({"tool_name": "list_issues"}))
+        assert out.startswith("list_issues")
+
+    def test_falls_back_to_the_document_name(self):
+        """Chunks indexed before the tool was recorded still render."""
+        from smartloop.agents.mcp.explorer import _mcp_source
+
+        assert _mcp_source("plain/doc", self._chunk({})) == "plain/doc"
+        assert _mcp_source("plain/doc", self._chunk(None)) == "plain/doc"
+
+    def test_indexed_chunks_carry_the_tool_name(self):
+        """The read path can only surface what indexing stored."""
+        import inspect
+
+        from smartloop.db import mcp_document_indexer as mod
+
+        src = inspect.getsource(mod)
+        assert '"tool_name": doc["tool_name"]' in src

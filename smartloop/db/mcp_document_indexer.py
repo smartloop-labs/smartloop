@@ -357,8 +357,11 @@ class MCPDocumentIndexer:
         with self._lock:
             if server_id:
                 self._crawling.add(server_id)
+            from smartloop.db.embeddings import indexing_burst
+
             try:
-                return self._crawl_server(server, ttl, force, on_server_updated)
+                with indexing_burst():
+                    return self._crawl_server(server, ttl, force, on_server_updated)
             finally:
                 self._crawling.discard(server_id)
 

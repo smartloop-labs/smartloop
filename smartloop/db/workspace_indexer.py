@@ -130,7 +130,9 @@ class WorkspaceIndexer:
         Returns a stats dict: ``{"indexed": N, "skipped": N, "removed": N}``.
         Thread-safe — concurrent calls are serialised.
         """
-        with self._lock:
+        from smartloop.db.embeddings import indexing_burst
+
+        with self._lock, indexing_burst():
             return self._index(work_dir)
 
     def search(

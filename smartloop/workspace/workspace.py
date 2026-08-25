@@ -406,7 +406,9 @@ class Workspace(BaseModel):
         ):
         # ``**_legacy`` swallows keys that were persisted by older builds but
         # have since been removed from the model (e.g. ``web_search``), so
-        # loading an existing config.json never fails validation.
+        # loading an existing config.json never fails validation. Anything
+        # still supported has to be named explicitly here — a field left to
+        # _legacy is silently dropped and reverts to its default on every load.
         super().__init__(id=id, projects=projects or [], merge_model_dir=merge_model_dir, workspace_dir=workspace_dir, models_dir=models_dir, models=models or [], adapters=adapters or [])
 
     @property

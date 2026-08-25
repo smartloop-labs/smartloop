@@ -1398,13 +1398,17 @@ class SLPOrchestrator:
 
             # EXPLORE: return pre-fetched search context (already collected)
             if step.step_type == StepType.EXPLORE:
+                # Local sources first, the web last. Everything above the web
+                # is the user's own material — their documents, workspace,
+                # connected servers and prior feedback — and a model reading
+                # top-down should meet that before a public page. Web results
+                # used to sit third, ahead of both MCP sources, which put
+                # someone else's page in front of the user's own data.
                 parts = []
                 if search_ctx.vector_context:
                     parts.append(search_ctx.vector_context)
                 if search_ctx.workspace_context:
                     parts.append(search_ctx.workspace_context)
-                if search_ctx.web_context:
-                    parts.append(self._frame_web_results(search_ctx.web_context))
                 if search_ctx.mcp_context:
                     parts.append(search_ctx.mcp_context)
                 if search_ctx.mcp_document_context:
@@ -1413,6 +1417,8 @@ class SLPOrchestrator:
                     )
                 if search_ctx.feedback_context:
                     parts.append(search_ctx.feedback_context)
+                if search_ctx.web_context:
+                    parts.append(self._frame_web_results(search_ctx.web_context))
                 content = "\n\n---\n\n".join(parts) if parts else ""
                 if search_ctx.citations:
                     self._explore_citations = search_ctx.citations
