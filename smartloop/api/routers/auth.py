@@ -107,9 +107,31 @@ def _resolve_user() -> Optional[UserInfo]:
         data = get_platform_service().get_current_user()
         return UserInfo(email=data["email"], name=data.get("name"))
     except PermissionError:
-        # 401 — access token is expired or revoked; clear it so we
-        # fall back to the developer token on subsequent requests.
-        # Keep the refresh token — it will be needed to mint a new access token.
+        # 401 — the access token is expired or revoked.  A refresh token can
+        # mint a new one, so redeem it and retry once before giving up.
+        #
+        # Clearing without trying was the bug: the comment here promised the
+        # refresh token would "be needed to mint a new access token", but the
+        # only code that redeems one is the background loop, on a 45-minute
+        # timer.  So a single 401 logged the user out for up to a full interval
+        # while a valid refresh token sat unused, and everything auth-gated
+        # degraded quietly in the meantime — web search skipping itself, Pro
+        # models dropping out of the catalogue.
+        from smartloop.platform.token_agent import refresh_access_token_now
+
+        if refresh_access_token_now():
+            try:
+                data = get_platform_service().get_current_user(force=True)
+                return UserInfo(email=data["email"], name=data.get("name"))
+            except Exception:
+                logger.warning(
+                    "User still unresolved after refreshing the access token",
+                    exc_info=True,
+                )
+        # Either there was nothing to refresh with, the refresh failed, or the
+        # new token was refused too.  Drop the dead access token so later
+        # requests fall back to the developer token.  A refresh token that was
+        # itself rejected has already been cleared by refresh_access_token_now.
         if credential_store.get_access_token():
             credential_store.clear_access_token()
             logger.warning("Cleared expired access token after 401 from platform API")
