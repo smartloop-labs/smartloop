@@ -719,7 +719,31 @@ async def stream_chunks(
     # the request falls back to the default model, and the search content
     # never reaches the LLM.
     response_capability = ModelCapability.GENERAL if orchestrator_context else None
+
+    # The response model is resolved by the call below, and resolving it can
+    # mean loading a model — the one load that used to surface nothing, landing
+    # between the last orchestration event and the first token.  It reports
+    # through ModelRouter like every other resolution; collect the events here
+    # and yield them, since this generator cannot interleave with the
+    # synchronous call itself.  The "loading" warning has to precede it, so it
+    # is announced separately first.
+    _model_events: list = []
+    model_service.begin_response_request(
+        lambda step, status, message: _model_events.append((step, status, message))
+    )
+
+    def _drain_model_events():
+        events, _model_events[:] = list(_model_events), []
+        return events
+
+    model_service.announce_response_model(response_capability)
+    for _step, _status, _message in _drain_model_events():
+        yield _status_event(_step, _status, _message)
+
     max_ctx = model_service.get_response_max_context_tokens(response_capability)
+
+    for _step, _status, _message in _drain_model_events():
+        yield _status_event(_step, _status, _message)
     if orchestrator_context and max_ctx > 0:
         # Size the context against the response model's real window, reserving
         # room for the fixed prompt overhead (system prompt, chat history,

@@ -1,6 +1,6 @@
 """Tests for the /v1/auth API router."""
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -72,28 +72,128 @@ class TestAuthStatus:
         assert data["authenticated"] is True
         assert data["user"] is None
 
-    def test_status_clears_expired_access_token_on_401(self, _no_platform_call, client):
-        """When /v1/users/me returns 401, the stale access token is purged."""
+class TestExpiredAccessToken:
+    """A 401 on /v1/users/me means the access token is dead — but a refresh
+    token can mint a new one, so it is redeemed before anything is thrown away.
+    Deleting first logged the user out until the background loop's next tick,
+    up to a full refresh interval later, with a working refresh token on disk.
+    """
+
+    _SERVICE = "smartloop.api.routers.auth.get_platform_service"
+    _REFRESH = "smartloop.platform.client.SLPPlatformClient.refresh_access_token"
+
+    def _status(self, _no_platform_call, client, get_user, refresh):
+        # Stop the autouse fixture so the real _resolve_user runs.
+        #
+        # Patched at the *service* boundary, not the client: the service caches
+        # the user in the workspace DB with a TTL, so patching the client left
+        # a warm cache to satisfy later calls — no request, no 401, nothing to
+        # assert.  That cache leaking between tests is what made this file fail
+        # intermittently depending on execution order.
+        #
+        # And both calls are patched so the test never reaches the network: it
+        # otherwise POSTed a fake refresh token to api.smartloop.ai and its
+        # result depended on what came back.
+        _no_platform_call.stop()
+        try:
+            service = MagicMock()
+            service.get_current_user = MagicMock(**get_user)
+            with patch(self._SERVICE, return_value=service), \
+                    patch(self._REFRESH, **refresh):
+                return client.get("/v1/auth/status").json()
+        finally:
+            _no_platform_call.start()
+
+    def test_a_valid_refresh_token_restores_the_session(
+        self, _no_platform_call, client,
+    ):
+        credential_store.set_access_token("expired-jwt")
+        credential_store.set_refresh_token("old-rt")
+
+        data = self._status(
+            _no_platform_call, client,
+            # 401 first, then the retry on the refreshed token succeeds.
+            get_user={"side_effect": [
+                PermissionError("Authentication failed"),
+                {"email": "chris@example.com", "name": "Chris"},
+            ]},
+            refresh={"return_value": {
+                "access_token": "fresh-jwt", "refresh_token": "new-rt",
+            }},
+        )
+
+        assert credential_store.get_access_token() == "fresh-jwt"
+        assert credential_store.get_refresh_token() == "new-rt"
+        assert data["authenticated"] is True
+        assert data["method"] == "access_token"
+        assert data["user"] == {"email": "chris@example.com", "name": "Chris"}
+
+    def test_a_rotated_refresh_token_is_optional(self, _no_platform_call, client):
+        """The endpoint may return only a new access token."""
+        credential_store.set_access_token("expired-jwt")
+        credential_store.set_refresh_token("old-rt")
+
+        self._status(
+            _no_platform_call, client,
+            get_user={"side_effect": [
+                PermissionError("Authentication failed"),
+                {"email": "chris@example.com"},
+            ]},
+            refresh={"return_value": {"access_token": "fresh-jwt"}},
+        )
+
+        assert credential_store.get_access_token() == "fresh-jwt"
+        assert credential_store.get_refresh_token() == "old-rt"
+
+    def test_a_dead_refresh_token_clears_both_and_falls_back(
+        self, _no_platform_call, client,
+    ):
+        """Retrying a rejected refresh token cannot help — re-login required."""
         credential_store.set_access_token("expired-jwt")
         credential_store.set_refresh_token("old-rt")
         credential_store.set_token("sk-dev-valid")
 
-        # Stop the autouse fixture so real _resolve_user runs, then
-        # make the underlying platform call raise a 401-style error.
-        _no_platform_call.stop()
-        with patch(
-            "smartloop.platform.client.SLPPlatformClient.get_current_user",
-            side_effect=PermissionError("Authentication failed"),
-        ):
-            resp = client.get("/v1/auth/status")
-        _no_platform_call.start()
+        data = self._status(
+            _no_platform_call, client,
+            get_user={"side_effect": PermissionError("Authentication failed")},
+            refresh={"side_effect": PermissionError("Authentication failed")},
+        )
 
-        data = resp.json()
         assert credential_store.get_access_token() is None
-        assert credential_store.get_refresh_token() == "old-rt"  # kept for future refresh
-        # Falls back to developer token
+        assert credential_store.get_refresh_token() is None
         assert data["authenticated"] is True
         assert data["method"] == "developer_token"
+
+    def test_no_refresh_token_still_purges_the_stale_one(
+        self, _no_platform_call, client,
+    ):
+        credential_store.set_access_token("expired-jwt")
+        credential_store.set_token("sk-dev-valid")
+
+        data = self._status(
+            _no_platform_call, client,
+            get_user={"side_effect": PermissionError("Authentication failed")},
+            refresh={"side_effect": AssertionError("must not be called")},
+        )
+
+        assert credential_store.get_access_token() is None
+        assert data["method"] == "developer_token"
+
+    def test_a_refresh_outage_leaves_the_refresh_token_alone(
+        self, _no_platform_call, client,
+    ):
+        """A network failure is not proof the token is bad — keep it to retry."""
+        credential_store.set_access_token("expired-jwt")
+        credential_store.set_refresh_token("old-rt")
+
+        self._status(
+            _no_platform_call, client,
+            get_user={"side_effect": PermissionError("Authentication failed")},
+            refresh={"side_effect": ConnectionError("platform unreachable")},
+        )
+
+        assert credential_store.get_access_token() is None
+        assert credential_store.get_refresh_token() == "old-rt"
 
 
 class TestSetToken:

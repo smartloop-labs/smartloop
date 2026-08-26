@@ -119,6 +119,7 @@ class TestTheReasonIsRecordedWhereItHappens:
         svc._model = MagicMock(workspace=MagicMock())
         svc._model.workspace.model_dir_for.return_value = "/models"
         svc._capability_skip = None
+        svc._last_fit_shortfall = None
         svc._find_model_ggufs = MagicMock(return_value=(gguf, None))
         svc._large_model_fits = MagicMock(return_value=fits)
         svc._evict_capability_models = MagicMock(return_value=False)
@@ -137,19 +138,29 @@ class TestTheReasonIsRecordedWhereItHappens:
         svc = self._service(fits=False)
 
         assert svc._load_workspace_llm(self._model(), "capability 'skills'") is None
-        assert svc.last_capability_skip() == ("gemma4-e2b", "memory")
+        assert svc.last_capability_skip() == ("gemma4-e2b", "memory", None)
+
+    def test_a_fit_failure_carries_the_measured_shortfall(self):
+        svc = self._service(fits=False)
+        svc._last_fit_shortfall = (4.9, 4.4)
+
+        assert svc._load_workspace_llm(self._model(), "capability 'skills'") is None
+        assert svc.last_capability_skip() == (
+            "gemma4-e2b", "memory", "needs ~4.9GB, 4.4GB free",
+        )
 
     def test_a_missing_gguf_records_missing(self):
         svc = self._service(gguf=None)
 
         assert svc._load_workspace_llm(self._model(), "capability 'skills'") is None
-        assert svc.last_capability_skip() == ("gemma4-e2b", "missing")
+        assert svc.last_capability_skip() == ("gemma4-e2b", "missing", None)
 
     def test_a_faulted_slot_records_memory(self):
+        """A runtime OOM has no measurement to report — only the cause."""
         svc = self._service(faulted=True)
 
         assert svc._load_workspace_llm(self._model(), "capability 'skills'") is None
-        assert svc.last_capability_skip() == ("gemma4-e2b", "memory")
+        assert svc.last_capability_skip() == ("gemma4-e2b", "memory", None)
 
     def test_a_resident_model_clears_a_stale_reason(self):
         svc = self._service()
@@ -158,3 +169,77 @@ class TestTheReasonIsRecordedWhereItHappens:
 
         assert svc._load_workspace_llm(self._model(), "capability 'skills'") is not None
         assert svc.last_capability_skip() is None
+
+
+# ── the figures travel to the user, not just the log ──────────────────────
+
+class TestTheShortfallIsReported:
+    """"Not enough memory" does not say how much to free.  The numbers do."""
+
+    def test_the_figures_are_appended(self):
+        router = _router(("gemma4-e2b", "memory", "needs ~4.9GB, 4.4GB free"))
+
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+
+        assert _messages(router)[-1] == (
+            "Selected sl-mini — not enough memory for gemma4-e2b "
+            "(needs ~4.9GB, 4.4GB free)"
+        )
+
+    def test_a_cause_with_no_figures_reads_as_before(self):
+        router = _router(("gemma4-e2b", "missing", None))
+
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+
+        assert _messages(router)[-1] == (
+            "Selected sl-mini — gemma4-e2b is not downloaded"
+        )
+
+    def test_a_two_element_record_is_still_accepted(self):
+        router = _router(("gemma4-e2b", "memory"))
+
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+
+        assert _messages(router)[-1] == (
+            "Selected sl-mini — not enough memory for gemma4-e2b"
+        )
+
+    def test_a_malformed_record_is_ignored(self):
+        router = _router(("gemma4-e2b",))
+
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+
+        assert _messages(router)[-1] == "Selected sl-mini"
+
+
+class TestTheShortfallIsMeasuredWhereItHappens:
+    def _service(self, free=(4.4, 24.0), weights_gb=3.2):
+        svc = object.__new__(ModelService)
+        svc._device_free_total_gb = MagicMock(return_value=free)
+        svc._last_fit_shortfall = None
+        return svc, weights_gb
+
+    def test_the_reserve_is_folded_into_the_requirement(self):
+        """Quoting the footprint alone shows a number below the free memory."""
+        from unittest.mock import patch
+
+        svc, weights = self._service()
+        with patch("os.path.getsize", return_value=int(weights * 1024**3)):
+            assert svc._large_model_fits("/m.gguf", 0, "gemma4-e2b") is False
+
+        # 3.2 weights + 0.7 overhead + 1.0 reserve = 4.9
+        assert svc._fit_shortfall_detail() == "needs ~4.9GB, 4.4GB free"
+
+    def test_a_successful_fit_clears_the_figures(self):
+        from unittest.mock import patch
+
+        svc, _ = self._service(free=(20.0, 24.0))
+        svc._last_fit_shortfall = (4.9, 4.4)
+        with patch("os.path.getsize", return_value=int(1.0 * 1024**3)):
+            assert svc._large_model_fits("/m.gguf", 0, "gemma4-e2b") is True
+
+        assert svc._fit_shortfall_detail() is None
+
+    def test_no_measurement_yields_no_detail(self):
+        svc, _ = self._service()
+        assert svc._fit_shortfall_detail() is None
