@@ -8,7 +8,7 @@ import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
@@ -534,15 +534,21 @@ Does answering the latest message require a new web search?
             return False
         return True
 
-    def _search_web(self, query: str) -> str:
+    def _search_web(
+        self,
+        query: str,
+        progress: Optional[Callable[[str, str, str], None]] = None,
+    ) -> str:
         """Hosted web search (Pro), part of explore — thread-safe, I/O bound.
 
         Runs the WebSearchAgent, which fetches each result link's content. Any
         failure is a silent skip (returns ``""``) so the model falls back to its
         own knowledge — no error/upsell is injected.
+
+        ``progress`` is forwarded so each page is reported as it is fetched.
         """
         try:
-            content = self.web_search_agent.search(query)
+            content = self.web_search_agent.search(query, progress=progress)
             if content:
                 logger.info(f"[collect] Web search returned {len(content)} chars")
             return content or ""
@@ -744,6 +750,7 @@ Does answering the latest message require a new web search?
         conversation_history: Optional[List[Dict[str, str]]] = None,
         executor: Optional[ThreadPoolExecutor] = None,
         project_dir: Optional[str] = None,
+        progress: Optional[Callable[[str, str, str], None]] = None,
     ) -> SearchContext:
         """Fan-out vector/feedback/workspace searches in parallel.
 
@@ -752,6 +759,10 @@ Does answering the latest message require a new web search?
         concurrently via a :class:`ThreadPoolExecutor`.  Skill tool
         execution still runs sequentially afterward (tools may depend
         on search results).
+
+        ``progress(step, status, message)`` — when supplied — reports the web
+        search leg.  The local searches are fast and finish together; the web
+        search is the one the user waits on.
         """
         ctx = SearchContext()
 
@@ -848,7 +859,24 @@ Does answering the latest message require a new web search?
             # :meth:`_needs_web_search`.
             if self.web_search_agent.is_enabled():
                 if self._needs_web_search(query, conversation_history):
-                    ctx.web_context = self._search_web(query)
+                    # Announce the search before it starts.  It is the longest
+                    # leg of collect — a provider round-trip plus one fetch per
+                    # result — and it runs on this thread while the local
+                    # searches above have already returned, so with no event
+                    # here the client shows the previous step until the whole
+                    # search is done.  A skipped search stays silent, as the
+                    # rest of this path is.
+                    if progress is not None:
+                        try:
+                            progress(
+                                "web_search", "processing",
+                                "Searching the web for the latest information",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[collect] progress callback failed", exc_info=True,
+                            )
+                    ctx.web_context = self._search_web(query, progress=progress)
                     if self.web_search_agent.last_sources:
                         ctx.web_sources = list(self.web_search_agent.last_sources)
                         ctx.web_source_extracts = dict(

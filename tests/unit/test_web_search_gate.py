@@ -19,7 +19,9 @@ def _explorer(monkeypatch, searched, enabled=True):
     monkeypatch.setattr(ex.web_search_agent, "last_sources", ["http://x"])
     monkeypatch.setattr(
         ex, "_search_web",
-        lambda q: searched.append(q) or "X2D II: 100MP medium format.",
+        # Matches _search_web(query, progress=None) — collect forwards the
+        # progress sink so the search can report each page it fetches.
+        lambda q, progress=None: searched.append(q) or "X2D II: 100MP medium format.",
     )
     monkeypatch.setattr(Explorer, "_search_vector", staticmethod(lambda *a: None))
     monkeypatch.setattr(Explorer, "_search_workspace", staticmethod(lambda *a: ""))

@@ -10,6 +10,7 @@ This is the leaf of the orchestration graph — it depends on nothing else.
 import logging
 from typing import Callable, Optional
 
+from smartloop.constants import display_model_label
 from smartloop.llms import BaseLLM
 from smartloop.types import ModelCapability
 from smartloop.agents.planner import ModelTier
@@ -46,12 +47,20 @@ class ModelRouter:
         large_llm: Optional[BaseLLM] = None,
         large_llm_provider: Optional[Callable[[], Optional[BaseLLM]]] = None,
         capability_llm_provider: Optional[Callable[[str], Optional[BaseLLM]]] = None,
+        capability_available: Optional[Callable[[str], bool]] = None,
+        capability_skip_reason: Optional[Callable[[], Optional[tuple]]] = None,
     ):
         self.orchestrator_llm = orchestrator_llm
         self.agent_llm = agent_llm
         self.large_llm = large_llm
         self._large_llm_provider = large_llm_provider
         self._capability_llm_provider = capability_llm_provider
+        # Answers "does any selected model declare this capability?" without
+        # loading anything, so a load is only announced when one can happen.
+        self._capability_available = capability_available
+        # Answers "why did the last capability model not load?" as
+        # ``(model_name, cause)``, so a fallback can say what went wrong.
+        self._capability_skip_reason = capability_skip_reason
         # Per-request state, reset by begin_request().
         self._progress_callback: Optional[Callable[[str, str, str], None]] = None
         self._emitted_model_events: set = set()
@@ -75,7 +84,21 @@ class ModelRouter:
         self._progress_callback = progress_callback
         self._emitted_model_events = set()
 
-    def llm_for_tier(self, tier: ModelTier, capability: Optional[str] = None) -> BaseLLM:
+    def llm_for_tier(
+        self,
+        tier: ModelTier,
+        capability: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> BaseLLM:
+        """Resolve the model for a node, reporting the choice to the client.
+
+        ``capability`` routes; ``purpose`` — when given — is what the user is
+        told the model is for.  The two are not the same thing.  Synthesis
+        routes on the ``skills`` capability because a skill's answer should be
+        written by a skills-capable model, but the user is watching the final
+        answer being written, and "Loading model for skills…" names an internal
+        routing tag rather than the work in progress.
+        """
         if tier == ModelTier.LARGE:
             if capability and self._capability_llm_provider is not None:
                 # Don't cache the capability LLM here — the provider
@@ -84,14 +107,22 @@ class ModelRouter:
                 # reference would pin that VRAM and defeat the eager release,
                 # so a subsequent capability (e.g. skills after dp) can't fit.
                 try:
-                    self.emit_model_loading(capability)
+                    # Only announce the load when there is something to load.
+                    # This event fires *before* the provider is consulted (its
+                    # whole point is to precede a slow load), so on a workspace
+                    # where no selected model declares the capability it used to
+                    # promise a load that never happened — "Loading model for
+                    # skills…" on a request with no skills-capable model, then a
+                    # fallback to the bootstrap model.
+                    if self._capability_model_exists(capability):
+                        self.emit_model_loading(capability, purpose)
                     llm = self._capability_llm_provider(capability)
                     if llm is not None:
                         logger.info(
                             "[models] capability '%s' → %s",
                             capability, self.model_label(llm),
                         )
-                        self.emit_model_selected(capability, llm)
+                        self.emit_model_selected(capability, llm, purpose)
                         return llm
                 except Exception as e:
                     logger.warning("[models] capability model load failed (%s): %s", capability, e)
@@ -110,9 +141,26 @@ class ModelRouter:
                     "[models] capability '%s' unresolved — falling back to %s",
                     capability, self.model_label(fallback),
                 )
-                self.emit_model_selected(capability, fallback)
+                self.emit_model_fallback(capability, fallback, purpose)
             return fallback
         return self.agent_llm
+
+    def _capability_model_exists(self, capability: Optional[str]) -> bool:
+        """True when some selected model declares *capability*.
+
+        Unknown (no predicate wired in) counts as True, so a caller that does
+        not supply one keeps the previous behaviour.
+        """
+        if not capability or self._capability_available is None:
+            return True
+        try:
+            return bool(self._capability_available(capability))
+        except Exception:
+            logger.debug(
+                "[models] capability availability check failed for %s",
+                capability, exc_info=True,
+            )
+            return True
 
     def decision_llm(self, capability: str) -> BaseLLM:
         """Resolve a capability model for a low-value *decision* node
@@ -147,9 +195,16 @@ class ModelRouter:
 
     @staticmethod
     def model_label(llm: BaseLLM) -> str:
+        """Name this model the way the user's model picker names it.
+
+        The GGUF's ``general.name`` is the upstream author's label, which for
+        our own model is ``Slp Orchestra Mini`` — a name that appears nowhere
+        in the product.  This label goes out on the progress SSE, so it is
+        mapped back to the short name (``sl-mini``) before it is shown.
+        """
         try:
             meta = llm.model.metadata
-            name = meta.get("general.name", "")
+            name = display_model_label(meta.get("general.name", ""))
             size = meta.get("general.size_label", "")
             if name:
                 return f"{name} ({size})" if size else name
@@ -198,25 +253,99 @@ class ModelRouter:
         self._emitted_model_events.add(key)
         return False
 
-    def emit_model_loading(self, capability: Optional[str]) -> None:
+    def _event_label(
+        self, capability: Optional[str], purpose: Optional[str],
+    ) -> tuple:
+        """``(label, key)`` for a model event — what to say, and what to dedupe
+        on.  ``purpose`` wins over the capability tag on both counts, so two
+        different jobs routed through the same capability each get their line.
+        """
+        if purpose:
+            return purpose, purpose.lower()
+        if capability:
+            return self._capability_label(capability), capability.lower()
+        return "", ""
+
+    def emit_model_loading(
+        self, capability: Optional[str], purpose: Optional[str] = None,
+    ) -> None:
         """Surface an *immediate* "loading" SSE before the (potentially slow)
         capability model load, so the user gets feedback right away instead of
         only after the model is resident. Emitted once per capability/request."""
-        if not capability or self._model_event_seen(f"loading:{capability.lower()}"):
+        label, key = self._event_label(capability, purpose)
+        if not key or self._model_event_seen(f"loading:{key}"):
             return
-        self.emit(
-            "model", "processing",
-            f"Loading model for {self._capability_label(capability)}…",
-        )
+        self.emit("model", "processing", f"Loading model for {label}…")
 
-    def emit_model_selected(self, capability: Optional[str], llm: BaseLLM) -> None:
+    def emit_model_selected(
+        self,
+        capability: Optional[str],
+        llm: BaseLLM,
+        purpose: Optional[str] = None,
+    ) -> None:
         """Surface the selected capability model as an SSE. Emitted once per
         capability/request (a fan-out resolves the model once per document)."""
-        if not capability or self._model_event_seen(f"selected:{capability.lower()}"):
+        label, key = self._event_label(capability, purpose)
+        if not key or self._model_event_seen(f"selected:{key}"):
             return
         self.emit(
             "model", "processing",
-            f"Selected {self.model_label(llm)} for {self._capability_label(capability)}",
+            f"Selected {self.model_label(llm)} for {label}",
         )
+
+    # Why a capability model was skipped, phrased for the user.  ``memory`` is
+    # the one they can act on — close something, or deselect a model — so it
+    # says so plainly instead of leaving the fallback looking like their
+    # selection was ignored.
+    _SKIP_REASONS = {
+        "memory": "not enough memory for {model}",
+        "missing": "{model} is not downloaded",
+        "faulted": "{model} ran out of memory",
+        "error": "{model} could not be loaded",
+    }
+
+    def _skip_explanation(self) -> str:
+        """Trailing clause explaining why no capability model was used, or ``""``."""
+        if self._capability_skip_reason is None:
+            return ""
+        try:
+            skip = self._capability_skip_reason()
+        except Exception:
+            logger.debug("[models] skip-reason lookup failed", exc_info=True)
+            return ""
+        if not skip:
+            return ""
+        try:
+            model_name, cause = skip
+        except (TypeError, ValueError):
+            return ""
+        template = self._SKIP_REASONS.get(cause)
+        if not template or not model_name:
+            return ""
+        from smartloop.constants import display_model_name
+        return template.format(model=display_model_name(model_name))
+
+    def emit_model_fallback(
+        self,
+        capability: Optional[str],
+        llm: BaseLLM,
+        purpose: Optional[str] = None,
+    ) -> None:
+        """Name the model that will run the step when the capability could not
+        be resolved, and say why when the reason is known.
+
+        Deliberately does not name the capability: no capability model was
+        found, so "Selected sl-mini for skills" reads as though one had been
+        chosen for that work.  Shares the selection dedupe key, so a later real
+        resolution for the same capability does not report twice.
+        """
+        _label, key = self._event_label(capability, purpose)
+        if not key or self._model_event_seen(f"selected:{key}"):
+            return
+        explanation = self._skip_explanation()
+        message = f"Selected {self.model_label(llm)}"
+        if explanation:
+            message = f"{message} — {explanation}"
+        self.emit("model", "processing", message)
 
     # Thin forwarding for test compatibility (tests mock _call_tool_for_server)

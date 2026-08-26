@@ -20,7 +20,7 @@ its own knowledge — no error or upsell is injected into the answer.
 
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from smartloop.search.providers import (
     NoSearchCredentials,
@@ -164,6 +164,7 @@ class WebSearchAgent:
         query: str,
         top_k: Optional[int] = None,
         num_candidates: Optional[int] = None,
+        progress: Optional[Callable[[str, str, str], None]] = None,
     ) -> str:
         """Search the web for *query* and return fetched result content.
 
@@ -172,6 +173,13 @@ class WebSearchAgent:
         registered on the account), unauthenticated, or fails —
         so it silently skips and the model falls back to its own knowledge
         instead of surfacing an error/upsell in the answer.
+
+        ``progress(step, status, message)`` — when supplied — reports each page
+        as it is fetched.  This is the slowest part of a request (one network
+        round-trip per result, serially), so without it the client sits on a
+        stale status line for the whole search.  Passed in per call rather than
+        held on the agent, which is shared across concurrent requests.  A
+        failing sink must never break the search, so it is called defensively.
         """
         if not self.is_enabled():
             logger.info("[web_search] disabled for this project — skipping")
@@ -202,7 +210,7 @@ class WebSearchAgent:
             logger.info("[web_search] no results for %r — skipping", query)
             return ""
 
-        return self._fetch_top(query, links, want, n)
+        return self._fetch_top(query, links, want, n, progress=progress)
 
     # ---------------------------------------------------------------- endpoint
 
@@ -221,8 +229,30 @@ class WebSearchAgent:
 
     # ---------------------------------------------------------------- fetching
 
+    @staticmethod
+    def _emit(
+        progress: Optional[Callable[[str, str, str], None]], message: str,
+    ) -> None:
+        """Report a search step, never letting a bad sink break the search."""
+        if progress is None:
+            return
+        try:
+            progress("web_search", "processing", message)
+        except Exception:
+            logger.debug("[web_search] progress callback failed", exc_info=True)
+
+    @staticmethod
+    def _source_label(url: str) -> str:
+        """Host of *url* for display, falling back to the raw URL."""
+        try:
+            from urllib.parse import urlparse
+            return urlparse(url).netloc or url
+        except Exception:
+            return url
+
     def _fetch_top(
-        self, query: str, links: List[str], top_k: int, num_candidates: int
+        self, query: str, links: List[str], top_k: int, num_candidates: int,
+        progress: Optional[Callable[[str, str, str], None]] = None,
     ) -> str:
         """Fetch the links, then LLM-rerank and keep the ``top_k`` most relevant.
 
@@ -237,6 +267,7 @@ class WebSearchAgent:
         for url in links:
             if len(fetched) >= budget:
                 break
+            self._emit(progress, f"Reading {self._source_label(url)}")
             content = ""
             try:
                 content = self.fetch_agent.fetch(url, max_length=4000)
@@ -265,6 +296,10 @@ class WebSearchAgent:
         logger.info(
             "[web_search] fetched %d/%d usable source(s), kept top %d (%d skipped) for %r",
             len(fetched), num_candidates, len(kept), len(skipped), query,
+        )
+        self._emit(
+            progress,
+            f"Read {len(kept)} web source{'s' if len(kept) != 1 else ''}",
         )
         return "\n\n".join(parts)
 

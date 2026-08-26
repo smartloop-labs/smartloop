@@ -145,3 +145,20 @@ def display_model_name(name):
     workspace is still shown as ``sl-mini``.
     """
     return canonical_model_name(name)
+
+
+def display_model_label(metadata_name):
+    """Public-facing label for a model's GGUF ``general.name``.
+
+    Metadata names are the upstream author's, not ours: the bootstrap model
+    ships as ``Slp Orchestra Mini`` but is ``sl-mini`` everywhere the user
+    sees it, so a progress event built from the metadata names a model that
+    appears nowhere in the UI.  Slugify and re-map; a name that doesn't
+    resolve to a different one keeps its metadata form, which for third-party
+    models is the friendly name already.
+    """
+    if not metadata_name:
+        return metadata_name
+    slug = "-".join(metadata_name.strip().lower().split())
+    canonical = display_model_name(slug)
+    return metadata_name if canonical == slug else canonical

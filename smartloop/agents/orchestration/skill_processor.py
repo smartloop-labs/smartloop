@@ -49,10 +49,6 @@ class SkillProcessor:
 
     def match(self, ctx: _OrchestratorContext, node: SkillMatchNode) -> NodeResult:
         """Select the user-picked skill, or LLM-match when none was picked."""
-        self._models.emit(
-            "analyze", "processing",
-            f"Analyzing your request against {len(ctx.skills)} available skill(s)",
-        )
         parsed_skills: List[Dict[str, str]] = []
         for sc in ctx.skills:
             name, desc = "", ""
@@ -120,10 +116,24 @@ class SkillProcessor:
             ]
 
         # Nothing to match — skip the LLM entirely so a project with no skills
-        # never pays to load the heavier skills model.
+        # never pays to load the heavier skills model.  Silently: announcing a
+        # match against skills that were all filtered out describes work that
+        # is not about to happen.
         if not skills_for_matching:
             self._matched_skills = []
             return NodeResult(node_id=node.node_id, success=True, data={"matched_skills": []})
+
+        # Announced here rather than on entry, and counting the candidates
+        # rather than everything on disk.  ``ctx.skills`` also holds the
+        # built-in tool skills (bash, file-read, file-write, …) and the system
+        # skills, none of which are matchable — counting those told the user
+        # their request was being weighed against skills they had never
+        # created and that could not be picked.
+        _n = len(skills_for_matching)
+        self._models.emit(
+            "analyze", "processing",
+            f"Analyzing your request against {_n} skill{'s' if _n != 1 else ''}",
+        )
 
         # Skill matching is an intent judgement the small orchestrator model is
         # poor at (it defaults to picking the only listed skill). Prefer the
@@ -357,7 +367,15 @@ class SkillProcessor:
             # model for the skills capability (largest-first via ranked_models_for),
             # not the small orchestrator. Falls back to the large/agent model when
             # no skills-capable model fits.
-            synth_llm = self._models.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+            #
+            # ``purpose`` is what the user is told.  The capability is how the
+            # model is chosen, and saying "Loading model for skills…" directly
+            # under "Synthesizing the final answer…" reports an internal routing
+            # tag as though it were a second, unrelated step.
+            synth_llm = self._models.llm_for_tier(
+                ModelTier.LARGE, ModelCapability.SKILLS,
+                purpose="the final answer",
+            )
             logger.info(
                 "[models] SYNTHESIZE → %s",
                 self._models.model_label(synth_llm),
