@@ -36,7 +36,7 @@ tools = ["list_widgets"]
 class TestBundledPlans:
     def test_the_shipped_plans_load(self):
         registry = load_plans(home_dir="/nonexistent")
-        assert set(registry) == {"notion", "linear", "trello", "canva"}
+        assert set(registry) == {"notion", "linear", "trello", "canva", "monday"}
 
     def test_linear_still_walks_teams_to_issues(self):
         # The tree the plan exists for. A transcription slip in the TOML would

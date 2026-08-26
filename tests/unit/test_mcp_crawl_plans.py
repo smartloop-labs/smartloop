@@ -8,6 +8,7 @@ weather connection gets walked every refresh cycle for nothing.
 from types import SimpleNamespace
 
 from smartloop.mcp.crawl_plans import (
+    coerce_argument,
     declares_argument,
     filter_arguments,
     generic_plan,
@@ -22,6 +23,7 @@ NOTION_PLAN = _plans()["notion"]
 LINEAR_PLAN = _plans()["linear"]
 TRELLO_PLAN = _plans()["trello"]
 CANVA_PLAN = _plans()["canva"]
+MONDAY_PLAN = _plans()["monday"]
 
 
 def _tool(name, schema=None):
@@ -52,6 +54,14 @@ class TestPlanResolution:
             remote_config=SimpleNamespace(server_url="https://mcp.trello.com/mcp"),
         )
         assert resolve_plan(server).slug == "trello"
+
+    def test_monday_matches_the_catalog_slug_and_the_hosted_url(self):
+        assert resolve_plan(_server(name="Work", catalog_slug="monday")).slug == "monday"
+        server = _server(
+            name="Work",
+            remote_config=SimpleNamespace(server_url="https://mcp.monday.com/mcp"),
+        )
+        assert resolve_plan(server).slug == "monday"
 
     def test_unknown_server_falls_back_to_a_derived_plan(self):
         plan = resolve_plan(_server(name="weather", tools=[_tool("get_forecast")]))
@@ -114,6 +124,42 @@ class TestArgumentResolution:
         assert filter_arguments({}, {"query": ""}) == {"query": ""}
 
 
+class TestArgumentCoercion:
+    """A record id is text; the schema says what the tool will accept."""
+
+    def test_a_number_typed_argument_takes_the_id_as_a_number(self):
+        schema = {"properties": {"workspace_id": {"type": "number"}}}
+        assert coerce_argument(schema, "workspace_id", "17112294") == 17112294
+
+    def test_a_string_typed_argument_keeps_the_text(self):
+        # The same account declares get_updates' objectId a string, so this is
+        # not a question that can be answered once for a server.
+        schema = {"properties": {"objectId": {"type": "string"}}}
+        assert coerce_argument(schema, "objectId", "17112294") == "17112294"
+
+    def test_an_argument_that_takes_either_form_is_left_alone(self):
+        schema = {"properties": {"id": {"type": ["string", "number"]}}}
+        assert coerce_argument(schema, "id", "42") == "42"
+
+    def test_a_nullable_number_still_coerces(self):
+        schema = {"properties": {"boardId": {"anyOf": [
+            {"type": "number"}, {"type": "null"},
+        ]}}}
+        assert coerce_argument(schema, "boardId", "18427542421") == 18427542421
+
+    def test_an_id_that_is_not_a_number_is_sent_as_it_is(self):
+        # Notion's ids are uuids and Canva's are prefixed tokens; a plan naming
+        # a numeric argument for one server must not mangle them.
+        schema = {"properties": {"page_id": {"type": "number"}}}
+        assert coerce_argument(schema, "page_id", "DAGx1-abc") == "DAGx1-abc"
+
+    def test_an_undeclared_or_unschemad_argument_is_untouched(self):
+        assert coerce_argument({}, "boardId", "1") == "1"
+        assert coerce_argument(
+            {"properties": {"other": {"type": "number"}}}, "boardId", "1",
+        ) == "1"
+
+
 class TestCuratedPlanShape:
     """The curated plans are tree walks, so the tree has to hold together."""
 
@@ -123,7 +169,7 @@ class TestCuratedPlanShape:
     def test_every_parent_is_produced_by_an_earlier_step(self):
         # A step can only fan out over records another step already collected,
         # so a parent named later (or misspelled) silently never runs.
-        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN, CANVA_PLAN):
+        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN, CANVA_PLAN, MONDAY_PLAN):
             seen = set()
             for step in plan.steps:
                 for parent in step.parent_labels:
@@ -131,7 +177,7 @@ class TestCuratedPlanShape:
                 seen.add(step.label)
 
     def test_step_labels_are_unique(self):
-        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN, CANVA_PLAN):
+        for plan in (NOTION_PLAN, LINEAR_PLAN, TRELLO_PLAN, CANVA_PLAN, MONDAY_PLAN):
             labels = [s.label for s in plan.steps]
             assert len(labels) == len(set(labels)), plan.slug
 
@@ -274,6 +320,49 @@ class TestCuratedPlanShape:
         labels = [step.label for step in CANVA_PLAN.steps]
         assert labels.index("designs") < labels.index("root-items")
         assert labels.index("designs") < labels.index("folder-items")
+
+    def test_monday_reaches_board_items_through_the_workspace_walk(self):
+        # monday has no board listing at all, so the only route to the items —
+        # the rows that are the content — is
+        # list_workspaces -> workspace_info -> get_board_items_page.
+        steps = self._steps(MONDAY_PLAN)
+        assert steps["workspaces"].parent_labels == ()
+        assert steps["workspace-contents"].parent_labels == ("workspaces",)
+        assert "workspace_id" in steps["workspace-contents"].parent_args
+        items = steps["board-items"]
+        assert items.parent_labels == ("workspace-contents",)
+        assert "boardId" in items.parent_args
+        assert resolve_tool(
+            ["get_board_items_page"], items.tools
+        ) == "get_board_items_page"
+
+    def test_monday_does_not_try_to_browse_with_search(self):
+        # `search` requires a non-empty searchTerm (minLength 1) and says so in
+        # its own description: there is no list-everything mode.  It also
+        # returns ids prefixed with the object type (`board-18427542421`),
+        # which no other monday tool accepts — so a step built on it would
+        # index nothing and poison any fan-out that trusted it.
+        for step in MONDAY_PLAN.steps:
+            assert resolve_tool(["search"], step.tools) is None, step.label
+            assert resolve_tool(["search"], step.detail_tools) is None, step.label
+
+    def test_monday_items_carry_their_column_values(self):
+        # Without includeColumns a row is a title and a timestamp: the status,
+        # owner and dates that make it an answer all live in the columns.
+        items = self._steps(MONDAY_PLAN)["board-items"]
+        assert items.arguments["includeColumns"] is True
+        assert items.arguments["includeItemDescription"] is True
+
+    def test_monday_reads_a_board_discussion_in_one_call(self):
+        # objectType is required and has no default.  Asked per board with
+        # includeItemUpdates, one call covers every update on the board; the
+        # per-item form would spend a call per row for the same text.
+        updates = self._steps(MONDAY_PLAN)["board-updates"]
+        assert updates.arguments["objectType"] == "Board"
+        assert updates.arguments["includeItemUpdates"] is True
+        assert updates.needs_arguments == ("objectType",)
+        assert updates.parent_labels == ("workspace-contents",)
+        assert "objectId" in updates.parent_args
 
     def test_every_trello_step_says_which_action_it_wants(self):
         # `action` is required on every hosted tool, and which *other* arguments
