@@ -7,13 +7,13 @@ Two failure modes this pins down:
 """
 import inspect
 
-from smartloop.agents import orchestrator
 from smartloop.agents.mcp import explorer
+from smartloop.agents.orchestration import pipeline_builder
 
 
 class TestExploreOrdering:
     def test_web_is_appended_after_every_local_source(self):
-        src = inspect.getsource(orchestrator.SLPOrchestrator)
+        src = inspect.getsource(pipeline_builder.PipelineBuilder)
         start = src.index("if step.step_type == StepType.EXPLORE:")
         # Bound the block at the join, so the window cannot silently clip a
         # source and make the ordering assertion vacuous.

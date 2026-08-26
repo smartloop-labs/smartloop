@@ -60,13 +60,13 @@ def _fetch_step():
 class TestExtractorHardening:
     def test_bare_yes_is_not_a_condition(self, orchestrator):
         """A reply with no '?' is malformed → no condition."""
-        assert orchestrator._extract_tool_condition_from_text(
+        assert orchestrator._skills.extract_tool_condition(
             "when user requests a url use fetch tool", "fetch"
         ) is None
 
     def test_real_question_is_a_condition(self, orchestrator, mock_llm):
         mock_llm.invoke.return_value = "Were discrepancies found in the results?"
-        cond = orchestrator._extract_tool_condition_from_text(
+        cond = orchestrator._skills.extract_tool_condition(
             "after analysis, if discrepancies found call fetch", "fetch"
         )
         assert cond == "llm:Were discrepancies found in the results?"
@@ -80,20 +80,20 @@ class TestFirstStepNotGated:
         # Isolate the condition gate from real arg resolution. The resolver
         # returns a (server, tool_name, arguments) tuple on success.
         server = MagicMock(id="srv")
-        orchestrator._resolve_tool_args = MagicMock(
+        orchestrator._steps.resolve_tool_args = MagicMock(
             return_value=(server, "fetch", {"url": "x"})
         )
         orchestrator.tool_caller.find_tool_schema = MagicMock(return_value=None)
         # A spy on the extractor proves it is never consulted for a first step.
-        orchestrator._extract_tool_condition_from_text = MagicMock(return_value="llm:x?")
+        orchestrator._skills.extract_tool_condition = MagicMock(return_value="llm:x?")
 
-        handler = orchestrator._make_resolve_handler(
+        handler = orchestrator._pipeline.make_resolve_handler(
             ctx, step, MagicMock(), has_upstream=False
         )
         result = handler({})
 
-        assert not orchestrator._extract_tool_condition_from_text.called
-        assert orchestrator._resolve_tool_args.called
+        assert not orchestrator._skills.extract_tool_condition.called
+        assert orchestrator._steps.resolve_tool_args.called
         assert result.data.get("skip") is False
         assert result.data.get("arguments") == {"url": "x"}
 
@@ -106,7 +106,7 @@ class TestFirstStepNotGated:
         )
         step = _fetch_step()
 
-        handler = orchestrator._make_resolve_handler(
+        handler = orchestrator._pipeline.make_resolve_handler(
             ctx, step, MagicMock(), has_upstream=True
         )
         result = handler({})

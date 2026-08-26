@@ -75,8 +75,8 @@ def test_server_fallback_also_names_the_weekday():
 
 @pytest.fixture
 def fmt():
-    from smartloop.agents.orchestrator import SLPOrchestrator
-    return SLPOrchestrator._format_ready_context
+    from smartloop.agents.orchestration.response_builder import ResponseBuilder
+    return ResponseBuilder.format_ready_context
 
 
 def test_skill_instructions_carry_the_date(fmt):
