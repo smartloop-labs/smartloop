@@ -313,17 +313,18 @@ class ModelRouter:
         except Exception:
             logger.debug("[models] skip-reason lookup failed", exc_info=True)
             return ""
-        if not skip:
+        if not isinstance(skip, (tuple, list)) or len(skip) < 2:
             return ""
-        try:
-            model_name, cause = skip
-        except (TypeError, ValueError):
-            return ""
+        model_name, cause = skip[0], skip[1]
+        # ``detail`` is optional and carries the figures behind the cause —
+        # "needs ~4.9GB, 4.4GB free" — which is the part the user can act on.
+        detail = skip[2] if len(skip) > 2 else None
         template = self._SKIP_REASONS.get(cause)
         if not template or not model_name:
             return ""
         from smartloop.constants import display_model_name
-        return template.format(model=display_model_name(model_name))
+        explanation = template.format(model=display_model_name(model_name))
+        return f"{explanation} ({detail})" if detail else explanation
 
     def emit_model_fallback(
         self,

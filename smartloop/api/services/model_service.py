@@ -38,6 +38,7 @@ from smartloop.model.model_manager import Model
 from smartloop.mcp.local_client import LocalMCPClient
 from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
 from smartloop.agents.orchestrator import SLPOrchestrator
+from smartloop.agents.orchestration.model_router import ModelRouter
 from smartloop.agents.planner import SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME, FETCH_SERVER_ID
 
 from smartloop.constants import canonical_model_name, display_model_label
@@ -63,6 +64,16 @@ from smartloop.db import embeddings
 _settings = AppSettings()
 
 logger = logging.getLogger(__name__)
+
+
+def _n_ctx_desc(cap: int) -> str:
+    """How to describe an ``llm_large_n_ctx_cap`` value in a log line.
+
+    ``0`` is the sentinel for *no cap* — the factory auto-sizes the context
+    from live available memory — but printing it raw read as a context window
+    of zero tokens, which is both alarming and wrong.
+    """
+    return f"n_ctx={cap}" if cap > 0 else "an auto-sized context"
 
 # Exceptions that indicate code defects (not recoverable runtime/IO
 # failures).  These re-raise instead of degrading to an empty result so
@@ -702,15 +713,20 @@ class ModelService:
         return self._load_workspace_llm(ws_model, "pinned")
 
     # Why the most recent capability model could not be loaded, as
-    # ``(model_name, cause)`` where cause is one of "memory", "missing",
-    # "faulted" or "error".  Advisory only — it feeds the progress event that
-    # explains a fallback, so a race between concurrent fan-out threads costs
-    # at most a wrong model name in one status line.
+    # ``(model_name, cause, detail)`` where cause is one of "memory",
+    # "missing", "faulted" or "error" and detail is a short human phrase or
+    # None.  Advisory only — it feeds the progress event that explains a
+    # fallback, so a race between concurrent fan-out threads costs at most a
+    # wrong model name in one status line.
     _capability_skip: Optional[tuple] = None
 
+    # Figures from the last failed fit check, as ``(needed_gb, free_gb)``.
+    # Set by _large_model_fits and read by the caller that acts on its verdict.
+    _last_fit_shortfall: Optional[tuple] = None
+
     def last_capability_skip(self) -> Optional[tuple]:
-        """``(model_name, cause)`` for the last capability model that could not
-        be loaded, or ``None`` when the last resolution succeeded.
+        """``(model_name, cause, detail)`` for the last capability model that
+        could not be loaded, or ``None`` when the last resolution succeeded.
 
         Lets the caller explain a fallback rather than silently answering on a
         smaller model: "not enough memory for gemma4-e2b" is actionable — the
@@ -718,6 +734,21 @@ class ModelService:
         sl-mini" looks like the model they chose was simply ignored.
         """
         return self._capability_skip
+
+    def _fit_shortfall_detail(self) -> Optional[str]:
+        """``"needs ~4.9GB, 4.4GB free"`` from the last failed fit check.
+
+        The numbers are the actionable part: they say how much to free, which
+        "not enough memory" on its own does not.
+        """
+        shortfall = self._last_fit_shortfall
+        if not shortfall:
+            return None
+        try:
+            needed_gb, free_gb = shortfall
+        except (TypeError, ValueError):
+            return None
+        return f"needs ~{needed_gb:.1f}GB, {free_gb:.1f}GB free"
 
     def _load_workspace_llm(self, ws_model, reason: str) -> Optional[BaseLLM]:
         """Return a resident (or freshly loaded) instance of one workspace
@@ -735,7 +766,7 @@ class ModelService:
             # Evicted after a runtime GPU OOM — don't reload it.  That is a
             # memory failure too, just one discovered during generation rather
             # than at load time.
-            self._capability_skip = (ws_model.model_name, "memory")
+            self._capability_skip = (ws_model.model_name, "memory", None)
             return None
         if cached is not None:
             # Resident and already passed the fit guard when loaded.
@@ -756,7 +787,7 @@ class ModelService:
                     "[capability-model] No GGUF found for %s at %s (%s)",
                     ws_model.model_name, model_dir, reason,
                 )
-                self._capability_skip = (ws_model.model_name, "missing")
+                self._capability_skip = (ws_model.model_name, "missing", None)
                 return None
 
             # Fit guard: skip a model that won't fit alongside the main
@@ -770,10 +801,12 @@ class ModelService:
                 ):
                     logger.warning(
                         "[capability-model] %s doesn't fit alongside the "
-                        "main model at n_ctx=%d (%s)",
-                        ws_model.model_name, cap, reason,
+                        "main model at %s (%s)",
+                        ws_model.model_name, _n_ctx_desc(cap), reason,
                     )
-                    self._capability_skip = (ws_model.model_name, "memory")
+                    self._capability_skip = (
+                        ws_model.model_name, "memory", self._fit_shortfall_detail(),
+                    )
                     return None
                 logger.info(
                     "[capability-model] Freed prior-step models to fit %s (%s)",
@@ -795,8 +828,20 @@ class ModelService:
                 "[capability-model] Failed to load %s (%s): %s",
                 ws_model.model_name, reason, e,
             )
-            self._capability_skip = (ws_model.model_name, "error")
+            self._capability_skip = (ws_model.model_name, "error", None)
             return None
+
+    @staticmethod
+    def _cap_name(capability) -> str:
+        """The capability's value, for logs and messages.
+
+        ``ModelCapability`` is a ``str`` enum, but on Python 3.11 formatting a
+        member goes through ``Enum.__str__`` — so an f-string yields
+        ``ModelCapability.GENERAL`` where every consumer of the value sees
+        ``general``.  Consumers are unaffected (they call ``.lower()``), but a
+        log line naming a member no one can grep for is worse than useless.
+        """
+        return str(getattr(capability, "value", capability))
 
     def has_capability_model(self, capability: str) -> bool:
         """True when some selected model declares *capability*.
@@ -848,7 +893,9 @@ class ModelService:
         # one the user picked.
         pinned = self._pinned_model()
         if pinned is not None:
-            llm = self._load_workspace_llm(pinned, f"pinned, capability '{capability}'")
+            llm = self._load_workspace_llm(
+                pinned, f"pinned, capability '{self._cap_name(capability)}'",
+            )
             if llm is None:
                 logger.warning(
                     "[capability-model] Sole selected model %s unavailable for "
@@ -874,7 +921,9 @@ class ModelService:
         for ws_model in ranked:
             # Walk down to the next-smaller capable model when this one has no
             # GGUF, faulted, or doesn't fit — rather than the tiny default.
-            llm = self._load_workspace_llm(ws_model, f"capability '{capability}'")
+            llm = self._load_workspace_llm(
+                ws_model, f"capability '{self._cap_name(capability)}'",
+            )
             if llm is not None:
                 return llm
 
@@ -937,14 +986,31 @@ class ModelService:
         kv_gb = 0.5 * (est_ctx / 4096)
         footprint_gb = model_gb + kv_gb + 0.7
         if footprint_gb + reserve_gb > free_gb:
+            # Only suggest the cap when there is a cap to lower.  Uncapped, the
+            # KV cache is already estimated at zero and the window auto-sizes,
+            # so the figure above is bare weights plus overhead — lowering the
+            # setting cannot move it, and offering the knob sends whoever reads
+            # this after the one lever that will not help.
+            remedy = (
+                "Lower SLP_LLM_LARGE_N_CTX_CAP or free memory to enable it."
+                if cap > 0 else
+                "Free memory to enable it — SLP_LLM_LARGE_N_CTX_CAP is unset, "
+                "so the context window already auto-sizes and this is the "
+                "weights alone."
+            )
             logger.warning(
                 "[large-model] %s needs ~%.1fGB (+%.1f reserve) but only %.1fGB "
-                "free of %.1fGB — falling back to the default model. Lower "
-                "SLP_LLM_LARGE_N_CTX_CAP or free VRAM to enable it.",
+                "free of %.1fGB — falling back to the default model. %s",
                 label or os.path.basename(gguf_path),
-                footprint_gb, reserve_gb, free_gb, total_gb,
+                footprint_gb, reserve_gb, free_gb, total_gb, remedy,
             )
+            # Carry the figures out for the progress event.  The reserve is
+            # folded into the requirement because that is the threshold that
+            # actually gated the load — quoting the footprint alone would show
+            # a number smaller than the free memory and read as a contradiction.
+            self._last_fit_shortfall = (footprint_gb + reserve_gb, free_gb)
             return False
+        self._last_fit_shortfall = None
         return True
 
     def _clip_on_cpu(self, gguf_path: str, cap: int) -> bool:
@@ -2336,6 +2402,91 @@ class ModelService:
             pass
         return type(llm).__name__
 
+    # What the user is told the response model is being resolved for.  The
+    # capability does the routing; this is the label on the event.
+    _RESPONSE_PURPOSE = "the response"
+
+    @property
+    def _response_router(self) -> ModelRouter:
+        """Reports response-model selection, the same way the orchestrator does.
+
+        The response model is resolved here rather than inside the orchestrator
+        — it is picked after orchestration finishes, by the streaming layer —
+        so without this it was the one model resolution that surfaced nothing:
+        a cold load landed between the last orchestration event and the first
+        token, as dead air exactly where the answer was expected to start.
+
+        Routing it through :class:`ModelRouter` rather than emitting ad hoc
+        means it inherits the same rules as every other resolution: no load is
+        announced unless one can happen, the event names the work rather than
+        the capability tag, and a fallback says why.
+
+        Held on the service (the streaming layer has no orchestrator to borrow
+        one from) and re-armed per request by :meth:`begin_response_request`.
+        """
+        router = getattr(self, "_response_router_instance", None)
+        if router is None:
+            router = ModelRouter(
+                orchestrator_llm=self._llm,
+                agent_llm=self._llm,
+                capability_llm_provider=self._get_llm_for_capability,
+                capability_available=self.has_capability_model,
+                capability_skip_reason=self.last_capability_skip,
+            )
+            self._response_router_instance = router
+        # The resident model can change between requests (a model switch
+        # reloads it), so keep the router pointing at the current one.
+        router.orchestrator_llm = self._llm
+        router.agent_llm = self._llm
+        return router
+
+    def begin_response_request(
+        self, progress_callback: Optional[Callable[[str, str, str], None]] = None,
+    ) -> None:
+        """Install this request's progress sink for response-model events.
+
+        Mirrors :meth:`ModelRouter.begin_request`, which the orchestrator calls
+        for its own phase.  Clearing per request also resets the once-per-
+        request dedupe, so a second question reports its model again.
+        """
+        self._response_router.begin_request(progress_callback)
+
+    def announce_response_model(self, capability: Optional[str]) -> None:
+        """Announce a pending response-model load *before* it blocks.
+
+        Resolution happens inside a synchronous call the streaming generator
+        cannot interleave with, so the warning has to be emitted ahead of it.
+        Only when something could actually load — see
+        :meth:`has_capability_model`.
+        """
+        if self._pinned_model() is not None or (
+            capability and self.has_capability_model(capability)
+        ):
+            self._response_router.emit_model_loading(
+                capability, purpose=self._RESPONSE_PURPOSE,
+            )
+
+    def _report_response_model(
+        self, capability: Optional[str], llm: Optional[BaseLLM],
+    ) -> None:
+        """Name the model that will write the answer.
+
+        Silent when the always-resident router model answers and no capability
+        was asked for — nothing was loaded and nothing was overridden, so there
+        is nothing to report.  When a capability *was* asked for and we still
+        landed on the router model, that is a fallback and says why.
+        """
+        if llm is None:
+            return
+        if llm is not self._llm:
+            self._response_router.emit_model_selected(
+                capability, llm, purpose=self._RESPONSE_PURPOSE,
+            )
+        elif capability:
+            self._response_router.emit_model_fallback(
+                capability, llm, purpose=self._RESPONSE_PURPOSE,
+            )
+
     def _llm_for_response(self, capability: Optional[str]) -> Optional[BaseLLM]:
         """Return the LLM to use for the final response.
 
@@ -2358,13 +2509,15 @@ class ModelService:
             if pinned is not None:
                 logger.info(
                     "[response] Using the sole selected model (capability='%s')",
-                    capability,
+                    self._cap_name(capability),
                 )
+                self._report_response_model(capability, pinned)
                 return pinned
             logger.warning(
                 "[response] Sole selected model %s unavailable — answering on "
                 "the default model", pinned_model.model_name,
             )
+            self._report_response_model(capability, self._llm)
             return self._llm
 
         if capability:
@@ -2372,20 +2525,23 @@ class ModelService:
             if cap_llm is not None and cap_llm is not self._llm:
                 logger.info(
                     "[response] Using capability='%s' LLM for final response",
-                    capability,
+                    self._cap_name(capability),
                 )
+                self._report_response_model(capability, cap_llm)
                 return cap_llm
             large_llm = self._get_large_llm()
             if large_llm is not None and large_llm is not self._llm:
                 logger.info(
                     "[response] Capability='%s' unavailable — falling back to large LLM",
-                    capability,
+                    self._cap_name(capability),
                 )
+                self._report_response_model(capability, large_llm)
                 return large_llm
             logger.info(
                 "[response] Capability='%s' unavailable and no larger model — using default LLM",
-                capability,
+                self._cap_name(capability),
             )
+        self._report_response_model(capability, self._llm)
         return self._llm
 
     def _default_fallback_llm(self, failed_llm: BaseLLM) -> Optional[BaseLLM]:
@@ -2457,7 +2613,7 @@ class ModelService:
 
         logger.info(
             "[models] RESPONSE → %s (capability=%s)",
-            self._model_label(llm), capability,
+            self._model_label(llm), self._cap_name(capability),
         )
 
         # Lock around inference - llama-cpp is not thread-safe
