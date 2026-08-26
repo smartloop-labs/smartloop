@@ -1,6 +1,6 @@
 """Citation formatting for the final ready-context.
 
-These tests pin how ``_format_ready_context`` labels and attributes
+These tests pin how ``ResponseBuilder.format_ready_context`` labels and attributes
 context: document citations produce a DOCUMENT CONTEXT block listing the
 source names, while plain tool output is labelled TOOL RESULTS.
 
@@ -10,10 +10,11 @@ classify → plan → execute path.)
 """
 
 from smartloop.agents.orchestrator import SLPOrchestrator
+from smartloop.agents.orchestration.response_builder import ResponseBuilder
 
 
 class TestCitationFormatting:
-    """Verify _format_ready_context includes source document names for citations."""
+    """Verify ResponseBuilder.format_ready_context includes source document names for citations."""
 
     def test_citations_include_document_names_in_context(self):
         """With multiple citations, the formatted context should list all
@@ -29,7 +30,7 @@ class TestCitationFormatting:
             "=== Document: invoice_Aaron Bergman_36258.pdf ===\n"
             "Invoice total: $120.00"
         )
-        result = SLPOrchestrator._format_ready_context(
+        result = ResponseBuilder.format_ready_context(
             combined, skill_instruction=None, citations=citations, cwd="/tmp",
         )
 
@@ -51,7 +52,7 @@ class TestCitationFormatting:
         citations = [
             {"document_id": "doc-1", "document_name": "invoice_Adam Hart_16384.pdf"},
         ]
-        result = SLPOrchestrator._format_ready_context(
+        result = ResponseBuilder.format_ready_context(
             "Invoice total: $540.00", skill_instruction=None,
             citations=citations, cwd="/tmp",
         )
@@ -61,7 +62,7 @@ class TestCitationFormatting:
 
     def test_no_citations_uses_tool_results(self):
         """Without citations, tool output is labelled as TOOL RESULTS."""
-        result = SLPOrchestrator._format_ready_context(
+        result = ResponseBuilder.format_ready_context(
             "Some tool output", skill_instruction=None, citations=None, cwd="/tmp",
             has_tool_results=True,
         )
@@ -70,7 +71,7 @@ class TestCitationFormatting:
 
     def test_no_citations_no_tool_results_passes_through(self):
         """Without citations or tool results flag, context passes through plain."""
-        result = SLPOrchestrator._format_ready_context(
+        result = ResponseBuilder.format_ready_context(
             "Some tool output", skill_instruction=None, citations=None, cwd="/tmp",
         )
         assert "Some tool output" in result
@@ -78,7 +79,7 @@ class TestCitationFormatting:
 
     def test_empty_citations_list_uses_tool_results(self):
         """An empty citations list with tool results flag should use TOOL RESULTS."""
-        result = SLPOrchestrator._format_ready_context(
+        result = ResponseBuilder.format_ready_context(
             "Some tool output", skill_instruction=None, citations=[], cwd="/tmp",
             has_tool_results=True,
         )

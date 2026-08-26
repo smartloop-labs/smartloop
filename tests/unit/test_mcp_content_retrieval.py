@@ -102,14 +102,16 @@ def ctx():
 
 
 class TestRelevanceGate:
+    """Crawled MCP content is judged before it reaches the answer context."""
+
     def test_irrelevant_crawled_content_is_cleared(self, orchestrator, ctx):
         orchestrator.agent_llm.invoke = MagicMock(return_value="NOT_RELEVANT")
         search_ctx = SearchContext(mcp_document_context="unrelated trello cards")
-        orchestrator._handle_context_gate(ctx, search_ctx)({})
+        orchestrator._judge.make_handler(ctx, search_ctx)({})
         assert search_ctx.mcp_document_context == ""
 
     def test_relevant_crawled_content_is_kept(self, orchestrator, ctx):
         orchestrator.agent_llm.invoke = MagicMock(return_value="RELEVANT")
         search_ctx = SearchContext(mcp_document_context="Q3 roadmap: ship it")
-        orchestrator._handle_context_gate(ctx, search_ctx)({})
+        orchestrator._judge.make_handler(ctx, search_ctx)({})
         assert search_ctx.mcp_document_context == "Q3 roadmap: ship it"

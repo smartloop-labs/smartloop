@@ -9,6 +9,7 @@ downstream skill/classify pipeline then hangs off that reduce node.
 from unittest.mock import MagicMock, patch
 
 from smartloop.agents.orchestrator import SLPOrchestrator
+from smartloop.agents.orchestration.response_builder import ResponseBuilder
 from smartloop.agents.mcp.explorer import SearchContext
 from smartloop.agents.nodes import (
     NodeResult, LLMDecisionNode, TransformNode,
@@ -26,7 +27,7 @@ def _make_orchestrator():
 
 def test_frame_web_results_instructs_model_not_to_disclaim():
     orch = _make_orchestrator()
-    framed = orch._frame_web_results("## [1] https://canyon.com\n\nSome bikes")
+    framed = orch._response.frame_web_results("## [1] https://canyon.com\n\nSome bikes")
     assert "live web search was just performed" in framed
     assert "real-time search results" in framed
     assert "do NOT say you lack" in framed.lower() or "Do NOT say you lack" in framed
@@ -61,14 +62,14 @@ def _ctx(orch, user_message="summarize the documents"):
 class TestBatchDocuments:
     def test_each_document_gets_its_own_batch(self):
         orch = _make_orchestrator()
-        batches = orch._batch_documents(_docs(5, size=50))
+        batches = orch._doc_fanout._batch_documents(_docs(5, size=50))
         assert len(batches) == 5
         assert all(len(b) == 1 for b in batches)
 
     def test_all_documents_processed_regardless_of_count(self):
         orch = _make_orchestrator()
         docs = _docs(50, size=100)
-        batches = orch._batch_documents(docs)
+        batches = orch._doc_fanout._batch_documents(docs)
         assert len(batches) == 50
         assert all(len(b) == 1 for b in batches)
         names = [b[0]["document_name"] for b in batches]
@@ -95,7 +96,7 @@ class TestRouteFanout:
             captured["parent"] = parent
             return []
 
-        orch._build_unified_pipeline = fake_pipeline
+        orch._pipeline._build_unified_pipeline = fake_pipeline
 
         deps = {
             skill_match_node.node_id: NodeResult(
@@ -107,7 +108,7 @@ class TestRouteFanout:
                 data={"search_ctx": sctx},
             ),
         }
-        res = orch._handle_route(
+        res = orch._pipeline.handle_route(
             ctx, deps, route_node, skill_match_node, collect_node,
         )
         nodes = {type(n).__name__: n for n, _ in res.data["_extend_dag"]}
@@ -164,7 +165,8 @@ class TestFanoutHandlers:
         ctx = _ctx(orch)
 
         parent = RouteNode()
-        nodes_and_handlers, reduce_node = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+        built = orch._doc_fanout.build(ctx, sctx, parent)
+        nodes_and_handlers, reduce_node = built.pairs, built.parent
         assert isinstance(reduce_node, TransformNode)
 
         results = {}
@@ -198,7 +200,7 @@ class TestFanoutHandlers:
         )
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+        nodes_and_handlers = orch._doc_fanout.build(ctx, sctx, parent).pairs
 
         results = {}
         reduce_handler = None
@@ -226,12 +228,12 @@ class TestFanoutHandlers:
         dp_llm = MagicMock()
         dp_llm.get_max_tokens = MagicMock(return_value=8192)
         dp_llm.invoke = MagicMock(return_value="DP EXTRACT")
-        orch._llm_for_tier = MagicMock(return_value=dp_llm)
+        orch._models.llm_for_tier = MagicMock(return_value=dp_llm)
 
         sctx = SearchContext(documents=_docs(3))
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+        nodes_and_handlers = orch._doc_fanout.build(ctx, sctx, parent).pairs
 
         batch_nodes = [n for n, _ in nodes_and_handlers if isinstance(n, LLMDecisionNode)]
         assert batch_nodes
@@ -250,7 +252,7 @@ class TestFanoutHandlers:
         sctx = SearchContext(documents=_docs(2))
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+        nodes_and_handlers = orch._doc_fanout.build(ctx, sctx, parent).pairs
 
         batch_node, batch_handler = nodes_and_handlers[0]
         result = batch_handler({})
@@ -264,7 +266,7 @@ class TestFanoutHandlers:
         sctx = SearchContext(documents=_docs(2))
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+        nodes_and_handlers = orch._doc_fanout.build(ctx, sctx, parent).pairs
 
         batch_node, batch_handler = nodes_and_handlers[0]
         result = batch_handler({})
@@ -280,7 +282,7 @@ class TestFanoutHandlers:
         sctx = SearchContext(documents=_docs(2))
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+        nodes_and_handlers = orch._doc_fanout.build(ctx, sctx, parent).pairs
 
         batch_node, batch_handler = nodes_and_handlers[0]
         result = batch_handler({})
@@ -305,7 +307,7 @@ class TestFanoutHandlers:
         sctx = SearchContext(documents=[doc])
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+        nodes_and_handlers = orch._doc_fanout.build(ctx, sctx, parent).pairs
 
         batch_node, batch_handler = nodes_and_handlers[0]
         result = batch_handler({})
@@ -332,7 +334,7 @@ class TestFanoutHandlers:
         sctx = SearchContext(documents=[doc])
         ctx = _ctx(orch)
         parent = RouteNode()
-        nodes_and_handlers, _ = orch._build_doc_fanout_nodes(ctx, sctx, parent)
+        nodes_and_handlers = orch._doc_fanout.build(ctx, sctx, parent).pairs
 
         batch_node, batch_handler = nodes_and_handlers[0]
         result = batch_handler({})
@@ -349,7 +351,7 @@ class TestJsonToTable:
         return _make_orchestrator()
 
     def test_top_level_array(self):
-        table = self._orch()._json_to_table(
+        table = self._orch()._doc_fanout._json_to_table(
             '[{"name": "A", "v": 1}, {"name": "B", "v": 2}]'
         )
         assert "| name | v |" in table
@@ -357,26 +359,26 @@ class TestJsonToTable:
         assert "| B | 2 |" in table
 
     def test_rows_container(self):
-        table = self._orch()._json_to_table('{"rows": [{"name": "A", "v": 1}]}')
+        table = self._orch()._doc_fanout._json_to_table('{"rows": [{"name": "A", "v": 1}]}')
         assert "| name | v |" in table
         assert "| A | 1 |" in table
 
     def test_nested_values_flattened_with_dotted_keys(self):
-        table = self._orch()._json_to_table(
+        table = self._orch()._doc_fanout._json_to_table(
             '[{"name": "A", "values": {"epa": 0.296484, "td": 31}}]'
         )
         assert "| name | values.epa | values.td |" in table
         assert "| A | 0.2965 | 31 |" in table
 
     def test_float_compaction(self):
-        table = self._orch()._json_to_table('[{"v": 4394.0, "epa": 0.296484}]')
+        table = self._orch()._doc_fanout._json_to_table('[{"v": 4394.0, "epa": 0.296484}]')
         assert "| 4394 | 0.2965 |" in table
 
     def test_returns_none_for_non_json(self):
-        assert self._orch()._json_to_table("just plain text") is None
+        assert self._orch()._doc_fanout._json_to_table("just plain text") is None
 
     def test_returns_none_for_json_without_rows(self):
-        assert self._orch()._json_to_table('{"category": "EPA/play"}') is None
+        assert self._orch()._doc_fanout._json_to_table('{"category": "EPA/play"}') is None
 
 
 # ------------------------------------------------------------------ #

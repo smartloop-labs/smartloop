@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from smartloop.agents.orchestrator import SLPOrchestrator
+from smartloop.agents.orchestration.tool_fanout import ToolFanout
 from smartloop.agents.mcp.explorer import SearchContext
 from smartloop.agents.nodes import (
     NodeResult, LLMDecisionNode, ToolCallNode, TransformNode,
@@ -123,7 +124,7 @@ class TestBuildStepNodesForEach:
             instruction="Get ticker info",
             for_each=True, inferred_args=["symbol"],
         )
-        nodes = orch._build_step_nodes(ctx, [step], search_ctx, parent=parent)
+        nodes = orch._pipeline.build_step_nodes(ctx, [step], search_ctx, parent=parent)
         node_types = [type(n).__name__ for n, _ in nodes]
         assert node_types == ["LLMDecisionNode", "TransformNode"]
         assert "ToolCallNode" not in node_types
@@ -140,7 +141,7 @@ class TestBuildStepNodesForEach:
             server_id="yfinance-srv", server_name="yfinance",
             instruction="Get ticker info",
         )
-        nodes = orch._build_step_nodes(ctx, [step], search_ctx, parent=parent)
+        nodes = orch._pipeline.build_step_nodes(ctx, [step], search_ctx, parent=parent)
         node_types = [type(n).__name__ for n, _ in nodes]
         assert "LLMDecisionNode" in node_types
         assert "ToolCallNode" in node_types
@@ -152,28 +153,28 @@ class TestBuildStepNodesForEach:
 
 class TestParseFanoutResponse:
     def test_one_per_line(self):
-        items = SLPOrchestrator._parse_fanout_response("AAPL\nMSFT\nGOOGL")
+        items = ToolFanout._parse_fanout_response("AAPL\nMSFT\nGOOGL")
         assert items == ["AAPL", "MSFT", "GOOGL"]
 
     def test_json_array(self):
-        items = SLPOrchestrator._parse_fanout_response('["AAPL", "MSFT"]')
+        items = ToolFanout._parse_fanout_response('["AAPL", "MSFT"]')
         assert items == ["AAPL", "MSFT"]
 
     def test_strips_bullets_and_numbers(self):
-        items = SLPOrchestrator._parse_fanout_response("1. AAPL\n2. MSFT\n- GOOGL\n• VYM")
+        items = ToolFanout._parse_fanout_response("1. AAPL\n2. MSFT\n- GOOGL\n• VYM")
         assert items == ["AAPL", "MSFT", "GOOGL", "VYM"]
 
     def test_skips_preamble_lines(self):
-        items = SLPOrchestrator._parse_fanout_response(
+        items = ToolFanout._parse_fanout_response(
             "Here are the symbols:\nAAPL\nMSFT"
         )
         assert items == ["AAPL", "MSFT"]
 
     def test_empty_response(self):
-        assert SLPOrchestrator._parse_fanout_response("") == []
+        assert ToolFanout._parse_fanout_response("") == []
 
     def test_single_item_json_falls_through_to_lines(self):
-        items = SLPOrchestrator._parse_fanout_response('["AAPL"]')
+        items = ToolFanout._parse_fanout_response('["AAPL"]')
         assert items == ["AAPL"]
 
 
@@ -193,7 +194,7 @@ class TestExtractFanoutItems:
         search_ctx = SearchContext()
         search_ctx.vector_context = "Fund A ticker AAPL, Fund B ticker MSFT, Fund C ticker GOOGL"
 
-        items = orch._extract_fanout_items(ctx, step, [], search_ctx)
+        items = orch._tool_fanout._extract_fanout_items(ctx, step, [], search_ctx)
         assert items == ["AAPL", "MSFT", "GOOGL"]
 
     def test_extracts_from_json_array(self):
@@ -211,7 +212,7 @@ class TestExtractFanoutItems:
         search_ctx = SearchContext()
         search_ctx.vector_context = "AAPL and MSFT funds"
 
-        items = orch._extract_fanout_items(ctx, step, [], search_ctx)
+        items = orch._tool_fanout._extract_fanout_items(ctx, step, [], search_ctx)
         assert items == ["AAPL", "MSFT"]
 
     def test_empty_context_returns_empty(self):
@@ -223,7 +224,7 @@ class TestExtractFanoutItems:
             instruction="Get ticker info",
         )
         search_ctx = SearchContext()
-        items = orch._extract_fanout_items(ctx, step, [], search_ctx)
+        items = orch._tool_fanout._extract_fanout_items(ctx, step, [], search_ctx)
         assert items == []
 
     def test_caps_at_max_items(self):
@@ -243,8 +244,8 @@ class TestExtractFanoutItems:
         search_ctx = SearchContext()
         search_ctx.vector_context = "lots of tickers"
 
-        items = orch._extract_fanout_items(ctx, step, [], search_ctx)
-        assert len(items) == orch._FANOUT_MAX_ITEMS
+        items = orch._tool_fanout._extract_fanout_items(ctx, step, [], search_ctx)
+        assert len(items) == orch._tool_fanout._FANOUT_MAX_ITEMS
 
     def test_llm_failure_returns_empty(self):
         orch = _make_orchestrator()
@@ -261,7 +262,7 @@ class TestExtractFanoutItems:
         search_ctx = SearchContext()
         search_ctx.vector_context = "some context"
 
-        items = orch._extract_fanout_items(ctx, step, [], search_ctx)
+        items = orch._tool_fanout._extract_fanout_items(ctx, step, [], search_ctx)
         assert items == []
 
 
@@ -286,12 +287,12 @@ class TestFanoutHandler:
             for_each=True,
         )
 
-        handler = orch._make_fanout_handler(ctx, step, search_ctx)
+        handler = orch._tool_fanout.make_handler(ctx, step, search_ctx)
         mock_server = MagicMock()
 
-        with patch.object(orch, '_extract_fanout_items', return_value=["AAPL", "MSFT"]), \
-             patch.object(orch, '_find_fanout_server', return_value=mock_server), \
-             patch.object(orch, '_call_tool') as mock_call:
+        with patch.object(orch._tool_fanout, '_extract_fanout_items', return_value=["AAPL", "MSFT"]), \
+             patch.object(orch._tool_fanout, '_find_fanout_server', return_value=mock_server), \
+             patch.object(orch._steps, 'call_tool') as mock_call:
 
             mock_call.return_value = ("Price: $150", '{"price": 150}')
 
@@ -314,9 +315,9 @@ class TestFanoutHandler:
             for_each=True,
         )
 
-        handler = orch._make_fanout_handler(ctx, step, search_ctx)
+        handler = orch._tool_fanout.make_handler(ctx, step, search_ctx)
 
-        with patch.object(orch, '_extract_fanout_items', return_value=[]):
+        with patch.object(orch._tool_fanout, '_extract_fanout_items', return_value=[]):
             result = handler({})
             assert result.success
             assert result.data["content"] == ""
@@ -335,7 +336,7 @@ class TestFanoutHandler:
             for_each=True,
         )
 
-        handler = orch._make_fanout_handler(ctx, step, search_ctx)
+        handler = orch._tool_fanout.make_handler(ctx, step, search_ctx)
         mock_server = MagicMock()
 
         call_count = {"n": 0}
@@ -345,9 +346,9 @@ class TestFanoutHandler:
                 return None
             return ("Price: $150", '{"price": 150}')
 
-        with patch.object(orch, '_extract_fanout_items', return_value=["AAPL", "BAD", "MSFT"]), \
-             patch.object(orch, '_find_fanout_server', return_value=mock_server), \
-             patch.object(orch, '_call_tool', side_effect=fail_second) as mock_call:
+        with patch.object(orch._tool_fanout, '_extract_fanout_items', return_value=["AAPL", "BAD", "MSFT"]), \
+             patch.object(orch._tool_fanout, '_find_fanout_server', return_value=mock_server), \
+             patch.object(orch._steps, 'call_tool', side_effect=fail_second) as mock_call:
 
             result = handler({})
             assert result.success
@@ -369,12 +370,12 @@ class TestFanoutHandler:
             for_each=True,
         )
 
-        handler = orch._make_fanout_handler(ctx, step, search_ctx)
+        handler = orch._tool_fanout.make_handler(ctx, step, search_ctx)
         mock_server = MagicMock()
 
-        with patch.object(orch, '_extract_fanout_items', return_value=["AAPL"]), \
-             patch.object(orch, '_find_fanout_server', return_value=mock_server), \
-             patch.object(orch, '_call_tool') as mock_call:
+        with patch.object(orch._tool_fanout, '_extract_fanout_items', return_value=["AAPL"]), \
+             patch.object(orch._tool_fanout, '_find_fanout_server', return_value=mock_server), \
+             patch.object(orch._steps, 'call_tool') as mock_call:
 
             mock_call.return_value = ("Price: $150", '{"price": 150}')
             result = handler({})
@@ -397,13 +398,13 @@ class TestFanoutHandler:
             for_each=True,
         )
 
-        handler = orch._make_fanout_handler(ctx, step, search_ctx)
+        handler = orch._tool_fanout.make_handler(ctx, step, search_ctx)
         mock_server = MagicMock()
 
-        with patch.object(orch, '_extract_fanout_items',
+        with patch.object(orch._tool_fanout, '_extract_fanout_items',
                           return_value=[{"symbol": "AAPL", "exchange": "NASDAQ"}]), \
-             patch.object(orch, '_find_fanout_server', return_value=mock_server), \
-             patch.object(orch, '_call_tool') as mock_call:
+             patch.object(orch._tool_fanout, '_find_fanout_server', return_value=mock_server), \
+             patch.object(orch._steps, 'call_tool') as mock_call:
 
             mock_call.return_value = ("Info", "raw")
             result = handler({})
@@ -427,10 +428,10 @@ class TestFanoutHandler:
             for_each=True,
         )
 
-        handler = orch._make_fanout_handler(ctx, step, search_ctx)
+        handler = orch._tool_fanout.make_handler(ctx, step, search_ctx)
 
-        with patch.object(orch, '_extract_fanout_items', return_value=["AAPL"]), \
-             patch.object(orch, '_find_fanout_server', return_value=None):
+        with patch.object(orch._tool_fanout, '_extract_fanout_items', return_value=["AAPL"]), \
+             patch.object(orch._tool_fanout, '_find_fanout_server', return_value=None):
 
             result = handler({})
             assert result.success
