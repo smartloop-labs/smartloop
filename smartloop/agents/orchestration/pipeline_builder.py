@@ -102,6 +102,7 @@ class PipelineBuilder:
             conversation_history=ctx.conversation_history,
             executor=self._executor._io_pool,
             project_dir=ctx.project_dir,
+            progress=self._models.emit,
         )
         return NodeResult(node_id=node.node_id, success=True, data={"search_ctx": search_ctx})
 
@@ -445,7 +446,9 @@ class PipelineBuilder:
             if step.step_type == StepType.WEB_SEARCH:
                 query = (step.default_args or {}).get("query") or step.instruction or ctx.user_message
                 self._models.emit("web_search", "processing", "Searching the web for the latest information")
-                content = self._web_search_agent.search(query)
+                content = self._web_search_agent.search(
+                    query, progress=self._models.emit,
+                )
                 # Record the URLs on the shared search context, exactly as the
                 # explore path does (see Explorer.collect).  _build_final_result
                 # reads them back as citations, so without this a plan that

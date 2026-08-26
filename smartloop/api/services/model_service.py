@@ -40,6 +40,7 @@ from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
 from smartloop.agents.orchestrator import SLPOrchestrator
 from smartloop.agents.planner import SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME, FETCH_SERVER_ID
 
+from smartloop.constants import canonical_model_name, display_model_label
 from smartloop.parsers.parser_factory import ParserFactory
 from smartloop import ConversationStore, MessageInput
 
@@ -468,7 +469,19 @@ class ModelService:
         Attempted at most once per active model (``_large_model_attempted``):
         if it loads it's cached; if it's absent or skipped for fit we return
         ``None`` and the caller falls back to the main/decision model.
+
+        With exactly one model selected that model IS the agent model, even
+        when it does not out-rank the bootstrap router (``_detect_large_model``
+        only promotes a bigger model, so a small selected model would otherwise
+        leave agent work on the router the user did not pick).  A pin that
+        fails to load returns ``None`` here rather than falling through to
+        detection: the pinned model is the only candidate detection could
+        find, so retrying it would just fail the same fit guard a second time.
+        The caller drops to the default model, as it does for any other
+        unavailable large model.
         """
+        if self._pinned_model() is not None:
+            return self._pinned_llm()
         if self._large_llm is not None:
             return self._large_llm
         if self._large_model_attempted:
@@ -640,15 +653,183 @@ class ModelService:
             reverse=descending,
         )
 
+    def _selected_models(self) -> List:
+        """The models the user has actually chosen — enabled *and* downloaded.
+
+        The bootstrap/orchestrator model is excluded.  It is always enabled,
+        is filtered out of the model list the user picks from (see
+        ``list_workspace_models``) and cannot be configured per project, so it
+        is infrastructure rather than a selection — counting it would mean the
+        user could never get down to a single selected model.  Resolution is
+        project-scoped, since per-project settings override the workspace
+        defaults.
+        """
+        if not self._model or not self._model.workspace:
+            return []
+        workspace = self._model.workspace
+        project = workspace.current_project
+        bootstrap = canonical_model_name(api_settings.default_model)
+        return [
+            m for m in workspace.models
+            if canonical_model_name(m.model_name) != bootstrap
+            and workspace.effective_model_enabled(m.model_name, project)
+            and workspace.effective_model_downloaded(m.model_name)
+        ]
+
+    def _pinned_model(self):
+        """The sole selected model, or ``None`` when 0 or 2+ are selected.
+
+        With two or more models selected the choice between them is ours to
+        make, and capability routing makes it per step.  With exactly one the
+        choice is the user's and it is explicit, so that model runs everything
+        — routing has nothing to route between, and second-guessing the
+        selection because the model doesn't declare some capability tag would
+        answer on the bootstrap model the user never picked.
+        """
+        selected = self._selected_models()
+        return selected[0] if len(selected) == 1 else None
+
+    def _pinned_llm(self) -> Optional[BaseLLM]:
+        """Loaded instance of the pinned model, or ``None``.
+
+        ``None`` means either that the user has not pinned the selection to one
+        model, or that the pinned model could not be loaded (no GGUF, or it
+        does not fit) — callers then take their existing fallback path.
+        """
+        ws_model = self._pinned_model()
+        if ws_model is None:
+            return None
+        return self._load_workspace_llm(ws_model, "pinned")
+
+    # Why the most recent capability model could not be loaded, as
+    # ``(model_name, cause)`` where cause is one of "memory", "missing",
+    # "faulted" or "error".  Advisory only — it feeds the progress event that
+    # explains a fallback, so a race between concurrent fan-out threads costs
+    # at most a wrong model name in one status line.
+    _capability_skip: Optional[tuple] = None
+
+    def last_capability_skip(self) -> Optional[tuple]:
+        """``(model_name, cause)`` for the last capability model that could not
+        be loaded, or ``None`` when the last resolution succeeded.
+
+        Lets the caller explain a fallback rather than silently answering on a
+        smaller model: "not enough memory for gemma4-e2b" is actionable — the
+        user can close something or deselect a model — where a bare "Selected
+        sl-mini" looks like the model they chose was simply ignored.
+        """
+        return self._capability_skip
+
+    def _load_workspace_llm(self, ws_model, reason: str) -> Optional[BaseLLM]:
+        """Return a resident (or freshly loaded) instance of one workspace
+        model, or ``None`` when it has no GGUF, faulted, or won't fit.
+
+        Shared by capability routing and the pinned-model path: consults the
+        per-model cache, honours a GPU-fault eviction, applies the fit guard
+        (evicting prior-step models to make room) and loads.  ``reason`` names
+        the caller in the logs — a capability, or ``pinned``.
+        """
+        workspace = self._model.workspace
+        cache_key = f"_cap_llm_{ws_model.model_name}"
+        cached = getattr(self, cache_key, None)
+        if cached is _GPU_FAULTED:
+            # Evicted after a runtime GPU OOM — don't reload it.  That is a
+            # memory failure too, just one discovered during generation rather
+            # than at load time.
+            self._capability_skip = (ws_model.model_name, "memory")
+            return None
+        if cached is not None:
+            # Resident and already passed the fit guard when loaded.
+            self._capability_skip = None
+            return cached
+
+        from smartloop.config.app_settings import AppSettings
+        cap = AppSettings().llm_large_n_ctx_cap
+        try:
+            model_dir = workspace.model_dir_for(ws_model.model_id)
+            # _find_model_ggufs excludes the mmproj/CLIP GGUF from the main
+            # pick.  This path is text-only capability routing; image OCR
+            # goes through get_vision_llm(), which loads the multimodal
+            # handler.
+            gguf_path, _mmproj = self._find_model_ggufs(model_dir)
+            if not gguf_path:
+                logger.warning(
+                    "[capability-model] No GGUF found for %s at %s (%s)",
+                    ws_model.model_name, model_dir, reason,
+                )
+                self._capability_skip = (ws_model.model_name, "missing")
+                return None
+
+            # Fit guard: skip a model that won't fit alongside the main
+            # model.  First eagerly release prior steps' capability models
+            # (and the on-demand large model) and retry — that frees enough
+            # VRAM to run this model on a memory-tight device.
+            if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
+                if not (
+                    self._evict_capability_models(keep_model_name=ws_model.model_name)
+                    and self._large_model_fits(gguf_path, cap, ws_model.model_name)
+                ):
+                    logger.warning(
+                        "[capability-model] %s doesn't fit alongside the "
+                        "main model at n_ctx=%d (%s)",
+                        ws_model.model_name, cap, reason,
+                    )
+                    self._capability_skip = (ws_model.model_name, "memory")
+                    return None
+                logger.info(
+                    "[capability-model] Freed prior-step models to fit %s (%s)",
+                    ws_model.model_name, reason,
+                )
+            from smartloop.llms.llm_factory import LlmFactory
+            llm = LlmFactory.get_llama_cpp_instance(
+                gguf_path, logger, self.get_project_id() or "",
+                max_n_ctx=cap,
+            )
+            setattr(self, cache_key, llm)
+            logger.info(
+                "[capability-model] Loaded %s (%s)", ws_model.model_name, reason,
+            )
+            self._capability_skip = None
+            return llm
+        except Exception as e:
+            logger.warning(
+                "[capability-model] Failed to load %s (%s): %s",
+                ws_model.model_name, reason, e,
+            )
+            self._capability_skip = (ws_model.model_name, "error")
+            return None
+
+    def has_capability_model(self, capability: str) -> bool:
+        """True when some selected model declares *capability*.
+
+        A cheap workspace lookup — it loads nothing.  The orchestrator uses it
+        to decide whether to announce a capability model load at all: the
+        "Loading model for X…" event has to fire *before* the slow load, so
+        without this check it promised a load on workspaces where no selected
+        model provides X (only one supported model declares ``skills``, for
+        instance) and the step then quietly fell back to the bootstrap model.
+        """
+        if not self._model or not self._model.workspace:
+            return False
+        # A pinned model serves every capability, declared or not.
+        if self._pinned_model() is not None:
+            return True
+        workspace = self._model.workspace
+        return bool(
+            workspace.ranked_models_for(capability, workspace.current_project)
+        )
+
     def _get_llm_for_capability(self, capability: str) -> Optional[BaseLLM]:
         """Return a loaded LLM matching the requested capability.
 
-        Walks the capability's models largest-first and returns the first that
-        is already resident or fits in memory — evicting prior-step capability
-        models to make room when needed.  When the largest doesn't fit it
-        promotes down to the next-largest same-capability model that does,
-        rather than dropping straight to the tiny default.  Returns ``None``
-        only when no capable model fits (caller then falls back to the
+        When the user has selected exactly one model, that model is returned
+        for every capability — see :meth:`_pinned_model`.
+
+        Otherwise walks the capability's models largest-first and returns the
+        first that is already resident or fits in memory — evicting prior-step
+        capability models to make room when needed.  When the largest doesn't
+        fit it promotes down to the next-largest same-capability model that
+        does, rather than dropping straight to the tiny default.  Returns
+        ``None`` only when no capable model fits (caller then falls back to the
         default/large model).
         """
         if not self._model or not self._model.workspace:
@@ -658,6 +839,24 @@ class ModelService:
             )
             return None
         workspace = self._model.workspace
+
+        # One selected model runs every step, whatever capability the step
+        # asked for.  Declared capabilities decide which of several selected
+        # models handles a step; with a single selection there is no such
+        # choice to make, and treating a missing 'dp' tag as "no capable
+        # model" would hand the step to the bootstrap model instead of the
+        # one the user picked.
+        pinned = self._pinned_model()
+        if pinned is not None:
+            llm = self._load_workspace_llm(pinned, f"pinned, capability '{capability}'")
+            if llm is None:
+                logger.warning(
+                    "[capability-model] Sole selected model %s unavailable for "
+                    "'%s' — falling back to the default model",
+                    pinned.model_name, capability,
+                )
+            return llm
+
         # Candidate selection is project-scoped (per-project model settings
         # override the workspace defaults); re-rank so same-size models with
         # broader capability coverage lead.
@@ -672,75 +871,12 @@ class ModelService:
             )
             return None
 
-        from smartloop.config.app_settings import AppSettings
-        cap = AppSettings().llm_large_n_ctx_cap
-
         for ws_model in ranked:
-            cache_key = f"_cap_llm_{ws_model.model_name}"
-            cached = getattr(self, cache_key, None)
-            if cached is _GPU_FAULTED:
-                # Evicted after a runtime GPU OOM — don't reload it; try the
-                # next-smaller capable model instead of the tiny default.
-                continue
-            if cached is not None:
-                # Resident and already passed the fit guard when loaded — as the
-                # largest resident candidate, it's the best available.
-                return cached
-
-            try:
-                model_dir = workspace.model_dir_for(ws_model.model_id)
-                # _find_model_ggufs excludes the mmproj/CLIP GGUF from the main
-                # pick.  This path is text-only capability routing; image OCR
-                # goes through get_vision_llm(), which loads the multimodal
-                # handler.
-                gguf_path, _mmproj = self._find_model_ggufs(model_dir)
-                if not gguf_path:
-                    logger.warning(
-                        "[capability-model] No GGUF found for %s at %s — "
-                        "trying next-smaller model for capability '%s'",
-                        ws_model.model_name, model_dir, capability,
-                    )
-                    continue
-
-                # Fit guard: skip a model that won't fit alongside the main
-                # model.  First eagerly release prior steps' capability models
-                # (and the on-demand large model) and retry — that frees enough
-                # VRAM to run this model on a memory-tight device.  If it still
-                # doesn't fit, promote down to the next-smaller candidate.
-                if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
-                    if not (
-                        self._evict_capability_models(keep_model_name=ws_model.model_name)
-                        and self._large_model_fits(gguf_path, cap, ws_model.model_name)
-                    ):
-                        logger.warning(
-                            "[capability-model] %s doesn't fit alongside the "
-                            "main model at n_ctx=%d — trying next-smaller model "
-                            "for capability '%s'",
-                            ws_model.model_name, cap, capability,
-                        )
-                        continue
-                    logger.info(
-                        "[capability-model] Freed prior-step models to fit %s "
-                        "for capability '%s'", ws_model.model_name, capability,
-                    )
-                from smartloop.llms.llm_factory import LlmFactory
-                llm = LlmFactory.get_llama_cpp_instance(
-                    gguf_path, logger, self.get_project_id() or "",
-                    max_n_ctx=cap,
-                )
-                setattr(self, cache_key, llm)
-                logger.info(
-                    "[capability-model] Loaded %s for capability '%s'",
-                    ws_model.model_name, capability,
-                )
+            # Walk down to the next-smaller capable model when this one has no
+            # GGUF, faulted, or doesn't fit — rather than the tiny default.
+            llm = self._load_workspace_llm(ws_model, f"capability '{capability}'")
+            if llm is not None:
                 return llm
-            except Exception as e:
-                logger.warning(
-                    "[capability-model] Failed to load %s for capability '%s': "
-                    "%s — trying next-smaller model", ws_model.model_name,
-                    capability, e,
-                )
-                continue
 
         logger.info(
             "[capability-model] No model declaring capability '%s' fits in "
@@ -2186,11 +2322,13 @@ class ModelService:
         """Human-readable name for a loaded LLM, from its GGUF metadata.
 
         Falls back to the class name when metadata is unavailable so the
-        response log always names *something* concrete.
+        response log always names *something* concrete.  The metadata name is
+        mapped to the product's own (see ``display_model_label``) so logs and
+        events name the model the user sees in the picker.
         """
         try:
             meta = llm.model.metadata
-            name = meta.get("general.name", "")
+            name = display_model_label(meta.get("general.name", ""))
             size = meta.get("general.size_label", "")
             if name:
                 return f"{name} ({size})" if size else name
@@ -2201,12 +2339,34 @@ class ModelService:
     def _llm_for_response(self, capability: Optional[str]) -> Optional[BaseLLM]:
         """Return the LLM to use for the final response.
 
+        With exactly one model selected, that model writes the response —
+        including when *capability* is None, which otherwise answers on the
+        bootstrap orchestrator LLM (see :meth:`_pinned_model`).  When it
+        cannot be loaded the default model answers instead: the rest of the
+        chain below would only rediscover the same unavailable model, and an
+        answer on the default beats no answer at all.
+
         Fallback chain when *capability* is set: capability-tagged model →
         largest downloaded model → default orchestrator LLM.  Small models
         struggle to synthesize long tool-result contexts, so we prefer any
         larger model when one is available; falls back cleanly to
         ``self._llm`` when nothing better is present.
         """
+        pinned_model = self._pinned_model()
+        if pinned_model is not None:
+            pinned = self._pinned_llm()
+            if pinned is not None:
+                logger.info(
+                    "[response] Using the sole selected model (capability='%s')",
+                    capability,
+                )
+                return pinned
+            logger.warning(
+                "[response] Sole selected model %s unavailable — answering on "
+                "the default model", pinned_model.model_name,
+            )
+            return self._llm
+
         if capability:
             cap_llm = self._get_llm_for_capability(capability)
             if cap_llm is not None and cap_llm is not self._llm:
@@ -3019,7 +3179,8 @@ class ModelService:
         memory-tight device those must not all stay resident, so when the next
         step's model won't fit we drop the others here — every
         ``_cap_llm_<name>`` cache except ``keep_model_name`` (the one about to be
-        used) plus the on-demand large agent model — then reclaim the GPU.
+        used), plus the on-demand large agent model and the vision/OCR model —
+        then reclaim the GPU.
 
         The default orchestrator model is never evicted, whether it is reached
         via ``self._llm`` or via its own ``_cap_llm_<default>`` slot: it is
@@ -3061,6 +3222,22 @@ class ModelService:
             self._large_llm = None
             self._large_model_name = None
             self._large_model_attempted = False
+            freed = True
+        # The vision/OCR model is on-demand and per-step exactly like the
+        # capability models above, but it lives in its own slot and used to be
+        # freed only at end-of-request.  So a document request that ran OCR
+        # first left the vision model resident, the next step's 'dp' model
+        # failed its fit guard against the VRAM it held, and extraction
+        # dropped onto the bootstrap router instead.  OCR is finished by the
+        # time a later step needs the room, and get_vision_llm reloads lazily
+        # (unload clears _vision_unavailable) if another page needs it.
+        if (self._vision_llm is not None
+                and self._vision_model_name != keep_model_name):
+            logger.info(
+                "[mem] Evicting prior-step vision model %s to free VRAM",
+                self._vision_model_name or "?",
+            )
+            self.unload_vision_model()
             freed = True
         if freed:
             self._cleanup_gpu_cache()
@@ -4660,12 +4837,26 @@ class ModelService:
         # own per-project dir so tools and scans stay self-contained.
         orchestrator_cwd = current_project.project_dir
 
+        # With exactly one model selected, it runs the routing and decision
+        # nodes too — not just the steps that resolve a capability.  Those
+        # nodes otherwise stay on the bootstrap model, which is never a user
+        # selection, so an explicit single choice would still leave the
+        # planner, the skill matcher and the relevance judge on another model.
+        pinned_llm = self._pinned_llm()
+        if pinned_llm is not None:
+            logger.info(
+                "[models] Single selected model pinned for the whole request: %s",
+                self._model_label(pinned_llm),
+            )
+
         try:
             orchestrator = SLPOrchestrator(
-                orchestrator_llm=self._llm,
-                agent_llm=self._decision_llm or self._llm,
+                orchestrator_llm=pinned_llm or self._llm,
+                agent_llm=pinned_llm or self._decision_llm or self._llm,
                 large_llm_provider=self._get_large_llm,
                 capability_llm_provider=self._get_llm_for_capability,
+                capability_available=self.has_capability_model,
+                capability_skip_reason=self.last_capability_skip,
                 model_path=getattr(self, '_model_gguf_path', None),
                 project_id=self.get_project_id(),
                 executor=self._get_llm_executor(),
@@ -4694,7 +4885,8 @@ class ModelService:
             # request until they finish generating.
             cancel_llms = [
                 llm for llm in {id(self._llm): self._llm,
-                                id(self._decision_llm): self._decision_llm}.values()
+                                id(self._decision_llm): self._decision_llm,
+                                id(pinned_llm): pinned_llm}.values()
                 if llm is not None
             ]
             if cancelled is not None:

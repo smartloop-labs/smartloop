@@ -25,6 +25,11 @@ def svc():
     s._large_llm = None
     s._large_model_name = None
     s._large_model_attempted = False
+    # The on-demand vision model is evicted here too, so the next step's
+    # capability model can fit (see test_vision_evicted_for_capability.py).
+    s._vision_llm = None
+    s._vision_model_name = None
+    s._vision_unavailable = False
     s._cleanup_gpu_cache = MagicMock()
     s._free_llm = MagicMock()
     return s

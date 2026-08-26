@@ -65,6 +65,8 @@ class SLPOrchestrator:
         large_llm: Optional[BaseLLM] = None,
         large_llm_provider: Optional[Callable[[], Optional[BaseLLM]]] = None,
         capability_llm_provider: Optional[Callable[[str], Optional[BaseLLM]]] = None,
+        capability_available: Optional[Callable[[str], bool]] = None,
+        capability_skip_reason: Optional[Callable[[], Optional[tuple]]] = None,
         model_path: Optional[str] = None,
         project_id: Optional[str] = None,
         executor: Optional[LLMExecutor] = None,
@@ -77,6 +79,8 @@ class SLPOrchestrator:
             large_llm=large_llm,
             large_llm_provider=large_llm_provider,
             capability_llm_provider=capability_llm_provider,
+            capability_available=capability_available,
+            capability_skip_reason=capability_skip_reason,
         )
 
         # -- Collaborators shared by the components below --
