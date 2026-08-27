@@ -46,6 +46,14 @@ def _service(*models):
         lambda name: next(
             (m._downloaded for m in all_models if m.model_name == name), False)
     )
+    # Nothing switched off per project, so the enabled set is the declared set.
+    # The pin reads this rather than ``effective_capabilities`` so a capability a
+    # project has turned off cannot be pinned — see test_model_service_capabilities.
+    workspace.effective_model_capabilities.side_effect = (
+        lambda name, project=None: next(
+            (list(m.effective_capabilities) for m in all_models
+             if m.model_name == name), [])
+    )
     workspace.ranked_models_for.side_effect = lambda cap, project=None: [
         m for m in all_models
         if m._enabled and m._downloaded and cap in m.effective_capabilities

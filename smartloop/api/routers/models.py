@@ -102,7 +102,11 @@ class ModelEntry(BaseModel):
     is_accessible: bool = False
     sha256: str | None = None
     enabled: bool = True
+    # Everything the model can do, for rendering; the subset currently switched
+    # on for the resolved project.  Both are needed — a client that only knew
+    # the enabled set could not offer a way to turn a capability back on.
     capabilities: list[str] = []
+    enabled_capabilities: list[str] = []
     # Reasoning is a per-model setting, not a per-request one: a model the user
     # switches thinking on for reasons on every call.  ``thinking`` is null for
     # a model whose capabilities lack "thinking" — the picker shows the toggle
@@ -160,8 +164,8 @@ async def list_models(
     ``internal`` entry arriving here means superuser credentials fetched the
     catalog and it belongs in the response.
 
-    Only ``enabled`` resolves against ``project_id``; download state is
-    workspace-wide.
+    Download state is workspace-wide; only ``enabled`` and
+    ``enabled_capabilities`` resolve against ``project_id``.
     """
     try:
         models = svc.list_models()
@@ -202,11 +206,17 @@ async def list_models(
         if ws_model:
             entry.enabled = workspace.effective_model_enabled(entry.name, project)
             entry.capabilities = _display_capabilities(ws_model.effective_capabilities)
+            entry.enabled_capabilities = workspace.effective_model_capabilities(
+                entry.name, project,
+            )
             entry.thinking = workspace.effective_model_thinking(entry.name, project)
         else:
             model_cls = SUPPORTED_MODELS.get(entry.name)
             if model_cls and hasattr(model_cls, 'default_capabilities'):
                 entry.capabilities = _display_capabilities(model_cls.default_capabilities())
+                # Not registered in this workspace, so no project can have
+                # toggled anything off for it: all of it is enabled.
+                entry.enabled_capabilities = list(entry.capabilities)
         result.append(entry)
 
     result.sort(key=lambda entry: (entry.access_level == AccessLevel.free, SUPPORTED_MODELS.get(entry.name).param_size_in_b() if SUPPORTED_MODELS.get(entry.name) else 0), reverse=True)
@@ -345,13 +355,24 @@ class ProjectModelEntry(BaseModel):
     downloaded: bool
     is_active: bool
     enabled: bool
+    # ``capabilities`` is everything the model supports (read-only, from the
+    # model class); ``enabled_capabilities`` is the subset switched on for this
+    # project.  A client renders one control per supported capability and uses
+    # the enabled set to show which are on.
     capabilities: list[str] = []
+    enabled_capabilities: list[str] = []
     settings: dict = {}
 
 
 class _UpdateProjectModelRequest(BaseModel):
     enabled: bool | None = None
     is_active: bool | None = None
+    # A sparse capability → enabled map, so a client toggling one capability
+    # sends only that key: it needs no read-modify-write round trip, and two
+    # toggles in flight for different capabilities can't clobber each other.
+    # Typing the key as the enum makes an unknown capability a 422; a
+    # capability this particular model doesn't support is a 400 below.
+    capabilities: dict[ModelCapability, bool] | None = None
     settings: dict | None = None
 
 
@@ -372,8 +393,10 @@ async def list_project_models(
     """List models registered for a project, with per-project state.
 
     Entries are seeded from the workspace (app-default) registry; a project's
-    own settings override those defaults.  Capabilities are read-only from the
-    model class, and so is ``downloaded`` — weights are shared workspace-wide.
+    own settings override those defaults.  ``capabilities`` is read-only from
+    the model class and so is ``downloaded`` — weights are shared
+    workspace-wide — while ``enabled_capabilities`` reflects this project's
+    per-capability toggles.
     """
     try:
         workspace, project = _resolve_project(model_service, project_id)
@@ -390,6 +413,7 @@ async def list_project_models(
                 is_active=workspace.effective_model_active(m.model_name, project),
                 enabled=workspace.effective_model_enabled(m.model_name, project),
                 capabilities=_display_capabilities(m.effective_capabilities),
+                enabled_capabilities=workspace.effective_model_capabilities(m.model_name, project),
                 settings=dict(pm.settings) if (pm := workspace.project_model(project, m.model_name)) else {},
             )
             for m in models
@@ -408,13 +432,19 @@ async def update_project_model(
     request: _UpdateProjectModelRequest,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """Update a project's model settings (enabled/active/settings).
+    """Update a project's model settings (enabled/active/capabilities/settings).
 
     Per-project overrides take precedence over the workspace (app-default)
-    registry.  Disabling a model also unloads any resident instance — VRAM is
-    shared across projects, so the unload stays global.  Download state is not
-    settable here: weights are added and removed workspace-wide, so the
-    ``downloaded`` field in the response is read-only.
+    registry.  Disabling a model — or switching one of its capabilities off —
+    also unloads any resident instance; VRAM is shared across projects, so the
+    unload stays global.  Download state is not settable here: weights are added
+    and removed workspace-wide, so the ``downloaded`` field in the response is
+    read-only.
+
+    ``capabilities`` is a sparse map of capability → enabled.  A capability the
+    model doesn't support, or one whose removal would leave the model with none,
+    is a 400 — a model that is enabled but has no capability is selectable by
+    nothing, so ``enabled`` is the way to turn it off entirely.
     """
     try:
         # An older client may still address the model by its previous name.
@@ -449,6 +479,38 @@ async def update_project_model(
                 # instance.
                 model_service.unload_model_by_name(model_name)
 
+        if request.capabilities is not None:
+            # The workspace is a long-lived singleton, so a half-applied map
+            # would leak into later reads even though the save below is never
+            # reached.  Snapshot the deny-list and roll it back on rejection so
+            # a 400 leaves the project exactly as it was.
+            denied_before = list(pm.disabled_capabilities)
+            try:
+                for capability, cap_enabled in request.capabilities.items():
+                    workspace.set_project_model_capability(
+                        project, model_name, capability, cap_enabled,
+                    )
+            except ValueError as e:
+                pm.disabled_capabilities = denied_before
+                raise HTTPException(status_code=400, detail=str(e))
+            if set(pm.disabled_capabilities) - set(denied_before):
+                # Switching a capability off has to free the instance serving
+                # it: the gate is read when a model is *selected*, but
+                # ``get_vision_llm``, ``_get_large_llm`` and the pinned-model
+                # path all short-circuit on a resident instance before that
+                # sweep runs, so a still-loaded model would keep answering for
+                # the capability just turned off.  Only on a shrink — turning
+                # one back on widens the gate and the resident instance stays
+                # valid.
+                #
+                # Note this is *not* ``unload_model_by_name``: that frees every
+                # slot the model occupies, which would drop the text instance a
+                # model still used for skills needs.  Only the slots that lost
+                # a capability go.  The unload is global (VRAM is shared across
+                # projects) and the caches are lazy, so another project reloads
+                # on next use.
+                model_service.unload_disabled_capability_slots(model_name)
+
         if request.is_active is not None:
             if request.is_active:
                 for other in project.model_settings:
@@ -468,6 +530,7 @@ async def update_project_model(
             "downloaded": workspace.effective_model_downloaded(model_name),
             "is_active": pm.is_active,
             "capabilities": _display_capabilities(model.effective_capabilities),
+            "enabled_capabilities": workspace.effective_model_capabilities(model_name, project),
             "settings": dict(pm.settings),
         }
     except HTTPException:

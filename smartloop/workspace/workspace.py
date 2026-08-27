@@ -133,6 +133,10 @@ class ProjectModel(BaseModel):
     project-level inference defaults (temperature, top_p, top_k, …) that will
     be added later.
 
+    ``disabled_capabilities`` records which of the model's capabilities the
+    project has turned off, and is resolved by
+    :meth:`Workspace.effective_model_capabilities`.
+
     Download state deliberately lives only on :class:`WorkspaceModel`: weights
     are downloaded and removed for the whole workspace, so a per-project copy
     would be a cache of a global fact with nothing to invalidate it.  See
@@ -145,6 +149,12 @@ class ProjectModel(BaseModel):
     # that the model class's).  Only meaningful for a model declaring
     # ``ModelCapability.THINKING``; see ``effective_model_thinking``.
     thinking: Optional[bool] = None
+    # Capabilities the user switched off for this project.  A deny-list rather
+    # than an allow-list: a capability *added* to a model class in a later
+    # release is then enabled by default in projects that already exist, which
+    # keeps the no-per-install-migration property the supported set already has
+    # (see :attr:`WorkspaceModel.effective_capabilities`).
+    disabled_capabilities: List[str] = Field(default_factory=list)
     settings: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("model_name")
@@ -158,6 +168,23 @@ class ProjectModel(BaseModel):
         workspace default.
         """
         return canonical_model_name(value)
+
+    @field_validator("disabled_capabilities")
+    @classmethod
+    def _clean_disabled_capabilities(cls, value: List[str]) -> List[str]:
+        """Normalize the deny-list, dropping anything that isn't a capability.
+
+        Entries are lowercased and de-duplicated, first occurrence winning.  A
+        value that no longer names a :class:`ModelCapability` — one dropped from
+        the enum since this config was written — is discarded rather than
+        failing the load, so an older ``config.json`` still opens.  Telling a
+        caller that a capability is unknown is the API layer's job, where there
+        is someone to tell.
+        """
+        known = {c.value for c in ModelCapability}
+        return list(dict.fromkeys(
+            v.lower() for v in value if isinstance(v, str) and v.lower() in known
+        ))
 
 
 class WorkspaceModel(BaseModel):
@@ -619,6 +646,43 @@ class Workspace(BaseModel):
         self.pin_model_for_existing_projects(model_name)
         ws.enabled = True
 
+    @staticmethod
+    def _selectable_capabilities(caps: List[str]) -> List[str]:
+        """*caps* minus the ones no selection path can ask for.
+
+        ``ModelCapability.THINKING`` declares that the chat template reads
+        ``enable_thinking``; nothing routes to it, and it is switched with the
+        ``thinking`` setting (see :meth:`effective_model_thinking`) rather than
+        the project deny-list.  Counting it as a capability would let a project
+        turn every routing capability off and still pass the last-capability
+        guard below, leaving an enabled model nothing selects.
+        """
+        thinking = ModelCapability.THINKING.value
+        return [c for c in caps if getattr(c, "value", c).lower() != thinking]
+
+    def effective_model_capabilities(self, model_name: str, project: Optional[Project] = None) -> List[str]:
+        """Capabilities *model_name* may be selected for on *project*.
+
+        The model's supported set (class-declared — see
+        :attr:`WorkspaceModel.effective_capabilities`) minus the capabilities
+        the project has switched off.  Resolution is intersective, so a stale
+        deny-list entry for a capability since dropped from the model class
+        contributes nothing, and elements come from the supported set unchanged
+        so callers comparing against :class:`ModelCapability` members still
+        match.
+
+        This is what every selection path reads (``ranked_models_for`` and the
+        sweeps in ``ModelService``); ``effective_capabilities`` remains the full
+        supported set the client renders from.
+        """
+        ws = self.get_model(model_name)
+        supported = self._selectable_capabilities(ws.effective_capabilities) if ws is not None else []
+        pm = self.project_model(project, model_name)
+        if pm is None or not pm.disabled_capabilities:
+            return supported
+        denied = {c.lower() for c in pm.disabled_capabilities}
+        return [c for c in supported if c.lower() not in denied]
+
     def set_project_model_enabled(self, project: Project, model_name: str, enabled: bool) -> Optional[ProjectModel]:
         """Set *model_name*'s enabled state on *project*, upserting an entry.
 
@@ -654,6 +718,66 @@ class Workspace(BaseModel):
                 other.is_active = (other is pm)
         else:
             pm.is_active = False
+        return pm
+
+    def set_project_model_capability(
+        self, project: Project, model_name: str, capability: str, enabled: bool,
+    ) -> Optional[ProjectModel]:
+        """Toggle one capability of *model_name* on *project*, upserting an entry.
+
+        Only the named capability is touched, so a client toggling one control
+        never has to restate the others.
+
+        Returns ``None`` without writing anything for the bootstrap model, which
+        has no per-project entry (see :meth:`is_bootstrap_model`).
+
+        Raises ``ValueError`` when the model is unknown, when *capability* is
+        not one it supports, or when disabling would leave it with none: a model
+        that is enabled but has no capability is selectable by nothing and
+        cannot be rendered coherently, so turning the model itself off (see
+        :meth:`set_project_model_enabled`) is the way to do that.
+        """
+        if self.is_bootstrap_model(model_name):
+            return None
+        ws = self.get_model(model_name)
+        if ws is None:
+            raise ValueError(f"Model not found: {model_name}")
+
+        # ``capability`` arrives either as a plain string or as a
+        # ``ModelCapability`` member (the API types the request keys as the
+        # enum).  ``str()`` on a member renders "ModelCapability.VISION", so go
+        # through ``.value``.
+        cap = getattr(capability, "value", capability).lower()
+        if cap == ModelCapability.THINKING.value:
+            raise ValueError(
+                "Reasoning is not a per-project capability toggle; set it with "
+                "the model's 'thinking' setting instead."
+            )
+        supported = self._selectable_capabilities(ws.effective_capabilities)
+        if cap not in {c.lower() for c in supported}:
+            raise ValueError(
+                f"Model {model_name} does not support capability '{cap}'"
+            )
+
+        self.sync_project_models(project)
+        pm = self.project_model(project, model_name)
+        if pm is None:
+            pm = ProjectModel(model_name=model_name)
+            project.model_settings.append(pm)
+
+        denied = {c.lower() for c in pm.disabled_capabilities}
+        if enabled:
+            denied.discard(cap)
+        else:
+            if {c.lower() for c in supported} - denied == {cap}:
+                raise ValueError(
+                    f"Cannot disable '{cap}': it is the last capability of "
+                    f"{model_name}. Disable the model instead."
+                )
+            denied.add(cap)
+        # Rebuild from the supported set so the stored order is stable and any
+        # stale entry (a capability dropped from the model class) is pruned.
+        pm.disabled_capabilities = [c.lower() for c in supported if c.lower() in denied]
         return pm
 
     def get_model(self, model_name: Optional[str] = None) -> Optional[WorkspaceModel]:
@@ -748,7 +872,10 @@ class Workspace(BaseModel):
         a smaller same-capability model when the largest doesn't fit in memory,
         rather than dropping straight to the tiny default. Empty when no
         downloaded model declares the capability.  Per-project settings
-        (``project=``) override the workspace defaults.
+        (``project=``) override the workspace defaults — both the model's
+        enabled flag and its per-capability toggles, so a model the project has
+        switched off for *this* capability drops out while still ranking for its
+        others.
         """
         cap = capability.lower()
         candidates = [
@@ -756,7 +883,7 @@ class Workspace(BaseModel):
             if self.effective_model_enabled(m.model_name, project)
             and self.effective_model_downloaded(m.model_name)
             and m.param_size_b > 0
-            and cap in [c.lower() for c in m.effective_capabilities]
+            and cap in [c.lower() for c in self.effective_model_capabilities(m.model_name, project)]
         ]
         candidates.sort(key=lambda m: m._rank, reverse=True)
         for m in candidates:

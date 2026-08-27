@@ -329,3 +329,290 @@ class TestWorkspaceDefaultEdit:
         for project_id in ("p1", "p2"):
             models = {m["model_name"]: m for m in client.get(f"/v1/projects/{project_id}/models").json()}
             assert models["gemma3-4b"]["enabled"] is True
+
+
+class TestProjectModelCapabilities:
+    """Per-capability toggles on a project's model.
+
+    ``capabilities`` is what the model supports (read-only, from the model
+    class); ``enabled_capabilities`` is the subset switched on for this project.
+    A client renders one control per supported capability and reads the enabled
+    set to know which are on, so both have to be reported.
+    """
+
+    def test_all_capabilities_start_enabled(self, isolated_workspace, client):
+        entry = next(
+            m for m in client.get("/v1/projects/p1/models").json()
+            if m["model_name"] == "gemma3-4b"
+        )
+
+        assert entry["capabilities"] == ["general", "dp"]
+        assert entry["enabled_capabilities"] == ["general", "dp"]
+
+    def test_patch_toggles_one_capability(self, isolated_workspace, client):
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        assert resp.status_code == 200
+        # The supported set is unchanged — the client still needs it to offer a
+        # way to switch dp back on.
+        assert resp.json()["capabilities"] == ["general", "dp"]
+        assert resp.json()["enabled_capabilities"] == ["general"]
+
+    def test_the_list_reflects_the_toggle(self, isolated_workspace, client):
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        entry = next(
+            m for m in client.get("/v1/projects/p1/models").json()
+            if m["model_name"] == "gemma3-4b"
+        )
+        assert entry["capabilities"] == ["general", "dp"]
+        assert entry["enabled_capabilities"] == ["general"]
+
+    def test_toggling_back_on_restores_it(self, isolated_workspace, client):
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": True}}
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["enabled_capabilities"] == ["general", "dp"]
+
+    def test_projects_are_independent(self, isolated_workspace, client):
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        p2 = {m["model_name"]: m for m in client.get("/v1/projects/p2/models").json()}
+        assert p2["gemma3-4b"]["enabled_capabilities"] == ["general", "dp"]
+
+    def test_a_toggle_leaves_the_other_fields_alone(self, isolated_workspace, client):
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        assert resp.json()["enabled"] is True
+        assert resp.json()["downloaded"] is True
+        assert resp.json()["settings"] == {}
+
+    def test_disabling_the_model_keeps_its_capability_state(self, isolated_workspace, client):
+        """``enabled`` is the master switch; the toggles persist underneath it."""
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+        client.patch("/v1/projects/p1/models/gemma3-4b", json={"enabled": False})
+
+        resp = client.patch("/v1/projects/p1/models/gemma3-4b", json={"enabled": True})
+        assert resp.json()["enabled_capabilities"] == ["general"]
+
+    def test_400_when_disabling_the_last_capability(self, isolated_workspace, client):
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"general": False}}
+        )
+
+        assert resp.status_code == 400
+        assert "last capability" in resp.json()["detail"]
+
+    def test_400_when_disabling_the_only_capability_of_a_single_capability_model(
+        self, isolated_workspace, client,
+    ):
+        resp = client.patch(
+            "/v1/projects/p1/models/qwen2-vl-2b", json={"capabilities": {"vision": False}}
+        )
+
+        assert resp.status_code == 400
+        assert "last capability" in resp.json()["detail"]
+
+    def test_400_for_a_capability_the_model_does_not_support(self, isolated_workspace, client):
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"vision": False}}
+        )
+
+        assert resp.status_code == 400
+        assert "does not support" in resp.json()["detail"]
+
+    def test_422_for_a_value_that_is_not_a_capability(self, isolated_workspace, client):
+        """Typing the request key as the enum rejects it before the handler."""
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b",
+            json={"capabilities": {"not-a-capability": False}},
+        )
+
+        assert resp.status_code == 422
+
+    def test_a_rejected_toggle_leaves_the_project_untouched(self, isolated_workspace, client):
+        """A partly-applied map must not leak into the in-memory workspace."""
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b",
+            json={"capabilities": {"dp": False, "general": False}},
+        )
+
+        assert resp.status_code == 400
+        entry = next(
+            m for m in client.get("/v1/projects/p1/models").json()
+            if m["model_name"] == "gemma3-4b"
+        )
+        assert entry["enabled_capabilities"] == ["general", "dp"]
+
+    def test_toggle_persists_to_disk(self, isolated_workspace, client):
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        from smartloop.workspace.workspace import Workspace as WS
+        with patch.object(WS, "config_file", isolated_workspace["config_file"]):
+            reloaded = WS.load()
+        project = next(p for p in reloaded.projects if p.id == "p1")
+        entry = next(m for m in project.model_settings if m.model_name == "gemma3-4b")
+        assert entry.disabled_capabilities == ["dp"]
+
+    def test_settings_cannot_reach_capability_state(self, isolated_workspace, client):
+        """``settings`` is an unvalidated catch-all, so the deny-list is not in it.
+
+        Were it stored there, this request would empty the model's capability
+        set behind the guards above.
+        """
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b",
+            json={"settings": {"disabled_capabilities": ["general", "dp"]}},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["enabled_capabilities"] == ["general", "dp"]
+
+    def test_bootstrap_model_is_rejected(self, isolated_workspace, client):
+        resp = client.patch(
+            f"/v1/projects/p1/models/{AppSettings().default_model}",
+            json={"capabilities": {"general": False}},
+        )
+
+        assert resp.status_code == 400
+        assert "always enabled" in resp.json()["detail"]
+
+
+class TestCapabilityToggleUnloadsTheModel:
+    """Switching a capability off has to free the resident instance.
+
+    The project gate is read when a model is *selected*, but ``get_vision_llm``
+    and ``_get_large_llm`` short-circuit on their name-keyed cache before that
+    sweep runs.  Without an unload here a model already in VRAM would keep
+    serving the capability the user just switched off, which is the same reason
+    the ``enabled`` flag unloads.
+    """
+
+    @pytest.fixture()
+    def unload(self):
+        from smartloop.api.services.model_service import ModelService
+        with patch.object(ModelService, "unload_disabled_capability_slots") as m:
+            yield m
+
+    def test_disabling_a_capability_unloads(self, isolated_workspace, client, unload):
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        assert resp.status_code == 200
+        unload.assert_called_once_with("gemma3-4b")
+
+    def test_enabling_a_capability_does_not_unload(self, isolated_workspace, client, unload):
+        """Turning one back on only widens the gate, so the instance stays valid."""
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+        unload.reset_mock()
+
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": True}}
+        )
+
+        assert resp.status_code == 200
+        unload.assert_not_called()
+
+    def test_a_no_op_patch_does_not_unload(self, isolated_workspace, client, unload):
+        """Re-sending the state a capability is already in must not drop VRAM."""
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": True}}
+        )
+
+        assert resp.status_code == 200
+        unload.assert_not_called()
+
+    def test_a_rejected_patch_does_not_unload(self, isolated_workspace, client, unload):
+        """The 400 leaves the deny-list untouched, so nothing should be freed."""
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+        unload.reset_mock()
+
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"general": False}}
+        )
+
+        assert resp.status_code == 400
+        unload.assert_not_called()
+
+    def test_a_partially_rejected_map_does_not_unload(self, isolated_workspace, client, unload):
+        """The whole map is rolled back on rejection, so it is not a shrink."""
+        resp = client.patch(
+            "/v1/projects/p1/models/gemma3-4b",
+            json={"capabilities": {"dp": False, "general": False}},
+        )
+
+        assert resp.status_code == 400
+        unload.assert_not_called()
+
+
+class TestCatalogAgreesWithTheProjectView:
+    """GET /v1/models?project_id= must resolve the same enabled set.
+
+    The catalog view and the project view render the same controls, so a
+    capability switched off in one has to read as off in the other.
+    """
+
+    @pytest.fixture(autouse=True)
+    def catalog(self, platform_service):
+        """The cloud catalog behind GET /v1/models (see the router docstring)."""
+        platform_service.list_models.return_value = [
+            {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it"},
+            {"name": "qwen2-vl-2b", "model_id": "Qwen/Qwen2-VL-2B-Instruct"},
+        ]
+
+    def test_enabled_capabilities_follow_the_project(self, isolated_workspace, client):
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        listed = {m["name"]: m for m in client.get("/v1/models?project_id=p1").json()}
+        assert listed["gemma3-4b"]["capabilities"] == ["general", "dp"]
+        assert listed["gemma3-4b"]["enabled_capabilities"] == ["general"]
+
+    def test_without_a_project_the_full_set_is_reported(self, isolated_workspace, client):
+        client.patch(
+            "/v1/projects/p1/models/gemma3-4b", json={"capabilities": {"dp": False}}
+        )
+
+        # No project_id — nothing to resolve the toggles against, so the
+        # workspace (app-default) view reports everything supported.
+        listed = {m["name"]: m for m in client.get("/v1/models").json()}
+        assert listed["gemma3-4b"]["enabled_capabilities"] == ["general", "dp"]
+
+    def test_a_model_absent_from_the_workspace_reports_its_class_defaults(
+        self, isolated_workspace, client, platform_service,
+    ):
+        """Nothing can have been toggled off for a model not registered here."""
+        platform_service.list_models.return_value = [
+            {"name": "gemma4-e4b", "model_id": "google/gemma-4-e4b-it"},
+        ]
+
+        listed = {m["name"]: m for m in client.get("/v1/models?project_id=p1").json()}
+        assert listed["gemma4-e4b"]["enabled_capabilities"] == ["general", "dp", "vision"]

@@ -76,6 +76,22 @@ def _n_ctx_desc(cap: int) -> str:
     """
     return f"n_ctx={cap}" if cap > 0 else "an auto-sized context"
 
+
+# The capabilities that make a model a candidate for text work — the agent /
+# synthesis model and the "has it any text capability left" checks.  Held as
+# plain values rather than ``ModelCapability`` members because both consumers
+# intersect it with capability *strings* read off the workspace, and a str-enum
+# member does not hash as its value (the same reason ``_ranked_candidates``
+# lowercases both sides before scoring overlap).
+#
+# ``CODING`` is deliberately absent: a coding model is routed to explicitly and
+# has never stood in as the general agent model.
+_TEXT_CAPS = frozenset({
+    ModelCapability.GENERAL.value,
+    ModelCapability.SKILLS.value,
+    ModelCapability.DP.value,
+})
+
 # Exceptions that indicate code defects (not recoverable runtime/IO
 # failures).  These re-raise instead of degrading to an empty result so
 # bugs surface loudly rather than silently returning no context.
@@ -563,7 +579,7 @@ class ModelService:
             m for m in workspace.models
             if workspace.effective_model_enabled(m.model_name, project)
             and workspace.effective_model_downloaded(m.model_name)
-            and ModelCapability.VISION in m.effective_capabilities
+            and ModelCapability.VISION in self._enabled_capabilities(m)
         ]
         # Smallest first: lowest latency OCR; same-size ties broken by cap overlap then version.
         candidates = self._ranked_candidates(
@@ -651,8 +667,24 @@ class ModelService:
             logger.warning("[vision] No runnable vision model available — image OCR disabled")
         return None
 
-    @staticmethod
+    def _enabled_capabilities(self, ws_model) -> list:
+        """Capabilities *ws_model* may be selected for in the current project.
+
+        Its class-declared set minus the capabilities the project has switched
+        off (see ``Workspace.effective_model_capabilities``).  Every selection
+        sweep below reads this rather than ``effective_capabilities``, which
+        stays the full supported set the client renders from.  Falls back to the
+        supported set when no workspace is loaded.
+        """
+        workspace = self._model.workspace if self._model else None
+        if workspace is None:
+            return list(ws_model.effective_capabilities)
+        return workspace.effective_model_capabilities(
+            ws_model.model_name, workspace.current_project,
+        )
+
     def _ranked_candidates(
+        self,
         candidates: list,
         ref_caps: set,
         descending: bool = True,
@@ -661,14 +693,23 @@ class ModelService:
 
         ``ref_caps`` is the reference capability set used to score overlap so
         that same-size models with broader coverage rank above narrower ones.
+        Overlap is scored against each model's *project-enabled* capabilities,
+        so coverage the project has switched off doesn't win a tie-break for
+        work the model won't be picked for.  Both sides are lowercased first:
+        ``ref_caps`` arrives as ``ModelCapability`` members from some callers
+        and as the planner's raw capability string from others, so comparing
+        them as plain strings keeps the score off the enum's hashing behavior
+        (which has moved between Python versions) and matches how the rest of
+        this module compares capabilities.
         Pass ``descending=True`` (default) to walk largest→smallest; pass
         ``False`` to walk smallest→largest.
         """
+        ref = {c.lower() for c in ref_caps}
         return sorted(
             candidates,
             key=lambda m: (
                 m._rank[0],
-                len(ref_caps & set(m.effective_capabilities)),
+                len(ref & {c.lower() for c in self._enabled_capabilities(m)}),
                 m._rank[1],
             ),
             reverse=descending,
@@ -721,9 +762,13 @@ class ModelService:
             return None
         ws_model = selected[0]
 
+        # The project-enabled set, not the model's full declared set: a
+        # capability the project switched off must not be pinnable, or the one
+        # path that skips capability ranking entirely would be the one place
+        # the toggle is ignored.
         caps = {
             self._cap_name(c).lower()
-            for c in (ws_model.effective_capabilities or [])
+            for c in (self._enabled_capabilities(ws_model) or [])
         }
         if ModelCapability.GENERAL.value in caps:
             return ws_model
@@ -1215,13 +1260,15 @@ class ModelService:
             # which only declares VISION) without requiring a specific SKILLS tag.
             # Walk largest-first; when the biggest doesn't fit, fall to the next
             # lower tier (e.g. gemma4-4b → gemma4-2b) rather than the tiny router.
-            _text_caps = {ModelCapability.GENERAL, ModelCapability.SKILLS, ModelCapability.DP}
             agent_models = [
                 m for m in workspace.models
                 if workspace.effective_model_enabled(m.model_name, project)
                 and workspace.effective_model_downloaded(m.model_name)
                 and m.model_name != self._model_name
-                and _text_caps & set(m.effective_capabilities)
+                and _TEXT_CAPS & {
+                    self._cap_name(c).lower()
+                    for c in self._enabled_capabilities(m)
+                }
             ]
             if not agent_models:
                 logger.info(
@@ -1231,7 +1278,7 @@ class ModelService:
                 return
             # Rank largest→smallest; same-size models with more cap overlap win.
             agent_models = self._ranked_candidates(
-                agent_models, ref_caps=_text_caps, descending=True,
+                agent_models, ref_caps=_TEXT_CAPS, descending=True,
             )
 
             from smartloop.config.app_settings import AppSettings
@@ -3625,6 +3672,92 @@ class ModelService:
 
         return unloaded
 
+    def unload_disabled_capability_slots(self, model_name: str) -> bool:
+        """Free resident instances of *model_name* this project can no longer pick.
+
+        ``get_vision_llm``, ``_get_large_llm`` and :meth:`_load_workspace_llm`
+        all short-circuit on a name-keyed resident instance *before* any
+        capability sweep runs, so switching a capability off has to evict the
+        slot that serves it or the model keeps answering for it.
+
+        Unlike :meth:`unload_model_by_name` this frees only the slots that
+        actually lost a capability.  Turning vision off on a model that still
+        has skills leaves its text instance resident — that is a separate
+        llama.cpp context (loaded without the mmproj projector), still fully
+        selectable, and dropping it would cost a reload for nothing.
+
+        The ``_cap_llm_<name>`` cache goes only when *every* text capability is
+        off.  It cannot be split any finer: the slot is keyed by model name, not
+        by capability, and it is text-only (``_load_workspace_llm`` picks its
+        GGUF through ``_find_model_ggufs``, which excludes the projector).  So
+        while one text capability remains it is still a legitimate pick, and
+        once none does nothing can reach it — including the pinned-model path,
+        which hands a sole selected model straight to ``_load_workspace_llm``
+        and would otherwise be served the cached instance for a capability the
+        project just switched off.
+
+        Idempotent; returns True if anything was actually unloaded.
+        """
+        workspace = self._model.workspace if self._model else None
+        if workspace is None:
+            return False
+        enabled = {
+            self._cap_name(c).lower()
+            for c in workspace.effective_model_capabilities(
+                model_name, workspace.current_project,
+            )
+        }
+        # The large/agent model is picked from any text capability, so it only
+        # goes stale once the project has switched *all* of them off — dropping
+        # 'skills' while 'general' stays on leaves it a valid pick.
+        has_text = bool(_TEXT_CAPS & enabled)
+
+        with self._inference_slot():
+            unloaded = False
+
+            if (self._vision_llm is not None
+                    and self._vision_model_name == model_name
+                    and ModelCapability.VISION.value not in enabled):
+                logger.info(
+                    "[unload] Releasing vision model %s — vision is switched "
+                    "off for this project", model_name,
+                )
+                self._free_llm(self._vision_llm)
+                self._vision_llm = None
+                self._vision_model_name = None
+                self._vision_unavailable = False
+                unloaded = True
+
+            if (self._large_llm is not None
+                    and self._large_model_name == model_name
+                    and not has_text):
+                logger.info(
+                    "[unload] Releasing large model %s — it has no text "
+                    "capability left for this project", model_name,
+                )
+                self._free_llm(self._large_llm)
+                self._large_llm = None
+                self._large_model_name = None
+                self._large_model_attempted = False
+                unloaded = True
+
+            if not has_text:
+                cache_key = f"_cap_llm_{model_name}"
+                cached = getattr(self, cache_key, None)
+                if cached is not None and cached is not _GPU_FAULTED:
+                    logger.info(
+                        "[unload] Releasing capability model %s — it has no "
+                        "text capability left for this project", model_name,
+                    )
+                    self._free_llm(cached)
+                    setattr(self, cache_key, None)
+                    unloaded = True
+
+            if unloaded:
+                self._cleanup_gpu_cache()
+
+        return unloaded
+
     # --------------------------------------------------------------- MCP servers
 
     def add_remote_mcp_server(
@@ -5172,14 +5305,14 @@ class ModelService:
             for m in workspace.models:
                 if (workspace.effective_model_enabled(m.model_name, project)
                         and workspace.effective_model_downloaded(m.model_name)):
-                    caps.extend(m.effective_capabilities)
+                    caps.extend(self._enabled_capabilities(m))
             available_capabilities = list(dict.fromkeys(caps))
             logger.info(
                 "[caps] models=%s available_capabilities=%s",
                 [(m.model_name,
                   workspace.effective_model_enabled(m.model_name, project),
                   workspace.effective_model_downloaded(m.model_name),
-                  m.effective_capabilities)
+                  self._enabled_capabilities(m))
                  for m in workspace.models],
                 available_capabilities,
             )

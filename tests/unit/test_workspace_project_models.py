@@ -2,7 +2,9 @@
 
 import pytest
 
+from smartloop.config import SUPPORTED_MODELS
 from smartloop.config.app_settings import AppSettings
+from smartloop.types import ModelCapability
 from smartloop.workspace.workspace import Project, ProjectModel, Workspace, WorkspaceModel
 
 BOOTSTRAP_MODEL = AppSettings().default_model
@@ -386,3 +388,289 @@ class TestLegacyModelNames:
         # A model with no alias still resolves by its own name.
         assert ws.project_model(project, "gemma3-4b").enabled is False
         assert ws.effective_model_enabled("gemma3-4b", project) is False
+
+
+def _make_capability_workspace() -> Workspace:
+    """Workspace whose selectable model declares three capabilities.
+
+    ``gemma4-e4b`` (general/dp/vision) gives room to switch one capability off
+    and still assert on the rest — ``gemma3-4b`` in :func:`_make_workspace` only
+    has two, so the last-capability guard fires too early to test the middle
+    cases.  ``qwen2-vl-2b`` declares vision alone, which is exactly the
+    single-capability model that guard exists for.
+    """
+    return Workspace(
+        id="ws-caps",
+        models=[
+            WorkspaceModel(
+                model_name=BOOTSTRAP_MODEL,
+                model_id="smartloop/slp-orchestra-mini",
+                downloaded=True,
+                enabled=True,
+            ),
+            WorkspaceModel(
+                model_name="gemma4-e4b",
+                model_id="google/gemma-4-e4b-it",
+                downloaded=True,
+                enabled=True,
+            ),
+            WorkspaceModel(
+                model_name="qwen2-vl-2b",
+                model_id="Qwen/Qwen2-VL-2B-Instruct",
+                downloaded=True,
+                enabled=True,
+            ),
+        ],
+        projects=[Project(id="p1", project_dir="/tmp/p1", current=True, name="p1")],
+    )
+
+
+class TestPerCapabilityToggles:
+    """A project can switch individual capabilities of a model off.
+
+    ``WorkspaceModel.effective_capabilities`` stays the *supported* set (what a
+    client renders); ``Workspace.effective_model_capabilities`` is the subset a
+    project will actually select the model for.
+    """
+
+    def test_all_capabilities_start_enabled(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.sync_project_models(project)
+
+        assert ws.project_model(project, "gemma4-e4b").disabled_capabilities == []
+        # Everything the model can be selected for; "thinking" is not one of
+        # those (it has its own setting), so it is absent from the resolved set
+        # even though the model declares it.
+        assert (ws.effective_model_capabilities("gemma4-e4b", project)
+                == [c for c in ws.get_model("gemma4-e4b").effective_capabilities
+                    if c != ModelCapability.THINKING])
+
+    def test_disabling_one_leaves_the_supported_set_alone(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+
+        enabled = [c.value for c in ws.effective_model_capabilities("gemma4-e4b", project)]
+        assert "vision" not in enabled
+        assert {"general", "dp"} <= set(enabled)
+        # The model still *supports* vision — the client needs that to offer a
+        # way to switch it back on.
+        assert ModelCapability.VISION in ws.get_model("gemma4-e4b").effective_capabilities
+
+    def test_toggling_back_on_restores_it(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", True)
+
+        assert ws.project_model(project, "gemma4-e4b").disabled_capabilities == []
+        assert ModelCapability.VISION in ws.effective_model_capabilities("gemma4-e4b", project)
+
+    def test_a_second_toggle_does_not_resurrect_the_first(self):
+        """Each toggle is independent — the deny-list accumulates."""
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+        ws.set_project_model_capability(project, "gemma4-e4b", "dp", False)
+
+        assert ws.project_model(project, "gemma4-e4b").disabled_capabilities == ["dp", "vision"]
+        assert [c.value for c in ws.effective_model_capabilities("gemma4-e4b", project)] == ["general"]
+
+    def test_projects_are_independent(self):
+        ws = _make_capability_workspace()
+        p1 = ws.projects[0]
+        p2 = Project(id="p2", project_dir="/tmp/p2", current=False, name="p2")
+        ws.projects.append(p2)
+
+        ws.set_project_model_capability(p1, "gemma4-e4b", "vision", False)
+
+        assert ModelCapability.VISION not in ws.effective_model_capabilities("gemma4-e4b", p1)
+        assert ModelCapability.VISION in ws.effective_model_capabilities("gemma4-e4b", p2)
+
+    def test_no_project_reports_the_full_supported_set(self):
+        ws = _make_capability_workspace()
+        ws.set_project_model_capability(ws.projects[0], "gemma4-e4b", "vision", False)
+
+        # Selection paths that pass no project resolve to workspace defaults,
+        # which carry no per-capability state.
+        assert ModelCapability.VISION in ws.effective_model_capabilities("gemma4-e4b")
+
+    def test_unknown_model_reports_nothing(self):
+        ws = _make_capability_workspace()
+        assert ws.effective_model_capabilities("nope", ws.projects[0]) == []
+
+    def test_rejects_a_capability_the_model_does_not_support(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+
+        with pytest.raises(ValueError, match="does not support"):
+            ws.set_project_model_capability(project, "gemma4-e4b", "coding", False)
+
+        assert ws.project_model(project, "gemma4-e4b") is None or \
+            ws.project_model(project, "gemma4-e4b").disabled_capabilities == []
+
+    def test_rejects_disabling_the_last_capability(self):
+        """An enabled model with no capability is selectable by nothing."""
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+        ws.set_project_model_capability(project, "gemma4-e4b", "dp", False)
+
+        with pytest.raises(ValueError, match="last capability"):
+            ws.set_project_model_capability(project, "gemma4-e4b", "general", False)
+
+        assert [c.value for c in ws.effective_model_capabilities("gemma4-e4b", project)] == ["general"]
+
+    def test_a_single_capability_model_cannot_be_emptied(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+
+        with pytest.raises(ValueError, match="last capability"):
+            ws.set_project_model_capability(project, "qwen2-vl-2b", "vision", False)
+
+    def test_the_model_switch_and_the_toggles_are_independent(self):
+        """Turning the model off keeps its capability choices for later."""
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+
+        ws.set_project_model_enabled(project, "gemma4-e4b", False)
+        assert ws.project_model(project, "gemma4-e4b").disabled_capabilities == ["vision"]
+
+        ws.set_project_model_enabled(project, "gemma4-e4b", True)
+        assert ModelCapability.VISION not in ws.effective_model_capabilities("gemma4-e4b", project)
+
+    def test_state_round_trips_through_serialization(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+
+        reloaded = Project.model_validate(project.model_dump(mode="json"))
+
+        entry = next(m for m in reloaded.model_settings if m.model_name == "gemma4-e4b")
+        assert entry.disabled_capabilities == ["vision"]
+
+    @pytest.mark.parametrize("stored,expected", [
+        (["VISION"], ["vision"]),                 # case is normalized
+        (["vision", "vision"], ["vision"]),       # duplicates collapse
+        (["vision", "not-a-capability"], ["vision"]),  # unknown values dropped
+    ])
+    def test_the_stored_list_is_normalized_on_load(self, stored, expected):
+        """A hand-edited or older config.json still loads.
+
+        Rejecting an unknown value outright would make a config written by a
+        build that had an extra capability unopenable; the API layer is where a
+        caller gets told.
+        """
+        assert ProjectModel(
+            model_name="gemma4-e4b", disabled_capabilities=stored,
+        ).disabled_capabilities == expected
+
+
+class TestCapabilityTogglesDriveSelection:
+    def test_ranked_models_for_drops_the_disabled_capability_only(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+
+        assert [m.model_name for m in ws.ranked_models_for("dp", project)] == ["gemma4-e4b"]
+
+        ws.set_project_model_capability(project, "gemma4-e4b", "dp", False)
+
+        # Gone for dp…
+        assert ws.ranked_models_for("dp", project) == []
+        # …but still the pick for the capabilities it kept.  (The bootstrap
+        # model infers "general" too and is never per-project configurable, so
+        # it trails the list.)
+        assert [m.model_name for m in ws.ranked_models_for("general", project)] == [
+            "gemma4-e4b", BOOTSTRAP_MODEL,
+        ]
+
+    def test_selection_falls_through_to_the_next_model(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        # Both declare vision; the larger one leads.
+        assert [m.model_name for m in ws.ranked_models_for("vision", project)] == [
+            "gemma4-e4b", "qwen2-vl-2b",
+        ]
+
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+
+        assert [m.model_name for m in ws.ranked_models_for("vision", project)] == ["qwen2-vl-2b"]
+
+    def test_best_model_for_follows_the_toggles(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+
+        assert ws.best_model_for("vision", project).model_name == "qwen2-vl-2b"
+
+    def test_ranked_models_for_ignores_toggles_when_no_project_is_passed(self):
+        ws = _make_capability_workspace()
+        ws.set_project_model_capability(ws.projects[0], "gemma4-e4b", "vision", False)
+
+        assert [m.model_name for m in ws.ranked_models_for("vision")] == [
+            "gemma4-e4b", "qwen2-vl-2b",
+        ]
+
+
+class TestCapabilitiesFollowTheModelClass:
+    """The deny-list is a complement, so class changes need no migration."""
+
+    def test_a_capability_added_later_is_enabled_without_migration(self, monkeypatch):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+
+        # A later release adds coding to the model class.  The project's stored
+        # state is untouched — an allow-list would have left it switched off.
+        model_cls = SUPPORTED_MODELS.get("gemma4-e4b")
+        monkeypatch.setattr(model_cls, "default_capabilities", staticmethod(lambda: [
+            ModelCapability.GENERAL, ModelCapability.DP,
+            ModelCapability.VISION, ModelCapability.CODING,
+        ]))
+
+        enabled = ws.effective_model_capabilities("gemma4-e4b", project)
+        assert ModelCapability.CODING in enabled
+        assert ModelCapability.VISION not in enabled   # still off, as the user set it
+
+    def test_a_capability_removed_later_leaves_no_phantom_entry(self, monkeypatch):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.set_project_model_capability(project, "gemma4-e4b", "vision", False)
+
+        # A later release drops vision from the model class.
+        model_cls = SUPPORTED_MODELS.get("gemma4-e4b")
+        monkeypatch.setattr(model_cls, "default_capabilities", staticmethod(lambda: [
+            ModelCapability.GENERAL, ModelCapability.DP,
+        ]))
+
+        assert [c.value for c in ws.effective_model_capabilities("gemma4-e4b", project)] == [
+            "general", "dp",
+        ]
+        # The stale entry is pruned the next time the deny-list is rewritten.
+        ws.set_project_model_capability(project, "gemma4-e4b", "dp", False)
+        assert ws.project_model(project, "gemma4-e4b").disabled_capabilities == ["dp"]
+
+
+class TestBootstrapModelCapabilitiesAreNotConfigurable:
+    def test_the_setter_refuses_to_create_an_entry(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.sync_project_models(project)
+
+        assert ws.set_project_model_capability(
+            project, BOOTSTRAP_MODEL, "general", False,
+        ) is None
+        assert ws.project_model(project, BOOTSTRAP_MODEL) is None
+
+    def test_it_keeps_its_full_capability_set(self):
+        ws = _make_capability_workspace()
+        project = ws.projects[0]
+        ws.sync_project_models(project)
+
+        assert (ws.effective_model_capabilities(BOOTSTRAP_MODEL, project)
+                == ws.get_model(BOOTSTRAP_MODEL).effective_capabilities)
