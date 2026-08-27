@@ -949,6 +949,44 @@ class TestEnvelopeUnwrapping:
 
         assert _unwrap_records({"cards": [], "nextCursor": None, "hasMore": False}) == []
 
+    def test_a_records_key_below_the_top_level_is_found(self):
+        # monday.com's workspace_info answers with the workspace, its folders
+        # and its root items, and the boards — the records, and the only source
+        # of board ids on the whole server — are two keys down.
+        from smartloop.db.mcp_document_indexer import _unwrap_records
+
+        records = _unwrap_records({
+            "message": "Workspace info retrieved",
+            "data": {
+                "workspace": {"id": "w1", "name": "Service"},
+                "folders": [],
+                "root_items": {
+                    "boards": [
+                        {"id": "18427542421", "name": "Tickets"},
+                        {"id": "18427542422", "name": "Subitems of Tickets"},
+                    ],
+                    "docs": [],
+                },
+            },
+        })
+        assert [r["id"] for r in records] == ["18427542421", "18427542422"]
+
+    def test_the_deep_search_only_trusts_a_known_record_name(self):
+        # get_user_context nests a user, an account and its products.  Pooling
+        # whatever lists happen to be nested would index a plan tier as a
+        # record of its own, so only the RECORD_LIST_KEYS vocabulary counts and
+        # this payload stays the single record it is.
+        from smartloop.db.mcp_document_indexer import _unwrap_records
+
+        payload = {
+            "message": "User context",
+            "user": {"id": "u1", "name": "Chris"},
+            "account": {"tier": "pro", "products": [{"kind": "service"}]},
+            "favorites": [],
+            "relevantBoards": [],
+        }
+        assert _unwrap_records(payload) == [payload]
+
     def test_a_step_fans_out_over_an_unknown_envelope(self):
         """The end of the same story: workspaces → boards actually walks."""
         with tempfile.TemporaryDirectory() as td:
@@ -1532,3 +1570,133 @@ class TestNotionComments:
                 a for tool, a in caller.calls if tool == "API-retrieve-a-comment"
             )
             assert args == {"page_id": "p1"}
+
+
+class TestStrictlyTypedArguments:
+    """A record id is text; a schema may say the argument is a number.
+
+    monday.com declares `workspace_id` and `boardId` as `number` and validates
+    without coercing: the string form comes back as "Expected number, received
+    string".  That failure is about the shape of the call rather than about one
+    parent, so the crawler abandons the whole step after it — the entire content
+    branch of the server, lost to a type.
+    """
+
+    def _monday_server(self):
+        return _server(name="monday.com", slug="monday", tools=[
+            _tool("get_user_context", {"properties": {}}),
+            _tool("list_workspaces", {"properties": {"limit": {"type": "number"}}}),
+            _tool("workspace_info", {
+                "properties": {"workspace_id": {"type": "number"}},
+                "required": ["workspace_id"],
+            }),
+            _tool("get_board_items_page", {
+                "properties": {
+                    "boardId": {"type": "number"},
+                    "limit": {"type": "number"},
+                    "includeColumns": {"type": "boolean"},
+                    "includeItemDescription": {"type": "boolean"},
+                },
+                "required": ["boardId"],
+            }),
+            _tool("get_updates", {
+                "properties": {
+                    "objectId": {"type": "string"},
+                    "objectType": {"type": "string"},
+                    "includeItemUpdates": {"type": "boolean"},
+                    "limit": {"type": "number"},
+                },
+                "required": ["objectId", "objectType"],
+            }),
+        ])
+
+    def _strict(self, name, kind):
+        """A tool that rejects the wrong type the way monday.com does."""
+        def handler(args):
+            value = args.get(name)
+            if not isinstance(value, kind) or isinstance(value, bool):
+                return _result(
+                    f'Error: Invalid arguments: expected {kind.__name__}, '
+                    f'received {type(value).__name__}',
+                    is_error=True,
+                )
+            return handler.reply(args)
+        return handler
+
+    def test_the_monday_walk_reaches_items_through_a_numeric_board_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            workspace_info = self._strict("workspace_id", int)
+            workspace_info.reply = lambda args: _result({
+                "message": "Workspace info retrieved",
+                "data": {
+                    "workspace": {"id": "17112294", "name": "Service"},
+                    "folders": [],
+                    "root_items": {
+                        "boards": [{"id": "18427542421", "name": "Tickets"}],
+                        "docs": [],
+                    },
+                },
+            })
+            items = self._strict("boardId", int)
+            items.reply = lambda args: _result({
+                "board": {"id": str(args["boardId"]), "name": "Tickets"},
+                "items": [{
+                    "id": "12860673314",
+                    "name": "Request for access",
+                    "url": "https://x.monday.com/boards/1/pulses/12860673314",
+                    "column_values": {"status95": "New", "priority": "Medium"},
+                }],
+            })
+            caller = FakeCaller({
+                "get_user_context": _result({"user": {"id": "u1", "name": "Chris"}}),
+                "list_workspaces": _result({
+                    "message": "Workspaces retrieved",
+                    "data": [{"id": "17112294", "name": "Service"}],
+                }),
+                "workspace_info": workspace_info,
+                "get_board_items_page": items,
+                "get_updates": _result("No updates found for board with id 1"),
+            })
+            idx = _indexer(td, caller)
+            stats = idx.crawl_server(self._monday_server(), force=True)
+
+            assert ("workspace_info", {"workspace_id": 17112294}) in caller.calls
+            assert any(
+                tool == "get_board_items_page" and args["boardId"] == 18427542421
+                for tool, args in caller.calls
+            )
+            text = "\n".join(_indexed_docs(idx._store).values())
+            assert "Request for access" in text
+            assert "priority" in text, "a row without its columns is only a title"
+            steps = {d["step"]: d for d in stats["details"]}
+            assert steps["board-items"]["records"] == 1
+
+    def test_an_id_the_schema_calls_a_string_is_left_as_text(self):
+        # The same account, the same kind of id: get_updates declares objectId
+        # a string.  Coercing everything numeric-looking would break this one.
+        with tempfile.TemporaryDirectory() as td:
+            workspace_info = self._strict("workspace_id", int)
+            workspace_info.reply = lambda args: _result({
+                "data": {
+                    "workspace": {"id": "17112294", "name": "Service"},
+                    "root_items": {"boards": [{"id": "18427542421", "name": "T"}]},
+                },
+            })
+            updates = self._strict("objectId", str)
+            updates.reply = lambda args: _result([
+                {"id": "up1", "text_body": "Access granted"},
+            ])
+            caller = FakeCaller({
+                "list_workspaces": _result({"data": [{"id": "17112294", "name": "S"}]}),
+                "workspace_info": workspace_info,
+                "get_board_items_page": _result({"items": []}),
+                "get_updates": updates,
+            })
+            idx = _indexer(td, caller)
+            idx.crawl_server(self._monday_server(), force=True)
+
+            assert any(
+                tool == "get_updates" and args["objectId"] == "18427542421"
+                for tool, args in caller.calls
+            )
+            assert "Access granted" in "\n".join(_indexed_docs(idx._store).values())

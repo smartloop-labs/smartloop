@@ -48,6 +48,7 @@ from smartloop.mcp.crawl_plans import (
     RECORD_TITLE_KEYS,
     CrawlPlan,
     CrawlStep,
+    coerce_argument,
     declares_argument,
     filter_arguments,
     resolve_argument,
@@ -131,12 +132,44 @@ def _first_str(data: Dict[str, Any], keys: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _nested_record_lists(data: Dict[str, Any], depth: int = 2) -> List[Any]:
+    """Pool the record lists a known key names *below* this level.
+
+    monday.com's ``workspace_info`` answers with ``{"workspace": {...},
+    "folders": [...], "root_items": {"boards": [...]}}``: the boards are the
+    records, two keys down, under an envelope name no other server uses.  The
+    search stops at the shallowest level that has any match and pools every
+    match there, so a board in a folder and a board at the root arrive as one
+    list rather than one of them winning.
+
+    Only the vocabulary in ``RECORD_LIST_KEYS`` counts, at any depth — pooling
+    whatever lists happen to be nested would turn a record's own sub-objects
+    (an issue's labels, a user's teams) into records of their own.
+    """
+    pooled: List[Any] = []
+    for key in RECORD_LIST_KEYS:
+        value = data.get(key)
+        if isinstance(value, list) and value and all(isinstance(i, dict) for i in value):
+            pooled.extend(value)
+    if pooled or depth <= 1:
+        return pooled
+    for value in data.values():
+        if isinstance(value, dict):
+            pooled.extend(_nested_record_lists(value, depth - 1))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    pooled.extend(_nested_record_lists(item, depth - 1))
+    return pooled
+
+
 def _unwrap_records(data: Any) -> List[Any]:
     """Find the record list inside a parsed tool result.
 
-    Handles the three shapes servers actually return: a bare list, an envelope
-    naming its list (``{"results": [...]}``, ``{"issues": {"nodes": [...]}}``),
-    and a single object.
+    Handles the shapes servers actually return: a bare list, an envelope naming
+    its list (``{"results": [...]}``, ``{"issues": {"nodes": [...]}}``), an
+    envelope that names it something new or keeps it a level or two down, and a
+    single object.
     """
     if isinstance(data, list):
         return data
@@ -169,11 +202,17 @@ def _unwrap_records(data: Any) -> List[Any]:
     if not _first_str(data, RECORD_ID_KEYS):
         listed = [
             value for value in data.values()
-            if isinstance(value, list)
+            if isinstance(value, list) and value
             and all(isinstance(item, dict) for item in value)
         ]
         if len(listed) == 1:
             return listed[0]
+        # Or names them a level or two further in: monday.com hands back the
+        # boards of a workspace under `data.root_items.boards`, and they are the
+        # only place a board id can be read from on that server.
+        nested = _nested_record_lists(data)
+        if nested:
+            return nested
     return [data]
 
 
@@ -750,7 +789,13 @@ class MCPDocumentIndexer:
                 text = record.text
                 if detail_tool and detail_arg and record.record_id:
                     detail_payload, changed, _ = call(
-                        detail_tool, {**detail_base, detail_arg: record.record_id}
+                        detail_tool,
+                        {
+                            **detail_base,
+                            detail_arg: coerce_argument(
+                                detail_schema, detail_arg, record.record_id,
+                            ),
+                        },
                     )
                     credentials_changed = credentials_changed or changed
                     detail_text = self._detail_text(detail_payload)
@@ -869,7 +914,10 @@ class MCPDocumentIndexer:
                 return None, 0
             arg_name = resolve_argument(schema, (name,)) or name
             return (
-                [{**base, arg_name: value} for value in values[:step.max_parents]],
+                [
+                    {**base, arg_name: coerce_argument(schema, arg_name, value)}
+                    for value in values[:step.max_parents]
+                ],
                 min(len(values), step.max_parents),
             )
 
@@ -899,7 +947,10 @@ class MCPDocumentIndexer:
             return None, 0
 
         arg_sets = [
-            {**base, parent_arg: parent.record_id}
+            {
+                **base,
+                parent_arg: coerce_argument(schema, parent_arg, parent.record_id),
+            }
             for parent in parents[:step.max_parents]
         ]
         return (arg_sets or None), len(arg_sets)

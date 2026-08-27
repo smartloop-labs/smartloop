@@ -224,7 +224,7 @@ async def _register_local_mcp_server(
             project_id=project_id,
             description=(curated.description if curated else None),
             tags=(list(curated.tags) if curated else None),
-            catalog_slug=(curated.slug if curated else None),
+            catalog_slug=(curated.slug if curated else None) or request.catalog_slug,
         )
     except MCPDiscoveryError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -303,7 +303,13 @@ async def _register_remote_mcp_server(
 
     curated_description = curated.description if curated else None
     curated_tags = list(curated.tags) if curated else None
-    curated_slug = curated.slug if curated else None
+    # Provenance is the client's claim about where it installed from, and it
+    # survives a lookup that missed.  `resolve_catalog_entry` never raises — a
+    # stale cache, an expired platform token and an outage all read as "not
+    # curated" — and dropping the slug there costs more than the metadata does:
+    # the connection then pays for LLM enrichment it doesn't need and has to
+    # find its crawl plan by matching substrings against its own name.
+    curated_slug = (curated.slug if curated else None) or request.catalog_slug
 
     server_url = effective_url.strip()
 
@@ -982,10 +988,17 @@ async def complete_mcp_oauth(
         si = connect_result.server_info if connect_result.success else None
         server_info_dict = _build_server_info_dict(si)
 
+        # The curated copy stashed at register time, for a client that posts the
+        # grant back instead of letting the browser redirect land on the GET
+        # callback.  Both completions write the same record, so both take their
+        # name, description, tags and provenance from the same place — read
+        # rather than popped, since the redirect may still be in flight.
+        session = _pending_oauth_sessions.get(request.state) or {}
+
         # Save the remote MCP server
         result = await _offload(
             model_service.add_remote_mcp_server,
-            name=si.name if si else "Remote MCP Server",
+            name=session.get("name") or (si.name if si else "Remote MCP Server"),
             server_url=request.server_url,
             auth_type="oauth",
             tools=[
@@ -1003,7 +1016,9 @@ async def complete_mcp_oauth(
             token_type=token_response.token_type,
             project_id=project_id,
             server_info=server_info_dict,
-            description=si.description if si else None,
+            description=session.get("description") or (si.description if si else None),
+            tags=session.get("tags"),
+            catalog_slug=session.get("catalog_slug"),
         )
 
         return _build_server_response(result)

@@ -32,6 +32,7 @@ breaking servers that expose only some of them.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -538,6 +539,65 @@ def filter_arguments(
         if match:
             resolved[match] = value
     return resolved
+
+
+def _declared_types(declared: Dict[str, Any]) -> Tuple[str, ...]:
+    """Every type a property's schema allows, flattened.
+
+    A property says its type as ``"number"``, as ``["number", "null"]``, or as a
+    branch of ``anyOf`` — three spellings of the same thing, and an id has to be
+    coerced for all of them or none.
+    """
+    types: List[str] = []
+    raw = declared.get("type")
+    if isinstance(raw, str):
+        types.append(raw)
+    elif isinstance(raw, list):
+        types.extend(t for t in raw if isinstance(t, str))
+    for branch in declared.get("anyOf") or declared.get("oneOf") or []:
+        if isinstance(branch, dict):
+            types.extend(_declared_types(branch))
+    return tuple(types)
+
+
+def coerce_argument(schema: Dict[str, Any], name: str, value: Any) -> Any:
+    """Cast *value* to the type the tool declares for *name*.
+
+    Record ids always arrive as strings: they are read out of a JSON payload
+    where an id is as often ``"18427542421"`` as ``18427542421``, and the
+    crawler keeps them as text.  A server that validates strictly rejects the
+    string form outright — monday.com answers
+    ``workspace_info(workspace_id="17112294")`` with "Expected number, received
+    string", and because the rejection is about the *shape* of the call rather
+    than about that one parent, the whole fan-out is abandoned.
+
+    The tool's own schema says which form it wants, so it is read rather than
+    guessed, the same way :func:`filter_arguments` reads it to decide what to
+    send at all.  Anything the schema doesn't declare numeric is left alone.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return value
+    declared = schema_properties(schema).get(name)
+    if not isinstance(declared, dict):
+        return value
+    types = _declared_types(declared)
+    if "string" in types or not any(t in ("number", "integer") for t in types):
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        number = float(value)
+    except ValueError:
+        # An id that isn't a number after all (a uuid, a slug, a URL).  Sending
+        # it unchanged is what the server rejects, but a plan naming a numeric
+        # argument may still be right about another server's variant of the same
+        # tool, so the call goes out and the failure is reported as itself.
+        return value
+    # "inf" and "nan" parse as floats and serialize to JSON no server accepts,
+    # and neither of them is an id.
+    return number if math.isfinite(number) else value
 
 
 # --------------------------------------------------------------- generic plan

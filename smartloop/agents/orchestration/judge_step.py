@@ -11,6 +11,7 @@ judging each retrieval source before any later step reads it, and inline in
 the reason handler, judging each step's output before it is appended.
 """
 import logging
+import re
 from typing import Callable, Dict, List, Optional
 
 from smartloop.agents.nodes import AgentNode, LLMDecisionNode, NodeResult
@@ -24,6 +25,50 @@ from smartloop.agents.orchestration.step import Step, StepNodes
 logger = logging.getLogger(__name__)
 
 JUDGE_STEP_NODE = "judge_step"
+
+# A verdict token, matched whole: ``RELEVANT`` inside ``NOT_RELEVANT`` is not a
+# separate word, and the alternation puts the negative first so the space-
+# separated spelling is read as one token rather than as a bare ``RELEVANT``.
+_VERDICT_RE = re.compile(r"\b(NOT[_ ]RELEVANT|RELEVANT)\b")
+
+# Leading decoration a small model puts in front of its answer: markdown
+# emphasis, a bullet, a "Verdict:" colon.  Stripped so a verdict that opens the
+# reply is still recognised as opening it.
+_VERDICT_PREFIX = "*_#>-—: \t\n\"'`"
+
+# How much of an undecided or rejecting reply is logged.  Long enough to show
+# the model's own words, short enough not to dump a paragraph per request.
+_REPLY_LOG_CHARS = 200
+
+
+def parse_verdict(reply: str) -> Optional[bool]:
+    """``True``/``False`` for a decisive verdict, ``None`` when there isn't one.
+
+    The check used to be ``"NOT_RELEVANT" in reply``, which reads any reply
+    *mentioning* the word as a rejection — including the two things a small
+    model most often says instead of answering: it quotes the instruction back
+    ("Reply RELEVANT or NOT_RELEVANT"), or it answers in prose ("the context is
+    RELEVANT, not NOT_RELEVANT").  Both dropped the context, which is how a
+    0.111-distance match for "list my boards on monday.com" ended up discarded
+    and answered with "I don't have access to your Monday.com boards".
+
+    So: whole tokens, and a reply that names *both* labels without leading with
+    one is treated as no verdict at all.  A verdict that opens the reply is
+    still decisive when the reasoning after it names the other label, which is
+    the normal shape of a well-formed answer ("NOT_RELEVANT — this is about
+    Trello, not relevant to the question").
+    """
+    text = (reply or "").strip().upper().lstrip(_VERDICT_PREFIX).strip()
+    matches = list(_VERDICT_RE.finditer(text))
+    if not matches:
+        return None
+    labels = {m.group(1).replace(" ", "_") for m in matches}
+    leading = matches[0].group(1).replace(" ", "_") if matches[0].start() == 0 else None
+    if leading:
+        return leading != "NOT_RELEVANT"
+    if len(labels) > 1:
+        return None
+    return "NOT_RELEVANT" not in labels
 
 
 class JudgeStep(Step):
@@ -129,12 +174,22 @@ Does this context serve the user's request? Reply RELEVANT or NOT_RELEVANT.
 </user>"""
 
         serves = True
+        reply = ""
         try:
             reply = str(self._models.agent_llm.invoke(
                 prompt, max_tokens=DECISION_MAX_TOKENS,
-            )).strip().upper()
-            if "NOT_RELEVANT" in reply or "NOT RELEVANT" in reply:
-                serves = False
+            )).strip()
+            verdict = parse_verdict(reply)
+            if verdict is None:
+                # No verdict in the reply.  Kept — but said out loud, because a
+                # judge that cannot answer its own prompt is a thing to know
+                # about rather than a silent pass.
+                logger.info(
+                    "[judge] %s: no verdict in reply (%s) — keeping context",
+                    label, reply[:_REPLY_LOG_CHARS] or "empty",
+                )
+            else:
+                serves = verdict
         except Exception:
             logger.debug(
                 "[judge] %s: LLM call failed — keeping context",
@@ -142,9 +197,13 @@ Does this context serve the user's request? Reply RELEVANT or NOT_RELEVANT.
             )
 
         if not serves:
+            # The reply travels with the decision: a misjudging model and a
+            # misread verdict produce the same log line without it, which is
+            # the position the last investigation of this ended in.
             logger.info(
-                "[judge] %s (%d chars) does not serve the request — dropped",
-                label, len(text),
+                "[judge] %s (%d chars) does not serve the request — dropped "
+                "(reply: %s)",
+                label, len(text), reply[:_REPLY_LOG_CHARS],
             )
         self._judge_cache[key] = serves
         return serves

@@ -608,3 +608,100 @@ parent = ["designs", "root-items", "folder-items"]
 parent_args = ["@canva_design_args"]
 max_records = 60
 max_parents = 25
+
+
+# ── monday.com ─────────────────────────────────────────────────────────────
+#
+# The tree is workspace → board → item, and the items are the content: a monday
+# board is a table of work, and the answer to "what is Caroline waiting on" is
+# in its rows and their column values.
+#
+# The route in is narrower than it looks, because monday has no "list
+# everything" tool at all:
+#
+#   * `search` requires a non-empty `searchTerm` (minLength 1, and its own
+#     description says there is no browse mode), so it cannot enumerate boards
+#     or docs — and the ids it returns are prefixed with the object type
+#     (`board-18427542421`), which no other tool accepts.  It is not used here.
+#   * `get_user_context` is one call and carries the account's favourite and
+#     recently visited boards, but nothing more on a fresh account.
+#   * `workspace_info` is the enumeration: every board, doc and folder in a
+#     workspace, with the bare numeric ids the board tools want.
+#
+# So the walk is list_workspaces → workspace_info → get_board_items_page, and
+# `workspace_info`'s boards are what everything board-scoped fans out over.
+#
+# monday validates strictly: `workspace_id` and `boardId` are declared `number`
+# and a string is rejected with "Expected number, received string", which is why
+# the crawler coerces a record id to the type the schema declares.  `objectId`
+# on `get_updates` is declared `string`, in the same account, for the same kind
+# of id — the coercion is what lets one plan speak to both.
+#
+# Left out on purpose: `read_docs` returns each WorkDoc's markdown, which is
+# real content, but it takes its ids as an array (and rejects the call without
+# them, despite declaring nothing required), and a fan-out passes one id as a
+# scalar.  Doc bodies wait for a crawler that can fill an array argument.
+
+[[mcp]]
+name = "monday"
+match = ["monday", "monday.com"]
+
+# One call, no arguments, and the only place the account's favourite and
+# recently visited boards appear — the closest thing monday has to "what this
+# person actually works on".
+[[mcp.index]]
+label = "user-context"
+tools = ["get_user_context", "get_me", "me"]
+max_records = 5
+
+# The root of the walk: no required argument, and the ids are bare and numeric.
+[[mcp.index]]
+label = "workspaces"
+tools = ["list_workspaces", "get_workspaces", "list_workspace"]
+arguments = { limit = 100 }
+max_records = 40
+
+# The enumeration everything below hangs off.  The payload is a map of the
+# workspace — `{"workspace": {...}, "folders": [...], "root_items": {"boards":
+# [...]}}` — so the boards arrive as this step's records and the workspace
+# itself is already indexed by the step above.
+[[mcp.index]]
+label = "workspace-contents"
+tools = ["workspace_info", "get_workspace_info", "get_workspace"]
+parent = "workspaces"
+parent_args = ["workspace_id", "workspaceId", "id"]
+max_records = 60
+max_parents = 20
+
+# Where the content is.  `includeColumns` is what makes a row an answer rather
+# than a title — status, owner, dates and the rest live there — and
+# `includeItemDescription` adds the body text an item carries.
+[[mcp.index]]
+label = "board-items"
+tools = ["get_board_items_page", "get_board_items", "get_board_items_by_name"]
+arguments = { limit = 50, includeColumns = true, includeItemDescription = true }
+parent = "workspace-contents"
+parent_args = ["boardId", "board_id", "id"]
+max_records = 120
+max_parents = 15
+
+# The discussion is where the reason for a status change is written down; the
+# row only carries the status.  Asked per *board* with `includeItemUpdates`
+# rather than per item: one call covers a board's whole discussion, where the
+# per-item form would spend one call per row to fetch the same text.
+[[mcp.index]]
+label = "board-updates"
+tools = ["get_updates", "list_updates", "get_item_updates"]
+arguments = { objectType = "Board", includeItemUpdates = true, limit = 100 }
+needs_arguments = ["objectType"]
+parent = "workspace-contents"
+parent_args = ["objectId", "object_id", "id"]
+max_records = 80
+max_parents = 15
+
+# Not content, but it is what lets an item's people column read back as a name.
+[[mcp.index]]
+label = "users"
+tools = ["list_users_and_teams", "list_users", "get_users"]
+arguments = { includeTeams = true }
+max_records = 50
