@@ -6,6 +6,7 @@ check an unrelated document reaches the prompt fenced as DOCUMENT CONTEXT, and
 the model answers that it has no context for the question instead of answering
 the question.
 """
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -92,6 +93,63 @@ class TestServesIntent:
         judge, llm = _judge()
         llm.invoke = MagicMock(return_value="hmm, maybe?")
         assert judge.serves_intent("madrid", "documents", "text") is True
+
+    def test_an_echoed_instruction_is_not_a_rejection(self):
+        """The reply that broke monday.com retrieval.
+
+        The judge's own prompt says "Reply RELEVANT or NOT_RELEVANT", and a
+        small model quoting it back was read as a rejection by the old
+        substring check — so a 0.111-distance match for "list my boards on
+        monday.com" was discarded and answered with "I don't have access to
+        your Monday.com boards".
+        """
+        judge, llm = _judge()
+        llm.invoke = MagicMock(return_value="Reply RELEVANT or NOT_RELEVANT")
+        assert judge.serves_intent(
+            "list my boards on monday.com", "MCP content", "boards: Tickets",
+        ) is True
+
+    def test_a_prose_answer_that_means_relevant_is_kept(self):
+        judge, llm = _judge()
+        llm.invoke = MagicMock(
+            return_value="The context is RELEVANT, not NOT_RELEVANT.",
+        )
+        assert judge.serves_intent("madrid", "documents", "Retiro Park") is True
+
+    def test_a_rejection_that_explains_itself_still_rejects(self):
+        """A well-formed answer leads with the verdict and then reasons, and the
+        reasoning naming the other label must not turn the verdict into a
+        keep."""
+        judge, llm = _judge()
+        llm.invoke = MagicMock(
+            return_value="NOT_RELEVANT — this is about Trello, not relevant "
+                         "to the monday.com question",
+        )
+        assert judge.serves_intent(
+            "list my boards on monday.com", "MCP content", "name: Pay Christy",
+        ) is False
+
+    def test_a_decorated_verdict_still_counts(self):
+        judge, llm = _judge()
+        llm.invoke = MagicMock(return_value="**NOT_RELEVANT**")
+        assert judge.serves_intent("madrid", "documents", "invoice") is False
+
+    def test_a_dropped_source_logs_what_the_model_replied(self, caplog):
+        """Without the reply in the log, a misjudging model and a misread
+        verdict produce the same line."""
+        judge, llm = _judge()
+        llm.invoke = MagicMock(return_value="NOT_RELEVANT, wrong subject")
+        with caplog.at_level(logging.INFO):
+            judge.serves_intent("madrid", "documents", "invoice")
+        assert "wrong subject" in caplog.text
+
+    def test_a_verdictless_reply_is_logged_as_kept(self, caplog):
+        judge, llm = _judge()
+        llm.invoke = MagicMock(return_value="MONDAY.COM")
+        with caplog.at_level(logging.INFO):
+            assert judge.serves_intent("madrid", "documents", "text") is True
+        assert "no verdict" in caplog.text
+        assert "MONDAY.COM" in caplog.text
 
     def test_verdict_is_memoized_per_request(self):
         judge, llm = _judge()
