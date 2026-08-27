@@ -9,6 +9,14 @@ cannot ("I don't have context") instead of falling through to what it knows.
 This module is that check.  It runs at two points: as a step in the DAG,
 judging each retrieval source before any later step reads it, and inline in
 the reason handler, judging each step's output before it is appended.
+
+It never gates the user's connected-app data.  Tool results — a live MCP call
+during explore, a tool step's output in the plan — are exempt at both points:
+they were fetched on purpose rather than returned by a similarity search, so
+there is no recall noise to filter, and a wrong verdict throws away the very
+data the request went to get.  Crawled MCP content is exempt too, because it
+already passed the retrieval quality floor and does not need a second, worse
+gate.  See ``_JUDGED_SOURCES`` below.
 """
 import logging
 import re
@@ -88,12 +96,34 @@ class JudgeStep(Step):
     # Retrieval sources judged individually before they reach the answer
     # context, as ``(SearchContext attribute, human label)``.
     #
-    # ``mcp_context`` is a live tool result gathered during explore, and is
-    # judged like the rest.  That the router chose to invoke a tool says only
-    # that it looked applicable, not that its output answered the question —
-    # and this source is placed AHEAD of web results in the final context, so
-    # an off-topic tool result does not merely sit alongside a good web answer,
-    # it precedes it.
+    # What belongs here is *retrieval*: content a similarity search handed us
+    # because it was nearest, not because it was asked for.  That is the whole
+    # premise of the judge — recall returns neighbours whether or not any of
+    # them is about the question.
+    #
+    # Both MCP sources are deliberately absent — the user's connected-app data
+    # is never gated by this judge.
+    #
+    # ``mcp_context`` is a live tool result, and a tool call is not recall:
+    # something decided to invoke it, the server ran it, and what came back is
+    # the answer to that call.  Judging it put a small decision model between
+    # the user and data they explicitly went and fetched — and every verdict
+    # here fails toward dropping, so the failure mode was running the
+    # Monday.com tool, getting the boards, and answering "I don't have access
+    # to your boards".  A tool that should not have been called is a routing
+    # problem, and gating its output cannot fix it: the call already happened,
+    # and binning the result only loses the one piece of context that was
+    # certainly about the request.
+    #
+    # ``mcp_document_context`` is crawled MCP content, and it is already
+    # relevance-gated where the gate belongs — in retrieval.
+    # ``search_mcp_documents`` runs it through ``_select_relevant_chunks``,
+    # the same quality floor (best-match distance <= 0.55) as document and
+    # workspace search, and returns nothing at all when the best match misses.
+    # Content that reaches this attribute has therefore already cleared a
+    # threshold; a second opinion from the small model is the *worse* of the
+    # two gates and only ever subtracts.  Identical reasoning to
+    # ``vector_context`` below.
     #
     # ``vector_context`` is deliberately absent: retrieved documents already
     # get their own per-document judge in the fan-out, where each one is
@@ -107,8 +137,6 @@ class JudgeStep(Step):
     _JUDGED_SOURCES = (
         ("workspace_context", "workspace files"),
         ("feedback_context", "feedback"),
-        ("mcp_context", "connected tools"),
-        ("mcp_document_context", "MCP content"),
     )
 
     name = "judge"
@@ -232,11 +260,27 @@ Does this context serve the user's request? Reply RELEVANT or NOT_RELEVANT.
 
         if dropped:
             self._models.emit(
-                "filter", "processing",
-                f"Set aside context that does not match the request: "
-                f"{', '.join(dropped)}",
+                "filter", "processing", self._set_aside_message(dropped),
             )
         return dropped
+
+    @staticmethod
+    def _set_aside_message(dropped: List[str]) -> str:
+        """Say what was put aside, in the voice the user is reading in.
+
+        "Set aside context that does not match the request: MCP content" reads
+        like a filter's own log line — a colon-delimited list of internal
+        source names.  The person watching is waiting on an answer, not
+        auditing the pipeline, so it names the sources in a sentence and says
+        why, which is also the part that keeps a dropped source from looking
+        lost.
+        """
+        if len(dropped) == 1:
+            items, pronoun = dropped[0], "it"
+        else:
+            items = f"{', '.join(dropped[:-1])} and {dropped[-1]}"
+            pronoun = "they"
+        return f"Set aside {items} — {pronoun} didn't seem relevant to your question"
 
     def has_judgeable_sources(self, search_ctx: SearchContext) -> bool:
         """True when at least one judged retrieval source has content."""

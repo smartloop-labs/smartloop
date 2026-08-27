@@ -143,7 +143,19 @@ class ModelRouter:
                 )
                 self.emit_model_fallback(capability, fallback, purpose)
             return fallback
-        return self.agent_llm
+        # A capability tag routes at every tier, not only LARGE.  A SMALL step
+        # is a decision node — picking an MCP tool, extracting its arguments,
+        # judging relevance — so it routes *best-effort*: decision_llm takes the
+        # capability model only when it is already resident or comfortably fits,
+        # and otherwise lands back on agent_llm without forcing a load.
+        #
+        # Dropping the tag here is what kept every MCP tool call on the
+        # bootstrap router: pipeline_builder tags a non-skill TOOL step SMALL
+        # and still sets its capability, and that capability was read by
+        # nothing.  It only surfaced with two or more models selected — a
+        # single selection is pinned into agent_llm upstream, so the default
+        # happened to be the user's model.
+        return self.decision_llm(capability)
 
     def _capability_model_exists(self, capability: Optional[str]) -> bool:
         """True when some selected model declares *capability*.
@@ -162,9 +174,9 @@ class ModelRouter:
             )
             return True
 
-    def decision_llm(self, capability: str) -> BaseLLM:
+    def decision_llm(self, capability: Optional[str]) -> BaseLLM:
         """Resolve a capability model for a low-value *decision* node
-        (skill matching, multi-step planning).
+        (skill matching, multi-step planning, MCP tool selection).
 
         Unlike :meth:`_llm_for_tier`, this never forces a generic large-model
         load: it uses the capability model only when it is already resident or

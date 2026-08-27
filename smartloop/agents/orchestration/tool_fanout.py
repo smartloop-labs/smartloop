@@ -196,7 +196,10 @@ class ToolFanout:
         )
 
         try:
-            response = str(self._models.agent_llm.invoke(prompt)).strip()
+            # Fan-out item extraction is argument extraction for the same tool,
+            # so it follows the step's capability like the single-call path.
+            fanout_llm = self._models.decision_llm(step.capability)
+            response = str(fanout_llm.invoke(prompt)).strip()
             logger.info(f"[fanout-extract] LLM response: {response[:300]}")
 
             items = self._parse_fanout_response(response)
