@@ -202,17 +202,22 @@ class TestEvaluateSources:
 
         dropped = orch._judge.evaluate_sources(ctx, search_ctx)
 
-        assert dropped == [
-            "workspace files", "feedback", "connected tools", "MCP content",
-        ]
-        assert not search_ctx.has_context
+        assert dropped == ["workspace files", "feedback"]
+        # Both MCP sources are exempt — they are the user's connected-app data.
+        assert search_ctx.mcp_context == "unrelated"
+        assert search_ctx.mcp_document_context == "unrelated"
 
-    def test_off_topic_live_tool_result_is_cleared(self):
-        """A live MCP result is judged too — the router picking a tool says
-        only that it looked applicable, not that its output answered."""
+    def test_a_live_tool_result_is_never_judged(self):
+        """A tool call is deliberate and its result is definite — not recall.
+
+        The judge runs on the small decision model and fails toward dropping,
+        so gating tool output means one bad verdict discards the data the
+        request went and fetched.  A wrong tool is a routing problem; binning
+        its result does not produce the right one.
+        """
         orch = _make_orchestrator()
         ctx = _ctx(orch)
-        _verdicts(orch, {"sprint backlog": "NOT_RELEVANT"})
+        orch.agent_llm.invoke = MagicMock(return_value="NOT_RELEVANT")
         search_ctx = SearchContext(
             mcp_context="sprint backlog: move model hosting to R2",
             web_context="The Hasselblad X2D II has a 100MP sensor.",
@@ -220,12 +225,45 @@ class TestEvaluateSources:
 
         dropped = orch._judge.evaluate_sources(ctx, search_ctx)
 
-        assert dropped == ["connected tools"]
-        assert search_ctx.mcp_context == ""
+        assert dropped == []
+        assert search_ctx.mcp_context == "sprint backlog: move model hosting to R2"
         # Web results were fetched for this query — never judged, never dropped.
         assert search_ctx.web_context == (
             "The Hasselblad X2D II has a 100MP sensor."
         )
+
+    def test_crawled_mcp_content_is_never_judged(self):
+        """Already gated in retrieval, where the gate belongs.
+
+        ``search_mcp_documents`` runs its hits through the shared quality
+        floor (``_select_relevant_chunks``, best distance <= 0.55) and returns
+        nothing when the best match misses — so anything that reaches this
+        attribute has cleared a threshold already.  A second opinion from the
+        small decision model is the worse of the two gates and can only
+        subtract.
+        """
+        orch = _make_orchestrator()
+        ctx = _ctx(orch)
+        orch.agent_llm.invoke = MagicMock(return_value="NOT_RELEVANT")
+        search_ctx = SearchContext(
+            mcp_document_context="Boards: Tickets, Roadmap, Hiring",
+        )
+
+        dropped = orch._judge.evaluate_sources(ctx, search_ctx)
+
+        assert dropped == []
+        assert search_ctx.mcp_document_context == "Boards: Tickets, Roadmap, Hiring"
+
+    def test_mcp_context_alone_does_not_start_the_judge(self):
+        """Nothing judgeable left, so the judge stays off the critical path."""
+        orch = _make_orchestrator()
+        ctx = _ctx(orch)
+        search_ctx = SearchContext(
+            mcp_context="open tickets = 4",
+            mcp_document_context="Boards: Tickets, Roadmap",
+        )
+
+        assert orch._judge.applies_to(ctx, search_ctx) is False
 
     def test_an_empty_search_context_never_reaches_the_llm(self):
         orch = _make_orchestrator()
@@ -374,6 +412,41 @@ class TestReasonHandlerJudging:
 
         assert [e["content"] for e in result.data["tool_results"]] == ["18C and sunny"]
         assert all("_is_tool" not in e for e in result.data["accumulated"])
+
+    def test_a_tool_step_output_is_never_judged(self):
+        """The other half of the tool exemption: a TOOL step in the plan.
+
+        Same reasoning as the live explore call — the plan resolved a tool,
+        the server ran it, and the result is what the request went to get.
+        """
+        orch = _make_orchestrator()
+        ctx = _ctx(orch)
+        orch.agent_llm.invoke = MagicMock(return_value="NOT_RELEVANT")
+
+        handler = orch._pipeline.make_reason_handler(ctx, SearchContext(), False)
+        result = handler({
+            "a": _dep("a", "list_boards", "boards: Tickets, Roadmap", is_tool=True),
+        })
+
+        assert [e["content"] for e in result.data["tool_results"]] == [
+            "boards: Tickets, Roadmap",
+        ]
+
+    def test_a_rejected_retrieval_step_still_drops_alongside_a_tool_result(self):
+        """The exemption is for tool output only — retrieval is still judged."""
+        orch = _make_orchestrator()
+        ctx = _ctx(orch)
+        _verdicts(orch, {"OLD INVOICE": "NOT_RELEVANT"})
+
+        handler = orch._pipeline.make_reason_handler(ctx, SearchContext(), False)
+        result = handler({
+            "a": _dep("a", "file-read", "OLD INVOICE for Adam Hart"),
+            "b": _dep("b", "get_weather", "18C and sunny", is_tool=True),
+        })
+
+        contents = [e["content"] for e in result.data["accumulated"]]
+        assert "OLD INVOICE for Adam Hart" not in contents
+        assert [e["content"] for e in result.data["tool_results"]] == ["18C and sunny"]
 
     def test_skill_context_bypasses_the_judge(self):
         """A skill's own steps are its procedure — not candidates to filter."""

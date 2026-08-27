@@ -35,12 +35,19 @@ class MCPAgent:
         mcp_servers: List[Any],
         base_dir: Optional[str] = None,
         top_k: int = 5,
+        llm: Optional[Any] = None,
     ) -> Optional[Tuple[str, str]]:
         """Return ``(server_id, tool_name)`` for *directive*, or None.
 
         Retrieves candidate tools from the ``mcp_tools`` vector index as one
         flat list (each entry a ``server.tool_name``) and asks the LLM to pick
         one. Returns None when nothing is indexed or the LLM declines.
+
+        ``llm`` overrides the model used for the pick — the caller passes the
+        step's capability model, which judges "which of these tools does the
+        user mean" far better than the small orchestrator model.  Mirrors the
+        override :class:`~smartloop.agents.mcp.explorer.Explorer` takes for the
+        same reason.  Falls back to the agent model when not supplied.
         """
         if not project_dir or not directive:
             return None
@@ -107,7 +114,7 @@ class MCPAgent:
         )
 
         try:
-            response = self._llm.invoke(prompt)
+            response = (llm or self._llm).invoke(prompt)
         except Exception as e:
             self._logger.warning(f"[mcp-agent] LLM pick failed: {e}")
             return None

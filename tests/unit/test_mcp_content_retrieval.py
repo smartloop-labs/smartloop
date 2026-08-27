@@ -102,16 +102,32 @@ def ctx():
 
 
 class TestRelevanceGate:
-    """Crawled MCP content is judged before it reaches the answer context."""
+    """Crawled MCP content is gated in retrieval, not by the judge.
 
-    def test_irrelevant_crawled_content_is_cleared(self, orchestrator, ctx):
+    ``search_mcp_documents`` already runs its hits through the shared quality
+    floor (``_select_relevant_chunks``: nothing is returned unless the best
+    match is within 0.55), so content that reaches ``mcp_document_context``
+    has cleared a threshold.  Re-deciding that with the small decision model
+    added a second, weaker gate that could only subtract — and it fails toward
+    dropping, so a misread verdict silently binned the user's connected-app
+    data and answered "I don't have access to that".
+    """
+
+    def test_crawled_content_survives_a_reject_verdict(self, orchestrator, ctx):
         orchestrator.agent_llm.invoke = MagicMock(return_value="NOT_RELEVANT")
         search_ctx = SearchContext(mcp_document_context="unrelated trello cards")
         orchestrator._judge.make_handler(ctx, search_ctx)({})
-        assert search_ctx.mcp_document_context == ""
+        assert search_ctx.mcp_document_context == "unrelated trello cards"
 
     def test_relevant_crawled_content_is_kept(self, orchestrator, ctx):
         orchestrator.agent_llm.invoke = MagicMock(return_value="RELEVANT")
         search_ctx = SearchContext(mcp_document_context="Q3 roadmap: ship it")
         orchestrator._judge.make_handler(ctx, search_ctx)({})
         assert search_ctx.mcp_document_context == "Q3 roadmap: ship it"
+
+    def test_the_judge_is_not_even_consulted(self, orchestrator, ctx):
+        """No LLM call at all — the crawl index already made this decision."""
+        orchestrator.agent_llm.invoke = MagicMock(return_value="NOT_RELEVANT")
+        search_ctx = SearchContext(mcp_document_context="Q3 roadmap: ship it")
+        orchestrator._judge.make_handler(ctx, search_ctx)({})
+        orchestrator.agent_llm.invoke.assert_not_called()

@@ -721,6 +721,11 @@ class StepExecutor:
                     directive=directive,
                     project_dir=project_dir,
                     mcp_servers=mcp_servers,
+                    # Same model that extracts the arguments below picks the
+                    # tool — the pick is the harder judgement of the two, so
+                    # leaving it on the default while upgrading extraction
+                    # only got the arguments right for the wrong tool.
+                    llm=llm,
                 )
                 if picked:
                     picked_server_id, picked_tool = picked

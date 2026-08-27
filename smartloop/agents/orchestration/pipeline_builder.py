@@ -745,10 +745,21 @@ Assess whether these search results are relevant to the user's request. If relev
             all_accumulated: List[Dict[str, Any]] = []
             tool_results: List[Dict[str, Any]] = []
 
-            # Every step output is judged against the user's intent before it
-            # is appended.  A plan routinely runs steps that turn out not to
-            # bear on the question, and each one that lands here becomes part
-            # of the context the answer is told to work from.
+            # Retrieval-shaped step outputs are judged against the user's
+            # intent before they are appended.  A plan routinely runs steps
+            # that turn out not to bear on the question, and each one that
+            # lands here becomes part of the context the answer is told to
+            # work from.
+            #
+            # Tool results are exempt.  A tool call is a deliberate act with a
+            # definite answer, not a similarity search that might have drifted
+            # — the plan resolved a tool, the server ran it, and what came
+            # back is the data the request went to get.  The judge runs on the
+            # small decision model and fails toward dropping, so gating tool
+            # output means a bad verdict discards the one thing that certainly
+            # was about the request.  If the wrong tool ran, that is a routing
+            # problem upstream; throwing away its result does not recover the
+            # right one.
             rejected: List[Dict[str, Any]] = []
             for dep_id, dep_result in deps.items():
                 if not dep_result.success or not isinstance(dep_result.data, dict):
@@ -761,7 +772,7 @@ Assess whether these search results are relevant to the user's request. If relev
                 if not text:
                     continue
                 entry = {"tool_name": tool_name, "content": text, "_is_tool": is_tool}
-                if ctx.skill_context or self._judge.serves_intent(
+                if is_tool or ctx.skill_context or self._judge.serves_intent(
                     ctx.user_message, tool_name or "step output", text,
                 ):
                     all_accumulated.append(entry)
