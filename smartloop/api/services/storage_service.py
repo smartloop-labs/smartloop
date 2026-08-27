@@ -218,14 +218,21 @@ def _keep_model_ids(workspace: Workspace, model_service: Any) -> dict[str, str]:
     if default is not None:
         mark(default.model_id, "default")
 
-    for m in workspace.models:
-        if m.is_active:
-            mark(m.model_id, "active")
-    for m in workspace.models:
-        # ``enabled`` is what the model picker writes, so this is the user's
-        # own selection — the thing the old vendor-directory sweep destroyed.
-        if m.enabled:
-            mark(m.model_id, "enabled")
+    # Resolved per scope, not read off the workspace entry: ``enabled`` and
+    # ``is_active`` can be overridden per project, so a model turned off
+    # app-wide may still be pinned on in a project that is using it.  The
+    # ``None`` scope reads through to the workspace entry (see
+    # ``Workspace.project_model``), which covers the app-default case.
+    for scope in (None, *workspace.projects):
+        for m in workspace.models:
+            if workspace.effective_model_active(m.model_name, scope):
+                mark(m.model_id, "active")
+        for m in workspace.models:
+            # ``enabled`` is what the model picker writes, so this is the
+            # user's own selection — the thing the old vendor-directory sweep
+            # destroyed.
+            if workspace.effective_model_enabled(m.model_name, scope):
+                mark(m.model_id, "enabled")
 
     return keep
 
@@ -534,6 +541,20 @@ def _drain_inference(model_service: Any) -> int:
     Returns the number of permits held, for the caller to release.  Raises
     ``RuntimeError`` on timeout rather than deleting weights a live decode
     could still be reading.
+
+    Workspace-wide, not merely this process: the model host runs inside the
+    supervisor wrapping this same ``ModelService``
+    (``Supervisor._start_model_host``), so a project agent's generation arrives
+    through ``InProcessModelClient`` and takes this very semaphore.  Draining it
+    here stops every child too.
+
+    The exception is a workspace running without that host —
+    ``SLP_MODEL_HOST_DISABLE=1``, or ``_start_model_host`` having lost the
+    socket to an ``OSError`` — where each child loads its own weights and this
+    drain cannot reach them.  What still protects those is ``_keep_model_ids``,
+    which reads ``enabled``/``is_active`` from the workspace record rather than
+    from memory, so a model any project is using is never a candidate.  Only a
+    model resident in a child yet switched off in every scope falls through.
     """
     semaphore = getattr(model_service, "_inference_lock", None)
     if semaphore is None or not hasattr(semaphore, "acquire"):
@@ -703,7 +724,10 @@ def run_cleanup(
             name = row.get("model_name")
             if name:
                 try:
-                    model_service.unload_model_by_name(name)
+                    # The unlocked variant: we hold every inference permit, and
+                    # the public unload_model_by_name takes one itself, so it
+                    # would block here forever against our own drain.
+                    model_service._unload_model_by_name_unlocked(name)
                 except Exception:                    # noqa: BLE001
                     logger.exception("[storage] Failed to unload %s before deletion", name)
         if model_rows:

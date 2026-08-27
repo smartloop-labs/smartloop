@@ -4021,34 +4021,44 @@ class ModelService:
         Idempotent; returns True if anything was actually unloaded.
         """
         with self._inference_slot():
-            unloaded = False
+            return self._unload_model_by_name_unlocked(model_name)
 
-            if self._large_llm is not None and self._large_model_name == model_name:
-                logger.info("[unload] Releasing deselected large model %s", model_name)
-                self._free_llm(self._large_llm)
-                self._large_llm = None
-                self._large_model_name = None
-                self._large_model_attempted = False
-                unloaded = True
+    def _unload_model_by_name_unlocked(self, model_name: str) -> bool:
+        """``unload_model_by_name`` without taking an inference slot.
 
-            if self._vision_llm is not None and self._vision_model_name == model_name:
-                logger.info("[unload] Releasing deselected vision model %s", model_name)
-                self._free_llm(self._vision_llm)
-                self._vision_llm = None
-                self._vision_model_name = None
-                self._vision_unavailable = False
-                unloaded = True
+        For callers that already hold every permit — storage cleanup drains
+        them all before deleting weights, and ``_inference_lock`` is a plain
+        semaphore, so re-acquiring here would deadlock against the caller.
+        Anyone not already holding the lock must use the public method.
+        """
+        unloaded = False
 
-            cache_key = f"_cap_llm_{model_name}"
-            cached = getattr(self, cache_key, None)
-            if cached is not None and cached is not _GPU_FAULTED:
-                logger.info("[unload] Releasing deselected capability model %s", model_name)
-                self._free_llm(cached)
-                setattr(self, cache_key, None)
-                unloaded = True
+        if self._large_llm is not None and self._large_model_name == model_name:
+            logger.info("[unload] Releasing deselected large model %s", model_name)
+            self._free_llm(self._large_llm)
+            self._large_llm = None
+            self._large_model_name = None
+            self._large_model_attempted = False
+            unloaded = True
 
-            if unloaded:
-                self._cleanup_gpu_cache()
+        if self._vision_llm is not None and self._vision_model_name == model_name:
+            logger.info("[unload] Releasing deselected vision model %s", model_name)
+            self._free_llm(self._vision_llm)
+            self._vision_llm = None
+            self._vision_model_name = None
+            self._vision_unavailable = False
+            unloaded = True
+
+        cache_key = f"_cap_llm_{model_name}"
+        cached = getattr(self, cache_key, None)
+        if cached is not None and cached is not _GPU_FAULTED:
+            logger.info("[unload] Releasing deselected capability model %s", model_name)
+            self._free_llm(cached)
+            setattr(self, cache_key, None)
+            unloaded = True
+
+        if unloaded:
+            self._cleanup_gpu_cache()
 
         return unloaded
 

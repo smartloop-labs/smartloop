@@ -7,6 +7,7 @@ must *not* happen.
 
 import json
 import os
+import threading
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -14,13 +15,15 @@ import pytest
 
 from smartloop.api.services import storage_service
 from smartloop.config.app_settings import AppSettings
-from smartloop.workspace.workspace import Project, Workspace, WorkspaceModel
+from smartloop.workspace.workspace import Project, ProjectModel, Workspace, WorkspaceModel
 
 # Mirrors the real config: only the bootstrap orchestrator is is_active, while
 # the models the user picked carry enabled=True.  Keying the keep-rule on
-# is_active alone would delete the picked ones.
+# is_active alone would delete the picked ones.  The bootstrap model is recorded
+# under its canonical name while its model_id keeps the pre-rename spelling —
+# renaming the directory would orphan already-downloaded weights.
 MODELS = [
-    ("slp-orchestra-mini", "smartloop-ai/slp-orchestra-mini", True, True),
+    ("sl-mini", "smartloop-ai/slp-orchestra-mini", True, True),
     ("gemma4-e4b", "google/gemma-4-e4b-it", True, False),
     ("gemma3-4b", "google/gemma-3-4b-it", False, False),
     ("ministral3-3b", "mistralai/Ministral-3-3B-Instruct-2512", False, False),
@@ -224,6 +227,51 @@ class TestComputeUsage:
         assert rows["google/gemma-3-4b-it"]["removable"] is False
         assert rows["google/gemma-3-4b-it"]["keep_reason"] == "loaded"
 
+    def test_project_enabled_model_is_kept_though_disabled_app_wide(self, env):
+        # A project override resolves ahead of the workspace entry, so this
+        # model is in use even though the app-wide picker has it off.
+        env["project"].model_settings.append(
+            ProjectModel(model_name="gemma3-4b", enabled=True)
+        )
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-3-4b-it"]["removable"] is False
+        assert rows["google/gemma-3-4b-it"]["keep_reason"] == "enabled"
+
+    def test_project_active_model_is_kept_though_disabled_app_wide(self, env):
+        env["project"].model_settings.append(
+            ProjectModel(model_name="gemma3-4b", enabled=False, is_active=True)
+        )
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-3-4b-it"]["removable"] is False
+        assert rows["google/gemma-3-4b-it"]["keep_reason"] == "active"
+
+    def test_model_off_in_every_scope_stays_removable(self, env):
+        # The guard against over-keeping: a project entry that says off must not
+        # protect anything, or cleanup quietly frees nothing.
+        env["project"].model_settings.append(
+            ProjectModel(model_name="gemma3-4b", enabled=False)
+        )
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-3-4b-it"]["removable"] is True
+
+    def test_the_bootstrap_model_resolves_under_its_legacy_name(self, env):
+        # config.json written before the rename records slp-orchestra-mini;
+        # canonicalization has to keep it resolving to the same entry.
+        env["workspace"].models[0].model_name = "slp-orchestra-mini"
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["smartloop-ai/slp-orchestra-mini"]["removable"] is False
+        assert {mid for mid, r in rows.items() if r["removable"]} == (
+            REMOVABLE_IDS | {"Qwen/unregistered-model"}
+        )
+
     def test_unregistered_model_dir_is_removable_and_flagged(self, env):
         rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
 
@@ -311,6 +359,16 @@ class TestCleanup:
         assert not os.path.exists(os.path.join(models_dir, "google/gemma-3-4b-it"))
         assert not os.path.exists(os.path.join(models_dir, "mistralai"))
 
+    def test_model_sweep_keeps_a_project_enabled_model(self, env):
+        env["project"].model_settings.append(
+            ProjectModel(model_name="gemma3-4b", enabled=True)
+        )
+
+        result = storage_service.run_cleanup(model_service=env["service"], models=True)
+
+        assert os.path.exists(os.path.join(env["models_dir"], "google/gemma-3-4b-it"))
+        assert "gemma3-4b" not in result["models_marked"]
+
     def test_model_sweep_prunes_the_emptied_org_dir(self, env):
         storage_service.run_cleanup(model_service=env["service"], models=True)
 
@@ -339,11 +397,44 @@ class TestCleanup:
     def test_model_sweep_unloads_each_deleted_model_only(self, env):
         storage_service.run_cleanup(model_service=env["service"], models=True)
 
-        unloaded = {c.args[0] for c in env["service"].unload_model_by_name.call_args_list}
-        assert unloaded == {"gemma3-4b", "ministral3-3b"}
+        calls = env["service"]._unload_model_by_name_unlocked.call_args_list
+        assert {c.args[0] for c in calls} == {"gemma3-4b", "ministral3-3b"}
         # unload_model() would evict the always-resident orchestrator.
         env["service"].unload_model.assert_not_called()
         env["service"]._reset_llm_executor.assert_called_once()
+
+    def test_model_sweep_never_takes_the_public_unload(self, env):
+        # unload_model_by_name() acquires an inference slot from the very
+        # semaphore the sweep has just drained, and threading.Semaphore is not
+        # reentrant — calling it here deadlocks the request forever while
+        # holding every permit, which wedges inference too.
+        storage_service.run_cleanup(model_service=env["service"], models=True)
+
+        env["service"].unload_model_by_name.assert_not_called()
+
+    def test_model_sweep_unloads_without_a_free_permit(self, env):
+        # The invariant behind the unlocked unload, against a real semaphore:
+        # by the time unload runs, no permit is left to take.
+        # Sized as ModelService sizes it, from the same n_parallel the sweep
+        # reads when deciding how many permits to drain.
+        permits = env["settings"].n_parallel
+        lock = threading.Semaphore(permits)
+        env["service"]._inference_lock = lock
+        acquired = []
+
+        def _unload(_name):
+            acquired.append(lock.acquire(timeout=0.25))
+
+        env["service"]._unload_model_by_name_unlocked.side_effect = _unload
+
+        storage_service.run_cleanup(model_service=env["service"], models=True)
+
+        assert acquired and not any(acquired), "the sweep must hold every permit"
+        assert not os.path.exists(
+            os.path.join(env["models_dir"], "mistralai/Ministral-3-3B-Instruct-2512")
+        )
+        # Every permit handed back, so inference is not wedged afterwards.
+        assert all(lock.acquire(timeout=0.25) for _ in range(permits))
 
     def test_model_ids_restricts_the_sweep(self, env):
         storage_service.run_cleanup(
