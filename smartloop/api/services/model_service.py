@@ -484,10 +484,12 @@ class ModelService:
         With exactly one model selected that model IS the agent model, even
         when it does not out-rank the bootstrap router (``_detect_large_model``
         only promotes a bigger model, so a small selected model would otherwise
-        leave agent work on the router the user did not pick).  A pin that
-        fails to load returns ``None`` here rather than falling through to
-        detection: the pinned model is the only candidate detection could
-        find, so retrying it would just fail the same fit guard a second time.
+        leave agent work on the router the user did not pick) — unless it is a
+        vision-only selection, which cannot run agent work at all and so leaves
+        detection to find a text model.  A pin that fails to load returns
+        ``None`` here rather than falling through to detection: the pinned
+        model is the only candidate detection could find, so retrying it would
+        just fail the same fit guard a second time.
         The caller drops to the default model, as it does for any other
         unavailable large model.
         """
@@ -687,8 +689,8 @@ class ModelService:
             and workspace.effective_model_downloaded(m.model_name)
         ]
 
-    def _pinned_model(self):
-        """The sole selected model, or ``None`` when 0 or 2+ are selected.
+    def _pinned_model(self, capability: Optional[str] = None):
+        """The sole selected model, or ``None`` when it cannot serve the step.
 
         With two or more models selected the choice between them is ours to
         make, and capability routing makes it per step.  With exactly one the
@@ -696,18 +698,49 @@ class ModelService:
         — routing has nothing to route between, and second-guessing the
         selection because the model doesn't declare some capability tag would
         answer on the bootstrap model the user never picked.
+
+        The one exception is a selection that cannot hold a text conversation
+        at all.  A vision-only model (qwen2-vl-2b declares ``VISION`` and
+        nothing else) exists to look at an image; pinning it to the whole
+        request puts the planner, the skill matcher, the relevance judge and
+        plain chat turns on a model that cannot do them.  So a selection
+        without ``GENERAL`` is pinned only to the steps whose *capability* it
+        actually declares — the image work it was chosen for — and everything
+        else falls back to the default model.
         """
         selected = self._selected_models()
-        return selected[0] if len(selected) == 1 else None
+        if len(selected) != 1:
+            return None
+        ws_model = selected[0]
 
-    def _pinned_llm(self) -> Optional[BaseLLM]:
+        caps = {
+            self._cap_name(c).lower()
+            for c in (ws_model.effective_capabilities or [])
+        }
+        if ModelCapability.GENERAL.value in caps:
+            return ws_model
+
+        cap = self._cap_name(capability).lower() if capability else ""
+        if cap and cap in caps:
+            return ws_model
+
+        logger.info(
+            "[models] Sole selected model %s declares %s but not 'general' — "
+            "%s runs on the default model",
+            ws_model.model_name, sorted(caps) or "no capability",
+            f"capability '{cap}'" if cap else "this step",
+        )
+        return None
+
+    def _pinned_llm(self, capability: Optional[str] = None) -> Optional[BaseLLM]:
         """Loaded instance of the pinned model, or ``None``.
 
-        ``None`` means either that the user has not pinned the selection to one
-        model, or that the pinned model could not be loaded (no GGUF, or it
-        does not fit) — callers then take their existing fallback path.
+        ``None`` means the user has not pinned the selection to one model, that
+        the pin does not cover *capability* (see :meth:`_pinned_model`), or
+        that the pinned model could not be loaded (no GGUF, or it does not
+        fit) — callers then take their existing fallback path.
         """
-        ws_model = self._pinned_model()
+        ws_model = self._pinned_model(capability)
         if ws_model is None:
             return None
         return self._load_workspace_llm(ws_model, "pinned")
@@ -855,8 +888,9 @@ class ModelService:
         """
         if not self._model or not self._model.workspace:
             return False
-        # A pinned model serves every capability, declared or not.
-        if self._pinned_model() is not None:
+        # A pinned model serves every capability it can — declared or not for
+        # a general-capable selection, only its own for a specialist one.
+        if self._pinned_model(capability) is not None:
             return True
         workspace = self._model.workspace
         return bool(
@@ -867,7 +901,7 @@ class ModelService:
         """Return a loaded LLM matching the requested capability.
 
         When the user has selected exactly one model, that model is returned
-        for every capability — see :meth:`_pinned_model`.
+        for every capability it can serve — see :meth:`_pinned_model`.
 
         Otherwise walks the capability's models largest-first and returns the
         first that is already resident or fits in memory — evicting prior-step
@@ -890,8 +924,10 @@ class ModelService:
         # models handles a step; with a single selection there is no such
         # choice to make, and treating a missing 'dp' tag as "no capable
         # model" would hand the step to the bootstrap model instead of the
-        # one the user picked.
-        pinned = self._pinned_model()
+        # one the user picked.  A selection that declares no 'general' at all
+        # is the exception: it covers only its own capability, so a vision-only
+        # model gets the image step and not the conversation around it.
+        pinned = self._pinned_model(capability)
         if pinned is not None:
             llm = self._load_workspace_llm(
                 pinned, f"pinned, capability '{self._cap_name(capability)}'",
@@ -2459,7 +2495,7 @@ class ModelService:
         Only when something could actually load — see
         :meth:`has_capability_model`.
         """
-        if self._pinned_model() is not None or (
+        if self._pinned_model(capability) is not None or (
             capability and self.has_capability_model(capability)
         ):
             self._response_router.emit_model_loading(
@@ -2492,7 +2528,8 @@ class ModelService:
 
         With exactly one model selected, that model writes the response —
         including when *capability* is None, which otherwise answers on the
-        bootstrap orchestrator LLM (see :meth:`_pinned_model`).  When it
+        bootstrap orchestrator LLM (see :meth:`_pinned_model`; a vision-only
+        selection writes only the response to a vision-tagged step).  When it
         cannot be loaded the default model answers instead: the rest of the
         chain below would only rediscover the same unavailable model, and an
         answer on the default beats no answer at all.
@@ -2503,9 +2540,9 @@ class ModelService:
         larger model when one is available; falls back cleanly to
         ``self._llm`` when nothing better is present.
         """
-        pinned_model = self._pinned_model()
+        pinned_model = self._pinned_model(capability)
         if pinned_model is not None:
-            pinned = self._pinned_llm()
+            pinned = self._pinned_llm(capability)
             if pinned is not None:
                 logger.info(
                     "[response] Using the sole selected model (capability='%s')",
@@ -4998,6 +5035,8 @@ class ModelService:
         # nodes otherwise stay on the bootstrap model, which is never a user
         # selection, so an explicit single choice would still leave the
         # planner, the skill matcher and the relevance judge on another model.
+        # Asked without a capability, so a vision-only selection declines these
+        # text-only nodes and they stay on the default model.
         pinned_llm = self._pinned_llm()
         if pinned_llm is not None:
             logger.info(
