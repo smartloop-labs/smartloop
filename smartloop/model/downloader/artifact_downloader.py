@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 from smartloop.platform import SLPPlatformClient
-from smartloop.platform import auth as platform_auth
 from smartloop.config import AppSettings
 from smartloop.constants import canonical_model_name, display_model_name, platform_model_name
 from smartloop.model.downloader.artifact_source import SLPModelSource, SLPBootstrapSource
@@ -531,11 +530,9 @@ class SLPArtifactDownloader(SLPDownloader):
         to match the base-class interface, resolves it to the short model name
         for the API call, and stores files under the model_id path.
         """
-        if not platform_auth.has_credentials():
-            raise EnvironmentError(
-                "Authentication required for GCS download. "
-                "Set a developer token via 'slp token set' or sign in through the Smartloop app."
-            )
+        # No credential check: the download endpoint serves FREE models to
+        # anonymous callers. auth_headers() yields {} when signed out, and the
+        # platform rejects an unentitled request with 403.
 
         model_name = self._resolve_model_name(model_id)
         local_dir = os.path.join(self.workspace.models_dir, model_id)

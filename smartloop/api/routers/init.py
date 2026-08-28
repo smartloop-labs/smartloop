@@ -18,7 +18,7 @@ from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
-from smartloop.platform import auth as platform_auth, get_platform_service
+from smartloop.platform import get_platform_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["init"])
@@ -227,12 +227,9 @@ async def init(
     model_dir = ws_model.model_dir
     needs_download = not _gguf_exists(model_dir)
 
-    if needs_download and not platform_auth.has_credentials():
-        raise HTTPException(
-            status_code=400,
-            detail="Authentication required for model download. "
-                   "Set a developer token via 'slp token set' or sign in through the Smartloop app.",
-        )
+    # No credential pre-flight: FREE models download anonymously, and the
+    # platform is the authority on the rest — it rejects an unentitled request
+    # with 403, which surfaces as an upgrade prompt.
 
     async def event_stream():
         try:
