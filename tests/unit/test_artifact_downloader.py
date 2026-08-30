@@ -107,3 +107,54 @@ class TestDownloadIsNotAuthGated:
         downloader = self._downloader(tmp_path, DenyingSource())
         with pytest.raises(ModelAccessError, match="not available on your current plan"):
             downloader.download("google/gemma-3-4b-it")
+
+
+class TestResolveArtifactsIsSeparableFromTheTransfer:
+    """Entitlement is decided by asking for the signed URLs, so that call is
+    split out: /v1/init runs it before opening its progress stream, then hands
+    the result to download() rather than paying for the rate-limited route
+    twice."""
+
+    def _downloader(self, tmp_path, source):
+        downloader = SLPArtifactDownloader.__new__(SLPArtifactDownloader)
+        downloader.workspace = type("WS", (), {"models_dir": str(tmp_path)})()
+        downloader.logger = logging.getLogger("test")
+        downloader._model_source = source
+        return downloader
+
+    def test_resolve_selects_the_gguf_artifacts(self, tmp_path):
+        class FakeSource:
+            def get_artifacts(self, model_name):
+                return {
+                    "model.gguf": "https://signed/model.gguf",
+                    "README.md": "https://signed/README.md",
+                }
+
+        resolved = self._downloader(tmp_path, FakeSource()).resolve_artifacts(
+            "google/gemma-3-4b-it")
+
+        assert resolved == {"model.gguf": "https://signed/model.gguf"}
+
+    def test_passed_artifacts_skip_the_second_platform_call(self, tmp_path):
+        calls = []
+
+        class CountingSource:
+            def get_artifacts(self, model_name):
+                calls.append(model_name)
+                return {}
+
+        downloader = self._downloader(tmp_path, CountingSource())
+        downloader.download("google/gemma-3-4b-it", artifacts={})
+
+        assert calls == [], "download() re-minted URLs the caller already had"
+
+    def test_refusal_leaves_no_model_directory_behind(self, tmp_path):
+        class DenyingSource:
+            def get_artifacts(self, model_name):
+                raise ModelAccessError("nope")
+
+        downloader = self._downloader(tmp_path, DenyingSource())
+        with pytest.raises(ModelAccessError):
+            downloader.download("google/gemma-3-4b-it")
+
+        assert not (tmp_path / "google/gemma-3-4b-it").exists()

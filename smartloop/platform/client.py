@@ -66,11 +66,23 @@ class ModelAccessError(PermissionError):
 
 def _raise_for_status(resp: httpx.Response, error_map: dict[int, str] | None = None,
                       error_cls: type[Exception] = ConnectionError) -> None:
+    """Raise *error_cls* for a non-2xx response, tagged with the upstream status.
+
+    The status is attached as ``status_code`` on the exception so callers can
+    classify the failure without re-deriving it from the message.  The API
+    router turns it back into an HTTP status for its own client, and a message
+    is a bad channel for that: it is written for a person to read, and it gets
+    reworded.
+    """
     if resp.is_success:
         return
     if error_map and resp.status_code in error_map:
-        raise error_cls(error_map[resp.status_code])
-    raise error_cls(f"API error ({resp.status_code}): {resp.reason_phrase}")
+        message = error_map[resp.status_code]
+    else:
+        message = f"API error ({resp.status_code}): {resp.reason_phrase}"
+    exc = error_cls(message)
+    exc.status_code = resp.status_code
+    raise exc
 
 
 class SLPPlatformClient:
@@ -178,6 +190,14 @@ class SLPPlatformClient:
         403 for anything the caller's plan doesn't grant.  That 403 is raised as
         :class:`ModelAccessError` so callers can tell "not on your plan" apart
         from the 401 that means the token itself is bad.
+
+        Failures are split by whether retrying could change the answer, because
+        the two lead somewhere different.  ``ConnectionError`` covers the
+        transient ones (429, 5xx): the download route is rate-limited per IP and
+        anonymous downloads now reach that limit, so a 429 means "wait a moment",
+        not "upgrade your plan".  ``PermissionError`` covers the verdicts about
+        this caller and this model (401/403/404), which no amount of retrying
+        fixes.  Every one of them carries ``status_code``.
         """
         try:
             resp = httpx.get(self._url(_MODEL_DOWNLOAD.format(model_name)),
@@ -185,16 +205,25 @@ class SLPPlatformClient:
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
+        if resp.status_code == 429 or resp.status_code >= 500:
+            _raise_for_status(resp, {
+                429: "Too many download requests. Please wait a moment and try again.",
+                500: f"Server error while fetching model '{model_name}' artifacts.",
+            }, ConnectionError)
+
         if resp.status_code == 403:
-            raise ModelAccessError(
+            exc = ModelAccessError(
                 f"Model '{model_name}' is not available on your current plan. "
                 "Please upgrade to access this model."
             )
+            exc.status_code = 403
+            raise exc
 
         _raise_for_status(resp, {
-            401: "Authentication failed. Check your SLP_DEVELOPER_TOKEN.",
+            # Reaches an end user in the app, so it says what they can do about
+            # it rather than naming an env var they have never set.
+            401: "Sign in to download this model.",
             404: f"Model '{model_name}' not found on server.",
-            500: f"Server error while fetching model '{model_name}' artifacts."
         }, PermissionError)
 
         artifacts = resp.json().get("artifacts", {})

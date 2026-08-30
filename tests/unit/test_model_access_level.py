@@ -20,7 +20,12 @@ def test_internal_is_a_known_tier():
 def test_the_public_tiers_still_parse():
     assert _entry("free").access_level is AccessLevel.free
     assert _entry("pro").access_level is AccessLevel.paid
-    assert _entry("premium").access_level is AccessLevel.premium
+
+
+def test_the_bogus_premium_tier_degrades():
+    """``premium`` never existed on the platform's ``ModelAccessLevel``, so it
+    is not a member here — it takes the unknown-tier path."""
+    assert _entry("premium").access_level is None
 
 
 def test_a_future_tier_degrades_instead_of_failing():
