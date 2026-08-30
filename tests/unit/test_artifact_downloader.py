@@ -1,11 +1,14 @@
 """Tests for smartloop.model.downloader.artifact_downloader."""
 
 import hashlib
+import logging
 import os
 
 import pytest
 
+from smartloop.auth import credential_store
 from smartloop.model.downloader.artifact_downloader import SLPArtifactDownloader
+from smartloop.platform import ModelAccessError
 
 
 class TestComputeLocalMd5:
@@ -61,3 +64,46 @@ class TestResolveModelName:
     def test_unknown_model_passthrough(self):
         assert SLPArtifactDownloader._resolve_model_name("unknown/model") == "unknown/model"
         assert SLPArtifactDownloader._resolve_model_id("nonexistent") == "nonexistent"
+
+
+class TestDownloadIsNotAuthGated:
+    """Free models download anonymously, so the downloader must not refuse to
+    try before it has asked the platform.
+
+    The platform is the only authority on access: it serves the free tier to an
+    anonymous caller and answers 403 (``ModelAccessError``) for anything the
+    caller's plan doesn't grant. A local credential check would have denied the
+    free download the platform would have served.
+    """
+
+    def _downloader(self, tmp_path, source):
+        downloader = SLPArtifactDownloader.__new__(SLPArtifactDownloader)
+        downloader.workspace = type("WS", (), {"models_dir": str(tmp_path)})()
+        downloader.logger = logging.getLogger("test")
+        downloader._model_source = source
+        return downloader
+
+    def test_reaches_the_platform_with_no_credentials(self, tmp_path):
+        asked = []
+
+        class FakeSource:
+            def get_artifacts(self, model_name):
+                asked.append(model_name)
+                return {}  # no GGUFs -> download() returns early
+
+        # No credentials are set (conftest isolates the store to a temp dir).
+        assert credential_store.has_credentials() is False
+
+        downloader = self._downloader(tmp_path, FakeSource())
+        downloader.download("google/gemma-3-4b-it")
+
+        assert asked == ["gemma3-4b"]
+
+    def test_plan_denial_propagates(self, tmp_path):
+        class DenyingSource:
+            def get_artifacts(self, model_name):
+                raise ModelAccessError(f"Model '{model_name}' is not available on your current plan.")
+
+        downloader = self._downloader(tmp_path, DenyingSource())
+        with pytest.raises(ModelAccessError, match="not available on your current plan"):
+            downloader.download("google/gemma-3-4b-it")

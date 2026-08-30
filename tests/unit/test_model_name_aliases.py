@@ -156,8 +156,6 @@ class TestDownloadUsesThePublishedName:
     def _downloader(self, monkeypatch, tmp_path, asked):
         from smartloop.model.downloader import artifact_downloader as ad
 
-        monkeypatch.setattr(ad.platform_auth, "has_credentials", lambda: True)
-
         class FakeSource:
             def get_artifacts(self, model_name):
                 asked.append(model_name)

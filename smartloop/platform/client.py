@@ -53,6 +53,17 @@ def _user_agent() -> str:
     return f"smartloop/{__version__} ({platform.system().lower()})"
 
 
+class ModelAccessError(PermissionError):
+    """The account's plan does not grant this model (HTTP 403).
+
+    A subclass of ``PermissionError`` so existing handlers keep catching it,
+    but distinguishable from a 401: a 401 means "sign in", a 403 means the
+    caller (signed in or anonymous) reached the endpoint and the model is not
+    on their plan.  Callers map it to an HTTP 403 so the UI can offer an
+    upgrade instead of a login.
+    """
+
+
 def _raise_for_status(resp: httpx.Response, error_map: dict[int, str] | None = None,
                       error_cls: type[Exception] = ConnectionError) -> None:
     if resp.is_success:
@@ -158,9 +169,15 @@ class SLPPlatformClient:
         return resp.json()
 
     def get_model_artifacts(self, model_name: str) -> dict[str, str]:
-        """GET /v1/models/{model_name}/download (auth required).
+        """GET /v1/models/{model_name}/download (auth optional).
 
         Returns ``{filename: signed_url}`` map.
+
+        Auth headers are sent when we have them, but their absence is not an
+        error: the platform serves free models to anonymous callers and answers
+        403 for anything the caller's plan doesn't grant.  That 403 is raised as
+        :class:`ModelAccessError` so callers can tell "not on your plan" apart
+        from the 401 that means the token itself is bad.
         """
         try:
             resp = httpx.get(self._url(_MODEL_DOWNLOAD.format(model_name)),
@@ -168,9 +185,14 @@ class SLPPlatformClient:
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
+        if resp.status_code == 403:
+            raise ModelAccessError(
+                f"Model '{model_name}' is not available on your current plan. "
+                "Please upgrade to access this model."
+            )
+
         _raise_for_status(resp, {
             401: "Authentication failed. Check your SLP_DEVELOPER_TOKEN.",
-            403: f"Model '{model_name}' is not available on your current plan. Please upgrade to access this model.",
             404: f"Model '{model_name}' not found on server.",
             500: f"Server error while fetching model '{model_name}' artifacts."
         }, PermissionError)

@@ -2,11 +2,12 @@ import os
 import threading
 from typing import Optional
 
-from smartloop.platform.client import SLPPlatformClient
+from smartloop.platform.client import ModelAccessError, SLPPlatformClient
 from smartloop.platform.service import PlatformService
 from smartloop.platform.workspace_db import WorkspaceDB
 
-__all__ = ["SLPPlatformClient", "PlatformService", "WorkspaceDB", "get_platform_service"]
+__all__ = ["ModelAccessError", "SLPPlatformClient", "PlatformService", "WorkspaceDB",
+           "get_platform_service"]
 
 
 _platform_service: Optional[PlatformService] = None
