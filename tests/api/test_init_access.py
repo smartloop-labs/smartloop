@@ -1,9 +1,13 @@
-"""Tests for the download access gate on /v1/init.
+"""/v1/init must answer a refused download with a status code, not a stream.
 
-Free models download with no token at all, so ``/v1/init`` must not ask for
-credentials.  The only gate left is the plan, and it answers with a real HTTP
-403 — before the SSE stream opens — so the client can render an upgrade prompt
-off the status code instead of parsing an error event.
+Free models download with no token at all, so there is no credential gate left
+on this route.  What remains is entitlement, and it is resolved against the
+platform *before* the SSE stream opens: once StreamingResponse begins, the
+request has committed to 200 and a refusal can only be described inside a body
+that a client keying off the status will never read.
+
+Only failures that happen mid-transfer arrive as SSE error frames, tagged with
+the status they would have been.
 """
 
 import json
@@ -15,10 +19,10 @@ from smartloop.api.main import app
 from smartloop.api.routers import init as init_router
 from smartloop.api.services import get_model_service
 from smartloop.platform import ModelAccessError
-from smartloop.workspace.workspace import Workspace
+from smartloop.workspace.workspace import Workspace, WorkspaceModel
 
 FREE_MODEL = "gemma3-4b"
-PAID_MODEL = "gemma4-e4b"
+PAID_MODEL = "gemma3-12b"
 
 
 @pytest.fixture
@@ -33,6 +37,11 @@ def model_service(tmp_path):
         workspace_dir=str(tmp_path),
         models_dir=str(tmp_path / "models"),
     )
+    workspace.models.append(WorkspaceModel(
+        model_name=PAID_MODEL,
+        model_id="google/gemma-3-12b-it",
+        downloaded=False,
+    ))
     svc = MagicMock()
     svc._ensure_workspace.return_value = workspace
     app.dependency_overrides[get_model_service] = lambda: svc
@@ -40,103 +49,121 @@ def model_service(tmp_path):
     app.dependency_overrides.pop(get_model_service, None)
 
 
-def _catalog(name, access_level, is_accessible):
-    return [{
-        "name": name,
-        "model_id": f"google/{name}",
-        "access_level": access_level,
-        "is_accessible": is_accessible,
-    }]
+def _stub_downloader(monkeypatch, side_effect=None, artifacts=None):
+    """Replace the downloader the router builds with one under our control."""
+    made = MagicMock()
+    made.resolve_artifacts.side_effect = side_effect
+    if side_effect is None:
+        made.resolve_artifacts.return_value = artifacts or {"model.gguf": "https://signed/url"}
+    monkeypatch.setattr(init_router, "SLPArtifactDownloader", lambda *a, **k: made)
+    return made
 
 
-def _init_status(client, model_name):
-    """POST /v1/init and return the status code without draining the stream.
+def _tagged(cls, message, status):
+    exc = cls(message)
+    exc.status_code = status
+    return exc
 
-    The gate runs before the ``StreamingResponse`` is built, so the status is
-    settled by the time the headers arrive; closing here keeps the test from
-    running a real download for the cases that are allowed through.
+
+def _frames(resp):
+    return [json.loads(line[len("data: "):])
+            for line in resp.text.splitlines() if line.startswith("data: ")]
+
+
+class TestEntitlementIsSettledBeforeTheStream:
+    def test_refusal_is_a_403_not_a_200_stream(self, client, model_service, monkeypatch):
+        _stub_downloader(monkeypatch, side_effect=ModelAccessError(
+            f"Model '{PAID_MODEL}' is not available on your current plan."))
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert resp.status_code == 403
+        assert "current plan" in resp.json()["detail"]
+
+    def test_rate_limit_surfaces_as_429(self, client, model_service, monkeypatch):
+        # Not 403: retrying fixes this one, and calling it a plan problem would
+        # send the user to a billing page instead of back in a minute.
+        _stub_downloader(monkeypatch, side_effect=_tagged(
+            ConnectionError, "Too many download requests. Please wait a moment and try again.", 429))
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert resp.status_code == 429
+
+    def test_platform_unreachable_is_502(self, client, model_service, monkeypatch):
+        _stub_downloader(monkeypatch, side_effect=ConnectionError("Connection error: refused"))
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert resp.status_code == 502
+
+    def test_unknown_model_is_still_400(self, client, model_service):
+        # The only remaining 400 on this route. It is not fixed by signing in,
+        # so a client must be able to tell it apart from an entitlement refusal.
+        resp = client.post("/v1/init", json={"model_name": "no-such-model"})
+
+        assert resp.status_code == 400
+        assert "Unknown model" in resp.json()["detail"]
+
+    def test_free_model_is_resolved_without_credentials(
+        self, client, model_service, monkeypatch
+    ):
+        # The point of DEV-383: the old behaviour was a 400 ("Authentication
+        # required") for any download without a token. A free model must now get
+        # as far as asking the platform for URLs.
+        made = _stub_downloader(monkeypatch)
+
+        with client.stream("POST", "/v1/init", json={"model_name": FREE_MODEL}) as resp:
+            assert resp.status_code == 200
+
+        made.resolve_artifacts.assert_called_once()
+
+    def test_resolved_urls_are_handed_to_the_download(
+        self, client, model_service, monkeypatch
+    ):
+        """The download route is rate-limited, so the URLs are minted once."""
+        artifacts = {"model.gguf": "https://signed/url"}
+        made = _stub_downloader(monkeypatch, artifacts=artifacts)
+
+        client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert made.download.call_args.kwargs["artifacts"] == artifacts
+
+
+class TestMidStreamFailureCarriesItsStatus:
+    """A failure after the stream opened still has to be classifiable.
+
+    The status line is 200 by then, so the code rides on the event for the
+    client to handle it the same way it handles the pre-stream status.
     """
-    with client.stream("POST", "/v1/init", json={"model_name": model_name}) as resp:
-        return resp.status_code
 
+    def test_late_plan_denial_is_tagged_403(self, client, model_service, monkeypatch):
+        # A plan that changed between resolving the URLs and using them.
+        made = _stub_downloader(monkeypatch)
+        made.download.side_effect = ModelAccessError(
+            f"Model '{PAID_MODEL}' is not available on your current plan.")
 
-class TestInitPlanGate:
-    def test_403_for_a_model_off_the_plan(self, client, platform_service, model_service):
-        platform_service.list_models.return_value = _catalog(PAID_MODEL, "pro", False)
-
-        with client.stream("POST", "/v1/init", json={"model_name": PAID_MODEL}) as resp:
-            assert resp.status_code == 403
-            assert "not available on your current plan" in resp.read().decode()
-
-    def test_no_gate_for_a_free_model_without_credentials(
-        self, client, platform_service, model_service
-    ):
-        # The old behaviour was a 400 ("Authentication required") for any
-        # download without a token. A free model must now get through.
-        platform_service.list_models.return_value = _catalog(FREE_MODEL, "free", False)
-
-        assert _init_status(client, FREE_MODEL) == 200
-
-    def test_accessible_paid_model_is_not_gated(
-        self, client, platform_service, model_service
-    ):
-        platform_service.list_models.return_value = _catalog(PAID_MODEL, "pro", True)
-
-        assert _init_status(client, PAID_MODEL) == 200
-
-    def test_unknown_to_the_catalog_is_not_gated(
-        self, client, platform_service, model_service
-    ):
-        # Fail open: a missing catalog entry must not block a download the
-        # platform would have served.
-        platform_service.list_models.return_value = []
-
-        assert _init_status(client, PAID_MODEL) == 200
-
-    def test_unclassified_model_is_not_gated(
-        self, client, platform_service, model_service
-    ):
-        # No access_level from the cloud — treat as free, as /v1/models does.
-        platform_service.list_models.return_value = _catalog(PAID_MODEL, None, False)
-
-        assert _init_status(client, PAID_MODEL) == 200
-
-    def test_unreachable_platform_is_not_gated(
-        self, client, platform_service, model_service
-    ):
-        platform_service.list_models.side_effect = ConnectionError("offline")
-
-        assert _init_status(client, PAID_MODEL) == 200
-
-
-class TestLateDenialOnTheStream:
-    """The pre-stream gate reads a cached catalog, so the platform's own 403 can
-    still land mid-stream. The status line is 200 by then, so the code has to
-    ride on the event for the client to handle it the same way."""
-
-    def test_error_event_carries_the_403(
-        self, client, platform_service, model_service, monkeypatch
-    ):
-        # Catalog says it's free; the platform disagrees when asked for URLs.
-        platform_service.list_models.return_value = _catalog(FREE_MODEL, "free", True)
-
-        def _denying_downloader(workspace, logger):
-            downloader = MagicMock()
-            downloader.download.side_effect = ModelAccessError(
-                f"Model '{FREE_MODEL}' is not available on your current plan."
-            )
-            return downloader
-
-        monkeypatch.setattr(init_router, "SLPArtifactDownloader", _denying_downloader)
-
-        resp = client.post("/v1/init", json={"model_name": FREE_MODEL})
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
 
         assert resp.status_code == 200
-        events = [
-            json.loads(line[len("data: "):])
-            for line in resp.text.splitlines()
-            if line.startswith("data: ")
-        ]
-        error = next(e for e in events if e["status"] == "error")
+        error = next(f for f in _frames(resp) if f.get("status") == "error")
         assert error["code"] == 403
         assert "not available on your current plan" in error["message"]
+
+    def test_expired_url_is_tagged_with_its_own_status(
+        self, client, model_service, monkeypatch
+    ):
+        _stub_downloader(monkeypatch)
+
+        async def boom(*args, **kwargs):
+            raise _tagged(PermissionError, "Download rejected (401 Unauthorized).", 401)
+            yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(init_router, "_download_and_stream", boom)
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert resp.status_code == 200  # already committed; the body carries the failure
+        errors = [f for f in _frames(resp) if f.get("status") == "error"]
+        assert errors, f"no error frame in stream: {resp.text!r}"
+        assert errors[0]["code"] == 401
