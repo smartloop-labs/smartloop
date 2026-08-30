@@ -160,7 +160,9 @@ class TestGetModelArtifacts:
         }
 
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
-        with pytest.raises(PermissionError, match="Authentication failed"):
+        # Reaches an end user in the app, so it says what they can do about it
+        # rather than naming an env var they have never set.
+        with pytest.raises(PermissionError, match="Sign in"):
             client.get_model_artifacts("slp-orchestra-mini")
 
     def test_404_raises_permission_error(self, stub_server):
@@ -198,6 +200,53 @@ class TestGetModelArtifacts:
         assert client.get_model_artifacts("gemma3-4b") == {
             "model.gguf": "https://storage/model.gguf",
         }
+
+    def test_429_raises_connection_error(self, stub_server):
+        """Rate limiting is transient, so it must not be typed as a plan problem.
+
+        The download route is rate-limited per IP, which anonymous downloads now
+        reach. Classing a 429 as a PermissionError would tell the user to
+        upgrade when what they need is to wait.
+        """
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/slp-orchestra-mini/download": (429, {"detail": "rate limited"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError) as exc:
+            client.get_model_artifacts("slp-orchestra-mini")
+        assert not isinstance(exc.value, PermissionError)
+        assert exc.value.status_code == 429
+
+    def test_server_error_raises_connection_error(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/slp-orchestra-mini/download": (500, {"detail": "boom"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError) as exc:
+            client.get_model_artifacts("slp-orchestra-mini")
+        assert not isinstance(exc.value, PermissionError)
+        assert exc.value.status_code == 500
+
+    def test_errors_carry_the_upstream_status(self, stub_server):
+        """Callers classify by status, not by matching message text.
+
+        /v1/init reads this back off the exception to choose its own HTTP
+        status, and a message is a bad channel for that: it is written for a
+        person and it gets reworded.
+        """
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/gemma3-12b/download": (403, {"detail": "upgrade"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ModelAccessError) as exc:
+            client.get_model_artifacts("gemma3-12b")
+        assert exc.value.status_code == 403
 
 
 class TestGetLatestRelease:

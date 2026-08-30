@@ -18,7 +18,7 @@ from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
-from smartloop.platform import ModelAccessError, PlatformService, get_platform_service
+from smartloop.platform import get_platform_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["init"])
@@ -38,6 +38,34 @@ class InitRequest(BaseModel):
 def _sse_event(data: dict, event: str = "progress") -> str:
     """Format a dict as an SSE event string."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _status_for(exc: Exception) -> int:
+    """Classify a stream failure as the HTTP status it would have been.
+
+    Entitlement is settled before the stream opens, so anything reaching here
+    failed mid-transfer — an expired signed URL, a full disk, a dropped socket.
+    The client still has to tell "sign in" apart from "try again", and it should
+    not have to do that by matching on message text, which is written for a
+    person and gets reworded.  Platform errors carry the upstream status (see
+    ``_raise_for_status``); the rest fall back to their type.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    if isinstance(exc, PermissionError):
+        return 403
+    if isinstance(exc, ConnectionError):
+        return 502
+    return 500
+
+
+def _error_event(exc: Exception) -> str:
+    """Terminal SSE frame for a failed stream, tagged with a status code."""
+    return _sse_event(
+        {"status": "error", "code": _status_for(exc), "message": str(exc)},
+        event="error",
+    )
 
 
 def _seed_model_catalog() -> None:
@@ -61,44 +89,6 @@ def _seed_model_catalog() -> None:
         logger.warning("Could not schedule model catalog seed", exc_info=True)
 
 
-async def _plan_denies(svc: PlatformService, model_name: str) -> bool:
-    """True when the cloud catalog says this model is off the caller's plan.
-
-    A free model downloads with no token at all, so the only thing worth
-    checking before starting the stream is the plan — and the catalog already
-    carries the answer the model picker rendered (``access_level`` plus the
-    per-user ``is_accessible``).  Answering here lets ``/v1/init`` reply with a
-    real HTTP 403 instead of a 200 stream that fails later.
-
-    Deliberately fail-open: an unclassified model, an empty catalog or an
-    unreachable platform must not block a download.  The platform re-checks
-    when the signed URLs are fetched and answers 403 itself, so a stale cache
-    costs a late error, never a wrongly-allowed download.
-
-    ``list_models`` is usually a cache read, but a cold cache turns it into a
-    sync cloud call with a 30s timeout — run it off the loop so a slow platform
-    stalls this request only, not every other one in flight.
-    """
-    loop = asyncio.get_event_loop()
-    try:
-        catalog = await loop.run_in_executor(None, svc.list_models)
-    except Exception:
-        logger.warning("Could not resolve model access level; deferring to the platform",
-                       exc_info=True)
-        return False
-
-    entry = next(
-        (m for m in catalog
-         if canonical_model_name(m.get("name", "")) == model_name),
-        None,
-    )
-    if entry is None:
-        return False
-    access_level = entry.get("access_level")
-    is_paid = access_level not in (None, "free")
-    return is_paid and not entry.get("is_accessible", False)
-
-
 def _gguf_exists(model_dir: str) -> bool:
     """Check whether a .gguf file exists in model_dir or its bin/ subdirectory."""
     if not os.path.isdir(model_dir):
@@ -110,8 +100,14 @@ def _gguf_exists(model_dir: str) -> bool:
 
 
 async def _download_and_stream(downloader, model_id: str, model_name: str,
-                                is_bootstrap: bool = False):
-    """Download model files and stream progress."""
+                                is_bootstrap: bool = False,
+                                artifacts: dict[str, str] | None = None):
+    """Download model files and stream progress.
+
+    *artifacts* carries a signed-URL map already resolved by the caller (see
+    :meth:`SLPArtifactDownloader.resolve_artifacts`), so entitlement is settled
+    before this stream opens and the URLs are minted once.
+    """
     progress_queue: Queue[dict] = Queue()
     _last_progress_time: dict[str, float] = {}
 
@@ -135,7 +131,8 @@ async def _download_and_stream(downloader, model_id: str, model_name: str,
         if is_bootstrap:
             downloader.bootstrap_download(progress_callback=on_progress)
         else:
-            downloader.download(model_id=model_id, progress_callback=on_progress)
+            downloader.download(model_id=model_id, progress_callback=on_progress,
+                                artifacts=artifacts)
 
     download_task = loop.run_in_executor(None, _do_download)
 
@@ -239,7 +236,6 @@ def _get_project_info(workspace, model_name: str) -> Optional[dict]:
 async def init(
     request: InitRequest,
     model_service: ModelService = Depends(get_model_service),
-    svc: PlatformService = Depends(get_platform_service),
 ):
     """Initialize the workspace and download the model.
 
@@ -264,28 +260,37 @@ async def init(
                                        enabled=request.project_id is None)
 
     model_dir = ws_model.model_dir
-    needs_download = not _gguf_exists(model_dir)
 
-    # Free models download anonymously, so there is no auth gate here — only a
-    # plan gate.  The 403 is raised before the stream opens so the client sees
-    # it as an HTTP status (the UI turns it into an upgrade prompt) rather than
-    # having to read it out of an SSE error event.
-    if needs_download and await _plan_denies(svc, target):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Model {display_model_name(target)} is not available on your current plan.",
-        )
+    # Settle entitlement before the response starts. There is no credential
+    # pre-flight — FREE models download anonymously and the platform is the
+    # authority on the rest — but the answer has to arrive as a status code:
+    # once StreamingResponse begins, the request has already committed to 200
+    # and a refusal can only be described inside the body. Resolving here also
+    # means the signed URLs are minted once, which matters because the download
+    # route is rate-limited per IP.
+    downloader = None
+    artifacts = None
+    if not _gguf_exists(model_dir):
+        downloader = SLPArtifactDownloader(workspace, logger)
+        try:
+            artifacts = await asyncio.get_event_loop().run_in_executor(
+                None, downloader.resolve_artifacts, ws_model.model_id
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=getattr(exc, "status_code", 403), detail=str(exc))
+        except ConnectionError as exc:
+            raise HTTPException(status_code=getattr(exc, "status_code", 502), detail=str(exc))
 
     async def event_stream():
         try:
             # 1. Download if needed
-            if _gguf_exists(model_dir):
+            if downloader is None:
                 yield _sse_event({"status": "model_ready", "message": f"Model {display_model_name(target)} already available."})
                 model_service.mark_model_downloaded(target)
                 model_service._model.save()
             else:
-                downloader = SLPArtifactDownloader(workspace, logger)
-                async for event in _download_and_stream(downloader, ws_model.model_id, target):
+                async for event in _download_and_stream(downloader, ws_model.model_id, target,
+                                                        artifacts=artifacts):
                     yield event
 
                 model_service.mark_model_downloaded(target)
@@ -327,16 +332,9 @@ async def init(
                 "project": _get_project_info(model_service._model.workspace, target),
             }, event="complete")
 
-        except ModelAccessError as exc:
-            # The plan gate above runs off a cached catalog, so the platform's
-            # own 403 can still land here (stale cache, or a plan that changed
-            # mid-download).  The status line is already 200 by now, so the code
-            # rides on the event for the UI to handle like the pre-stream 403.
-            logger.warning("Init denied by plan: %s", exc)
-            yield _sse_event({"status": "error", "code": 403, "message": str(exc)}, event="error")
         except Exception as exc:
             logger.exception("Init failed")
-            yield _sse_event({"status": "error", "message": str(exc)}, event="error")
+            yield _error_event(exc)
 
     return StreamingResponse(
         event_stream(),
@@ -448,7 +446,7 @@ async def bootstrap(
 
         except Exception as exc:
             logger.exception("Bootstrap failed")
-            yield _sse_event({"status": "error", "message": str(exc)}, event="error")
+            yield _error_event(exc)
 
     return StreamingResponse(
         event_stream(),

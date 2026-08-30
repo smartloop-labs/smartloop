@@ -71,25 +71,64 @@ class TestListModels:
         assert names == ["gemma3-4b"]
 
     def test_lists_paid_models_outside_plan(self, client, platform_service):
-        # The picker shows what an upgrade would buy, so a Pro/premium model
-        # the plan doesn't grant is listed with is_accessible=False rather than
-        # hidden. Access is enforced at download time (403), not here.
+        # The picker shows what an upgrade would buy, so a Pro model the plan
+        # doesn't grant is listed with is_accessible=False rather than hidden.
+        # Access is enforced at download time (403), not here.
         platform_service.list_models.return_value = [
             {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it",
              "access_level": "free", "is_accessible": True},
             {"name": "gemma3-12b", "model_id": "google/gemma-3-12b-it",
              "access_level": "pro", "is_accessible": False},
-            {"name": "gemma3-27b", "model_id": "google/gemma-3-27b-it",
-             "access_level": "premium", "is_accessible": False},
         ]
         resp = client.get("/v1/models")
 
         assert resp.status_code == 200
         by_name = {m["name"]: m for m in resp.json()}
-        assert set(by_name) == {"gemma3-4b", "gemma3-12b", "gemma3-27b"}
+        assert set(by_name) == {"gemma3-4b", "gemma3-12b"}
         assert by_name["gemma3-12b"]["access_level"] == "pro"
         assert by_name["gemma3-12b"]["is_accessible"] is False
-        assert by_name["gemma3-27b"]["is_accessible"] is False
+
+    def test_lists_internal_models(self, client, platform_service):
+        # The cloud filters INTERNAL out for everyone but superusers, so a row
+        # that reaches us is one the caller is entitled to see. It must survive
+        # validation — a local enum missing the member would 500 the list.
+        platform_service.list_models.return_value = [
+            {"name": "gemma3-12b", "model_id": "google/gemma-3-12b-it",
+             "access_level": "internal", "is_accessible": True},
+        ]
+        resp = client.get("/v1/models")
+
+        assert resp.status_code == 200
+        assert [m["access_level"] for m in resp.json()] == ["internal"]
+
+    def test_an_unknown_access_level_costs_the_level_not_the_model(self, client, platform_service):
+        # An access level added cloud-side ahead of a release drops to null and
+        # the model is still listed — losing the tier beats losing the entry.
+        platform_service.list_models.return_value = [
+            {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it",
+             "access_level": "free", "is_accessible": True},
+            {"name": "gemma3-27b", "model_id": "google/gemma-3-27b-it",
+             "access_level": "enterprise", "is_accessible": False},
+        ]
+        resp = client.get("/v1/models")
+
+        assert resp.status_code == 200
+        by_name = {m["name"]: m for m in resp.json()}
+        assert set(by_name) == {"gemma3-4b", "gemma3-27b"}
+        assert by_name["gemma3-27b"]["access_level"] is None
+
+    def test_skips_unparseable_entry_without_dropping_the_rest(self, client, platform_service):
+        # A row the client cannot represent at all -- here a required field the
+        # cloud stopped sending -- costs that row, not the whole catalog.
+        platform_service.list_models.return_value = [
+            {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it",
+             "access_level": "free", "is_accessible": True},
+            {"name": "gemma3-27b", "access_level": "pro", "is_accessible": False},
+        ]
+        resp = client.get("/v1/models")
+
+        assert resp.status_code == 200
+        assert [m["name"] for m in resp.json()] == ["gemma3-4b"]
 
     def test_lists_everything_when_not_logged_in(self, client, platform_service):
         # Anonymous callers get is_accessible=False on everything — including
