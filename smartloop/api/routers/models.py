@@ -6,7 +6,7 @@ import logging
 from enum import Enum
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ValidationError, field_validator
 
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.config import SUPPORTED_MODELS
@@ -73,9 +73,20 @@ async def unload_model(model_service: ModelService = Depends(get_model_service))
     return {"status": "ok", "message": f"Model unloaded (project: {project_name})."}
 
 class AccessLevel(str, Enum):
+    """Mirrors the cloud catalog's access levels exactly.
+
+    These values are proxied straight through from the platform API, so the
+    members have to match ``ModelAccessLevel`` there (FREE/PRO/INTERNAL) or a
+    valid row fails validation on arrival.  ``premium`` was a member here
+    without ever existing on that enum — it was added client-side in the same
+    change as ``paid``, apparently conflating a model's access level with the
+    user-level ``is_premium`` plan flag — so it only ever admitted a value that
+    cannot arrive.  ``internal`` only ever appears when superuser credentials
+    fetched the catalog — the cloud filters it out for everyone else — so it
+    needs no special handling here beyond being representable.
+    """
     free = "free"
     paid = "pro"
-    premium = "premium"
     # Not on any plan: staff/preview builds the catalog publishes alongside the
     # public tiers.  Listed like the rest — access is enforced where the weights
     # are served (/v1/init and the signed-URL fetch both answer 403), not by
@@ -128,19 +139,25 @@ async def list_models(
     svc: PlatformService = Depends(get_platform_service),
     project_id: str | None = Query(default=None, description="Resolve enabled state against this project; defaults to workspace (app-default) state."),
 ):
-    """List available models from the cloud API (cached locally), enriched with local state.
+    """Proxy the cloud model catalog (cached locally), enriched with local state.
 
-    The whole catalog is returned, Pro/premium included: the picker shows what
-    an upgrade would buy, and the client decides how to present a model the
-    plan doesn't grant.  ``access_level`` and the per-user ``is_accessible``
-    (computed by the cloud — see ``_refresh_platform_cache`` in the auth
-    router) carry that state.  Free models download with no token at all, so
-    ``is_accessible`` is not a download gate; an anonymous caller gets
-    ``is_accessible=False`` on everything and can still download the free tier.
+    Every model the cloud returns is returned here, whatever its access level.
+    Entitlement is described, not enforced: the cloud computes ``is_accessible``
+    per-user on each request (see ``_refresh_platform_cache`` in the auth
+    router), and the client decides what to do with a model it says no to —
+    hide it, or show it locked as an upgrade prompt.  Free models download with
+    no token at all, so ``is_accessible`` is not a download gate; an anonymous
+    caller gets ``is_accessible=False`` on everything and can still download the
+    free tier.
 
     Access is enforced where the weights are actually served: ``/v1/init``
-    answers 403 for a model off the plan, and the platform answers 403 again
-    when the signed URLs are fetched.  Nothing is hidden here to enforce it.
+    resolves the signed URLs before it opens its stream and surfaces the
+    platform's 403 as an HTTP status.  Nothing is hidden here to enforce it.
+
+    The cloud already withholds what must not be seen at all.  ``internal``
+    models are filtered out server-side for anyone who is not a superuser, so an
+    ``internal`` entry arriving here means superuser credentials fetched the
+    catalog and it belongs in the response.
 
     Only ``enabled`` resolves against ``project_id``; download state is
     workspace-wide.
@@ -166,10 +183,19 @@ async def list_models(
 
     result = []
     for m in models:
-        entry = ModelEntry(**m) if isinstance(m, dict) else m
+        try:
+            entry = ModelEntry(**m) if isinstance(m, dict) else m
+        except ValidationError:
+            # One unrecognised row must not empty the catalog. The cloud can add
+            # a field or an access level ahead of a client release, and a user
+            # left with no models at all is a worse failure than a missing one.
+            logger.warning("Skipping unparseable model catalog entry: %r", m, exc_info=True)
+            continue
         # The cloud catalog may still publish a model under its old name.
         entry.name = canonical_model_name(entry.name)
         if entry.name == bootstrap_model:
+            # Not an entitlement filter: the orchestrator is represented by the
+            # client's "Auto" affordance, not as a model you pick.
             continue
         ws_model = ws_lookup.get(entry.name)
         if ws_model:
