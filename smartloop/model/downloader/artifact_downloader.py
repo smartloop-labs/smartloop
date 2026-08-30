@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 from smartloop.platform import SLPPlatformClient
-from smartloop.platform import auth as platform_auth
 from smartloop.config import AppSettings
 from smartloop.constants import canonical_model_name, display_model_name, platform_model_name
 from smartloop.model.downloader.artifact_source import SLPModelSource, SLPBootstrapSource
@@ -523,32 +522,58 @@ class SLPArtifactDownloader(SLPDownloader):
                 return name
         return model_id
 
+    def resolve_artifacts(self, model_id: str) -> dict[str, str]:
+        """Ask the platform for this model's signed GGUF URLs.
+
+        This is the step that decides entitlement, and it is separated from
+        :meth:`download` so a caller can settle "may this account have these
+        weights?" *before* committing to a long-running transfer — the API
+        router runs it ahead of opening its progress stream, so a refusal is an
+        HTTP status rather than an error buried in a stream that already
+        returned 200.
+
+        The URLs are minted per call and the route is rate-limited, so the
+        result is passed on to :meth:`download` rather than being requested
+        twice.  Raises ``PermissionError`` when the account is not entitled and
+        ``ConnectionError`` for transient failures (see
+        :meth:`SLPPlatformClient.get_model_artifacts`).
+        """
+        model_name = self._resolve_model_name(model_id)
+        # The catalog is keyed by the name the platform publishes, which can lag
+        # a local rename (sl-mini is still served as slp-orchestra-mini).
+        artifacts = self._model_source.get_artifacts(platform_model_name(model_name))
+        return _select_gguf_artifacts(artifacts)
+
     def download(self, model_id: str,
-                 progress_callback: ProgressCallback | None = None) -> Path:
+                 progress_callback: ProgressCallback | None = None,
+                 artifacts: dict[str, str] | None = None) -> Path:
         """Download GGUF model via the /v1/models/{model_name}/download endpoint.
 
         Accepts the HuggingFace-style *model_id* (e.g. "google/gemma-3-1b-it")
         to match the base-class interface, resolves it to the short model name
         for the API call, and stores files under the model_id path.
-        """
-        if not platform_auth.has_credentials():
-            raise EnvironmentError(
-                "Authentication required for GCS download. "
-                "Set a developer token via 'slp token set' or sign in through the Smartloop app."
-            )
 
+        *artifacts* accepts an already-resolved map from
+        :meth:`resolve_artifacts`; callers that have one pass it so the signed
+        URLs are minted once.  Omitting it resolves them here, which is what the
+        CLI and TUI do.
+
+        No credential check: the download endpoint serves FREE models to
+        anonymous callers.  ``auth_headers()`` yields ``{}`` when signed out and
+        the platform rejects an unentitled request with 403.
+        """
         model_name = self._resolve_model_name(model_id)
-        local_dir = os.path.join(self.workspace.models_dir, model_id)
-        os.makedirs(local_dir, exist_ok=True)
 
         self.logger.info(f"Downloading model: {display_model_name(model_name)}")
         print()
 
-        # The catalog is keyed by the name the platform publishes, which can lag
-        # a local rename (sl-mini is still served as slp-orchestra-mini).
-        artifacts = self._model_source.get_artifacts(platform_model_name(model_name))
+        if artifacts is None:
+            artifacts = self.resolve_artifacts(model_id)
 
-        artifacts = _select_gguf_artifacts(artifacts)
+        # After the entitlement call, not before: a refused download should not
+        # leave an empty model directory behind for the workspace to trip over.
+        local_dir = os.path.join(self.workspace.models_dir, model_id)
+        os.makedirs(local_dir, exist_ok=True)
 
         if not artifacts:
             self.logger.info(f"[ok] No GGUF files to download")

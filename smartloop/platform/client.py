@@ -55,11 +55,23 @@ def _user_agent() -> str:
 
 def _raise_for_status(resp: httpx.Response, error_map: dict[int, str] | None = None,
                       error_cls: type[Exception] = ConnectionError) -> None:
+    """Raise *error_cls* for a non-2xx response, tagged with the upstream status.
+
+    The status is attached as ``status_code`` on the exception so callers can
+    classify the failure without re-deriving it from the message.  The API
+    router turns it back into an HTTP status for its own client, and a message
+    is a bad channel for that: it is written for a person to read, and it gets
+    reworded.
+    """
     if resp.is_success:
         return
     if error_map and resp.status_code in error_map:
-        raise error_cls(error_map[resp.status_code])
-    raise error_cls(f"API error ({resp.status_code}): {resp.reason_phrase}")
+        message = error_map[resp.status_code]
+    else:
+        message = f"API error ({resp.status_code}): {resp.reason_phrase}"
+    exc = error_cls(message)
+    exc.status_code = resp.status_code
+    raise exc
 
 
 class SLPPlatformClient:
@@ -158,9 +170,23 @@ class SLPPlatformClient:
         return resp.json()
 
     def get_model_artifacts(self, model_name: str) -> dict[str, str]:
-        """GET /v1/models/{model_name}/download (auth required).
+        """GET /v1/models/{model_name}/download (auth optional).
 
         Returns ``{filename: signed_url}`` map.
+
+        Free-tier models are served to anonymous callers, so this sends whatever
+        ``auth_headers_fn`` yields — ``{}`` when signed out — and lets the
+        platform decide.  Two failure classes come back, and they are typed
+        apart because the retry policy depends on the difference:
+
+        ``PermissionError`` for a verdict about *this caller and this model*
+        (401/403/404).  Retrying changes nothing; the user has to sign in or
+        upgrade, so :meth:`_run_with_retries` re-raises it immediately.
+
+        ``ConnectionError`` for anything transient (429, 5xx).  The download
+        route is rate-limited per IP, so an anonymous burst legitimately earns a
+        429 — that is a "wait a moment", not a plan problem, and typing it as
+        one would both mislead the user and disable the backoff that fixes it.
         """
         try:
             resp = httpx.get(self._url(_MODEL_DOWNLOAD.format(model_name)),
@@ -168,11 +194,16 @@ class SLPPlatformClient:
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
+        if resp.status_code == 429 or resp.status_code >= 500:
+            _raise_for_status(resp, {
+                429: "Too many download requests. Please wait a moment and try again.",
+                500: f"Server error while fetching model '{model_name}' artifacts.",
+            }, ConnectionError)
+
         _raise_for_status(resp, {
-            401: "Authentication failed. Check your SLP_DEVELOPER_TOKEN.",
+            401: "Sign in to download this model.",
             403: f"Model '{model_name}' is not available on your current plan. Please upgrade to access this model.",
             404: f"Model '{model_name}' not found on server.",
-            500: f"Server error while fetching model '{model_name}' artifacts."
         }, PermissionError)
 
         artifacts = resp.json().get("artifacts", {})

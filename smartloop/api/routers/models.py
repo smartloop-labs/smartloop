@@ -6,7 +6,7 @@ import logging
 from enum import Enum
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.config import SUPPORTED_MODELS
@@ -62,9 +62,17 @@ async def unload_model(model_service: ModelService = Depends(get_model_service))
     return {"status": "ok", "message": f"Model unloaded (project: {project_name})."}
 
 class AccessLevel(str, Enum):
+    """Mirrors the cloud catalog's access levels exactly.
+
+    These values are proxied straight through from the platform API, so the
+    members have to match ``ModelAccessLevel`` there or a valid row fails
+    validation on arrival.  ``internal`` only ever appears when superuser
+    credentials fetched the catalog — the cloud filters it out for everyone
+    else — so it needs no special handling here beyond being representable.
+    """
     free = "free"
     paid = "pro"
-    premium = "premium"
+    internal = "internal"
 
 class ModelEntry(BaseModel):
     name: str
@@ -84,20 +92,24 @@ async def list_models(
     svc: PlatformService = Depends(get_platform_service),
     project_id: str | None = Query(default=None, description="Resolve enabled state against this project; defaults to workspace (app-default) state."),
 ):
-    """List available models from the cloud API (cached locally), enriched with local state.
+    """Proxy the cloud model catalog (cached locally), enriched with local state.
 
-    Paid models (Pro/premium) are listed only when the account's plan grants
-    them: the cloud computes ``is_accessible`` per-user (see
-    ``_refresh_platform_cache`` in the auth router), so a free account never
-    sees a Pro-only model.  Free models are always listed — anonymous callers
-    get ``is_accessible=False`` on everything, so gating them on that flag
-    would leave a logged-out user with an empty catalog.
+    Every model the cloud returns is returned here, whatever its access level.
+    Entitlement is described, not enforced: the cloud computes ``is_accessible``
+    per-user on each request (see ``_refresh_platform_cache`` in the auth
+    router), and the client decides what to do with a model it says no to —
+    hide it, or show it locked as an upgrade prompt.  Filtering here would take
+    that choice away from the client, and did: Pro models never reached it.
 
-    A model already downloaded into this workspace is always listed too,
-    whatever its access level: the weights are on disk and stay usable after a
-    plan downgrade or a logout.  Download state is workspace-wide, so the plan
-    gate above is deliberately not project-scoped; only ``enabled`` resolves
-    against ``project_id``.
+    The cloud already withholds what must not be seen at all.  ``internal``
+    models are filtered out server-side for anyone who is not a superuser, so an
+    ``internal`` entry arriving here means superuser credentials fetched the
+    catalog and it belongs in the response.
+
+    Local state is layered on top: ``enabled`` resolves against ``project_id``
+    (or the workspace app-default), and ``capabilities`` comes from the model
+    class.  Download state is workspace-wide, so it is deliberately not
+    project-scoped.
     """
     try:
         models = svc.list_models()
@@ -120,17 +132,21 @@ async def list_models(
 
     result = []
     for m in models:
-        entry = ModelEntry(**m) if isinstance(m, dict) else m
+        try:
+            entry = ModelEntry(**m) if isinstance(m, dict) else m
+        except ValidationError:
+            # One unrecognised row must not empty the catalog. The cloud can add
+            # a field or an access level ahead of a client release, and a user
+            # left with no models at all is a worse failure than a missing one.
+            logger.warning("Skipping unparseable model catalog entry: %r", m, exc_info=True)
+            continue
         # The cloud catalog may still publish a model under its old name.
         entry.name = canonical_model_name(entry.name)
         if entry.name == bootstrap_model:
+            # Not an entitlement filter: the orchestrator is represented by the
+            # client's "Auto" affordance, not as a model you pick.
             continue
         ws_model = ws_lookup.get(entry.name)
-        # An unset access_level means the cloud didn't classify the model —
-        # treat it as free rather than hiding it.
-        is_paid = entry.access_level not in (None, AccessLevel.free)
-        if is_paid and not entry.is_accessible and not (ws_model and ws_model.downloaded):
-            continue
         if ws_model:
             entry.enabled = workspace.effective_model_enabled(entry.name, project)
             entry.capabilities = ws_model.effective_capabilities

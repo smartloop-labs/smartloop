@@ -70,14 +70,45 @@ class TestListModels:
         names = [m["name"] for m in resp.json()]
         assert names == ["gemma3-4b"]
 
-    def test_excludes_paid_models_outside_plan(self, client, platform_service):
+    def test_lists_paid_models_outside_plan_as_inaccessible(self, client, platform_service):
+        # The endpoint proxies the catalog rather than gating it: a model the
+        # plan does not cover is still listed, carrying the is_accessible=False
+        # the client needs to show it locked (or hide it, its choice).
         platform_service.list_models.return_value = [
             {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it",
              "access_level": "free", "is_accessible": True},
             {"name": "gemma3-12b", "model_id": "google/gemma-3-12b-it",
              "access_level": "pro", "is_accessible": False},
+        ]
+        resp = client.get("/v1/models")
+
+        assert resp.status_code == 200
+        by_name = {m["name"]: m for m in resp.json()}
+        assert set(by_name) == {"gemma3-4b", "gemma3-12b"}
+        assert by_name["gemma3-12b"]["access_level"] == "pro"
+        assert by_name["gemma3-12b"]["is_accessible"] is False
+
+    def test_lists_internal_models(self, client, platform_service):
+        # The cloud filters INTERNAL out for everyone but superusers, so a row
+        # that reaches us is one the caller is entitled to see. It must survive
+        # validation — the local enum used to lack the member and 500 the list.
+        platform_service.list_models.return_value = [
+            {"name": "gemma3-12b", "model_id": "google/gemma-3-12b-it",
+             "access_level": "internal", "is_accessible": True},
+        ]
+        resp = client.get("/v1/models")
+
+        assert resp.status_code == 200
+        assert [m["access_level"] for m in resp.json()] == ["internal"]
+
+    def test_skips_unparseable_entry_without_dropping_the_rest(self, client, platform_service):
+        # A row the client cannot represent (a level added cloud-side ahead of a
+        # release) costs that row, not the whole catalog.
+        platform_service.list_models.return_value = [
+            {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it",
+             "access_level": "free", "is_accessible": True},
             {"name": "gemma3-27b", "model_id": "google/gemma-3-27b-it",
-             "access_level": "premium", "is_accessible": False},
+             "access_level": "enterprise", "is_accessible": False},
         ]
         resp = client.get("/v1/models")
 
@@ -85,18 +116,18 @@ class TestListModels:
         assert [m["name"] for m in resp.json()] == ["gemma3-4b"]
 
     def test_keeps_free_models_when_not_logged_in(self, client, platform_service):
-        # Anonymous callers get is_accessible=False on everything, so the free
-        # tier must not be gated on that flag.
+        # Anonymous callers get is_accessible=True on the free tier (the cloud
+        # computes it per request), but the free tier is listed either way.
         platform_service.list_models.return_value = [
             {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it",
-             "access_level": "free", "is_accessible": False},
+             "access_level": "free", "is_accessible": True},
             {"name": "gemma3-12b", "model_id": "google/gemma-3-12b-it",
              "access_level": "pro", "is_accessible": False},
         ]
         resp = client.get("/v1/models")
 
         assert resp.status_code == 200
-        assert [m["name"] for m in resp.json()] == ["gemma3-4b"]
+        assert "gemma3-4b" in [m["name"] for m in resp.json()]
 
     def test_keeps_unclassified_models(self, client, platform_service):
         # No access_level from the cloud — treat as free, not as gated.
@@ -124,9 +155,11 @@ class TestListModels:
         assert resp.status_code == 200
         assert [m["name"] for m in resp.json()] == ["gemma3-12b"]
 
-    def test_excludes_inaccessible_model_registered_but_not_downloaded(
+    def test_lists_inaccessible_model_registered_but_not_downloaded(
         self, client, platform_service, workspace_models
     ):
+        # Registered without weights and outside the plan: still listed, still
+        # flagged inaccessible. Deciding what that looks like is the client's.
         workspace_models.append(_ws_model("gemma3-12b", downloaded=False))
         platform_service.list_models.return_value = [
             {"name": "gemma3-12b", "model_id": "google/gemma-3-12b-it",
@@ -135,7 +168,8 @@ class TestListModels:
         resp = client.get("/v1/models")
 
         assert resp.status_code == 200
-        assert resp.json() == []
+        assert [m["name"] for m in resp.json()] == ["gemma3-12b"]
+        assert resp.json()[0]["is_accessible"] is False
 
     def test_returns_empty_list(self, client, platform_service):
         platform_service.list_models.return_value = []

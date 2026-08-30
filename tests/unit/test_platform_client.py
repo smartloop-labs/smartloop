@@ -160,7 +160,9 @@ class TestGetModelArtifacts:
         }
 
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
-        with pytest.raises(PermissionError, match="Authentication failed"):
+        # Reaches an end user in the app, so it says what they can do about it
+        # rather than naming an env var they have never set.
+        with pytest.raises(PermissionError, match="Sign in"):
             client.get_model_artifacts("slp-orchestra-mini")
 
     def test_404_raises_permission_error(self, stub_server):
@@ -170,6 +172,47 @@ class TestGetModelArtifacts:
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
         with pytest.raises(PermissionError, match="not found"):
             client.get_model_artifacts("nonexistent")
+
+    def test_429_raises_connection_error(self, stub_server):
+        """Rate limiting is transient, so it must not be typed as a plan problem.
+
+        ``_run_with_retries`` re-raises PermissionError immediately; classing a
+        429 as one would disable the backoff that resolves it and tell the user
+        to upgrade instead of to wait.
+        """
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/slp-orchestra-mini/download": (429, {"detail": "rate limited"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError) as exc:
+            client.get_model_artifacts("slp-orchestra-mini")
+        assert not isinstance(exc.value, PermissionError)
+        assert exc.value.status_code == 429
+
+    def test_server_error_raises_connection_error(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/slp-orchestra-mini/download": (500, {"detail": "boom"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError) as exc:
+            client.get_model_artifacts("slp-orchestra-mini")
+        assert not isinstance(exc.value, PermissionError)
+
+    def test_error_carries_the_upstream_status(self, stub_server):
+        """Callers classify by status, not by matching message text."""
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/slp-orchestra-mini/download": (403, {"detail": "upgrade"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(PermissionError) as exc:
+            client.get_model_artifacts("slp-orchestra-mini")
+        assert exc.value.status_code == 403
 
 
 class TestGetLatestRelease:
