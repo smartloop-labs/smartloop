@@ -70,7 +70,10 @@ class TestListModels:
         names = [m["name"] for m in resp.json()]
         assert names == ["gemma3-4b"]
 
-    def test_excludes_paid_models_outside_plan(self, client, platform_service):
+    def test_lists_paid_models_outside_plan(self, client, platform_service):
+        # The picker shows what an upgrade would buy, so a Pro/premium model
+        # the plan doesn't grant is listed with is_accessible=False rather than
+        # hidden. Access is enforced at download time (403), not here.
         platform_service.list_models.return_value = [
             {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it",
              "access_level": "free", "is_accessible": True},
@@ -82,11 +85,16 @@ class TestListModels:
         resp = client.get("/v1/models")
 
         assert resp.status_code == 200
-        assert [m["name"] for m in resp.json()] == ["gemma3-4b"]
+        by_name = {m["name"]: m for m in resp.json()}
+        assert set(by_name) == {"gemma3-4b", "gemma3-12b", "gemma3-27b"}
+        assert by_name["gemma3-12b"]["access_level"] == "pro"
+        assert by_name["gemma3-12b"]["is_accessible"] is False
+        assert by_name["gemma3-27b"]["is_accessible"] is False
 
-    def test_keeps_free_models_when_not_logged_in(self, client, platform_service):
-        # Anonymous callers get is_accessible=False on everything, so the free
-        # tier must not be gated on that flag.
+    def test_lists_everything_when_not_logged_in(self, client, platform_service):
+        # Anonymous callers get is_accessible=False on everything — including
+        # the free tier they can in fact download — so that flag must not
+        # decide what is listed.
         platform_service.list_models.return_value = [
             {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it",
              "access_level": "free", "is_accessible": False},
@@ -96,7 +104,7 @@ class TestListModels:
         resp = client.get("/v1/models")
 
         assert resp.status_code == 200
-        assert [m["name"] for m in resp.json()] == ["gemma3-4b"]
+        assert sorted(m["name"] for m in resp.json()) == ["gemma3-12b", "gemma3-4b"]
 
     def test_keeps_unclassified_models(self, client, platform_service):
         # No access_level from the cloud — treat as free, not as gated.
@@ -124,9 +132,11 @@ class TestListModels:
         assert resp.status_code == 200
         assert [m["name"] for m in resp.json()] == ["gemma3-12b"]
 
-    def test_excludes_inaccessible_model_registered_but_not_downloaded(
+    def test_lists_inaccessible_model_registered_but_not_downloaded(
         self, client, platform_service, workspace_models
     ):
+        # Registered, not yet on disk, and off the plan — still listed, with
+        # the local ``enabled`` state resolved as for any other entry.
         workspace_models.append(_ws_model("gemma3-12b", downloaded=False))
         platform_service.list_models.return_value = [
             {"name": "gemma3-12b", "model_id": "google/gemma-3-12b-it",
@@ -135,7 +145,7 @@ class TestListModels:
         resp = client.get("/v1/models")
 
         assert resp.status_code == 200
-        assert resp.json() == []
+        assert [m["name"] for m in resp.json()] == ["gemma3-12b"]
 
     def test_returns_empty_list(self, client, platform_service):
         platform_service.list_models.return_value = []

@@ -86,18 +86,20 @@ async def list_models(
 ):
     """List available models from the cloud API (cached locally), enriched with local state.
 
-    Paid models (Pro/premium) are listed only when the account's plan grants
-    them: the cloud computes ``is_accessible`` per-user (see
-    ``_refresh_platform_cache`` in the auth router), so a free account never
-    sees a Pro-only model.  Free models are always listed — anonymous callers
-    get ``is_accessible=False`` on everything, so gating them on that flag
-    would leave a logged-out user with an empty catalog.
+    The whole catalog is returned, Pro/premium included: the picker shows what
+    an upgrade would buy, and the client decides how to present a model the
+    plan doesn't grant.  ``access_level`` and the per-user ``is_accessible``
+    (computed by the cloud — see ``_refresh_platform_cache`` in the auth
+    router) carry that state.  Free models download with no token at all, so
+    ``is_accessible`` is not a download gate; an anonymous caller gets
+    ``is_accessible=False`` on everything and can still download the free tier.
 
-    A model already downloaded into this workspace is always listed too,
-    whatever its access level: the weights are on disk and stay usable after a
-    plan downgrade or a logout.  Download state is workspace-wide, so the plan
-    gate above is deliberately not project-scoped; only ``enabled`` resolves
-    against ``project_id``.
+    Access is enforced where the weights are actually served: ``/v1/init``
+    answers 403 for a model off the plan, and the platform answers 403 again
+    when the signed URLs are fetched.  Nothing is hidden here to enforce it.
+
+    Only ``enabled`` resolves against ``project_id``; download state is
+    workspace-wide.
     """
     try:
         models = svc.list_models()
@@ -126,11 +128,6 @@ async def list_models(
         if entry.name == bootstrap_model:
             continue
         ws_model = ws_lookup.get(entry.name)
-        # An unset access_level means the cloud didn't classify the model —
-        # treat it as free rather than hiding it.
-        is_paid = entry.access_level not in (None, AccessLevel.free)
-        if is_paid and not entry.is_accessible and not (ws_model and ws_model.downloaded):
-            continue
         if ws_model:
             entry.enabled = workspace.effective_model_enabled(entry.name, project)
             entry.capabilities = ws_model.effective_capabilities

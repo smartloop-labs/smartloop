@@ -6,7 +6,7 @@ from threading import Thread
 
 import pytest
 
-from smartloop.platform.client import SLPPlatformClient
+from smartloop.platform.client import ModelAccessError, SLPPlatformClient
 
 
 class _StubHandler(BaseHTTPRequestHandler):
@@ -170,6 +170,34 @@ class TestGetModelArtifacts:
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
         with pytest.raises(PermissionError, match="not found"):
             client.get_model_artifacts("nonexistent")
+
+    def test_403_raises_model_access_error(self, stub_server):
+        """403 is "not on your plan", not "your token is bad" — the two lead to
+        different UI (upgrade vs. sign in), so they must not collapse into one
+        exception."""
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/gemma3-12b/download": (403, {"detail": "forbidden"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ModelAccessError, match="not available on your current plan"):
+            client.get_model_artifacts("gemma3-12b")
+
+    def test_free_model_downloads_without_auth_headers(self, stub_server):
+        """A free model is served to an anonymous caller; the client must not
+        require credentials to ask."""
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/gemma3-4b/download": (200, {
+                "artifacts": {"model.gguf": "https://storage/model.gguf"},
+            }),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        assert client.get_model_artifacts("gemma3-4b") == {
+            "model.gguf": "https://storage/model.gguf",
+        }
 
 
 class TestGetLatestRelease:

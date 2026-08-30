@@ -18,7 +18,7 @@ from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
-from smartloop.platform import auth as platform_auth, get_platform_service
+from smartloop.platform import ModelAccessError, PlatformService, get_platform_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["init"])
@@ -59,6 +59,44 @@ def _seed_model_catalog() -> None:
         future.add_done_callback(_log_result)
     except Exception:
         logger.warning("Could not schedule model catalog seed", exc_info=True)
+
+
+async def _plan_denies(svc: PlatformService, model_name: str) -> bool:
+    """True when the cloud catalog says this model is off the caller's plan.
+
+    A free model downloads with no token at all, so the only thing worth
+    checking before starting the stream is the plan — and the catalog already
+    carries the answer the model picker rendered (``access_level`` plus the
+    per-user ``is_accessible``).  Answering here lets ``/v1/init`` reply with a
+    real HTTP 403 instead of a 200 stream that fails later.
+
+    Deliberately fail-open: an unclassified model, an empty catalog or an
+    unreachable platform must not block a download.  The platform re-checks
+    when the signed URLs are fetched and answers 403 itself, so a stale cache
+    costs a late error, never a wrongly-allowed download.
+
+    ``list_models`` is usually a cache read, but a cold cache turns it into a
+    sync cloud call with a 30s timeout — run it off the loop so a slow platform
+    stalls this request only, not every other one in flight.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        catalog = await loop.run_in_executor(None, svc.list_models)
+    except Exception:
+        logger.warning("Could not resolve model access level; deferring to the platform",
+                       exc_info=True)
+        return False
+
+    entry = next(
+        (m for m in catalog
+         if canonical_model_name(m.get("name", "")) == model_name),
+        None,
+    )
+    if entry is None:
+        return False
+    access_level = entry.get("access_level")
+    is_paid = access_level not in (None, "free")
+    return is_paid and not entry.get("is_accessible", False)
 
 
 def _gguf_exists(model_dir: str) -> bool:
@@ -201,6 +239,7 @@ def _get_project_info(workspace, model_name: str) -> Optional[dict]:
 async def init(
     request: InitRequest,
     model_service: ModelService = Depends(get_model_service),
+    svc: PlatformService = Depends(get_platform_service),
 ):
     """Initialize the workspace and download the model.
 
@@ -227,11 +266,14 @@ async def init(
     model_dir = ws_model.model_dir
     needs_download = not _gguf_exists(model_dir)
 
-    if needs_download and not platform_auth.has_credentials():
+    # Free models download anonymously, so there is no auth gate here — only a
+    # plan gate.  The 403 is raised before the stream opens so the client sees
+    # it as an HTTP status (the UI turns it into an upgrade prompt) rather than
+    # having to read it out of an SSE error event.
+    if needs_download and await _plan_denies(svc, target):
         raise HTTPException(
-            status_code=400,
-            detail="Authentication required for model download. "
-                   "Set a developer token via 'slp token set' or sign in through the Smartloop app.",
+            status_code=403,
+            detail=f"Model {display_model_name(target)} is not available on your current plan.",
         )
 
     async def event_stream():
@@ -285,6 +327,13 @@ async def init(
                 "project": _get_project_info(model_service._model.workspace, target),
             }, event="complete")
 
+        except ModelAccessError as exc:
+            # The plan gate above runs off a cached catalog, so the platform's
+            # own 403 can still land here (stale cache, or a plan that changed
+            # mid-download).  The status line is already 200 by now, so the code
+            # rides on the event for the UI to handle like the pre-stream 403.
+            logger.warning("Init denied by plan: %s", exc)
+            yield _sse_event({"status": "error", "code": 403, "message": str(exc)}, event="error")
         except Exception as exc:
             logger.exception("Init failed")
             yield _sse_event({"status": "error", "message": str(exc)}, event="error")
