@@ -198,14 +198,24 @@ class TestSimpleResume:
         assert dest.read_bytes() == b"ABCDEFGH"
 
     def test_401_raises_without_retry(self, tmp_path, monkeypatch):
+        """A 401 on the transfer is a stale URL, not a credentials problem.
+
+        Entitlement was settled before the transfer began, so this cannot mean
+        "you are not allowed" — the signed URL went past its expiry. It is a
+        ``ConnectionError`` so the caller offers a retry rather than a sign-in
+        prompt, and it still short-circuits the retry loop, because re-fetching
+        the same dead URL eight times helps nobody.
+        """
         dest = tmp_path / "file.bin"
         stream = _ScriptedStream(_FakeResp(401, []))
         monkeypatch.setattr(ad.httpx, "stream", stream)
 
         dl = _downloader()
-        with pytest.raises(PermissionError):
+        with pytest.raises(ad.StaleDownloadURLError) as exc:
             dl._download_file_simple("file.bin", "http://x/file", str(dest), size=8,
                                      progress_callback=None, supports_range=True)
+        assert isinstance(exc.value, ConnectionError)
+        assert not isinstance(exc.value, PermissionError)
         assert len(stream.header_calls) == 1
 
     def test_recovers_from_midstream_read_timeout(self, tmp_path, monkeypatch):
@@ -316,3 +326,39 @@ class TestVerifyAndAtomicPublish:
         assert (tmp_path / "model.gguf").read_bytes() == data
         assert not (tmp_path / "model.gguf.part").exists()
         assert len(stream.header_calls) == 1  # verification skipped, no re-download
+
+
+class TestChunkedFailureKeepsItsKind:
+    """The chunked path is the one production actually takes.
+
+    CHUNKED_THRESHOLD is 100 MB and every shipped model is larger, so a real
+    dropped connection always arrives through here. It used to re-raise every
+    chunk failure as a bare RuntimeError, which threw away the classification
+    the outer layers were careful to preserve — the SSE frame said 500 for a
+    dead link no matter what the layers above it did.
+    """
+
+    def _chunked(self, tmp_path, monkeypatch, exc):
+        monkeypatch.setattr(ad, "CHUNK_WORKERS", 1)
+        monkeypatch.setattr(ad.SLPArtifactDownloader, "_download_chunk",
+                            lambda *a, **k: (_ for _ in ()).throw(exc))
+        dl = _downloader()
+        with pytest.raises(Exception) as caught:
+            dl._download_file_chunked("file.bin", "http://x/file",
+                                      str(tmp_path / "file.bin"), size=1024,
+                                      progress_callback=None)
+        return caught.value
+
+    def test_dropped_connection_stays_a_connection_error(self, tmp_path, monkeypatch):
+        err = self._chunked(tmp_path, monkeypatch, httpx.ConnectError("dropped"))
+        assert isinstance(err, ConnectionError)
+        assert "Chunk download failed" in str(err)
+
+    def test_stale_signed_url_stays_a_connection_error(self, tmp_path, monkeypatch):
+        err = self._chunked(tmp_path, monkeypatch, ad.StaleDownloadURLError("expired"))
+        assert isinstance(err, ConnectionError)
+
+    def test_permanent_failure_stays_a_runtime_error(self, tmp_path, monkeypatch):
+        err = self._chunked(tmp_path, monkeypatch, ValueError("corrupt"))
+        assert isinstance(err, RuntimeError)
+        assert not isinstance(err, ConnectionError)
