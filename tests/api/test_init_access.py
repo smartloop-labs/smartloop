@@ -167,3 +167,68 @@ class TestMidStreamFailureCarriesItsStatus:
         errors = [f for f in _frames(resp) if f.get("status") == "error"]
         assert errors, f"no error frame in stream: {resp.text!r}"
         assert errors[0]["code"] == 401
+
+
+class TestMidStreamFailureIsClassifiedByWhatFixesIt:
+    """The code has to answer "would trying again help?", not just "it broke".
+
+    Every one of these used to arrive as a bare 500 or, worse, a 403 — which the
+    desktop client renders as "Sign in to download this model" for a signed-out
+    user and "Your plan doesn't include this model" for a signed-in one. A full
+    disk telling someone to upgrade their plan is the failure this guards.
+    """
+
+    @pytest.mark.parametrize("exc,expected", [
+        # Aggregated by _aggregate_error once the transfer gives up: a dropped
+        # socket, an expired signed URL, an upstream 5xx.
+        (ConnectionError("Failed to download 1 file(s): model.gguf"), 502),
+        (init_router.ModelAccessError("not on your plan"), 403),
+        # An OSError subclass, and emphatically not an entitlement verdict.
+        (PermissionError("[Errno 13] Permission denied: '/models'"), 500),
+        (OSError(28, "No space left on device"), 500),
+        (RuntimeError("model.gguf: MD5 verification failed"), 500),
+    ])
+    def test_status_reflects_the_remedy(self, exc, expected):
+        assert init_router._status_for(exc) == expected
+
+    def test_upstream_status_still_wins(self):
+        """A platform error carries its own status and keeps it."""
+        assert init_router._status_for(
+            _tagged(ConnectionError, "Too many download requests.", 429)) == 429
+        assert init_router._status_for(
+            _tagged(PermissionError, "Sign in to download this model.", 401)) == 401
+
+    def test_dropped_socket_reaches_the_client_as_502(
+        self, client, model_service, monkeypatch
+    ):
+        _stub_downloader(monkeypatch)
+
+        async def boom(*args, **kwargs):
+            raise ConnectionError("Failed to download 1 file(s): model.gguf")
+            yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(init_router, "_download_and_stream", boom)
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert resp.status_code == 200
+        errors = [f for f in _frames(resp) if f.get("status") == "error"]
+        assert errors, f"no error frame in stream: {resp.text!r}"
+        assert errors[0]["code"] == 502
+
+    def test_local_disk_refusal_is_not_a_sign_in_prompt(
+        self, client, model_service, monkeypatch
+    ):
+        _stub_downloader(monkeypatch)
+
+        async def boom(*args, **kwargs):
+            raise PermissionError("[Errno 13] Permission denied: '/models'")
+            yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(init_router, "_download_and_stream", boom)
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        errors = [f for f in _frames(resp) if f.get("status") == "error"]
+        assert errors, f"no error frame in stream: {resp.text!r}"
+        assert errors[0]["code"] == 500

@@ -7,7 +7,13 @@ import os
 import pytest
 
 from smartloop.auth import credential_store
-from smartloop.model.downloader.artifact_downloader import SLPArtifactDownloader
+import httpx
+
+from smartloop.model.downloader.artifact_downloader import (
+    SLPArtifactDownloader,
+    StaleDownloadURLError,
+    _aggregate_error,
+)
 from smartloop.platform import ModelAccessError
 
 
@@ -158,3 +164,65 @@ class TestResolveArtifactsIsSeparableFromTheTransfer:
             downloader.download("google/gemma-3-4b-it")
 
         assert not (tmp_path / "google/gemma-3-4b-it").exists()
+
+
+class TestAggregateErrorKeepsTheFailureKind:
+    """Per-file failures collapse into one exception that still says what broke.
+
+    The router maps whatever escapes onto an HTTP status, so flattening
+    everything to ``RuntimeError`` — as this once did — told the client "500"
+    for a dropped socket and a corrupt file alike. They need different answers:
+    one is worth retrying, the other never will be.
+    """
+
+    def _status_error(self, code):
+        return httpx.HTTPStatusError(
+            "boom", request=httpx.Request("GET", "http://x"),
+            response=httpx.Response(code),
+        )
+
+    @pytest.mark.parametrize("exc", [
+        httpx.ConnectError("dropped"),
+        httpx.ReadTimeout("stalled"),
+        StaleDownloadURLError("url expired"),
+    ])
+    def test_transient_failures_aggregate_to_connection_error(self, exc):
+        result = _aggregate_error([("model.gguf", exc)])
+        assert isinstance(result, ConnectionError)
+        assert "model.gguf" in str(result)
+
+    @pytest.mark.parametrize("code", [401, 403])
+    def test_stale_signed_url_is_transient_not_a_verdict(self, code):
+        """GCS answers 403 ExpiredToken past X-Goog-Expires.
+
+        Entitlement was settled before the transfer started, so this is about
+        the URL, not the account — and it must not surface as a plan refusal.
+        """
+        result = _aggregate_error([("model.gguf", self._status_error(code))])
+        assert isinstance(result, ConnectionError)
+        assert not isinstance(result, PermissionError)
+
+    @pytest.mark.parametrize("exc", [
+        RuntimeError("model.gguf: MD5 verification failed after 3 attempts"),
+        ValueError("no artifacts"),
+    ])
+    def test_permanent_failures_stay_runtime_errors(self, exc):
+        result = _aggregate_error([("model.gguf", exc)])
+        assert isinstance(result, RuntimeError)
+        assert not isinstance(result, ConnectionError)
+
+    def test_one_permanent_failure_makes_the_batch_permanent(self):
+        """Don't promise a retry will help when part of the batch is unfixable."""
+        result = _aggregate_error([
+            ("a.gguf", httpx.ConnectError("dropped")),
+            ("b.gguf", RuntimeError("MD5 verification failed")),
+        ])
+        assert isinstance(result, RuntimeError)
+        assert not isinstance(result, ConnectionError)
+
+    def test_message_names_every_failed_file(self):
+        result = _aggregate_error([
+            ("a.gguf", httpx.ConnectError("x")),
+            ("b.gguf", httpx.ConnectError("y")),
+        ])
+        assert "Failed to download 2 file(s): a.gguf, b.gguf" == str(result)
