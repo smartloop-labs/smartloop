@@ -73,12 +73,29 @@ _STREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=30.0)
 # (silent corruption that completed without a network error).
 _MAX_VERIFY_ATTEMPTS = 3
 
+# Statuses that mean the signed URL went stale, not that the caller is unentitled.
+# Entitlement is settled before the transfer starts (see ``resolve_artifacts``),
+# so an auth refusal *here* is about the URL rather than the account: GCS answers
+# 403 ``<Code>ExpiredToken</Code>`` for a signature past ``X-Goog-Expires`` and
+# 401 for one it cannot parse. Telling the user to sign in would be a dead end —
+# they already are, or did not need to be.
+_STALE_URL_STATUS = {401, 403}
+
 _UNAUTHORIZED_MSG = (
     "Download rejected (401 Unauthorized). "
     "The download URL may have expired or the resource requires authentication."
 )
 
 _T = TypeVar("_T")
+
+
+class StaleDownloadURLError(ConnectionError):
+    """A signed URL was rejected mid-transfer, so a fresh one may well work.
+
+    A ``ConnectionError`` rather than a ``PermissionError`` because that is the
+    action it implies: the account was already cleared before the stream opened,
+    and the fix is to ask for new URLs, not new credentials.
+    """
 
 
 def _is_retryable_error(exc: Exception) -> bool:
@@ -88,6 +105,45 @@ def _is_retryable_error(exc: Exception) -> bool:
     # httpx.TransportError covers connect/read/write timeouts, connection resets,
     # and RemoteProtocolError (server closed the stream / incomplete read).
     return isinstance(exc, httpx.TransportError)
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """True when trying again — now or later — could plausibly succeed.
+
+    Wider than :func:`_is_retryable_error`, which decides whether *this* call
+    retries immediately. This decides how the failure is described to whoever
+    asked for the download, and a stale signed URL belongs here even though
+    retrying the same URL is pointless: re-requesting the download works.
+    """
+    if _is_retryable_error(exc):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _STALE_URL_STATUS
+    return isinstance(exc, ConnectionError)
+
+
+def _classified(message: str, transient: bool) -> Exception:
+    """An error that reads as *message* but still says whether to try again.
+
+    The API router turns whatever escapes the download onto an HTTP status for
+    its own client (see ``_status_for``), and the only thing that status has to
+    convey is whether trying again could help. Re-raising as a bare
+    ``RuntimeError`` — which every layer here used to do — answered "500,
+    something broke" for a dropped socket and a corrupt file alike, so a client
+    could not tell "your connection died, retry" from "this will never work".
+    """
+    return ConnectionError(message) if transient else RuntimeError(message)
+
+
+def _aggregate_error(failed: "list[tuple[str, Exception]]") -> Exception:
+    """Collapse per-file failures into one exception that keeps their kind.
+
+    Transient only when *every* file failed transiently: one unfixable file
+    means the download stays broken, so promising a retry would be a lie.
+    """
+    message = (f"Failed to download {len(failed)} file(s): "
+               f"{', '.join(name for name, _ in failed)}")
+    return _classified(message, all(_is_transient_error(exc) for _, exc in failed))
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -228,7 +284,7 @@ class SLPArtifactDownloader(SLPDownloader):
         # the client sees one download, not the files fighting over the meter.
         aggregate = AggregateProgress(total_bytes, progress_callback, label)
 
-        failed = []
+        failed: "list[tuple[str, Exception]]" = []
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = {
@@ -245,15 +301,16 @@ class SLPArtifactDownloader(SLPDownloader):
                 try:
                     future.result()
                 except PermissionError:
+                    # A local filesystem refusal (unwritable models dir, a
+                    # sandbox denial) — nothing about it improves by letting the
+                    # other files finish first.
                     raise
                 except Exception as e:
                     self.logger.error(f"[error] {filename}: {e}")
-                    failed.append(filename)
+                    failed.append((filename, e))
 
         if failed:
-            raise RuntimeError(
-                f"Failed to download {len(failed)} file(s): {', '.join(failed)}"
-            )
+            raise _aggregate_error(failed)
 
         aggregate.finish()
         self.logger.info(f"[ok] {log_prefix} downloaded to: {log_dir}")
@@ -345,7 +402,7 @@ class SLPArtifactDownloader(SLPDownloader):
             headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
             with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=_STREAM_TIMEOUT) as resp:
                 if resp.status_code == 401:
-                    raise PermissionError(_UNAUTHORIZED_MSG)
+                    raise StaleDownloadURLError(_UNAUTHORIZED_MSG)
                 # If we asked to resume but the server ignored it (sent 200, not
                 # 206), it's streaming the whole file — rewrite from the start.
                 if resume_from and resp.status_code != 206:
@@ -389,7 +446,7 @@ class SLPArtifactDownloader(SLPDownloader):
             with httpx.stream("GET", url, headers=headers, follow_redirects=True,
                               timeout=_STREAM_TIMEOUT) as resp:
                 if resp.status_code == 401:
-                    raise PermissionError(_UNAUTHORIZED_MSG)
+                    raise StaleDownloadURLError(_UNAUTHORIZED_MSG)
                 resp.raise_for_status()
                 with open(dest, "r+b") as f:
                     f.seek(cur_start)
@@ -443,9 +500,14 @@ class SLPArtifactDownloader(SLPDownloader):
                 try:
                     future.result()
                 except Exception as e:
-                    raise RuntimeError(
+                    # Keep the cause's kind: every model worth downloading is
+                    # over CHUNKED_THRESHOLD, so this is the path a real dropped
+                    # connection takes, and flattening it to RuntimeError here
+                    # would undo the classification the outer layers preserve.
+                    raise _classified(
                         f"Chunk download failed for {flat_name} "
-                        f"(bytes {chunk_range[0]}-{chunk_range[1]}): {e}"
+                        f"(bytes {chunk_range[0]}-{chunk_range[1]}): {e}",
+                        _is_transient_error(e),
                     ) from e
 
     def bootstrap_download(self, model_name: str | None = None,

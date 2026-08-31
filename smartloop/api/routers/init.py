@@ -18,7 +18,7 @@ from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
-from smartloop.platform import get_platform_service
+from smartloop.platform import ModelAccessError, get_platform_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["init"])
@@ -49,12 +49,20 @@ def _status_for(exc: Exception) -> int:
     not have to do that by matching on message text, which is written for a
     person and gets reworded.  Platform errors carry the upstream status (see
     ``_raise_for_status``); the rest fall back to their type.
+
+    Only :class:`ModelAccessError` earns a 403.  ``PermissionError`` used to,
+    which was too wide by half: it is an ``OSError`` subclass, so an unwritable
+    models directory arrived as "not on your plan" and the desktop client turned
+    that into a sign-in prompt for what is a local disk problem.  A platform
+    refusal carries ``status_code`` and is answered above regardless.
     """
     status = getattr(exc, "status_code", None)
     if isinstance(status, int):
         return status
-    if isinstance(exc, PermissionError):
+    if isinstance(exc, ModelAccessError):
         return 403
+    # Transfers that died on a dropped socket, a stale signed URL or an upstream
+    # 5xx are aggregated into a ConnectionError by ``_aggregate_error``.
     if isinstance(exc, ConnectionError):
         return 502
     return 500
