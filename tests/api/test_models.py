@@ -131,12 +131,15 @@ class TestListModels:
         assert [m["name"] for m in resp.json()] == ["gemma3-4b"]
 
     def test_lists_everything_when_not_logged_in(self, client, platform_service):
-        # Anonymous callers get is_accessible=False on everything — including
-        # the free tier they can in fact download — so that flag must not
-        # decide what is listed.
+        # What the cloud actually sends an anonymous caller: the free tier is
+        # accessible (it downloads with no token — see ModelAccessManager
+        # .can_access_model, which answers FREE before it looks at the user)
+        # and pro is not.  The pro model must still be listed, because the
+        # picker shows what an upgrade would buy — so is_accessible describes
+        # a model, it does not decide whether one appears.
         platform_service.list_models.return_value = [
             {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it",
-             "access_level": "free", "is_accessible": False},
+             "access_level": "free", "is_accessible": True},
             {"name": "gemma3-12b", "model_id": "google/gemma-3-12b-it",
              "access_level": "pro", "is_accessible": False},
         ]

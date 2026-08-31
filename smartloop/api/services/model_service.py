@@ -3772,11 +3772,17 @@ class ModelService:
         Weights live in one shared ``models_dir`` and are added or removed for
         the whole workspace, so this is a single workspace-level flag — there
         is no per-project download state to keep in step with it.
+
+        Persists what it mutated, rather than leaving that to the caller.  The
+        workspace resolved here is not always ``self._model.workspace``: on a
+        fresh process ``_model`` is still None, so a caller reaching for it to
+        save would fail on the line after this one.
         """
         workspace = self._model.workspace if self._model is not None else self._ensure_workspace()
         ws = workspace.get_model(model_name)
         if ws is not None:
             ws.downloaded = True
+        workspace.save()
 
     def _cleanup_gpu_cache(self):
         """Clear GPU cache to free up memory after unloading models."""
