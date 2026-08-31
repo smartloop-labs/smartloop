@@ -145,10 +145,11 @@ async def list_models(
     Entitlement is described, not enforced: the cloud computes ``is_accessible``
     per-user on each request (see ``_refresh_platform_cache`` in the auth
     router), and the client decides what to do with a model it says no to —
-    hide it, or show it locked as an upgrade prompt.  Free models download with
-    no token at all, so ``is_accessible`` is not a download gate; an anonymous
-    caller gets ``is_accessible=False`` on everything and can still download the
-    free tier.
+    hide it, or show it locked as an upgrade prompt.  An anonymous caller gets
+    ``is_accessible=True`` on the free tier and ``False`` on the rest, which is
+    the same shape a signed-in answer has — so a client that hides
+    ``is_accessible=False`` still shows a signed-out user the models they can
+    actually download, rather than an empty picker.
 
     Access is enforced where the weights are actually served: ``/v1/init``
     resolves the signed URLs before it opens its stream and surfaces the

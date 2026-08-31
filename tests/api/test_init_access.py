@@ -17,7 +17,7 @@ import pytest
 
 from smartloop.api.main import app
 from smartloop.api.routers import init as init_router
-from smartloop.api.services import get_model_service
+from smartloop.api.services import ModelService, get_model_service
 from smartloop.platform import ModelAccessError
 from smartloop.workspace.workspace import Workspace, WorkspaceModel
 
@@ -232,3 +232,87 @@ class TestMidStreamFailureIsClassifiedByWhatFixesIt:
         errors = [f for f in _frames(resp) if f.get("status") == "error"]
         assert errors, f"no error frame in stream: {resp.text!r}"
         assert errors[0]["code"] == 500
+
+
+class TestInitOnAFreshProcess:
+    """/v1/init must not need a prior request to have warmed the service.
+
+    ``ModelService`` is a process-wide singleton whose ``_model`` starts as None;
+    ``_ensure_model()`` is what assigns it, and it runs *after* the download.
+    The router used to call ``_model.save()`` immediately after
+    ``mark_model_downloaded``, so on a fresh process the weights landed on disk
+    and the client still got an error frame. Both branches hit that line, so the
+    retry failed identically: "model_ready", then error, forever.
+    """
+
+    @pytest.fixture
+    def cold_service(self, model_service):
+        """A service in the state a just-started process is really in.
+
+        ``_model`` is None until ``_ensure_model()`` runs, so the mock assigns it
+        there rather than pretending it was always available — that ordering is
+        the whole point of the test.
+        """
+        workspace = model_service._ensure_workspace.return_value
+        model_service._model = None
+
+        def ensure_model():
+            model_service._model = MagicMock(workspace=workspace)
+
+        model_service._ensure_model.side_effect = ensure_model
+        return model_service
+
+    def test_download_completes_without_a_warmed_model(
+        self, client, cold_service, monkeypatch
+    ):
+        _stub_downloader(monkeypatch)
+
+        async def streamed(*args, **kwargs):
+            yield init_router._sse_event({"status": "downloading", "message": "..."})
+
+        monkeypatch.setattr(init_router, "_download_and_stream", streamed)
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert resp.status_code == 200
+        errors = [f for f in _frames(resp) if f.get("status") == "error"]
+        assert not errors, f"fresh-process init errored: {errors}"
+        cold_service.mark_model_downloaded.assert_called_with(PAID_MODEL)
+
+    def test_already_downloaded_also_survives_a_fresh_process(
+        self, client, cold_service, monkeypatch, tmp_path
+    ):
+        """The model_ready branch dereferenced the same None."""
+        model_dir = tmp_path / "models" / "google/gemma-3-12b-it"
+        model_dir.mkdir(parents=True)
+        (model_dir / "weights.gguf").write_bytes(b"\0")
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        frames = _frames(resp)
+        assert any(f.get("status") == "model_ready" for f in frames), frames
+        assert not [f for f in frames if f.get("status") == "error"], frames
+
+    def test_the_download_flag_reaches_disk(self, client, cold_service, monkeypatch):
+        """The flag is only useful if it is persisted, and it must not need _model.
+
+        ``mark_model_downloaded`` resolves the workspace itself and saves it, so
+        the flag survives a restart whether or not anything warmed the service.
+        """
+        workspace = cold_service._ensure_workspace.return_value
+        cold_service.mark_model_downloaded.side_effect = \
+            lambda name: ModelService.mark_model_downloaded(cold_service, name)
+        saves = []
+        monkeypatch.setattr(type(workspace), "save", lambda self: saves.append(1))
+        _stub_downloader(monkeypatch)
+
+        async def streamed(*args, **kwargs):
+            yield init_router._sse_event({"status": "downloading", "message": "..."})
+
+        monkeypatch.setattr(init_router, "_download_and_stream", streamed)
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert not [f for f in _frames(resp) if f.get("status") == "error"]
+        assert saves, "the workspace was never persisted"
+        assert workspace.get_model(PAID_MODEL).downloaded is True
