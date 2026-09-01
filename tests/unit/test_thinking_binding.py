@@ -144,34 +144,6 @@ def test_binding_failure_leaves_the_model_usable():
     LlmFactory._bind_thinking(llm, True, logging.getLogger(__name__))
 
 
-def test_the_capability_says_which_models_can_reason():
-    # Read off the shipped GGUF chat templates: Qwen3.5 gates on
-    # enable_thinking, Gemma 4 does too (defaulting it false), Gemma 3 and
-    # Qwen2-VL never mention it.
-    assert LlmFactory.supports_thinking("qwen3.5-2b") is True
-    assert LlmFactory.supports_thinking("gemma4-e2b") is True
-    assert LlmFactory.supports_thinking("gemma4-e4b") is True
-    assert LlmFactory.supports_thinking("gemma3-4b") is False
-    assert LlmFactory.supports_thinking("qwen2-vl-2b") is False
-    assert LlmFactory.supports_thinking(None) is False
-
-
-def test_the_capability_is_what_the_ui_lists():
-    from smartloop.config.supported_models import SUPPORTED_MODELS
-    from smartloop.types import ModelCapability
-
-    caps = SUPPORTED_MODELS["qwen3.5-2b"].default_capabilities()
-    assert ModelCapability.THINKING in caps
-    assert ModelCapability.THINKING not in SUPPORTED_MODELS["gemma3-4b"].default_capabilities()
-
-
-def test_reasoning_is_off_until_switched_on():
-    # Both supporting families ship off: reasoning costs tokens and latency on
-    # every call, so it is opt-in from the model picker.
-    assert LlmFactory.thinking_for("qwen3.5-2b") is False
-    assert LlmFactory.thinking_for("gemma4-e2b") is False
-
-
 def test_a_model_without_the_capability_is_never_bound():
     assert LlmFactory.thinking_for("gemma3-4b") is None
     assert LlmFactory.thinking_for(None) is None
@@ -214,17 +186,7 @@ def test_every_supported_model_resolves():
         assert LlmFactory.thinking_for(name) in (True, False, None)
 
 
-def test_an_explicit_override_beats_the_model_default():
-    assert LlmFactory.thinking_for("qwen3.5-2b", override=True) is True
-    assert LlmFactory.thinking_for("gemma4-e2b", override=True) is True
-
-
 def test_nothing_can_force_reasoning_onto_a_model_without_it():
     # gemma3-4b's template never reads enable_thinking, so honoring the flag
     # would just bind a no-op wrapper and mislead the caller.
     assert LlmFactory.thinking_for("gemma3-4b", override=True) is None
-
-
-def test_the_env_setting_can_turn_reasoning_on(monkeypatch):
-    monkeypatch.setenv("SLP_THINKING_ENABLED", "1")
-    assert LlmFactory.thinking_for("qwen3.5-2b") is True

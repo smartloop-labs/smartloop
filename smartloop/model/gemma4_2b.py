@@ -34,6 +34,12 @@ class Gemma4_2bModel(GenericModel):
             ModelCapability.SKILLS,
             ModelCapability.DP,
             ModelCapability.VISION,
+            # Gemma 4's chat template reads enable_thinking (defaulting it to
+            # false) and emits its reasoning on a <|channel>thought…<channel|>
+            # channel.  Declared so the model picker offers the toggle; left at
+            # the inherited thinking_default() of off, so it costs nothing
+            # until a request asks for it.
+            ModelCapability.THINKING,
         ]
 
     @staticmethod

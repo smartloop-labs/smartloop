@@ -814,6 +814,33 @@ class ModelService:
             self._capability_skip = None
             return cached
 
+        # A step routed to the orchestrator model (or the on-demand large one)
+        # must reuse the resident instance rather than build a second llama.cpp
+        # context over the same GGUF.  Duplicating the weights and KV cache of
+        # a model already in memory is what trips a shared-memory GPU over its
+        # allocation limit:
+        #
+        #     ggml_vulkan: Failed to allocate pinned memory
+        #     (Requested buffer size exceeds device buffer size limit)
+        #
+        # Canonicalize both sides so a legacy workspace name (e.g. the pre-
+        # rename ``slp-orchestra-mini``) still resolves to the resident model.
+        canonical = canonical_model_name(ws_model.model_name)
+        resident_orchestrator = getattr(self, "_llm", None)
+        if (
+            resident_orchestrator is not None
+            and canonical_model_name(getattr(self, "_model_name", None)) == canonical
+        ):
+            self._capability_skip = None
+            return resident_orchestrator
+        resident_large = getattr(self, "_large_llm", None)
+        if (
+            resident_large is not None
+            and canonical_model_name(getattr(self, "_large_model_name", None)) == canonical
+        ):
+            self._capability_skip = None
+            return resident_large
+
         from smartloop.config.app_settings import AppSettings
         cap = AppSettings().llm_large_n_ctx_cap
         try:

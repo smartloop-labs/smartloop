@@ -13,9 +13,20 @@ from smartloop.config import SUPPORTED_MODELS
 from smartloop.config.app_settings import AppSettings
 from smartloop.constants import canonical_model_name
 from smartloop.platform import PlatformService, get_platform_service
+from smartloop.types import ModelCapability
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["models"])
+
+
+def _display_capabilities(caps) -> list:
+    """The capabilities a model advertises to the client.
+
+    ``ModelCapability.THINKING`` is internal-only: it drives the setting and
+    the picker toggle, not routing — no step asks for a "thinking model" — so
+    it is stripped from the list returned in the model listing.
+    """
+    return [c for c in caps if c != ModelCapability.THINKING]
 
 class _ModelLoadRequest(BaseModel):
     project_id: str | None = None
@@ -163,12 +174,12 @@ async def list_models(
         ws_model = ws_lookup.get(entry.name)
         if ws_model:
             entry.enabled = workspace.effective_model_enabled(entry.name, project)
-            entry.capabilities = ws_model.effective_capabilities
+            entry.capabilities = _display_capabilities(ws_model.effective_capabilities)
             entry.thinking = workspace.effective_model_thinking(entry.name, project)
         else:
             model_cls = SUPPORTED_MODELS.get(entry.name)
             if model_cls and hasattr(model_cls, 'default_capabilities'):
-                entry.capabilities = model_cls.default_capabilities()
+                entry.capabilities = _display_capabilities(model_cls.default_capabilities())
         result.append(entry)
 
     result.sort(key=lambda entry: (entry.access_level == AccessLevel.free, SUPPORTED_MODELS.get(entry.name).param_size_in_b() if SUPPORTED_MODELS.get(entry.name) else 0), reverse=True)
@@ -208,7 +219,7 @@ async def list_workspace_models(
                 downloaded=m.downloaded,
                 is_active=m.is_active,
                 enabled=m.enabled,
-                capabilities=m.effective_capabilities,
+                capabilities=_display_capabilities(m.effective_capabilities),
                 thinking=workspace.effective_model_thinking(m.model_name),
             )
             for m in models
@@ -278,7 +289,7 @@ async def update_workspace_model(
             "model_name": model_name,
             "enabled": model.enabled,
             "thinking": workspace.effective_model_thinking(model_name),
-            "capabilities": model.effective_capabilities,
+            "capabilities": _display_capabilities(model.effective_capabilities),
         }
     except HTTPException:
         # A status we chose deliberately (e.g. the 400 above) — the catch-all
@@ -351,7 +362,7 @@ async def list_project_models(
                 downloaded=workspace.effective_model_downloaded(m.model_name),
                 is_active=workspace.effective_model_active(m.model_name, project),
                 enabled=workspace.effective_model_enabled(m.model_name, project),
-                capabilities=m.effective_capabilities,
+                capabilities=_display_capabilities(m.effective_capabilities),
                 settings=dict(pm.settings) if (pm := workspace.project_model(project, m.model_name)) else {},
             )
             for m in models
@@ -429,7 +440,7 @@ async def update_project_model(
             "enabled": pm.enabled,
             "downloaded": workspace.effective_model_downloaded(model_name),
             "is_active": pm.is_active,
-            "capabilities": model.effective_capabilities,
+            "capabilities": _display_capabilities(model.effective_capabilities),
             "settings": dict(pm.settings),
         }
     except HTTPException:

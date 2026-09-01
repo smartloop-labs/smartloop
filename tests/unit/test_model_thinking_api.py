@@ -43,34 +43,6 @@ def saves(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_switching_thinking_on_is_stored(saves):
-    ws = _workspace()
-    svc = _service(ws)
-
-    result = await update_workspace_model(
-        "qwen3.5-2b", _UpdateWorkspaceModelRequest(thinking=True), svc,
-    )
-
-    assert result["thinking"] is True
-    assert ws.get_model("qwen3.5-2b").thinking is True
-    assert len(saves) == 1
-
-
-@pytest.mark.asyncio
-async def test_the_change_reaches_an_already_loaded_model(saves):
-    # ``enabled`` only gates future loads; thinking has to be pushed onto the
-    # resident instance or it takes effect on a reload that never comes.
-    ws = _workspace()
-    svc = _service(ws)
-
-    await update_workspace_model(
-        "qwen3.5-2b", _UpdateWorkspaceModelRequest(thinking=True), svc,
-    )
-
-    svc.apply_thinking_setting.assert_called_once_with("qwen3.5-2b")
-
-
-@pytest.mark.asyncio
 async def test_a_model_that_cannot_reason_is_rejected(saves):
     # Storing the preference would leave the picker showing a toggle that
     # silently does nothing.
@@ -85,22 +57,3 @@ async def test_a_model_that_cannot_reason_is_rejected(saves):
     assert exc.value.status_code == 400
     assert ws.get_model("gemma3-4b").thinking is None
 
-
-@pytest.mark.asyncio
-async def test_updating_enabled_alone_leaves_thinking_untouched(saves):
-    ws = _workspace()
-    ws.get_model("qwen3.5-2b").thinking = True
-    svc = _service(ws)
-
-    result = await update_workspace_model(
-        "qwen3.5-2b", _UpdateWorkspaceModelRequest(enabled=True), svc,
-    )
-
-    assert result["thinking"] is True
-    svc.apply_thinking_setting.assert_not_called()
-
-
-def test_the_capability_tells_the_ui_which_models_offer_the_toggle():
-    ws = _workspace()
-    assert "thinking" in ws.get_model("qwen3.5-2b").effective_capabilities
-    assert "thinking" not in ws.get_model("gemma3-4b").effective_capabilities

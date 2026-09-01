@@ -45,6 +45,7 @@ class Qwen3_5_2bModel(GenericModel):
             ModelCapability.SKILLS,
             ModelCapability.DP,
             ModelCapability.VISION,
+            ModelCapability.THINKING,
         ]
 
     @staticmethod
