@@ -165,6 +165,18 @@ class AppSettings(BaseSettings):
         validation_alias="slp_vision_clip_device",
         description='Device for the CLIP/mmproj image encoder: "auto" (GPU when enough VRAM is free, else CPU), "gpu" (force GPU — faster but OOM-segfaults if VRAM is tight), or "cpu" (always CPU).',
     )
+    # Override for hybrid-reasoning models' <think> block (Qwen3.5 and friends,
+    # see SLPModel.thinking_default).  Reasoning costs tokens and latency on
+    # every call, enough that a long orchestration pass can run into
+    # orchestrate_timeout_s, so slp_thinking_enabled=0 answers directly without
+    # a code change (and =1 forces it on).  Unset (the default) uses each
+    # model's own default; models with no reasoning mode are unaffected either
+    # way.
+    thinking_enabled: Optional[bool] = Field(
+        default=None,
+        validation_alias="slp_thinking_enabled",
+        description="Override reasoning models' <think> block: 1 = think first (slower), 0 = answer directly. Unset uses each model's default.",
+    )
     # Optional smaller model for decision nodes (classify, match_skills).
     # Falls back to the main model when not set.
     decision_model: Optional[str] = Field(

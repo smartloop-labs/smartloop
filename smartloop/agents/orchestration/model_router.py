@@ -248,6 +248,7 @@ class ModelRouter:
         ModelCapability.DP.value: "document processing",
         ModelCapability.VISION.value: "vision",
         ModelCapability.CODING.value: "coding",
+        ModelCapability.THINKING.value: "thinking",
     }
 
     def _capability_label(self, capability: str) -> str:

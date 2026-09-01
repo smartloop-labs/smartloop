@@ -26,6 +26,7 @@ from langchain_core.outputs import GenerationChunk
 from smartloop.model_factory import ModelFactory
 from smartloop.config import ModelConfig, SUPPORTED_MODELS
 from smartloop.llms.base_llm import BaseLLM
+from smartloop.llms.thinking import strip_thinking
 from smartloop.types import ModelCapability
 from smartloop.workspace import DocumentInfo, DocumentStatus, MCPServer, Workspace
 from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPServerStatus, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
@@ -623,6 +624,13 @@ class ModelService:
                     gguf_path, logger, self.get_project_id() or "",
                     max_n_ctx=cap, mmproj_path=mmproj_path,
                     clip_on_cpu=clip_on_cpu, vision_handler=vision_handler,
+                    # Reasoning is off for the vision copy whatever the model
+                    # declares: transcribing a page and describing an image are
+                    # perception, not deliberation, and the small vision_n_ctx
+                    # has to hold several thousand image tokens — a <think>
+                    # block would spend the transcription's output budget on
+                    # itself.
+                    thinking=False,
                 )
                 self._vision_llm = llm
                 self._vision_model_name = ws_model.model_name
@@ -849,6 +857,7 @@ class ModelService:
             llm = LlmFactory.get_llama_cpp_instance(
                 gguf_path, logger, self.get_project_id() or "",
                 max_n_ctx=cap,
+                thinking=self._thinking_for(ws_model.model_name),
             )
             setattr(self, cache_key, llm)
             logger.info(
@@ -863,6 +872,64 @@ class ModelService:
             )
             self._capability_skip = (ws_model.model_name, "error", None)
             return None
+
+    def _thinking_for(self, model_name: str) -> Optional[bool]:
+        """Whether ``model_name`` should reason, per the picker's setting.
+
+        Reasoning is a property of the model, not of a request: it is stored
+        per model (and per project) like ``enabled`` and set from the model
+        picker, so a model the user turned thinking on for reasons on every
+        call without the client having to ask each time.  ``None`` means the
+        model does not support it and nothing is bound.
+        """
+        from smartloop.llms.llm_factory import LlmFactory
+        try:
+            workspace = self._ensure_workspace()
+        except Exception:
+            return LlmFactory.thinking_for(model_name)
+        return workspace.effective_model_thinking(
+            model_name, workspace.current_project,
+        )
+
+    def apply_thinking_setting(self, model_name: str) -> bool:
+        """Push a just-changed reasoning setting onto a resident model.
+
+        The setting otherwise only takes effect on the next load, which for an
+        always-resident model is never.  Re-flagging is a single attribute
+        write that the bound chat handler reads on its next call (see
+        ``LlmFactory._bind_thinking``) — no reload, no VRAM churn.  Returns
+        True when a resident instance was updated.
+        """
+        value = self._thinking_for(model_name)
+        if value is None:
+            return False
+        updated = False
+        for name, llm in self._loaded_thinking_models():
+            if name != model_name:
+                continue
+            try:
+                setattr(llm.model, "_slp_thinking", value)
+                updated = True
+            except Exception as e:  # never fail a settings change over a hint
+                logger.debug("[thinking] could not re-flag %s: %s", name, e)
+        if updated:
+            logger.info("[thinking] %s → enable_thinking=%s", model_name, value)
+        return updated
+
+    def _loaded_thinking_models(self):
+        """(model_name, llm) for every resident model that can reason."""
+        from smartloop.llms.llm_factory import LlmFactory
+        pairs = []
+        if self._model_name and self._llm is not None:
+            pairs.append((self._model_name, self._llm))
+        if self._large_model_name and self._large_llm is not None:
+            pairs.append((self._large_model_name, self._large_llm))
+        for attr, cached in list(self.__dict__.items()):
+            if not attr.startswith("_cap_llm_") or cached in (None, _GPU_FAULTED):
+                continue
+            pairs.append((attr[len("_cap_llm_"):], cached))
+        return [(n, l) for n, l in pairs
+                if l is not None and LlmFactory.supports_thinking(n)]
 
     @staticmethod
     def _cap_name(capability) -> str:
@@ -1183,6 +1250,7 @@ class ModelService:
                 from smartloop.llms.llm_factory import LlmFactory
                 self._large_llm = LlmFactory.get_llama_cpp_instance(
                     gguf_path, logger, self.get_project_id() or "", max_n_ctx=cap,
+                    thinking=self._thinking_for(largest.model_name),
                 )
                 self._large_model_name = largest.model_name
                 logger.info("[large-model] Loaded %s for agent/skill tasks", largest.model_name)
@@ -5568,6 +5636,10 @@ class ModelService:
             result = _ask(llm)
         choice0 = (result.get("choices") or [{}])[0]
         answer = (choice0.get("message", {}).get("content") or "").strip()
+        # This path calls create_chat_completion directly, so it does its own
+        # <think> filtering — a reasoning model loaded here with thinking left
+        # on (template default) must not leak its monologue into the answer.
+        answer = strip_thinking(answer)
         # Qwen2-VL sometimes prefixes its reply with a stray "label:" (often an
         # empty label, leaving a leading ":"); drop it so the answer reads clean.
         answer = answer.lstrip(":").strip()

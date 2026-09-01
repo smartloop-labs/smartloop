@@ -15,6 +15,13 @@ class ModelCapability(str, Enum):
     DP = "dp"
     VISION = "vision"
     CODING = "coding"
+    # Declares that the model's chat template reads ``enable_thinking`` — i.e.
+    # it can reason in a hidden block before answering.  Unlike the others this
+    # is not a routing target (no step asks for a "thinking model"); it is the
+    # capability the model picker reads to show the toggle, and what gates the
+    # per-request ``thinking`` flag on /v1/chat/completions.  See
+    # ``SLPModel.thinking_default`` for whether it starts on.
+    THINKING = "thinking"
 	
 class Document:
 	def __init__(self, **kwargs) -> None:

@@ -1,4 +1,5 @@
 """Factory to create LLM wrapper classes"""
+import inspect
 import os
 import json
 import sys
@@ -203,7 +204,16 @@ class LlmFactory:
             # Keep the projector off the GPU only when asked — its image-encode
             # pass OOM-segfaults the (uncatchable) native clip code on a
             # tight-VRAM device.  With enough VRAM it stays on GPU (faster).
+            # MTMDChatHandler takes ``use_gpu`` as a constructor argument, which
+            # scopes the choice to THIS handler; the module-level patch is the
+            # fallback for the older Llava15-derived handlers, which hardcode
+            # ``use_gpu = True``.  Prefer the argument: the patch is global and
+            # permanent, so one tight-VRAM vision load would otherwise pin every
+            # later projector in the process to CPU.
             if clip_on_cpu:
+                if "use_gpu" in inspect.signature(handler_cls.__init__).parameters:
+                    return handler_cls(clip_model_path=mmproj_path, verbose=False,
+                                       use_gpu=False)
                 LlmFactory._force_clip_on_cpu(logger)
             return handler_cls(clip_model_path=mmproj_path, verbose=False)
         except Exception as e:
@@ -211,11 +221,107 @@ class LlmFactory:
             return None
 
     @staticmethod
+    def supports_thinking(model_name: str | None) -> bool:
+        """True when ``model_name`` declares ``ModelCapability.THINKING``.
+
+        That capability is the single source of truth for "this model's chat
+        template reads ``enable_thinking``" — it is what the model picker shows
+        and what gates the per-request ``thinking`` flag.  Treated as False for
+        a model outside ``SUPPORTED_MODELS`` (user-added) and for one whose
+        class declares no capabilities at all (the bootstrap model): binding
+        the flag onto a template that ignores it does nothing.
+        """
+        if not model_name:
+            return False
+        try:
+            from smartloop.config.supported_models import SUPPORTED_MODELS
+            from smartloop.types import ModelCapability
+            model_cls = SUPPORTED_MODELS.get(model_name)
+        except Exception:
+            return False
+        # Not every model class declares capabilities — SLPModel has no
+        # default, and callers guard with hasattr throughout (see
+        # WorkspaceModel.effective_capabilities).
+        declared = getattr(model_cls, "default_capabilities", None)
+        if not callable(declared):
+            return False
+        try:
+            return ModelCapability.THINKING in declared()
+        except Exception:
+            return False
+
+    @staticmethod
+    def thinking_for(model_name: str | None, override: bool | None = None) -> bool | None:
+        """Whether ``model_name`` should reason, or ``None`` to leave it alone.
+
+        ``None`` means the model does not support reasoning, so nothing is
+        bound.  Otherwise the answer is, most specific first: the caller's
+        ``override`` (the request's ``thinking`` field), then
+        ``slp_thinking_enabled``, then the model class's
+        ``thinking_default()``.
+        """
+        if not LlmFactory.supports_thinking(model_name):
+            return None
+        if override is not None:
+            return override
+        from smartloop.config.app_settings import AppSettings
+        setting = AppSettings().thinking_enabled
+        if setting is not None:
+            return setting
+        from smartloop.config.supported_models import SUPPORTED_MODELS
+        model_cls = SUPPORTED_MODELS.get(model_name)
+        default = getattr(model_cls, "thinking_default", None)
+        return bool(default()) if callable(default) else False
+
+    @staticmethod
+    def _bind_thinking(llm, enabled: bool, logger: Logger) -> None:
+        """Render every chat completion with ``enable_thinking=enabled``.
+
+        Hybrid-reasoning models read that variable from their own chat template
+        to decide whether to open a ``<think>`` block.  ``Llama.create_chat_completion``
+        has no ``**kwargs`` to forward it through, so the flag is bound onto
+        the resolved chat handler once at load time — handlers do take
+        ``**kwargs`` and pass them straight to the template render.  Binding it
+        on the ``Llama`` object rather than at each call site means the direct
+        ``create_chat_completion`` callers (vision Q&A, OCR) are covered too.
+
+        The bound value is read from ``Llama._slp_thinking`` on every call
+        rather than baked in, so a caller can turn reasoning off for the
+        duration of one completion — see ``LlamaCpp._thinking_for_budget``.
+
+        Best-effort: a llama-cpp that resolves handlers differently leaves the
+        model loaded with its template default rather than failing the load.
+        """
+        try:
+            import llama_cpp.llama_chat_format as llama_chat_format
+            # Same resolution order as Llama.create_chat_completion.
+            handler = (
+                llm.chat_handler
+                or llm._chat_handlers.get(llm.chat_format)
+                or llama_chat_format.get_chat_completion_handler(llm.chat_format)
+            )
+
+            def _with_thinking(**kwargs):
+                # Read the flag off the Llama the call names, not a captured
+                # reference — the handler must not keep the model alive.
+                target = kwargs.get("llama")
+                kwargs.setdefault(
+                    "enable_thinking", getattr(target, "_slp_thinking", enabled)
+                )
+                return handler(**kwargs)
+
+            llm._slp_thinking = enabled
+            llm.chat_handler = _with_thinking
+            logger.info(f"[thinking] enable_thinking={enabled} bound to chat template")
+        except Exception as e:
+            logger.warning(f"[thinking] Could not set enable_thinking={enabled}: {e}")
+
+    @staticmethod
     def get_llama_cpp_instance(
         path: str, logger: Logger, project_id: str, lora_path: str | None = None,
         *, probe: bool = True, max_n_ctx: int | None = None,
         mmproj_path: str | None = None, clip_on_cpu: bool = False,
-        vision_handler: str | None = None,
+        vision_handler: str | None = None, thinking: bool | None = None,
     ):
         """Returns an instance of the configured LlamaCpp wrapper class.
 
@@ -239,6 +345,11 @@ class LlmFactory:
         ``vision_handler``: chat-handler class name declared by the model
         class (``vision_chat_handler()``); authoritative when set, otherwise
         the handler is inferred from the GGUF architecture.
+
+        ``thinking``: turn the model's ``<think>`` reasoning block on/off (see
+        ``SLPModel.thinking_default()`` and ``LlmFactory.thinking_for``);
+        ``None`` keeps the chat template's own default.  The block itself is
+        stripped from replies by :mod:`smartloop.llms.thinking`.
         """
         from llama_cpp import Llama, llama_supports_gpu_offload
         from smartloop.llms.llama_cpp import LlamaCpp
@@ -416,6 +527,9 @@ class LlmFactory:
                 llm = Llama(**config)
             else:
                 raise
+
+        if thinking is not None:
+            LlmFactory._bind_thinking(llm, thinking, logger)
 
         return LlamaCpp(
             model=llm,
