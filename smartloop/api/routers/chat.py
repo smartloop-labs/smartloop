@@ -465,6 +465,30 @@ def _build_messages_with_history(
     return history_messages + request.messages
 
 
+def _unload_when_idle(future, model_service: ModelService, loop) -> None:
+    """Free the auxiliary models once *future*'s worker thread has unwound.
+
+    Used by the orchestration-timeout path, which abandons its executor future
+    instead of awaiting it: the models it is using cannot be closed until it
+    stops touching them.  The unload itself goes back onto a worker thread —
+    it closes llama.cpp contexts and reclaims the GPU, which must not block
+    the event loop.
+    """
+    def _unload() -> None:
+        try:
+            model_service.unload_auxiliary_models()
+        except Exception as e:  # cleanup must never surface to the client
+            logger.warning("[orchestrate] deferred model unload failed: %s", e)
+
+    def _on_done(_completed) -> None:
+        try:
+            loop.run_in_executor(None, _unload)
+        except Exception as e:
+            logger.warning("[orchestrate] could not schedule model unload: %s", e)
+
+    future.add_done_callback(_on_done)
+
+
 async def stream_chunks(
     request: ChatCompletionRequest,
     model_service: ModelService,
@@ -624,7 +648,17 @@ async def stream_chunks(
                 )
                 yield f"data: {timeout_chunk.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"
-                model_service.unload_auxiliary_models()
+                # The orchestration thread is still running — we deliberately
+                # did not await the future, and ``cancelled`` is only observed
+                # between tokens, so it is very likely inside a native
+                # llama.cpp call right now.  Unloading here would close the
+                # llama.cpp context it is decoding on: a native use-after-free
+                # that takes down the whole server rather than this one
+                # request (the same hazard ``run_sync_stream`` avoids by
+                # unloading on the producer thread).  Defer it until the thread
+                # actually unwinds; if it never does, the auxiliary models stay
+                # resident, which beats a segfault.
+                _unload_when_idle(orchestrate_future, model_service, loop)
                 return
             try:
                 event = await asyncio.wait_for(status_queue.get(), timeout=0.1)
@@ -1123,6 +1157,21 @@ async def create_chat_completion(
             )
 
         # Non-streaming response
+        return await _complete_without_streaming(request, model_service)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error in chat completion")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _complete_without_streaming(
+    request: ChatCompletionRequest,
+    model_service: ModelService,
+):
+    """The non-streaming half of ``create_chat_completion``."""
+    try:
         # Switch project if specified
         if request.project_id:
             try:

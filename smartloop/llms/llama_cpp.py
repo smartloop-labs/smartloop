@@ -1,4 +1,5 @@
 """Llama Cpp wrapper class"""
+import contextlib
 import threading
 import time
 import re
@@ -12,11 +13,20 @@ from langchain_core.outputs import GenerationChunk
 from llama_cpp import Llama
 
 from .base_llm import BaseLLM
+from .thinking import ThinkingFilter, strip_thinking
 
 # Attribute the per-context lock is stashed under on the ``Llama`` object, and
 # the guard that makes creating it race-free.
 _LOCK_ATTR = "_slp_context_lock"
 _LOCK_REGISTRY_LOCK = threading.Lock()
+
+# Output budget below which a reasoning model is told not to think.  Decision
+# calls cap output hard (8-256 tokens for a yes/no or a short label); a <think>
+# block would consume the whole budget and return a truncated thought where the
+# caller expected "yes".  Module-level, not a class attribute: pydantic turns a
+# leading-underscore class attribute into a private attr that reads back as a
+# descriptor off the class.
+THINKING_MIN_BUDGET = 512
 
 class LlamaCpp(BaseLLM[Llama]):
     """Llama wrapper"""
@@ -149,6 +159,38 @@ class LlamaCpp(BaseLLM[Llama]):
             self.logger.warning("[llm] prompt-fit guard failed: %s", e)
             return prompt
 
+    @contextlib.contextmanager
+    def _thinking_for_budget(self, max_tokens: Optional[int]):
+        """Suppress the reasoning block for a call too small to hold one.
+
+        ``max_tokens`` is the call's *effective* output budget, so this covers
+        both ways it gets small: a decision call that caps its own output (8-256
+        tokens for a yes/no or a short label), and a long prompt that leaves
+        little context headroom behind it.  Either way a <think> block would
+        spend the budget on itself and the caller would get a truncated thought
+        where it expected an answer.
+
+        Only applies to a model that was loaded with reasoning on (see
+        ``LlmFactory._bind_thinking``); everything else keeps its default.
+        Flipping the flag on the shared ``Llama`` is safe because the context
+        lock this runs under already serializes generation on it.
+        """
+        model = self.model
+        previous = getattr(model, "_slp_thinking", None)
+        suppress = (
+            previous
+            and max_tokens is not None
+            and max_tokens < THINKING_MIN_BUDGET
+        )
+        if not suppress:
+            yield
+            return
+        model._slp_thinking = False
+        try:
+            yield
+        finally:
+            model._slp_thinking = previous
+
     def _call(
         self,
         prompt: str,
@@ -173,15 +215,19 @@ class LlamaCpp(BaseLLM[Llama]):
                 # Stream internally so generation can be interrupted between
                 # tokens when the request is cancelled. stream=False is a single
                 # blocking call that cannot be halted once started.
-                stream = self.model.create_chat_completion(
-                    messages=messages,
-                    max_tokens=available_tokens,
-                    temperature=self.temperature,
-                    repeat_penalty=1.2,
-                    frequency_penalty=0.1,
-                    presence_penalty=0.1,
-                    stream=True
-                )
+                # The guard only has to span the call itself: the chat handler
+                # renders the template (where enable_thinking is read) eagerly
+                # and returns an already-prompted token generator.
+                with self._thinking_for_budget(available_tokens):
+                    stream = self.model.create_chat_completion(
+                        messages=messages,
+                        max_tokens=available_tokens,
+                        temperature=self.temperature,
+                        repeat_penalty=1.2,
+                        frequency_penalty=0.1,
+                        presence_penalty=0.1,
+                        stream=True
+                    )
 
                 parts: List[str] = []
                 chunk_count = 0
@@ -211,7 +257,12 @@ class LlamaCpp(BaseLLM[Llama]):
                     f"{'Cancelled' if cancelled else 'Completed'} | "
                     f"chunks={chunk_count} elapsed={elapsed:.3f}s"
                 )
-                return re.sub(r'[\t]+', "", "".join(parts).strip())
+                # A reasoning model's <think> block is not the answer: every
+                # caller from here on treats this string as one (JSON planning,
+                # skill matching, the chat reply), so drop it.  A no-op for
+                # models that don't think.
+                text = strip_thinking("".join(parts))
+                return re.sub(r'[\t]+', "", text.strip())
             except Exception as ex:
                 self.logger.error(f"Generation failed: {ex}")
             finally:
@@ -251,6 +302,10 @@ class LlamaCpp(BaseLLM[Llama]):
             )
 
             chunk_count = 0
+            # Reasoning is withheld from the stream rather than shown and then
+            # retracted; the tags can split across chunks, so the filter is
+            # stateful and spans the whole stream.
+            thinking = ThinkingFilter()
             for chunk in stream:
                 # Check for cancellation between chunks
                 if self._cancelled is not None and self._cancelled.is_set():
@@ -275,15 +330,31 @@ class LlamaCpp(BaseLLM[Llama]):
                     text = str(chunk)
 
                 # Only yield non-empty text chunks
-                if text:
+                visible = thinking.feed(text) if text else ""
+                if visible:
                     # Create GenerationChunk from the text
-                    generation_chunk = GenerationChunk(text=text)
+                    generation_chunk = GenerationChunk(text=visible)
 
                     # Notify run manager if available
                     if run_manager:
                         run_manager.on_llm_new_token(generation_chunk.text, chunk=generation_chunk)
 
                     yield generation_chunk
+
+            # Release whatever the filter held back — a trailing partial tag
+            # that turned out to be ordinary text, or (when generation was cut
+            # off mid-thought) the reasoning itself, which beats a blank reply.
+            if thinking.unterminated:
+                self.logger.warning(
+                    "Generation ended inside a <think> block — the reply was "
+                    "never reached (raise max_tokens or disable thinking)"
+                )
+            tail = thinking.flush()
+            if tail:
+                generation_chunk = GenerationChunk(text=tail)
+                if run_manager:
+                    run_manager.on_llm_new_token(generation_chunk.text, chunk=generation_chunk)
+                yield generation_chunk
 
             if chunk_count == 0:
                 self.logger.warning("No chunks received from stream")

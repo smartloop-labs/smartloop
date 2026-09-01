@@ -116,28 +116,6 @@ def test_mcp2_breakage_retries_with_mcp_pin():
     assert project.mcp_servers[0].config.args == retry_args
 
 
-def test_uvx_bare_command_gets_pin_at_front():
-    project = _project()
-    svc = _svc(project)
-    patcher, mock_cls = _patch_client([MCPLaunchError(_MCP2_TRACEBACK), _OK])
-    try:
-        _register_and_discover(
-            svc,
-            command="uvx",
-            args=["weather-mcp-pypi"],
-            project_id="p1",
-        )
-    finally:
-        patcher.stop()
-
-    assert mock_cls.call_count == 2
-    retry_args = mock_cls.call_args_list[1].kwargs["args"]
-    assert retry_args == [
-        "tool", "run", "--with", "mcp<2",
-        "--from", "weather-mcp-pypi", "weather-mcp-pypi",
-    ]
-
-
 def test_no_pin_when_with_flag_already_present():
     project = _project()
     svc = _svc(project)

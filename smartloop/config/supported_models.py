@@ -21,6 +21,7 @@ class _LazyModelDict:
             from smartloop.model.gemma4_4b import Gemma4_4bModel
             from smartloop.model.qwen2_vl_2b import Qwen2VL_2bModel
             from smartloop.model.ministral_3b import Ministral3bModel
+            from smartloop.model.qwen3_5_2b import Qwen3_5_2bModel
             self._data = OrderedDict({
                 BOOTSTRAP_MODEL: GemmaItTextModel,
                 "gemma3-4b": GemmaItModel,
@@ -28,6 +29,7 @@ class _LazyModelDict:
                 "gemma4-e4b": Gemma4_4bModel,
                 "qwen2-vl-2b": Qwen2VL_2bModel,
                 "ministral3-3b": Ministral3bModel,
+                "qwen3.5-2b": Qwen3_5_2bModel,
             })
         return self._data
 

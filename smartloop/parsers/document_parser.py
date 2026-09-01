@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from markitdown import MarkItDown
 
 from .base_parser import BaseParser
+from smartloop.llms.thinking import strip_thinking
 from smartloop.config.app_settings import AppSettings
 
 _OCR_PROMPT = (
@@ -88,6 +89,10 @@ class _VisionChatCompletions:
         )
         content = ((result.get("choices") or [{}])[0]
                    .get("message", {}).get("content") or "")
+        # Reasoning models are loaded with thinking off for vision work, but a
+        # model whose own chat template thinks by default would otherwise write
+        # its monologue into the extracted document text.
+        content = strip_thinking(content)
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
         )

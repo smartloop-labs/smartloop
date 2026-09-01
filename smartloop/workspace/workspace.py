@@ -141,6 +141,10 @@ class ProjectModel(BaseModel):
     model_name: str
     enabled: bool = True
     is_active: bool = False
+    # Reason before answering.  None = follow the workspace default (and below
+    # that the model class's).  Only meaningful for a model declaring
+    # ``ModelCapability.THINKING``; see ``effective_model_thinking``.
+    thinking: Optional[bool] = None
     settings: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("model_name")
@@ -165,6 +169,9 @@ class WorkspaceModel(BaseModel):
     downloaded: bool = False
     is_active: bool = False
     enabled: bool = True
+    # Reason before answering; None = the model class's own default.  Set from
+    # the model picker for models whose capabilities include "thinking".
+    thinking: Optional[bool] = None
     capabilities: List[str] = Field(default_factory=list)
     config: Optional[ModelConfig] = None
     models_dir: str = Field(default="", exclude=True)
@@ -501,6 +508,58 @@ class Workspace(BaseModel):
         ws = self.get_model(model_name)
         return ws.enabled if ws is not None else True
 
+    def supports_thinking(self, model_name: str) -> bool:
+        """Whether *model_name* declares ``ModelCapability.THINKING``.
+
+        Read straight off the resolved capabilities, so it tracks the model
+        class rather than anything persisted.
+        """
+        ws = self.get_model(model_name)
+        caps = ws.effective_capabilities if ws is not None else []
+        return ModelCapability.THINKING in [
+            c.lower() if isinstance(c, str) else c for c in caps
+        ]
+
+    def effective_model_thinking(self, model_name: str, project: Optional[Project] = None) -> Optional[bool]:
+        """Whether *model_name* should reason before answering.
+
+        Resolution: project override → workspace (app-default) entry →
+        ``slp_thinking_enabled`` → the model class's ``thinking_default()``.
+
+        Returns ``None`` for a model that does not declare
+        ``ModelCapability.THINKING``, which means "bind nothing": its chat
+        template never reads ``enable_thinking``, so a stored preference for it
+        would be a setting that silently does nothing.
+        """
+        if not self.supports_thinking(model_name):
+            return None
+        pm = self.project_model(project, model_name)
+        if pm is not None and pm.thinking is not None:
+            return pm.thinking
+        ws = self.get_model(model_name)
+        if ws is not None and ws.thinking is not None:
+            return ws.thinking
+        from smartloop.llms.llm_factory import LlmFactory
+        return LlmFactory.thinking_for(model_name)
+
+    def set_project_model_thinking(self, project: Project, model_name: str, thinking: Optional[bool]) -> Optional[ProjectModel]:
+        """Set *model_name*'s reasoning preference on *project*.
+
+        ``None`` clears the override so the model falls back to the workspace
+        default.  Returns ``None`` without writing anything for the bootstrap
+        model, which has no per-project entry.
+        """
+        if self.is_bootstrap_model(model_name):
+            return None
+        self.sync_project_models(project)
+        pm = self.project_model(project, model_name)
+        if pm is None:
+            pm = ProjectModel(model_name=model_name, thinking=thinking)
+            project.model_settings.append(pm)
+        else:
+            pm.thinking = thinking
+        return pm
+
     def effective_model_downloaded(self, model_name: str) -> bool:
         """Whether *model_name*'s weights are present in the workspace.
 
@@ -541,6 +600,7 @@ class Workspace(BaseModel):
                 model_name=model_name,
                 enabled=self.effective_model_enabled(model_name, project),
                 is_active=self.effective_model_active(model_name, project),
+                thinking=self.effective_model_thinking(model_name, project),
             ))
 
     def promote_model_to_workspace_default(self, model_name: str) -> None:

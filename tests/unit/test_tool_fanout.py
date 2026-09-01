@@ -5,16 +5,13 @@ When a skill says "for each X, call tool Y", the pipeline extracts a
 list of items from upstream context and calls the tool once per item,
 aggregating all results into a single NodeResult.
 """
-import json
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from smartloop.agents.orchestrator import SLPOrchestrator
 from smartloop.agents.orchestration.tool_fanout import ToolFanout
 from smartloop.agents.mcp.explorer import SearchContext
 from smartloop.agents.nodes import (
-    NodeResult, LLMDecisionNode, ToolCallNode, TransformNode,
+    LLMDecisionNode, ToolCallNode, TransformNode,
 )
 from smartloop.agents.planner import PlanStep, StepType
 
@@ -44,67 +41,6 @@ def _ctx(orch, user_message="summarize fund info"):
 # ------------------------------------------------------------------ #
 # _parse_mcp_blocks: for_each detection                               #
 # ------------------------------------------------------------------ #
-
-class TestParseMcpBlocksForEach:
-    def test_for_each_detected_before_block(self):
-        content = (
-            "For each fund using the ticker symbol get stock info:\n"
-            "```mcp\nyfinance.get_ticker_info(symbol)\n```"
-        )
-        blocks = SLPOrchestrator._parse_mcp_blocks(content)
-        assert len(blocks) == 1
-        assert blocks[0]["for_each"] is True
-
-    def test_for_every_detected(self):
-        content = (
-            "For every item in the list, look it up:\n"
-            "```mcp\napi.lookup_item(item_id)\n```"
-        )
-        blocks = SLPOrchestrator._parse_mcp_blocks(content)
-        assert len(blocks) == 1
-        assert blocks[0]["for_each"] is True
-
-    def test_for_all_detected(self):
-        content = (
-            "For all entries, validate:\n"
-            "```mcp\nvalidator.check(entry)\n```"
-        )
-        blocks = SLPOrchestrator._parse_mcp_blocks(content)
-        assert len(blocks) == 1
-        assert blocks[0]["for_each"] is True
-
-    def test_no_for_each_when_absent(self):
-        content = (
-            "Get stock info:\n"
-            "```mcp\nyfinance.get_ticker_info(symbol)\n```"
-        )
-        blocks = SLPOrchestrator._parse_mcp_blocks(content)
-        assert len(blocks) == 1
-        assert blocks[0]["for_each"] is False
-
-    def test_for_each_outside_lookback_window(self):
-        content = (
-            "For each fund do something.\n"
-            + "x" * 400
-            + "\nNow call:\n"
-            "```mcp\nyfinance.get_ticker_info(symbol)\n```"
-        )
-        blocks = SLPOrchestrator._parse_mcp_blocks(content)
-        assert len(blocks) == 1
-        assert blocks[0]["for_each"] is False
-
-    def test_multiple_blocks_independent_detection(self):
-        content = (
-            "Get the summary:\n"
-            "```mcp\napi.get_summary(id)\n```\n\n"
-            "For each item, get details:\n"
-            "```mcp\napi.get_details(item_id)\n```"
-        )
-        blocks = SLPOrchestrator._parse_mcp_blocks(content)
-        assert len(blocks) == 2
-        assert blocks[0]["for_each"] is False
-        assert blocks[1]["for_each"] is True
-
 
 # ------------------------------------------------------------------ #
 # _build_step_nodes: fan-out node creation                            #

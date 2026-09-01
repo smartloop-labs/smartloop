@@ -7,7 +7,7 @@ from pathlib import Path
 
 from typing import TYPE_CHECKING, Iterator, Optional, Union
 
-from smartloop.types import ModelType
+from smartloop.types import ModelCapability, ModelType
 from smartloop.llms.base_llm import BaseLLM
 
 if TYPE_CHECKING:
@@ -67,6 +67,37 @@ class SLPModel(ABC):
         fall back to parsing the size from the model name/id.
         """
         return 0.0
+
+    @staticmethod
+    def default_capabilities() -> list[ModelCapability]:
+        """Capabilities this model declares — never empty.
+
+        Every model does at least general chat, so that is the floor.  A base
+        implementation exists mainly so the question is always answerable:
+        callers used to probe with ``hasattr`` and one that forgot broke every
+        load of the bootstrap model, whose class declares nothing of its own
+        (``type object 'GemmaItTextModel' has no attribute
+        'default_capabilities'``).  Its resolved capabilities are unchanged —
+        ``WorkspaceModel._infer_capabilities`` gave a 1B text model exactly
+        ``[GENERAL]`` too — and models outside ``SUPPORTED_MODELS`` still go
+        through that inference, since there is no class to ask.
+        """
+        return [ModelCapability.GENERAL]
+
+    @staticmethod
+    def thinking_default() -> bool:
+        """Whether reasoning starts ON for a model that supports it.
+
+        Only consulted for a model that declares
+        ``ModelCapability.THINKING`` — that capability is what says the chat
+        template reads ``enable_thinking`` at all, and it is what the model
+        picker shows.  A supporting model defaults to off here; override to
+        ``True`` where reasoning is worth its token and latency cost on every
+        call.  Either way the client can flip it per request (the ``thinking``
+        field on /v1/chat/completions), and the reasoning block never reaches
+        callers — see :mod:`smartloop.llms.thinking`.
+        """
+        return False
 
     @staticmethod
     def vision_chat_handler() -> Optional[str]:

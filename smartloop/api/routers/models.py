@@ -6,16 +6,27 @@ import logging
 from enum import Enum
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.config.app_settings import AppSettings
 from smartloop.constants import canonical_model_name
 from smartloop.platform import PlatformService, get_platform_service
+from smartloop.types import ModelCapability
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["models"])
+
+
+def _display_capabilities(caps) -> list:
+    """The capabilities a model advertises to the client.
+
+    ``ModelCapability.THINKING`` is internal-only: it drives the setting and
+    the picker toggle, not routing — no step asks for a "thinking model" — so
+    it is stripped from the list returned in the model listing.
+    """
+    return [c for c in caps if c != ModelCapability.THINKING]
 
 class _ModelLoadRequest(BaseModel):
     project_id: str | None = None
@@ -65,6 +76,11 @@ class AccessLevel(str, Enum):
     free = "free"
     paid = "pro"
     premium = "premium"
+    # Not on any plan: staff/preview builds the catalog publishes alongside the
+    # public tiers.  Listed like the rest — access is enforced where the weights
+    # are served (/v1/init and the signed-URL fetch both answer 403), not by
+    # hiding the entry.
+    internal = "internal"
 
 class ModelEntry(BaseModel):
     name: str
@@ -76,6 +92,34 @@ class ModelEntry(BaseModel):
     sha256: str | None = None
     enabled: bool = True
     capabilities: list[str] = []
+    # Reasoning is a per-model setting, not a per-request one: a model the user
+    # switches thinking on for reasons on every call.  ``thinking`` is null for
+    # a model whose capabilities lack "thinking" — the picker shows the toggle
+    # only when the model can honor it.
+    thinking: bool | None = None
+
+    @field_validator("access_level", mode="before")
+    @classmethod
+    def _tolerate_unknown_access_level(cls, value):
+        """Drop an access level this build doesn't know instead of failing.
+
+        The catalog is server-side and gains tiers without a client release —
+        ``internal`` above arrived that way and 500'd the whole picker, because
+        one unparseable entry fails the response model for every model in the
+        list.  An unknown tier degrades to ``None`` (the client's "unspecified"
+        case) so the rest of the catalog still renders; the download path
+        enforces access regardless.
+        """
+        if value is None or isinstance(value, AccessLevel):
+            return value
+        try:
+            return AccessLevel(value)
+        except ValueError:
+            logger.warning(
+                "[models] unknown access_level %r in catalog — treating as unspecified",
+                value,
+            )
+            return None
 
 
 @router.get("/models", response_model=list[ModelEntry])
@@ -130,11 +174,12 @@ async def list_models(
         ws_model = ws_lookup.get(entry.name)
         if ws_model:
             entry.enabled = workspace.effective_model_enabled(entry.name, project)
-            entry.capabilities = ws_model.effective_capabilities
+            entry.capabilities = _display_capabilities(ws_model.effective_capabilities)
+            entry.thinking = workspace.effective_model_thinking(entry.name, project)
         else:
             model_cls = SUPPORTED_MODELS.get(entry.name)
             if model_cls and hasattr(model_cls, 'default_capabilities'):
-                entry.capabilities = model_cls.default_capabilities()
+                entry.capabilities = _display_capabilities(model_cls.default_capabilities())
         result.append(entry)
 
     result.sort(key=lambda entry: (entry.access_level == AccessLevel.free, SUPPORTED_MODELS.get(entry.name).param_size_in_b() if SUPPORTED_MODELS.get(entry.name) else 0), reverse=True)
@@ -149,6 +194,7 @@ class WorkspaceModelEntry(BaseModel):
     is_active: bool
     enabled: bool
     capabilities: list[str] = []
+    thinking: bool | None = None
 
 
 @router.get("/models/workspace", response_model=list[WorkspaceModelEntry])
@@ -173,7 +219,8 @@ async def list_workspace_models(
                 downloaded=m.downloaded,
                 is_active=m.is_active,
                 enabled=m.enabled,
-                capabilities=m.effective_capabilities,
+                capabilities=_display_capabilities(m.effective_capabilities),
+                thinking=workspace.effective_model_thinking(m.model_name),
             )
             for m in models
         ]
@@ -184,6 +231,7 @@ async def list_workspace_models(
 
 class _UpdateWorkspaceModelRequest(BaseModel):
     enabled: bool | None = None
+    thinking: bool | None = None
     capabilities: list[str] | None = None
 
 
@@ -193,7 +241,11 @@ async def update_workspace_model(
     request: _UpdateWorkspaceModelRequest,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """Update a workspace model's enabled state.
+    """Update a workspace model's enabled state, or whether it reasons.
+
+    ``thinking`` is rejected for a model whose capabilities lack "thinking":
+    its chat template never reads ``enable_thinking``, so storing the
+    preference would leave the picker showing a toggle that does nothing.
 
     ``capabilities`` in the request body is accepted for backward
     compatibility but ignored — capabilities are read-only from the
@@ -218,13 +270,31 @@ async def update_workspace_model(
             # instance (see ModelService.unload_model_by_name).
             if request.enabled is False:
                 model_service.unload_model_by_name(model_name)
+        if request.thinking is not None:
+            if not workspace.supports_thinking(model_name):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{model_name} does not support thinking",
+                )
+            workspace.pin_model_for_existing_projects(model_name)
+            model.thinking = request.thinking
+            # Unlike ``enabled`` — which only gates future loads — this has to
+            # reach the instance that is already resident, or the setting would
+            # not take effect until the model is next loaded (for the
+            # always-resident orchestrator, never).
+            model_service.apply_thinking_setting(model_name)
         workspace.save()
         return {
             "status": "ok",
             "model_name": model_name,
             "enabled": model.enabled,
-            "capabilities": model.effective_capabilities,
+            "thinking": workspace.effective_model_thinking(model_name),
+            "capabilities": _display_capabilities(model.effective_capabilities),
         }
+    except HTTPException:
+        # A status we chose deliberately (e.g. the 400 above) — the catch-all
+        # below would otherwise re-wrap it as an opaque 500.
+        raise
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -292,7 +362,7 @@ async def list_project_models(
                 downloaded=workspace.effective_model_downloaded(m.model_name),
                 is_active=workspace.effective_model_active(m.model_name, project),
                 enabled=workspace.effective_model_enabled(m.model_name, project),
-                capabilities=m.effective_capabilities,
+                capabilities=_display_capabilities(m.effective_capabilities),
                 settings=dict(pm.settings) if (pm := workspace.project_model(project, m.model_name)) else {},
             )
             for m in models
@@ -370,7 +440,7 @@ async def update_project_model(
             "enabled": pm.enabled,
             "downloaded": workspace.effective_model_downloaded(model_name),
             "is_active": pm.is_active,
-            "capabilities": model.effective_capabilities,
+            "capabilities": _display_capabilities(model.effective_capabilities),
             "settings": dict(pm.settings),
         }
     except HTTPException:
