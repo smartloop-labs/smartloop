@@ -294,13 +294,13 @@ async def init(
             # 1. Download if needed
             if downloader is None:
                 yield _sse_event({"status": "model_ready", "message": f"Model {display_model_name(target)} already available."})
-                model_service.mark_model_downloaded(target)
+                model_service.mark_model_downloaded(target, workspace=workspace)
             else:
                 async for event in _download_and_stream(downloader, ws_model.model_id, target,
                                                         artifacts=artifacts):
                     yield event
 
-                model_service.mark_model_downloaded(target)
+                model_service.mark_model_downloaded(target, workspace=workspace)
 
             # ``mark_model_downloaded`` persisted the workspace, so config.json
             # is on disk and the platform service can bind the workspace DB and
