@@ -416,12 +416,16 @@ async def bootstrap(
                 async for event in _download_and_stream(downloader, bootstrap_model_id, bootstrap_name, is_bootstrap=True):
                     yield event
 
-                model_service.mark_model_downloaded(bootstrap_name)
+                model_service.mark_model_downloaded(bootstrap_name, workspace=workspace)
                 existing_model_name = bootstrap_name
-                workspace.save()
 
-            # Workspace is on disk in both branches above, so the platform
-            # service can bind the workspace DB and persist the catalog.
+            # Both branches above mutated this workspace -- a downloaded flag
+            # on a model whose weights were already on disk, or a freshly
+            # registered bootstrap model -- and only the download branch used
+            # to persist it, so the flag the other branch set never reached
+            # disk.  Saving here covers both; config.json is then on disk for
+            # the platform service to bind the workspace DB against.
+            workspace.save()
             _seed_model_catalog()
 
             # 4. Ensure model pipeline
