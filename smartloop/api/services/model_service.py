@@ -3378,7 +3378,7 @@ class ModelService:
         except Exception:
             pass
 
-    def mark_model_downloaded(self, model_name: str) -> None:
+    def mark_model_downloaded(self, model_name: str, workspace: Optional[Workspace] = None) -> None:
         """Record that *model_name*'s weights are present in the workspace.
 
         Weights live in one shared ``models_dir`` and are added or removed for
@@ -3389,8 +3389,17 @@ class ModelService:
         workspace resolved here is not always ``self._model.workspace``: on a
         fresh process ``_model`` is still None, so a caller reaching for it to
         save would fail on the line after this one.
+
+        *workspace* must be passed by any caller holding unsaved edits, and a
+        caller that registered the model with ``add_model`` always is.  On a
+        cold process ``_ensure_workspace`` returns ``Workspace.load()``, which
+        builds a *new* instance per call and deliberately skips the singleton
+        cache — so resolving one here would read the model back off disk
+        without the caller's addition, skip the flag for a model it cannot
+        find, and then save that stale instance over the caller's.
         """
-        workspace = self._model.workspace if self._model is not None else self._ensure_workspace()
+        if workspace is None:
+            workspace = self._model.workspace if self._model is not None else self._ensure_workspace()
         ws = workspace.get_model(model_name)
         if ws is not None:
             ws.downloaded = True

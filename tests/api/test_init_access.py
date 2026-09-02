@@ -277,7 +277,8 @@ class TestInitOnAFreshProcess:
         assert resp.status_code == 200
         errors = [f for f in _frames(resp) if f.get("status") == "error"]
         assert not errors, f"fresh-process init errored: {errors}"
-        cold_service.mark_model_downloaded.assert_called_with(PAID_MODEL)
+        cold_service.mark_model_downloaded.assert_called_once()
+        assert cold_service.mark_model_downloaded.call_args.args[0] == PAID_MODEL
 
     def test_already_downloaded_also_survives_a_fresh_process(
         self, client, cold_service, monkeypatch, tmp_path
@@ -301,7 +302,8 @@ class TestInitOnAFreshProcess:
         """
         workspace = cold_service._ensure_workspace.return_value
         cold_service.mark_model_downloaded.side_effect = \
-            lambda name: ModelService.mark_model_downloaded(cold_service, name)
+            lambda name, workspace=None: ModelService.mark_model_downloaded(
+                cold_service, name, workspace=workspace)
         saves = []
         monkeypatch.setattr(type(workspace), "save", lambda self: saves.append(1))
         _stub_downloader(monkeypatch)
@@ -316,3 +318,62 @@ class TestInitOnAFreshProcess:
         assert not [f for f in _frames(resp) if f.get("status") == "error"]
         assert saves, "the workspace was never persisted"
         assert workspace.get_model(PAID_MODEL).downloaded is True
+
+    def test_the_router_hands_over_its_own_workspace(
+        self, client, cold_service, monkeypatch
+    ):
+        """The flag has to land on the instance the router mutated.
+
+        This fixture's ``_ensure_workspace`` is a mock returning one object, so
+        the test above cannot tell the two instances apart — it passes whether
+        or not the workspace is threaded through.  Asserting the hand-off is
+        what pins it here; ``test_the_flag_survives_a_second_load`` covers the
+        real two-instance behaviour.
+        """
+        _stub_downloader(monkeypatch)
+
+        async def streamed(*args, **kwargs):
+            yield init_router._sse_event({"status": "downloading", "message": "..."})
+
+        monkeypatch.setattr(init_router, "_download_and_stream", streamed)
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert resp.status_code == 200
+        _, kwargs = cold_service.mark_model_downloaded.call_args
+        assert kwargs.get("workspace") is cold_service._ensure_workspace.return_value
+
+    def test_the_flag_survives_a_second_load(self, tmp_path, monkeypatch):
+        """A cold ``_ensure_workspace`` builds a *fresh* workspace every call.
+
+        The router registers the model on its own instance and deliberately
+        does not save (a refused download must strand nothing in config.json),
+        so resolving a second instance inside ``mark_model_downloaded`` read
+        the model back off disk *without* that registration, skipped the flag
+        for a model it could not find, and saved the stale copy over it —
+        leaving config.json with no record of the model at all.
+        """
+        monkeypatch.setattr(Workspace, "config_file", str(tmp_path / "config.json"))
+        Workspace(
+            id="ws-1",
+            workspace_dir=str(tmp_path / "ws-1"),
+            models_dir=str(tmp_path / "ws-1" / "models"),
+        ).save()
+
+        svc = MagicMock()
+        svc._model = None
+        svc._ensure_workspace = lambda cfg=None: ModelService._ensure_workspace(svc, cfg)
+
+        # What the router does before the stream opens.
+        routers_workspace = svc._ensure_workspace()
+        routers_workspace.add_model(PAID_MODEL, "google/gemma-3-12b-it", enabled=False)
+        assert svc._ensure_workspace() is not routers_workspace, \
+            "a cold _ensure_workspace is supposed to return a fresh instance"
+
+        # What the stream does after the transfer.
+        ModelService.mark_model_downloaded(svc, PAID_MODEL, workspace=routers_workspace)
+
+        reloaded = Workspace.load()
+        assert [m.model_name for m in reloaded.models] == [PAID_MODEL], \
+            "the router's add_model was clobbered by a stale instance"
+        assert reloaded.get_model(PAID_MODEL).downloaded is True
