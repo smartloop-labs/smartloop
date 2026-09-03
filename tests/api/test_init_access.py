@@ -17,6 +17,7 @@ import pytest
 
 from smartloop.api.main import app
 from smartloop.api.routers import init as init_router
+from smartloop.api.routers._errors import status_for
 from smartloop.api.services import ModelService, get_model_service
 from smartloop.platform import ModelAccessError
 from smartloop.workspace.workspace import Workspace, WorkspaceModel
@@ -182,20 +183,20 @@ class TestMidStreamFailureIsClassifiedByWhatFixesIt:
         # Aggregated by _aggregate_error once the transfer gives up: a dropped
         # socket, an expired signed URL, an upstream 5xx.
         (ConnectionError("Failed to download 1 file(s): model.gguf"), 502),
-        (init_router.ModelAccessError("not on your plan"), 403),
+        (ModelAccessError("not on your plan"), 403),
         # An OSError subclass, and emphatically not an entitlement verdict.
         (PermissionError("[Errno 13] Permission denied: '/models'"), 500),
         (OSError(28, "No space left on device"), 500),
         (RuntimeError("model.gguf: MD5 verification failed"), 500),
     ])
     def test_status_reflects_the_remedy(self, exc, expected):
-        assert init_router._status_for(exc) == expected
+        assert status_for(exc) == expected
 
     def test_upstream_status_still_wins(self):
         """A platform error carries its own status and keeps it."""
-        assert init_router._status_for(
+        assert status_for(
             _tagged(ConnectionError, "Too many download requests.", 429)) == 429
-        assert init_router._status_for(
+        assert status_for(
             _tagged(PermissionError, "Sign in to download this model.", 401)) == 401
 
     def test_dropped_socket_reaches_the_client_as_502(
