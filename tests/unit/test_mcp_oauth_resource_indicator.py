@@ -171,7 +171,8 @@ class TestStoredServerRefresh:
         ctx.__enter__ = MagicMock(return_value=client)
         ctx.__exit__ = MagicMock(return_value=False)
         with patch("httpx.Client", return_value=ctx):
-            token = MCPToolCaller.refresh_access_token(server)
+            caller = MCPToolCaller(arg_extractor=None, result_mapper=None)
+            token = caller.refresh_access_token(server)
         return token, client.posts
 
     def test_persisted_resource_is_replayed(self):
