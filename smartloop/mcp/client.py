@@ -17,9 +17,11 @@ class MCPClientError(Exception):
 
 
 class MCPConnectionError(MCPClientError):
-    def __init__(self, message: str, www_authenticate: Optional[str] = None):
+    def __init__(self, message: str, www_authenticate: Optional[str] = None,
+                 status_code: Optional[int] = None):
         super().__init__(message)
         self.www_authenticate = www_authenticate
+        self.status_code = status_code
 
 
 class MCPProtocolError(MCPClientError):
@@ -65,6 +67,11 @@ class MCPToolCallResult:
     content: Optional[List[dict]] = None
     is_error: bool = False
     error: Optional[str] = None
+    #: The server rejected the token (HTTP 401), so refreshing it may help.
+    #: Callers used to ask ``"401" in result.error`` instead — a substring test
+    #: against a message that embeds the server's own response body, so any tool
+    #: returning a document mentioning 401 spent a refresh token on nothing.
+    auth_expired: bool = False
 
 
 class MCPClient:
@@ -210,9 +217,10 @@ class MCPClient:
                     f"Response: {body or '(empty)'}. "
                     f"Authorization sent: {auth_preview}"
                 )
-                raise MCPConnectionError(detail, www_authenticate=www_auth)
+                raise MCPConnectionError(detail, www_authenticate=www_auth, status_code=401)
             if response.status_code == 403:
-                raise MCPConnectionError("Authorization failed: Insufficient permissions")
+                raise MCPConnectionError(
+                    "Authorization failed: Insufficient permissions", status_code=403)
 
             response.raise_for_status()
 
@@ -409,7 +417,10 @@ class MCPClient:
 
         except (MCPConnectionError, MCPProtocolError) as e:
             logger.error("[mcp-remote] Tool call '%s' on %s failed: %s", tool_name, server_url, e)
-            return MCPToolCallResult(success=False, error=str(e))
+            return MCPToolCallResult(
+                success=False, error=str(e),
+                auth_expired=getattr(e, "status_code", None) == 401,
+            )
         except Exception as e:
             logger.error("[mcp-remote] Tool call '%s' on %s unexpected error: %s", tool_name, server_url, e, exc_info=True)
             return MCPToolCallResult(success=False, error=f"Unexpected error: {str(e)}")
