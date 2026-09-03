@@ -185,3 +185,21 @@ def test_text_shorter_than_a_phrase_yields_nothing():
 ])
 def test_figures_normalise_formatting(text, expected):
     assert _figures(text) == expected
+
+
+def test_figures_survive_a_number_too_long_for_a_float():
+    """A 400-digit run overflows float() to inf; int(inf) used to raise
+    OverflowError inside the streaming generator and abort the response."""
+    huge = "9" * 400
+    assert _figures(huge) == {huge}
+    assert _citation_used(_cit(extract="total " + huge), "The total is " + huge)
+
+
+def test_verification_failure_keeps_sources_instead_of_raising(monkeypatch):
+    monkeypatch.setattr(
+        "smartloop.api.routers.chat._verify_citations",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    out = _verified_citations([_cit(), _cit()], "any answer")
+    assert len(out) == 1
+    assert "_extract" not in out[0]
