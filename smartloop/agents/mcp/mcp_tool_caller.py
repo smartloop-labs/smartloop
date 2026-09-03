@@ -2,7 +2,7 @@ import httpx
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from smartloop.mcp import MCPClient
 from smartloop.mcp.local_client import LocalMCPClient
@@ -20,9 +20,18 @@ logger = logging.getLogger(__name__)
 class MCPToolCaller:
     """Handles MCP server communication: tool calls, server lookup, auth, and prerequisites."""
 
-    def __init__(self, arg_extractor: MCPArgumentExtractor, result_mapper: MCPResultMapper):
+    def __init__(self, arg_extractor: MCPArgumentExtractor, result_mapper: MCPResultMapper,
+                 persist: Optional[Callable[[], None]] = None):
         self.arg_extractor = arg_extractor
         self.result_mapper = result_mapper
+        #: Called after a refresh replaces a server's credentials, to write them
+        #: back to the workspace.  Optional because one caller — the content
+        #: crawl — already persists through its own ``on_server_updated`` hook.
+        self._persist = persist
+
+    def set_persist(self, persist: Optional[Callable[[], None]]) -> None:
+        """Install the callback that writes refreshed credentials back to disk."""
+        self._persist = persist
 
     def call_tool(
         self,
@@ -133,8 +142,18 @@ class MCPToolCaller:
             return server.remote_config.token
         return None
 
-    @staticmethod
-    def refresh_access_token(server: "MCPServer") -> Optional[str]:
+    def refresh_access_token(self, server: "MCPServer") -> Optional[str]:
+        """Redeem *server*'s refresh token, storing the result on the server.
+
+        The new credentials are written back through :attr:`_persist`.  Leaving
+        them in memory was a slow-acting break: providers that rotate refresh
+        tokens hand back a new one and retire the old, so a refresh during a chat
+        turn left the workspace holding a refresh token the provider had already
+        invalidated.  The connection kept working until the process restarted and
+        then could never be renewed again — only the content crawl persisted, so
+        which of the two paths happened to run last decided whether a connection
+        survived.
+        """
         creds = server.oauth_credentials
         if not creds or not creds.refresh_token:
             logger.warning(f"No refresh token available for server '{server.name}'")
@@ -173,6 +192,17 @@ class MCPToolCaller:
                 creds.refresh_token = data["refresh_token"]
             if data.get("expires_in"):
                 creds.expires_at = time.time() + data["expires_in"]
+
+            if self._persist is not None:
+                try:
+                    self._persist()
+                except Exception as e:
+                    # The token in memory is good, so the call this refresh was
+                    # for should still go ahead; it is the *next* process that
+                    # pays for a failed write.
+                    logger.warning(
+                        f"Refreshed '{server.name}' but could not persist credentials: {e}"
+                    )
 
             logger.info(f"Refreshed access token for server '{server.name}'")
             return new_access
