@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -235,9 +236,16 @@ def _figures(text: str) -> set:
         core = raw.rstrip(".,")
         if len(core.replace(".", "").replace(",", "")) < _FIGURE_MIN_DIGITS:
             continue
+        digits = core.replace(",", "")
         try:
-            value = float(core.replace(",", ""))
+            value = float(digits)
         except ValueError:
+            continue
+        if not math.isfinite(value):
+            # A digit run too long for a float (overflows to inf) is still a
+            # figure worth matching — normalise it by hand rather than through
+            # int(), which raises on inf.
+            out.add(digits.rstrip("0").rstrip(".") if "." in digits else digits)
             continue
         out.add(str(int(value)) if value == int(value) else str(value))
     return out
@@ -286,7 +294,34 @@ def _citation_used(citation: dict, response: str) -> bool:
 
 
 def _verified_citations(citations, response: str) -> list:
-    """Deduplicate by document and drop sources the answer never used."""
+    """Deduplicate by document and drop sources the answer never used.
+
+    Runs while a response is being finished, so it must not be able to fail:
+    a bug in source checking should cost a citation, never the answer the user
+    already saw streamed.  On error the sources are kept as-is, deduplicated.
+    """
+    try:
+        return _verify_citations(citations, response)
+    except Exception:
+        logger.exception("[citations] Verification failed — keeping all sources")
+        return _dedupe_citations(citations)
+
+
+def _dedupe_citations(citations) -> list:
+    """One entry per document, with the private ``_`` keys stripped."""
+    seen: set = set()
+    out: list = []
+    for c in citations or []:
+        doc_id = c.get("document_id")
+        key = doc_id if doc_id is not None else c.get("document_name")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({k: v for k, v in c.items() if not k.startswith("_")})
+    return out
+
+
+def _verify_citations(citations, response: str) -> list:
     evidence = _AnswerEvidence(response)
     seen: set = set()
     out: list = []
