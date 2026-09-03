@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import stat
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -71,30 +72,64 @@ def _load_creds() -> dict:
 
 
 def _save_creds(creds: dict) -> None:
+    """Write the credential file, replacing it in one step.
+
+    Writing in place truncated the file before the ciphertext landed, so a
+    reader arriving mid-write — or a process that died there — found a partial
+    Fernet blob.  ``_load_creds`` cannot tell that apart from a bad key and
+    answers ``{}`` either way, which presents as a silent, total logout.  Write
+    a sibling and rename: readers see the whole of one version or the whole of
+    the other.
+    """
     fernet = _get_fernet()
     cp = _creds_path()
     _ensure_dir(os.path.dirname(cp))
-    fd = os.open(cp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(fernet.encrypt(json.dumps(creds).encode()))
+    tmp = f"{cp}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(fernet.encrypt(json.dumps(creds).encode()))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, cp)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # -- helpers ---------------------------------------------------------------
+
+#: Held across the read-modify-write in :func:`_set` and :func:`_clear`.  The
+#: whole file is rewritten to change one key, so two unsynchronized writers —
+#: the token refresh agent storing an access token while a request thread stores
+#: the rotated refresh token — would each save a copy of the file as it looked
+#: before the other's change, dropping one of the two silently.
+#:
+#: Process-local.  A second process (the CLI alongside a running server) can
+#: still interleave; :func:`_save_creds` keeps that from corrupting the file,
+#: but the lost-update window remains and wants a real file lock.
+_write_lock = threading.RLock()
+
 
 def _get(key: str) -> str | None:
     return _load_creds().get(key)
 
 
 def _set(key: str, value: str) -> None:
-    creds = _load_creds()
-    creds[key] = value
-    _save_creds(creds)
+    with _write_lock:
+        creds = _load_creds()
+        creds[key] = value
+        _save_creds(creds)
 
 
 def _clear(key: str) -> None:
-    creds = _load_creds()
-    creds.pop(key, None)
-    _save_creds(creds)
+    with _write_lock:
+        creds = _load_creds()
+        creds.pop(key, None)
+        _save_creds(creds)
 
 
 # -- developer token -------------------------------------------------------
@@ -146,7 +181,7 @@ def clear_refresh_token() -> None:
 
 def get_active_token() -> str | None:
     """Return the best available auth token: access_token > developer_token."""
-    return _get(_ACCESS_TOKEN) or _get(_DEVELOPER_TOKEN)
+    return _get(_ACCESS_TOKEN) or get_token()
 
 
 def has_credentials() -> bool:
@@ -160,11 +195,18 @@ def auth_headers() -> dict[str, str]:
     - access_token  → ``{"Authorization": "Bearer <token>"}``
     - developer_token → ``{"X-Api-Key": "<token>"}``
     - neither → ``{}``
+
+    The developer token comes from :func:`get_token`, so ``SLP_DEVELOPER_TOKEN``
+    counts here exactly as the module docstring says it does.  Reading the file
+    store directly meant an env-var-only user was reported as signed in by
+    ``/v1/auth/status`` — which asks :func:`get_token` — while every request
+    went out with no credentials at all: web search silently off, the catalog
+    silently anonymous.
     """
     access = _get(_ACCESS_TOKEN)
     if access:
         return {"Authorization": f"Bearer {access}"}
-    dev = _get(_DEVELOPER_TOKEN)
+    dev = get_token()
     if dev:
         return {"X-Api-Key": f"{dev}"}
     return {}

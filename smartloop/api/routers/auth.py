@@ -84,6 +84,15 @@ def _refresh_platform_cache(refresh_user: bool = True) -> None:
     token = credential_store.get_access_token() or credential_store.get_token()
     if token and token == _last_refreshed_token:
         return
+
+    # Whether hosted search will serve is an answer about the account, cached for
+    # a minute.  Signing in with that cache holding a "no" from the logged-out
+    # state left search skipping itself for the first minute of the session —
+    # ``reset_status_cache`` existed for exactly this and nothing called it.
+    from smartloop.search import providers
+
+    providers.reset_status_cache()
+
     svc = get_platform_service()
     if refresh_user:
         try:
@@ -107,31 +116,18 @@ def _resolve_user() -> Optional[UserInfo]:
         data = get_platform_service().get_current_user()
         return UserInfo(email=data["email"], name=data.get("name"))
     except PermissionError:
-        # 401 — the access token is expired or revoked.  A refresh token can
-        # mint a new one, so redeem it and retry once before giving up.
+        # A 401 that survived :meth:`SLPPlatformClient._authed`, which redeems the
+        # refresh token and retries before any exception is raised.  So by the
+        # time one arrives here the refresh has already been tried and failed —
+        # there was nothing to refresh with, the refresh itself was refused, or
+        # the fresh token was refused too.
         #
-        # Clearing without trying was the bug: the comment here promised the
-        # refresh token would "be needed to mint a new access token", but the
-        # only code that redeems one is the background loop, on a 45-minute
-        # timer.  So a single 401 logged the user out for up to a full interval
-        # while a valid refresh token sat unused, and everything auth-gated
-        # degraded quietly in the meantime — web search skipping itself, Pro
-        # models dropping out of the catalogue.
-        from smartloop.platform.token_agent import refresh_access_token_now
-
-        if refresh_access_token_now():
-            try:
-                data = get_platform_service().get_current_user(force=True)
-                return UserInfo(email=data["email"], name=data.get("name"))
-            except Exception:
-                logger.warning(
-                    "User still unresolved after refreshing the access token",
-                    exc_info=True,
-                )
-        # Either there was nothing to refresh with, the refresh failed, or the
-        # new token was refused too.  Drop the dead access token so later
-        # requests fall back to the developer token.  A refresh token that was
-        # itself rejected has already been cleared by refresh_access_token_now.
+        # This used to do the redeeming itself, which is why it was the only path
+        # in the app that recovered from an expired token; that logic now lives
+        # in the client, where every endpoint gets it.  What is left is the part
+        # that was always local to auth status: drop the dead access token so
+        # later requests fall back to the developer token.  A refresh token that
+        # was itself rejected has already been cleared by the refresh agent.
         if credential_store.get_access_token():
             credential_store.clear_access_token()
             logger.warning("Cleared expired access token after 401 from platform API")
@@ -142,8 +138,15 @@ def _resolve_user() -> Optional[UserInfo]:
 
 
 @router.get("/status", response_model=AuthStatusResponse)
-async def auth_status():
-    """Return the current credential state without exposing token values."""
+def auth_status():
+    """Return the current credential state without exposing token values.
+
+    Deliberately ``def`` rather than ``async def``, along with every other
+    handler in this router: they resolve the user through the platform API with
+    a synchronous client, and on the worst path — a 401, a refresh, a retry —
+    that is three 30-second calls.  On the event loop those stall every chat
+    stream in flight; declared sync, FastAPI runs them in the threadpool.
+    """
     has_dev = credential_store.get_token() is not None
     has_access = credential_store.get_access_token() is not None
     authenticated = has_dev or has_access
@@ -173,7 +176,7 @@ async def auth_status():
 
 
 @router.post("/token", response_model=AuthStatusResponse)
-async def set_token(request: TokenSetRequest):
+def set_token(request: TokenSetRequest):
     """Store a token in the credential store.
 
     Defaults to developer_token (used by ``slp token set``).
@@ -187,11 +190,11 @@ async def set_token(request: TokenSetRequest):
         logger.info("Access token updated via /v1/auth/token")
 
     _refresh_platform_cache()
-    return await auth_status()
+    return auth_status()
 
 
 @router.delete("/token", response_model=AuthStatusResponse)
-async def clear_token(
+def clear_token(
     type: ClearScope = Query(
         default=ClearScope.all,
         description="Which credentials to clear: all, developer_token, or access_token",
@@ -215,7 +218,7 @@ async def clear_token(
     # logout. Keep the cached user profile as-is — stale is acceptable and
     # already-downloaded models remain usable.
     _refresh_platform_cache(refresh_user=False)
-    return await auth_status()
+    return auth_status()
 
 
 # -- OAuth callback ------------------------------------------------------------
@@ -230,7 +233,7 @@ class OAuthCallbackRequest(BaseModel):
 
 
 @router.post("/callback", response_model=AuthStatusResponse)
-async def oauth_callback(request: OAuthCallbackRequest):
+def oauth_callback(request: OAuthCallbackRequest):
     """Receive tokens from the webapp after a completed OAuth flow.
 
     The cloud API handles the actual OAuth code exchange and redirects the
@@ -243,7 +246,7 @@ async def oauth_callback(request: OAuthCallbackRequest):
 
     _log_token_received("POST", request.access_token, request.refresh_token)
     _refresh_platform_cache()
-    return await auth_status()
+    return auth_status()
 
 
 APP_URL = AppSettings().slp_app_url if hasattr(AppSettings(), "slp_app_url") else "https://app.smartloop.ai"
@@ -259,7 +262,7 @@ def _log_token_received(method: str, access_token: str, refresh_token: Optional[
 
 
 @router.get("/callback")
-async def oauth_callback_get(
+def oauth_callback_get(
     access_token: str = Query(description="JWT access token from the OAuth flow"),
     refresh_token: Optional[str] = Query(default=None, description="Refresh token"),
 ):

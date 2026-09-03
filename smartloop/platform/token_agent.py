@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -58,13 +59,40 @@ def _needs_refresh() -> bool:
     return exp - time.time() <= REFRESH_INTERVAL_SECONDS
 
 
+#: Serializes redemption.  Two callers reach this — the background loop on the
+#: event loop, and a request thread whose call just came back 401 — and with
+#: single-use rotating refresh tokens the second redemption of the same token is
+#: refused, which clears both credentials and logs the user out.
+_refresh_lock = threading.Lock()
+
+
 def refresh_access_token_now(client: Optional[SLPPlatformClient] = None) -> bool:
     """Redeem the stored refresh token for a new access token.
 
-    Returns True when a new access token was stored.  A 401 from the refresh
-    endpoint means the refresh token itself is dead — retrying cannot help, so
-    both tokens are cleared and the user has to log in again.  Any other
-    failure leaves the credentials alone to be retried later.
+    Returns True when a new access token is in place.  Concurrent callers
+    collapse onto one redemption: whoever holds the lock does the work, and the
+    rest find the token already replaced and report success without spending the
+    refresh token a second time.
+    """
+    before = credential_store.get_access_token()
+    with _refresh_lock:
+        current = credential_store.get_access_token()
+        if current and current != before:
+            # Someone refreshed while we waited for the lock.  Their token is the
+            # live one; redeeming again would burn a rotated refresh token for a
+            # result we already have.
+            return True
+        return _redeem(client)
+
+
+def _redeem(client: Optional[SLPPlatformClient] = None) -> bool:
+    """Do the actual redemption.  Callers hold :data:`_refresh_lock`.
+
+    A 401 from the refresh endpoint means the refresh token itself is dead —
+    retrying cannot help, so both tokens are cleared and the user has to log in
+    again.  Any other failure leaves the credentials alone to be retried later;
+    ``_raise_for_status`` guarantees a 429 or 5xx arrives as ``ConnectionError``
+    rather than as the ``PermissionError`` that would clear them.
     """
     refresh_token = credential_store.get_refresh_token()
     if not refresh_token:
