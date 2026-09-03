@@ -110,7 +110,7 @@ def call_read_only(
             arguments=arguments, access_token=access_token,
         )
         credentials_changed = False
-        if not result.success and result.error and "401" in str(result.error):
+        if not result.success and result.auth_expired:
             new_token = caller.refresh_access_token(server)
             if new_token:
                 credentials_changed = True

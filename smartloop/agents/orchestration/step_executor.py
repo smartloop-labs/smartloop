@@ -614,7 +614,7 @@ class StepExecutor:
             arguments=arguments, access_token=access_token,
         )
 
-        if not result.success and result.error and "401" in result.error and server_url:
+        if not result.success and result.auth_expired and server_url:
             new_token = self.tool_caller.refresh_access_token(server)
             if new_token:
                 result = self.tool_caller.call_tool(
@@ -1115,7 +1115,7 @@ class StepExecutor:
             arguments=arguments, access_token=access_token, cwd=cwd,
         )
 
-        if not result.success and result.error and "401" in result.error and server_url:
+        if not result.success and result.auth_expired and server_url:
             new_token = self.tool_caller.refresh_access_token(server)
             if new_token:
                 result = self.tool_caller.call_tool(
