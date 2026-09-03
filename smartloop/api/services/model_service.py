@@ -4561,8 +4561,18 @@ class ModelService:
         identity tool leaves the field alone.
         """
         try:
+            from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
             from smartloop.mcp.account import probe_account
-            account = probe_account(server)
+
+            # Given its own caller so a token refreshed by the probe is written
+            # back.  The default caller has no persistence hook, and the probe
+            # discarded the "credentials changed" flag it got back — so the one
+            # call that runs on every connect could rotate a refresh token into
+            # a variable nobody read.
+            account = probe_account(
+                server,
+                tool_caller=MCPToolCaller(None, None, persist=self._model.save),
+            )
         except Exception as e:
             logger.debug("[mcp-account] probe failed for '%s': %s", server.name, e)
             return
@@ -5301,6 +5311,12 @@ class ModelService:
                 executor=self._get_llm_executor(),
             )
             workspace = self._model.workspace
+
+            # A tool call that renews an expired OAuth token mutates the server
+            # in memory; this is what writes it back.  Set here because the
+            # orchestrator has no workspace of its own — the service owns it.
+            orchestrator.tool_caller.set_persist(workspace.save)
+
             project = workspace.current_project
             caps: list[str] = []
             for m in workspace.models:
