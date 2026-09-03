@@ -53,8 +53,7 @@ from smartloop import ConversationStore, MessageInput
 from smartloop.api.config import api_settings
 from smartloop.config.app_settings import AppSettings
 
-from smartloop.auth import credential_store
-from smartloop.model.downloader import SLPArtifactDownloader, HFDownloader
+from smartloop.model.downloader import SLPArtifactDownloader
 from smartloop.tasks import (
     TaskQueue,
     DownloaderTask,
@@ -3310,8 +3309,12 @@ class ModelService:
 
         workspace = self._model.workspace if self._model else self._ensure_workspace()
 
-        downloader_cls = SLPArtifactDownloader if credential_store.has_credentials() else HFDownloader
-        downloader = downloader_cls(workspace, logger)
+        # Not gated on credentials.  The platform serves free models to anonymous
+        # callers and is the only authority on the rest, so a logged-out user
+        # downloading a free model belongs here — sending them to HuggingFace
+        # instead (with no HF token either) failed on a model ``/v1/init`` would
+        # have delivered, because that path stopped gating and this one did not.
+        downloader = SLPArtifactDownloader(workspace, logger)
 
         def _on_download_complete(task, status, _message):
             from smartloop.tasks.base_task import TaskStatus
