@@ -7,7 +7,9 @@ also slept *first*, so nothing refreshed at all during the first interval after
 start.
 """
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -141,6 +143,72 @@ class TestRedeemingTheRefreshToken:
 
         assert refresh_access_token_now(client) is False
         client.refresh_access_token.assert_not_called()
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503])
+    def test_a_platform_outage_is_not_a_rejection(self, status):
+        """Only a 401 may clear the credentials.
+
+        ``_raise_for_status`` used to give every non-2xx the endpoint's error
+        class, so a 500 from the refresh endpoint arrived as ``PermissionError``
+        and landed in the branch below that clears *both* tokens.  A bad minute
+        on the platform logged the user out with no way back but a re-login —
+        the exact opposite of what the docstring promised.
+        """
+        credential_store.set_access_token("stale")
+        credential_store.set_refresh_token("rt")
+        exc = ConnectionError(f"API error ({status})")
+        exc.status_code = status
+        client = self._client(side_effect=exc)
+
+        assert refresh_access_token_now(client) is False
+        assert credential_store.get_access_token() == "stale"
+        assert credential_store.get_refresh_token() == "rt"
+
+
+class TestConcurrentCallersRedeemOnce:
+    """Two callers reach the refresh agent: the background loop and a request
+    thread whose call just came back 401.  With single-use rotating refresh
+    tokens, the second redemption of the same token is *refused* — which takes
+    the 401 branch and clears both credentials, logging the user out on what was
+    a successful refresh.
+    """
+
+    def test_the_refresh_token_is_spent_once(self):
+        credential_store.set_refresh_token("old-rt")
+        started = threading.Barrier(2)
+        calls = []
+
+        def redeem(refresh_token):
+            calls.append(refresh_token)
+            time.sleep(0.05)  # hold the lock long enough for the other to queue
+            return {"access_token": f"fresh-{len(calls)}", "refresh_token": "rotated"}
+
+        client = MagicMock()
+        client.refresh_access_token = MagicMock(side_effect=redeem)
+
+        def call():
+            started.wait()
+            return refresh_access_token_now(client)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [f.result() for f in [pool.submit(call), pool.submit(call)]]
+
+        assert results == [True, True]
+        assert calls == ["old-rt"], f"refresh token redeemed {len(calls)} times"
+        assert credential_store.get_access_token() == "fresh-1"
+        assert credential_store.get_refresh_token() == "rotated"
+
+    def test_a_caller_that_genuinely_needs_one_still_gets_one(self):
+        """The short-circuit is "someone else just refreshed", not "ever refreshed"."""
+        credential_store.set_refresh_token("rt")
+        client = MagicMock()
+        client.refresh_access_token = MagicMock(
+            side_effect=[{"access_token": "first"}, {"access_token": "second"}],
+        )
+
+        assert refresh_access_token_now(client) is True
+        assert refresh_access_token_now(client) is True
+        assert credential_store.get_access_token() == "second"
 
 
 class TestTheLoopRunsBeforeItSleeps:
