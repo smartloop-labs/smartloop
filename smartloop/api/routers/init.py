@@ -18,8 +18,9 @@ from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
-from smartloop.platform import ModelAccessError, get_platform_service
+from smartloop.platform import get_platform_service
 from smartloop.workspace.context import projects_delegated
+from smartloop.api.routers._errors import status_for
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["init"])
@@ -41,38 +42,10 @@ def _sse_event(data: dict, event: str = "progress") -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-def _status_for(exc: Exception) -> int:
-    """Classify a stream failure as the HTTP status it would have been.
-
-    Entitlement is settled before the stream opens, so anything reaching here
-    failed mid-transfer — an expired signed URL, a full disk, a dropped socket.
-    The client still has to tell "sign in" apart from "try again", and it should
-    not have to do that by matching on message text, which is written for a
-    person and gets reworded.  Platform errors carry the upstream status (see
-    ``_raise_for_status``); the rest fall back to their type.
-
-    Only :class:`ModelAccessError` earns a 403.  ``PermissionError`` used to,
-    which was too wide by half: it is an ``OSError`` subclass, so an unwritable
-    models directory arrived as "not on your plan" and the desktop client turned
-    that into a sign-in prompt for what is a local disk problem.  A platform
-    refusal carries ``status_code`` and is answered above regardless.
-    """
-    status = getattr(exc, "status_code", None)
-    if isinstance(status, int):
-        return status
-    if isinstance(exc, ModelAccessError):
-        return 403
-    # Transfers that died on a dropped socket, a stale signed URL or an upstream
-    # 5xx are aggregated into a ConnectionError by ``_aggregate_error``.
-    if isinstance(exc, ConnectionError):
-        return 502
-    return 500
-
-
 def _error_event(exc: Exception) -> str:
     """Terminal SSE frame for a failed stream, tagged with a status code."""
     return _sse_event(
-        {"status": "error", "code": _status_for(exc), "message": str(exc)},
+        {"status": "error", "code": status_for(exc), "message": str(exc)},
         event="error",
     )
 

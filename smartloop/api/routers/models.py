@@ -13,6 +13,7 @@ from smartloop.config import SUPPORTED_MODELS
 from smartloop.config.app_settings import AppSettings
 from smartloop.constants import canonical_model_name
 from smartloop.platform import PlatformService, get_platform_service
+from smartloop.api.routers._errors import status_for
 from smartloop.types import ModelCapability
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,11 @@ async def load_model(
         project_name = model_service.get_current_project_name() or "default"
         return {"status": "ok", "message": f"Model loaded for inference (project: {project_name})."}
     except PermissionError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        # Not necessarily a 401.  ``PermissionError`` covers a plan refusal
+        # (``ModelAccessError``, 403) and, being an ``OSError`` subclass, an
+        # unwritable models directory too — answering 401 to either sent the
+        # desktop client to a sign-in prompt for something signing in cannot fix.
+        raise HTTPException(status_code=status_for(e), detail=str(e))
     except (EnvironmentError, ConnectionError) as e:
         raise HTTPException(status_code=502, detail=str(e))
     except ValueError as e:
