@@ -39,6 +39,13 @@ def _no_platform_call():
     patcher.stop()
 
 
+def _unauthorized() -> PermissionError:
+    """A platform 401 as the client actually raises it, status attached."""
+    exc = PermissionError("Authentication failed")
+    exc.status_code = 401
+    return exc
+
+
 class TestAuthStatus:
     def test_no_credentials(self, client):
         resp = client.get("/v1/auth/status")
@@ -131,7 +138,7 @@ class TestExpiredAccessToken:
 
         data = self._status(
             _no_platform_call, client,
-            get_user={"side_effect": PermissionError("Authentication failed")},
+            get_user={"side_effect": _unauthorized()},
         )
 
         assert credential_store.get_access_token() is None
@@ -151,11 +158,27 @@ class TestExpiredAccessToken:
 
         self._status(
             _no_platform_call, client,
-            get_user={"side_effect": PermissionError("Authentication failed")},
+            get_user={"side_effect": _unauthorized()},
         )
 
         assert credential_store.get_access_token() is None
         assert credential_store.get_refresh_token() == "still-good-rt"
+
+    def test_only_a_401_discards_the_token(self, _no_platform_call, client):
+        """403 and 404 arrive here as PermissionError too — they are not the
+        token's fault, and an API deploy that moves a route should not log
+        everyone out of the desktop client."""
+        for status in (403, 404):
+            credential_store.set_access_token("good-jwt")
+            exc = PermissionError(f"API error ({status})")
+            exc.status_code = status
+
+            data = self._status(
+                _no_platform_call, client, get_user={"side_effect": exc},
+            )
+
+            assert credential_store.get_access_token() == "good-jwt", status
+            assert data["user"] is None
 
     def test_an_outage_is_not_a_logout(self, _no_platform_call, client):
         """A platform blip now arrives as ConnectionError, not PermissionError.
