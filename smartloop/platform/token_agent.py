@@ -65,6 +65,17 @@ def _needs_refresh() -> bool:
 #: refused, which clears both credentials and logs the user out.
 _refresh_lock = threading.Lock()
 
+#: How long a failed redemption suppresses the next attempt.  The lock alone
+#: only collapses callers when the refresh *succeeds* — on failure the stored
+#: token is unchanged, so every queued waiter falls through and pays the full
+#: timeout in turn.  With the auth endpoints now served from the threadpool,
+#: ten concurrent 401s against a degraded platform meant ten serialized
+#: redemptions holding ten threadpool slots.  One attempt per window is enough
+#: to discover the platform is still down.
+_FAILED_REFRESH_COOLDOWN_SECONDS = 30.0
+
+_last_failure_at: float = 0.0
+
 
 def refresh_access_token_now(client: Optional[SLPPlatformClient] = None) -> bool:
     """Redeem the stored refresh token for a new access token.
@@ -74,6 +85,8 @@ def refresh_access_token_now(client: Optional[SLPPlatformClient] = None) -> bool
     rest find the token already replaced and report success without spending the
     refresh token a second time.
     """
+    global _last_failure_at
+
     before = credential_store.get_access_token()
     with _refresh_lock:
         current = credential_store.get_access_token()
@@ -82,7 +95,16 @@ def refresh_access_token_now(client: Optional[SLPPlatformClient] = None) -> bool
             # live one; redeeming again would burn a rotated refresh token for a
             # result we already have.
             return True
-        return _redeem(client)
+
+        if time.monotonic() - _last_failure_at < _FAILED_REFRESH_COOLDOWN_SECONDS:
+            # A redemption failed moments ago.  Whatever stopped it — the
+            # platform is down, the refresh token is gone — will not have been
+            # fixed by the time it took us to reach the lock.
+            return False
+
+        ok = _redeem(client)
+        _last_failure_at = 0.0 if ok else time.monotonic()
+        return ok
 
 
 def _redeem(client: Optional[SLPPlatformClient] = None) -> bool:

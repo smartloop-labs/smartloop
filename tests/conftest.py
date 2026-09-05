@@ -14,6 +14,22 @@ def _isolate_credential_store(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_refresh_cooldown():
+    """Forget any failed-refresh cooldown left by another test.
+
+    ``token_agent`` suppresses a redemption for a window after one fails, so a
+    test that exercises a failing refresh would otherwise make the *next* test's
+    legitimate refresh return False without calling anything — a failure that
+    only appears in full-suite runs and disappears in isolation.
+    """
+    from smartloop.platform import token_agent
+
+    token_agent._last_failure_at = 0.0
+    yield
+    token_agent._last_failure_at = 0.0
+
+
+@pytest.fixture(autouse=True)
 def _restore_root_logging():
     """Snapshot and restore the root logger around every test.
 
