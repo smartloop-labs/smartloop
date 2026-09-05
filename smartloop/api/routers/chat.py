@@ -203,9 +203,69 @@ def format_messages_to_prompt(
 # share 7-12 ordinary words ("available", "different", "perform", "three"),
 # which is why a one-word rule credited five Vanguard PDFs to a `good-morning`
 # routine.  No pair of unrelated texts in that sample shared a 3-word run.
+#
+# Runs of ordinary grammar are excluded on top of that — see ``_STOPWORDS``.
+# The length stays at 3 rather than rising to 4: a four-word rule loses the
+# short reused phrase that is often the only trace a summarising answer keeps
+# of its source ("engaged for contract work" against "for contract work
+# services" shares three words and no four).
 _PHRASE_LEN = 3
 
-_WORD_RE = re.compile(r"[a-z0-9][a-z0-9.,%/-]*")
+# Function words carry no attribution: every English text has them, so a run
+# built only out of these is a coincidence of grammar rather than a trace of
+# one text in another.  "here are the", "in the last", "as well as", "one of
+# the" — each is a three-word run, and each used to be enough to credit a
+# document the answer had never opened.  A run must carry at least
+# ``_MIN_CONTENT_WORDS`` words from outside this set to count as evidence.
+#
+# This list is English and only English, which is a real limit and not a
+# hidden one: against a French or Japanese answer nothing here matches, every
+# word reads as a content word, and the rule falls back to the plain
+# three-word run it refines.  That is the pre-existing behaviour rather than a
+# new failure — the filter subtracts false credits where it applies and is
+# inert where it does not — but it does mean English gets a check the other
+# languages do not.  Deriving the same thing from token frequency was tried on
+# paper and abandoned: a 300-character extract is far too short for the counts
+# to separate grammar from content.
+_STOPWORDS = frozenset("""
+a an the and or but if then than that this these those there here
+is are was were be been being am do does did doing done
+have has had having will would shall should can could may might must
+of in on at to for from by with without into onto over under about as
+it its it's they them their we us our you your he she his her i me my
+not no nor so such only just also very more most much many few some any
+each every other another same own all both which who whom whose what when
+where why how while during before after above below up down out off again
+one two three first second next last new old good great best
+""".split())
+
+# How many words in a shared run must be outside ``_STOPWORDS``.  Two, not one:
+# a single content word surrounded by grammar ("here are the **jobs**") is the
+# shape of an incidental collision, while two content words in a three-word
+# window ("for **contract work**") is phrasing one text took from another.
+_MIN_CONTENT_WORDS = 2
+
+# A word in any script.  This was ``[a-z0-9][a-z0-9.,%/-]*`` — ASCII only —
+# which did not weaken the check outside English so much as switch it off.
+# Arabic, Chinese, Hebrew, Cyrillic, Devanagari and Thai text yielded no words
+# at all, so no runs, so no evidence either way, so every source was kept
+# unconditionally.  Accented Latin fared worse than that: "über" tokenised as
+# "ber" and "für" as "f" + "r", and those fragments are in no stopword list,
+# so they counted as content words and a run of mangled German passed as
+# evidence.
+_WORD_RE = re.compile(r"\w[\w.,%/-]*", re.UNICODE)
+
+# Scripts written without spaces between words: Japanese kana, CJK ideographs,
+# Thai.  Splitting these on whitespace yields one enormous "word" and no runs,
+# so the same "no evidence, keep everything" hole reopens for them.  Their runs
+# are counted in characters instead — ``_CHAR_GRAM`` of them is a comparable
+# unit to a three-word English run, since these scripts pack a word into one or
+# two characters.
+_CONTINUOUS_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0e7f]{%d,}"
+    % 5
+)
+_CHAR_GRAM = 5
 _NUMBER_RE = re.compile(r"\b\d[\d.,]*\b")
 # Figures below this many significant digits are not evidence of anything: an
 # answer saying "3 sets of 10 reps" would otherwise match any document that
@@ -214,13 +274,26 @@ _FIGURE_MIN_DIGITS = 3
 
 
 def _phrases(text: str) -> set:
-    """Every ``_PHRASE_LEN``-word run in *text*, normalised for comparison."""
-    words = [w.strip(".,%/-") for w in _WORD_RE.findall(text.lower())]
+    """The ``_PHRASE_LEN``-word runs in *text* that could evidence attribution.
+
+    Normalised for comparison, and filtered: a run has to carry at least
+    ``_MIN_CONTENT_WORDS`` words that are not grammar.  Both sides of the
+    comparison are built this way, so a run only ever matches a run that also
+    qualified.
+    """
+    lowered = (text or "").lower()
+    words = [w.strip(".,%/-") for w in _WORD_RE.findall(lowered)]
     words = [w for w in words if w]
-    return {
-        " ".join(words[i:i + _PHRASE_LEN])
-        for i in range(len(words) - _PHRASE_LEN + 1)
-    }
+    out = set()
+    for i in range(len(words) - _PHRASE_LEN + 1):
+        run = words[i:i + _PHRASE_LEN]
+        if sum(w not in _STOPWORDS for w in run) < _MIN_CONTENT_WORDS:
+            continue
+        out.add(" ".join(run))
+    for span in _CONTINUOUS_RE.findall(lowered):
+        for i in range(len(span) - _CHAR_GRAM + 1):
+            out.add(span[i:i + _CHAR_GRAM])
+    return out
 
 
 def _figures(text: str) -> set:
@@ -295,6 +368,18 @@ def _citation_used(citation: dict, response: str) -> bool:
 
 def _verified_citations(citations, response: str) -> list:
     """Deduplicate by document and drop sources the answer never used.
+
+    Computed, not asked.  A citation exists so a reader can trace a statement
+    back to the text it came from, which makes the question a mechanical one —
+    does any of this document's text appear in the answer? — and mechanical is
+    what it stays: string comparison over the finished response, no model call,
+    nothing for the user to wait through once the answer is on screen.
+
+    An LLM judge was tried here and removed.  It cost a model call per source
+    after the answer had finished streaming, and it was wrong in the direction
+    that matters: asked "key features hasselblad x2d ii", it put an indexed
+    resume back on the answer as a source, overruling a text comparison that
+    had correctly found nothing in common.
 
     Runs while a response is being finished, so it must not be able to fail:
     a bug in source checking should cost a citation, never the answer the user
@@ -1023,6 +1108,10 @@ async def stream_chunks(
 
     # Stream content chunks and collect full response for session history
     full_response_parts = []
+    # The verified citation set, computed once when the answer is complete and
+    # reused for both the session record and the client event — the two used to
+    # scan the same response independently.
+    verified_citations = None
     try:
         while True:
             item = await queue.get()
@@ -1067,12 +1156,14 @@ async def stream_chunks(
             "[stream] Streaming finished — %d chunk(s), %d char(s), preview=%r",
             len(full_response_parts), len(full_response), full_response[:200],
         )
+        if citations and full_response:
+            verified_citations = _verified_citations(citations, full_response)
         if request.session_id and full_response:
             # Persist the same verified set the client is shown — never the raw
             # list, which still carries the private ``_extract`` payload.
             model_service.append_to_session(
                 request.session_id, "assistant", full_response,
-                citations=_verified_citations(citations, full_response),
+                citations=verified_citations or [],
                 message_id=message_id,
             )
         # Model cleanup deliberately does NOT happen here — see
@@ -1135,7 +1226,11 @@ async def stream_chunks(
         # the filename: an earlier filename-based check dropped real sources
         # whose names say nothing about their contents ("sp46.pdf" for a
         # Vanguard fund).
-        unique_citations = _verified_citations(citations, "".join(full_response_parts))
+        unique_citations = (
+            verified_citations
+            if verified_citations is not None
+            else _verified_citations(citations, "".join(full_response_parts))
+        )
         if unique_citations:
             citations_payload = json.dumps({
                 "object": "chat.citations",
@@ -1321,12 +1416,18 @@ async def _complete_without_streaming(
                 # backslashes as escape characters (e.g. \.out → .out on Windows).
                 response_text = f"{response_text}\n\n[{Path(written_path).name}]({Path(written_path).as_posix()})"
 
+        # Verified once and reused for both the session record and the
+        # response — the two used to scan the same text independently.
+        verified_citations = None
+        if citations and response_text:
+            verified_citations = _verified_citations(citations, response_text)
+
         # Store assistant response in session history (after auto-write so the link is included)
         message_id = request.message_id or f"msg-{uuid.uuid4().hex[:8]}"
         if request.session_id and response_text:
             model_service.append_to_session(
                 request.session_id, "assistant", response_text,
-                citations=_verified_citations(citations, response_text),
+                citations=verified_citations or [],
                 message_id=message_id,
             )
 
@@ -1342,7 +1443,11 @@ async def _complete_without_streaming(
 
         citation_models = None
         if citations:
-            unique_citations = _verified_citations(citations, response_text)
+            unique_citations = (
+                verified_citations
+                if verified_citations is not None
+                else _verified_citations(citations, response_text)
+            )
             if unique_citations:
                 citation_models = [
                     Citation(document_id=c["document_id"], document_name=c.get("document_name"))
