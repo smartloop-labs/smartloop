@@ -393,10 +393,16 @@ class SLPPlatformClient:
 
     def push_token_usage(self, record: dict, timeout: int = 10) -> None:
         """POST /v1/usage/tokens (auth required). Fire-and-forget telemetry."""
+        # Deliberately not through :meth:`_authed`.  A 401 here would redeem the
+        # refresh token, and a refresh endpoint answering 401 clears both
+        # credentials — so a fire-and-forget telemetry POST, whose every failure
+        # is swallowed by the except below, could log the user out with no
+        # visible cause.  Usage records are flushed in batches, so it would do
+        # it once per queued record.
         try:
-            resp = self._authed(
-                lambda h: httpx.post(self._url(_USAGE_TOKENS), headers=h,
-                                     json=record, timeout=timeout))
+            resp = httpx.post(self._url(_USAGE_TOKENS),
+                              headers=self._headers(self._auth_headers_fn()),
+                              json=record, timeout=timeout)
             _raise_for_status(resp)
         except Exception as e:
             logger.error("Failed to push token usage: %s", e)
