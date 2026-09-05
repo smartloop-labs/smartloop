@@ -198,6 +198,38 @@ class TestConcurrentCallersRedeemOnce:
         assert credential_store.get_access_token() == "fresh-1"
         assert credential_store.get_refresh_token() == "rotated"
 
+    def test_a_failed_redemption_holds_off_the_queue_behind_it(self):
+        """The lock alone only collapses callers when the refresh *succeeds*.
+
+        On failure the stored token is unchanged, so every waiter falls through
+        and pays the full timeout in turn. With the auth endpoints served from
+        the threadpool, ten concurrent 401s against a degraded platform meant
+        ten serialized redemptions holding ten threadpool slots.
+        """
+        credential_store.set_refresh_token("rt")
+        client = MagicMock()
+        client.refresh_access_token = MagicMock(
+            side_effect=ConnectionError("platform unreachable"))
+
+        assert refresh_access_token_now(client) is False
+        assert refresh_access_token_now(client) is False
+        assert refresh_access_token_now(client) is False
+
+        assert client.refresh_access_token.call_count == 1
+        # Nothing was thrown away — the credentials are still there to retry with.
+        assert credential_store.get_refresh_token() == "rt"
+
+    def test_the_hold_off_lifts_once_one_succeeds(self):
+        credential_store.set_refresh_token("rt")
+        client = MagicMock()
+        client.refresh_access_token = MagicMock(side_effect=ConnectionError("down"))
+        assert refresh_access_token_now(client) is False
+
+        token_agent._last_failure_at = 0.0  # window elapsed
+        client.refresh_access_token = MagicMock(return_value={"access_token": "fresh"})
+        assert refresh_access_token_now(client) is True
+        assert credential_store.get_access_token() == "fresh"
+
     def test_a_caller_that_genuinely_needs_one_still_gets_one(self):
         """The short-circuit is "someone else just refreshed", not "ever refreshed"."""
         credential_store.set_refresh_token("rt")
