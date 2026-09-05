@@ -43,20 +43,35 @@ def _ensure_dir(path: str) -> None:
 
 
 def _get_fernet():
-    """Return a Fernet instance, generating the key file if needed."""
+    """Return a Fernet instance, generating the key file if needed.
+
+    The key is created with ``O_EXCL`` and never truncated in place.  Truncating
+    was the same hazard :func:`_save_creds` was hardened against, and worse here:
+    this runs from :func:`_load_creds`, which readers reach *without* the write
+    lock, so a reader arriving mid-write got a short key, ``Fernet`` raised, and
+    the bare ``except`` below reported it as "no credentials" — a phantom logout.
+
+    Losing the ``O_EXCL`` race means another writer created the key first; read
+    theirs rather than overwriting it, which would strand every credential
+    already encrypted under it.
+    """
     from cryptography.fernet import Fernet
 
     kp = _key_path()
-    if os.path.exists(kp):
-        with open(kp, "rb") as f:
-            key = f.read()
-    else:
-        key = Fernet.generate_key()
+    if not os.path.exists(kp):
         _ensure_dir(os.path.dirname(kp))
-        fd = os.open(kp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(key)
-    return Fernet(key)
+        try:
+            fd = os.open(kp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "wb") as f:
+                f.write(Fernet.generate_key())
+                f.flush()
+                os.fsync(f.fileno())
+
+    with open(kp, "rb") as f:
+        return Fernet(f.read())
 
 
 def _load_creds() -> dict:
