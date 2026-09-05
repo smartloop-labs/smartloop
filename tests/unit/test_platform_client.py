@@ -665,3 +665,54 @@ class TestRefreshAccessToken:
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
         with pytest.raises(ValueError, match="missing access_token"):
             client.refresh_access_token("old-rt")
+
+
+class TestTheRetryFollowsTheCredential:
+    """``_authed`` retries when the credentials *changed*, not when the refresh
+    reported success. The two come apart in both directions.
+    """
+
+    def test_a_dead_oauth_token_falls_back_to_the_developer_token(self, stub_server):
+        """Redeeming a dead refresh token clears both OAuth credentials — and
+        leaves a working developer token behind.
+
+        Keyed on the refresh's return value that read as failure, so the request
+        was abandoned with "Sign in to download this model" for a user who was
+        signed in, and the identical next request succeeded.
+        """
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/sl-mini/download": [
+                (401, {"detail": "Unauthorized"}),
+                (200, {"artifacts": {"m.gguf": "https://blob/m.gguf"}}),
+            ],
+            "/v1/auth/jwt/refresh": (401, {"detail": "revoked"}),
+        }
+        credential_store.set_access_token("expired")
+        credential_store.set_refresh_token("revoked-rt")
+        credential_store.set_token("sk-dev-good")
+
+        client = SLPPlatformClient(base_url)
+        assert client.get_model_artifacts("sl-mini") == {"m.gguf": "https://blob/m.gguf"}
+
+        assert credential_store.get_access_token() is None
+        assert credential_store.get_refresh_token() is None
+        sent = [r["headers"] for r in handler.requests if r["path"].endswith("/download")]
+        assert sent[0]["Authorization"] == "Bearer expired"
+        assert sent[1]["X-Api-Key"] == "sk-dev-good"
+
+    def test_an_unchanged_credential_is_not_resent(self, stub_server):
+        """A refresh that reports success without changing what we send would
+        only buy a guaranteed second 401."""
+        base_url, handler = stub_server
+        handler.routes = {"/v1/users/me": (401, {"detail": "Unauthorized"})}
+
+        client = SLPPlatformClient(
+            base_url,
+            auth_headers_fn=lambda: {"Authorization": "Bearer same"},
+            refresh_fn=lambda: True,
+        )
+        with pytest.raises(PermissionError):
+            client.get_current_user()
+
+        assert len(handler.requests) == 1
