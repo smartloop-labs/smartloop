@@ -172,12 +172,31 @@ class SLPPlatformClient:
 
         *send* is called with the headers to use rather than being handed a
         prepared request, so the retry re-reads ``auth_headers_fn`` and picks up
-        the token the refresh just stored.
+        whatever the refresh left behind.
+
+        The retry is keyed on the credentials having actually *changed*, not on
+        what the refresh reported.  The two are not the same, and both
+        directions were wrong:
+
+        * The refresh can fail and still leave us better off.  Redeeming a dead
+          refresh token clears both OAuth credentials, after which
+          ``auth_headers`` falls back to the developer token — a credential that
+          works.  Keyed on the boolean, that request failed with "sign in to
+          download this model" for a user who was signed in, and the next
+          request succeeded.
+        * The refresh can report success without changing what we send, in
+          which case resending is a guaranteed second 401.
         """
-        resp = send(self._headers(self._auth_headers_fn()))
-        if resp.status_code == 401 and self._refresh_fn():
-            resp = send(self._headers(self._auth_headers_fn()))
-        return resp
+        sent = self._auth_headers_fn()
+        resp = send(self._headers(sent))
+        if resp.status_code != 401:
+            return resp
+
+        self._refresh_fn()
+        current = self._auth_headers_fn()
+        if current == sent:
+            return resp
+        return send(self._headers(current))
 
     def list_bootstrap_models(self) -> list[dict]:
         """GET /v1/bootstrap/models (no auth). Returns the array of model entries."""
