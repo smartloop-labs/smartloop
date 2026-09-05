@@ -704,3 +704,23 @@ class TestTheRetryFollowsTheCredential:
             client.get_current_user()
 
         assert len(handler.requests) == 1
+
+
+class TestTelemetryCannotLogYouOut:
+    def test_a_401_on_usage_does_not_redeem_the_refresh_token(self, stub_server):
+        """``push_token_usage`` is fire-and-forget and swallows every failure.
+
+        Routed through ``_authed`` it could redeem the refresh token, and a
+        refresh endpoint answering 401 clears both credentials — so a telemetry
+        POST could log the user out with nothing visible but a log line. Records
+        flush in batches, so it would do it once per queued record.
+        """
+        base_url, handler = stub_server
+        handler.routes = {"/v1/usage/tokens": (401, {"detail": "Unauthorized"})}
+        credential_store.set_access_token("expired")
+        credential_store.set_refresh_token("rt")
+
+        SLPPlatformClient(base_url).push_token_usage({"tokens": 1})
+
+        assert not [r for r in handler.requests if "refresh" in r["path"]]
+        assert credential_store.get_refresh_token() == "rt"
