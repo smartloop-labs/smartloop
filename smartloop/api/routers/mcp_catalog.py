@@ -62,7 +62,11 @@ def _to_entries(raw: list) -> list[MCPCatalogEntry]:
 
 
 @router.get("/mcp-catalog", response_model=list[MCPCatalogEntry])
-async def list_mcp_catalog(
+    # Sync on purpose: the platform client is synchronous, and a 401 now costs
+    # a refresh and a retry on top of the original call.  On the event loop
+    # that stalls every in-flight chat stream; declared sync, FastAPI runs it
+    # in the threadpool.  See ``auth_status`` in the auth router.
+def list_mcp_catalog(
     svc: PlatformService = Depends(get_platform_service),
 ):
     """List curated MCP server catalog entries.
