@@ -34,6 +34,12 @@ _TIMEOUT = 30
 _SEARCH_TIMEOUT = 15
 _SEARCH_STATUS_TIMEOUT = 5
 
+#: The refresh grant is a single small POST, and it lands *inside* another
+#: call's budget — the web-search gate allows itself 5s precisely because it
+#: sits in front of a user-visible turn, and inheriting the 30s control-plane
+#: timeout let one 401 turn that into 40s.
+_REFRESH_TIMEOUT = 10
+
 
 def _user_agent() -> str:
     """Identify this client to the API.
@@ -351,7 +357,8 @@ class SLPPlatformClient:
         """
         try:
             resp = httpx.post(self._url(_JWT_REFRESH), headers=self._headers(),
-                              json={"refresh_token": refresh_token}, timeout=_TIMEOUT)
+                              json={"refresh_token": refresh_token},
+                              timeout=_REFRESH_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
