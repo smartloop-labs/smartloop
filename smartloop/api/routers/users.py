@@ -50,7 +50,11 @@ def _user_read(data: dict) -> UserRead:
 
 
 @router.get("/me", response_model=UserRead)
-async def get_me(svc: PlatformService = Depends(get_platform_service)):
+    # Sync on purpose: the platform client is synchronous, and a 401 now costs
+    # a refresh and a retry on top of the original call.  On the event loop
+    # that stalls every in-flight chat stream; declared sync, FastAPI runs it
+    # in the threadpool.  See ``auth_status`` in the auth router.
+def get_me(svc: PlatformService = Depends(get_platform_service)):
     """Return the authenticated user's profile from the platform API."""
     try:
         data = svc.get_current_user()
@@ -63,7 +67,11 @@ async def get_me(svc: PlatformService = Depends(get_platform_service)):
 
 
 @router.patch("/me", response_model=UserRead)
-async def update_me(body: UserUpdate, svc: PlatformService = Depends(get_platform_service)):
+    # Sync on purpose: the platform client is synchronous, and a 401 now costs
+    # a refresh and a retry on top of the original call.  On the event loop
+    # that stalls every in-flight chat stream; declared sync, FastAPI runs it
+    # in the threadpool.  See ``auth_status`` in the auth router.
+def update_me(body: UserUpdate, svc: PlatformService = Depends(get_platform_service)):
     """Update the authenticated user's profile via the platform API."""
     payload = body.model_dump(exclude_none=True)
     if not payload:
