@@ -274,10 +274,12 @@ async def init(
             artifacts = await asyncio.get_event_loop().run_in_executor(
                 None, downloader.resolve_artifacts, ws_model.model_id
             )
-        except PermissionError as exc:
-            raise HTTPException(status_code=getattr(exc, "status_code", 403), detail=str(exc))
-        except ConnectionError as exc:
-            raise HTTPException(status_code=getattr(exc, "status_code", 502), detail=str(exc))
+        except (PermissionError, ConnectionError) as exc:
+            # Same classifier the stream's error frame uses.  Keeping a second
+            # rule here is how the two halves of this endpoint came to disagree:
+            # the fallback was 403, so an unwritable models directory answered
+            # "not on your plan" before the stream and 500 inside it.
+            raise HTTPException(status_code=status_for(exc), detail=str(exc))
 
     async def event_stream():
         try:

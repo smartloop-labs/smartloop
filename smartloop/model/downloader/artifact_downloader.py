@@ -126,7 +126,7 @@ def _classified(message: str, transient: bool) -> Exception:
     """An error that reads as *message* but still says whether to try again.
 
     The API router turns whatever escapes the download onto an HTTP status for
-    its own client (see ``_status_for``), and the only thing that status has to
+    its own client (see ``status_for``), and the only thing that status has to
     convey is whether trying again could help. Re-raising as a bare
     ``RuntimeError`` — which every layer here used to do — answered "500,
     something broke" for a dropped socket and a corrupt file alike, so a client
