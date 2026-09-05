@@ -115,7 +115,19 @@ def _resolve_user() -> Optional[UserInfo]:
     try:
         data = get_platform_service().get_current_user()
         return UserInfo(email=data["email"], name=data.get("name"))
-    except PermissionError:
+    except PermissionError as exc:
+        # ``get_current_user`` raises PermissionError for every refusal that is
+        # not transient — 403 and 404 as much as 401 — so the status has to be
+        # read rather than assumed.  Only a 401 is a statement about the token.
+        # Discarding one on a 404 meant an API deploy that moved a route logged
+        # everyone out of the desktop client.
+        if getattr(exc, "status_code", None) != 401:
+            logger.warning(
+                "Could not resolve user (HTTP %s) — leaving credentials alone",
+                getattr(exc, "status_code", "?"),
+            )
+            return None
+
         # A 401 that survived :meth:`SLPPlatformClient._authed`, which redeems the
         # refresh token and retries before any exception is raised.  So by the
         # time one arrives here the refresh has already been tried and failed —
