@@ -16,7 +16,7 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"  # Suppress transformers warnings
 import mimetypes
 mimetypes.knownfiles = []
 
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 from .conversation_store import ConversationStore, MessageInput
 from .server import start_server, stop_server, get_status, is_server_running, get_server_url, read_pid_file
