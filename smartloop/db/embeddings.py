@@ -205,3 +205,24 @@ def embedding_to_blob(vec: np.ndarray) -> bytes:
 def blob_to_embedding(blob: bytes) -> np.ndarray:
     """Deserialise a BLOB back to a 1-D float32 numpy vector."""
     return np.frombuffer(blob, dtype=np.float32)
+
+
+# --------------------------------------------------------------- similarity
+
+def cosine_distances(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Cosine distance (``1 - similarity``) from *query_vec* to each row.
+
+    The one place the comparison is defined, so everything that asks "is this
+    text about the same thing as that text?" — chunk retrieval ranking a
+    corpus against the user's question, citation verification checking a
+    source against the finished answer — agrees on what a distance of 0.55
+    means.  Rows are re-normalised here rather than trusted: vectors come
+    both from the embedder (already L2-normalised) and from SQLite BLOBs
+    written by older index versions.
+    """
+    matrix = np.atleast_2d(np.asarray(matrix, dtype=np.float32))
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1, norms)
+    q = np.asarray(query_vec, dtype=np.float32).ravel()
+    q = q / (np.linalg.norm(q) or 1)
+    return 1.0 - ((matrix / norms) @ q)

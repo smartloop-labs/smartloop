@@ -98,6 +98,12 @@ _RECALL_MAX_DISTANCE = 0.8      # broad initial recall before selection
 _MIN_BEST_DISTANCE = 0.55       # quality floor: reject a weak best match
 _DISTANCE_CUTOFF_MARGIN = 0.15  # keep chunks within this margin of the best
 
+# How many matched chunks a citation carries for the router to verify against.
+# Closest-first, so this keeps the passages the document was actually retrieved
+# for and drops its long tail of weaker hits — which is both the cheaper and
+# the stricter thing to check the finished answer against.
+_MAX_CITATION_CHUNKS = 5
+
 
 def _select_relevant_chunks(chunks: list, label: str = "vector-search") -> list:
     """Apply the shared relevance-selection criteria to ranked chunks.
@@ -2316,10 +2322,12 @@ class ModelService:
                     # citation reaches a client).  Being retrieved is not
                     # evidence a document was used — nearest neighbour always
                     # returns something — so the router checks the finished
-                    # answer against this extract before crediting the source.
+                    # answer against this before crediting the source.
                     extract = doc_groups.get(chunk.document_name or chunk.document_id)
                     if extract:
                         citation["_extract"] = extract
+                    citation["_chunks"] = []
+                    citation["_vectors"] = []
                     if page:
                         citation["page_numbers"] = [page]
                     seen_docs[chunk.document_id] = citation
@@ -2329,6 +2337,25 @@ class ModelService:
                     if page not in pages:
                         pages.append(page)
                         existing["page_numbers"] = sorted(pages)
+
+                # The chunks that actually matched, closest first — the
+                # passages this document was retrieved *for*.  ``_extract``
+                # above is the whole document (the expansion step fetches every
+                # chunk of every matched file), and checking a finished answer
+                # against a whole document credits almost anything: a long file
+                # covers enough ground that some page of it looks related to
+                # any answer.  These are what the router scores instead.
+                #
+                # Their vectors ride along too.  They were computed when the
+                # document was indexed and read back a moment ago to rank this
+                # very search, so the router can check them against the answer
+                # without encoding a single character of source text — the
+                # answer itself is the only thing left to embed.
+                existing = seen_docs[chunk.document_id]
+                chunk_text = (chunk.text or "").strip()
+                if chunk_text and len(existing["_chunks"]) < _MAX_CITATION_CHUNKS:
+                    existing["_chunks"].append(chunk_text)
+                    existing["_vectors"].append(chunk.embedding)
 
             # seen_docs preserves discovery (similarity) order.
             all_citations = list(seen_docs.values())
@@ -3538,7 +3565,7 @@ class ModelService:
         except Exception as e:  # cleanup must never fail a response
             logger.warning("[models] embedding unload failed: %s", e)
 
-    def unload_auxiliary_models(self) -> None:
+    def unload_auxiliary_models(self, include_embedding: bool = True) -> None:
         """Release every on-demand auxiliary model, keeping only the resident
         orchestrator.
 
@@ -3549,20 +3576,30 @@ class ModelService:
         underlying unloads are idempotent, so this is safe to call whether or
         not either model was actually loaded for the request.
 
-        The embedding model goes with them. Retrieval runs at the start of a
-        turn and is finished well before the response is; holding its weights
-        and llama.cpp context until the next question is the same idle cost as
-        the auxiliary LLMs. It reloads lazily on the next search.
+        The embedding model goes with them by default, on the same reasoning:
+        holding its weights and llama.cpp context until the next question is
+        the same idle cost as the auxiliary LLMs.
+
+        ``include_embedding=False`` for the one caller where that reasoning
+        does not hold. Retrieval is finished long before the response is, but
+        citation verification is not — it scores the sources against the
+        finished answer, so the embedding model is wanted again *after*
+        generation ends. Unloading it here would mean reloading it seconds
+        later, and this GGUF takes about three seconds to come back, paid in
+        full where the user is already waiting for citations to appear. That
+        caller unloads it itself once verification is done.
 
         Each unload is guarded on its own so one failure still returns the
         other models' VRAM instead of skipping the rest of the cleanup.
         """
-        for name, unload in (
+        unloads = [
             ("vision", self.unload_vision_model),
             ("large", self.unload_large_model),
             ("capability", self._evict_capability_models),
-            ("embedding", self.unload_embedding_model),
-        ):
+        ]
+        if include_embedding:
+            unloads.append(("embedding", self.unload_embedding_model))
+        for name, unload in unloads:
             try:
                 unload()
             except Exception as e:  # cleanup must never fail a response

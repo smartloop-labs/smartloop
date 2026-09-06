@@ -46,6 +46,14 @@ class ChunkResult(BaseModel):
     distance: float = 0.0
     metadata: dict = {}
     source_content: Optional[str] = None
+    # This chunk's embedding, as the raw BLOB the index stores.  Carried out of
+    # the store so callers that need to compare the chunk against something
+    # else — citation verification checking it against the finished answer —
+    # can do it without paying to encode text that was already encoded at
+    # index time.  ``None`` from the TF-IDF fallback path, which has no
+    # vectors.  Kept as bytes rather than an array so ``ChunkResult`` stays a
+    # plain pydantic model; ``blob_to_embedding`` decodes it.
+    embedding: Optional[bytes] = None
 
 
 class VectorStore(ABC):
