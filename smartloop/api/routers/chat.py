@@ -8,11 +8,13 @@ import os
 import re
 from pathlib import Path
 import threading
+import time
 import uuid
 
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator, List
 
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -29,6 +31,10 @@ from smartloop.api.model import (
     Usage,
 )
 from smartloop.api.services import ModelService, get_model_service, get_api_client
+# The same relevance criteria retrieval uses to decide a chunk is about the
+# user's question — reused below to decide a source is about the answer, so
+# the two ends of the citation contract agree on what "related" means.
+from smartloop.api.services.model_service import _MIN_BEST_DISTANCE
 from smartloop.constants import SYSTEM_PROMPT, display_model_name, resolve_current_date
 from smartloop.types import ModelCapability
 
@@ -352,6 +358,181 @@ class _AnswerEvidence:
         return bool(_figures(source) & self.figures)
 
 
+# ------------------------------------------------------------ semantic check
+
+# A citation is scored on the chunks it was retrieved for (``_chunks``), not on
+# its ``_extract`` — that is the whole document, because retrieval expands every
+# match to the complete file before building the prompt.  Scoring a whole
+# document credits almost anything: a long file covers enough ground that some
+# page of it looks related to any answer.  Chunks are the passages that made
+# the document a match in the first place, and each one already carries the
+# document reference the citation is built from.
+#
+# ``_extract`` stays as the fallback for citations built elsewhere (web
+# results, document fan-out) that carry no chunks.  Either way the text is
+# compared a window at a time and scored on its closest window, the shape
+# retrieval already uses: a document ranks on its best chunk, not on an average
+# over everything it contains.
+_WINDOW_CHARS = 1200
+_WINDOW_OVERLAP = 200
+
+# Ceiling on the windows taken from any one text.  Verification runs after the
+# answer has streamed, so its cost is latency the user waits through with the
+# response already on screen; a 200-page PDF must not turn that into a minute
+# of embedding.
+_MAX_WINDOWS = 8
+
+# Distance above which the answer is not about this source, and the margin
+# within which a source still counts against the closest one.  Both are
+# needed.  The ceiling alone is not a robust separator, and the margin alone
+# would punish an answer that drew evenly on several documents.
+#
+# The ceiling is retrieval's own quality floor — the same embedding model and
+# the same ``1 - cosine`` scale, so the number means the same thing.  Measured
+# on a camera question answered from three web sources with two unrelated fund
+# PDFs also retrieved:
+#
+#     0.123  newsshooter.com/…/hasselblad-x2d-ii-100c   used
+#     0.248  store-na.hasselblad.com/…/x2d-ii-100c      used
+#     0.354  uk.pcmag.com/…/hasselblad-x2d-ii-100c      used
+#     0.563  sp923.pdf                                  unrelated
+#     0.569  sp3184.pdf                                 unrelated
+#
+# The margin is *not* retrieval's.  It started as ``_DISTANCE_CUTOFF_MARGIN``
+# (0.15) on the reasoning that the two comparisons are the same shape, and the
+# run above shows they are not: at 0.15 the cutoff came out at 0.273 and threw
+# away the PCMag review of the exact camera the question was about.  Sources an
+# answer genuinely used spread wider than chunks matching a query do — a
+# paraphrased passage and a quoted figure are not equally close to the text
+# that came out.  0.30 spans that spread while still landing (0.423 here) well
+# clear of the unrelated documents.
+_CITATION_MAX_DISTANCE = _MIN_BEST_DISTANCE
+_CITATION_CUTOFF_MARGIN = 0.30
+
+
+def _windows(text: str) -> list:
+    """*text* split into overlapping windows the embedder can take whole.
+
+    Sampled evenly when a text yields more than ``_MAX_WINDOWS``, not
+    truncated to the first few: the passage an answer drew on is as likely to
+    be on the last page of a document as the first.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= _WINDOW_CHARS:
+        return [text]
+    step = _WINDOW_CHARS - _WINDOW_OVERLAP
+    starts = list(range(0, len(text) - _WINDOW_OVERLAP, step))
+    if len(starts) > _MAX_WINDOWS:
+        last = len(starts) - 1
+        starts = sorted({
+            starts[round(i * last / (_MAX_WINDOWS - 1))]
+            for i in range(_MAX_WINDOWS)
+        })
+    return [text[s:s + _WINDOW_CHARS] for s in starts]
+
+
+def _citation_sources(citation: dict) -> tuple:
+    """``(vectors, texts)`` — the passages this citation is judged on.
+
+    Split by what still costs something.  Retrieval carries each matched
+    chunk's vector out of the index in ``_vectors``, so most citations arrive
+    already encoded and contribute nothing to the encode batch.  Only the
+    leftovers — chunks whose vector is missing (the TF-IDF fallback path
+    stores none) and citations built outside retrieval that have an extract
+    but no chunks (web results, document fan-out) — come back as text.
+    """
+    from smartloop.db.embeddings import blob_to_embedding
+
+    chunks = citation.get("_chunks") or []
+    blobs = citation.get("_vectors") or []
+    vectors, texts = [], []
+    for i, chunk in enumerate(chunks):
+        blob = blobs[i] if i < len(blobs) else None
+        if blob:
+            vectors.append(blob_to_embedding(blob))
+        elif chunk and chunk.strip():
+            texts.extend(_windows(chunk))
+    if vectors or texts:
+        return vectors, texts
+    return [], _windows(citation.get("_extract") or "")
+
+
+def _lexical_sources(citation: dict) -> list:
+    """The source *text* for the fallback check, which cannot use vectors."""
+    chunks = [c for c in (citation.get("_chunks") or []) if c and c.strip()]
+    if chunks:
+        return chunks
+    extract = citation.get("_extract")
+    return [extract] if extract else []
+
+
+def _semantic_distances(citations: list, response: str, base_dir) -> list | None:
+    """Answer-to-source cosine distance per citation, closest passage wins.
+
+    ``None`` — for the whole batch or for an individual citation — means
+    "could not be judged", never "unrelated": the caller falls back to the
+    lexical check rather than dropping a source it failed to measure.
+
+    One :func:`encode_texts` call, and in the ordinary case it encodes only
+    the answer.  The source side was embedded when the documents were indexed
+    and read back a moment ago to rank this very search — re-encoding it here
+    would be paying twice for the same vectors, after the answer has already
+    streamed, which is latency the user watches.
+    """
+    from smartloop.db.embeddings import cosine_distances, encode_texts
+
+    answer_windows = _windows(response)
+    if not answer_windows:
+        return None
+
+    matrices: list = []   # per citation: the vectors to compare against
+    pending: list = []    # source text with no vector, queued for encoding
+    owners: list = []     # which citation each queued text belongs to
+    for i, citation in enumerate(citations):
+        vectors, texts = _citation_sources(citation)
+        matrices.append(list(vectors))
+        owners.extend([i] * len(texts))
+        pending.extend(texts)
+
+    encoded = encode_texts(answer_windows + pending, base_dir)
+    if encoded is None or len(encoded) != len(answer_windows) + len(pending):
+        # No embedding model on this install, or encoding failed.
+        return None
+
+    if pending:
+        # Everything here should have been encoded during generation; anything
+        # left is a source ``_prepare_citation_sources`` could not reach, and
+        # it is being paid for in the pause after the answer.
+        logger.info(
+            "[citations] Encoded %d source passage(s) after the answer",
+            len(pending),
+        )
+
+    answer_vectors = encoded[:len(answer_windows)]
+    for j, owner in enumerate(owners):
+        matrices[owner].append(encoded[len(answer_windows) + j])
+
+    dim = answer_vectors.shape[1]
+    out: list = []
+    for matrix in matrices:
+        # An index written by a different embedding model yields vectors the
+        # answer cannot be compared against.  ``active_embedding_identity``
+        # should have invalidated those already; if one survives, decline to
+        # judge that source rather than crash the response it belongs to.
+        matrix = [v for v in matrix if getattr(v, "shape", None) == (dim,)]
+        if not matrix:
+            out.append(None)
+            continue
+        source_vectors = np.stack(matrix)
+        out.append(min(
+            float(cosine_distances(a, source_vectors).min())
+            for a in answer_vectors
+        ))
+    return out
+
+
 def _citation_used(citation: dict, response: str) -> bool:
     """True when *response* actually drew on this citation's source.
 
@@ -360,20 +541,38 @@ def _citation_used(citation: dict, response: str) -> bool:
     document will surface it for any question, however unrelated.  Crediting a
     source the answer never used is worse than showing no source at all.
 
+    The lexical check only — the single-citation entry point, kept for callers
+    and tests that have no embedder to hand.  :func:`_verified_citations` is
+    the real path and compares in embedding space.
+
     Citations carrying no extract are always kept; absence of evidence is not
     evidence of misuse.
     """
     return _AnswerEvidence(response).drew_on(citation.get("_extract") or "")
 
 
-def _verified_citations(citations, response: str) -> list:
+def _verified_citations(citations, response: str, base_dir=None, embed=True) -> list:
     """Deduplicate by document and drop sources the answer never used.
 
     Computed, not asked.  A citation exists so a reader can trace a statement
-    back to the text it came from, which makes the question a mechanical one —
-    does any of this document's text appear in the answer? — and mechanical is
-    what it stays: string comparison over the finished response, no model call,
-    nothing for the user to wait through once the answer is on screen.
+    back to the text it came from, so the question is "is this answer about
+    the passages this document was retrieved for?" — the same question
+    retrieval already answers about a chunk and the user's prompt, asked in
+    the other direction.  It is answered the same way, with the same pieces:
+    :func:`~smartloop.db.embeddings.encode_texts` for the vectors,
+    :func:`~smartloop.db.embeddings.cosine_distances` for the comparison, and
+    ``_select_relevant_chunks``' own ceiling and margin for the cutoff.
+
+    Embeddings rather than string overlap because an answer is a rewrite of
+    its source, not a quotation of it.  Shared word runs miss a source the
+    answer paraphrased, translated, or summarised into a table, and the
+    fallbacks that covered for that — keep anything with no comparable text,
+    credit anything sharing a figure — kept sources on generous terms.
+
+    Which costs one encode of the answer and nothing else.  The source side is
+    already vectors: computed when each document was indexed, read back out of
+    the index to rank the search that produced these citations, and carried
+    here on ``_vectors``.  Nothing about the documents is recomputed.
 
     An LLM judge was tried here and removed.  It cost a model call per source
     after the answer had finished streaming, and it was wrong in the direction
@@ -381,15 +580,27 @@ def _verified_citations(citations, response: str) -> list:
     resume back on the answer as a source, overruling a text comparison that
     had correctly found nothing in common.
 
+    ``embed=False`` forces the lexical fallback.  That is for the interrupt
+    path, which runs while the client is being torn down: a stopped answer
+    still gets its sources checked, but with the free test rather than one
+    that loads a model to grade a response nobody waited for.
+
     Runs while a response is being finished, so it must not be able to fail:
     a bug in source checking should cost a citation, never the answer the user
     already saw streamed.  On error the sources are kept as-is, deduplicated.
     """
+    started = time.monotonic()
     try:
-        return _verify_citations(citations, response)
+        return _verify_citations(citations, response, base_dir, embed)
     except Exception:
         logger.exception("[citations] Verification failed — keeping all sources")
         return _dedupe_citations(citations)
+    finally:
+        # The one number to watch: this is wall-clock the user spends looking
+        # at a finished answer with no sources under it.
+        logger.info(
+            "[citations] Verified in %.2fs", time.monotonic() - started,
+        )
 
 
 def _dedupe_citations(citations) -> list:
@@ -406,8 +617,8 @@ def _dedupe_citations(citations) -> list:
     return out
 
 
-def _verify_citations(citations, response: str) -> list:
-    evidence = _AnswerEvidence(response)
+def _unique_citations(citations) -> list:
+    """One entry per document, private keys intact, retrieval order kept."""
     seen: set = set()
     out: list = []
     for c in citations or []:
@@ -415,15 +626,157 @@ def _verify_citations(citations, response: str) -> list:
         key = doc_id if doc_id is not None else c.get("document_name")
         if key in seen:
             continue
-        if not evidence.drew_on(c.get("_extract") or ""):
-            logger.info(
-                "[citations] Dropping %r — answer does not draw on it",
-                c.get("document_name"),
-            )
-            continue
         seen.add(key)
-        out.append({k: v for k, v in c.items() if not k.startswith("_")})
+        out.append(c)
     return out
+
+
+def _verify_citations(citations, response: str, base_dir=None, embed=True) -> list:
+    unique = _unique_citations(citations)
+    if not unique:
+        return []
+
+    distances = _semantic_distances(unique, response, base_dir) if embed else None
+
+    if distances is None:
+        # No embedder available, or the caller asked not to load one — fall
+        # back to the lexical evidence check so verification degrades to a
+        # weaker test rather than switching off.
+        logger.info("[citations] Scoring sources without embeddings")
+        evidence = _AnswerEvidence(response)
+        keep = []
+        for c in unique:
+            passages = _lexical_sources(c)
+            keep.append(not passages or any(evidence.drew_on(p) for p in passages))
+        distances = [None] * len(unique)
+        cutoff = _CITATION_MAX_DISTANCE
+    else:
+        # Retrieval's own selection criteria, applied to the finished answer:
+        # a hard ceiling, then a margin around the closest source.  The margin
+        # is what stops a handful of documents that merely cleared the ceiling
+        # riding along behind the one that actually produced the answer.
+        measured = [d for d in distances if d is not None]
+        cutoff = _CITATION_MAX_DISTANCE
+        if measured:
+            cutoff = min(cutoff, min(measured) + _CITATION_CUTOFF_MARGIN)
+        keep = [d is None or d <= cutoff for d in distances]
+
+    out: list = []
+    for citation, distance, kept in zip(unique, distances, keep):
+        # Logged for every source, kept or not: the two thresholds are the
+        # tunables here and these lines are what they should be tuned against.
+        logger.info(
+            "[citations] %r distance=%s cutoff=%.3f — %s",
+            citation.get("document_name"),
+            f"{distance:.3f}" if distance is not None else "n/a",
+            cutoff,
+            "keeping" if kept else "dropping, answer is not about it",
+        )
+        if kept:
+            out.append({k: v for k, v in citation.items() if not k.startswith("_")})
+    return out
+
+
+def _embedding_base_dir(model_service) -> str | None:
+    """Where the embedding model is cached — the workspace, as retrieval uses."""
+    workspace = getattr(getattr(model_service, "_model", None), "workspace", None)
+    return getattr(workspace, "workspace_dir", None)
+
+
+def _prepare_citation_sources(citations, model_service) -> None:
+    """Embed every source now, while the answer is still being generated.
+
+    Verification compares two things, and only one of them depends on the
+    answer.  The sources are known the moment retrieval returns — before the
+    first token — so waiting until the answer is finished to encode them puts
+    all of that work in the one place where the user is watching a spinner.
+
+    It is not a small amount of work.  Documents from the index arrive already
+    vectorised, but web results carry a whole fetched page and nothing else,
+    so three links are two dozen windows to encode; that was the bulk of the
+    pause this is here to remove.  Done alongside generation it overlaps with
+    tokens the user is reading, and verification is left with one encode of
+    the answer.
+
+    Normalises as it goes: every citation ends up as ``_chunks`` plus an
+    index-aligned ``_vectors``, whichever shape it arrived in.
+
+    Best effort throughout.  A failure here costs the pause it was meant to
+    avoid and nothing else — verification encodes whatever it finds missing,
+    and falls back to the lexical check if there is no model at all.
+    """
+    try:
+        from smartloop.db.embeddings import (
+            embedding_to_blob, encode_texts, warmup,
+        )
+
+        base_dir = _embedding_base_dir(model_service)
+        pending: list = []
+        slots: list = []
+        for citation in citations or []:
+            chunks = list(citation.get("_chunks") or [])
+            vectors = list(citation.get("_vectors") or [])
+            if not chunks:
+                # A citation built outside retrieval — a web page, a fan-out
+                # extract.  Window it once here so verification never has to.
+                chunks = _windows(citation.get("_extract") or "")
+                vectors = []
+            vectors += [None] * (len(chunks) - len(vectors))
+            citation["_chunks"] = chunks
+            citation["_vectors"] = vectors
+            for i, chunk in enumerate(chunks):
+                if vectors[i] is None:
+                    slots.append((citation, i))
+                    pending.append(chunk)
+
+        if not pending:
+            # Every source came out of the index with its vector.  Still load
+            # the model, since the answer has to go through it either way.
+            warmup(base_dir)
+            return
+
+        encoded = encode_texts(pending, base_dir)
+        if encoded is None:
+            return
+        for (citation, i), vector in zip(slots, encoded):
+            citation["_vectors"][i] = embedding_to_blob(vector)
+        logger.info(
+            "[citations] Pre-embedded %d source passage(s) during generation",
+            len(pending),
+        )
+    except Exception as e:
+        logger.warning("[citations] Source pre-embedding failed: %s", e)
+
+
+async def _verified_citations_async(
+    citations, response: str, model_service, prepared=None,
+) -> list:
+    """:func:`_verified_citations` off the event loop.
+
+    It runs the embedder now, and llama.cpp holds the GIL — on the loop thread
+    that would stall every other in-flight request until it returned.  The
+    default executor, not ``_executor``: that pool has a single worker, held
+    for the duration of a generation by the thread producing the stream.
+
+    *prepared* is the :func:`_prepare_citation_sources` task started when
+    generation began.  Waited on rather than raced: it is writing the very
+    ``_vectors`` this is about to read, and starting early would mean encoding
+    those sources a second time.  By this point the answer has finished, so it
+    has had the whole generation to run and normally completes immediately.
+    """
+    if prepared is not None:
+        try:
+            await prepared
+        except Exception:
+            pass  # already logged there; verification encodes what is missing
+
+    return await asyncio.get_event_loop().run_in_executor(
+        None,
+        _verified_citations,
+        citations,
+        response,
+        _embedding_base_dir(model_service),
+    )
 
 
 def _request_cwd(model_service) -> str | None:
@@ -1081,13 +1434,30 @@ async def stream_chunks(
         try:
             _stream_into_queue()
         finally:
-            # Frees the on-demand auxiliary models (vision + large agent) and
-            # the embedding model, leaving only the orchestrator resident
-            # between chats.  Never raises — unload_auxiliary_models swallows.
-            model_service.unload_auxiliary_models()
+            # Frees the on-demand auxiliary models (vision + large agent),
+            # leaving only the orchestrator resident between chats.  Never
+            # raises — unload_auxiliary_models swallows.
+            #
+            # The embedding model stays when there are sources to verify: this
+            # runs the moment generation ends, which is the moment before
+            # verification wants it.  Freeing it here would mean reloading the
+            # GGUF seconds later, three seconds of it, exactly where the user
+            # is waiting for citations.  The consumer frees it once it is done.
+            model_service.unload_auxiliary_models(include_embedding=not citations)
 
     # Start the sync stream in thread pool
     _executor.submit(run_sync_stream)
+
+    # Load the embedding model and encode the sources alongside generation
+    # rather than after it.  Verification cannot start until the answer is
+    # complete; nothing else about it has to wait.  Overlapped with the tokens
+    # the user is already reading this costs nothing, and it leaves the step
+    # after the answer with one encode instead of the whole job.
+    prepared_sources = None
+    if citations:
+        prepared_sources = loop.run_in_executor(
+            None, _prepare_citation_sources, citations, model_service,
+        )
 
     # Signal that streaming has started
     yield _status_event("streaming", "processing", "Generating response...")
@@ -1146,6 +1516,37 @@ async def stream_chunks(
                 )]
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
+
+        # The answer is complete, so the sources can finally be checked
+        # against it.  Announced as a step rather than done silently: this
+        # embeds the response, which takes long enough to notice, and it lands
+        # exactly where the user thinks the turn is over — text has stopped
+        # moving and the citations are not up yet.  An unexplained pause there
+        # reads as a hang; "Checking sources" reads as the last piece of work.
+        #
+        # Which is why it is here and not in the ``finally`` below, where it
+        # used to sit.  Announcing it means yielding around it, and that block
+        # also runs on client disconnect, where a yield raises "async
+        # generator ignored GeneratorExit" and takes the session write down
+        # with it.  Awaiting there is fine; yielding is not.
+        if citations and full_response_parts:
+            yield _status_event("citations", "processing", "Checking sources...")
+            verified_citations = await _verified_citations_async(
+                citations, "".join(full_response_parts), model_service,
+                prepared_sources,
+            )
+            # Verification held the last reference to the embedding model —
+            # the producer skipped it on the way out.  Free it now, without
+            # waiting: the citations event should not queue behind a GPU
+            # context teardown.  Safe to fire here because the warmup above
+            # cannot still be in flight; ``encode_texts`` just took the same
+            # load lock.
+            loop.run_in_executor(None, model_service.unload_embedding_model)
+            yield _status_event(
+                "citations", "completed",
+                f"{len(verified_citations)} source(s) cited" if verified_citations
+                else "No sources used",
+            )
     finally:
         # Signal cancellation so the background thread stops producing chunks
         cancelled.set()
@@ -1156,8 +1557,20 @@ async def stream_chunks(
             "[stream] Streaming finished — %d chunk(s), %d char(s), preview=%r",
             len(full_response_parts), len(full_response), full_response[:200],
         )
-        if citations and full_response:
-            verified_citations = _verified_citations(citations, full_response)
+        if verified_citations is None and citations and full_response:
+            # Only reached when the stream did not finish on its own.  The
+            # sources still get checked before being written to the session,
+            # but with the lexical test: loading an embedding model to grade
+            # an answer the user just stopped is work nobody is waiting for,
+            # on the one path that runs while the client is going away.
+            verified_citations = _verified_citations(
+                citations, full_response, embed=False,
+            )
+            # The producer left the embedding model loaded for a verification
+            # pass that is no longer going to happen — nothing else will free
+            # it.  Off-thread: this closes a llama.cpp context, and the
+            # interrupt path must not stall on that.
+            loop.run_in_executor(None, model_service.unload_embedding_model)
         if request.session_id and full_response:
             # Persist the same verified set the client is shown — never the raw
             # list, which still carries the private ``_extract`` payload.
@@ -1219,24 +1632,18 @@ async def stream_chunks(
         })
         yield f"data: {usage_payload}\n\n"
 
-    if citations:
-        # Deduplicate, then credit only the sources the answer actually used —
-        # passing the relevance filter means a document was *retrieved*, not
-        # that it informed the response.  Matching is on document content, not
-        # the filename: an earlier filename-based check dropped real sources
-        # whose names say nothing about their contents ("sp46.pdf" for a
-        # Vanguard fund).
-        unique_citations = (
-            verified_citations
-            if verified_citations is not None
-            else _verified_citations(citations, "".join(full_response_parts))
-        )
-        if unique_citations:
-            citations_payload = json.dumps({
-                "object": "chat.citations",
-                "citations": unique_citations,
-            })
-            yield f"data: {citations_payload}\n\n"
+    # The set checked during the "citations" step above — credit only the
+    # sources the answer actually used, since passing the relevance filter
+    # means a document was *retrieved*, not that it informed the response.
+    # Matching is on document content, not the filename: an earlier
+    # filename-based check dropped real sources whose names say nothing about
+    # their contents ("sp46.pdf" for a Vanguard fund).
+    if verified_citations:
+        citations_payload = json.dumps({
+            "object": "chat.citations",
+            "citations": verified_citations,
+        })
+        yield f"data: {citations_payload}\n\n"
 
     yield _status_event("streaming", "completed", "Response complete")
 
@@ -1398,6 +1805,16 @@ async def _complete_without_streaming(
         if request.session_id and last_user_msg:
             model_service.append_to_session(request.session_id, "user", last_user_msg)
 
+        # Embed the sources alongside generation — see the same call in
+        # stream_chunks.  The completion below runs on ``_executor``, a
+        # single-worker pool, so this goes to the default one or it would queue
+        # behind the very work it is meant to overlap with.
+        prepared_sources = None
+        if citations:
+            prepared_sources = loop.run_in_executor(
+                None, _prepare_citation_sources, citations, model_service,
+            )
+
         # Run sync completion in thread pool
         response_capability = ModelCapability.GENERAL if orchestrator_context else None
         response_text = await loop.run_in_executor(
@@ -1420,7 +1837,9 @@ async def _complete_without_streaming(
         # response — the two used to scan the same text independently.
         verified_citations = None
         if citations and response_text:
-            verified_citations = _verified_citations(citations, response_text)
+            verified_citations = await _verified_citations_async(
+                citations, response_text, model_service, prepared_sources,
+            )
 
         # Store assistant response in session history (after auto-write so the link is included)
         message_id = request.message_id or f"msg-{uuid.uuid4().hex[:8]}"
@@ -1442,17 +1861,11 @@ async def _complete_without_streaming(
         )
 
         citation_models = None
-        if citations:
-            unique_citations = (
-                verified_citations
-                if verified_citations is not None
-                else _verified_citations(citations, response_text)
-            )
-            if unique_citations:
-                citation_models = [
-                    Citation(document_id=c["document_id"], document_name=c.get("document_name"))
-                    for c in unique_citations
-                ]
+        if verified_citations:
+            citation_models = [
+                Citation(document_id=c["document_id"], document_name=c.get("document_name"))
+                for c in verified_citations
+            ]
 
         return ChatCompletionResponse(
             model=request.model,

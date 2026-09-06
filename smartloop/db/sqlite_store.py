@@ -19,6 +19,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from smartloop.db.embeddings import (
     blob_to_embedding,
+    cosine_distances,
     embedding_to_blob,
     encode_texts,
 )
@@ -399,15 +400,7 @@ class IndexStore(VectorStore):
         if not emb_matrix:
             return self._query_by_tfidf(rows, "", n_results, max_distance)
 
-        corpus_matrix = np.stack(emb_matrix)
-        # Normalise for cosine similarity
-        norms = np.linalg.norm(corpus_matrix, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1, norms)
-        corpus_matrix = corpus_matrix / norms
-
-        q = query_vec / (np.linalg.norm(query_vec) or 1)
-        similarities = corpus_matrix @ q
-        distances = 1.0 - similarities
+        distances = cosine_distances(query_vec, np.stack(emb_matrix))
 
         # Boost documents by the NUMBER of distinct query keywords they
         # contain so the document the user actually named ("Adam Hart") ranks
@@ -444,6 +437,10 @@ class IndexStore(VectorStore):
                     distance=dist,
                     metadata=meta,
                     source_content=row["content"],
+                    # Already in hand — ranking just used it.  Passing it on
+                    # costs a ``tobytes()`` and saves whoever needs to compare
+                    # this chunk again from re-encoding it.
+                    embedding=embedding_to_blob(emb_matrix[idx]),
                 )
             )
         return results
