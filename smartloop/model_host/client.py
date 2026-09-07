@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 _device_owner = False
 
 
+#: Whether this interpreter can speak AF_UNIX at all.  Feature-detected rather
+#: than guessed from the platform, which is what CPython's own ``socketpair``
+#: does — Windows builds simply do not define it.
+HAS_UNIX_SOCKETS = hasattr(socket, "AF_UNIX")
+
+
 def mark_device_owner() -> None:
     """Declare that this process owns the models, not a host elsewhere."""
     global _device_owner
@@ -242,6 +248,11 @@ class RemoteModelClient(ModelClient):
             return self._sock
         host, port = parse_address(self.address)
         if port is None:
+            if not HAS_UNIX_SOCKETS:
+                raise ModelHostError(
+                    f"{self.address} is a unix socket path, which this platform "
+                    "cannot open; the host should be listening on host:port"
+                )
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(self._timeout)
             sock.connect(host)
@@ -393,9 +404,9 @@ class ModelHostError(RuntimeError):
 def parse_address(address: str) -> tuple[str, Optional[int]]:
     """Split *address* into ``(path, None)`` or ``(host, port)``.
 
-    A unix socket path is the normal case.  ``host:port`` exists for Windows,
-    which has no ``AF_UNIX`` in this stdlib, and for debugging a host that is
-    not on the same filesystem.
+    A unix socket path is the normal case.  ``host:port`` is what Windows
+    gets — no ``AF_UNIX`` there — and is also useful for debugging a host that
+    is not on the same filesystem.
     """
     if address.startswith("unix://"):
         return address[len("unix://"):], None
@@ -418,14 +429,26 @@ MAX_UNIX_SOCKET_PATH = 103
 def default_socket_path(home_dir: str) -> str:
     """Where the model host listens when nothing says otherwise.
 
-    Normally ``<home>/model-host.sock``.  A long home overflows ``sun_path``
-    and the bind fails with "AF_UNIX path too long" — which is not exotic: the
-    macOS App Sandbox puts the home under
-    ``~/Library/Containers/<bundle id>/Data``, and a test tree can be deeper
-    still.  So the path is checked, and falls back first to a short name in the
-    system temp directory (keyed by the home, so two workspaces never share a
-    socket) and finally to loopback TCP, which has no length limit at all.
+    Normally ``<home>/model-host.sock`` — a filesystem object, so the OS
+    enforces who may connect.  Two things take that away:
+
+    * **No AF_UNIX at all.**  Windows builds of CPython do not define it, so
+      there is nothing to bind and the host listens on loopback TCP instead.
+    * **A home too deep for ``sun_path``.**  It is 104 bytes, and the macOS App
+      Sandbox puts the home under ``~/Library/Containers/<bundle id>/Data``.
+      A short name in the system temp directory, keyed by the home so two
+      workspaces never share one, usually fits; loopback is the last resort.
+
+    Loopback binds to 127.0.0.1, so nothing off-machine can reach it — but it
+    has no file permissions, so any local process may connect where a unix
+    socket would have said no.  That is the trade Windows makes today.
     """
+    if not HAS_UNIX_SOCKETS:
+        logger.info(
+            "[model-host] no AF_UNIX on this platform; listening on loopback",
+        )
+        return "127.0.0.1:0"
+
     path = os.path.join(home_dir, "model-host.sock")
     if len(path.encode("utf-8")) <= MAX_UNIX_SOCKET_PATH:
         return path

@@ -516,6 +516,69 @@ class TestConcurrency:
         assert sorted(results) == sorted(f"answer to q{n}" for n in range(6))
 
 
+class TestPlatformsWithoutUnixSockets:
+    """Windows has no ``AF_UNIX``; the host has to still be reachable there.
+
+    Feature-detected rather than guessed from ``sys.platform`` — which is what
+    CPython's own ``socketpair`` does, and it means a build without AF_UNIX is
+    handled wherever it turns up.
+    """
+
+    def test_the_default_address_becomes_loopback(self, monkeypatch):
+        from smartloop.model_host import client as client_mod
+
+        monkeypatch.setattr(client_mod, "HAS_UNIX_SOCKETS", False)
+
+        assert client_mod.default_socket_path("/home/x/.smartloop") == "127.0.0.1:0"
+
+    def test_loopback_binds_and_serves(self, device):
+        """The fallback has to actually work, not just be selected."""
+        server = ModelHost(device, "127.0.0.1:0")
+        server.start()
+        try:
+            assert parse_address(server.address)[1] > 0
+            client = RemoteModelClient(server.address, timeout=15)
+            try:
+                assert client.is_loaded() is True
+                assert list(client.stream("hi")) == ["Hello", ", ", "world"]
+            finally:
+                client.close()
+        finally:
+            server.stop()
+
+    def test_binding_a_path_without_af_unix_says_why(self, device, tmp_path):
+        from smartloop.model_host import host as host_mod
+
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(host_mod, "HAS_UNIX_SOCKETS", False)
+        try:
+            with pytest.raises(OSError, match="no AF_UNIX"):
+                ModelHost(device, str(tmp_path / "h.sock")).bind()
+        finally:
+            monkey.undo()
+
+    def test_connecting_to_a_path_without_af_unix_says_why(self, monkeypatch, tmp_path):
+        from smartloop.model_host import client as client_mod
+
+        monkeypatch.setattr(client_mod, "HAS_UNIX_SOCKETS", False)
+
+        client = client_mod.RemoteModelClient(str(tmp_path / "h.sock"), timeout=2)
+        with pytest.raises(ModelHostError, match="cannot open"):
+            client.is_loaded()
+
+    def test_the_stale_socket_sweep_is_skipped(self, monkeypatch, tmp_path):
+        """Nothing to unlink when the platform never made one."""
+        from smartloop.model_host import host as host_mod
+
+        monkeypatch.setattr(host_mod, "HAS_UNIX_SOCKETS", False)
+        leftover = tmp_path / "stale.sock"
+        leftover.write_text("")
+
+        host_mod._unlink_stale_socket(str(leftover))  # must not raise
+
+        assert leftover.exists()
+
+
 class TestTheSocketFile:
     def test_it_is_not_world_readable(self, host):
         assert os.stat(host.address).st_mode & 0o777 == 0o600

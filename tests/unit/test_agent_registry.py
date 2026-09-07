@@ -40,6 +40,42 @@ class TestLiveness:
         assert process_alive(pid) is False
 
 
+class TestLivenessDoesNotKillWhatItAsksAbout:
+    """``os.kill(pid, 0)`` is POSIX-only as a *question*.
+
+    On Windows ``os.kill`` maps anything but CTRL_C_EVENT / CTRL_BREAK_EVENT
+    onto TerminateProcess — so the conventional check would kill the agent
+    every time ``slp agent status`` asked whether it was running.
+    """
+
+    def test_it_does_not_signal_the_process(self, monkeypatch):
+        import smartloop.supervisor.registry as registry_mod
+
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("liveness must not go through os.kill")
+
+        monkeypatch.setattr(registry_mod.os, "kill", _forbidden)
+
+        assert process_alive(os.getpid()) is True
+        assert process_alive(4194305) is False
+
+    def test_a_zombie_does_not_count_as_alive(self):
+        """A child nobody waited on still answers signal 0 after it dies."""
+        import subprocess
+        import sys
+        import time
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        for _ in range(200):
+            if not process_alive(proc.pid):
+                break
+            time.sleep(0.05)
+        try:
+            assert process_alive(proc.pid) is False
+        finally:
+            proc.wait(timeout=10)
+
+
 class TestRecords:
     def test_it_knows_where_to_forward(self):
         assert _record(port=41234).base_url == "http://127.0.0.1:41234"

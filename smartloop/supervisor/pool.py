@@ -55,6 +55,13 @@ _BACKOFF_RESET_AFTER = 120.0
 DEFAULT_MEMORY_LIMIT_BYTES = 0
 
 
+def _detached_process_kwargs() -> dict:
+    """Popen arguments that put a child in its own process group."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
 class ChildStartError(RuntimeError):
     """A project agent could not be started, or never became healthy."""
 
@@ -123,7 +130,13 @@ class ProjectAgentPool:
         with self._lock:
             process = self._processes.get(project_id)
         if process is not None:
-            return record if process.poll() is None else None
+            # Both signals have to agree, because for a moment after a kill
+            # they disagree: the process can already be gone from the process
+            # table while ``waitpid`` has not yet reported it exited.  Trusting
+            # the handle alone leaves a window in which the supervisor forwards
+            # a request to a port with nothing behind it.
+            if process.poll() is not None:
+                return None
         return record if record.alive else None
 
     def ensure(self, project_id: str) -> AgentRecord:
@@ -159,7 +172,12 @@ class ProjectAgentPool:
                 # pipes unread would eventually block it on a full buffer.
                 stdout=None,
                 stderr=None,
-                start_new_session=True,
+                # Detach from our console/process group so a Ctrl-C in the
+                # terminal reaches the supervisor only — it then stops the
+                # children itself, in order, after the model host they use.
+                # subprocess ignores start_new_session on Windows, which needs
+                # the creation flag instead.
+                **_detached_process_kwargs(),
             )
         except OSError as exc:
             raise ChildStartError(
@@ -468,19 +486,24 @@ def _process_started_at(process: subprocess.Popen) -> float:
 
 
 def _signal_pid(pid: int, timeout: float) -> None:
-    """Terminate a process we did not spawn and therefore cannot ``wait`` on."""
+    """Terminate a process we did not spawn and therefore cannot ``wait`` on.
+
+    Through psutil, which spells "ask it to stop, then insist" portably.
+    ``signal.SIGKILL`` does not exist on Windows at all, and ``os.kill`` there
+    terminates on any signal — so the POSIX two-step written literally would
+    be an AttributeError on one platform and an immediate kill on the other.
+    """
     try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
+        import psutil
+
+        proc = psutil.Process(pid)
+    except Exception:
         return
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return
-        time.sleep(0.1)
     try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass

@@ -42,19 +42,34 @@ AGENT_PORT_FILE = "agent.port"
 def process_alive(pid: Optional[int]) -> bool:
     """Whether *pid* names a live process.
 
-    ``signal 0`` performs the permission and existence checks without
-    delivering anything.  A pid we are not allowed to signal still exists,
-    which is why ``PermissionError`` counts as alive.
+    Asked through psutil rather than the usual ``os.kill(pid, 0)``.  The
+    signal-0 trick is POSIX: on Windows ``os.kill`` maps every signal other
+    than ``CTRL_C_EVENT``/``CTRL_BREAK_EVENT`` onto ``TerminateProcess``, so
+    the conventional liveness check would *kill the process it is asking
+    about* — and this is called from ``slp agent status``.
+
+    A zombie does not count as alive.  On POSIX a child nobody has waited on
+    still answers signal 0 after it dies, and treating that as running would
+    have the supervisor keep forwarding requests to a port with nothing
+    behind it.  A process we may not inspect does count: ``AccessDenied``
+    means it is there, just not ours.
     """
     if not pid or pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-    except PermissionError:
+        import psutil
+
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except ImportError:  # pragma: no cover - psutil is a hard dependency
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
         return True
-    except OSError:
+    except Exception as exc:
+        if exc.__class__.__name__ == "AccessDenied":
+            return True
         return False
-    return True
 
 
 class AgentRecord:

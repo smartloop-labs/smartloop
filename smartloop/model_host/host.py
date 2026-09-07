@@ -24,7 +24,8 @@ from typing import Callable, Optional
 
 from smartloop.model_host import protocol
 from smartloop.model_host.client import (
-    InProcessModelClient, ModelClient, mark_device_owner, parse_address,
+    HAS_UNIX_SOCKETS, InProcessModelClient, ModelClient, mark_device_owner,
+    parse_address,
 )
 from smartloop.model_host.protocol import (
     CANCEL, CHUNK, RESULT, ConnectionClosed, ProtocolError,
@@ -69,6 +70,11 @@ class ModelHost:
     def bind(self) -> str:
         """Create the listening socket. Returns the address actually bound."""
         path, port = parse_address(self.address)
+        if port is None and not HAS_UNIX_SOCKETS:
+            raise OSError(
+                f"cannot listen on {path}: this platform has no AF_UNIX. "
+                "Give the host a host:port address instead."
+            )
         if port is None:
             # A socket file left by a crashed host would make bind() fail with
             # EADDRINUSE even though nothing is listening.
@@ -279,7 +285,7 @@ def _unlink_stale_socket(path: str) -> None:
     *live* host is never unlinked out from under its clients — the restart
     fails loudly instead, which is the correct outcome.
     """
-    if not os.path.exists(path):
+    if not HAS_UNIX_SOCKETS or not os.path.exists(path):
         return
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     probe.settimeout(0.5)
