@@ -214,6 +214,15 @@ class ModelRouter:
         in the product.  This label goes out on the progress SSE, so it is
         mapped back to the short name (``sl-mini``) before it is shown.
         """
+        # A handle to a model owned by another process reports its own label —
+        # there is no local GGUF here to read metadata from, and falling
+        # through would put "RemoteLLM" on the user's progress event.
+        # Must be a real string: ``getattr`` on a test double answers every
+        # attribute with a truthy mock, which would shadow the metadata path
+        # for every locally-loaded model.
+        explicit = getattr(llm, "model_label", None)
+        if isinstance(explicit, str) and explicit:
+            return explicit
         try:
             meta = llm.model.metadata
             name = display_model_label(meta.get("general.name", ""))

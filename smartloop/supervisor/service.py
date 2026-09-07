@@ -1,0 +1,264 @@
+"""The supervisor: one port, one workspace registry, a process per project.
+
+What it owns (Tier 1 in the RFC): the client-facing port, the workspace record,
+the model catalog and credentials, release polling and token refresh — and the
+children.  What it does not own is any project's state; that belongs to the
+child fixed to that project, which is the whole point of the split.
+
+This is the architecture, not a mode.  ``SLP_SUPERVISOR=0`` (or ``slp agent
+start --no-supervised``) still falls back to the single shared server, but that
+is a migration escape hatch to be removed once this has run in the field — not
+a second topology to keep working indefinitely.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from typing import Optional
+
+from smartloop.config import AppSettings
+from smartloop.supervisor.pool import ProjectAgentPool
+from smartloop.supervisor.registry import AgentRegistry
+
+logger = logging.getLogger(__name__)
+
+
+def _settings_now() -> AppSettings:
+    """Read the settings at the moment they are needed, not at import.
+
+    A module-level ``AppSettings()`` freezes the environment as it was when
+    this module was first imported, which makes the agent limits impossible to
+    set from a launcher — and, more to the point, is the same import-time
+    pinning the workspace paths had to shed for a child to be pointed at its
+    own home.
+    """
+    return AppSettings()
+
+
+#: Values of ``SLP_SUPERVISOR`` that turn supervision *off*.  Supervision is
+#: the default, so the environment variable is an opt-out.
+_DISABLED_VALUES = ("0", "false", "no", "off")
+
+
+def supervision_enabled() -> bool:
+    """Whether this process should supervise rather than serve projects itself.
+
+    On by default: a project's runaway index job, wedged MCP server or OOM
+    should cost that project and no other, and that is only true when each one
+    has its own process.  ``SLP_SUPERVISOR=0`` (or ``slp agent start
+    --no-supervised``) falls back to the single shared server.
+
+    A process pinned to a project is never a supervisor, whatever the
+    environment says.  Children inherit the environment, so with supervision
+    defaulted on this is what stops a child from trying to supervise itself and
+    spawning a grandchild for the project it already is.
+    """
+    from smartloop.workspace.context import pinned_project_id
+
+    if pinned_project_id() is not None:
+        return False
+    return (os.environ.get("SLP_SUPERVISOR", "").strip().lower()
+            not in _DISABLED_VALUES)
+
+
+def model_host_enabled() -> bool:
+    """Whether the supervisor should run a model host for its children.
+
+    On by default under supervision, because it is the thing that makes
+    per-project processes affordable: without it every child loads its own copy
+    of the weights into the same device.  ``SLP_MODEL_HOST_DISABLE=1`` opts out
+    for debugging a single child.
+    """
+    return (os.environ.get("SLP_MODEL_HOST_DISABLE", "").strip().lower()
+            not in ("1", "true", "yes"))
+
+
+class Supervisor:
+    """Owns the registry, the model host, and the pool of project agents."""
+
+    def __init__(self, home_dir: Optional[str] = None,
+                 idle_ttl: Optional[float] = None,
+                 memory_limit_mb: Optional[int] = None) -> None:
+        settings = _settings_now()
+        self.home_dir = home_dir or settings.home_dir
+        self.registry = AgentRegistry(self.home_dir).load()
+        self.idle_ttl = (settings.agent_idle_ttl_s if idle_ttl is None
+                         else idle_ttl)
+        self.memory_limit_bytes = int(
+            (settings.agent_memory_limit_mb if memory_limit_mb is None
+             else memory_limit_mb) * 1024 * 1024
+        )
+        self.model_host = None
+        self._model_host_thread: Optional[threading.Thread] = None
+        self.pool: Optional[ProjectAgentPool] = None
+
+    # -- project lookup -----------------------------------------------------
+
+    def project_dir_for(self, project_id: str) -> Optional[str]:
+        """Where a project's state lives, read fresh from the workspace record.
+
+        Deliberately not cached: a project created while the supervisor is
+        running must be routable without a restart, and the workspace record is
+        cheap to read now that it no longer carries every project's documents.
+        """
+        from smartloop.workspace import Workspace
+
+        workspace = Workspace.load()
+        if workspace is None:
+            return None
+        project = next(
+            (p for p in workspace.projects if p.id == project_id), None,
+        )
+        return project.project_dir if project else None
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def start(self, port: int) -> None:
+        """Bring up the model host and the pool, and record ourselves."""
+        self.registry.set_supervisor(os.getpid(), port)
+
+        address = self._start_model_host()
+        self.pool = ProjectAgentPool(
+            registry=self.registry,
+            project_dir_for=self.project_dir_for,
+            idle_ttl=self.idle_ttl,
+            model_host_address=address,
+            memory_limit_bytes=self.memory_limit_bytes,
+        )
+        self.pool.start_reaper()
+        adopted = [r.project_id for r in self.registry.live()]
+        if adopted:
+            logger.info("[supervisor] adopted running agents for %s",
+                        ", ".join(adopted))
+        logger.info("[supervisor] ready on port %d", port)
+
+    def _start_model_host(self) -> Optional[str]:
+        """Run the model host in this process, on a background thread.
+
+        In-process rather than a fourth process: the supervisor is already
+        long-lived and does no project work, so it is the natural home for the
+        device, and one less process is one less thing to supervise.  Children
+        reach it over the socket exactly as they would a separate host, so
+        splitting it out later changes nothing on their side.
+        """
+        if not model_host_enabled():
+            logger.info("[supervisor] model host disabled; children load their own")
+            self.registry.set_model_host(None, None)
+            return None
+
+        from smartloop.api.services import get_model_service
+        from smartloop.model_host.client import (
+            InProcessModelClient, default_socket_path,
+        )
+        from smartloop.model_host.host import ModelHost
+
+        address = (os.environ.get("SLP_MODEL_HOST") or "").strip() or \
+            default_socket_path(self.home_dir)
+        try:
+            host = ModelHost(InProcessModelClient(get_model_service()), address)
+            bound = host.start()
+        except OSError as exc:
+            # Losing the host is not fatal: children fall back to loading their
+            # own models, which is slower and heavier but still correct.
+            logger.warning("[supervisor] could not start the model host: %s", exc)
+            self.registry.set_model_host(None, None)
+            return None
+
+        self.model_host = host
+        self.registry.set_model_host(os.getpid(), bound)
+        return bound
+
+    def stop(self) -> None:
+        """Stop the children, then the host. Children first: they use it."""
+        if self.pool is not None:
+            self.pool.stop_reaper()
+            self.pool.stop_all()
+            self.pool = None
+        if self.model_host is not None:
+            self.model_host.stop()
+            self.model_host = None
+        self.registry.set_model_host(None, None)
+        logger.info("[supervisor] stopped")
+
+    # -- reporting ----------------------------------------------------------
+
+    def status(self) -> dict:
+        """What ``slp agent status`` reports: the whole tree, not one process."""
+        import psutil
+
+        agents = []
+        for record in self.registry.all():
+            entry = {
+                "project_id": record.project_id,
+                "pid": record.pid,
+                "port": record.port,
+                "alive": record.alive,
+                "idle_seconds": round(record.idle_seconds, 1),
+                "rss_bytes": _rss(record.pid, psutil),
+            }
+            agents.append(entry)
+
+        return {
+            "supervisor": {
+                **self.registry.supervisor,
+                "rss_bytes": _rss(self.registry.supervisor.get("pid"), psutil),
+            },
+            "model_host": self.registry.model_host,
+            "agents": agents,
+            "limits": {
+                "idle_ttl_seconds": self.idle_ttl,
+                "memory_limit_bytes": self.memory_limit_bytes or None,
+            },
+        }
+
+
+def _rss(pid: Optional[int], psutil) -> Optional[int]:
+    """Resident size of *pid*, or ``None`` when it cannot be read.
+
+    The number the RFC wants measured before deciding whether children are
+    lazily started or pre-warmed: a child carries FastAPI, the SQLite index and
+    the LangChain import graph even with no model in it.
+    """
+    if not pid:
+        return None
+    try:
+        return psutil.Process(pid).memory_info().rss
+    except Exception:
+        return None
+
+
+#: The process-wide supervisor, when this process is one.
+_supervisor: Optional[Supervisor] = None
+_supervisor_lock = threading.Lock()
+
+
+def get_supervisor() -> Optional[Supervisor]:
+    """The running supervisor, or ``None`` when it was explicitly disabled."""
+    return _supervisor
+
+
+def start_supervisor(port: int, idle_ttl: Optional[float] = None) -> Supervisor:
+    """Create and start the process-wide supervisor."""
+    global _supervisor
+    with _supervisor_lock:
+        if _supervisor is None:
+            _supervisor = Supervisor(idle_ttl=idle_ttl)
+            _supervisor.start(port)
+        return _supervisor
+
+
+def stop_supervisor() -> None:
+    """Stop and forget the process-wide supervisor."""
+    global _supervisor
+    with _supervisor_lock:
+        if _supervisor is not None:
+            _supervisor.stop()
+            _supervisor = None
+
+
+def get_pool() -> Optional[ProjectAgentPool]:
+    """The pool routing should use, or ``None`` when not supervising."""
+    supervisor = _supervisor
+    return supervisor.pool if supervisor is not None else None

@@ -35,6 +35,7 @@ from smartloop.parsers.parser_factory import BaseLLM, ParserFactory
 from smartloop.tasks.base_task import BaseTask, TaskResult, TaskStatus
 from smartloop.tasks.documents_manifest import DocumentsManifest
 from smartloop.workspace import Document, DocumentStatus, Workspace
+from smartloop.workspace.context import pinned_project_id, use_project
 
 
 class IndexerTask(BaseTask):
@@ -45,10 +46,16 @@ class IndexerTask(BaseTask):
         workspace: Workspace,
         logger: logging.Logger,
         progress_callback: Optional[Callable] = None,
+        project_id: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(name="indexer", logger=logger, auto=True, **kwargs)
         self.workspace = workspace
+        # The project this indexer serves.  A per-project agent child passes
+        # its own id, so its loop indexes that project whether or not it is
+        # the one the UI has selected; left unset (the single-process case)
+        # the task keeps following the selection, as it always has.
+        self.project_id = project_id or pinned_project_id()
         self.progress_callback = progress_callback
         self._loop_thread: Optional[threading.Thread] = None
         self._queue: queue.Queue[str] = queue.Queue()
@@ -165,8 +172,12 @@ class IndexerTask(BaseTask):
         self._set_status(TaskStatus.COMPLETED, "Event loop stopped")
 
     def _worker_run(self, doc_id: str) -> None:
+        # Bind the task's project for the whole pass, so anything the parser or
+        # model service resolves downstream agrees with the project this
+        # document actually belongs to.  A no-op when the task is unscoped.
         try:
-            self._process_document_by_id(doc_id)
+            with use_project(self.project_id):
+                self._process_document_by_id(doc_id)
         except Exception as e:
             self.logger.error(f"[Indexer] Worker error for {doc_id[:8]}: {e}")
         finally:
@@ -178,8 +189,7 @@ class IndexerTask(BaseTask):
     # ------------------------------------------------------------------
 
     def _process_document_by_id(self, doc_id: str) -> None:
-        self._refresh_workspace()
-        project = self.workspace.current_project
+        project = self._project()
         if not project:
             self.logger.warning("[Indexer] No active project — skipping document")
             return
@@ -392,8 +402,7 @@ class IndexerTask(BaseTask):
         that deletions from the folder are reflected in the vector store and
         workspace config.
         """
-        self._refresh_workspace()
-        project = self.workspace.current_project
+        project = self._project()
         if not project:
             return
 
@@ -516,8 +525,7 @@ class IndexerTask(BaseTask):
         store.  The underlying :class:`WorkspaceIndexer` is hash-incremental,
         so repeat passes only re-embed changed files.
         """
-        self._refresh_workspace()
-        project = self.workspace.current_project
+        project = self._project()
         if not project:
             return
 
@@ -578,8 +586,7 @@ class IndexerTask(BaseTask):
     def execute(self, **kwargs) -> TaskResult:
         """Batch fallback for TaskQueue.submit() compatibility."""
         try:
-            self._refresh_workspace()
-            project = self.workspace.current_project
+            project = self._project()
             if not project:
                 return TaskResult(success=False, error="No active project")
 
@@ -611,6 +618,21 @@ class IndexerTask(BaseTask):
     def _get_manifest(self, project) -> DocumentsManifest:
         manifest_path = Path(project.project_dir) / "documents.jsonl"
         return DocumentsManifest(manifest_path)
+
+    def _project(self):
+        """The project this pass indexes, refreshing the workspace first.
+
+        Scoped to :py:attr:`project_id` when the task owns one; otherwise it
+        follows the selected project, which is what a single shared process
+        has always done.
+        """
+        self._refresh_workspace()
+        if self.project_id:
+            return next(
+                (p for p in (self.workspace.projects or []) if p.id == self.project_id),
+                None,
+            )
+        return self.workspace.current_project
 
     def _refresh_workspace(self) -> None:
         current = Workspace.get_instance()

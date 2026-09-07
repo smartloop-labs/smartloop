@@ -1,4 +1,4 @@
-.PHONY: help venv install build run run-debug run-local test test-unit test-cov build-binary check-apple-symbols sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
+.PHONY: help venv install build run run-debug run-single run-debug-single run-local test test-unit test-cov build-binary check-apple-symbols sign notarize archive archive-zip publish-binary release-linux release-windows release clean clean-server clean-actions
 
 UNAME_S := $(shell uname -s)
 DIST_DIR := dist/slp
@@ -106,8 +106,10 @@ help:
 	@echo "  Development:"
 	@echo "  install         - Create venv and install Python requirements"
 	@echo "  build           - install + llama-cpp-python with GPU support + model downloads"
-	@echo "  run             - Start the API server with default INFO logging"
-	@echo "  run-debug       - Start the API server with LOG_LEVEL=DEBUG (verbose orchestrator/DAG/MCP logs)"
+	@echo "  run             - Start the agent (one process per project) with INFO logging"
+	@echo "  run-debug       - Same, with LOG_LEVEL=DEBUG (verbose orchestrator/DAG/MCP logs)"
+	@echo "  run-single      - Start with one shared process for every project"
+	@echo "  run-debug-single - run-single with LOG_LEVEL=DEBUG"
 	@echo "  run-local       - Start the agent against the local API (http://localhost:8888)"
 	@echo "  test            - Run slp --help and check llama-cpp GPU binding"
 	@echo "  clean           - Remove .venv, build artifacts, and caches"
@@ -160,6 +162,16 @@ run:
 
 run-debug:
 	LOG_LEVEL=DEBUG $(PYTHON) -m main agent start
+
+# `run` and `run-debug` are supervised: one process per project behind :38540,
+# sharing one model host.  Children inherit LOG_LEVEL and write to
+# <project_dir>/agent.log as well as this terminal, so the orchestrator trace
+# still shows up live.  These two fall back to the single shared process.
+run-single:
+	$(PYTHON) -m main agent start --no-supervised
+
+run-debug-single:
+	LOG_LEVEL=DEBUG $(PYTHON) -m main agent start --no-supervised
 
 run-local:
 	SLP_API_BASE=http://localhost:8888 $(PYTHON) -m main agent start

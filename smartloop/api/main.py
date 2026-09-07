@@ -18,14 +18,21 @@ import re as _re
 import time as _time
 
 from smartloop.api.config import api_settings
+from smartloop.api.middleware import ProjectScopeMiddleware
+from smartloop.supervisor.routing import ProjectRoutingMiddleware
+from smartloop.supervisor.service import (
+    get_pool, get_supervisor, start_supervisor, stop_supervisor,
+    supervision_enabled,
+)
 
 from smartloop.api.routers import auth_router, chat_router, documents_router, projects_router, assets_router, mcp_servers_router, mcp_catalog_router, models_router, init_router, skills_router, users_router, feedback_router, project_io_router, releases_router, web_search_router
 
 from smartloop.api.services import get_model_service, get_api_client
 from smartloop.config import AppSettings
 from smartloop.workspace import Workspace
+from smartloop.workspace.context import pinned_project_id
 from smartloop.utils.log_utils import print_logo
-from smartloop.workspace.migrations import migrate_project_state
+from smartloop.workspace.migrations import migrate_project_state, split_project_state
 from smartloop.platform.token_agent import run_token_refresh_loop
 from smartloop.platform.release_agent import run_release_poll_loop
 from smartloop import __version__
@@ -145,6 +152,16 @@ async def lifespan(app: FastAPI):
 
     workspace = Workspace.load()
 
+    # When supervising, this process owns the port, the workspace record and
+    # the model host — and spawns a child per project rather than serving
+    # projects itself.  Off unless SLP_SUPERVISOR says otherwise, so an
+    # existing install is the single server it has always been.
+    if supervision_enabled():
+        try:
+            start_supervisor(api_settings.api_port)
+        except Exception:
+            logger.exception("Supervisor failed to start; serving projects in-process")
+
     # Skills/documents moved from the user-space folder into project_dir so
     # they follow the framework's home (SLP_HOME, or the App Sandbox
     # container).  Fold in anything left at the old location.  Best-effort:
@@ -155,16 +172,42 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Project state migration failed; continuing startup")
 
+    # Break the single config.json into a workspace record plus one
+    # project.json per project, so a project's state is only ever written by
+    # whoever owns that project.  Idempotent, and the pre-split file is kept —
+    # see split_project_state for the rollback.  Best-effort for the same
+    # reason as above: a workspace that cannot be split still runs.
+    try:
+        split_project_state(workspace)
+    except Exception:
+        logger.exception("Project state split failed; continuing startup")
+
     if api_settings.debug_mode:
         logger.info("🔧 Debug mode enabled - will load base model with LoRA adapters")
 
-    token_refresh_task = asyncio.create_task(run_token_refresh_loop())
-    release_poll_task = asyncio.create_task(run_release_poll_loop())
+    # Credentials and releases are workspace-level, and belong to whoever owns
+    # the workspace.  A per-project agent skips them: N children polling the
+    # same release endpoint and refreshing the same token is N times the work
+    # for one answer, and they would race each other writing the credential
+    # store.  Whoever owns the workspace does it once.
+    workspace_owner = pinned_project_id() is None
+    token_refresh_task = (
+        asyncio.create_task(run_token_refresh_loop()) if workspace_owner else None
+    )
+    release_poll_task = (
+        asyncio.create_task(run_release_poll_loop()) if workspace_owner else None
+    )
 
     config_watcher_task = None
     model_service = get_model_service()
 
-    if workspace:
+    if workspace and not api_settings.preload_model:
+        # Declared since the API server was written and never consulted.  It
+        # earns its keep now: a per-project agent that reaches the device
+        # through a model host has no reason to load weights of its own, and
+        # bringing one up should not wait on (or trigger) a download.
+        logger.info("Model pre-load disabled (slp_api_preload_model=0)")
+    elif workspace:
         logger.info("Pre-loading model for current project...")
         try:
             model_service.load_model()
@@ -199,12 +242,19 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    token_refresh_task.cancel()
-    release_poll_task.cancel()
+    for task in (token_refresh_task, release_poll_task):
+        if task is not None:
+            task.cancel()
     if config_watcher_task and not config_watcher_task.done():
         config_watcher_task.cancel()
 
     logger.info("Shutting down Smartloop API server...")
+
+    # Children first: they are using the model host this also stops.
+    try:
+        stop_supervisor()
+    except Exception:
+        logger.exception("Supervisor shutdown failed; continuing")
 
     model_service.shutdown_tasks()
     model_service.unload_model()
@@ -230,6 +280,21 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+# add_middleware prepends, so these run outermost-last: the stack below ends up
+# CORS → project routing → project binding → routers.
+#
+# Bind each request to the project it addresses before anything resolves one.
+# Innermost of the three: only a request this process is actually going to
+# serve needs a binding.
+app.add_middleware(ProjectScopeMiddleware)
+
+# A project-scoped request is forwarded to the child that owns the project
+# instead of reaching this app's routers at all.  Inside CORS deliberately: a
+# preflight is answered here without a handler, and routing it would cold-start
+# a project agent to answer an OPTIONS.  Falls straight through when there is
+# no pool — in a child, and under the --no-supervised fallback.
+app.add_middleware(ProjectRoutingMiddleware, pool_provider=get_pool)
 
 # CORS middleware
 origins = api_settings.cors_origins.split(",") if api_settings.cors_origins != "*" else ["*"]
@@ -378,6 +443,25 @@ async def health_check():
     return result
 
 
+@app.get("/agents")
+async def agents():
+    """What is actually running: the supervisor, the model host, each project.
+
+    ``slp agent status`` used to describe one process, because there was one.
+    With a process per project the interesting questions are which projects are
+    resident, on which ports, and what each is costing in RSS — the number the
+    decision between lazy-starting and pre-warming children turns on.
+
+    A process running the ``--no-supervised`` fallback answers
+    ``supervised: false`` and nothing else; its single process is fully
+    described by ``/health``.
+    """
+    supervisor = get_supervisor()
+    if supervisor is None:
+        return {"supervised": False, "agents": []}
+    return {"supervised": True, **supervisor.status()}
+
+
 @app.get("/")
 async def root():
     """Root endpoint"""
@@ -463,6 +547,8 @@ def run_server():
         )
         server = _PortCapturingServer(config)
         server.run()
+    except KeyboardInterrupt:
+        logger.info("Interrupted — server stopped")
     finally:
         # Clean up PID and port files on exit
         try:
@@ -509,6 +595,15 @@ def start_server_foreground(host: str, port: int, service: bool = True) -> None:
                 config = uvicorn.Config(app, host=host, port=port, log_level="info", log_config=None)
                 server = _PortCapturingServer(config)
                 server.run()
+            except KeyboardInterrupt:
+                # Ctrl-C is someone stopping the agent, not a crash.  uvicorn
+                # has already run the lifespan shutdown by the time this
+                # arrives — so the children and the model host are down — and
+                # all that is left is to leave without a traceback, and
+                # certainly without the restart-with-backoff below treating a
+                # deliberate stop as something to recover from.
+                logger.info("Interrupted — agent stopped")
+                break
             except Exception:
                 if not service:
                     raise

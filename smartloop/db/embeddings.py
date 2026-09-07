@@ -47,6 +47,37 @@ def active_embedding_identity() -> str:
         return "llama-cpp:unknown"
 
 
+#: Connection to the model host, when one owns the embedder for this process.
+_remote = None
+_remote_lock = threading.Lock()
+
+
+def _remote_embedder():
+    """The model host to embed through, or ``None`` to embed locally.
+
+    BGE-M3 is ~417 MB.  Loading it in every per-project agent would multiply
+    that by the number of open projects for no benefit — the vectors are
+    identical whoever computes them — so a child hands the work to the process
+    that already holds the model.  The host itself always embeds locally: it
+    *is* the model, and delegating would be a call to itself.
+    """
+    global _remote
+
+    from smartloop.model_host.client import is_device_owner
+
+    address = (os.environ.get("SLP_MODEL_HOST") or "").strip()
+    if not address or is_device_owner():
+        return None
+    if _remote is not None and _remote.address == address:
+        return _remote
+    with _remote_lock:
+        if _remote is None or _remote.address != address:
+            from smartloop.model_host.client import RemoteModelClient
+
+            _remote = RemoteModelClient(address)
+    return _remote
+
+
 def _get_model(base_dir: Optional[str] = None):
     """Return the cached embedding model, loading on first call.
 
@@ -171,7 +202,13 @@ def _shutdown_embeddings() -> None:
 
 
 def warmup(base_dir: Optional[str] = None) -> None:
-    """Pre-load the embedding model so the first search doesn't pay the cost."""
+    """Pre-load the embedding model so the first search doesn't pay the cost.
+
+    A no-op when a model host owns the embedder: it is already warm there, and
+    loading a second copy here is the cost this avoids.
+    """
+    if _remote_embedder() is not None:
+        return
     _get_model(base_dir)
 
 
@@ -181,8 +218,19 @@ def encode_texts(
     """Encode *texts* into a dense embedding matrix.
 
     Returns an ``(N, dim)`` numpy array, or ``None`` when the model is
-    unavailable.
+    unavailable.  Routed to the model host when one owns the embedder, so every
+    project agent shares a single resident copy.
     """
+    remote = _remote_embedder()
+    if remote is not None:
+        try:
+            return remote.encode_texts(texts, base_dir=base_dir)
+        except Exception as exc:
+            # Same contract as a failed local load: callers fall back to
+            # TF-IDF rather than the child quietly loading its own model.
+            logger.warning("[embeddings] model host encoding failed: %s", exc)
+            return None
+
     model = _get_model(base_dir)
     if model is None:
         return None

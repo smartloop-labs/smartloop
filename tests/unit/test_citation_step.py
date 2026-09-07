@@ -26,6 +26,7 @@ from langchain_core.outputs import GenerationChunk
 
 from smartloop.api.model.chat import ChatCompletionRequest, ChatMessage
 from smartloop.api.routers.chat import stream_chunks
+from smartloop.model_host.client import InProcessModelClient
 
 DOC = "invoice-contoso.pdf"
 CHUNK = "Invoice from Contoso Ltd. to Jordan Rivera for contract work."
@@ -52,6 +53,10 @@ def _service(stream_completion, citations):
     svc.get_max_context_tokens.return_value = 4096
     svc.maybe_write_output.return_value = None
     svc._model.workspace.workspace_dir = "/tmp/ws"
+    # Chat generates through the model client, whose default implementation is
+    # the in-process one — so put the real client in front of the fake service
+    # and the test drives exactly the path production takes.
+    svc.model_client = InProcessModelClient(svc)
     return svc
 
 

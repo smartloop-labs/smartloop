@@ -351,9 +351,13 @@ class TestProvenanceSurvivesThePersistence:
         assert restored.tags == CATALOG_TAGS
         assert restored.description == CATALOG_DESC
 
-        # And the file itself, since a client reading config.json directly is
-        # what first showed the field going missing.
+        # And the file itself, since a client reading the persisted state
+        # directly is what first showed the field going missing.  Per-project
+        # state lives in the project's own directory now; config.json keeps a
+        # thin index that says where.
         with open(config_file) as fh:
-            raw = json.load(fh)
-        persisted = raw["workspace"]["projects"][0]["mcp_servers"][0]
+            index = json.load(fh)["workspace"]["projects"][0]
+        assert "mcp_servers" not in index  # the bulk stays out of config.json
+        with open(os.path.join(index["project_dir"], "project.json")) as fh:
+            persisted = json.load(fh)["project"]["mcp_servers"][0]
         assert persisted["catalog_slug"] == SLUG

@@ -131,11 +131,44 @@ def _select_relevant_chunks(chunks: list, label: str = "vector-search") -> list:
         )
     return kept
 
+
+class _ProjectCaches:
+    """The per-project store handles a request resolves against.
+
+    These used to be one slot each on :class:`ModelService`, implicitly keyed to
+    whichever project the ``current`` flag last named.  With the project bound
+    per request rather than per process, two concurrent chats hold two
+    different projects at once, and a single slot would have them evicting each
+    other's store on every turn — reopening SQLite each time, and in the window
+    between the check and the rebuild answering one project's query from the
+    other's index.  One slot per project removes the interleaving entirely.
+    """
+
+    __slots__ = (
+        "workspace_indexer", "feedback_indexer",
+        "mcp_document_indexer", "mcp_document_indexer_dir", "doc_store",
+    )
+
+    def __init__(self) -> None:
+        self.workspace_indexer: Optional[WorkspaceIndexer] = None
+        self.feedback_indexer: Optional[FeedbackIndexer] = None
+        self.mcp_document_indexer: Optional[MCPDocumentIndexer] = None
+        self.mcp_document_indexer_dir: Optional[str] = None
+        self.doc_store: Optional[object] = None
+
+
 class ModelService:
     """Singleton service to manage model lifecycle and inference"""
 
     _instance: Optional["ModelService"] = None
     _lock = threading.Lock()
+
+    # Class-level so they exist on an instance built with ``__new__`` alone —
+    # which several call sites and tests do — rather than blowing up the first
+    # time anything asks how this process reaches the model.  The service is a
+    # singleton, so one construction lock for the class is one per process.
+    _model_client = None
+    _model_client_lock = threading.Lock()
 
     def __new__(cls) -> "ModelService":
         if cls._instance is None:
@@ -185,13 +218,90 @@ class ModelService:
         self._sessions: dict[str, List[MessageInput]] = {}  # session_id -> chat history (in-memory cache)
         self._conversation_store = ConversationStore(_settings.home_dir)
         self._task_queue = TaskQueue(logger)
-        self._workspace_indexer: Optional[WorkspaceIndexer] = None
-        self._feedback_indexer: Optional[FeedbackIndexer] = None
-        self._mcp_document_indexer: Optional[MCPDocumentIndexer] = None
-        self._mcp_document_indexer_dir: Optional[str] = None
-        self._doc_store: Optional[Any] = None
-        self._doc_store_project_id: Optional[str] = None
+        # Store handles, one set per project (see :class:`_ProjectCaches`).
+        self._project_caches: Dict[str, _ProjectCaches] = {}
+        self._project_caches_lock = threading.Lock()
         self._initialized = True
+
+    # ------------------------------------------------------------ model client
+
+    @property
+    def model_client(self):
+        """How this process reaches the generative model.
+
+        In-process by default — the same ``stream_completion`` /
+        ``generate_completion`` calls, behind one interface — so the seam costs
+        a method call and nothing else.  When ``SLP_MODEL_HOST`` names a socket
+        the very same calls go to the process that owns the device instead,
+        which is what lets several per-project agents share one resident model
+        rather than each loading its own copy into the same VRAM.
+
+        Resolved once: the transport is a property of how this process was
+        started, and re-reading the environment per call would let it change
+        underneath an in-flight generation.
+        """
+        client = self._model_client
+        if client is None:
+            # Built on first use — importing the client pulls in the
+            # transport, which a process that never generates should not pay
+            # for.
+            from smartloop.model_host.client import get_model_client
+
+            with self._model_client_lock:
+                if self._model_client is None:
+                    # Set on the instance, shadowing the class default, so a
+                    # test that swaps one in does not leak into the next.
+                    self._model_client = get_model_client(self)
+                client = self._model_client
+        return client
+
+    def _remote_device(self):
+        """The model client when the weights live in another process, else ``None``.
+
+        In-process — the supervisor, and the ``--no-supervised`` fallback —
+        this is ``None`` and every path below behaves exactly as it always
+        has.  In a per-project agent it is the host, and the service builds
+        handles to it rather than loading a second copy of the weights into
+        the same device.
+        """
+        from smartloop.model_host.client import RemoteModelClient
+
+        client = self.model_client
+        return client if isinstance(client, RemoteModelClient) else None
+
+    def _remote_llm(self, capability: Optional[str] = None):
+        """A handle to the host's model for *capability*."""
+        from smartloop.model_host.remote_llm import RemoteLLM
+
+        return RemoteLLM(
+            self._remote_device(),
+            project_id=self.get_project_id() or "",
+            capability=capability,
+        )
+
+    # ------------------------------------------------------- per-project caches
+
+    def _caches(self, project_id: str) -> _ProjectCaches:
+        """Return (creating if needed) the cache slot for *project_id*."""
+        with self._project_caches_lock:
+            cache = self._project_caches.get(project_id)
+            if cache is None:
+                cache = _ProjectCaches()
+                self._project_caches[project_id] = cache
+            return cache
+
+    def _drop_caches(self, project_id: Optional[str] = None) -> None:
+        """Discard cached stores for *project_id*, or for every project.
+
+        Called when a project's on-disk state changes underneath the handles
+        (create, delete, UI switch), so the next read reopens rather than
+        querying an index that no longer describes the directory.
+        """
+        with self._project_caches_lock:
+            if project_id is None:
+                self._project_caches.clear()
+            else:
+                self._project_caches.pop(project_id, None)
 
     def get_session_history(self, session_id: str) -> List[MessageInput]:
         """Get chat history for a session, loading from disk on first access."""
@@ -408,6 +518,20 @@ class ModelService:
         if current_project:
             self._setup_project_tools(current_project)
 
+        if self._remote_device() is not None:
+            # The device is the model host's.  Every role the orchestrator
+            # asks for — main, decision, large, capability — becomes a handle
+            # to it; the host does the selection, because it is the only side
+            # that can see what fits.
+            self._llm = self._remote_llm()
+            self._decision_llm = None
+            self._model_name = target_model
+            logger.info(
+                "[load_model] using the model host for %s (project: %s)",
+                target_model, project_name,
+            )
+            return self._llm
+
         self._llm = self._model.get_instance()
         self._model_name = target_model
 
@@ -480,6 +604,9 @@ class ModelService:
             self._decision_model_name = None
 
     def _get_large_llm(self) -> Optional[BaseLLM]:
+        if self._remote_device() is not None:
+            return self._remote_llm(ModelCapability.SKILLS)
+
         """Return the large (agent) model, loading it lazily on first use.
 
         Loaded on demand — only when an agent task actually needs it — rather
@@ -757,6 +884,12 @@ class ModelService:
         ws_model = self._pinned_model(capability)
         if ws_model is None:
             return None
+        if self._remote_device() is not None:
+            # The pin says *which* model; putting it in memory is the host's
+            # business.  Loading the GGUF here would be a second copy of the
+            # weights in the same device — and a fit check made by a process
+            # that cannot see the device.
+            return self._remote_llm(capability)
         return self._load_workspace_llm(ws_model, "pinned")
 
     # Why the most recent capability model could not be loaded, as
@@ -998,6 +1131,12 @@ class ModelService:
         )
 
     def _get_llm_for_capability(self, capability: str) -> Optional[BaseLLM]:
+        if self._remote_device() is not None:
+            # The host owns model selection: it can see the device, and a
+            # child cannot, so "which model serves this capability" is not a
+            # question this side is able to answer.
+            return self._remote_llm(capability)
+
         """Return a loaded LLM matching the requested capability.
 
         When the user has selected exactly one model, that model is returned
@@ -1343,16 +1482,18 @@ class ModelService:
         """
         if self._model is None or not work_dir or not os.path.isdir(work_dir):
             return []
+        current_project = self._model.workspace.current_project
+        if not current_project:
+            return []
+        cache = self._caches(current_project.id)
         try:
-            if self._workspace_indexer is None:
-                current_project = self._model.workspace.current_project
-                if not current_project:
-                    return []
-                self._workspace_indexer = WorkspaceIndexer(
+            if cache.workspace_indexer is None:
+                cache.workspace_indexer = WorkspaceIndexer(
                     project_dir=current_project.project_dir,
                     logger=logger,
                     base_dir=self._model.workspace.workspace_dir,
                 )
+            indexer = cache.workspace_indexer
 
             # Same emphasis step as documents: resolve references / keywords
             # against history so follow-ups are grounded.
@@ -1361,33 +1502,34 @@ class ModelService:
                 search_query = self._build_history_search_query(query, conversation_history)
 
             recall = max(n_results, 20)
-            chunks = self._workspace_indexer.search(
+            chunks = indexer.search(
                 search_query, n_results=recall, max_distance=_RECALL_MAX_DISTANCE,
             )
             # Raw-query fallback, mirroring the document path.
             if not chunks and search_query != query:
-                chunks = self._workspace_indexer.search(
+                chunks = indexer.search(
                     query, n_results=recall, max_distance=_RECALL_MAX_DISTANCE,
                 )
             return _select_relevant_chunks(chunks, label="workspace-search")
         except Exception as e:
             logger.warning(f"[workspace-index] search_workspace failed: {e}")
-            self._workspace_indexer = None
+            cache.workspace_indexer = None
             return []
 
     # --------------------------------------------------------------- feedback
 
     def _ensure_feedback_indexer(self) -> FeedbackIndexer:
-        if self._feedback_indexer is None:
-            current_project = self._model.workspace.current_project
-            if not current_project:
-                raise ValueError("No active project")
-            self._feedback_indexer = FeedbackIndexer(
+        current_project = self._model.workspace.current_project
+        if not current_project:
+            raise ValueError("No active project")
+        cache = self._caches(current_project.id)
+        if cache.feedback_indexer is None:
+            cache.feedback_indexer = FeedbackIndexer(
                 project_dir=current_project.project_dir,
                 logger=logger,
                 base_dir=self._model.workspace.workspace_dir,
             )
-        return self._feedback_indexer
+        return cache.feedback_indexer
 
     def submit_feedback(self, session_id: str, message_id: str, project_id: str, rating: str) -> dict:
         self._ensure_model()
@@ -1541,7 +1683,9 @@ class ModelService:
             return kept[:n_results]
         except Exception as e:
             logger.warning(f"[feedback-index] search_feedback failed: {e}")
-            self._feedback_indexer = None
+            project = self._model.workspace.current_project
+            if project:
+                self._caches(project.id).feedback_indexer = None
             return []
 
     def build_model(self, model_name: Optional[str] = None, quantize: Optional[str] = None, developer_token: Optional[str] = None, progress_callback=None) -> None:
@@ -2179,12 +2323,12 @@ class ModelService:
 
             # Reuse a single store per project to avoid SQLite
             # lock conflicts with the background indexer.
-            if self._doc_store is None or self._doc_store_project_id != current_project.id:
-                self._doc_store = StoreFactory.create_store(
+            cache = self._caches(current_project.id)
+            if cache.doc_store is None:
+                cache.doc_store = StoreFactory.create_store(
                     current_project.project_dir, logger=logger, base_dir=workspace.workspace_dir
                 )
-                self._doc_store_project_id = current_project.id
-            store = self._doc_store
+            store = cache.doc_store
 
             search_query = query
             if conversation_history:
@@ -2499,6 +2643,14 @@ class ModelService:
         Returns 0 when no model is loaded so callers always get a safe
         integer back.
         """
+        remote = self._remote_device()
+        if remote is not None:
+            # A child has no tokenizer of its own; the host's is the only one
+            # that matches the model the prompt will actually be run on.
+            try:
+                return int(remote.count_tokens(text))
+            except Exception:
+                return 0
         if self._llm is None:
             return 0
         try:
@@ -2511,6 +2663,12 @@ class ModelService:
 
         Returns 0 when no model is loaded.
         """
+        remote = self._remote_device()
+        if remote is not None:
+            try:
+                return int(remote.max_context_tokens()) or DEFAULT_MAX_CONTEXT_TOKENS
+            except Exception:
+                return DEFAULT_MAX_CONTEXT_TOKENS
         if self._llm is None:
             return DEFAULT_MAX_CONTEXT_TOKENS
         try:
@@ -2538,7 +2696,23 @@ class ModelService:
             return DEFAULT_MAX_CONTEXT_TOKENS
 
     def is_loaded(self) -> bool:
-        """Check if a model is currently loaded"""
+        """Whether this service can serve a request right now.
+
+        With the device in another process, that is two questions and both
+        have to hold: the host must have weights, *and* this process must hold
+        a handle to them.  Answering with the host's half alone tells the
+        caller there is nothing to load — so ``load_model`` never runs here,
+        ``self._llm`` stays ``None``, and the orchestrator then finds no LLM
+        and silently bypasses itself into raw generation.
+        """
+        remote = self._remote_device()
+        if remote is not None:
+            if self._llm is None:
+                return False
+            try:
+                return bool(remote.is_loaded())
+            except Exception:
+                return False
         return self._llm is not None
 
     @staticmethod
@@ -2550,6 +2724,15 @@ class ModelService:
         mapped to the product's own (see ``display_model_label``) so logs and
         events name the model the user sees in the picker.
         """
+        # A handle to a model in another process carries the label its owner
+        # reports; there is no local GGUF to read metadata from, and falling
+        # through would put the class name on a user-facing status event.
+        # Must be a real string: ``getattr`` on a test double answers every
+        # attribute with a truthy mock, which would shadow the metadata path
+        # for every locally-loaded model.
+        explicit = getattr(llm, "model_label", None)
+        if isinstance(explicit, str) and explicit:
+            return explicit
         try:
             meta = llm.model.metadata
             name = display_model_label(meta.get("general.name", ""))
@@ -2559,6 +2742,22 @@ class ModelService:
         except Exception:
             pass
         return type(llm).__name__
+
+    def response_model_label(self, capability: Optional[str] = None) -> str:
+        """Name the model that will actually write the response.
+
+        Deliberately the *same* resolution the response itself goes through —
+        :meth:`_llm_for_response`, with its pinned-model, capability, large
+        fallback and default chain — and not a cheaper "what is resident right
+        now" approximation.  This label goes on the progress event a user
+        reads, so it has to name the model that answers; an approximation is
+        free to name a different one, which is worse than no label at all.
+
+        The selection is what the single-process server ran anyway, and it is
+        idempotent for a resident model, so asking it here costs nothing the
+        request was not about to spend.
+        """
+        return self._model_label(self._llm_for_response(capability))
 
     # What the user is told the response model is being resolved for.  The
     # capability does the routing; this is the label on the event.
@@ -3220,12 +3419,9 @@ class ModelService:
         self._model.save()
         logger.info(f"[create_project] State dir: {project.project_dir}")
 
-        # Reset cached indexers/stores so they get re-created for the new project
-        self._workspace_indexer = None
-        self._feedback_indexer = None
-        self._mcp_document_indexer = None
-        self._doc_store = None
-        self._doc_store_project_id = None
+        # Drop any slot left over from a project that reused this id, so the
+        # fresh directory is opened rather than a handle to the old one.
+        self._drop_caches(project_id)
 
         # Initialize the index store so the schema is ready before
         # the first query.
@@ -3349,22 +3545,25 @@ class ModelService:
         if was_current and workspace.projects:
             workspace.projects[0].current = True
 
-        # Reset cached indexers/stores since the project they pointed to may be gone
-        self._workspace_indexer = None
-        self._feedback_indexer = None
-        self._mcp_document_indexer = None
-        self._doc_store = None
-        self._doc_store_project_id = None
+        # Release the deleted project's store handles; its directory is gone.
+        self._drop_caches(project_id)
 
         self._model.save()
 
         return {"id": project_id, "deleted": True, "message": "Project deleted successfully"}
 
     def set_current_project(self, project_id: str) -> None:
-        """Switch the active project.
+        """Record which project the UI has selected.
 
-        All projects use the workspace's active model, so no model
-        switching is needed on project change.
+        This is no longer how a request chooses its project — that is bound
+        per request by :func:`~smartloop.workspace.context.use_project`, so
+        this call cannot move the project out from under a chat that is
+        already running.  What remains is the *selection*: the project a
+        client with no ``project_id`` gets, and the one ``slp agent status``
+        reports.
+
+        All projects use the workspace's active model, so no model switching
+        is needed on selection change.
         """
         self._ensure_model()
 
@@ -3373,22 +3572,17 @@ class ModelService:
         if target is None:
             raise ValueError(f"Project not found: {project_id}")
 
-        # Already active — skip the cache teardown and workspace save.  Clients
-        # re-POST /v1/models/load on unrelated setting changes (e.g. toggling
-        # web search), and dropping the indexer/doc-store caches there forces a
-        # needless re-open of the vector stores on the next query.
+        # Already selected — nothing to persist.  Clients re-POST
+        # /v1/models/load on unrelated setting changes (e.g. toggling web
+        # search), and this is on that path.
         if target.current:
             return
 
         for p in workspace.projects:
             p.current = (p.id == project_id)
 
-        # Reset cached indexers/stores so they get re-created for the new project
-        self._workspace_indexer = None
-        self._feedback_indexer = None
-        self._mcp_document_indexer = None
-        self._doc_store = None
-        self._doc_store_project_id = None
+        # Store handles are keyed by project, so a selection change no longer
+        # invalidates anything — the incoming project's slot is already right.
 
         self._model.save()
 
@@ -4233,18 +4427,19 @@ class ModelService:
     # ------------------------------------------------------ mcp content crawl
 
     def _ensure_mcp_document_indexer(self, project: "Project") -> MCPDocumentIndexer:
-        """Return the crawl indexer for *project*, rebuilding it on a switch."""
+        """Return the crawl indexer for *project*, rebuilding it if relocated."""
+        cache = self._caches(project.id)
         if (
-            self._mcp_document_indexer is None
-            or self._mcp_document_indexer_dir != project.project_dir
+            cache.mcp_document_indexer is None
+            or cache.mcp_document_indexer_dir != project.project_dir
         ):
-            self._mcp_document_indexer = MCPDocumentIndexer(
+            cache.mcp_document_indexer = MCPDocumentIndexer(
                 project_dir=project.project_dir,
                 logger=logger,
                 base_dir=self._model.workspace.workspace_dir,
             )
-            self._mcp_document_indexer_dir = project.project_dir
-        return self._mcp_document_indexer
+            cache.mcp_document_indexer_dir = project.project_dir
+        return cache.mcp_document_indexer
 
     def _crawl_mcp_server(
         self,
@@ -4559,7 +4754,9 @@ class ModelService:
             return _select_relevant_chunks(chunks, label="mcp-content-search")
         except Exception as e:
             logger.warning(f"[mcp-crawl] search_mcp_documents failed: {e}")
-            self._mcp_document_indexer = None
+            project = self._model.workspace.current_project
+            if project:
+                self._caches(project.id).mcp_document_indexer = None
             return []
 
     def _unindex_mcp_documents(self, project: "Project", server_id: str) -> None:
@@ -5011,6 +5208,16 @@ class ModelService:
             instead of running it through another LLM.
         """
         logger.info("[orchestrator] entered orchestrate: %r", user_message[:120])
+        # A missing handle is recoverable when the weights are the host's —
+        # building one is a constructor call, not a load.  Worth doing here
+        # rather than trusting every caller to have gone through load_model,
+        # because the alternative is this method quietly degrading to raw
+        # generation and taking skills, tools and planning with it.
+        if self._llm is None and self._remote_device() is not None:
+            self._llm = self._remote_llm()
+            self._model_name = self._model_name or api_settings.default_model
+            logger.info("[orchestrator] bound to the model host")
+
         if self._model is None or self._llm is None:
             logger.warning(
                 "[orchestrator] BYPASSED — model/llm not loaded "

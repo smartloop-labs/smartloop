@@ -15,7 +15,8 @@ already-resident shared model.  Concurrency comes from llama.cpp
 ``n_parallel`` continuous batching within that one instance instead.
 """
 import logging
-from concurrent.futures import ThreadPoolExecutor
+
+from smartloop.workspace.context import ProjectBoundExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,9 @@ class LLMExecutor:
     """
 
     def __init__(self, max_io_workers: int = 6):
-        self._io_pool = ThreadPoolExecutor(
+        # Project-bound: the searches and MCP calls dispatched here resolve
+        # against the requesting project (see smartloop.workspace.context).
+        self._io_pool = ProjectBoundExecutor(
             max_workers=max_io_workers, thread_name_prefix="io"
         )
 

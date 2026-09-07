@@ -137,10 +137,37 @@ def get_status(host: str, port: int) -> dict:
     except httpx.HTTPError:
         pass
 
+    # Under a supervisor there is a process per project rather than one server,
+    # so status is a tree: the supervisor, the model host, then a row per
+    # project.  Absent under the --no-supervised fallback, where /health
+    # already says everything there is to say.
+    try:
+        agents = httpx.get(f"{get_server_url(host, port)}/agents", timeout=5).json()
+        if agents.get("supervised"):
+            names = _project_names(host, port)
+            for agent in agents.get("agents", []):
+                agent["name"] = names.get(agent.get("project_id"))
+            result["supervised"] = True
+            result["supervisor"] = agents.get("supervisor", {})
+            result["model_host"] = agents.get("model_host", {})
+            result["agents"] = agents.get("agents", [])
+    except (httpx.HTTPError, ValueError):
+        pass
+
     return result
 
 
-def start_server(host: str, port: int, debug: bool = False, service: bool = True) -> None:
+def _project_names(host: str, port: int) -> dict:
+    """``{project_id: name}``, so the status table reads in project names."""
+    try:
+        data = httpx.get(f"{get_server_url(host, port)}/v1/projects", timeout=10).json()
+    except (httpx.HTTPError, ValueError):
+        return {}
+    return {p.get("id"): p.get("name") for p in data.get("projects", [])}
+
+
+def start_server(host: str, port: int, debug: bool = False, service: bool = True,
+                 supervised: bool = True) -> None:
     """Start the API server in the foreground (blocking).
 
     Args:
@@ -148,6 +175,13 @@ def start_server(host: str, port: int, debug: bool = False, service: bool = True
         port: Port to bind to (default: SLP_API_PORT env or 38540).
         debug: Enable debug mode (loads base model with LoRA adapters).
         service: Auto-restart on crash with exponential backoff.
+        supervised: Run a process per project behind this port, with the model
+            factored out into a host they share.  The default.  The client
+            contract is unchanged either way; what changes is the blast radius
+            of one project's runaway job.  Pass False for the single shared
+            server — one process, and one project's crash takes the rest down
+            with it.
     """
-  
+    os.environ["SLP_SUPERVISOR"] = "1" if supervised else "0"
+
     start_server_foreground(host, port, service=service)
