@@ -83,15 +83,22 @@ def start_listener(
     file_level="INFO",
     console_level="INFO",
     force_console: Optional[bool] = None,
+    log_path: Optional[str] = None,
 ) -> logging.handlers.QueueListener:
     """Start the listener that owns the real handlers.
 
-    Always adds a ``RotatingFileHandler`` writing to ``<home_dir>/server.log``.
+    Writes to a ``RotatingFileHandler`` at ``<home_dir>/server.log``, or at
+    *log_path* when one is given.  A per-project agent passes its own
+    ``<project_dir>/agent.log``: with a process per project, one shared log
+    would interleave every project's orchestration trace into a file where
+    working out which lines belong to the project you are debugging is the
+    hard part.  Separate files make that question disappear.
+
     Adds a stdout ``StreamHandler`` when running interactively (TTY and not a
     PyInstaller frozen build), unless ``force_console`` overrides the
     auto-detection.
     """
-    log_path = Path(home_dir) / "server.log"
+    log_path = Path(log_path) if log_path else Path(home_dir) / "server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter(DEFAULT_FORMAT)

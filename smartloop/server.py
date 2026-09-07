@@ -7,7 +7,6 @@ Provides start_server, stop_server, and get_status as importable functions:
 
 import logging
 import os
-import signal
 import time
 
 from pathlib import Path
@@ -16,6 +15,7 @@ import httpx
 
 from smartloop.config import AppSettings
 from smartloop.api import start_server_foreground
+from smartloop.supervisor.registry import process_alive
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +39,18 @@ def is_server_running(host: str, port: int) -> bool:
 
 
 def read_pid_file() -> int | None:
-    """Read PID from the pid file if it exists and the process is alive."""
+    """Read PID from the pid file if it exists and the process is alive.
+
+    Liveness goes through :func:`process_alive`, not ``os.kill(pid, 0)``: on
+    Windows ``os.kill`` terminates on any signal it is given, so the usual
+    check would kill the running agent every time someone asked for its status.
+    """
     try:
         if PID_FILE.exists():
             pid = int(PID_FILE.read_text().strip())
-            try:
-                os.kill(pid, 0)
+            if process_alive(pid):
                 return pid
-            except OSError:
-                PID_FILE.unlink(missing_ok=True)
+            PID_FILE.unlink(missing_ok=True)
     except (ValueError, IOError):
         pass
     return None
@@ -67,28 +70,23 @@ def stop_server() -> bool:
     pid = read_pid_file()
     if pid:
         try:
-            os.kill(pid, signal.SIGTERM)
+            # Ask, then insist — through psutil, because ``signal.SIGKILL``
+            # does not exist on Windows and ``os.kill`` there terminates on
+            # whatever signal it is handed.
+            import psutil
 
-            still_running = False
-            for _ in range(20):
-                try:
-                    os.kill(pid, 0)
-                    time.sleep(0.5)
-                    still_running = True
-                except OSError:
-                    still_running = False
-                    break
-
-            if still_running:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except psutil.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
             PID_FILE.unlink(missing_ok=True)
             logger.info("Server stopped (PID %d)", pid)
             return True
-        except OSError as e:
+        except Exception as e:
             logger.error("Could not stop server: %s", e)
             PID_FILE.unlink(missing_ok=True)
     else:
@@ -137,10 +135,37 @@ def get_status(host: str, port: int) -> dict:
     except httpx.HTTPError:
         pass
 
+    # Under a supervisor there is a process per project rather than one server,
+    # so status is a tree: the supervisor, the model host, then a row per
+    # project.  Absent under the --no-supervised fallback, where /health
+    # already says everything there is to say.
+    try:
+        agents = httpx.get(f"{get_server_url(host, port)}/agents", timeout=5).json()
+        if agents.get("supervised"):
+            names = _project_names(host, port)
+            for agent in agents.get("agents", []):
+                agent["name"] = names.get(agent.get("project_id"))
+            result["supervised"] = True
+            result["supervisor"] = agents.get("supervisor", {})
+            result["model_host"] = agents.get("model_host", {})
+            result["agents"] = agents.get("agents", [])
+    except (httpx.HTTPError, ValueError):
+        pass
+
     return result
 
 
-def start_server(host: str, port: int, debug: bool = False, service: bool = True) -> None:
+def _project_names(host: str, port: int) -> dict:
+    """``{project_id: name}``, so the status table reads in project names."""
+    try:
+        data = httpx.get(f"{get_server_url(host, port)}/v1/projects", timeout=10).json()
+    except (httpx.HTTPError, ValueError):
+        return {}
+    return {p.get("id"): p.get("name") for p in data.get("projects", [])}
+
+
+def start_server(host: str, port: int, debug: bool = False, service: bool = True,
+                 supervised: bool = True) -> None:
     """Start the API server in the foreground (blocking).
 
     Args:
@@ -148,6 +173,13 @@ def start_server(host: str, port: int, debug: bool = False, service: bool = True
         port: Port to bind to (default: SLP_API_PORT env or 38540).
         debug: Enable debug mode (loads base model with LoRA adapters).
         service: Auto-restart on crash with exponential backoff.
+        supervised: Run a process per project behind this port, with the model
+            factored out into a host they share.  The default.  The client
+            contract is unchanged either way; what changes is the blast radius
+            of one project's runaway job.  Pass False for the single shared
+            server — one process, and one project's crash takes the rest down
+            with it.
     """
-  
+    os.environ["SLP_SUPERVISOR"] = "1" if supervised else "0"
+
     start_server_foreground(host, port, service=service)

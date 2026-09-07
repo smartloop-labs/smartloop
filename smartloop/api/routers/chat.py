@@ -37,6 +37,7 @@ from smartloop.api.services import ModelService, get_model_service, get_api_clie
 from smartloop.api.services.model_service import _MIN_BEST_DISTANCE
 from smartloop.constants import SYSTEM_PROMPT, display_model_name, resolve_current_date
 from smartloop.types import ModelCapability
+from smartloop.workspace.context import bind, set_active_project
 
 
 logger = logging.getLogger(__name__)
@@ -779,6 +780,39 @@ async def _verified_citations_async(
     )
 
 
+def _bind_request_project(request, model_service) -> None:
+    """Bind this request to the project it named, for the rest of its life.
+
+    This replaces ``set_current_project`` as the way a chat chooses its
+    project.  The old call flipped a ``current`` flag shared by every request
+    in the process, so two chats on different projects raced: the second
+    moved the pointer while the first was still resolving documents, skills
+    and MCP servers through it, and the first then answered from the second's
+    project.
+
+    The binding lives in the request's own context instead, which FastAPI
+    gives each request and which anyio copies into the task that streams the
+    response — so concurrent chats hold different projects at the same time
+    and neither can move the other's.  Work handed to a thread pool has to
+    carry it explicitly; see :func:`~smartloop.workspace.context.bind`.
+
+    Nothing is reset: the context dies with the request's task.  Nor is the
+    ``current`` flag touched — a chat no longer changes which project the UI
+    has selected; ``/v1/models/load`` remains the one call that does.
+    """
+    if not request.project_id:
+        return
+    workspace = getattr(getattr(model_service, "_model", None), "workspace", None)
+    if workspace is not None and not any(
+        p.id == request.project_id for p in (workspace.projects or [])
+    ):
+        logger.warning(
+            "Project not found: %s, using current project", request.project_id
+        )
+        return
+    set_active_project(request.project_id)
+
+
 def _request_cwd(model_service) -> str | None:
     """The working directory for this request — always framework-level.
 
@@ -979,12 +1013,10 @@ async def stream_chunks(
     # id it was requested with.
     stream_model = display_model_name(request.model)
 
-    # Switch project if specified
-    if request.project_id:
-        try:
-            model_service.set_current_project(request.project_id)
-        except ValueError:
-            logger.warning(f"Project not found: {request.project_id}, using current project")
+    # Belt and braces: the endpoint binds the project before this generator is
+    # ever iterated, but stream_chunks is also driven directly by tests and by
+    # any future caller that skips the endpoint.
+    _bind_request_project(request, model_service)
 
     # Load the session's recent history ONCE and share it between the prompt
     # (prepended prior turns) and the orchestrator (search/planning context).
@@ -1063,9 +1095,12 @@ async def stream_chunks(
                 status_queue.put_nowait, _status_event(step, status, message)
             )
 
+        # ``bind`` carries this request's project into the worker: an executor
+        # hop does not copy the context, and everything the orchestrator
+        # resolves — documents, skills, MCP servers — hangs off it.
         orchestrate_future = loop.run_in_executor(
             None,
-            lambda: model_service.orchestrate(
+            bind(lambda: model_service.orchestrate(
                 last_user_msg, skills=project_skills, cwd=_request_cwd(model_service),
                 conversation_history=conversation_history,
                 has_attachments=has_attachments,
@@ -1074,7 +1109,7 @@ async def stream_chunks(
                 cancelled=cancelled,
                 requested_skill=requested_skill,
                 current_date=_request_current_date(request),
-            ),
+            )),
         )
 
         from smartloop.config.app_settings import AppSettings
@@ -1327,13 +1362,16 @@ async def stream_chunks(
         _ALNUM_STREAM_THRESHOLD = 20
 
         try:
-            for chunk in model_service.stream_completion(
-                prompt, request.model, cancelled=cancelled,
-                capability=response_capability,
+            # Through the model client rather than the service directly: the
+            # default implementation is the same in-process call, but a project
+            # agent configured with SLP_MODEL_HOST reaches the shared device
+            # owner here instead.  The client always yields plain text.
+            for text in model_service.model_client.stream(
+                prompt, request.model, capability=response_capability,
+                cancelled=cancelled,
             ):
                 if cancelled.is_set():
                     break
-                text = chunk.text if hasattr(chunk, 'text') else str(chunk)
                 if not text:
                     continue
                 collected.append(text)
@@ -1385,7 +1423,7 @@ async def stream_chunks(
                     f"Content:\n{_escape_role_tags(raw_content)}</user>"
                 )
                 try:
-                    retry = model_service.generate_completion(
+                    retry = model_service.model_client.generate(
                         simple_prompt, request.model,
                         capability=response_capability,
                     )
@@ -1445,8 +1483,9 @@ async def stream_chunks(
             # is waiting for citations.  The consumer frees it once it is done.
             model_service.unload_auxiliary_models(include_embedding=not citations)
 
-    # Start the sync stream in thread pool
-    _executor.submit(run_sync_stream)
+    # Start the sync stream in thread pool, carrying the request's project
+    # binding into the worker (see _bind_request_project).
+    _executor.submit(bind(run_sync_stream))
 
     # Load the embedding model and encode the sources alongside generation
     # rather than after it.  Verification cannot start until the answer is
@@ -1456,7 +1495,7 @@ async def stream_chunks(
     prepared_sources = None
     if citations:
         prepared_sources = loop.run_in_executor(
-            None, _prepare_citation_sources, citations, model_service,
+            None, bind(_prepare_citation_sources), citations, model_service,
         )
 
     # Signal that streaming has started
@@ -1671,6 +1710,11 @@ async def create_chat_completion(
     Supports both streaming and non-streaming modes.
     """
     try:
+        # Bind before anything resolves a project.  Set here rather than
+        # inside the streaming generator because this coroutine's context is
+        # the one anyio copies into the task that iterates the response.
+        _bind_request_project(request, model_service)
+
         if not model_service.is_loaded():
             logger.info("Model not loaded, attempting automatic reload...")
             try:
@@ -1709,12 +1753,9 @@ async def _complete_without_streaming(
 ):
     """The non-streaming half of ``create_chat_completion``."""
     try:
-        # Switch project if specified
-        if request.project_id:
-            try:
-                model_service.set_current_project(request.project_id)
-            except ValueError:
-                logger.warning(f"Project not found: {request.project_id}, using current project")
+        # See stream_chunks: the endpoint has already bound this, but the
+        # helper is also called directly.
+        _bind_request_project(request, model_service)
 
         if not model_service.is_loaded():
             logger.info("Model not loaded (non-streaming), attempting automatic reload...")
@@ -1757,12 +1798,12 @@ async def _complete_without_streaming(
         if last_user_msg:
             orchestrator_context, _, tool_error, citations, _, is_mutation = await loop.run_in_executor(
                 _executor,
-                lambda: model_service.orchestrate(
+                bind(lambda: model_service.orchestrate(
                     last_user_msg, skills=project_skills, cwd=_request_cwd(model_service),
                     conversation_history=conversation_history,
                     images=image_attachments,
                     current_date=_request_current_date(request),
-                ),
+                )),
             )
 
         if tool_error:
@@ -1812,16 +1853,16 @@ async def _complete_without_streaming(
         prepared_sources = None
         if citations:
             prepared_sources = loop.run_in_executor(
-                None, _prepare_citation_sources, citations, model_service,
+                None, bind(_prepare_citation_sources), citations, model_service,
             )
 
         # Run sync completion in thread pool
         response_capability = ModelCapability.GENERAL if orchestrator_context else None
         response_text = await loop.run_in_executor(
             _executor,
-            lambda: model_service.generate_completion(
+            bind(lambda: model_service.model_client.generate(
                 prompt, request.model, capability=response_capability,
-            ),
+            )),
         )
 
         # Auto file-write: if user asked to create/generate/write, save LLM response to file

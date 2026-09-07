@@ -7,10 +7,11 @@ in parallel via a shared ThreadPoolExecutor.
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from typing import Callable, Dict
 
 from smartloop.agents.nodes import DAG, LLMDecisionNode, NodeResult
+from smartloop.workspace.context import ProjectBoundExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,10 @@ class DAGExecutor:
     """
 
     def __init__(self, max_workers: int = 6):
-        self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="dag")
+        # Project-bound: nodes resolve documents, skills and MCP servers
+        # against the project of the request that scheduled them, and a plain
+        # pool would leave a worker on whichever project it last ran.
+        self._pool = ProjectBoundExecutor(max_workers=max_workers, thread_name_prefix="dag")
         self._llm_lock = threading.Lock()
 
     def _wrap_handler(self, node, handler: Callable) -> Callable:

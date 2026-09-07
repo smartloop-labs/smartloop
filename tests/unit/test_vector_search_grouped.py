@@ -7,6 +7,7 @@ exceptions are swallowed and turned into None, so a NameError there fails
 silently at runtime — these tests exercise the real code path with a
 mocked store to catch that class of bug.
 """
+import threading
 from unittest.mock import MagicMock, patch
 
 from smartloop.api.services.model_service import ModelService
@@ -16,8 +17,10 @@ from smartloop.db.store import ChunkResult
 def _service_with_store(store):
     """Build a bare ModelService wired to a fake project + store."""
     svc = ModelService.__new__(ModelService)
-    svc._doc_store = None
-    svc._doc_store_project_id = None
+    # Store handles are per project now, so the service needs the real slot
+    # machinery rather than a pair of bare attributes.
+    svc._project_caches = {}
+    svc._project_caches_lock = threading.Lock()
 
     project = MagicMock()
     project.id = "proj-1"

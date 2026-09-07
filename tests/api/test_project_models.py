@@ -82,6 +82,23 @@ def client(platform_service):
     app.dependency_overrides.pop(get_platform_service, None)
 
 
+
+def _saved_project(config_file: str, project_id: str) -> dict:
+    """A project's persisted record, read back from its own file.
+
+    Per-project state no longer lives in ``config.json`` — that keeps a thin
+    index, and each project owns a ``project.json`` in its own directory.  The
+    index is what says where, so this walks the same path a load does.
+    """
+    index = json.loads(pathlib.Path(config_file).read_text())["workspace"]["projects"]
+    entry = next(p for p in index if p["id"] == project_id)
+    state = pathlib.Path(entry["project_dir"]) / "project.json"
+    if not state.is_file():
+        # Nothing has saved this project yet — the index entry is all there is,
+        # which is itself the answer for a test asserting nothing was written.
+        return entry
+    return json.loads(state.read_text())["project"]
+
 class TestListProjectModels:
     def test_lists_models_with_workspace_defaults(self, isolated_workspace, client):
         resp = client.get("/v1/projects/p1/models")
@@ -255,9 +272,9 @@ class TestBootstrapModelIsNotConfigurablePerProject:
         bootstrap = AppSettings().default_model
         client.patch(f"/v1/projects/p1/models/{bootstrap}", json={"enabled": False})
 
-        saved = json.loads(pathlib.Path(isolated_workspace["config_file"]).read_text())
-        for project in saved["workspace"]["projects"]:
-            names = {m["model_name"] for m in project.get("model_settings", [])}
+        for project_id in ("p1", "p2"):
+            saved = _saved_project(isolated_workspace["config_file"], project_id)
+            names = {m["model_name"] for m in saved.get("model_settings", [])}
             assert bootstrap not in names
 
 
@@ -286,8 +303,7 @@ class TestEnablePromotesWorkspaceDefault:
 
         # p2 had no entry for the model before the enable; it must have gained an
         # explicit one, otherwise it would read through to the new default.
-        saved = json.loads(pathlib.Path(isolated_workspace["config_file"]).read_text())
-        p2_saved = next(p for p in saved["workspace"]["projects"] if p["id"] == "p2")
+        p2_saved = _saved_project(isolated_workspace["config_file"], "p2")
         entry = next(m for m in p2_saved["model_settings"] if m["model_name"] == "qwen2-vl-2b")
         assert entry["enabled"] is False
 

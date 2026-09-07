@@ -216,6 +216,27 @@ class AppSettings(BaseSettings):
         validation_alias="slp_mcp_idle_crawl_interval_s",
         description="Seconds between MCP content refreshes while the model is idle.",
     )
+    # --- per-project agent processes (see smartloop.supervisor) ------------
+    # How long a project agent may sit unused before the supervisor stops it,
+    # returning its baseline RSS.  A child carries FastAPI, the SQLite index
+    # and the LangChain import graph even with no model in it, so ten open
+    # projects is worth reclaiming.  0 keeps every started agent resident.
+    agent_idle_ttl_s: float = Field(
+        default=900.0,
+        validation_alias="slp_agent_idle_ttl_s",
+        description="Seconds a project agent may idle before it is stopped; 0 = never.",
+    )
+    # Resident-size ceiling for one project agent, in megabytes.  Separate
+    # processes contain a *crash*; a ceiling contains a leak, which would
+    # otherwise still take the machine down with it.  The offending child is
+    # stopped and restarts on its project's next request; the others never
+    # notice.  0 (default) = no ceiling.
+    agent_memory_limit_mb: int = Field(
+        default=0,
+        validation_alias="slp_agent_memory_limit_mb",
+        description="Per-project agent RSS ceiling in MB; 0 = no ceiling.",
+    )
+
     @model_validator(mode="after")
     def _resolve_defaults(self) -> "AppSettings":
         """Resolve defaults that depend on other fields."""

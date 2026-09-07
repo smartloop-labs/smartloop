@@ -6,6 +6,7 @@ document or one stored feedback Q&A silence it for every query.  Which of the
 collected sources actually answers the question is decided downstream.
 """
 
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -118,7 +119,9 @@ class TestFeedbackRelevanceFloor:
 
         svc = ModelService.__new__(ModelService)
         svc._model = MagicMock()
-        svc._feedback_indexer = indexer
+        svc._project_caches = {}
+        svc._project_caches_lock = threading.Lock()
+        svc._caches(svc._model.workspace.current_project.id).feedback_indexer = indexer
         return svc
 
     def _chunk(self, distance):

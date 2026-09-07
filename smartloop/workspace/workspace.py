@@ -15,9 +15,116 @@ from smartloop.config import ModelConfig, AppSettings
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name
 from smartloop.types import ModelCapability
+from smartloop.workspace.context import active_project_id, pinned_project_id
 from smartloop.workspace.types import Document, DocumentInfo, DocumentStatus, Skill
 
 _settings = AppSettings()
+logger = logging.getLogger(__name__)
+
+#: Filename of a project's own state, inside its ``project_dir``.
+PROJECT_STATE_FILE = "project.json"
+
+#: Schema version stamped into ``project.json``, so a future layout change can
+#: recognise what it is reading rather than guessing from the shape.
+PROJECT_STATE_VERSION = 1
+
+#: Fields ``config.json`` stays authoritative for even when ``project.json``
+#: also carries them.  Selection is a property of the workspace — which project
+#: the UI is looking at — not of any one project, and only the supervisor
+#: writes it.
+_WORKSPACE_OWNED_PROJECT_FIELDS = ("current",)
+
+#: The thin per-project record kept in ``config.json``.  Enough to list and
+#: route projects without opening any of them; everything else lives in the
+#: project's own file.
+_PROJECT_INDEX_FIELDS = (
+    "id", "name", "description", "project_dir", "current", "system",
+)
+
+
+def _home_dir() -> str:
+    """The framework home, resolved now rather than at import.
+
+    ``AppSettings`` is instantiated once at import, which pins ``SLP_HOME`` to
+    whatever it was then.  A per-project agent child is spawned with its own
+    environment, so the home has to be re-read at the moment it is needed.
+    """
+    home = os.environ.get("SLP_HOME")
+    return os.path.expanduser(home) if home else _settings.home_dir
+
+
+class _ConfigFilePath:
+    """``Workspace.config_file``, resolved on access instead of at import.
+
+    It used to be a plain ``ClassVar`` computed when this module was first
+    imported, which fixed the path for the life of the process and made it
+    impossible to point a child at a different home.  A non-data descriptor
+    keeps the same ``Workspace.config_file`` spelling at every call site —
+    and stays overridable by assignment, which the tests rely on.
+    """
+
+    def __get__(self, obj, owner=None) -> str:
+        override = os.environ.get("SLP_CONFIG_FILE")
+        if override:
+            return os.path.expanduser(override)
+        return os.path.join(_home_dir(), "config.json")
+
+
+def _legacy_layout() -> bool:
+    """True when the workspace should be kept as a single ``config.json``.
+
+    The rollback path for the split: set ``SLP_LEGACY_CONFIG=1`` and the
+    framework reads and writes the monolith again, ignoring any ``project.json``
+    already written beside it.  Nothing has to be undone by hand — the
+    pre-migration backup is still there, and the split files are simply not
+    consulted.
+    """
+    return os.environ.get("SLP_LEGACY_CONFIG", "").strip().lower() in ("1", "true", "yes")
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    """Write *data* to *path* so a reader sees the old file or the new one.
+
+    Same contract the workspace config has always had: write a sibling
+    temporary file, flush it to the platter, then rename over the target.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_file = f"{path}.tmp"
+    with open(tmp_file, "w") as fh:
+        json.dump(data, fh, indent=4)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_file, path)
+
+
+def project_state_path(project_dir: str) -> str:
+    """Where a project's own state lives."""
+    return os.path.join(project_dir, PROJECT_STATE_FILE)
+
+
+def read_project_state(project_dir: str) -> Optional[dict]:
+    """Return a project's persisted record, or ``None`` when there isn't one.
+
+    Never raises: a project whose file is missing, empty or corrupt falls back
+    to the thin record in ``config.json`` rather than failing the whole load
+    and taking every other project down with it.
+    """
+    path = project_state_path(project_dir)
+    try:
+        with open(path, "r") as fh:
+            content = fh.read().strip()
+    except OSError:
+        return None
+    if not content:
+        return None
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        logger.warning("[project-state] %s is not valid JSON; ignoring it", path)
+        return None
+    project = data.get("project") if isinstance(data, dict) else None
+    return project if isinstance(project, dict) else None
+
 
 def _is_mmproj_gguf(filename: str) -> bool:
     """True when a GGUF is a vision mmproj / CLIP projector (not main weights)."""
@@ -375,6 +482,38 @@ class Project (BaseModel):
             ))
         return result
 
+    # ------------------------------------------------------------- persistence
+
+    @property
+    def state_file(self) -> str:
+        """This project's own ``project.json``, inside its ``project_dir``."""
+        return project_state_path(self.project_dir)
+
+    def to_index(self) -> dict:
+        """The thin record ``config.json`` keeps for this project.
+
+        Enough to list projects and route a request to one without opening
+        any of them.  Documents, skills, MCP servers and model settings are
+        deliberately absent: they are the bulk of the old monolith, and the
+        reason two processes could not both hold a workspace.
+        """
+        dumped = self.model_dump(mode="json")
+        return {k: dumped[k] for k in _PROJECT_INDEX_FIELDS if k in dumped}
+
+    def save_state(self) -> None:
+        """Write this project's full record to its own directory.
+
+        The whole record, not just the fields ``config.json`` leaves out, so
+        the directory is self-describing: a ``project_dir`` can be copied to
+        another workspace and read back without the file it came from.
+        """
+        if not self.project_dir:
+            return
+        _atomic_write_json(self.state_file, {
+            "version": PROJECT_STATE_VERSION,
+            "project": self.model_dump(mode="json"),
+        })
+
     def model_build_dir(self) -> str:
         """Per-project directory where the built GGUF is written."""
         return os.path.join(self.project_dir, "model")
@@ -391,7 +530,8 @@ class Workspace(BaseModel):
     # Serializes save(): background tasks (document indexing, MCP provisioning
     # and the MCP content crawl) each persist from their own thread.
     _save_lock: ClassVar[threading.Lock] = threading.Lock()
-    config_file: ClassVar[str] = os.path.join(_settings.home_dir, "config.json")
+    #: Resolved on access, not at import — see :class:`_ConfigFilePath`.
+    config_file: ClassVar[Any] = _ConfigFilePath()
 
     id: str
     projects: List[Project] = []
@@ -817,35 +957,116 @@ class Workspace(BaseModel):
                     return os.path.join(model_dir, f)
         return exact
 
-    def save(self) -> None:
-        """Persist workspace state to config.json.
+    def _workspace_record(self, projects: List[dict]) -> dict:
+        """The ``config.json`` document, with *projects* as its project list."""
+        ws_data = self.model_dump(mode="json")
+        ws_data.pop("model_dir", None)
+        ws_data.pop("model_path", None)
+        ws_data.pop("current_project", None)
+        ws_data.pop("model_id", None)
+        ws_data["projects"] = projects
+        active = self.active_model
+        return {"id": active.model_id if active else "", "workspace": ws_data}
 
-        Serialized and atomic.  Several background tasks now write the
-        workspace from their own threads — document indexing, MCP provisioning,
-        the MCP content crawl — and two of them writing the same file directly
-        would interleave into a truncated or half-updated config.  The snapshot
-        is taken under the lock and swapped in with a rename, so a reader (or a
-        crash) sees either the old file or the new one.
+    def save(self) -> None:
+        """Persist workspace state, each project into its own file.
+
+        Serialized and atomic.  Several background tasks write the workspace
+        from their own threads — document indexing, MCP provisioning, the MCP
+        content crawl — and two of them writing the same file directly would
+        interleave into a truncated or half-updated config.  Every file is
+        snapshotted under the lock and swapped in with a rename, so a reader
+        (or a crash) sees either the old file or the new one.
+
+        The split matters for more than tidiness.  When every project lived in
+        one document, a save was a whole-workspace snapshot: two writers each
+        holding a full :class:`Workspace` would have the last one silently
+        discard the other project's newly indexed documents and MCP
+        registrations.  Now a project's own state is only ever written by
+        whoever owns that project.
+
+        What gets written depends on what this process owns:
+
+        * a per-project agent child (pinned, see
+          :func:`~smartloop.workspace.context.pin_project`) writes **only** its
+          own ``project.json`` — the workspace record belongs to the
+          supervisor, and a child writing it would clobber its siblings;
+        * an unpinned process — today's single server, the supervisor, the CLI
+          — writes the workspace record and every project's file.
+
+        ``SLP_LEGACY_CONFIG=1`` restores the single-document format; see
+        :func:`_legacy_layout`.
         """
         with self._save_lock:
-            ws_data = self.model_dump(mode="json")
-            ws_data.pop("model_dir", None)
-            ws_data.pop("model_path", None)
-            ws_data.pop("current_project", None)
-            ws_data.pop("model_id", None)
-            active = self.active_model
-            data = {"id": active.model_id if active else "", "workspace": ws_data}
-            tmp_file = f"{self.config_file}.tmp"
-            with open(tmp_file, "w") as f:
-                json.dump(data, f, indent=4)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_file, self.config_file)
-    
+            if _legacy_layout():
+                dumped = self.model_dump(mode="json")
+                _atomic_write_json(
+                    self.config_file, self._workspace_record(dumped.get("projects") or []),
+                )
+                return
+
+            pinned = pinned_project_id()
+            if pinned:
+                project = next((p for p in self.projects if p.id == pinned), None)
+                if project is not None:
+                    project.save_state()
+                else:
+                    logger.warning(
+                        "[workspace] pinned to project %s, which is not in this "
+                        "workspace — nothing saved", pinned,
+                    )
+                return
+
+            for project in self.projects or []:
+                project.save_state()
+            _atomic_write_json(
+                self.config_file,
+                self._workspace_record([p.to_index() for p in (self.projects or [])]),
+            )
+
+    @classmethod
+    def _hydrate_projects(cls, ws_data: dict) -> dict:
+        """Fold each project's own ``project.json`` into the workspace record.
+
+        Called on the raw document before validation, so a project is built
+        once from its complete state rather than being validated thin and
+        patched afterwards.  ``project_dir`` is derived here the same way
+        :meth:`_rebase_paths` derives it — from the current home, never from
+        what was persisted — because the file has to be found before the
+        project object that would tell us where it is exists.
+
+        A project with no file of its own (not yet migrated, or a workspace
+        still in the legacy layout) keeps whatever ``config.json`` holds for
+        it, so a half-migrated workspace still loads completely.
+        """
+        if _legacy_layout():
+            return ws_data
+
+        workspace_dir = os.path.join(_home_dir(), ws_data.get("id") or "")
+        hydrated: List[dict] = []
+        for entry in ws_data.get("projects") or []:
+            project_id = entry.get("id") if isinstance(entry, dict) else None
+            if not project_id:
+                hydrated.append(entry)
+                continue
+            state = read_project_state(os.path.join(workspace_dir, project_id))
+            if not state:
+                hydrated.append(entry)
+                continue
+            # The project's own file wins for its own state; the workspace
+            # record stays authoritative for the selection.
+            merged = {**entry, **state}
+            for field in _WORKSPACE_OWNED_PROJECT_FIELDS:
+                if field in entry:
+                    merged[field] = entry[field]
+            hydrated.append(merged)
+        ws_data["projects"] = hydrated
+        return ws_data
+
     @classmethod
     def _create_new_workspace(cls, config: ModelConfig) -> 'Workspace':
         workspace_id = str(uuid4())
-        workspace_dir = os.path.join(_settings.home_dir, workspace_id)
+        workspace_dir = os.path.join(_home_dir(), workspace_id)
         models_dir = os.path.join(workspace_dir, "models")
 
         os.makedirs(models_dir, exist_ok=True)
@@ -889,11 +1110,12 @@ class Workspace(BaseModel):
                 ws_data.pop("model_path", None)
                 ws_data.pop("current_project", None)
                 ws_data.pop("model_id", None)
+                ws_data = cls._hydrate_projects(ws_data)
 
                 workspace = Workspace.model_validate(ws_data)
 
                 # Re-resolve paths against current base_dir
-                workspace.workspace_dir = os.path.join(_settings.home_dir, workspace.id)
+                workspace.workspace_dir = os.path.join(_home_dir(), workspace.id)
                 workspace.models_dir = os.path.join(workspace.workspace_dir, "models")
                 cls._rebase_paths(workspace)
 
@@ -979,11 +1201,12 @@ class Workspace(BaseModel):
             ws_data.pop("model_path", None)
             ws_data.pop("current_project", None)
             ws_data.pop("model_id", None)
+            ws_data = cls._hydrate_projects(ws_data)
 
             workspace = Workspace.model_validate(ws_data)
 
             # Re-resolve paths against home_dir
-            workspace.workspace_dir = os.path.join(_settings.home_dir, workspace.id)
+            workspace.workspace_dir = os.path.join(_home_dir(), workspace.id)
             workspace.models_dir = os.path.join(workspace.workspace_dir, "models")
             cls._rebase_paths(workspace)
 
@@ -1018,7 +1241,30 @@ class Workspace(BaseModel):
     @computed_field(repr=False)
     @property
     def current_project(self) -> Optional['Project']:
-        """Get the current active project"""
+        """The project this unit of work belongs to.
+
+        Resolution is scoped before it is global.  A request that named a
+        ``project_id`` binds it for its own lifetime (and a per-project agent
+        child pins one for the whole process), so concurrent chats on different
+        projects each resolve their own — where previously both read a single
+        ``current`` flag that the later request had already moved.
+
+        The flag remains the fallback, and now means only "the project the UI
+        has selected": it answers for unbound callers such as the CLI, the
+        supervisor's own reads, and clients that send no ``project_id``.
+        """
+        bound_id = active_project_id()
+        if bound_id:
+            for project in self.projects:
+                if project.id == bound_id:
+                    return project
+            # Bound to a project this workspace doesn't have.  Falling back to
+            # the flag would silently answer for the wrong project, so say so —
+            # but don't raise: a stale binding must not take down the request.
+            logger.warning(
+                "[project-context] bound project %s is not in this workspace; "
+                "falling back to the selected project", bound_id,
+            )
         for project in self.projects:
             if project.current:
                 return project

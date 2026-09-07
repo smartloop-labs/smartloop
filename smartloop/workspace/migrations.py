@@ -1,5 +1,10 @@
 """One-time on-disk layout migrations, run at server startup.
 
+Two of them, both moving state to where the process that owns it can reach it:
+:func:`migrate_project_state` relocates skills and documents off a
+client-supplied path, and :func:`split_project_state` breaks the single
+``config.json`` into a workspace record plus one file per project.
+
 Skills and documents used to live under a *user-space* folder — ``project.cwd``,
 defaulting to ``~/smartloop/<name>``.  That path is client-supplied and absolute,
 so it does not follow the framework's home:
@@ -19,12 +24,17 @@ the framework.  This module moves anything left in the old location.
 import logging
 import os
 import shutil
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:  # pragma: no cover
     from smartloop.workspace.workspace import Project, Workspace
 
 logger = logging.getLogger(__name__)
+
+#: Copy of the single-document ``config.json`` taken before it is first split.
+#: The rollback path: restore this over ``config.json`` and set
+#: ``SLP_LEGACY_CONFIG=1``, and the workspace is exactly as it was.
+MONOLITH_BACKUP_SUFFIX = ".pre-split.bak"
 
 #: Subdirectories that moved from the user-space folder into ``project_dir``.
 _MIGRATED_SUBDIRS = ("skills", "documents")
@@ -117,3 +127,97 @@ def migrate_project_state(workspace: "Workspace") -> dict:
                         "y" if count == 1 else "ies", src, dest,
                     )
     return migrated
+
+
+# ---------------------------------------------------------------------------
+# config.json → workspace record + one project.json per project
+# ---------------------------------------------------------------------------
+
+
+def _needs_split(workspace: "Workspace") -> bool:
+    """True when at least one project has no state file of its own yet."""
+    from smartloop.workspace.workspace import project_state_path
+
+    for project in getattr(workspace, "projects", []) or []:
+        if not project.project_dir:
+            continue
+        if not os.path.isfile(project_state_path(project.project_dir)):
+            return True
+    return False
+
+
+def _backup_monolith(config_file: str) -> Optional[str]:
+    """Copy ``config.json`` aside before it is rewritten, once.
+
+    An existing backup is never overwritten: it is the pre-migration state,
+    and a second (already-split) copy on top of it would destroy the only
+    thing a rollback has to restore from.
+    """
+    if not os.path.isfile(config_file):
+        return None
+    backup = f"{config_file}{MONOLITH_BACKUP_SUFFIX}"
+    if os.path.exists(backup):
+        return backup
+    try:
+        shutil.copy2(config_file, backup)
+    except OSError as exc:
+        logger.warning("[migrate] Could not back up %s: %s", config_file, exc)
+        return None
+    logger.info("[migrate] Backed up the pre-split config to %s", backup)
+    return backup
+
+
+def split_project_state(workspace: "Workspace") -> dict:
+    """Move each project's own state out of ``config.json`` into its directory.
+
+    A workspace used to be one document holding every project.  That made a
+    save a whole-workspace snapshot, so two writers each holding a
+    :class:`Workspace` would have the last one silently discard the other
+    project's newly indexed documents and MCP registrations — the one thing
+    that had to be settled before two processes could run side by side.
+
+    Afterwards ``config.json`` keeps only workspace state (id, models,
+    models_dir) plus a thin project index, and each
+    ``<project_dir>/project.json`` holds that project's own record.
+
+    Idempotent, and safe to interrupt: the pre-split ``config.json`` is copied
+    aside first, every project file is written before the workspace record is
+    rewritten, and a project that already has a file is left alone.  Returns
+    ``{"migrated": [project ids], "backup": path or None}``.
+
+    To roll back, restore the backup over ``config.json`` and set
+    ``SLP_LEGACY_CONFIG=1``; the ``project.json`` files are then ignored
+    rather than having to be removed.
+    """
+    from smartloop.workspace.workspace import _legacy_layout
+
+    result: dict = {"migrated": [], "backup": None}
+    if workspace is None or _legacy_layout() or not _needs_split(workspace):
+        return result
+
+    result["backup"] = _backup_monolith(workspace.config_file)
+
+    for project in getattr(workspace, "projects", []) or []:
+        if not project.project_dir:
+            continue
+        try:
+            os.makedirs(project.project_dir, exist_ok=True)
+            project.save_state()
+        except OSError as exc:
+            logger.warning(
+                "[migrate] Could not write state for project %s: %s",
+                project.id, exc,
+            )
+            continue
+        result["migrated"].append(project.id)
+
+    # Only now is the monolith replaced by the thin record — every project's
+    # state is already on disk, so an interruption before this point leaves the
+    # old file intact and the next run simply redoes the write.
+    workspace.save()
+
+    logger.info(
+        "[migrate] Split config.json — %d project(s) now hold their own state",
+        len(result["migrated"]),
+    )
+    return result

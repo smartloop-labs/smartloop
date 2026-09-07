@@ -7,6 +7,8 @@ import os
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from smartloop.workspace.context import ProjectBoundExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -769,7 +771,9 @@ Does answering the latest message require a new web search?
         if not model_service:
             return ctx
 
-        pool = executor or ThreadPoolExecutor(max_workers=6)
+        # Project-bound: the fan-out searches below resolve against the
+        # requesting project (see smartloop.workspace.context).
+        pool = executor or ProjectBoundExecutor(max_workers=6)
         own_pool = executor is None
 
         try:
@@ -1207,7 +1211,7 @@ Does answering the latest message require a new web search?
         summaries_text = ""
 
         if need_fetch and need_collect:
-            pool = executor or ThreadPoolExecutor(max_workers=4)
+            pool = executor or ProjectBoundExecutor(max_workers=4)
             own_pool = executor is None
             try:
                 f_fetch = pool.submit(self.fetch_url, urls[0], mcp_servers)
