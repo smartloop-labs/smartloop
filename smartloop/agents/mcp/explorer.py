@@ -638,6 +638,16 @@ Does answering the latest message require a new web search?
                 "[collect] %s.%s returned %d chars",
                 getattr(server, "name", ""), tool_name, len(body),
             )
+            # The payload, not just its size.  A short answer here is the
+            # difference between "the tool found nothing", "the tool answered
+            # in prose that carries no record ids to follow up on" and "the
+            # follow-up plan missed" — three different bugs that a char count
+            # cannot tell apart, and the execute path has always logged its
+            # raw result for exactly this reason.
+            logger.info(
+                "[collect] %s.%s raw result: %s",
+                getattr(server, "name", ""), tool_name, body[:1000],
+            )
             return f"MCP TOOL ({getattr(server, 'name', '')}.{tool_name}):\n{body}"
         except Exception as e:
             if isinstance(e, _PROGRAMMING_ERRORS):
