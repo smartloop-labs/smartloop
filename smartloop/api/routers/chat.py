@@ -1366,9 +1366,14 @@ async def stream_chunks(
             # default implementation is the same in-process call, but a project
             # agent configured with SLP_MODEL_HOST reaches the shared device
             # owner here instead.  The client always yields plain text.
+            # The answer does not reason.  Reasoning is how a tool call is
+            # course-corrected into the right tool with the right arguments
+            # (see MCPAgent) — by the time the answer is written that decision
+            # is made and its results are in the context, so a <think> block
+            # here only withholds the stream while it is produced.
             for text in model_service.model_client.stream(
                 prompt, request.model, capability=response_capability,
-                cancelled=cancelled,
+                cancelled=cancelled, thinking=False,
             ):
                 if cancelled.is_set():
                     break
@@ -1425,7 +1430,7 @@ async def stream_chunks(
                 try:
                     retry = model_service.model_client.generate(
                         simple_prompt, request.model,
-                        capability=response_capability,
+                        capability=response_capability, thinking=False,
                     )
                 except Exception as e:
                     logger.error(f"[stream] Simplified retry failed: {e}")
@@ -1860,8 +1865,10 @@ async def _complete_without_streaming(
         response_capability = ModelCapability.GENERAL if orchestrator_context else None
         response_text = await loop.run_in_executor(
             _executor,
+            # No reasoning on the answer — see the streaming path above.
             bind(lambda: model_service.model_client.generate(
                 prompt, request.model, capability=response_capability,
+                thinking=False,
             )),
         )
 

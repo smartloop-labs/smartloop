@@ -100,6 +100,7 @@ class RemoteLLM(BaseLLM):
         # on the local LLM; here it travels to the host as a cancel frame.
         for text in self.client.stream(
             prompt, capability=self._capability, cancelled=self._cancelled,
+            thinking=kwargs.get("thinking"),
         ):
             if self._cancelled is not None and self._cancelled.is_set():
                 break

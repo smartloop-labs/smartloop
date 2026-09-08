@@ -41,7 +41,8 @@ class FakeDevice(ModelClient):
             raise self.fail_with
         return f"answer to {prompt}"
 
-    def stream(self, prompt, model_name=None, capability=None, cancelled=None):
+    def stream(self, prompt, model_name=None, capability=None, cancelled=None,
+               thinking=None):
         self.calls.append(("stream", prompt, model_name, capability))
         if self.fail_with:
             raise self.fail_with
@@ -228,7 +229,7 @@ class TestTheInProcessClient:
             return "done"
 
         def stream_completion(self, prompt, model_name=None, cancelled=None,
-                              capability=None):
+                              capability=None, thinking=None):
             self.calls.append(("stream_completion", prompt, model_name, capability))
 
             class _Chunk:

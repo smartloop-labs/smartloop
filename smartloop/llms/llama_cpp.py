@@ -375,15 +375,16 @@ class LlamaCpp(BaseLLM[Llama]):
             messages = self.create_messages_from_prompt(prompt)
             available_tokens = self._get_available_tokens(prompt)
 
-            stream = self.model.create_chat_completion(
-                messages=messages,
-                max_tokens=available_tokens,
-                temperature=self.temperature,
-                repeat_penalty=1.1,
-                frequency_penalty=0.0,
-                presence_penalty=0.0,
-                stream=True
-            )
+            with self._thinking_override(kwargs.get("thinking")):
+                stream = self.model.create_chat_completion(
+                    messages=messages,
+                    max_tokens=available_tokens,
+                    temperature=self.temperature,
+                    repeat_penalty=1.1,
+                    frequency_penalty=0.0,
+                    presence_penalty=0.0,
+                    stream=True
+                )
 
             chunk_count = 0
             start_time = time.time()

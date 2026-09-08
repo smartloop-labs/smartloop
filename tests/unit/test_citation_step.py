@@ -123,7 +123,8 @@ def _steps(events: list) -> list:
 
 async def _run(citations, answer=f"The invoice was for Jordan Rivera, {CHUNK}",
                session_id=None):
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text=answer)
 
     svc = _service(stream_completion, citations)
@@ -198,7 +199,8 @@ async def test_an_interrupt_writes_the_session_without_loading_the_embedder(_enc
     entered = threading.Event()
     release = threading.Event()
 
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text=f"The invoice was for Jordan Rivera, {CHUNK}")
         entered.set()
         release.wait(10)
@@ -265,7 +267,8 @@ async def test_an_interrupt_frees_the_embedder_nobody_will_use():
     entered = threading.Event()
     release = threading.Event()
 
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text=f"The invoice was for Jordan Rivera, {CHUNK}")
         entered.set()
         release.wait(10)
@@ -298,7 +301,8 @@ async def test_the_sources_are_embedded_while_the_answer_is_still_streaming():
         sources_done.set()
         return _fake_vectors(texts)
 
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text="The invoice ")
         sources_done.wait(10)      # the sources are being encoded right now
         yield GenerationChunk(text=f"was for Jordan Rivera, {CHUNK}")
@@ -363,7 +367,8 @@ async def test_an_interrupt_never_embeds_the_answer():
 
     answer = f"The invoice was for Jordan Rivera, {CHUNK}"
 
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text=answer)
         entered.set()
         release.wait(10)

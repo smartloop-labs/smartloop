@@ -255,6 +255,7 @@ class ModelHost:
                 args.get("model_name"),
                 capability=args.get("capability"),
                 cancelled=cancelled,
+                thinking=args.get("thinking"),
             ):
                 self._poll_for_cancel(conn, conn_id)
                 if cancelled.is_set():

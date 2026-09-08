@@ -88,7 +88,8 @@ class ModelClient(ABC):
     @abstractmethod
     def stream(self, prompt: str, model_name: Optional[str] = None,
                capability: Optional[str] = None,
-               cancelled: Optional[threading.Event] = None) -> Iterator[str]:
+               cancelled: Optional[threading.Event] = None,
+               thinking: Optional[bool] = None) -> Iterator[str]:
         """Complete *prompt*, yielding text as it is produced.
 
         *cancelled* is cooperative and observed between tokens — a native
@@ -192,9 +193,11 @@ class InProcessModelClient(ModelClient):
             max_tokens=max_tokens, thinking=thinking,
         )
 
-    def stream(self, prompt, model_name=None, capability=None, cancelled=None):
+    def stream(self, prompt, model_name=None, capability=None, cancelled=None,
+               thinking=None):
         for chunk in self._service.stream_completion(
             prompt, model_name, cancelled=cancelled, capability=capability,
+            thinking=thinking,
         ):
             # ``GenerationChunk`` in, plain text out — the wire carries text,
             # so the in-process path yields the same thing rather than making
@@ -368,10 +371,12 @@ class RemoteModelClient(ModelClient):
                           capability=capability, max_tokens=max_tokens,
                           thinking=thinking) or ""
 
-    def stream(self, prompt, model_name=None, capability=None, cancelled=None):
+    def stream(self, prompt, model_name=None, capability=None, cancelled=None,
+               thinking=None):
         stream = self._exchange(
             "stream",
-            {"prompt": prompt, "model_name": model_name, "capability": capability},
+            {"prompt": prompt, "model_name": model_name,
+             "capability": capability, "thinking": thinking},
             streaming=True,
             cancelled=cancelled,
         )

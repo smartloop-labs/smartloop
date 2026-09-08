@@ -2974,6 +2974,7 @@ class ModelService:
         model_name: Optional[str] = None,
         cancelled: Optional[threading.Event] = None,
         capability: Optional[str] = None,
+        thinking: Optional[bool] = None,
     ) -> Iterator[GenerationChunk]:
         """
         Stream completion from the LLM.
@@ -2989,6 +2990,8 @@ class ModelService:
                        abort inference early.  Checked between chunks.
             capability: When set, prefer the LLM matching this capability
                         over ``self._llm`` for the final response.
+            thinking: Force the reasoning block on/off for this generation.
+                      The answer passes False — see the chat router.
 
         Yields:
             GenerationChunk objects from the LLM
@@ -3008,7 +3011,7 @@ class ModelService:
             try:
                 # Propagate cancellation event so the LLM can stop mid-inference.
                 llm._cancelled = cancelled
-                for chunk in llm.stream(prompt):
+                for chunk in llm.stream(prompt, thinking=thinking):
                     if cancelled is not None and cancelled.is_set():
                         break
                     emitted += 1

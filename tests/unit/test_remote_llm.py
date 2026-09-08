@@ -38,7 +38,8 @@ class FakeClient:
             raise self.fail_with
         return f"answered {prompt}"
 
-    def stream(self, prompt, model_name=None, capability=None, cancelled=None):
+    def stream(self, prompt, model_name=None, capability=None, cancelled=None,
+               thinking=None):
         self.calls.append(("stream", prompt, capability))
         for chunk in self.chunks:
             if cancelled is not None and cancelled.is_set():

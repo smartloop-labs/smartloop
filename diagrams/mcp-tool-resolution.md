@@ -10,7 +10,9 @@ Four changes, drawn against the code that implements them:
    background walk.
 2. **One reasoned call.** Resolution picks the tool *and* fills its required
    arguments in a single pass, with `thinking=True` and an output budget big
-   enough for the reasoning block.
+   enough for the reasoning block — and the answer runs with `thinking=False`,
+   so the reasoning budget is spent on the decision rather than on the stream
+   the user is waiting for.
 3. **The call is shown.** The client sees which call was resolved and which
    went out, not just which model was selected.
 4. **Launchers belong to the server.** A definition file names `npx`, `python`
@@ -75,14 +77,18 @@ sequenceDiagram
     end
 ```
 
-**Why it always reasons.** `thinking` is a per-call argument now, carried from
-`MCPAgent` through `LlamaCpp.invoke` (which flips `_slp_thinking` for the
-duration of the call) or, when the weights live in the model host, over the
-wire to `ModelService.generate_completion`. The user's thinking setting governs
-the *visible answer*; this call's output is a JSON tool call whose monologue is
-stripped before anything reads it. The budget matters too:
-`_thinking_for_budget` suppresses the block under `THINKING_MIN_BUDGET` (512),
-so resolution asks for 1024, clamped to whatever context is left.
+**Why it always reasons — and why the answer never does.** Reasoning is how a
+tool call is course-corrected into the right tool with the right arguments, so
+it is spent here and nowhere else. `thinking` is a per-call argument: the
+resolve call passes `True`, the answer passes `False`, and both travel with the
+request — through `LlamaCpp.invoke`/`_stream`, which flip `_slp_thinking` for
+the duration of one call and restore it, or over the wire to the model host
+when the weights live there. A `<think>` block on the answer would buy nothing
+(the decision is already made and its results are in the context) and cost the
+whole stream, because the filter withholds every token of a thought the reader
+never sees. The budget matters too: `_thinking_for_budget` suppresses the block
+under `THINKING_MIN_BUDGET` (512), so resolution asks for 1024, clamped to
+whatever context is left.
 
 **Which model.** `ModelRouter.reasoning_llm` routes the resolve node to a model
 declaring `ModelCapability.THINKING` when the workspace has one enabled — best
@@ -179,6 +185,7 @@ registration.
 | Reply parsed as number / name / bare digit | `mcp_agent.py` `_parse` | `…::TestParsingWhatModelsActuallyEmit` |
 | Fabricated + echoed values dropped | `mcp_agent.py` `_clean_arguments` | `…::TestArgumentsAreCleaned` |
 | The call asks for thinking + room to think | `mcp_agent.py` `resolve` | `…::TestReasoningGetsRoomToThink` |
+| Only the tool call reasons; the answer does not | `chat.py`, `llama_cpp.py` `_thinking_override` | `test_thinking_is_for_the_tool_call.py` |
 | Thinking travels to the model host | `remote_llm.py`, `model_host/client.py` | `test_remote_llm.py` |
 | A thinking-capable model runs resolution | `model_router.py` `reasoning_llm` | — (routing, exercised in `pipeline_builder`) |
 | Resolution's arguments are used as returned | `step_executor.py` | `test_mcp_resolution_fills_arguments.py` |
