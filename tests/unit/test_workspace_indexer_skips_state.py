@@ -13,6 +13,7 @@ import threading
 from unittest.mock import MagicMock
 
 from smartloop.db.workspace_indexer import WorkspaceIndexer, _MANIFEST_FILENAME
+from smartloop.workspace.workspace import PROJECT_STATE_FILE
 
 
 def _indexer(project_dir):
@@ -81,3 +82,63 @@ class TestStateFilesAreNotContent:
             idx = _indexer(td)
             idx.index(td)
             assert set(idx._manifest) == {os.path.join("src", "db", "schema.sql")}
+
+    def test_the_project_state_file_is_not_indexed(self):
+        # ``project.json`` is the same mistake as the manifest without the
+        # leading dot: the project's own record, rewritten every turn, so
+        # indexing it re-embedded a megabyte of bookkeeping on every scan.
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, PROJECT_STATE_FILE), "w") as fh:
+                json.dump({"project": {"id": "p1", "documents": []}}, fh)
+            with open(os.path.join(td, "notes.md"), "w") as fh:
+                fh.write("real content")
+
+            idx = _indexer(td)
+            idx.index(td)
+            assert set(idx._manifest) == {"notes.md"}
+
+    def test_rewriting_the_state_file_leaves_the_index_alone(self):
+        # The loop as the user felt it: every turn rewrites project.json, so
+        # every scan used to delete and re-embed all of it.
+        with tempfile.TemporaryDirectory() as td:
+            state = os.path.join(td, PROJECT_STATE_FILE)
+            with open(state, "w") as fh:
+                json.dump({"project": {"sessions": []}}, fh)
+            with open(os.path.join(td, "notes.md"), "w") as fh:
+                fh.write("real content")
+
+            idx = _indexer(td)
+            idx.index(td)
+            with open(state, "w") as fh:
+                json.dump({"project": {"sessions": ["a", "b", "c"]}}, fh)
+            second = idx.index(td)
+
+            assert second["indexed"] == 0
+            assert second["removed"] == 0
+
+    def test_a_state_file_deeper_in_the_tree_is_still_indexed(self):
+        # Only the scan root's copy is ours — a project that happens to keep a
+        # project.json of its own under src/ keeps it.
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "src"))
+            nested = os.path.join(td, "src", PROJECT_STATE_FILE)
+            with open(nested, "w") as fh:
+                json.dump({"name": "someone else's file"}, fh)
+            idx = _indexer(td)
+            idx.index(td)
+            assert set(idx._manifest) == {os.path.join("src", PROJECT_STATE_FILE)}
+
+    def test_an_already_indexed_state_file_is_removed_from_the_store(self):
+        # Existing installs have it in the store and the manifest; the first
+        # pass after the fix has to clean up rather than orphan 567 chunks.
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, PROJECT_STATE_FILE), "w") as fh:
+                json.dump({"project": {}}, fh)
+            idx = _indexer(td)
+            idx._manifest = {PROJECT_STATE_FILE: "whatever-it-hashed-to"}
+
+            stats = idx.index(td)
+
+            assert stats["removed"] == 1
+            assert idx._manifest == {}
+            idx._store.delete_document.assert_called_once()

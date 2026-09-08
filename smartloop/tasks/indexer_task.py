@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from smartloop.db import StoreFactory
+from smartloop.db.embeddings import device_idle_seconds
 from smartloop.db.workspace_indexer import WorkspaceIndexer
 from smartloop.utils import DocumentSplitter, normalize_path, json_to_table
 from smartloop.parsers.parser_factory import BaseLLM, ParserFactory
@@ -71,6 +72,10 @@ class IndexerTask(BaseTask):
         # index is only consulted opportunistically during chat.
         self._last_workspace_scan: float = 0.0
         self._WORKSPACE_SCAN_INTERVAL: float = 30.0
+        # How long the model has to have been quiet before a workspace pass
+        # starts.  Covers the gaps *within* a turn, not just an active call —
+        # see the check in :meth:`_scan_workspace_files`.
+        self._WORKSPACE_QUIET_SECONDS: float = 5.0
         self._workspace_indexer: Optional[WorkspaceIndexer] = None
         self._workspace_indexer_dir: Optional[str] = None
         self._workspace_scan_inflight: bool = False
@@ -535,6 +540,38 @@ class IndexerTask(BaseTask):
         # install, which would silently empty the index.
         work_dir = project.project_dir
         if not work_dir or not os.path.isdir(work_dir):
+            return
+
+        # Wait for the model to be quiet before spending the GPU on chunks.
+        #
+        # Embedding and generation share one device, and a pass over a few
+        # hundred chunks drops a streaming reply from ~57 tok/s to ~3 while it
+        # runs — the user watches their answer arrive a word at a time so the
+        # workspace index can be a minute fresher.  Nothing here is urgent
+        # enough to win that trade.
+        #
+        # A *quiet period* rather than "is it generating right now": one turn
+        # is many sequential calls — classify, skill match, tool resolution,
+        # judge, then the answer — and a bare busy check would start a pass in
+        # the gap between two of them and run straight through the reply.
+        # Deferring, not queueing: the loop comes back every
+        # ``_WORKSPACE_SCAN_INTERVAL`` and the pass is hash-incremental, so a
+        # skipped turn costs nothing but freshness.
+        idle = device_idle_seconds()
+        if idle < self._WORKSPACE_QUIET_SECONDS:
+            self.logger.debug(
+                "[Indexer] Workspace scan deferred — model busy (idle %.1fs < "
+                "%.1fs)", idle, self._WORKSPACE_QUIET_SECONDS,
+            )
+            # Re-arm for one quiet period rather than a full interval: the
+            # dispatcher stamped the clock when it handed this pass over, and
+            # leaving it there would turn every deferral into a 30s wait, so a
+            # busy stretch would starve the index instead of postponing it.
+            self._last_workspace_scan = (
+                time.time()
+                - self._WORKSPACE_SCAN_INTERVAL
+                + self._WORKSPACE_QUIET_SECONDS
+            )
             return
 
         # Recreate the indexer when the active project changes so the store

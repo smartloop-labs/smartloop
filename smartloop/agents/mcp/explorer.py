@@ -23,7 +23,10 @@ from .server_selector import (
 )
 from .mcp_tool_caller import MCPToolCaller
 from .argument_extractor import MCPArgumentExtractor
-from .mcp_agent import MCPAgent, format_call, missing_required
+from .mcp_agent import (
+    MCPAgent, format_call, is_entitlement_notice, mark_tool_unavailable,
+    missing_required,
+)
 
 if TYPE_CHECKING:
     from smartloop.workspace.workspace import MCPServer
@@ -525,8 +528,29 @@ Does answering the latest message require a new web search?
     # dozen connections would put all of them in front of every answer.
     _MAX_SERVERS_PER_QUESTION = 4
 
+    @staticmethod
+    def _emit(
+        progress: Optional[Callable[[str, str, str], None]],
+        step: str,
+        message: str,
+    ) -> None:
+        """Report one step to the client, never failing the work over it.
+
+        A progress callback crosses a thread boundary into the request's event
+        loop (see ``chat.py``), so it is the kind of thing that can raise long
+        after the client has gone.  Collect's job is the context, not the
+        commentary.
+        """
+        if progress is None:
+            return
+        try:
+            progress(step, "processing", message)
+        except Exception:
+            logger.debug("[collect] progress callback failed", exc_info=True)
+
     def _run_mcp(self, query: str, mcp_servers: Optional[List["MCPServer"]],
-                 project_dir: Optional[str], llm: Optional[BaseLLM] = None) -> str:
+                 project_dir: Optional[str], llm: Optional[BaseLLM] = None,
+                 progress: Optional[Callable[[str, str, str], None]] = None) -> str:
         """Gather what the connected servers know about *query*.
 
         Every server is asked, not just the best-matching one: a question is
@@ -563,40 +587,102 @@ Does answering the latest message require a new web search?
 
         gathered = []
         for server in servers:
-            text = self._run_mcp_server(query, server, llm)
+            text = self._run_mcp_server(query, server, llm, progress=progress)
             if text:
                 gathered.append(text)
         return "\n\n".join(gathered)
 
     def _run_mcp_server(
         self, query: str, server: "MCPServer", llm: Optional[BaseLLM] = None,
+        progress: Optional[Callable[[str, str, str], None]] = None,
     ) -> str:
         """One server's answer to *query*, or ``""``."""
+        server_name = getattr(server, "name", None) or "the server"
         try:
-            picked = self.mcp_agent.resolve(query, [server], llm=llm)
-            if not picked:
-                return ""
-            tool_name = picked.tool_name
-            if not self._is_read_only_tool(tool_name):
-                logger.info(
-                    "[collect] MCP tool '%s' is not read-only — leaving to a "
-                    "planned execute step", tool_name,
-                )
-                return ""
+            # Resolution is the long leg — a reasoned pick over this server's
+            # whole tool list, tens of seconds on a large catalog — and it runs
+            # before anything is called, so with no event here the client sits
+            # on "Processing..." through all of it and the work reads as a
+            # hang.  Named per server, because a workspace with two
+            # connections pays this once each.
+            # Two attempts, because the first pick can turn out to be a tool
+            # this account cannot call.  Discovery lists what the server has,
+            # not what the plan is entitled to, so a paywalled tool is
+            # indistinguishable from a usable one until it answers — and it
+            # answers with an advertisement, successfully.  Retrying once with
+            # it struck off the catalogue is what lets the same turn fall to
+            # the tool that does work (``notion-search`` where
+            # ``notion-ai-search`` is Business-only) instead of handing the
+            # upsell to the model as though it were the document.
+            raw = ""
+            tool_name = ""
+            for attempt in (1, 2):
+                self._emit(progress, "tool", f"Choosing a {server_name} tool")
+                picked = self.mcp_agent.resolve(query, [server], llm=llm)
+                if not picked:
+                    return ""
+                tool_name = picked.tool_name
+                if not self._is_read_only_tool(tool_name):
+                    logger.info(
+                        "[collect] MCP tool '%s' is not read-only — leaving to a "
+                        "planned execute step", tool_name,
+                    )
+                    return ""
 
-            raw = self._call_mcp_tool(server, tool_name, picked.arguments, query)
+                # The tool and its arguments, not just the server: "Calling
+                # Notion" is indistinguishable between reading a page and
+                # searching for one, and which of the two ran is the thing a
+                # user watching this actually wants to know.
+                self._emit(
+                    progress, "tool",
+                    f"Calling {format_call(server_name, tool_name, picked.arguments)}",
+                )
+                raw = self._call_mcp_tool(server, tool_name, picked.arguments, query)
+                if not raw:
+                    return ""
+
+                if not is_entitlement_notice(raw):
+                    break
+
+                # Struck off before the retry, so the same resolution cannot
+                # come back with the same answer.
+                mark_tool_unavailable(getattr(server, "id", "") or "", tool_name)
+                logger.warning(
+                    "[collect] %s.%s is not available on this account — %s. "
+                    "Dropping it from the catalogue%s",
+                    server_name, tool_name, raw.strip().splitlines()[0][:160],
+                    " and re-resolving" if attempt == 1 else "",
+                )
+                self._emit(
+                    progress, "tool",
+                    f"{server_name}.{tool_name} needs a higher plan — "
+                    "trying another tool",
+                )
+                raw = ""
             if not raw:
                 return ""
 
             # A listing answers "which records", not "what do they say".  The
             # connection's plan names the tool that fetches a record's body, so
             # a search hit becomes the page behind it rather than its title.
-            detail = self._fetch_record_details(server, tool_name, raw)
+            detail = self._fetch_record_details(
+                server, tool_name, raw, progress=progress,
+            )
             body = f"{raw}\n\n{detail}" if detail else raw
 
             logger.info(
                 "[collect] %s.%s returned %d chars",
                 getattr(server, "name", ""), tool_name, len(body),
+            )
+            # The payload, not just its size.  A short answer here is the
+            # difference between "the tool found nothing", "the tool answered
+            # in prose that carries no record ids to follow up on" and "the
+            # follow-up plan missed" — three different bugs that a char count
+            # cannot tell apart, and the execute path has always logged its
+            # raw result for exactly this reason.
+            logger.info(
+                "[collect] %s.%s raw result: %s",
+                getattr(server, "name", ""), tool_name, body[:1000],
             )
             return f"MCP TOOL ({getattr(server, 'name', '')}.{tool_name}):\n{body}"
         except Exception as e:
@@ -656,6 +742,7 @@ Does answering the latest message require a new web search?
 
     def _fetch_record_details(
         self, server: "MCPServer", tool_name: str, payload: str,
+        progress: Optional[Callable[[str, str, str], None]] = None,
     ) -> str:
         """Bodies behind the records *payload* lists, per the connection's plan.
 
@@ -674,11 +761,22 @@ Does answering the latest message require a new web search?
         if not calls:
             return ""
 
+        server_name = getattr(server, "name", None) or "the server"
         bodies = []
-        for detail_tool, arguments in calls:
+        # Announced per record, not once for the batch: a search hit list turns
+        # into one fetch each, and a question that matched five pages spends
+        # most of its collect here.  Reported with the same call format as the
+        # resolved tool, so the follow-ups read as the calls they are rather
+        # than as a single opaque step.
+        for index, (detail_tool, arguments) in enumerate(calls, start=1):
             logger.info(
                 "[collect] following up with %s",
                 format_call(getattr(server, "name", ""), detail_tool, arguments),
+            )
+            self._emit(
+                progress, "tool",
+                f"Reading {index} of {len(calls)} from {server_name}: "
+                f"{format_call('', detail_tool, arguments)}",
             )
             result = self.tool_caller.call_tool(
                 server=server, tool_name=detail_tool, arguments=arguments,
@@ -826,6 +924,7 @@ Does answering the latest message require a new web search?
             if mcp_servers:
                 f_mcp = pool.submit(
                     self._run_mcp, query, mcp_servers, project_dir, mcp_llm,
+                    progress,
                 )
 
             # Collect primary results (local retrieval + MCP tools)
@@ -871,16 +970,10 @@ Does answering the latest message require a new web search?
                     # here the client shows the previous step until the whole
                     # search is done.  A skipped search stays silent, as the
                     # rest of this path is.
-                    if progress is not None:
-                        try:
-                            progress(
-                                "web_search", "processing",
-                                "Searching the web for the latest information",
-                            )
-                        except Exception:
-                            logger.debug(
-                                "[collect] progress callback failed", exc_info=True,
-                            )
+                    self._emit(
+                        progress, "web_search",
+                        "Searching the web for the latest information",
+                    )
                     ctx.web_context = self._search_web(query, progress=progress)
                     if self.web_search_agent.last_sources:
                         ctx.web_sources = list(self.web_search_agent.last_sources)
