@@ -15,14 +15,16 @@ carry crawl plans — declarative walks that vectorized a server's pages, issues
 and cards ahead of time — and they are gone: a walk went stale between
 questions, only covered the listings someone had written a plan for, and
 answered from a snapshot when the tool that would give the current answer was
-one call away.
+one call away.  A file still carrying those fields installs anyway — see
+:data:`RETIRED_FIELDS` — because the connection it names is unaffected by the
+indexing it can no longer ask for.
 """
 
 from __future__ import annotations
 
 import re
 import shlex
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -73,6 +75,25 @@ def launcher_for(package: str) -> Tuple[str, List[str]]:
     return "uvx", [package]
 
 
+# --------------------------------------------------------------- retired keys
+#
+# Crawling is gone, but the files that configured it are still on people's
+# disks, and a file that says `index_every = "15m"` beside a url or a package
+# name still names a working connection.  So the retired keys are dropped
+# rather than rejected: such a file installs, with a logged line naming the
+# fields that did nothing.  Everything *else* unknown stays an error —
+# `packag = ` has to name the typo rather than quietly install a server with
+# no command.
+
+#: Per-entry fields the old indexing format used, accepted and ignored.
+RETIRED_FIELDS = ("crawl", "index", "index_every", "step", "extend")
+
+
+def retired_fields(raw: Mapping[str, Any]) -> Tuple[str, ...]:
+    """Which retired indexing fields *raw* declares, in the order it lists them."""
+    return tuple(key for key in raw if key in RETIRED_FIELDS)
+
+
 class MCPDefinition(BaseModel):
     """One MCP server, as a file describes it.
 
@@ -112,6 +133,19 @@ class MCPDefinition(BaseModel):
     # Extra substrings matched against an installed server's name, package and
     # URL.  `name` and `slug` are always tried, so this is for the aliases.
     match: Tuple[str, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired(cls, data: Any) -> Any:
+        """Ignore the indexing fields a file written for the old format carries.
+
+        See :data:`RETIRED_FIELDS`.  Dropped in the model, so every way of
+        building a definition — a drop-in file, an upload, a test — treats
+        them alike.
+        """
+        if isinstance(data, dict) and retired_fields(data):
+            return {k: v for k, v in data.items() if k not in RETIRED_FIELDS}
+        return data
 
     @field_validator("args", mode="before")
     @classmethod

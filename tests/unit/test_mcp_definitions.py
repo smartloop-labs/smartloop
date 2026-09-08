@@ -22,7 +22,7 @@ from smartloop.mcp.definition_loader import (
     reload_definitions,
     user_definition_paths,
 )
-from smartloop.mcp.definitions import MCPDefinition, definition_for
+from smartloop.mcp.definitions import MCPDefinition, definition_for, retired_fields
 
 _MINIMAL = '''
 [[mcp]]
@@ -74,6 +74,55 @@ package = "yahoo-finance-mcp"
         # A typo must name the field rather than being silently ignored.
         with pytest.raises(Exception, match="packag"):
             parse_definitions('[[mcp]]\nname = "x"\npackag = "y"\n', "test")
+
+
+class TestFilesWrittenForTheOldIndexingFormat:
+    """A file that configured crawling still names a working connection.
+
+    Crawling is gone, so those fields describe nothing — but they sit beside a
+    url or a package name that is unaffected, and someone's existing file has
+    to keep installing rather than being rejected for saying something that is
+    now a no-op.
+    """
+
+    def test_the_retired_indexing_fields_are_ignored(self):
+        text = """
+[[mcp]]
+name = "stocks"
+package = "yahoo-finance-mcp"
+crawl = true
+index_every = "15m"
+
+[[mcp.index]]
+label = "stock-info"
+tools = ["get_stock_info"]
+max_pages = 20
+max_parents = 25
+"""
+        d = parse_definitions(text, "test")["stocks"]
+        assert d.launch == ("uvx", ["yahoo-finance-mcp"])
+        assert d.kind == "local"
+        assert not hasattr(d, "index")
+
+    def test_the_ignored_fields_are_named_in_the_log(self, caplog):
+        text = '[[mcp]]\nname = "x"\nurl = "https://e.example/mcp"\nindex_every = "6h"\n'
+        with caplog.at_level("WARNING"):
+            parse_definitions(text, "some-file.toml")
+        assert "index_every" in caplog.text
+        assert "some-file.toml" in caplog.text
+
+    def test_a_typo_is_still_rejected_beside_them(self):
+        # Ignoring the retired keys must not turn into ignoring every unknown
+        # key: `packag` still has to be reported.
+        text = '[[mcp]]\nname = "x"\nindex_every = "6h"\npackag = "y"\n'
+        with pytest.raises(Exception, match="packag"):
+            parse_definitions(text, "test")
+
+    def test_retired_fields_reports_what_an_entry_carries(self):
+        assert retired_fields({"name": "x", "index_every": "1h", "index": []}) == (
+            "index_every", "index",
+        )
+        assert retired_fields({"name": "x", "package": "y"}) == ()
 
 
 class TestLaunchers:

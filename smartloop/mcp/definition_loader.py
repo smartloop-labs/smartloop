@@ -26,7 +26,7 @@ import threading
 import tomllib
 from typing import Dict, List, Optional, Tuple
 
-from smartloop.mcp.definitions import MCPDefinition
+from smartloop.mcp.definitions import MCPDefinition, retired_fields
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,8 @@ def parse_definitions(text: str, source: str) -> Dict[str, MCPDefinition]:
 
     Raises on a malformed document — callers decide whether one bad file is
     fatal (it is, for an upload the user is watching) or not (it isn't, for the
-    drop-in directory).
+    drop-in directory).  The retired indexing fields are not malformed: they
+    are dropped, and logged once per entry that carries them.
     """
     document = tomllib.loads(text)
     found: Dict[str, MCPDefinition] = {}
@@ -66,8 +67,19 @@ def parse_definitions(text: str, source: str) -> Dict[str, MCPDefinition]:
     for raw in entries:
         if not isinstance(raw, dict):
             raise ValueError("each [[mcp]] must be a table")
+        retired = retired_fields(raw)
         definition = MCPDefinition(**raw)
         found[definition.key] = definition
+        if retired:
+            # The connection installed; the indexing it asked for no longer
+            # exists.  Said out loud so the file can be tidied, rather than
+            # leaving someone to wonder why nothing gets crawled.
+            logger.warning(
+                "[mcp-definitions] %s: '%s' declares %s, which no longer does "
+                "anything — a connection's tools are called when a question "
+                "needs them, nothing is indexed ahead of time",
+                source, definition.key, ", ".join(retired),
+            )
         logger.debug("[mcp-definitions] %s: loaded '%s'", source, definition.key)
     return found
 

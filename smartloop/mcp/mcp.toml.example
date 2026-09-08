@@ -62,3 +62,11 @@
 #                    ("npx -y some-mcp") is split too, with `args` appended.
 #                    A url and a package name are alternatives: a server is
 #                    reached over HTTP or run as a process, not both.
+#
+#  ── Fields that no longer do anything ──────────────────────────────────────
+#
+#  Earlier versions crawled a connection on a schedule, and a file said so with
+#  `crawl`, `index_every`, `index`/`step` and `extend`. Those fields are read
+#  and ignored: the connection beside them still installs, and a line in the
+#  log names what did nothing. Every *other* unknown field is an error, so a
+#  typo (`packag = `) is still reported rather than silently dropped.
