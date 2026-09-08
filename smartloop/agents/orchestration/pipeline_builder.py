@@ -21,6 +21,7 @@ from smartloop.agents.nodes import (
 )
 from smartloop.agents.fetch_agent import FetchAgent
 from smartloop.agents.mcp.explorer import EnrichedContext, Explorer, SearchContext
+from smartloop.agents.mcp.mcp_agent import MCPAgent, format_call
 from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 from smartloop.agents.orchestration.context import _OrchestratorContext
 from smartloop.agents.orchestration.document_fanout import DocumentFanoutStep
@@ -103,6 +104,9 @@ class PipelineBuilder:
             executor=self._executor._io_pool,
             project_dir=ctx.project_dir,
             progress=self._models.emit,
+            # The live MCP call made here resolves its tool the same way a
+            # planned step does, so it gets the same reasoning model.
+            mcp_llm=self._models.reasoning_llm(self._models.agent_llm),
         )
         return NodeResult(node_id=node.node_id, success=True, data={"search_ctx": search_ctx})
 
@@ -237,8 +241,6 @@ class PipelineBuilder:
             matched_sources.append("web")
         if search_ctx.mcp_context:
             matched_sources.append("mcp")
-        if search_ctx.mcp_document_context:
-            matched_sources.append("mcp-content")
         has_indexed_context = bool(matched_sources)
 
         if classification.intent == IntentType.CONVERSATION:
@@ -475,7 +477,7 @@ class PipelineBuilder:
                 # is the user's own material — their documents, workspace,
                 # connected servers and prior feedback — and a model reading
                 # top-down should meet that before a public page. Web results
-                # used to sit third, ahead of both MCP sources, which put
+                # used to sit third, ahead of the MCP result, which put
                 # someone else's page in front of the user's own data.
                 parts = []
                 if search_ctx.vector_context:
@@ -484,10 +486,6 @@ class PipelineBuilder:
                     parts.append(search_ctx.workspace_context)
                 if search_ctx.mcp_context:
                     parts.append(search_ctx.mcp_context)
-                if search_ctx.mcp_document_context:
-                    parts.append(
-                        f"MCP CONTENT:\n{search_ctx.mcp_document_context}"
-                    )
                 if search_ctx.feedback_context:
                     parts.append(search_ctx.feedback_context)
                 if search_ctx.web_context:
@@ -620,6 +618,10 @@ Assess whether these search results are relevant to the user's request. If relev
         there is no upstream.
         """
         step_llm = self._models.llm_for_tier(step.model_tier, step.capability)
+        # Resolution is one call that picks the tool and fills its arguments,
+        # so it goes to a reasoning model when the workspace has one enabled —
+        # see ModelRouter.reasoning_llm and MCPAgent.
+        step_llm = self._models.reasoning_llm(step_llm)
         logger.info(
             "[models] RESOLVE(%s) → %s%s: %s",
             step.tool_name, step.model_tier.value,
@@ -654,6 +656,16 @@ Assess whether these search results are relevant to the user's request. If relev
                 f"{step.server_name}/{step.tool_name}: {step.instruction}"
             )
 
+            # Say that a tool call is being worked out, and on what — a
+            # resolution that reasons takes seconds, and "Selected <model> for
+            # the response" is not an account of what is happening.
+            self._models.emit(
+                "tool", "processing",
+                "Reasoning about which tool to call"
+                if MCPAgent.can_think(step_llm)
+                else "Working out which tool to call",
+            )
+
             resolved = self._steps.resolve_tool_args(
                 ctx,
                 step=step,
@@ -663,12 +675,23 @@ Assess whether these search results are relevant to the user's request. If relev
 
             if resolved is None:
                 logger.info(f"[resolve] {step.tool_name} — could not resolve args")
+                self._models.emit(
+                    "tool", "processing",
+                    f"No tool call could be resolved for "
+                    f"{step.tool_name or step.instruction[:60]}",
+                )
                 return NodeResult(node_id=node_id, success=True, data={
                     "skip": True,
                     "tool_name": step.tool_name or step.step_type.value,
                 })
 
             server, tool_name, arguments = resolved
+            # The decision itself, in the shape it will be called: which
+            # server, which tool, and the arguments it goes out with.
+            self._models.emit(
+                "tool", "processing",
+                f"Resolved {format_call(server.name, tool_name, arguments)}",
+            )
             logger.info(f"[resolve] {tool_name} resolved args: {arguments}")
             return NodeResult(node_id=node_id, success=True, data={
                 "skip": False,
@@ -717,6 +740,10 @@ Assess whether these search results are relevant to the user's request. If relev
                 fail_msg = f"Tool '{tool_name}' failed: server not found." if step.skill_name else ""
                 return plan_step_result(node_id, step, fail_msg)
 
+            self._models.emit(
+                "tool", "processing",
+                f"Calling {format_call(server.name, tool_name, arguments)}",
+            )
             result = self._steps.call_tool(server, tool_name, arguments, cwd=ctx.effective_cwd)
             if result is None:
                 fail_msg = f"Tool '{tool_name}' call failed — no result returned." if step.skill_name else ""

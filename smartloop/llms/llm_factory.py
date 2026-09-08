@@ -251,6 +251,22 @@ class LlmFactory:
             return False
 
     @staticmethod
+    def _template_reads_thinking(llm) -> bool:
+        """True when the loaded GGUF's own chat template can reason.
+
+        ``supports_thinking`` answers from ``SUPPORTED_MODELS``, which knows
+        nothing about a model the user built or merged themselves — and those
+        are exactly the models this misses, since a merge of a reasoning base
+        keeps its template.  The template is the ground truth: it is what reads
+        ``enable_thinking`` when the handler passes it.
+        """
+        try:
+            template = (llm.metadata or {}).get("tokenizer.chat_template", "")
+        except Exception:
+            return False
+        return "enable_thinking" in str(template)
+
+    @staticmethod
     def thinking_for(model_name: str | None, override: bool | None = None) -> bool | None:
         """Whether ``model_name`` should reason, or ``None`` to leave it alone.
 
@@ -322,6 +338,7 @@ class LlmFactory:
         *, probe: bool = True, max_n_ctx: int | None = None,
         mmproj_path: str | None = None, clip_on_cpu: bool = False,
         vision_handler: str | None = None, thinking: bool | None = None,
+        model_name: str | None = None,
     ):
         """Returns an instance of the configured LlamaCpp wrapper class.
 
@@ -528,6 +545,22 @@ class LlmFactory:
             else:
                 raise
 
+        if thinking is None:
+            # The registry could not answer — a user-built or merged model is
+            # not in SUPPORTED_MODELS, so nothing declares THINKING for it.
+            # The GGUF itself can: its chat template either reads
+            # ``enable_thinking`` or it doesn't.  Bind off in that case, which
+            # keeps the visible answer as it is today and still leaves the flag
+            # present, so a caller that wants reasoning for its own call can
+            # turn it on (see ``MCPAgent._thinking_on``).
+            if LlmFactory._template_reads_thinking(llm):
+                logger.info(
+                    "[thinking] chat template reads enable_thinking — binding "
+                    "the flag for a model the registry does not describe"
+                )
+                from smartloop.config.app_settings import AppSettings
+                thinking = bool(AppSettings().thinking_enabled)
+
         if thinking is not None:
             LlmFactory._bind_thinking(llm, thinking, logger)
 
@@ -536,4 +569,5 @@ class LlmFactory:
             tokenizer=llm.tokenizer,
             project_id=project_id,
             logger=logger,
+            model_name=model_name,
         )

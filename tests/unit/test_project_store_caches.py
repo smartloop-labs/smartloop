@@ -32,7 +32,6 @@ class TestOneSlotPerProject:
         assert cache.doc_store is None
         assert cache.workspace_indexer is None
         assert cache.feedback_indexer is None
-        assert cache.mcp_document_indexer is None
 
     def test_a_handle_stored_for_one_project_is_invisible_to_another(self):
         svc = _service()

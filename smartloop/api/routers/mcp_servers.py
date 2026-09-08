@@ -13,7 +13,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from smartloop.api.model import (
-    MCPCrawlRequest,
     MCPDefinitionRequest,
     MCPServerResponse,
     DeleteMCPServerResponse,
@@ -136,8 +135,6 @@ def _build_server_response(result: dict) -> MCPServerResponse:
         server_info=result.get("server_info"),
         status=result.get("status", "ready"),
         last_error=result.get("last_error"),
-        crawl=result.get("crawl"),
-        last_crawl_at=result.get("last_crawl_at"),
         account=result.get("account"),
     )
 
@@ -190,14 +187,16 @@ async def _register_local_mcp_server(
 ) -> MCPRegisterResponse:
     """Register a local (stdio) MCP server from a client-supplied command.
 
-    Standard MCP stdio config: the caller provides ``command`` (e.g. ``uvx``,
-    ``npx``) plus ``args``; the command must be installed on the host PATH.
+    Standard MCP stdio config: the caller provides ``command`` (``uvx``,
+    ``npx``, ``python``, a path to a program, …) plus ``args``; the command must
+    be installed on the host PATH. No launcher is assumed — the command is run
+    as written.
     When *curated* is a resolved catalog entry, its config and metadata win over
     the request.
 
     Returns as soon as the connection is persisted, with ``status="pending"``:
-    launching the process, enumerating tools, generating metadata and indexing
-    all happen on the MCP background task.  Clients follow the server's
+    launching the process, enumerating tools and generating metadata all happen
+    on the MCP background task.  Clients follow the server's
     ``status``/``last_error`` (via ``GET /projects/{id}/mcp``) instead of
     waiting here, and can re-run a failed pass with ``.../mcp/{id}/refresh``.
     """
@@ -208,10 +207,15 @@ async def _register_local_mcp_server(
 
     if not command:
         raise HTTPException(status_code=400, detail="'command' is required for local servers")
-    if not args:
+    # A launcher (uvx, npx, python, …) with nothing to launch cannot start. A
+    # command that is itself a path to a program is complete without arguments,
+    # so it is not held to this — the service applies the same rule.
+    if not args and not (os.path.isabs(command) or os.sep in command):
         raise HTTPException(
             status_code=400,
-            detail="'args' is required for local servers (e.g. args=['yahoo-finance-mcp'] for uvx, or args=['-m', 'module'] for python)",
+            detail="'args' is required for local servers (e.g. args=['yahoo-finance-mcp'] "
+                   "for uvx, args=['-y', '@scope/pkg'] for npx, or args=['-m', 'module'] "
+                   "for python)",
         )
     try:
         result = await _offload(
@@ -307,8 +311,7 @@ async def _register_remote_mcp_server(
     # survives a lookup that missed.  `resolve_catalog_entry` never raises — a
     # stale cache, an expired platform token and an outage all read as "not
     # curated" — and dropping the slug there costs more than the metadata does:
-    # the connection then pays for LLM enrichment it doesn't need and has to
-    # find its crawl plan by matching substrings against its own name.
+    # the connection then pays for LLM enrichment it doesn't need.
     curated_slug = (curated.slug if curated else None) or request.catalog_slug
 
     server_url = effective_url.strip()
@@ -508,8 +511,8 @@ async def list_mcp_servers_for_project(
 ):
     """List MCP servers for a specific project.
 
-    Each server carries an ``indexing`` block — provisioning and content-crawl
-    state — so a client can show "still indexing" without a request per server.
+    Each server carries an ``indexing`` block — its provisioning state — so a
+    client can show "still connecting" without a request per server.
     """
     try:
         return {"servers": model_service.list_mcp_servers_with_status(project_id)}
@@ -521,43 +524,23 @@ async def list_mcp_servers_for_project(
 
 
 @router.get("/projects/{project_id}/mcp/tools/count")
-async def count_indexed_mcp_tools_for_project(
+async def count_mcp_tools_for_project(
     project_id: str,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """Diagnostic: how many MCP tool vectors are indexed for the project.
+    """Diagnostic: how many MCP tools the project has available.
 
-    ``tool_vectors`` is the count in the ``mcp_tools`` vector collection;
-    ``server_tools`` is the total tools across registered servers. They should
-    match once every server has been indexed — a mismatch means some server's
-    tools were not vectorized.
+    ``tools`` is the total across registered servers as discovery recorded it —
+    the catalog a step is resolved against — and ``by_server`` breaks it down,
+    so a connection that discovered nothing is visible here rather than only in
+    the logs.
     """
     try:
-        return model_service.count_indexed_mcp_tools(project_id)
+        return model_service.count_mcp_tools(project_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.exception("Error counting indexed MCP tools")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/projects/{project_id}/mcp/content")
-async def mcp_content_status_for_project(
-    project_id: str,
-    model_service: ModelService = Depends(get_model_service),
-):
-    """Crawled MCP content state for the project.
-
-    Reports the number of indexed content chunks and, per server, the crawl
-    plan that matched, how many records/documents it produced and when it last
-    ran — the content counterpart to ``mcp/tools/count``.
-    """
-    try:
-        return model_service.mcp_content_status(project_id)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.exception("Error reading MCP content status")
+        logger.exception("Error counting MCP tools")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -567,17 +550,16 @@ async def get_mcp_server(
     server_id: str,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """One MCP server, with whether its content is still being indexed.
+    """One MCP server, with whether it is still being provisioned.
 
-    Registration returns before the server is usable: tool discovery and the
-    content crawl both run on the MCP task.  ``indexing.state`` is what a
-    client polls — ``provisioning`` → ``queued`` → ``indexing`` → ``indexed``,
-    or ``failed`` with ``indexing.error``, or ``disabled`` for a server whose
-    content isn't crawled.  ``indexing.in_progress`` is the single flag to
-    drive a spinner off.
+    Registration returns before the server is usable: tool discovery runs on
+    the MCP task.  ``indexing.state`` is what a client polls —
+    ``provisioning`` → ``ready``, or ``failed`` with ``indexing.error`` — and
+    ``indexing.in_progress`` is the single flag to drive a spinner off.
+    ``indexing.tools`` is how many tools discovery found.
 
-    Declared after the literal ``mcp/tools/count`` and ``mcp/content`` routes:
-    a path parameter here would otherwise swallow them.
+    Declared after the literal ``mcp/tools/count`` route: a path parameter here
+    would otherwise swallow it.
     """
     try:
         return model_service.mcp_server_status(server_id, project_id=project_id)
@@ -585,25 +567,6 @@ async def get_mcp_server(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.exception("Error reading MCP server status")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/projects/{project_id}/mcp/content/refresh")
-async def refresh_mcp_content_for_project(
-    project_id: str,
-    model_service: ModelService = Depends(get_model_service),
-):
-    """Re-crawl every document-type server in the project now.
-
-    The crawl also runs at startup and on the periodic cycle; this is the
-    manual "fetch it again" for when the source just changed.
-    """
-    try:
-        return model_service.crawl_mcp_content(project_id=project_id, force=True)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.exception("Error refreshing MCP content")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -625,31 +588,6 @@ async def refresh_mcp_server(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.exception("Error refreshing MCP server")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/projects/{project_id}/mcp/{server_id}/crawl")
-async def set_mcp_server_crawl(
-    project_id: str,
-    server_id: str,
-    request: MCPCrawlRequest,
-    model_service: ModelService = Depends(get_model_service),
-):
-    """Opt one server's content in or out of the crawl cycle.
-
-    Document-type servers (Notion, Linear, Trello, …) crawl by default; this
-    turns it on for a server we don't recognise as one, or off for a server
-    whose content shouldn't be indexed.  Disabling also drops what was already
-    indexed for it.
-    """
-    try:
-        return model_service.set_mcp_crawl_enabled(
-            server_id, request.enabled, project_id=project_id,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.exception("Error updating MCP crawl setting")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -708,15 +646,15 @@ async def register_mcp_from_definition(
 ):
     """Install a connection from a dropped-in TOML file.
 
-    The file is the whole definition: what the server is called, how to reach
-    it, and — optionally — how to index its content.  Both halves are kept: the
-    file is saved under ``~/.smartloop/mcp.d/`` so its crawl plan is there for
-    every later refresh, and the connection itself goes through the ordinary
-    registration path, so a remote server needing OAuth returns an ``auth_url``
-    exactly as it would if the URL had been typed in.
+    The file is the whole definition: what the server is called and how to
+    reach it.  It is kept — saved under ``~/.smartloop/mcp.d/`` so the
+    connection can be re-created, edited or removed as a file — and the
+    connection itself goes through the ordinary registration path, so a remote
+    server needing OAuth returns an ``auth_url`` exactly as it would if the URL
+    had been typed in.
     """
-    from smartloop.mcp.plan_loader import (
-        USER_PLANS_DIR, parse_definitions, reload_plans,
+    from smartloop.mcp.definition_loader import (
+        USER_DEFINITIONS_DIR, parse_definitions, reload_definitions,
     )
 
     try:
@@ -746,25 +684,23 @@ async def register_mcp_from_definition(
                    f"remote server, or a package name for one to run locally.",
         )
 
-    # Persist before registering: the plan has to be on disk by the time the
-    # provisioning pass runs its first crawl, and that is queued by the
-    # registration below.
+    # Persist before registering, so a file dropped in is on disk even if the
+    # registration below fails and has to be retried.
     try:
         from smartloop.config.app_settings import AppSettings
-        drop_in_dir = os.path.join(AppSettings().home_dir, USER_PLANS_DIR)
+        drop_in_dir = os.path.join(AppSettings().home_dir, USER_DEFINITIONS_DIR)
         os.makedirs(drop_in_dir, exist_ok=True)
         # Named after the connection, not after whatever the file was called on
         # the way in — that is what makes re-dropping an edited file replace
-        # the old plan instead of stacking a second copy beside it.
+        # the old definition instead of stacking a second copy beside it.
         target = os.path.join(drop_in_dir, f"{definition.key}.toml")
         with open(target, "w", encoding="utf-8") as fh:
             fh.write(request.toml)
-        reload_plans()
+        reload_definitions()
         logger.info("[mcp-definition] Saved '%s' to %s", definition.key, target)
     except Exception as e:
-        # The connection is still worth installing without its plan; the crawl
-        # falls back to a derived one.
-        logger.warning("[mcp-definition] Could not save the plan file: %s", e)
+        # The connection is still worth installing without the file kept.
+        logger.warning("[mcp-definition] Could not save the definition file: %s", e)
 
     command, args = definition.launch
     register = MCPRegisterRequest(

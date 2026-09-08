@@ -308,7 +308,9 @@ def _unlink_stale_socket(path: str) -> None:
 _OPERATIONS: dict[str, Callable[[ModelClient, dict], object]] = {
     "generate": lambda c, a: c.generate(
         a.get("prompt") or "", a.get("model_name"), capability=a.get("capability"),
+        max_tokens=a.get("max_tokens"), thinking=a.get("thinking"),
     ),
+    "supports_thinking": lambda c, a: c.supports_thinking(a.get("capability")),
     "encode_texts": lambda c, a: protocol.encode_array(
         c.encode_texts(a.get("texts") or [], base_dir=a.get("base_dir")),
     ),

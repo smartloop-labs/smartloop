@@ -136,7 +136,7 @@ class TaskQueue:
         # Expose background workspace-indexing state (IndexerTask)
         if hasattr(task, "workspace_status"):
             status["workspace"] = task.workspace_status
-        # Expose MCP provisioning / content-crawl state (MCPTask)
+        # Expose MCP provisioning state (MCPTask)
         if hasattr(task, "mcp_status"):
             status["mcp"] = task.mcp_status
         return status

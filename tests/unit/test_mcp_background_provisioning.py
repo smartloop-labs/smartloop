@@ -1,8 +1,7 @@
-"""Registering an MCP server must not block on discovery, the LLM or indexing.
+"""Registering an MCP server must not block on discovery or the LLM.
 
-Registration used to launch the server process, call the LLM twice for
-description/tags/summary and embed the tool vectors, all in front of the
-client's request.  It now persists the connection and hands the rest to the MCP
+Registration used to launch the server process and call the LLM twice for
+description/tags/summary, all in front of the client's request.  It now persists the connection and hands the rest to the MCP
 task; these tests pin that the slow work has actually left the request path and
 that the background pass records a state the client can act on.
 """
@@ -49,7 +48,7 @@ class TestRegistrationIsNonBlocking:
             )
         client_cls.assert_not_called()
 
-    def test_local_registration_makes_no_llm_call_and_no_index_write(self):
+    def test_local_registration_makes_no_llm_call(self):
         project = _project()
         svc = _svc(project)
         with patch("smartloop.api.services.model_service.LocalMCPClient"):
@@ -57,7 +56,6 @@ class TestRegistrationIsNonBlocking:
                 svc, command="uvx", args=["--from", "pkg", "pkg"], project_id="p1",
             )
         svc._enrich_mcp_server.assert_not_called()
-        svc._index_mcp_tools.assert_not_called()
 
     def test_local_registration_persists_pending_and_queues_the_work(self):
         project = _project()
@@ -93,7 +91,7 @@ class TestRegistrationIsNonBlocking:
         svc.get_llm.assert_not_called()
         svc._enrich_mcp_server.assert_not_called()
 
-    def test_remote_registration_defers_enrichment_and_indexing(self):
+    def test_remote_registration_defers_enrichment(self):
         project = _project()
         svc = _svc(project)
         result = ModelService.add_remote_mcp_server(
@@ -101,7 +99,6 @@ class TestRegistrationIsNonBlocking:
             tools=[{"name": "search", "description": "d"}], project_id="p1",
         )
         svc._enrich_mcp_server.assert_not_called()
-        svc._index_mcp_tools.assert_not_called()
         svc._queue_mcp_provisioning.assert_called_once()
         assert result["status"] == "pending"
 
@@ -115,11 +112,11 @@ class TestRegistrationIsNonBlocking:
         result = ModelService._mcp_server_to_dict(project.mcp_servers[0])
         assert result["status"] == "pending"
         assert result["last_error"] is None
-        assert "last_crawl_at" in result
+        assert result["tools"] == []
 
 
 class TestProvisioningPass:
-    def test_successful_pass_discovers_enriches_indexes_and_crawls(self):
+    def test_successful_pass_discovers_and_enriches(self):
         project = _project()
         svc = _svc(project)
         ModelService.add_remote_mcp_server(
@@ -127,7 +124,6 @@ class TestProvisioningPass:
             project_id="p1",
         )
         svc._discover_mcp_tools.side_effect = lambda s: setattr(s, "tools", _TOOLS)
-        svc._crawl_mcp_server.return_value = {"indexed": 3}
 
         result = ModelService._provision_mcp_server(svc, "p1", project.mcp_servers[0].id)
 
@@ -135,12 +131,12 @@ class TestProvisioningPass:
         assert server.status == MCPServerStatus.READY
         assert server.last_error is None
         svc._enrich_mcp_server.assert_called_once()
-        svc._index_mcp_tools.assert_called_once()
-        # Forced, not TTL-gated: a connection made a moment ago has to be
-        # searchable now, not at the next refresh cycle.
-        svc._crawl_mcp_server.assert_called_once()
-        assert svc._crawl_mcp_server.call_args.kwargs.get("force") is True
+        # Discovery is the whole catalog: the tools it recorded are what
+        # MCPAgent resolves a step against, so there is nothing to index and
+        # nothing to crawl.
+        assert server.tools == _TOOLS
         assert result["status"] == "ready"
+        assert result["tools"] == 1
 
     def test_failed_discovery_is_recorded_on_the_server_not_raised(self):
         project = _project()
@@ -157,8 +153,7 @@ class TestProvisioningPass:
         assert server.last_error == "Package not found."
         assert result["status"] == "failed"
         # A failed discovery must not leave half-provisioned state behind.
-        svc._index_mcp_tools.assert_not_called()
-        svc._crawl_mcp_server.assert_not_called()
+        svc._enrich_mcp_server.assert_not_called()
 
     def test_discovery_is_skipped_when_registration_supplied_the_tools(self):
         project = _project()
@@ -169,7 +164,7 @@ class TestProvisioningPass:
         )
         ModelService._provision_mcp_server(svc, "p1", project.mcp_servers[0].id)
         svc._discover_mcp_tools.assert_not_called()
-        svc._index_mcp_tools.assert_called_once()
+        svc._enrich_mcp_server.assert_called_once()
 
     def test_a_deleted_server_is_a_no_op(self):
         project = _project()
@@ -253,85 +248,9 @@ class TestRemoteDiscovery:
                 ModelService._discover_mcp_tools(svc, server)
 
 
-class TestMCPTaskSchedule:
-    def test_first_tick_runs_a_crawl(self):
-        """The start cycle: whatever was indexed last session gets refreshed."""
-        done = threading.Event()
-        task = MCPTask(
-            logger=MagicMock(),
-            crawler=lambda: (done.set(), {"servers": {}})[1],
-            crawl_interval=3600,
-        )
-        try:
-            task.start_loop()
-            assert done.wait(timeout=5)
-        finally:
-            task.stop()
-
-    def test_interval_gates_later_crawls(self):
-        task = MCPTask(logger=MagicMock(), crawler=lambda: {}, crawl_interval=3600)
-        task._crawl_requested = False
-        task._last_crawl_cycle = 100.0
-        assert task._crawl_due(200.0) is False
-        assert task._crawl_due(3701.0) is True
-
-    def test_zero_interval_disables_the_periodic_crawl(self):
-        task = MCPTask(logger=MagicMock(), crawler=lambda: {}, crawl_interval=0)
-        task._crawl_requested = False
-        assert task._crawl_due(1_000_000.0) is False
-        # An explicit request still runs — "disabled" means no cadence, not
-        # that a client can no longer ask for a refresh.
-        task._crawl_requested = True
-        assert task._crawl_due(1_000_000.0) is True
-
-    def _task(self, idle_seconds, interval=3600, idle_interval=600):
-        task = MCPTask(
-            logger=MagicMock(),
-            crawler=lambda: {},
-            crawl_interval=interval,
-            idle_crawl_interval=idle_interval,
-            idle_provider=lambda: idle_seconds,
-        )
-        task._crawl_requested = False
-        task._last_crawl_cycle = 0.0
-        return task
-
-    def test_an_idle_app_refreshes_every_ten_minutes(self):
-        task = self._task(idle_seconds=30.0)
-        assert task._crawl_due(599.0) is False
-        assert task._crawl_due(601.0) is True
-
-    def test_the_idle_cadence_waits_while_the_model_is_answering(self):
-        # Background indexing competes for CPU, network and the same MCP
-        # connections a live tool call needs; none of that belongs on a reply
-        # someone is watching stream.
-        task = self._task(idle_seconds=0.0)
-        assert task._crawl_due(700.0) is False
-
-    def test_an_hour_refreshes_even_mid_conversation(self):
-        # The backstop: without it a long working session would never refresh.
-        task = self._task(idle_seconds=0.0)
-        assert task._crawl_due(3601.0) is True
-
-    def test_a_busy_app_crawls_as_soon_as_it_goes_quiet(self):
-        assert self._task(idle_seconds=5.0)._crawl_due(700.0) is True
-
-    def test_idle_does_not_mean_continuously(self):
-        task = self._task(idle_seconds=99_999.0)
-        assert task._crawl_due(60.0) is False
-
-    def test_an_explicit_request_ignores_both_thresholds(self):
-        # A just-connected server is indexed now, not at the next cadence.
-        task = self._task(idle_seconds=0.0)
-        task._crawl_requested = True
-        assert task._crawl_due(0.0) is True
-
-    def test_without_an_idle_signal_the_ceiling_is_the_whole_schedule(self):
-        task = MCPTask(logger=MagicMock(), crawler=lambda: {}, crawl_interval=3600)
-        task._crawl_requested = False
-        task._last_crawl_cycle = 0.0
-        assert task._crawl_due(700.0) is False
-        assert task._crawl_due(3601.0) is True
+class TestMCPTaskQueue:
+    """The task owns provisioning and nothing else — the periodic content
+    crawl it used to run is gone, so a session starts without indexing."""
 
     def test_enqueued_server_is_provisioned_off_the_caller_thread(self):
         seen = []
@@ -342,7 +261,7 @@ class TestMCPTaskSchedule:
             done.set()
             return {}
 
-        task = MCPTask(logger=MagicMock(), provisioner=provisioner, crawl_interval=3600)
+        task = MCPTask(logger=MagicMock(), provisioner=provisioner)
         try:
             task.enqueue("p1", "s1")
             assert done.wait(timeout=5)
@@ -363,7 +282,6 @@ class TestMCPTaskSchedule:
             logger=MagicMock(),
             provisioner=provisioner,
             pending_provider=lambda: [("p1", "left-pending")],
-            crawl_interval=3600,
         )
         try:
             task.start_loop()
@@ -372,12 +290,9 @@ class TestMCPTaskSchedule:
         finally:
             task.stop()
 
-    def test_status_reports_the_cycle_for_health(self):
-        task = MCPTask(logger=MagicMock(), crawler=lambda: {}, crawl_interval=900)
-        status = task.mcp_status
-        assert status["crawl_interval_seconds"] == 900
-        assert status["queued"] == 0
-        assert status["crawling"] is False
+    def test_status_reports_the_queue_for_health(self):
+        status = MCPTask(logger=MagicMock()).mcp_status
+        assert status == {"queued": 0, "provisioning": 0}
 
 
 class TestIdleSignal:

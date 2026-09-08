@@ -71,6 +71,7 @@ class ModelLoader:
                 lora_path=lora_path, max_n_ctx=main_max_n_ctx,
                 thinking=self.workspace.effective_model_thinking(
                     ws_model.model_name, project) if ws_model else None,
+                model_name=ws_model.model_name if ws_model else None,
             )
 
             # print a table of model parameters and device configuration

@@ -90,5 +90,6 @@ include = ["smartloop*"]
 
 [tool.setuptools.package-data]
 "smartloop.skills" = ["*.md"]
-# The curated MCP crawl plans. Data, not code — see smartloop/mcp/plan_loader.py.
-"smartloop.mcp" = ["*.toml"]
+# `call_plans.toml` is data the code reads at runtime; `mcp.toml.example` is
+# the connection-file reference, shipped so it is on disk next to the loader.
+"smartloop.mcp" = ["*.toml", "*.example"]

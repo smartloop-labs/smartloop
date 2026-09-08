@@ -197,15 +197,13 @@ class TestEvaluateSources:
             workspace_context="unrelated",
             feedback_context="unrelated",
             mcp_context="unrelated",
-            mcp_document_context="unrelated",
         )
 
         dropped = orch._judge.evaluate_sources(ctx, search_ctx)
 
         assert dropped == ["workspace files", "feedback"]
-        # Both MCP sources are exempt — they are the user's connected-app data.
+        # The MCP result is exempt — it is the user's connected-app data.
         assert search_ctx.mcp_context == "unrelated"
-        assert search_ctx.mcp_document_context == "unrelated"
 
     def test_a_live_tool_result_is_never_judged(self):
         """A tool call is deliberate and its result is definite — not recall.
@@ -232,36 +230,11 @@ class TestEvaluateSources:
             "The Hasselblad X2D II has a 100MP sensor."
         )
 
-    def test_crawled_mcp_content_is_never_judged(self):
-        """Already gated in retrieval, where the gate belongs.
-
-        ``search_mcp_documents`` runs its hits through the shared quality
-        floor (``_select_relevant_chunks``, best distance <= 0.55) and returns
-        nothing when the best match misses — so anything that reaches this
-        attribute has cleared a threshold already.  A second opinion from the
-        small decision model is the worse of the two gates and can only
-        subtract.
-        """
-        orch = _make_orchestrator()
-        ctx = _ctx(orch)
-        orch.agent_llm.invoke = MagicMock(return_value="NOT_RELEVANT")
-        search_ctx = SearchContext(
-            mcp_document_context="Boards: Tickets, Roadmap, Hiring",
-        )
-
-        dropped = orch._judge.evaluate_sources(ctx, search_ctx)
-
-        assert dropped == []
-        assert search_ctx.mcp_document_context == "Boards: Tickets, Roadmap, Hiring"
-
     def test_mcp_context_alone_does_not_start_the_judge(self):
         """Nothing judgeable left, so the judge stays off the critical path."""
         orch = _make_orchestrator()
         ctx = _ctx(orch)
-        search_ctx = SearchContext(
-            mcp_context="open tickets = 4",
-            mcp_document_context="Boards: Tickets, Roadmap",
-        )
+        search_ctx = SearchContext(mcp_context="open tickets = 4")
 
         assert orch._judge.applies_to(ctx, search_ctx) is False
 

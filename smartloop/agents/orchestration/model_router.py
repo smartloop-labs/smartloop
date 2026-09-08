@@ -157,6 +157,36 @@ class ModelRouter:
         # happened to be the user's model.
         return self.decision_llm(capability)
 
+    def reasoning_llm(self, fallback: BaseLLM) -> BaseLLM:
+        """A model that can reason, for a call whose judgement warrants it.
+
+        MCP tool resolution is that call: one pass over every discovered tool
+        that has to pick the tool *and* fill its required arguments, and a
+        reasoning block is the difference between a considered answer and a
+        guess.  So if the workspace has a model declaring
+        ``ModelCapability.THINKING`` enabled, that model runs it — rather than
+        whichever model the step would otherwise use, which on a multi-model
+        selection is the small router model.
+
+        Best-effort, like every other decision-node routing: ``decision_llm``
+        takes the capability model only when it is resident or comfortably
+        fits, so this never forces a load onto a memory-tight device.  A
+        *fallback* that already reasons is kept as-is — no lookup, no switch.
+        """
+        capability = ModelCapability.THINKING.value
+        if getattr(fallback, "supports_thinking", False):
+            return fallback
+        if not self._capability_model_exists(capability):
+            return fallback
+        resolved = self.decision_llm(capability)
+        if resolved is not None and getattr(resolved, "supports_thinking", False):
+            logger.info(
+                "[models] tool resolution → %s (thinking)",
+                self.model_label(resolved),
+            )
+            return resolved
+        return fallback
+
     def _capability_model_exists(self, capability: Optional[str]) -> bool:
         """True when some selected model declares *capability*.
 

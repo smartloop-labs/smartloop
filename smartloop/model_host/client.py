@@ -73,8 +73,17 @@ class ModelClient(ABC):
 
     @abstractmethod
     def generate(self, prompt: str, model_name: Optional[str] = None,
-                 capability: Optional[str] = None) -> str:
-        """Complete *prompt* and return the whole response."""
+                 capability: Optional[str] = None,
+                 max_tokens: Optional[int] = None,
+                 thinking: Optional[bool] = None) -> str:
+        """Complete *prompt* and return the whole response.
+
+        ``max_tokens`` caps the output; ``thinking`` forces the reasoning block
+        on or off for this call whatever the user's setting says.  Both belong
+        to the request rather than to the loaded model: a decision call caps
+        itself so a missing stop token cannot ramble, and a call whose output
+        is a tool call rather than an answer reasons even when the visible
+        answer does not (see ``MCPAgent``)."""
 
     @abstractmethod
     def stream(self, prompt: str, model_name: Optional[str] = None,
@@ -103,6 +112,14 @@ class ModelClient(ABC):
     @abstractmethod
     def is_loaded(self) -> bool:
         """Whether a generative model is resident."""
+
+    def supports_thinking(self, capability: Optional[str] = None) -> bool:
+        """Whether the model serving *capability* can reason.
+
+        Not abstract: a client that cannot answer says no, and a caller that
+        wanted reasoning simply asks for it and gets whatever the model does.
+        """
+        return False
 
     @abstractmethod
     def model_name(self) -> Optional[str]:
@@ -168,9 +185,11 @@ class InProcessModelClient(ModelClient):
     def __init__(self, model_service) -> None:
         self._service = model_service
 
-    def generate(self, prompt, model_name=None, capability=None) -> str:
+    def generate(self, prompt, model_name=None, capability=None,
+                 max_tokens=None, thinking=None) -> str:
         return self._service.generate_completion(
             prompt, model_name, capability=capability,
+            max_tokens=max_tokens, thinking=thinking,
         )
 
     def stream(self, prompt, model_name=None, capability=None, cancelled=None):
@@ -189,6 +208,9 @@ class InProcessModelClient(ModelClient):
 
     def is_loaded(self) -> bool:
         return self._service.is_loaded()
+
+    def supports_thinking(self, capability=None) -> bool:
+        return self._service.supports_thinking(capability)
 
     def model_name(self) -> Optional[str]:
         return self._service._model_name
@@ -340,9 +362,11 @@ class RemoteModelClient(ModelClient):
 
     # -- ModelClient --------------------------------------------------------
 
-    def generate(self, prompt, model_name=None, capability=None) -> str:
+    def generate(self, prompt, model_name=None, capability=None,
+                 max_tokens=None, thinking=None) -> str:
         return self._call("generate", prompt=prompt, model_name=model_name,
-                          capability=capability) or ""
+                          capability=capability, max_tokens=max_tokens,
+                          thinking=thinking) or ""
 
     def stream(self, prompt, model_name=None, capability=None, cancelled=None):
         stream = self._exchange(
@@ -364,6 +388,9 @@ class RemoteModelClient(ModelClient):
 
     def is_loaded(self) -> bool:
         return bool(self._call("is_loaded"))
+
+    def supports_thinking(self, capability=None) -> bool:
+        return bool(self._call("supports_thinking", capability=capability))
 
     def model_name(self) -> Optional[str]:
         return self._call("model_name")

@@ -103,7 +103,6 @@ class ResponseBuilder:
             or search_ctx.workspace_context
             or search_ctx.web_context
             or search_ctx.mcp_context
-            or search_ctx.mcp_document_context
         ):
             logger.info(
                 "[collect] indexed match found — overriding conversation "
@@ -169,7 +168,6 @@ class ResponseBuilder:
         workspace_context = search_ctx.workspace_context
         web_context = search_ctx.web_context
         mcp_context = search_ctx.mcp_context
-        mcp_document_context = search_ctx.mcp_document_context
 
         if not tool_context and vector_context and not is_conversation:
             context_parts.append(vector_context)
@@ -196,14 +194,6 @@ class ResponseBuilder:
                 context_parts.append(f"WORKSPACE FILES:\n{workspace_context}")
                 logger.info(f"[collect] workspace: {len(workspace_context)} chars")
 
-            # Crawled MCP content is stored content, like documents and
-            # workspace files — a live tool result for this query outranks it,
-            # which is why it sits behind the same `not tool_context` gate.
-            if mcp_document_context and not is_conversation:
-                context_parts.append(f"MCP CONTENT:\n{mcp_document_context}")
-                logger.info(
-                    f"[collect] mcp content: {len(mcp_document_context)} chars"
-                )
 
         if not context_parts and not has_skill:
             logger.info("[collect] No context gathered — conversation only")

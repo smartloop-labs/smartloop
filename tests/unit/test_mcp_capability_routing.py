@@ -80,65 +80,60 @@ class TestSmallTierHonoursCapability:
         assert router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS) is cap_llm
 
 
-class TestToolPickTakesTheOverride:
+class TestToolResolutionTakesTheOverride:
     """The pick is the harder judgement of the two — upgrading only the
     argument extraction just got the arguments right for the wrong tool."""
 
     @staticmethod
-    def _agent_with_two_candidates(default_llm):
+    def _agent_with_two_tools(default_llm):
         agent = MCPAgent(default_llm)
-        # Two candidates, so the pick actually goes to the LLM (a single
-        # candidate needs no disambiguation and short-circuits).
-        candidates = []
-        for i, (server_id, tool) in enumerate(
-            [("srv-1", "list_issues"), ("srv-1", "create_issue")]
-        ):
-            c = MagicMock()
-            c.metadata = {
-                "server_id": server_id,
-                "tool_name": tool,
-                "qualified_name": f"linear.{tool}",
-            }
-            c.text = tool
-            candidates.append(c)
         server = MagicMock()
         server.id = "srv-1"
+        server.name = "linear"
         server.enabled = True
-        server.tools = []
-        return agent, candidates, [server]
+        server.system = False
+        server.tools = [
+            {"name": "list_issues", "description": "List issues",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "create_issue", "description": "Create an issue",
+             "input_schema": {
+                 "type": "object",
+                 "properties": {"title": {"type": "string",
+                                          "description": "The issue title"}},
+                 "required": ["title"],
+             }},
+        ]
+        return agent, [server]
 
-    def _select(self, monkeypatch, agent, candidates, servers, **kwargs):
-        indexer = MagicMock()
-        indexer.search.return_value = candidates
-        monkeypatch.setattr(
-            "smartloop.db.mcp_tool_indexer.MCPToolIndexer",
-            MagicMock(return_value=indexer),
-        )
-        return agent.select_tool(
+    def test_the_override_model_resolves_the_call(self):
+        default_llm = _llm("Slp Orchestra Mini")
+        default_llm.invoke = MagicMock(return_value='{"tool": 2}')
+        capability_llm = _llm("Gemma 3n E2B")
+        capability_llm.invoke = MagicMock(return_value='{"tool": 1}')
+        agent, servers = self._agent_with_two_tools(default_llm)
+
+        resolved = agent.resolve(
             directive="list my open issues",
-            project_dir="/tmp/project",
             mcp_servers=servers,
-            **kwargs,
+            llm=capability_llm,
         )
 
-    def test_the_override_model_makes_the_pick(self, monkeypatch):
-        default_llm = MagicMock(invoke=MagicMock(return_value="2"))
-        capability_llm = MagicMock(invoke=MagicMock(return_value="1"))
-        agent, candidates, servers = self._agent_with_two_candidates(default_llm)
-
-        picked = self._select(
-            monkeypatch, agent, candidates, servers, llm=capability_llm,
-        )
-
-        assert picked == ("srv-1", "list_issues")
+        assert (resolved.server_id, resolved.tool_name) == ("srv-1", "list_issues")
         capability_llm.invoke.assert_called_once()
         default_llm.invoke.assert_not_called()
 
-    def test_without_an_override_the_agent_model_still_picks(self, monkeypatch):
-        default_llm = MagicMock(invoke=MagicMock(return_value="2"))
-        agent, candidates, servers = self._agent_with_two_candidates(default_llm)
+    def test_without_an_override_the_agent_model_still_resolves(self):
+        default_llm = _llm("Slp Orchestra Mini")
+        default_llm.invoke = MagicMock(
+            return_value='{"tool": 2, "arguments": {"title": "Login is broken"}}'
+        )
+        agent, servers = self._agent_with_two_tools(default_llm)
 
-        picked = self._select(monkeypatch, agent, candidates, servers)
+        resolved = agent.resolve(
+            directive="file an issue: Login is broken", mcp_servers=servers,
+        )
 
-        assert picked == ("srv-1", "create_issue")
+        assert (resolved.server_id, resolved.tool_name) == ("srv-1", "create_issue")
+        # The pick and its required argument come out of the same call.
+        assert resolved.arguments == {"title": "Login is broken"}
         default_llm.invoke.assert_called_once()

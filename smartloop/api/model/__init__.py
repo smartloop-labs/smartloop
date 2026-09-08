@@ -34,7 +34,6 @@ from .project import (
 )
 
 from .mcp import (
-    MCPCrawlRequest,
     MCPDefinitionRequest,
     MCPServerResponse,
     MCPServerListResponse,
@@ -73,7 +72,6 @@ __all__ = [
     "ProjectResponse",
     "ProjectListResponse",
     "DeleteProjectResponse",
-    "MCPCrawlRequest",
     "MCPDefinitionRequest",
     "MCPServerResponse",
     "MCPServerListResponse",

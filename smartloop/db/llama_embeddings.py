@@ -55,7 +55,7 @@ _EMBED_N_CTX = 2048
 _MAX_INPUT_CHARS = 2000
 
 # Chunks handed to llama.cpp per embed() call.  The whole list used to go in
-# one call, so indexing a large document (an MCP crawl can produce hundreds of
+# one call, so indexing a large document (a workspace pass can produce hundreds of
 # chunks) allocated for every chunk at once — with n_ubatch sized to the full
 # 8192-token context, that is what pushed memory over.  Slicing bounds the peak
 # to a fixed cost regardless of how much is being indexed; the model is loaded

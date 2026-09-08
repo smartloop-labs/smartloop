@@ -1,8 +1,8 @@
-"""Embedding memory behaviour: bounded encode batches, and unload after a crawl.
+"""Embedding memory behaviour: bounded encode batches, and unload when idle.
 
-Adding an MCP server used to push memory over: the crawl embedded every chunk
-in a single llama.cpp call, and the model then stayed resident with nothing to
-do. These cover both halves.
+An indexing pass used to push memory over: it embedded every chunk in a single
+llama.cpp call, and the model then stayed resident with nothing to do. These
+cover both halves.
 """
 import numpy as np
 import pytest
@@ -121,35 +121,6 @@ class TestUnload:
         embeddings.unload()
 
         assert embeddings._model is None
-
-
-class TestCrawlUnloadsEmbeddings:
-    def test_crawl_server_unloads_even_when_the_crawl_raises(self, monkeypatch):
-        """A crawl that failed has still loaded the model."""
-        from smartloop.db import mcp_document_indexer as mod
-
-        calls = []
-        monkeypatch.setattr(
-            "smartloop.db.embeddings.unload", lambda: calls.append("unload")
-        )
-
-        indexer = object.__new__(mod.MCPDocumentIndexer)
-        import logging
-        import threading
-
-        indexer._lock = threading.RLock()
-        indexer._crawling = set()
-        indexer._logger = logging.getLogger("test")
-
-        def boom(*a, **k):
-            raise RuntimeError("crawl failed")
-
-        monkeypatch.setattr(indexer, "_crawl_server", boom, raising=False)
-
-        with pytest.raises(RuntimeError):
-            indexer.crawl_server(object())
-
-        assert calls == ["unload"]
 
 
 class TestInputClamp:

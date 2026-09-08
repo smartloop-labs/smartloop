@@ -194,28 +194,6 @@ class AppSettings(BaseSettings):
         validation_alias="slp_orchestrate_timeout_s",
         description="Max seconds for one orchestration pass before it is cancelled; 0 disables.",
     )
-    # How often registered document-type MCP servers (Notion, Linear, Trello, …)
-    # are re-crawled so their vectorized content tracks the source.  The first
-    # cycle always runs at startup; two thresholds decide the cadence after
-    # that.
-    #
-    # This one is the ceiling: an hour since the last crawl and the content is
-    # stale enough to be worth refreshing even if the user is mid-conversation.
-    # 0 disables the periodic refresh entirely (a crawl then only happens on
-    # registration or when a client asks for one).
-    mcp_crawl_interval_s: float = Field(
-        default=3600.0,
-        validation_alias="slp_mcp_crawl_interval_s",
-        description="Seconds after which MCP content is refreshed regardless of activity; 0 disables the periodic crawl.",
-    )
-    # The idle cadence, and the usual one: a crawl competes for CPU, network and
-    # the same MCP connections a live tool call needs, so most refreshes should
-    # land in a gap rather than on a reply someone is watching stream.
-    mcp_idle_crawl_interval_s: float = Field(
-        default=600.0,
-        validation_alias="slp_mcp_idle_crawl_interval_s",
-        description="Seconds between MCP content refreshes while the model is idle.",
-    )
     # --- per-project agent processes (see smartloop.supervisor) ------------
     # How long a project agent may sit unused before the supervisor stops it,
     # returning its baseline RSS.  A child carries FastAPI, the SQLite index

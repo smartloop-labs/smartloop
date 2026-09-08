@@ -33,8 +33,10 @@ class FakeDevice(ModelClient):
         self.loaded = True
         self.yielded = 0
 
-    def generate(self, prompt, model_name=None, capability=None) -> str:
+    def generate(self, prompt, model_name=None, capability=None,
+                 max_tokens=None, thinking=None) -> str:
         self.calls.append(("generate", prompt, model_name, capability))
+        self.options = {"max_tokens": max_tokens, "thinking": thinking}
         if self.fail_with:
             raise self.fail_with
         return f"answer to {prompt}"
@@ -219,8 +221,10 @@ class TestTheInProcessClient:
             self.calls = []
             self._model_name = "sl-mini"
 
-        def generate_completion(self, prompt, model_name=None, capability=None):
+        def generate_completion(self, prompt, model_name=None, capability=None,
+                                max_tokens=None, thinking=None):
             self.calls.append(("generate_completion", prompt, model_name, capability))
+            self.options = {"max_tokens": max_tokens, "thinking": thinking}
             return "done"
 
         def stream_completion(self, prompt, model_name=None, cancelled=None,

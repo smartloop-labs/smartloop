@@ -58,6 +58,7 @@ class RemoteLLM(BaseLLM):
         )
         self._cancelled: Optional[threading.Event] = None
         self._capability = capability
+        self._supports_thinking: Optional[bool] = None
 
     # -- identity -----------------------------------------------------------
 
@@ -82,7 +83,11 @@ class RemoteLLM(BaseLLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
-        return self.client.generate(prompt, capability=self._capability)
+        return self.client.generate(
+            prompt, capability=self._capability,
+            max_tokens=kwargs.get("max_tokens"),
+            thinking=kwargs.get("thinking"),
+        )
 
     def _stream(
         self,
@@ -100,16 +105,44 @@ class RemoteLLM(BaseLLM):
                 break
             yield GenerationChunk(text=text)
 
-    def invoke(self, prompt: str, max_tokens: Optional[int] = None) -> str:
+    @property
+    def supports_thinking(self) -> bool:
+        """Whether the model behind this handle can reason.
+
+        Asked of the host, which owns the weights and therefore the answer.
+        Cached per handle: it cannot change without the host swapping models,
+        and this is read on the resolution path of every MCP step.
+        """
+        if self._supports_thinking is None:
+            try:
+                self._supports_thinking = bool(
+                    self.client.supports_thinking(self._capability)
+                )
+            except Exception:
+                self._supports_thinking = False
+        return self._supports_thinking
+
+    def invoke(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        thinking: Optional[bool] = None,
+    ) -> str:
         """Generate once, matching the local LLM's forgiving contract.
 
         Errors are returned rather than raised for the same reason they are
         locally: the orchestrator calls this from DAG nodes that treat a bad
         answer as a dead branch, and an exception there would take down a whole
         plan over one step.
+
+        ``max_tokens`` and ``thinking`` travel to the host with the request:
+        they belong to this call, not to the loaded model, and a caller whose
+        output is a tool call rather than an answer needs both.
         """
         try:
-            response = (self._call(prompt) or "").strip()
+            response = (self._call(
+                prompt, max_tokens=max_tokens, thinking=thinking,
+            ) or "").strip()
             if response.endswith("<|eot_id|>"):
                 response = response[:-10].strip()
             return response or "No response generated"

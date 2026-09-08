@@ -32,16 +32,8 @@ class MCPServerResponse(BaseModel):
     # waiting on the response.
     status: str = "ready"
     last_error: Optional[str] = None
-    # Content crawl opt-in: None = automatic (on for document-type servers).
-    crawl: Optional[bool] = None
-    last_crawl_at: Optional[float] = None
     # Account this connection is linked as, when the server can say.
     account: Optional[str] = None
-
-
-class MCPCrawlRequest(BaseModel):
-    """Opt a server's content in or out of the crawl cycle."""
-    enabled: bool = True
 
 
 class MCPServerListResponse(BaseModel):
@@ -80,7 +72,7 @@ class MCPDefinitionRequest(BaseModel):
     """A connection described by a dropped-in TOML file.
 
     ``toml`` is the file's text; ``filename`` names the copy kept under
-    ``~/.smartloop/mcp.d/`` so the crawl plan it declares survives the install.
+    ``~/.smartloop/mcp.d/``, so the connection survives as a file.
     """
     toml: str
     filename: Optional[str] = None

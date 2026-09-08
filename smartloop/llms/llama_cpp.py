@@ -31,8 +31,30 @@ THINKING_MIN_BUDGET = 512
 class LlamaCpp(BaseLLM[Llama]):
     """Llama wrapper"""
     temperature: float = 0.3
-    def __init__(self, model: Llama, tokenizer: Any, logger: logging.Logger, project_id: str, is_training: bool = False):
+    def __init__(self, model: Llama, tokenizer: Any, logger: logging.Logger, project_id: str, is_training: bool = False, model_name: Optional[str] = None):
         super().__init__(model=model, tokenizer=tokenizer, logger=logger, project_id=project_id, is_training=is_training)
+        # The name this model was *selected* under, which is what the picker
+        # shows and therefore what a status event has to say.
+        self._slp_model_name = model_name
+
+    @property
+    def model_label(self) -> str:
+        """The model's name as the user chose it, or ``""``.
+
+        A GGUF's ``general.name`` is the upstream author's — for a model the
+        user built or merged it is whatever the build was called
+        ("Build Merged"), a name that appears nowhere in the product.  The
+        selected name is the one in the picker, so it leads; empty here means
+        the caller falls back to the metadata (see
+        ``ModelRouter.model_label``).
+        """
+        if not self._slp_model_name:
+            return ""
+        try:
+            from smartloop.constants import display_model_name
+            return display_model_name(self._slp_model_name)
+        except Exception:
+            return self._slp_model_name
     
     def _context_lock(self) -> "threading.RLock":
         """The lock serializing generation on this llama.cpp context.
@@ -159,6 +181,38 @@ class LlamaCpp(BaseLLM[Llama]):
             self.logger.warning("[llm] prompt-fit guard failed: %s", e)
             return prompt
 
+    @property
+    def supports_thinking(self) -> bool:
+        """True when this model's chat template can reason.
+
+        The flag is bound onto the ``Llama`` at load and only for a model whose
+        template reads ``enable_thinking`` (see ``LlmFactory._bind_thinking``),
+        so its presence is the answer.  Its *value* is the user's setting for
+        visible answers, which a caller can override per call.
+        """
+        return hasattr(self.model, "_slp_thinking")
+
+    @contextlib.contextmanager
+    def _thinking_override(self, thinking: Optional[bool]):
+        """Force the reasoning block on or off for one call.
+
+        Used by callers whose output is not the visible answer — resolving an
+        MCP tool call, for one — where the monologue is stripped before
+        anything reads the text and the judgement is worth the tokens.  Safe on
+        the shared ``Llama``: generation on it is serialized by the context
+        lock this runs inside.
+        """
+        model = self.model
+        if thinking is None or not hasattr(model, "_slp_thinking"):
+            yield
+            return
+        previous = model._slp_thinking
+        model._slp_thinking = bool(thinking)
+        try:
+            yield
+        finally:
+            model._slp_thinking = previous
+
     @contextlib.contextmanager
     def _thinking_for_budget(self, max_tokens: Optional[int]):
         """Suppress the reasoning block for a call too small to hold one.
@@ -218,7 +272,8 @@ class LlamaCpp(BaseLLM[Llama]):
                 # The guard only has to span the call itself: the chat handler
                 # renders the template (where enable_thinking is read) eagerly
                 # and returns an already-prompted token generator.
-                with self._thinking_for_budget(available_tokens):
+                with self._thinking_override(kwargs.get("thinking")), \
+                        self._thinking_for_budget(available_tokens):
                     stream = self.model.create_chat_completion(
                         messages=messages,
                         max_tokens=available_tokens,
@@ -375,7 +430,12 @@ class LlamaCpp(BaseLLM[Llama]):
         """Get the type of language model used by this chat model. Used for logging purposes only."""
         return "smartloop"
 
-    def invoke(self, prompt: str, max_tokens: Optional[int] = None) -> str:
+    def invoke(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        thinking: Optional[bool] = None,
+    ) -> str:
         """
         Invoke the LLM with the given prompt
 
@@ -385,16 +445,23 @@ class LlamaCpp(BaseLLM[Llama]):
                 for short classification-style calls (e.g. skill matching) to
                 avoid runaway greedy generation when the model fails to emit
                 a stop token.
+            thinking: Force the reasoning block on (True) or off (False) for
+                this call, whatever the user's setting says. For a call whose
+                output is not the visible answer — the monologue is stripped
+                either way — and where the judgement is worth the tokens. None
+                leaves the setting alone.
 
         Returns:
             Generated response text
         """
 
         try:
-            response = (
-                self._call(prompt, max_tokens=max_tokens)
-                if max_tokens is not None else self._call(prompt)
-            )
+            kwargs = {}
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            if thinking is not None:
+                kwargs["thinking"] = thinking
+            response = self._call(prompt, **kwargs)
 
             cleaned_response = response.strip()
             if cleaned_response.endswith('<|eot_id|>'):

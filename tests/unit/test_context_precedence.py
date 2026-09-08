@@ -1,9 +1,12 @@
 """Local sources lead the explore context, and none of them cancel another.
 
-Two failure modes this pins down:
-  * web results ordered ahead of the user's own MCP content;
+Three failure modes this pins down:
+  * web results ordered ahead of the user's own connected-server data;
   * a live MCP tool result suppressing the web search entirely, so a query
-    spanning both came back with half its context.
+    spanning both came back with half its context;
+  * the live MCP call itself being skipped, which is what a locally indexed
+    copy of the server's content used to do — a question is now put to every
+    source, the servers included.
 """
 import inspect
 
@@ -29,7 +32,6 @@ class TestExploreOrdering:
             "search_ctx.vector_context",
             "search_ctx.workspace_context",
             "search_ctx.mcp_context",
-            "search_ctx.mcp_document_context",
             "search_ctx.feedback_context",
         ):
             assert pos(local) < web, f"{local} must be appended before web results"
@@ -54,11 +56,15 @@ class TestSourcesCombine:
 
         assert "_needs_web_search" in block
 
-    def test_crawled_mcp_content_is_collected_unconditionally(self):
-        """It is submitted to the pool regardless of what else matched, so no
-        other source can drop it."""
-        src = inspect.getsource(explorer)
-        assert "f_mcp_docs = pool.submit(" in src
-        submit_at = src.index("f_mcp_docs = pool.submit(")
-        preceding = src[:submit_at].rsplit("\n", 6)[-1]
-        assert "if " not in preceding, "MCP content search must not be conditional"
+    def test_the_live_mcp_call_is_submitted_whenever_a_server_is_connected(self):
+        """Nothing else matching may skip it: the connected servers are one of
+        the sources a question is put to, not a fallback for when the local
+        ones come back empty."""
+        src = inspect.getsource(explorer.Explorer.collect_parallel)
+        start = src.index("f_mcp = None")
+        block = src[start:start + 300]
+
+        assert "if mcp_servers:" in block
+        assert "self._run_mcp" in block
+        # The only condition on it is "is there a server at all".
+        assert "mcp_document_context" not in src

@@ -20,7 +20,7 @@ from smartloop.agents.nodes import NodeResult
 from smartloop.agents.mcp.argument_extractor import MCPArgumentExtractor
 from smartloop.agents.mcp.dependency_analyzer import MCPDependencyAnalyzer
 from smartloop.agents.mcp.explorer import Explorer
-from smartloop.agents.mcp.mcp_agent import MCPAgent
+from smartloop.agents.mcp.mcp_agent import MCPAgent, missing_required
 from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 from smartloop.agents.mcp.server_selector import (
     BASH_TOOL, EXPLORE_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL,
@@ -669,7 +669,6 @@ class StepExecutor:
         mcp_servers = ctx.mcp_servers
         available_servers = ctx.available_servers
         cwd = ctx.effective_cwd
-        project_dir = ctx.project_dir
 
         tool_name = step.tool_name or ""
         has_explicit_tool = bool(step.tool_name)
@@ -699,45 +698,64 @@ class StepExecutor:
             step.server_id == SYSTEM_TOOLS_SERVER_ID or tool_name in _SYSTEM_TOOLS
         )
 
+        # What earlier steps returned, shared by tool resolution below and the
+        # dependency analysis further down: a chained call ("comment on the
+        # design you just listed") takes its arguments from here, so the two
+        # must read the same text.
+        prior_text = ""
+        if previous_results:
+            prior_text = "\n".join(
+                f"[{r.get('tool_name', 'tool')}]: {str(r.get('result', ''))[:500]}"
+                for r in previous_results
+            )
+
         # Find server + tool.
         server = None
         if step.server_id:
             server = self.tool_caller.find_server(mcp_servers, step.server_id, step.server_name)
 
+        # Arguments the resolution below filled while picking the tool. Used
+        # instead of a second extraction pass when they cover what the tool
+        # requires — one call that saw the tool list, the request and the prior
+        # results together beats two that each saw part of it.
+        resolved_arguments: Dict[str, Any] = {}
+
         if not is_system:
-            # External MCP tools resolve through the MCPAgent: it retrieves the
-            # top tools from the mcp_tools vector index as one flat
-            # server.tool_name list and the LLM picks one. There is no
+            # External MCP tools resolve through the MCPAgent: it reasons over
+            # the tools discovery recorded for every connected server and
+            # answers with one call, required arguments filled. There is no
             # keyword-scan fallback. An explicit, already-resolvable plan choice
             # (server present + exact tool schema) is honoured first so a
-            # well-specified plan skips retrieval.
+            # well-specified plan skips resolution.
             explicit_ok = (
                 server is not None
                 and has_explicit_tool
                 and self.tool_caller.find_tool_schema(server, tool_name) is not None
             )
             if not explicit_ok:
-                picked = self._mcp_agent.select_tool(
+                picked = self._mcp_agent.resolve(
                     directive=directive,
-                    project_dir=project_dir,
                     mcp_servers=mcp_servers,
-                    # Same model that extracts the arguments below picks the
-                    # tool — the pick is the harder judgement of the two, so
+                    context=prior_text,
+                    # Same model that extracts the arguments below resolves the
+                    # call — the pick is the harder judgement of the two, so
                     # leaving it on the default while upgrading extraction
                     # only got the arguments right for the wrong tool.
                     llm=llm,
                 )
                 if picked:
-                    picked_server_id, picked_tool = picked
                     server = self.tool_caller.find_server(
-                        mcp_servers, picked_server_id, picked_server_id,
+                        mcp_servers, picked.server_id, picked.server_id,
                     )
                     if server:
-                        tool_name = picked_tool
+                        tool_name = picked.tool_name
                         has_explicit_tool = True
+                        resolved_arguments = dict(picked.arguments)
                         logger.info(
-                            f"[resolve] MCPAgent selected '{tool_name}' on "
-                            f"server '{server.name}' via vector retrieval"
+                            f"[resolve] MCPAgent resolved '{tool_name}' on "
+                            f"server '{server.name}' "
+                            f"(thinking={picked.reasoned}, "
+                            f"args={sorted(resolved_arguments)})"
                         )
 
         if not server:
@@ -812,11 +830,7 @@ class StepExecutor:
             for t in server.tools
         ]
         dep_context = directive
-        if previous_results:
-            prior_text = "\n".join(
-                f"[{r.get('tool_name', 'tool')}]: {str(r.get('result', ''))[:500]}"
-                for r in previous_results
-            )
+        if prior_text:
             dep_context = f"{directive}\n\nPrevious step results:\n{prior_text}"
 
         dep_analysis = self.dep_analyzer.invoke(
@@ -934,6 +948,20 @@ class StepExecutor:
             arguments = deterministic_args
             logger.info(
                 "[resolve] '%s' all required params filled deterministically: %s",
+                tool_name, arguments,
+            )
+        elif resolved_arguments and not missing_required(input_schema, resolved_arguments):
+            # Resolution already filled every required argument, in the call
+            # that chose the tool — a second extraction pass would ask a
+            # smaller question with less context and can only lose.  A partial
+            # fill falls through to the extractor below rather than being
+            # patched up here.
+            properties_now = input_schema.get('properties', {})
+            arguments = {
+                k: v for k, v in resolved_arguments.items() if k in properties_now
+            }
+            logger.info(
+                "[resolve] '%s' arguments came from tool resolution: %s",
                 tool_name, arguments,
             )
         elif resolved_ids:
