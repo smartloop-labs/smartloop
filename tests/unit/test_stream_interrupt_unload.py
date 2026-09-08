@@ -69,7 +69,8 @@ async def test_interrupt_defers_unload_until_the_producer_stops():
     release = threading.Event()   # let it produce its second token
     finished = threading.Event()  # producer's generator is done
 
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         try:
             yield GenerationChunk(text="hello")
             entered.set()
@@ -119,7 +120,8 @@ async def test_interrupt_defers_unload_until_the_producer_stops():
 @pytest.mark.asyncio
 async def test_normal_completion_still_unloads():
     """The happy path must keep freeing the auxiliary models."""
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text="hello")
 
     svc = _service(stream_completion)

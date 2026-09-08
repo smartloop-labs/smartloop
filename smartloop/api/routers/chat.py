@@ -35,7 +35,9 @@ from smartloop.api.services import ModelService, get_model_service, get_api_clie
 # user's question — reused below to decide a source is about the answer, so
 # the two ends of the citation contract agree on what "related" means.
 from smartloop.api.services.model_service import _MIN_BEST_DISTANCE
-from smartloop.constants import SYSTEM_PROMPT, display_model_name, resolve_current_date
+from smartloop.constants import (
+    OPENING_TOKENS, SYSTEM_PROMPT, display_model_name, resolve_current_date,
+)
 from smartloop.types import ModelCapability
 from smartloop.workspace.context import bind, set_active_project
 
@@ -89,6 +91,14 @@ def _resolve_requested_skill(message: str, skills: list) -> tuple:
             cleaned = rest.strip() or f"Run the '{s.name}' skill."
             return s.name, cleaned
     return None, message
+
+
+#: Chunks of the answer that go out before the source encode is dispatched.
+#: The embedder loads onto the same device the answer decodes on, so it waits
+#: for the opening — see the dispatch in ``stream_chunks``.  The same window
+#: the decode rate is reported over, so the log and this decision are talking
+#: about the same opening.
+_PREP_SOURCES_AFTER_CHUNKS = OPENING_TOKENS
 
 
 _TAG_ESCAPE = {
@@ -1366,9 +1376,14 @@ async def stream_chunks(
             # default implementation is the same in-process call, but a project
             # agent configured with SLP_MODEL_HOST reaches the shared device
             # owner here instead.  The client always yields plain text.
+            # The answer does not reason.  Reasoning is how a tool call is
+            # course-corrected into the right tool with the right arguments
+            # (see MCPAgent) — by the time the answer is written that decision
+            # is made and its results are in the context, so a <think> block
+            # here only withholds the stream while it is produced.
             for text in model_service.model_client.stream(
                 prompt, request.model, capability=response_capability,
-                cancelled=cancelled,
+                cancelled=cancelled, thinking=False,
             ):
                 if cancelled.is_set():
                     break
@@ -1425,7 +1440,7 @@ async def stream_chunks(
                 try:
                     retry = model_service.model_client.generate(
                         simple_prompt, request.model,
-                        capability=response_capability,
+                        capability=response_capability, thinking=False,
                     )
                 except Exception as e:
                     logger.error(f"[stream] Simplified retry failed: {e}")
@@ -1489,14 +1504,30 @@ async def stream_chunks(
 
     # Load the embedding model and encode the sources alongside generation
     # rather than after it.  Verification cannot start until the answer is
-    # complete; nothing else about it has to wait.  Overlapped with the tokens
-    # the user is already reading this costs nothing, and it leaves the step
-    # after the answer with one encode instead of the whole job.
+    # complete; nothing else about it has to wait, and overlapping it leaves
+    # the step after the answer with one encode instead of the whole job.
+    #
+    # Not from the first token, though.  The embedder is a second GGUF and it
+    # goes onto the same device the answer is decoding on — around a second
+    # and a half of it, plus the encode itself:
+    #
+    #   21:46:47,018  [models] RESPONSE → qwen3.5-2b
+    #   21:46:47,020  [embeddings] Using cached GGUF … bge-m3-Q4_K_M.gguf
+    #   21:46:48,382  [embeddings] Loaded llama-cpp:… (n_gpu_layers=-1)
+    #
+    # Landing that on the opening tokens is the one place it is visible: the
+    # answer starts slowly and then speeds up, which reads as the model
+    # warming up.  Starting it once the opening is out keeps the overlap for
+    # everything after — nearly all of a long answer — and a short answer pays
+    # what it paid before this was overlapped at all.
     prepared_sources = None
-    if citations:
-        prepared_sources = loop.run_in_executor(
-            None, bind(_prepare_citation_sources), citations, model_service,
-        )
+
+    def _start_source_prep() -> None:
+        nonlocal prepared_sources
+        if citations and prepared_sources is None:
+            prepared_sources = loop.run_in_executor(
+                None, bind(_prepare_citation_sources), citations, model_service,
+            )
 
     # Signal that streaming has started
     yield _status_event("streaming", "processing", "Generating response...")
@@ -1546,6 +1577,8 @@ async def stream_chunks(
                 break
 
             full_response_parts.append(item)
+            if len(full_response_parts) == _PREP_SOURCES_AFTER_CHUNKS:
+                _start_source_prep()
             chunk = ChatCompletionChunk(
                 model=stream_model,
                 choices=[ChunkChoice(
@@ -1569,6 +1602,10 @@ async def stream_chunks(
         # generator ignored GeneratorExit" and takes the session write down
         # with it.  Awaiting there is fine; yielding is not.
         if citations and full_response_parts:
+            # An answer shorter than the opening window never reached the
+            # dispatch above; the encode still has to happen, it just has
+            # nothing left to overlap with.
+            _start_source_prep()
             yield _status_event("citations", "processing", "Checking sources...")
             verified_citations = await _verified_citations_async(
                 citations, "".join(full_response_parts), model_service,
@@ -1860,8 +1897,10 @@ async def _complete_without_streaming(
         response_capability = ModelCapability.GENERAL if orchestrator_context else None
         response_text = await loop.run_in_executor(
             _executor,
+            # No reasoning on the answer — see the streaming path above.
             bind(lambda: model_service.model_client.generate(
                 prompt, request.model, capability=response_capability,
+                thinking=False,
             )),
         )
 

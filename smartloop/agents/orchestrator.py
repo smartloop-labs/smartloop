@@ -93,9 +93,10 @@ class SLPOrchestrator:
         self.explorer = Explorer(self.agent_llm, self.tool_caller, self.arg_extractor)
         fetch_agent = FetchAgent()
         web_search_agent = WebSearchAgent(llm=self.agent_llm)
-        # MCPAgent: vector-retrieves candidate tools as one flat server.tool_name
-        # list, then LLM-picks. This is the resolution path for external MCP tool
-        # steps (no separate server selector, no keyword-scan fallback).
+        # MCPAgent: reasons over the tools discovery recorded for every
+        # connected server and answers with one call, required arguments
+        # filled. This is the resolution path for external MCP tool steps (no
+        # separate server selector, no keyword-scan fallback).
         self._mcp_agent = MCPAgent(self.agent_llm, logger)
 
         # -- Orchestration components, constructed in dependency order --

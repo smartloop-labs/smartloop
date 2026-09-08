@@ -183,11 +183,11 @@ class MCPOAuthCredentials(BaseModel):
 class MCPServerStatus(str, Enum):
     """Provisioning state of a registered MCP server.
 
-    Registration only persists the connection; discovery, metadata enrichment
-    and indexing run in the background (see :class:`MCPTask`), so a server is
-    ``PENDING`` until that pass finishes.  ``READY`` is the default so servers
-    written before this field existed — already discovered and indexed — are
-    not re-queued on upgrade.
+    Registration only persists the connection; discovery and metadata
+    enrichment run in the background (see :class:`MCPTask`), so a server is
+    ``PENDING`` until that pass finishes.  ``READY`` is the default so
+    servers written before this field existed — already discovered — are not
+    re-queued on upgrade.
     """
     PENDING = "pending"
     READY = "ready"
@@ -213,17 +213,12 @@ class MCPServer(BaseModel):
     system: bool = False
     tools: List[MCPToolDefinition] = []
     server_info: Optional[Dict[str, Any]] = None
-    # Background provisioning state (discovery → enrichment → tool index →
-    # content crawl).  Registration returns as soon as the connection is
-    # persisted, so clients poll this instead of blocking on the handshake.
+    # Background provisioning state (tool discovery, then metadata enrichment).
+    # Registration returns as soon as the connection is persisted, so clients
+    # poll this instead of blocking on the handshake.
     status: MCPServerStatus = MCPServerStatus.READY
     # Human-readable reason the last provisioning pass failed, if it did.
     last_error: Optional[str] = None
-    # Content crawl (see smartloop.mcp.crawl_plans): None = auto (crawl when a
-    # curated plan matches this server), True/False = explicit opt in/out.
-    crawl: Optional[bool] = None
-    # Epoch seconds of the last completed content crawl, for the refresh cycle.
-    last_crawl_at: Optional[float] = None
     # Which account this connection is authenticated as ("mehfuz@smartloop.ai",
     # "Smartloop HQ"), probed at provisioning time.  It is what distinguishes
     # two connections to the same product; None when the server ships no
@@ -527,8 +522,8 @@ class Workspace(BaseModel):
 
     _instance: ClassVar[Optional['Workspace']] = None
     _lock: ClassVar[threading.Lock] = threading.Lock()
-    # Serializes save(): background tasks (document indexing, MCP provisioning
-    # and the MCP content crawl) each persist from their own thread.
+    # Serializes save(): background tasks (document indexing, MCP
+    # provisioning) each persist from their own thread.
     _save_lock: ClassVar[threading.Lock] = threading.Lock()
     #: Resolved on access, not at import — see :class:`_ConfigFilePath`.
     config_file: ClassVar[Any] = _ConfigFilePath()
@@ -972,8 +967,8 @@ class Workspace(BaseModel):
         """Persist workspace state, each project into its own file.
 
         Serialized and atomic.  Several background tasks write the workspace
-        from their own threads — document indexing, MCP provisioning, the MCP
-        content crawl — and two of them writing the same file directly would
+        from their own threads — document indexing, MCP provisioning — and two
+        of them writing the same file directly would
         interleave into a truncated or half-updated config.  Every file is
         snapshotted under the lock and swapped in with a rename, so a reader
         (or a crash) sees either the old file or the new one.

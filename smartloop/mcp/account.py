@@ -7,7 +7,7 @@ connections: *whose* Notion is this?
 
 MCP has no standard "who am I", so this resolves one of the identity tools
 servers conventionally ship (``notion-get-self``, Linear's ``get_viewer``, …),
-calls it through the same read-only path the content crawl uses, and pulls a
+calls it through the shared read-only path, and pulls a
 human-readable label out of whatever shape comes back.
 
 Everything here is best-effort: a server with no identity tool, or one that
@@ -21,14 +21,14 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from smartloop.mcp.crawl_plans import normalize_name
+from smartloop.mcp.definitions import normalize_name
 from smartloop.mcp.read_only_calls import call_read_only, ensure_tool_caller
 
 logger = logging.getLogger(__name__)
 
 # Tools that answer "who is this connection authenticated as".
 #
-# Matched *exactly* (see :func:`resolve_account_tool`), unlike crawl steps.  The
+# Matched *exactly* (see :func:`resolve_account_tool`).  The
 # loose matcher would pair ``get_me`` with Trello's ``get_members`` — a member
 # list is not an account, and labelling a connection with the wrong person's
 # name is worse than labelling it with nothing.  So every real spelling is
@@ -65,11 +65,10 @@ _MAX_LABEL_CHARS = 80
 def resolve_account_tool(tool_names: List[str]) -> Optional[str]:
     """Return the server's identity tool, or None.
 
-    Exact-match only, on the shared name normalisation:
-    :func:`~smartloop.mcp.crawl_plans.resolve_tool` widens to prefix and
-    substring passes, which is right for a crawl step (skipping one is a missed
-    page) and wrong here (guessing wrong names the connection after someone
-    else).
+    Exact-match only, on the shared name normalisation
+    (:func:`~smartloop.mcp.definitions.normalize_name`).  A looser match —
+    prefix, substring — would guess, and a wrong guess names the connection
+    after someone else's account.
     """
     by_norm = {normalize_name(name): name for name in tool_names if name}
     for candidate in ACCOUNT_TOOLS:
@@ -142,7 +141,7 @@ def extract_account(payload: Optional[str]) -> Optional[str]:
 def probe_account(server: Any, tool_caller: Any = None) -> Optional[str]:
     """Return the account *server* is linked to, or None.
 
-    One read-only call, made through the same path as the content crawl.  Never
+    One read-only call, made through the shared read-only path.  Never
     raises: an unreachable server or a missing identity tool leaves the
     connection unlabelled.
     """

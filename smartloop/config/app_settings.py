@@ -67,6 +67,25 @@ class AppSettings(BaseSettings):
     # multi-process workers (each with its own model copy) were removed because
     # same-device copies serialize in the driver anyway.
     n_parallel: int = Field(default=1, validation_alias="slp_n_parallel")
+    # Prompt-processing batch (llama.cpp n_batch).  Prefill is what a long
+    # prompt costs — the whole tool catalog an MCP step is resolved against,
+    # a document being summarized — and it runs one batch at a time, so 512
+    # made a 3k-token prompt six passes when a GPU could do it in two.  Raised
+    # on a GPU backend (see LlmFactory), where the buffer it grows is measured
+    # in tens of MB; 0 keeps llama.cpp's own default.
+    llm_n_batch: int = Field(
+        default=0,
+        validation_alias="slp_llm_n_batch",
+        description="llama.cpp n_batch; 0 = choose from the device.",
+    )
+    # Generation threads (llama.cpp n_threads).  Only the layers that are not
+    # offloaded run on them, so this matters most on a CPU-only load — where a
+    # flat 4 left most of the machine idle.  0 = choose from the device.
+    llm_n_threads: int = Field(
+        default=0,
+        validation_alias="slp_llm_n_threads",
+        description="llama.cpp n_threads; 0 = choose from the device.",
+    )
     # Context window for each LLM worker's model copy.  0 (default) = no cap:
     # Cap applied to the MAIN model's (auto-sized) context window.  Its KV
     # cache otherwise scales to the whole device, leaving nothing for the
@@ -193,28 +212,6 @@ class AppSettings(BaseSettings):
         default=180.0,
         validation_alias="slp_orchestrate_timeout_s",
         description="Max seconds for one orchestration pass before it is cancelled; 0 disables.",
-    )
-    # How often registered document-type MCP servers (Notion, Linear, Trello, …)
-    # are re-crawled so their vectorized content tracks the source.  The first
-    # cycle always runs at startup; two thresholds decide the cadence after
-    # that.
-    #
-    # This one is the ceiling: an hour since the last crawl and the content is
-    # stale enough to be worth refreshing even if the user is mid-conversation.
-    # 0 disables the periodic refresh entirely (a crawl then only happens on
-    # registration or when a client asks for one).
-    mcp_crawl_interval_s: float = Field(
-        default=3600.0,
-        validation_alias="slp_mcp_crawl_interval_s",
-        description="Seconds after which MCP content is refreshed regardless of activity; 0 disables the periodic crawl.",
-    )
-    # The idle cadence, and the usual one: a crawl competes for CPU, network and
-    # the same MCP connections a live tool call needs, so most refreshes should
-    # land in a gap rather than on a reply someone is watching stream.
-    mcp_idle_crawl_interval_s: float = Field(
-        default=600.0,
-        validation_alias="slp_mcp_idle_crawl_interval_s",
-        description="Seconds between MCP content refreshes while the model is idle.",
     )
     # --- per-project agent processes (see smartloop.supervisor) ------------
     # How long a project agent may sit unused before the supervisor stops it,

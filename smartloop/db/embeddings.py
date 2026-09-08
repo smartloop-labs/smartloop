@@ -122,7 +122,7 @@ def _get_model(base_dir: Optional[str] = None):
 def unload() -> None:
     """Release the embedding model, freeing its weights and llama.cpp context.
 
-    Indexing is bursty — an MCP crawl embeds a few hundred chunks and then
+    Indexing is bursty — a workspace pass embeds a few hundred chunks and then
     nothing touches the model for minutes — but the singleton held the GGUF
     resident for the life of the process. Dropping it after a burst returns
     that memory; the next search reloads it lazily.
@@ -160,7 +160,7 @@ _burst_lock = threading.Lock()
 def indexing_burst():
     """Release the embedding model when this indexing scope finishes.
 
-    Indexing is bursty — a crawl or a workspace pass embeds a few hundred
+    Indexing is bursty — a document or workspace pass embeds a few hundred
     chunks and then nothing touches the model for minutes — so holding a GGUF
     and its llama.cpp context resident afterwards is pure cost. Wrapping the
     entry points keeps that decision in one place; adding an indexer means

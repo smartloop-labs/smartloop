@@ -7,8 +7,9 @@ and two things downstream depend on it:
   Without the slug, a 93-tool server like monday.com goes to the small model
   and comes back as unparseable JSON — two inference calls spent to produce
   nothing, and the curated description overwritten if it had succeeded.
-* :func:`~smartloop.mcp.crawl_plans.resolve_plan` checks the slug before it
-  falls back to matching substrings against the server's name and URL.
+* :func:`~smartloop.mcp.definitions.definition_for` checks the slug before it
+  falls back to matching substrings against the server's name and URL, which is
+  how a deleted connection's dropped-in file is found and removed.
 
 The install is not one call: register resolves the catalog, the OAuth grant
 leaves and comes back, and only then is the record written and saved.  The
@@ -205,7 +206,7 @@ class TestRegistrationCarriesTheSlug:
         platform token or an outage all read as "not curated".  Provenance is
         the client's claim about where it installed from, so losing the lookup
         must not lose the slug: without it the connection silently pays for LLM
-        enrichment and leans on name matching to find its crawl plan."""
+        enrichment and leans on name matching to find its definition file."""
         _, session = _register(catalog_hit=False)
         assert session["catalog_slug"] == SLUG
         # The metadata genuinely is unknown here, unlike the provenance.

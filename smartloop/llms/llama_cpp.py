@@ -12,6 +12,8 @@ from langchain_core.outputs import GenerationChunk
 
 from llama_cpp import Llama
 
+from smartloop.constants import OPENING_TOKENS
+
 from .base_llm import BaseLLM
 from .thinking import ThinkingFilter, strip_thinking
 
@@ -31,8 +33,30 @@ THINKING_MIN_BUDGET = 512
 class LlamaCpp(BaseLLM[Llama]):
     """Llama wrapper"""
     temperature: float = 0.3
-    def __init__(self, model: Llama, tokenizer: Any, logger: logging.Logger, project_id: str, is_training: bool = False):
+    def __init__(self, model: Llama, tokenizer: Any, logger: logging.Logger, project_id: str, is_training: bool = False, model_name: Optional[str] = None):
         super().__init__(model=model, tokenizer=tokenizer, logger=logger, project_id=project_id, is_training=is_training)
+        # The name this model was *selected* under, which is what the picker
+        # shows and therefore what a status event has to say.
+        self._slp_model_name = model_name
+
+    @property
+    def model_label(self) -> str:
+        """The model's name as the user chose it, or ``""``.
+
+        A GGUF's ``general.name`` is the upstream author's — for a model the
+        user built or merged it is whatever the build was called
+        ("Build Merged"), a name that appears nowhere in the product.  The
+        selected name is the one in the picker, so it leads; empty here means
+        the caller falls back to the metadata (see
+        ``ModelRouter.model_label``).
+        """
+        if not self._slp_model_name:
+            return ""
+        try:
+            from smartloop.constants import display_model_name
+            return display_model_name(self._slp_model_name)
+        except Exception:
+            return self._slp_model_name
     
     def _context_lock(self) -> "threading.RLock":
         """The lock serializing generation on this llama.cpp context.
@@ -159,6 +183,100 @@ class LlamaCpp(BaseLLM[Llama]):
             self.logger.warning("[llm] prompt-fit guard failed: %s", e)
             return prompt
 
+    @property
+    def supports_thinking(self) -> bool:
+        """True when this model's chat template can reason.
+
+        The flag is bound onto the ``Llama`` at load and only for a model whose
+        template reads ``enable_thinking`` (see ``LlmFactory._bind_thinking``),
+        so its presence is the answer.  Its *value* is what the flag is set to
+        between calls and no longer decides any of them: every call says what
+        it wants and unspecified means off (see :meth:`_requested_thinking`).
+        """
+        return hasattr(self.model, "_slp_thinking")
+
+    @staticmethod
+    def _rate(
+        prompt_tokens: int,
+        generated: int,
+        start_time: float,
+        first_token_at: Optional[float],
+        opening_at: Optional[float] = None,
+    ) -> str:
+        """`` | 512 prompt, ttft 1.8s, 12.4 tok/s`` for a generation.
+
+        "Slow" is not actionable and neither is a wall-clock total: a long
+        prompt on a fast model and a short prompt on a model that fell back to
+        CPU take the same ten seconds and want opposite fixes.  Prefill (time
+        to the first token, which the prompt pays for) and decode rate (what
+        the weights and the offload decide) separate them, and both are free to
+        measure here.
+
+        The average hides a ramp, though, and a ramp is what a reader notices:
+        an answer that opens slowly and then runs is reported as the same
+        10 tok/s as one that was even throughout.  So when a generation is long
+        enough to have two halves, *opening_at* — the moment the first
+        ``OPENING_TOKENS`` were out — splits the decode rate into the opening
+        the reader waits on and the rest, and something loading onto the device
+        alongside the first tokens shows up as the difference between them.
+        """
+        if not generated or first_token_at is None:
+            return ""
+        ttft = first_token_at - start_time
+        now = time.time()
+        decode = max(1e-6, now - first_token_at)
+        rate = f"{generated / decode:.1f} tok/s"
+        if opening_at is not None and generated > OPENING_TOKENS:
+            opening = max(1e-6, opening_at - first_token_at)
+            rest = max(1e-6, now - opening_at)
+            rate = (
+                f"{rate} (first {OPENING_TOKENS}: "
+                f"{OPENING_TOKENS / opening:.1f}, then "
+                f"{(generated - OPENING_TOKENS) / rest:.1f})"
+            )
+        return f" | {prompt_tokens} prompt, ttft {ttft:.2f}s, {rate}"
+
+    @staticmethod
+    def _requested_thinking(kwargs: Dict[str, Any]) -> bool:
+        """Whether this call asked to reason.  Unspecified means no.
+
+        Reasoning is opt-in per call, not a mode the model sits in.  A <think>
+        block is worth its tokens where it changes the outcome — resolving an
+        MCP tool call, which has to pick the tool *and* fill its arguments —
+        and it is pure latency everywhere else: classification, planning,
+        skill matching, per-document extraction and synthesis all parse a
+        short answer out of the reply and throw the monologue away.  Those
+        calls used to inherit whatever the model was loaded with, so turning
+        reasoning on for a model made the whole turn slower with nothing to
+        show for it.
+
+        The only caller that opts in is ``MCPAgent.resolve``.  Short decision
+        calls were already covered by :meth:`_thinking_for_budget`; this covers
+        the ones with room to think, which are the expensive ones.
+        """
+        return bool(kwargs.get("thinking"))
+
+    @contextlib.contextmanager
+    def _thinking_override(self, thinking: Optional[bool]):
+        """Force the reasoning block on or off for one call.
+
+        Used by callers whose output is not the visible answer — resolving an
+        MCP tool call, for one — where the monologue is stripped before
+        anything reads the text and the judgement is worth the tokens.  Safe on
+        the shared ``Llama``: generation on it is serialized by the context
+        lock this runs inside.
+        """
+        model = self.model
+        if thinking is None or not hasattr(model, "_slp_thinking"):
+            yield
+            return
+        previous = model._slp_thinking
+        model._slp_thinking = bool(thinking)
+        try:
+            yield
+        finally:
+            model._slp_thinking = previous
+
     @contextlib.contextmanager
     def _thinking_for_budget(self, max_tokens: Optional[int]):
         """Suppress the reasoning block for a call too small to hold one.
@@ -218,7 +336,8 @@ class LlamaCpp(BaseLLM[Llama]):
                 # The guard only has to span the call itself: the chat handler
                 # renders the template (where enable_thinking is read) eagerly
                 # and returns an already-prompted token generator.
-                with self._thinking_for_budget(available_tokens):
+                with self._thinking_override(self._requested_thinking(kwargs)), \
+                        self._thinking_for_budget(available_tokens):
                     stream = self.model.create_chat_completion(
                         messages=messages,
                         max_tokens=available_tokens,
@@ -232,6 +351,8 @@ class LlamaCpp(BaseLLM[Llama]):
                 parts: List[str] = []
                 chunk_count = 0
                 cancelled = False
+                first_token_at: Optional[float] = None
+                opening_at: Optional[float] = None
                 for chunk in stream:
                     # Check for cancellation between chunks.
                     if self._cancelled is not None and self._cancelled.is_set():
@@ -249,13 +370,18 @@ class LlamaCpp(BaseLLM[Llama]):
                             text = choice['text'] or ""
 
                     if text:
+                        if first_token_at is None:
+                            first_token_at = time.time()
                         parts.append(text)
                         chunk_count += 1
+                        if chunk_count == OPENING_TOKENS:
+                            opening_at = time.time()
 
                 elapsed = time.time() - start_time
                 self.logger.info(
                     f"{'Cancelled' if cancelled else 'Completed'} | "
                     f"chunks={chunk_count} elapsed={elapsed:.3f}s"
+                    f"{self._rate(prompt_tokens, chunk_count, start_time, first_token_at, opening_at)}"
                 )
                 # A reasoning model's <think> block is not the answer: every
                 # caller from here on treats this string as one (JSON planning,
@@ -291,17 +417,21 @@ class LlamaCpp(BaseLLM[Llama]):
             messages = self.create_messages_from_prompt(prompt)
             available_tokens = self._get_available_tokens(prompt)
 
-            stream = self.model.create_chat_completion(
-                messages=messages,
-                max_tokens=available_tokens,
-                temperature=self.temperature,
-                repeat_penalty=1.1,
-                frequency_penalty=0.0,
-                presence_penalty=0.0,
-                stream=True
-            )
+            with self._thinking_override(self._requested_thinking(kwargs)):
+                stream = self.model.create_chat_completion(
+                    messages=messages,
+                    max_tokens=available_tokens,
+                    temperature=self.temperature,
+                    repeat_penalty=1.1,
+                    frequency_penalty=0.0,
+                    presence_penalty=0.0,
+                    stream=True
+                )
 
             chunk_count = 0
+            start_time = time.time()
+            first_token_at: Optional[float] = None
+            opening_at: Optional[float] = None
             # Reasoning is withheld from the stream rather than shown and then
             # retracted; the tags can split across chunks, so the filter is
             # stateful and spans the whole stream.
@@ -312,6 +442,10 @@ class LlamaCpp(BaseLLM[Llama]):
                     break
 
                 chunk_count += 1
+                if first_token_at is None:
+                    first_token_at = time.time()
+                elif chunk_count == OPENING_TOKENS:
+                    opening_at = time.time()
                 # Extract text from llama_cpp CreateChatCompletionStreamResponse format
                 text = ""
 
@@ -358,6 +492,15 @@ class LlamaCpp(BaseLLM[Llama]):
 
             if chunk_count == 0:
                 self.logger.warning("No chunks received from stream")
+            else:
+                self.logger.info(
+                    "Streamed | chunks=%d elapsed=%.3fs%s",
+                    chunk_count, time.time() - start_time,
+                    self._rate(
+                        self.get_num_tokens(prompt), chunk_count,
+                        start_time, first_token_at, opening_at,
+                    ),
+                )
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:
@@ -375,7 +518,12 @@ class LlamaCpp(BaseLLM[Llama]):
         """Get the type of language model used by this chat model. Used for logging purposes only."""
         return "smartloop"
 
-    def invoke(self, prompt: str, max_tokens: Optional[int] = None) -> str:
+    def invoke(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        thinking: Optional[bool] = None,
+    ) -> str:
         """
         Invoke the LLM with the given prompt
 
@@ -385,16 +533,23 @@ class LlamaCpp(BaseLLM[Llama]):
                 for short classification-style calls (e.g. skill matching) to
                 avoid runaway greedy generation when the model fails to emit
                 a stop token.
+            thinking: Force the reasoning block on (True) or off (False) for
+                this call, whatever the user's setting says. For a call whose
+                output is not the visible answer — the monologue is stripped
+                either way — and where the judgement is worth the tokens. None
+                leaves the setting alone.
 
         Returns:
             Generated response text
         """
 
         try:
-            response = (
-                self._call(prompt, max_tokens=max_tokens)
-                if max_tokens is not None else self._call(prompt)
-            )
+            kwargs = {}
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            if thinking is not None:
+                kwargs["thinking"] = thinking
+            response = self._call(prompt, **kwargs)
 
             cleaned_response = response.strip()
             if cleaned_response.endswith('<|eot_id|>'):

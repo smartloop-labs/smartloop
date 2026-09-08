@@ -30,13 +30,16 @@ class FakeClient:
         self.tokens = 42
         self.context = 8192
 
-    def generate(self, prompt, model_name=None, capability=None):
+    def generate(self, prompt, model_name=None, capability=None,
+                 max_tokens=None, thinking=None):
         self.calls.append(("generate", prompt, capability))
+        self.options = {"max_tokens": max_tokens, "thinking": thinking}
         if self.fail_with:
             raise self.fail_with
         return f"answered {prompt}"
 
-    def stream(self, prompt, model_name=None, capability=None, cancelled=None):
+    def stream(self, prompt, model_name=None, capability=None, cancelled=None,
+               thinking=None):
         self.calls.append(("stream", prompt, capability))
         for chunk in self.chunks:
             if cancelled is not None and cancelled.is_set():

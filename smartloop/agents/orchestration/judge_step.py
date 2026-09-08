@@ -14,9 +14,7 @@ It never gates the user's connected-app data.  Tool results — a live MCP call
 during explore, a tool step's output in the plan — are exempt at both points:
 they were fetched on purpose rather than returned by a similarity search, so
 there is no recall noise to filter, and a wrong verdict throws away the very
-data the request went to get.  Crawled MCP content is exempt too, because it
-already passed the retrieval quality floor and does not need a second, worse
-gate.  See ``_JUDGED_SOURCES`` below.
+data the request went to get.  See ``_JUDGED_SOURCES`` below.
 """
 import logging
 import re
@@ -101,10 +99,8 @@ class JudgeStep(Step):
     # premise of the judge — recall returns neighbours whether or not any of
     # them is about the question.
     #
-    # Both MCP sources are deliberately absent — the user's connected-app data
-    # is never gated by this judge.
-    #
-    # ``mcp_context`` is a live tool result, and a tool call is not recall:
+    # ``mcp_context`` is deliberately absent — the user's connected-app data
+    # is never gated by this judge.  It is a live tool result, and a tool call is not recall:
     # something decided to invoke it, the server ran it, and what came back is
     # the answer to that call.  Judging it put a small decision model between
     # the user and data they explicitly went and fetched — and every verdict
@@ -114,16 +110,6 @@ class JudgeStep(Step):
     # problem, and gating its output cannot fix it: the call already happened,
     # and binning the result only loses the one piece of context that was
     # certainly about the request.
-    #
-    # ``mcp_document_context`` is crawled MCP content, and it is already
-    # relevance-gated where the gate belongs — in retrieval.
-    # ``search_mcp_documents`` runs it through ``_select_relevant_chunks``,
-    # the same quality floor (best-match distance <= 0.55) as document and
-    # workspace search, and returns nothing at all when the best match misses.
-    # Content that reaches this attribute has therefore already cleared a
-    # threshold; a second opinion from the small model is the *worse* of the
-    # two gates and only ever subtracts.  Identical reasoning to
-    # ``vector_context`` below.
     #
     # ``vector_context`` is deliberately absent: retrieved documents already
     # get their own per-document judge in the fan-out, where each one is

@@ -80,65 +80,188 @@ class TestSmallTierHonoursCapability:
         assert router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS) is cap_llm
 
 
-class TestToolPickTakesTheOverride:
+class TestToolResolutionTakesTheOverride:
     """The pick is the harder judgement of the two — upgrading only the
     argument extraction just got the arguments right for the wrong tool."""
 
     @staticmethod
-    def _agent_with_two_candidates(default_llm):
+    def _agent_with_two_tools(default_llm):
         agent = MCPAgent(default_llm)
-        # Two candidates, so the pick actually goes to the LLM (a single
-        # candidate needs no disambiguation and short-circuits).
-        candidates = []
-        for i, (server_id, tool) in enumerate(
-            [("srv-1", "list_issues"), ("srv-1", "create_issue")]
-        ):
-            c = MagicMock()
-            c.metadata = {
-                "server_id": server_id,
-                "tool_name": tool,
-                "qualified_name": f"linear.{tool}",
-            }
-            c.text = tool
-            candidates.append(c)
         server = MagicMock()
         server.id = "srv-1"
+        server.name = "linear"
         server.enabled = True
-        server.tools = []
-        return agent, candidates, [server]
+        server.system = False
+        server.tools = [
+            {"name": "list_issues", "description": "List issues",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "create_issue", "description": "Create an issue",
+             "input_schema": {
+                 "type": "object",
+                 "properties": {"title": {"type": "string",
+                                          "description": "The issue title"}},
+                 "required": ["title"],
+             }},
+        ]
+        return agent, [server]
 
-    def _select(self, monkeypatch, agent, candidates, servers, **kwargs):
-        indexer = MagicMock()
-        indexer.search.return_value = candidates
-        monkeypatch.setattr(
-            "smartloop.db.mcp_tool_indexer.MCPToolIndexer",
-            MagicMock(return_value=indexer),
-        )
-        return agent.select_tool(
+    def test_the_override_model_resolves_the_call(self):
+        default_llm = _llm("Slp Orchestra Mini")
+        default_llm.invoke = MagicMock(return_value='{"tool": 2}')
+        capability_llm = _llm("Gemma 3n E2B")
+        capability_llm.invoke = MagicMock(return_value='{"tool": 1}')
+        agent, servers = self._agent_with_two_tools(default_llm)
+
+        resolved = agent.resolve(
             directive="list my open issues",
-            project_dir="/tmp/project",
             mcp_servers=servers,
-            **kwargs,
+            llm=capability_llm,
         )
 
-    def test_the_override_model_makes_the_pick(self, monkeypatch):
-        default_llm = MagicMock(invoke=MagicMock(return_value="2"))
-        capability_llm = MagicMock(invoke=MagicMock(return_value="1"))
-        agent, candidates, servers = self._agent_with_two_candidates(default_llm)
-
-        picked = self._select(
-            monkeypatch, agent, candidates, servers, llm=capability_llm,
-        )
-
-        assert picked == ("srv-1", "list_issues")
+        assert (resolved.server_id, resolved.tool_name) == ("srv-1", "list_issues")
         capability_llm.invoke.assert_called_once()
         default_llm.invoke.assert_not_called()
 
-    def test_without_an_override_the_agent_model_still_picks(self, monkeypatch):
-        default_llm = MagicMock(invoke=MagicMock(return_value="2"))
-        agent, candidates, servers = self._agent_with_two_candidates(default_llm)
+    def test_without_an_override_the_agent_model_still_resolves(self):
+        default_llm = _llm("Slp Orchestra Mini")
+        default_llm.invoke = MagicMock(
+            return_value='{"tool": 2, "arguments": {"title": "Login is broken"}}'
+        )
+        agent, servers = self._agent_with_two_tools(default_llm)
 
-        picked = self._select(monkeypatch, agent, candidates, servers)
+        resolved = agent.resolve(
+            directive="file an issue: Login is broken", mcp_servers=servers,
+        )
 
-        assert picked == ("srv-1", "create_issue")
+        assert (resolved.server_id, resolved.tool_name) == ("srv-1", "create_issue")
+        # The pick and its required argument come out of the same call.
+        assert resolved.arguments == {"title": "Login is broken"}
         default_llm.invoke.assert_called_once()
+
+
+class TestTheReasoningModelIsAnnouncedAsWork:
+    """What the user is told about the model that resolves a tool call.
+
+    ``thinking`` is an internal routing tag: the API leaves it out of the
+    capabilities it reports, and it names a property of the model rather than
+    the work in progress.  Surfaced verbatim it read "Selected qwen3.5-2b for
+    thinking" — and on the single-model workspace where that model also writes
+    the answer, it landed directly beside "Selected qwen3.5-2b for the
+    response": one model, twice, under two labels.
+    """
+
+    def _router(self, capability_llm):
+        agent_llm = _llm("Qwen3.5 2B")
+        agent_llm.supports_thinking = False
+        progress = MagicMock()
+        router = ModelRouter(
+            orchestrator_llm=agent_llm,
+            agent_llm=agent_llm,
+            capability_llm_provider=lambda cap: capability_llm,
+            capability_available=lambda cap: capability_llm is not None,
+        )
+        router.begin_request(progress)
+        return router, agent_llm, progress
+
+    def _messages(self, progress):
+        return [call.args[2] for call in progress.call_args_list]
+
+    def test_a_switch_is_announced_as_tool_resolution(self):
+        reasoner = _llm("Qwen3 4B")
+        reasoner.supports_thinking = True
+        router, agent_llm, progress = self._router(reasoner)
+
+        assert router.reasoning_llm(agent_llm) is reasoner
+
+        messages = self._messages(progress)
+        assert messages == ["Selected Qwen3 4B for tool resolution"]
+        assert not any("thinking" in m for m in messages)
+
+    def test_landing_on_the_model_already_in_use_is_not_announced(self):
+        """Nothing was switched, so there is nothing to report."""
+        agent_llm = _llm("Qwen3.5 2B")
+        agent_llm.supports_thinking = False
+        progress = MagicMock()
+        router = ModelRouter(
+            orchestrator_llm=agent_llm,
+            agent_llm=agent_llm,
+            # The workspace's reasoning model *is* the model this request runs
+            # on — the single-model case.
+            capability_llm_provider=lambda cap: agent_llm,
+            capability_available=lambda cap: True,
+        )
+        router.begin_request(progress)
+
+        router.reasoning_llm(agent_llm)
+
+        assert self._messages(progress) == []
+
+    def test_a_fallback_that_already_reasons_is_kept_and_silent(self):
+        reasoner = _llm("Qwen3 4B")
+        reasoner.supports_thinking = True
+        router, _agent_llm, progress = self._router(_llm("Gemma 3n E2B"))
+
+        assert router.reasoning_llm(reasoner) is reasoner
+        assert self._messages(progress) == []
+
+    def test_no_reasoning_model_in_the_workspace_says_nothing(self):
+        router, agent_llm, progress = self._router(None)
+
+        assert router.reasoning_llm(agent_llm) is agent_llm
+        assert self._messages(progress) == []
+
+    def _multi_model_router(self, capability_llm):
+        """Two or more models selected: the request itself runs on the small
+        router model, so a capability model is always a real switch."""
+        router_llm = _llm("Slp Orchestra Mini")
+        router_llm.supports_thinking = False
+        progress = MagicMock()
+        router = ModelRouter(
+            orchestrator_llm=router_llm,
+            agent_llm=router_llm,
+            capability_llm_provider=lambda cap: capability_llm(cap),
+            capability_available=lambda cap: capability_llm(cap) is not None,
+        )
+        router.begin_request(progress)
+        return router, router_llm, progress
+
+    def test_a_model_already_announced_is_not_announced_again(self):
+        """One model serving two capabilities is one selection, not two.
+
+        Synthesis names it for ``skills``; the tool call lands on the same
+        model a moment later.  Both are switches away from the router model,
+        so neither is suppressed by the "already in use" check — and the user
+        read the same model being picked twice:
+
+            Selected qwen3.5-2b for skills
+            Selected qwen3.5-2b for tool resolution
+        """
+        worker = _llm("Qwen3.5 2B")
+        worker.supports_thinking = True
+        router, router_llm, progress = self._multi_model_router(lambda cap: worker)
+
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.reasoning_llm(router_llm)
+
+        selected = [m for m in self._messages(progress) if m.startswith("Selected")]
+        assert selected == ["Selected Qwen3.5 2B for skills"]
+
+    def test_a_different_model_for_the_tool_call_is_still_announced(self):
+        """Suppression is about repetition, not about the second event: work
+        moving to another model is exactly what the line is for."""
+        worker = _llm("Qwen3.5 2B")
+        worker.supports_thinking = False
+        reasoner = _llm("Qwen3 4B")
+        reasoner.supports_thinking = True
+        router, router_llm, progress = self._multi_model_router(
+            lambda cap: reasoner if cap == ModelCapability.THINKING.value else worker,
+        )
+
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.reasoning_llm(router_llm)
+
+        selected = [m for m in self._messages(progress) if m.startswith("Selected")]
+        assert selected == [
+            "Selected Qwen3.5 2B for skills",
+            "Selected Qwen3 4B for tool resolution",
+        ]

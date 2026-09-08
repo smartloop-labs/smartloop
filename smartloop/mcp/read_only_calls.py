@@ -1,21 +1,17 @@
-"""One read-only MCP tool call, shared by every background pass that makes one.
+"""One read-only MCP tool call, for a background pass that makes one.
 
-The content crawl (:mod:`smartloop.db.mcp_document_indexer`) and the account
-probe (:mod:`smartloop.mcp.account`) both need the same thing: call a tool that
-changes nothing, get its text back, and treat a failure as a skip rather than an
+The account probe (:mod:`smartloop.mcp.account`) needs a tool call that changes
+nothing, its text back, and a failure treated as a skip rather than an
 exception — including the expired-OAuth-token retry the live tool path does.
-
-That logic grew inside the crawler.  It lives here so a second caller reuses it
-instead of growing a second, subtly different copy: the 401 retry in particular
-is the kind of thing that gets forgotten in a re-implementation and then only
-shows up as a background pass that silently stops working an hour into a
-session.
+The 401 retry in particular is the kind of thing that gets forgotten in a
+re-implementation and then only shows up as a background pass that silently
+stops working an hour into a session, so it lives in one place.
 
 The transport underneath is :class:`~smartloop.agents.mcp.mcp_tool_caller.MCPToolCaller`
-— the same class the live agent path calls tools through, so a crawl and a
-model-issued call reach a server identically.  Only its transport-level helpers
-are used here; the argument extractor and result mapper it takes for the live
-path are LLM-backed and have no place in a background pass.
+— the same class the live agent path calls tools through, so a background call
+and a model-issued one reach a server identically.  Only its transport-level
+helpers are used here; the argument extractor and result mapper it takes for
+the live path are LLM-backed and have no place in a background pass.
 """
 
 from __future__ import annotations

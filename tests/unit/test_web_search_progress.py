@@ -104,8 +104,7 @@ def _collect(*, enabled, needed=True, progress=None):
     ex.web_search_agent.last_sources = ["https://example.com/a"]
     ex.web_search_agent.search.return_value = "WEB"
 
-    with patch.object(Explorer, "_search_mcp_documents", return_value=""), \
-         patch.object(Explorer, "_search_vector", return_value=None), \
+    with patch.object(Explorer, "_search_vector", return_value=None), \
          patch.object(Explorer, "_search_feedback", return_value=""), \
          patch.object(Explorer, "_search_workspace", return_value=""), \
          patch.object(Explorer, "_needs_web_search", return_value=needed):

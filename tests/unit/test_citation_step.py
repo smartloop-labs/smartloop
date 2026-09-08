@@ -26,6 +26,7 @@ from langchain_core.outputs import GenerationChunk
 
 from smartloop.api.model.chat import ChatCompletionRequest, ChatMessage
 from smartloop.api.routers.chat import stream_chunks
+from smartloop.constants import OPENING_TOKENS
 from smartloop.model_host.client import InProcessModelClient
 
 DOC = "invoice-contoso.pdf"
@@ -123,7 +124,8 @@ def _steps(events: list) -> list:
 
 async def _run(citations, answer=f"The invoice was for Jordan Rivera, {CHUNK}",
                session_id=None):
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text=answer)
 
     svc = _service(stream_completion, citations)
@@ -198,7 +200,8 @@ async def test_an_interrupt_writes_the_session_without_loading_the_embedder(_enc
     entered = threading.Event()
     release = threading.Event()
 
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text=f"The invoice was for Jordan Rivera, {CHUNK}")
         entered.set()
         release.wait(10)
@@ -265,7 +268,8 @@ async def test_an_interrupt_frees_the_embedder_nobody_will_use():
     entered = threading.Event()
     release = threading.Event()
 
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text=f"The invoice was for Jordan Rivera, {CHUNK}")
         entered.set()
         release.wait(10)
@@ -298,7 +302,8 @@ async def test_the_sources_are_embedded_while_the_answer_is_still_streaming():
         sources_done.set()
         return _fake_vectors(texts)
 
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text="The invoice ")
         sources_done.wait(10)      # the sources are being encoded right now
         yield GenerationChunk(text=f"was for Jordan Rivera, {CHUNK}")
@@ -363,7 +368,8 @@ async def test_an_interrupt_never_embeds_the_answer():
 
     answer = f"The invoice was for Jordan Rivera, {CHUNK}"
 
-    def stream_completion(prompt, model_name=None, cancelled=None, capability=None):
+    def stream_completion(prompt, model_name=None, cancelled=None, capability=None,
+                          thinking=None):
         yield GenerationChunk(text=answer)
         entered.set()
         release.wait(10)
@@ -380,3 +386,73 @@ async def test_an_interrupt_never_embeds_the_answer():
 
     assert not any(answer in t for batch in encoded for t in batch)
     release.set()
+
+
+class TestTheSourceEncodeWaitsForTheOpening:
+    """Overlapping the encode with generation is right; starting it first is not.
+
+    The embedder is a second GGUF and it loads onto the same device the answer
+    is decoding on — about a second and a half of it, from the server log:
+
+        21:46:47,018  [models] RESPONSE → qwen3.5-2b
+        21:46:47,020  [embeddings] Using cached GGUF … bge-m3-Q4_K_M.gguf
+        21:46:48,382  [embeddings] Loaded llama-cpp:… (n_gpu_layers=-1)
+
+    Landing that on the first tokens is the one place it shows: the answer
+    opens slowly and then speeds up, which reads as the model warming up.
+    """
+
+    def _service_with(self, chunks, monkeypatch):
+        """(service, started) — *started* is set when the encode is reached."""
+        started = threading.Event()
+
+        def prepare(citations, model_service):
+            started.set()
+
+        monkeypatch.setattr(
+            "smartloop.api.routers.chat._prepare_citation_sources", prepare,
+        )
+
+        def stream_completion(prompt, model_name=None, cancelled=None,
+                              capability=None, thinking=None):
+            for text in chunks:
+                yield GenerationChunk(text=text)
+
+        return _service(stream_completion, [_citation()]), started
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_start_before_the_opening_is_out(self, monkeypatch):
+        # Two hundred one-token chunks: long enough to have an opening and a
+        # rest, like the answers this was noticed on.
+        svc, started = self._service_with(["tok " for _ in range(200)], monkeypatch)
+
+        stream = stream_chunks(_request(), svc)
+        seen = 0
+        try:
+            async for event in stream:
+                deltas = [
+                    e for e in _events([event])
+                    if (e.get("choices") or [{}])[0].get("delta", {}).get("content")
+                ]
+                if not deltas:
+                    continue
+                seen += 1
+                if seen == 1:
+                    # One token of the answer is out; the device belongs to
+                    # the model that is writing it.
+                    assert not started.wait(0.25)
+                if seen > OPENING_TOKENS:
+                    break
+        finally:
+            await stream.aclose()
+
+        assert started.wait(5), "the encode still has to happen"
+
+    @pytest.mark.asyncio
+    async def test_a_short_answer_still_gets_its_sources_encoded(self, monkeypatch):
+        """Nothing left to overlap with — but the encode still has to happen."""
+        svc, started = self._service_with(["Jordan Rivera."], monkeypatch)
+
+        [event async for event in stream_chunks(_request(), svc)]
+
+        assert started.is_set()

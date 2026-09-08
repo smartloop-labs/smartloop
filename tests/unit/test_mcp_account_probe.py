@@ -34,7 +34,7 @@ class TestToolResolution:
         assert resolve_account_tool(["get_viewer", "list_issues"]) == "get_viewer"
 
     def test_a_member_listing_is_not_an_identity_tool(self):
-        # The crawl's loose matcher pairs `get_me` with `get_members`; naming a
+        # A loose matcher would pair `get_me` with `get_members`; naming a
         # connection after whoever tops a member list is worse than not naming
         # it at all, so this match is exact.
         assert resolve_account_tool(["get_members", "get_boards"]) is None

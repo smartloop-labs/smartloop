@@ -23,7 +23,7 @@ from .server_selector import (
 )
 from .mcp_tool_caller import MCPToolCaller
 from .argument_extractor import MCPArgumentExtractor
-from .mcp_agent import MCPAgent
+from .mcp_agent import MCPAgent, format_call, missing_required
 
 if TYPE_CHECKING:
     from smartloop.workspace.workspace import MCPServer
@@ -51,6 +51,11 @@ EXPLORE_SKIP_DIRS = {
 }
 MAX_EXPLORE_FILES = 50
 MAX_FILE_CHARS = 2000
+
+# How much of one fetched record body reaches the prompt.  A Notion page can be
+# very long and three of them share the answer's context with everything else
+# collect gathered.
+_MAX_RECORD_BODY_CHARS = 4000
 
 MAX_SKILL_FILE_CHARS = 4_000
 MAX_TREE_ENTRIES = 10
@@ -83,80 +88,6 @@ _QUERY_STOP_WORDS = {
 
 # ------------------------------------------------------------------ models
 
-def _mcp_source(name: str, chunk: Any) -> str:
-    """Source line for a crawled MCP chunk.
-
-    The crawl already records which tool produced each record, but the header
-    only carried ``<server>/<step>/<title>`` — so the model saw content with no
-    way to say where it came from, and could not name the tool when asked. The
-    tool is the source for MCP content, so it leads.
-
-    The record's own URL comes next, and it is the one thing here the model
-    cannot reconstruct.  A live tool call returns raw JSON, so answering from
-    one gave the user a link they could click straight through to the Canva
-    design or Notion page; answering from the index gave them
-    ``<server>/<step>/<title>``, which reads like a file path and opens
-    nothing.  The URL is stripped from the embedded text on purpose — a link is
-    noise in an embedding, and ``ResultFormatter.is_noisy_value`` drops every
-    ``*_url`` key — so the header is where it has to travel.
-
-    The record's id is here for a different reason: it is the handle a *next*
-    tool call needs.  "List my designs, then comment on that one" only works if
-    the id came back with the listing, and without it the model has to re-run a
-    live search purely to recover what the crawl already knew — which is the
-    thing indexing exists to avoid.  Labelled ``id:`` rather than left for the
-    URL to imply, because deriving an id from a URL is wrong on at least one
-    server already: a Trello card's id is its ARI, while its URL carries the
-    shortLink, and ``trelloReadCard`` rejects the latter.
-
-    Like the URL it is stripped from the embedded text, and for the same reason
-    — ``is_noisy_value`` drops every key ending in ``_id``, so ``design_id``
-    never survives into a chunk.
-
-    All read from metadata rather than baked into ``document_name`` at index
-    time, so content already crawled gains them without a re-index.
-    """
-    meta = getattr(chunk, "metadata", None) or {}
-    tool = meta.get("tool_name")
-    server = meta.get("server_name")
-    record_id = (meta.get("record_id") or "").strip()
-    url = (meta.get("source_url") or "").strip()
-    parts = [p for p in (f"{server} · {tool}" if tool and server else tool, name) if p]
-    # A record with no title of its own is already named by its id, and saying
-    # it twice reads like two different records.
-    if record_id and record_id not in name:
-        parts.append(f"id: {record_id}")
-    if url:
-        parts.append(url)
-    return " — ".join(parts) if parts else name
-
-
-def _crawl_age(chunk: Any) -> str:
-    """`` (indexed 12m ago)`` for a crawled record, or ``""``.
-
-    A crawled record is a snapshot, and this content is now used *instead of*
-    calling the server — so the age has to travel with it. Without it the model
-    states a fifteen-minute-old quote as the current price, with nothing in the
-    prompt to suggest otherwise.
-    """
-    try:
-        crawled_at = float((chunk.metadata or {}).get("crawled_at") or 0)
-    except (TypeError, ValueError):
-        return ""
-    if not crawled_at:
-        return ""
-    seconds = max(0.0, time.time() - crawled_at)
-    if seconds < 90:
-        return " (indexed just now)"
-    minutes = int(seconds // 60)
-    if minutes < 60:
-        return f" (indexed {minutes}m ago)"
-    hours = minutes // 60
-    if hours < 24:
-        return f" (indexed {hours}h ago)"
-    return f" (indexed {hours // 24}d ago)"
-
-
 class SearchContext(BaseModel):
     """Collected explore results: vector, feedback, workspace, and web search."""
 
@@ -175,12 +106,6 @@ class SearchContext(BaseModel):
     # Result of an auto-run read-only MCP tool (a "collect" step). Write /
     # side-effecting tools are NOT run here — they stay planned execute steps.
     mcp_context: str = ""
-    # Content crawled from document-type MCP servers (Notion pages, Linear
-    # issues, Trello cards) and vectorized ahead of the query — the indexed
-    # counterpart to mcp_context's live call. Kept separate because it is
-    # stored content, not a fresh fetch: it must not suppress a web search the
-    # way a live tool result does.
-    mcp_document_context: str = ""
     citations: Optional[List[Dict[str, Any]]] = None
     # Per-document search results ({"document_name", "content"}), ordered by
     # relevance.  Populated by the parallel vector search and consumed by the
@@ -200,7 +125,6 @@ class SearchContext(BaseModel):
             or self.workspace_context
             or self.web_context
             or self.mcp_context
-            or self.mcp_document_context
         )
 
 
@@ -575,73 +499,207 @@ Does answering the latest message require a new web search?
     def _is_read_only_tool(cls, tool_name: str) -> bool:
         """True only when a tool name clearly reads (no side effects).
 
-        Conservative: unknown/ambiguous verbs are treated as NOT read-only so a
-        side-effecting tool is never auto-run during collect — it stays a
-        planned execute step. (MCP annotations aren't persisted, so this is a
-        leading-verb heuristic over the tool name.)
+        Every word in the name is considered, not just the first.  Servers
+        name tools after the product as often as after the verb —
+        ``notion-search``, ``API-get-users``, ``trelloReadCard`` — and a
+        leading-verb rule read "notion" as an unknown verb and refused to run
+        the one tool the question was about.  Any write word anywhere still
+        vetoes: ``notion-create-pages`` is a write however it is spelled.
+
+        Conservative in both directions: a name with no recognised verb is not
+        read-only, so a side-effecting tool is never auto-run during collect —
+        it stays a planned execute step.  (MCP annotations aren't persisted, so
+        this is a heuristic over the name.)
         """
         if not tool_name:
             return False
-        first = re.split(r"[_\-\s.]+", tool_name.strip().lower())[0]
-        if first in cls._WRITE_VERBS:
+        # camelCase is a word boundary too: `trelloReadCard` is three words.
+        spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", tool_name.strip())
+        words = set(re.split(r"[_\-\s.]+", spaced.lower()))
+        if words & cls._WRITE_VERBS:
             return False
-        return first in cls._READ_ONLY_VERBS
+        return bool(words & cls._READ_ONLY_VERBS)
+
+    # How many connected servers are asked for one question.  Each costs a
+    # reasoned resolution and a network round-trip, and a workspace with a
+    # dozen connections would put all of them in front of every answer.
+    _MAX_SERVERS_PER_QUESTION = 4
 
     def _run_mcp(self, query: str, mcp_servers: Optional[List["MCPServer"]],
-                 project_dir: Optional[str]) -> str:
-        """Auto-run a read-only MCP tool for *query* as a collect step.
+                 project_dir: Optional[str], llm: Optional[BaseLLM] = None) -> str:
+        """Gather what the connected servers know about *query*.
 
-        Vector-retrieves the best-matching tool (MCPAgent), and — only when it
-        is read-only — extracts args and executes it, returning the result.
-        Write/side-effecting tools are left for a planned execute step. Any
-        failure is a silent skip (returns ``""``).
+        Every server is asked, not just the best-matching one: a question is
+        put to documents, workspace files, feedback and the web all at once,
+        and a connected server is a source like any of them.  Resolving over
+        the whole catalog instead picked one tool for the whole workspace, so a
+        question spanning two servers came back with half its context — and on
+        a large catalog the pick was made from a list too long to describe.
+
+        Per server: resolve a call over *its* tools, run it when the tool is
+        read-only, then follow the connection's call plan to fetch the bodies
+        behind the records it returned (see :mod:`smartloop.mcp.call_plans`).
+        Write/side-effecting tools are left for a planned execute step.  A
+        failure anywhere is a silent skip for that server, never for the rest.
         """
-        if not self.tool_caller or not self.arg_extractor or not mcp_servers or not project_dir:
+        if not self.tool_caller or not self.arg_extractor or not mcp_servers:
             return ""
+
+        servers = [
+            s for s in mcp_servers
+            if getattr(s, "enabled", True)
+            and not getattr(s, "system", False)
+            and getattr(s, "id", None) != SYSTEM_TOOLS_SERVER_ID
+            and (getattr(s, "tools", None) or [])
+        ]
+        if not servers:
+            return ""
+        if len(servers) > self._MAX_SERVERS_PER_QUESTION:
+            logger.info(
+                "[collect] %d connected servers — asking the first %d",
+                len(servers), self._MAX_SERVERS_PER_QUESTION,
+            )
+            servers = servers[: self._MAX_SERVERS_PER_QUESTION]
+
+        gathered = []
+        for server in servers:
+            text = self._run_mcp_server(query, server, llm)
+            if text:
+                gathered.append(text)
+        return "\n\n".join(gathered)
+
+    def _run_mcp_server(
+        self, query: str, server: "MCPServer", llm: Optional[BaseLLM] = None,
+    ) -> str:
+        """One server's answer to *query*, or ``""``."""
         try:
-            picked = self.mcp_agent.select_tool(query, project_dir, mcp_servers)
+            picked = self.mcp_agent.resolve(query, [server], llm=llm)
             if not picked:
                 return ""
-            server_id, tool_name = picked
+            tool_name = picked.tool_name
             if not self._is_read_only_tool(tool_name):
                 logger.info(
                     "[collect] MCP tool '%s' is not read-only — leaving to a "
                     "planned execute step", tool_name,
                 )
                 return ""
-            server = next((s for s in mcp_servers if getattr(s, "id", None) == server_id), None)
-            if server is None:
-                return ""
-            tool_def = next(
-                (t for t in (server.tools or []) if getattr(t, "name", None) == tool_name),
-                None,
-            )
-            input_schema = (getattr(tool_def, "input_schema", None) or {}) if tool_def else {}
 
+            raw = self._call_mcp_tool(server, tool_name, picked.arguments, query)
+            if not raw:
+                return ""
+
+            # A listing answers "which records", not "what do they say".  The
+            # connection's plan names the tool that fetches a record's body, so
+            # a search hit becomes the page behind it rather than its title.
+            detail = self._fetch_record_details(server, tool_name, raw)
+            body = f"{raw}\n\n{detail}" if detail else raw
+
+            logger.info(
+                "[collect] %s.%s returned %d chars",
+                getattr(server, "name", ""), tool_name, len(body),
+            )
+            return f"MCP TOOL ({getattr(server, 'name', '')}.{tool_name}):\n{body}"
+        except Exception as e:
+            if isinstance(e, _PROGRAMMING_ERRORS):
+                raise
+            logger.warning(
+                "[collect] MCP call on '%s' failed, skipping: %s",
+                getattr(server, "name", ""), e,
+            )
+            return ""
+
+    def _call_mcp_tool(
+        self,
+        server: "MCPServer",
+        tool_name: str,
+        arguments: Dict[str, Any],
+        query: str,
+    ) -> str:
+        """Run one read-only tool and return its text, or ``""``."""
+        tool_def = next(
+            (t for t in (server.tools or []) if getattr(t, "name", None) == tool_name),
+            None,
+        )
+        input_schema = (getattr(tool_def, "input_schema", None) or {}) if tool_def else {}
+
+        # Resolution filled the required arguments in the same call that picked
+        # the tool; the extractor is only needed when it could not.
+        arguments = dict(arguments or {})
+        if missing_required(input_schema, arguments):
             arguments = self.arg_extractor.invoke(
                 user_input=query, tool_name=tool_name, input_schema=input_schema,
             )
             arguments.pop("_missing_params", None)
 
-            access_token = self.tool_caller.get_access_token(server)
+        # The call itself, in the log, before it goes out: a resolution that
+        # picked a tool and a call that actually reached the server are
+        # different events, and only the second one can fail.
+        logger.info(
+            "[collect] calling %s",
+            format_call(getattr(server, "name", ""), tool_name, arguments),
+        )
+        result = self.tool_caller.call_tool(
+            server=server, tool_name=tool_name, arguments=arguments,
+            access_token=self.tool_caller.get_access_token(server),
+        )
+        if not result.success or not result.content:
+            logger.info(
+                "[collect] %s returned nothing (%s)",
+                tool_name, getattr(result, "error", None) or "empty result",
+            )
+            return ""
+        return "\n".join(
+            block.get("text", "") if isinstance(block, dict) and block.get("type") == "text"
+            else str(block)
+            for block in result.content
+        ).strip()
+
+    def _fetch_record_details(
+        self, server: "MCPServer", tool_name: str, payload: str,
+    ) -> str:
+        """Bodies behind the records *payload* lists, per the connection's plan.
+
+        Returns ``""`` when the connection has no plan, the plan names no
+        detail tool the server has, or the payload carries no record ids —
+        every one of which is the ordinary case for a server whose listing is
+        already the answer.
+        """
+        try:
+            from smartloop.mcp.call_plans import follow_up_calls
+
+            calls = follow_up_calls(server, tool_name, payload)
+        except Exception as e:
+            logger.debug("[collect] no follow-up plan for %s: %s", tool_name, e)
+            return ""
+        if not calls:
+            return ""
+
+        bodies = []
+        for detail_tool, arguments in calls:
+            logger.info(
+                "[collect] following up with %s",
+                format_call(getattr(server, "name", ""), detail_tool, arguments),
+            )
             result = self.tool_caller.call_tool(
-                server=server, tool_name=tool_name,
-                arguments=arguments, access_token=access_token,
+                server=server, tool_name=detail_tool, arguments=arguments,
+                access_token=self.tool_caller.get_access_token(server),
             )
             if not result.success or not result.content:
-                return ""
-            raw = "\n".join(
+                continue
+            text = "\n".join(
                 block.get("text", "") if isinstance(block, dict) and block.get("type") == "text"
                 else str(block)
                 for block in result.content
             ).strip()
-            if not raw:
-                return ""
-            logger.info("[collect] MCP tool '%s' returned %d chars", tool_name, len(raw))
-            return f"MCP TOOL ({tool_name}):\n{raw}"
-        except Exception as e:
-            logger.warning(f"[collect] MCP tool run failed, skipping: {e}")
+            if text:
+                bodies.append(text[:_MAX_RECORD_BODY_CHARS])
+        if not bodies:
             return ""
+        logger.info(
+            "[collect] fetched %d record body/bodies from %s",
+            len(bodies), getattr(server, "name", ""),
+        )
+        return "\n\n".join(bodies)
 
     @staticmethod
     def _is_non_data_file(fname: str) -> bool:
@@ -701,45 +759,6 @@ Does answering the latest message require a new web search?
             logger.warning(f"[collect] Workspace search failed: {e}")
         return ""
 
-    @staticmethod
-    def _search_mcp_documents(
-        query: str,
-        model_service: Any,
-        conversation_history: Optional[List[Dict[str, str]]] = None,
-    ) -> str:
-        """Crawled MCP content search — thread-safe, I/O bound.
-
-        The indexed half of MCP retrieval: content a crawl already pulled from
-        Notion/Linear/Trello is searched like any other collection, so the
-        answer doesn't depend on the router selecting the right live tool call
-        for this particular phrasing.
-        """
-        try:
-            chunks = model_service.search_mcp_documents(
-                query, n_results=8, conversation_history=conversation_history,
-            )
-            if not chunks:
-                return ""
-            best: dict = {}
-            for chunk in chunks:
-                name = chunk.document_name or chunk.document_id
-                if name not in best or chunk.distance < best[name].distance:
-                    best[name] = chunk
-            text = "\n\n".join(
-                f"--- {_mcp_source(name, chunk)}{_crawl_age(chunk)} ---\n"
-                f"{chunk.text[:2000]}"
-                for name, chunk in best.items()
-            )
-            logger.info(
-                f"[collect] MCP content search returned {len(best)} record(s)"
-            )
-            return text
-        except Exception as e:
-            if isinstance(e, _PROGRAMMING_ERRORS):
-                raise
-            logger.warning(f"[collect] MCP content search failed: {e}")
-        return ""
-
     def collect_parallel(
         self,
         query: str,
@@ -753,6 +772,7 @@ Does answering the latest message require a new web search?
         executor: Optional[ThreadPoolExecutor] = None,
         project_dir: Optional[str] = None,
         progress: Optional[Callable[[str, str, str], None]] = None,
+        mcp_llm: Optional[BaseLLM] = None,
     ) -> SearchContext:
         """Fan-out vector/feedback/workspace searches in parallel.
 
@@ -791,41 +811,22 @@ Does answering the latest message require a new web search?
                 self._search_workspace, query, model_service, cwd,
                 history_for_search,
             ) if cwd else None
-            # MCP (read-only): part of explore — vector-retrieve the best tool
-            # and auto-run it if read-only, returning the result. Write tools
-            # are skipped here (they stay planned execute steps).
-            # Crawled MCP content: already embedded, so it is a vector search
-            # like any other — no tool call, no server round-trip.
-            f_mcp_docs = pool.submit(
-                self._search_mcp_documents, query, model_service, history_for_search,
-            )
-
-            # Resolved before the live call is even submitted, because its
-            # answer decides whether that call is needed: a crawl already
-            # pulled this server's content, so asking the server again returns
-            # what is already in hand at the cost of a network round-trip that
-            # can also fail.  The ordering costs nothing — this is a local
-            # vector query against a collection that is already open.
+            # MCP (read-only): part of explore, and on the same footing as
+            # every other source — the connected servers are searched for this
+            # question alongside documents, workspace files, feedback and the
+            # web, in the same fan-out.  The tool is resolved by reasoning over
+            # what discovery found (MCPAgent) and run only if it is read-only;
+            # write tools stay planned execute steps.
             #
-            # The content carries its age into the prompt (see `_crawl_age`),
-            # which is what keeps the trade honest: the model can say how old
-            # the snapshot is instead of presenting it as this second's truth.
-            ctx.mcp_document_context = f_mcp_docs.result()
-
-            # MCP (read-only): part of explore — vector-retrieve the best tool
-            # and auto-run it if read-only, returning the result. Write tools
-            # are skipped here (they stay planned execute steps).
+            # This used to be gated on a vectorized copy of the server's
+            # content: when that local index matched, the live call was skipped
+            # and the answer came from a snapshot. The snapshot is gone, so the
+            # source of truth is the server, asked now.
             f_mcp = None
-            if mcp_servers and project_dir:
-                if ctx.mcp_document_context:
-                    logger.info(
-                        "[collect] Crawled MCP content matched — skipping the "
-                        "live tool call"
-                    )
-                else:
-                    f_mcp = pool.submit(
-                        self._run_mcp, query, mcp_servers, project_dir,
-                    )
+            if mcp_servers:
+                f_mcp = pool.submit(
+                    self._run_mcp, query, mcp_servers, project_dir, mcp_llm,
+                )
 
             # Collect primary results (local retrieval + MCP tools)
             vec_result = f_vec.result()

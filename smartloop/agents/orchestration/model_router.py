@@ -157,6 +157,36 @@ class ModelRouter:
         # happened to be the user's model.
         return self.decision_llm(capability)
 
+    def reasoning_llm(self, fallback: BaseLLM) -> BaseLLM:
+        """A model that can reason, for a call whose judgement warrants it.
+
+        MCP tool resolution is that call: one pass over every discovered tool
+        that has to pick the tool *and* fill its required arguments, and a
+        reasoning block is the difference between a considered answer and a
+        guess.  So if the workspace has a model declaring
+        ``ModelCapability.THINKING`` enabled, that model runs it — rather than
+        whichever model the step would otherwise use, which on a multi-model
+        selection is the small router model.
+
+        Best-effort, like every other decision-node routing: ``decision_llm``
+        takes the capability model only when it is resident or comfortably
+        fits, so this never forces a load onto a memory-tight device.  A
+        *fallback* that already reasons is kept as-is — no lookup, no switch.
+        """
+        capability = ModelCapability.THINKING.value
+        if getattr(fallback, "supports_thinking", False):
+            return fallback
+        if not self._capability_model_exists(capability):
+            return fallback
+        resolved = self.decision_llm(capability, purpose=self._RESOLUTION_PURPOSE)
+        if resolved is not None and getattr(resolved, "supports_thinking", False):
+            logger.info(
+                "[models] tool resolution → %s (thinking)",
+                self.model_label(resolved),
+            )
+            return resolved
+        return fallback
+
     def _capability_model_exists(self, capability: Optional[str]) -> bool:
         """True when some selected model declares *capability*.
 
@@ -174,9 +204,21 @@ class ModelRouter:
             )
             return True
 
-    def decision_llm(self, capability: Optional[str]) -> BaseLLM:
+    #: What the user is told a reasoning model was picked for.  ``thinking``
+    #: is an internal routing tag — it is excluded from the capabilities the
+    #: API reports (see ``api/routers/models.py``) and it names a property of
+    #: the model rather than the work, so "Selected qwen3.5-2b for thinking"
+    #: tells the reader nothing about what is happening.
+    _RESOLUTION_PURPOSE = "tool resolution"
+
+    def decision_llm(
+        self, capability: Optional[str], purpose: Optional[str] = None,
+    ) -> BaseLLM:
         """Resolve a capability model for a low-value *decision* node
         (skill matching, multi-step planning, MCP tool selection).
+
+        ``purpose`` is what the user is told the model is for, in place of the
+        capability tag — see :meth:`llm_for_tier` on why the two differ.
 
         Unlike :meth:`_llm_for_tier`, this never forces a generic large-model
         load: it uses the capability model only when it is already resident or
@@ -196,7 +238,14 @@ class ModelRouter:
                         "[models] decision capability '%s' → %s",
                         capability, self.model_label(llm),
                     )
-                    self.emit_model_selected(capability, llm)
+                    # Nothing was switched when the capability resolves to the
+                    # model this request is already running on.  Announcing it
+                    # anyway puts a second "Selected …" beside the first,
+                    # naming one model twice under two labels — which is what
+                    # a single-model workspace saw for every MCP step, since
+                    # the model that reasons is also the one that answers.
+                    if llm is not self.agent_llm:
+                        self.emit_model_selected(capability, llm, purpose)
                     return llm
             except Exception as e:
                 logger.warning(
@@ -275,6 +324,10 @@ class ModelRouter:
         self._emitted_model_events.add(key)
         return False
 
+    def _model_event_fired(self, key: str) -> bool:
+        """True if this model SSE already fired — without recording it."""
+        return key in getattr(self, "_emitted_model_events", ())
+
     def _event_label(
         self, capability: Optional[str], purpose: Optional[str],
     ) -> tuple:
@@ -305,15 +358,36 @@ class ModelRouter:
         llm: BaseLLM,
         purpose: Optional[str] = None,
     ) -> None:
-        """Surface the selected capability model as an SSE. Emitted once per
-        capability/request (a fan-out resolves the model once per document)."""
+        """Surface the selected capability model as an SSE.
+
+        Emitted once per capability/request — a fan-out resolves the model once
+        per document — and, where nothing announced a load, once per model.
+
+        A "Selected …" line answers the "Loading model for …" line before it,
+        so a step that promised a load always reports what it got, even when
+        that is a model the user has already seen.  A step that promised
+        nothing has only the switch to report, and a model already named this
+        turn is not a switch: resolving a tool call after synthesis, on a
+        workspace where one model serves both, read as the model being picked
+        twice —
+
+            Selected qwen3.5-2b for skills
+            Selected qwen3.5-2b for tool resolution
+
+        — where the second line told the user nothing the first had not.  Work
+        moving to a *different* model is still announced, every time.
+        """
         label, key = self._event_label(capability, purpose)
         if not key or self._model_event_seen(f"selected:{key}"):
             return
-        self.emit(
-            "model", "processing",
-            f"Selected {self.model_label(llm)} for {label}",
-        )
+        name = self.model_label(llm)
+        # Recorded whichever way this goes: a line that answered a load has
+        # named the model, so a later step that promised nothing has nothing
+        # left to add about it.
+        first_mention = not self._model_event_seen(f"selected-model:{name}")
+        if not first_mention and not self._model_event_fired(f"loading:{key}"):
+            return
+        self.emit("model", "processing", f"Selected {name} for {label}")
 
     # Why a capability model was skipped, phrased for the user.  ``memory`` is
     # the one they can act on — close something, or deselect a model — so it

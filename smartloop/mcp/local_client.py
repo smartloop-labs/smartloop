@@ -73,12 +73,17 @@ class LocalMCPClient:
     # ------------------------------------------------------------------
 
     def _resolve_command(self, env: dict[str, str]) -> str:
-        """Resolve the command to a full path.
+        """The exact program to exec, as a full path where one can be found.
 
-        Built-in Smartloop servers run as FastMCP modules under the current
-        runtime. Everything else (``uvx``, ``npx``, an absolute path, …) is the
-        standard MCP stdio config supplied by the caller and is run as-is,
-        resolved against the system ``PATH``.
+        The configured command and its arguments are run as written — nothing
+        here rewrites a launcher's invocation.  What it does do is answer
+        *which* ``uvx`` (or ``npx``, or ``python``): the app's ``PATH`` is not
+        the shell's, so a command a user verified in a terminal can be missing
+        from the process that launches it.  Resolving once, here, makes the
+        failure "not on this PATH" rather than a bare ENOENT from a subprocess.
+
+        Falls through to the bare name when nothing matches, so the OS produces
+        the error rather than this method inventing one.
         """
         # Built-in MCP servers are launched as `<interpreter> -m smartloop.<...>`.
         # The interpreter path is captured at registration time and persisted
@@ -93,20 +98,16 @@ class LocalMCPClient:
         if os.path.isabs(self.command):
             return self.command
 
-        # Only apply PATH workaround inside a frozen (PyInstaller) bundle
-        if not getattr(sys, "frozen", False):
-            return self.command
-
-        # Try resolving with the current env PATH first
         found = shutil.which(self.command, path=env.get("PATH"))
         if found:
             return found
 
-        # Augment PATH with the Python executable's directory (covers
-        # entry-point scripts installed alongside python/pip)
+        # Entry-point scripts installed alongside the interpreter (pipx, a
+        # venv's bin) are not always on the PATH a GUI process inherits.
         python_bin_dir = os.path.dirname(sys.executable)
-        augmented_path = python_bin_dir + os.pathsep + env.get("PATH", "")
-        found = shutil.which(self.command, path=augmented_path)
+        found = shutil.which(
+            self.command, path=python_bin_dir + os.pathsep + env.get("PATH", ""),
+        )
         if found:
             return found
 
@@ -146,6 +147,13 @@ class LocalMCPClient:
 
         merged_env = {**os.environ, **self.env}
         resolved_command = self._resolve_command(merged_env)
+        # The exact command line, as it goes to the OS: what a user configured
+        # is what runs, and when it does not start this is the line that says
+        # which program was actually looked for.
+        logger.info(
+            "[mcp-local] launching %s",
+            " ".join([resolved_command, *self.args]),
+        )
 
         if self._is_builtin_module():
             import smartloop as _pkg

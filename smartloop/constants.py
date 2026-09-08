@@ -16,6 +16,19 @@ SLP_PANEL     = "#272036"
 SLP_MUTED     = "#6b5b7b"
 SLP_TEXT      = "#e2d9f3"
 
+#: How many generated tokens count as the *opening* of an answer.
+#:
+#: Two things need the same number, which is why it lives here rather than in
+#: either of them: the decode rate is reported over this window and the rest
+#: separately (``LlamaCpp._rate``), because an average hides the ramp a reader
+#: actually notices; and work that would load a second model onto the same
+#: device waits for it (the source encode in ``routers/chat.py``), so the ramp
+#: is not something the app causes itself.  Long enough to average out a
+#: stutter, short enough to still be the part of the answer the reader is
+#: waiting on rather than reading.
+OPENING_TOKENS = 32
+
+
 # Logo used in the TUI and console logging.
 LOGO = (
     "█▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█\n"

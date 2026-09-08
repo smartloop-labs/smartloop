@@ -53,8 +53,7 @@ class TestStateFilesAreNotContent:
             assert second["skipped"] == 1
 
     def test_other_hidden_files_are_skipped_too(self):
-        # The MCP crawl writes its own manifest into the same directory, and
-        # that one churns on every crawl.
+        # Other passes write their own manifests into the same directory.
         with tempfile.TemporaryDirectory() as td:
             for name in (".mcp_documents_manifest.json", ".env", ".DS_Store"):
                 with open(os.path.join(td, name), "w") as fh:
