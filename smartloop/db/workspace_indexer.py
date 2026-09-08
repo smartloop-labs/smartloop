@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from smartloop.db.store import ChunkResult
 from smartloop.db.store_factory import StoreFactory
 from smartloop.utils import json_to_table
+from smartloop.workspace.workspace import PROJECT_STATE_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,19 @@ _MANIFEST_FILENAME = ".workspace_manifest.json"
 # root of the scan.  The scan root *is* ``project_dir`` (see IndexerTask), so
 # the vector store's own files are always inside it.
 SKIP_ROOT_DIRS = frozenset({"db"})
+
+# Files holding the framework's own state, skipped at the root of the scan for
+# the same reason as SKIP_ROOT_DIRS — and for the reason hidden files are
+# skipped below, which ``project.json`` shares without being hidden.
+#
+# It is the project's own record, rewritten on every turn (a new session, a
+# document, an MCP registration), and it grows with use: by a few hundred
+# conversations it was a megabyte, 567 chunks.  Indexing it meant every turn
+# changed its hash, so every scan deleted and re-embedded all of it — a
+# minute of GPU spent re-learning the app's own bookkeeping, competing with
+# the reply the user was waiting for, and never answering a question anyone
+# would ask of a workspace.
+SKIP_ROOT_FILES = frozenset({PROJECT_STATE_FILE})
 
 
 # ------------------------------------------------------------------ helpers
@@ -197,6 +211,8 @@ class WorkspaceIndexer:
                 # Indexing it made every run dirty the input to the next one: a
                 # file re-embedded every scan, forever, for nothing.
                 if fname.startswith("."):
+                    continue
+                if at_root and fname in SKIP_ROOT_FILES:
                     continue
                 ext = os.path.splitext(fname)[1].lower()
                 if ext not in INDEX_EXTENSIONS:

@@ -212,6 +212,40 @@ def warmup(base_dir: Optional[str] = None) -> None:
     _get_model(base_dir)
 
 
+def device_idle_seconds() -> float:
+    """Seconds since the process that runs our embeddings last generated.
+
+    ``0.0`` while it is generating right now, ``inf`` when it has not
+    generated at all.  Asked of the *host* when one owns the embedder, because
+    that is where both the embedding and the generation actually happen: a
+    child polling its own idle time would always read "quiet" and answer for
+    the wrong device.
+
+    Batch embedding and generation are the same GPU, and a bge-m3 pass over a
+    few hundred chunks takes the token rate of a streaming reply from ~57/s to
+    ~3/s.  Background indexing reads this to wait for a quiet moment — the
+    reason :meth:`ModelService._inference_slot` keeps the count at all.
+
+    Unknowable means idle: a host that cannot be reached is not one to defer
+    to, and an indexer that never runs is worse than one that overlaps.
+    """
+    remote = _remote_embedder()
+    if remote is not None:
+        try:
+            return remote.idle_seconds()
+        except Exception as exc:
+            logger.debug("[embeddings] could not read host idle time: %s", exc)
+            return float("inf")
+
+    try:
+        from smartloop.api.services.model_service import ModelService
+
+        service = ModelService._instance
+        return service.idle_seconds() if service is not None else float("inf")
+    except Exception:
+        return float("inf")
+
+
 def encode_texts(
     texts: List[str], base_dir: Optional[str] = None,
 ) -> Optional[np.ndarray]:
