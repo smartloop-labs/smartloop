@@ -110,6 +110,77 @@ class ResolvedCall:
     reasoned: bool = False
 
 
+#: Tools this account cannot call, learned by calling them.  Keyed
+#: ``(server_id, tool_name)`` and held for the life of the process: an
+#: entitlement is a property of the workspace's plan, not of one request, and
+#: re-learning it costs a wasted resolution and a wasted round-trip every turn.
+_UNAVAILABLE_TOOLS: set = set()
+_UNAVAILABLE_LOCK = threading.Lock()
+
+#: Phrasings a server uses to decline a call it advertised, in the shape of a
+#: successful result.  Deliberately narrow: matching "upgrade" or "plan" alone
+#: would throw away a real Notion page about pricing, which is exactly the
+#: content a user would ask for.  Each of these is a sentence about the
+#: *caller's* entitlement, not something a document says.
+_ENTITLEMENT_PATTERNS = (
+    re.compile(r"\brequires? an?\b[^.]{0,40}\bplan\b", re.I),
+    re.compile(r"\brequires? a subscription\b", re.I),
+    re.compile(r"\bnot available on your (current )?plan\b", re.I),
+    re.compile(r"\bmcp_tool_upsell\b", re.I),
+    re.compile(r"\bupgrade (your plan|to a paid)\b", re.I),
+)
+
+#: An entitlement notice is short — a sentence and a link.  A long payload that
+#: happens to contain one of the phrases above is far more likely to be real
+#: content that mentions plans, so length is part of the test.
+_MAX_ENTITLEMENT_CHARS = 2000
+
+
+def is_entitlement_notice(text: str) -> bool:
+    """Whether *text* is a server declining a call rather than answering it.
+
+    A paywalled tool does not fail.  Notion's ``notion-ai-search`` on a
+    non-Business plan returns HTTP 200, ``success=True``, and a body reading
+    "This tool requires a Business plan or higher" with an upsell link — which
+    every layer above then treats as retrieved content, so an advertisement
+    reaches the model in place of the document and the answer is written from
+    it.  There is no field distinguishing this from an answer; the text is the
+    only signal there is.
+    """
+    if not text:
+        return False
+    candidate = text.strip()
+    if len(candidate) > _MAX_ENTITLEMENT_CHARS:
+        return False
+    return any(p.search(candidate) for p in _ENTITLEMENT_PATTERNS)
+
+
+def mark_tool_unavailable(server_id: str, tool_name: str) -> None:
+    """Stop offering *tool_name* for resolution on this server.
+
+    Called when a tool declines for entitlement reasons.  Without this the
+    resolver keeps picking the same paywalled tool every turn — it is still in
+    discovery, still the best-sounding name for the question — and every turn
+    pays a resolution and a round-trip to be told the same thing.
+    """
+    if not server_id or not tool_name:
+        return
+    with _UNAVAILABLE_LOCK:
+        _UNAVAILABLE_TOOLS.add((server_id, tool_name))
+
+
+def unavailable_tools() -> frozenset:
+    """The ``(server_id, tool_name)`` pairs known to be unavailable."""
+    with _UNAVAILABLE_LOCK:
+        return frozenset(_UNAVAILABLE_TOOLS)
+
+
+def forget_unavailable_tools() -> None:
+    """Clear what has been learned — for tests, and for a re-authentication."""
+    with _UNAVAILABLE_LOCK:
+        _UNAVAILABLE_TOOLS.clear()
+
+
 def format_call(server_name: str, tool_name: str, arguments: Dict[str, Any]) -> str:
     """``notion.create-pages(parent="Roadmap", pages=[…])`` — the call, for a person.
 
@@ -280,7 +351,13 @@ class MCPAgent:
         explore) are resolved by the planner against their own constants, and
         putting them in this list only gives the model a way to answer "read a
         file" to a question about Notion.
+
+        Tools discovery advertised but the account cannot actually call are
+        left out too — see :func:`mark_tool_unavailable`.  Discovery lists what
+        a server *has*, not what this plan is entitled to, so a paywalled tool
+        looks identical to a usable one until it is called.
         """
+        unavailable = unavailable_tools()
         entries: List[MCPAgent._Entry] = []
         seen: set = set()
         for server in mcp_servers:
@@ -295,6 +372,8 @@ class MCPAgent:
             for tool in getattr(server, "tools", None) or []:
                 name = self._field(tool, "name")
                 if not name:
+                    continue
+                if (server_id, name) in unavailable:
                     continue
                 qualified = f"{server_name}.{name}"
                 if qualified in seen:

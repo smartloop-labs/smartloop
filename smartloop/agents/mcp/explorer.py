@@ -23,7 +23,10 @@ from .server_selector import (
 )
 from .mcp_tool_caller import MCPToolCaller
 from .argument_extractor import MCPArgumentExtractor
-from .mcp_agent import MCPAgent, format_call, missing_required
+from .mcp_agent import (
+    MCPAgent, format_call, is_entitlement_notice, mark_tool_unavailable,
+    missing_required,
+)
 
 if TYPE_CHECKING:
     from smartloop.workspace.workspace import MCPServer
@@ -602,27 +605,60 @@ Does answering the latest message require a new web search?
             # on "Processing..." through all of it and the work reads as a
             # hang.  Named per server, because a workspace with two
             # connections pays this once each.
-            self._emit(progress, "tool", f"Choosing a {server_name} tool")
-            picked = self.mcp_agent.resolve(query, [server], llm=llm)
-            if not picked:
-                return ""
-            tool_name = picked.tool_name
-            if not self._is_read_only_tool(tool_name):
-                logger.info(
-                    "[collect] MCP tool '%s' is not read-only — leaving to a "
-                    "planned execute step", tool_name,
-                )
-                return ""
+            # Two attempts, because the first pick can turn out to be a tool
+            # this account cannot call.  Discovery lists what the server has,
+            # not what the plan is entitled to, so a paywalled tool is
+            # indistinguishable from a usable one until it answers — and it
+            # answers with an advertisement, successfully.  Retrying once with
+            # it struck off the catalogue is what lets the same turn fall to
+            # the tool that does work (``notion-search`` where
+            # ``notion-ai-search`` is Business-only) instead of handing the
+            # upsell to the model as though it were the document.
+            raw = ""
+            tool_name = ""
+            for attempt in (1, 2):
+                self._emit(progress, "tool", f"Choosing a {server_name} tool")
+                picked = self.mcp_agent.resolve(query, [server], llm=llm)
+                if not picked:
+                    return ""
+                tool_name = picked.tool_name
+                if not self._is_read_only_tool(tool_name):
+                    logger.info(
+                        "[collect] MCP tool '%s' is not read-only — leaving to a "
+                        "planned execute step", tool_name,
+                    )
+                    return ""
 
-            # The tool and its arguments, not just the server: "Calling
-            # Notion" is indistinguishable between reading a page and
-            # searching for one, and which of the two ran is the thing a user
-            # watching this actually wants to know.
-            self._emit(
-                progress, "tool",
-                f"Calling {format_call(server_name, tool_name, picked.arguments)}",
-            )
-            raw = self._call_mcp_tool(server, tool_name, picked.arguments, query)
+                # The tool and its arguments, not just the server: "Calling
+                # Notion" is indistinguishable between reading a page and
+                # searching for one, and which of the two ran is the thing a
+                # user watching this actually wants to know.
+                self._emit(
+                    progress, "tool",
+                    f"Calling {format_call(server_name, tool_name, picked.arguments)}",
+                )
+                raw = self._call_mcp_tool(server, tool_name, picked.arguments, query)
+                if not raw:
+                    return ""
+
+                if not is_entitlement_notice(raw):
+                    break
+
+                # Struck off before the retry, so the same resolution cannot
+                # come back with the same answer.
+                mark_tool_unavailable(getattr(server, "id", "") or "", tool_name)
+                logger.warning(
+                    "[collect] %s.%s is not available on this account — %s. "
+                    "Dropping it from the catalogue%s",
+                    server_name, tool_name, raw.strip().splitlines()[0][:160],
+                    " and re-resolving" if attempt == 1 else "",
+                )
+                self._emit(
+                    progress, "tool",
+                    f"{server_name}.{tool_name} needs a higher plan — "
+                    "trying another tool",
+                )
+                raw = ""
             if not raw:
                 return ""
 
