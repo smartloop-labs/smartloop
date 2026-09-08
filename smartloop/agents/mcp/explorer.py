@@ -525,8 +525,29 @@ Does answering the latest message require a new web search?
     # dozen connections would put all of them in front of every answer.
     _MAX_SERVERS_PER_QUESTION = 4
 
+    @staticmethod
+    def _emit(
+        progress: Optional[Callable[[str, str, str], None]],
+        step: str,
+        message: str,
+    ) -> None:
+        """Report one step to the client, never failing the work over it.
+
+        A progress callback crosses a thread boundary into the request's event
+        loop (see ``chat.py``), so it is the kind of thing that can raise long
+        after the client has gone.  Collect's job is the context, not the
+        commentary.
+        """
+        if progress is None:
+            return
+        try:
+            progress(step, "processing", message)
+        except Exception:
+            logger.debug("[collect] progress callback failed", exc_info=True)
+
     def _run_mcp(self, query: str, mcp_servers: Optional[List["MCPServer"]],
-                 project_dir: Optional[str], llm: Optional[BaseLLM] = None) -> str:
+                 project_dir: Optional[str], llm: Optional[BaseLLM] = None,
+                 progress: Optional[Callable[[str, str, str], None]] = None) -> str:
         """Gather what the connected servers know about *query*.
 
         Every server is asked, not just the best-matching one: a question is
@@ -563,16 +584,25 @@ Does answering the latest message require a new web search?
 
         gathered = []
         for server in servers:
-            text = self._run_mcp_server(query, server, llm)
+            text = self._run_mcp_server(query, server, llm, progress=progress)
             if text:
                 gathered.append(text)
         return "\n\n".join(gathered)
 
     def _run_mcp_server(
         self, query: str, server: "MCPServer", llm: Optional[BaseLLM] = None,
+        progress: Optional[Callable[[str, str, str], None]] = None,
     ) -> str:
         """One server's answer to *query*, or ``""``."""
+        server_name = getattr(server, "name", None) or "the server"
         try:
+            # Resolution is the long leg — a reasoned pick over this server's
+            # whole tool list, tens of seconds on a large catalog — and it runs
+            # before anything is called, so with no event here the client sits
+            # on "Processing..." through all of it and the work reads as a
+            # hang.  Named per server, because a workspace with two
+            # connections pays this once each.
+            self._emit(progress, "tool", f"Choosing a {server_name} tool")
             picked = self.mcp_agent.resolve(query, [server], llm=llm)
             if not picked:
                 return ""
@@ -584,6 +614,14 @@ Does answering the latest message require a new web search?
                 )
                 return ""
 
+            # The tool and its arguments, not just the server: "Calling
+            # Notion" is indistinguishable between reading a page and
+            # searching for one, and which of the two ran is the thing a user
+            # watching this actually wants to know.
+            self._emit(
+                progress, "tool",
+                f"Calling {format_call(server_name, tool_name, picked.arguments)}",
+            )
             raw = self._call_mcp_tool(server, tool_name, picked.arguments, query)
             if not raw:
                 return ""
@@ -591,7 +629,9 @@ Does answering the latest message require a new web search?
             # A listing answers "which records", not "what do they say".  The
             # connection's plan names the tool that fetches a record's body, so
             # a search hit becomes the page behind it rather than its title.
-            detail = self._fetch_record_details(server, tool_name, raw)
+            detail = self._fetch_record_details(
+                server, tool_name, raw, progress=progress,
+            )
             body = f"{raw}\n\n{detail}" if detail else raw
 
             logger.info(
@@ -656,6 +696,7 @@ Does answering the latest message require a new web search?
 
     def _fetch_record_details(
         self, server: "MCPServer", tool_name: str, payload: str,
+        progress: Optional[Callable[[str, str, str], None]] = None,
     ) -> str:
         """Bodies behind the records *payload* lists, per the connection's plan.
 
@@ -674,11 +715,22 @@ Does answering the latest message require a new web search?
         if not calls:
             return ""
 
+        server_name = getattr(server, "name", None) or "the server"
         bodies = []
-        for detail_tool, arguments in calls:
+        # Announced per record, not once for the batch: a search hit list turns
+        # into one fetch each, and a question that matched five pages spends
+        # most of its collect here.  Reported with the same call format as the
+        # resolved tool, so the follow-ups read as the calls they are rather
+        # than as a single opaque step.
+        for index, (detail_tool, arguments) in enumerate(calls, start=1):
             logger.info(
                 "[collect] following up with %s",
                 format_call(getattr(server, "name", ""), detail_tool, arguments),
+            )
+            self._emit(
+                progress, "tool",
+                f"Reading {index} of {len(calls)} from {server_name}: "
+                f"{format_call('', detail_tool, arguments)}",
             )
             result = self.tool_caller.call_tool(
                 server=server, tool_name=detail_tool, arguments=arguments,
@@ -826,6 +878,7 @@ Does answering the latest message require a new web search?
             if mcp_servers:
                 f_mcp = pool.submit(
                     self._run_mcp, query, mcp_servers, project_dir, mcp_llm,
+                    progress,
                 )
 
             # Collect primary results (local retrieval + MCP tools)
@@ -871,16 +924,10 @@ Does answering the latest message require a new web search?
                     # here the client shows the previous step until the whole
                     # search is done.  A skipped search stays silent, as the
                     # rest of this path is.
-                    if progress is not None:
-                        try:
-                            progress(
-                                "web_search", "processing",
-                                "Searching the web for the latest information",
-                            )
-                        except Exception:
-                            logger.debug(
-                                "[collect] progress callback failed", exc_info=True,
-                            )
+                    self._emit(
+                        progress, "web_search",
+                        "Searching the web for the latest information",
+                    )
                     ctx.web_context = self._search_web(query, progress=progress)
                     if self.web_search_agent.last_sources:
                         ctx.web_sources = list(self.web_search_agent.last_sources)
