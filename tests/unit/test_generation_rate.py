@@ -13,6 +13,7 @@ change them; they are chosen from the device now, and logged.
 import logging
 import time
 
+from smartloop.constants import OPENING_TOKENS
 from smartloop.llms.llama_cpp import LlamaCpp
 from smartloop.llms.llm_factory import LlmFactory
 
@@ -36,6 +37,26 @@ class TestTheRateLine:
     def test_a_single_token_does_not_divide_by_zero(self):
         now = time.time()
         assert "tok/s" in LlamaCpp._rate(10, 1, now, now)
+
+    def test_the_opening_is_reported_apart_from_the_rest(self):
+        """An average hides the ramp, and the ramp is what a reader notices."""
+        now = time.time()
+        start = now - 11.0
+        first = now - 10.0               # 10s of decode
+        opening = now - 6.0              # the first 32 tokens took 4s of it
+
+        line = LlamaCpp._rate(900, 132, start, first, opening)
+
+        # 132/10s overall, 32 in 4s at the start, 100 in the 6s after.
+        assert "13.2 tok/s" in line
+        assert f"first {OPENING_TOKENS}: 8.0" in line
+        assert "then 16.7" in line
+
+    def test_a_generation_too_short_to_have_two_halves_reports_one_rate(self):
+        now = time.time()
+        line = LlamaCpp._rate(900, OPENING_TOKENS, now - 3.0, now - 2.0, now - 1.0)
+        assert "tok/s" in line
+        assert "first" not in line
 
 
 class TestBatchAndThreads:
