@@ -600,7 +600,7 @@ class ModelService:
 
     def _get_large_llm(self) -> Optional[BaseLLM]:
         if self._remote_device() is not None:
-            return self._remote_llm(ModelCapability.SKILLS)
+            return self._remote_llm(ModelCapability.REASONING)
 
         """Return the large (agent) model, loading it lazily on first use.
 
@@ -1389,10 +1389,10 @@ class ModelService:
             orchestrator_rank = orchestrator._rank if orchestrator else (0, 0.0)
             # Pick the agent/large model from any general-capable (text) model —
             # filtering by GENERAL excludes vision-only models (e.g. qwen2-vl-2b
-            # which only declares VISION) without requiring a specific SKILLS tag.
+            # which only declares VISION) without requiring a specific REASONING tag.
             # Walk largest-first; when the biggest doesn't fit, fall to the next
             # lower tier (e.g. gemma4-4b → gemma4-2b) rather than the tiny router.
-            _text_caps = {ModelCapability.GENERAL, ModelCapability.SKILLS, ModelCapability.DP}
+            _text_caps = {ModelCapability.GENERAL, ModelCapability.REASONING, ModelCapability.DP}
             agent_models = [
                 m for m in workspace.models
                 if workspace.effective_model_enabled(m.model_name, project)

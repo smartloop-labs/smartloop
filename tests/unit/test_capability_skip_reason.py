@@ -43,7 +43,7 @@ class TestTheFallbackExplainsItself:
     def test_memory_is_named(self):
         router = _router(("gemma4-e2b", "memory"))
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert _messages(router)[-1] == (
             "Selected sl-mini — not enough memory for gemma4-e2b"
@@ -52,21 +52,21 @@ class TestTheFallbackExplainsItself:
     def test_a_gpu_fault_is_also_a_memory_message(self):
         router = _router(("gemma4-e2b", "faulted"))
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert "ran out of memory" in _messages(router)[-1]
 
     def test_a_missing_download_is_named(self):
         router = _router(("gemma4-e2b", "missing"))
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert "not downloaded" in _messages(router)[-1]
 
     def test_the_legacy_name_is_shown_as_the_product_name(self):
         router = _router(("slp-orchestra-mini", "memory"))
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert "sl-mini" in _messages(router)[-1]
         assert "orchestra" not in _messages(router)[-1].lower()
@@ -74,14 +74,14 @@ class TestTheFallbackExplainsItself:
     def test_no_recorded_reason_leaves_the_message_bare(self):
         router = _router(None)
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert _messages(router)[-1] == "Selected sl-mini"
 
     def test_an_unknown_cause_is_not_guessed_at(self):
         router = _router(("gemma4-e2b", "something-new"))
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert _messages(router)[-1] == "Selected sl-mini"
 
@@ -95,7 +95,7 @@ class TestTheFallbackExplainsItself:
         )
         router.begin_request(MagicMock())
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert _messages(router)[-1] == "Selected sl-mini"
 
@@ -108,7 +108,7 @@ class TestTheFallbackExplainsItself:
         )
         router.begin_request(MagicMock())
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert _messages(router)[-1] == "Selected sl-mini"
 
@@ -137,14 +137,14 @@ class TestTheReasonIsRecordedWhereItHappens:
     def test_a_fit_failure_records_memory(self):
         svc = self._service(fits=False)
 
-        assert svc._load_workspace_llm(self._model(), "capability 'skills'") is None
+        assert svc._load_workspace_llm(self._model(), "capability 'reasoning'") is None
         assert svc.last_capability_skip() == ("gemma4-e2b", "memory", None)
 
     def test_a_fit_failure_carries_the_measured_shortfall(self):
         svc = self._service(fits=False)
         svc._last_fit_shortfall = (4.9, 4.4)
 
-        assert svc._load_workspace_llm(self._model(), "capability 'skills'") is None
+        assert svc._load_workspace_llm(self._model(), "capability 'reasoning'") is None
         assert svc.last_capability_skip() == (
             "gemma4-e2b", "memory", "needs ~4.9GB, 4.4GB free",
         )
@@ -152,14 +152,14 @@ class TestTheReasonIsRecordedWhereItHappens:
     def test_a_missing_gguf_records_missing(self):
         svc = self._service(gguf=None)
 
-        assert svc._load_workspace_llm(self._model(), "capability 'skills'") is None
+        assert svc._load_workspace_llm(self._model(), "capability 'reasoning'") is None
         assert svc.last_capability_skip() == ("gemma4-e2b", "missing", None)
 
     def test_a_faulted_slot_records_memory(self):
         """A runtime OOM has no measurement to report — only the cause."""
         svc = self._service(faulted=True)
 
-        assert svc._load_workspace_llm(self._model(), "capability 'skills'") is None
+        assert svc._load_workspace_llm(self._model(), "capability 'reasoning'") is None
         assert svc.last_capability_skip() == ("gemma4-e2b", "memory", None)
 
     def test_a_resident_model_clears_a_stale_reason(self):
@@ -167,7 +167,7 @@ class TestTheReasonIsRecordedWhereItHappens:
         svc._capability_skip = ("gemma4-e2b", "memory")
         setattr(svc, "_cap_llm_gemma4-e2b", MagicMock(name="resident"))
 
-        assert svc._load_workspace_llm(self._model(), "capability 'skills'") is not None
+        assert svc._load_workspace_llm(self._model(), "capability 'reasoning'") is not None
         assert svc.last_capability_skip() is None
 
 
@@ -179,7 +179,7 @@ class TestTheShortfallIsReported:
     def test_the_figures_are_appended(self):
         router = _router(("gemma4-e2b", "memory", "needs ~4.9GB, 4.4GB free"))
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert _messages(router)[-1] == (
             "Selected sl-mini — not enough memory for gemma4-e2b "
@@ -189,7 +189,7 @@ class TestTheShortfallIsReported:
     def test_a_cause_with_no_figures_reads_as_before(self):
         router = _router(("gemma4-e2b", "missing", None))
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert _messages(router)[-1] == (
             "Selected sl-mini — gemma4-e2b is not downloaded"
@@ -198,7 +198,7 @@ class TestTheShortfallIsReported:
     def test_a_two_element_record_is_still_accepted(self):
         router = _router(("gemma4-e2b", "memory"))
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert _messages(router)[-1] == (
             "Selected sl-mini — not enough memory for gemma4-e2b"
@@ -207,7 +207,7 @@ class TestTheShortfallIsReported:
     def test_a_malformed_record_is_ignored(self):
         router = _router(("gemma4-e2b",))
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
 
         assert _messages(router)[-1] == "Selected sl-mini"
 

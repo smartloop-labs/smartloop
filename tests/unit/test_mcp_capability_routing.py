@@ -77,7 +77,7 @@ class TestSmallTierHonoursCapability:
         cap_llm = _llm("Gemma 3n E2B")
         router, _agent_llm = _router(capability_llm=cap_llm)
 
-        assert router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS) is cap_llm
+        assert router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING) is cap_llm
 
 
 class TestToolResolutionTakesTheOverride:
@@ -233,18 +233,18 @@ class TestTheReasoningModelIsAnnouncedAsWork:
         so neither is suppressed by the "already in use" check — and the user
         read the same model being picked twice:
 
-            Selected qwen3.5-2b for skills
+            Selected qwen3.5-2b for reasoning
             Selected qwen3.5-2b for tool resolution
         """
         worker = _llm("Qwen3.5 2B")
         worker.supports_thinking = True
         router, router_llm, progress = self._multi_model_router(lambda cap: worker)
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
         router.reasoning_llm(router_llm)
 
         selected = [m for m in self._messages(progress) if m.startswith("Selected")]
-        assert selected == ["Selected Qwen3.5 2B for skills"]
+        assert selected == ["Selected Qwen3.5 2B for reasoning"]
 
     def test_a_different_model_for_the_tool_call_is_still_announced(self):
         """Suppression is about repetition, not about the second event: work
@@ -257,11 +257,11 @@ class TestTheReasoningModelIsAnnouncedAsWork:
             lambda cap: reasoner if cap == ModelCapability.THINKING.value else worker,
         )
 
-        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.REASONING)
         router.reasoning_llm(router_llm)
 
         selected = [m for m in self._messages(progress) if m.startswith("Selected")]
         assert selected == [
-            "Selected Qwen3.5 2B for skills",
+            "Selected Qwen3.5 2B for reasoning",
             "Selected Qwen3 4B for tool resolution",
         ]

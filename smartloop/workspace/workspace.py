@@ -382,8 +382,9 @@ class WorkspaceModel(BaseModel):
 
         if size >= 3:
             # GENERAL already added above; larger models additionally handle
-            # skills and document processing.
-            caps.append(ModelCapability.SKILLS)
+            # reasoning (skill matching, MCP tool resolution, planning) and
+            # document processing.
+            caps.append(ModelCapability.REASONING)
             caps.append(ModelCapability.DP)
 
         return caps

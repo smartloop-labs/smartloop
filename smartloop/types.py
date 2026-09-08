@@ -11,17 +11,39 @@ class ModelType(Enum):
 
 class ModelCapability(str, Enum):
     GENERAL = "general"
-    SKILLS = "skills"
+    # The model that reasons over a set of options before acting: which skill
+    # matches this request, which MCP server and tool a step needs, how a
+    # prompt decomposes into a plan.  Named for the work rather than for one
+    # of its callers — it was ``skills`` when skill matching was the only
+    # thing routed to it, which then read as a lie everywhere else, most of
+    # all in the SSE that tells a user their MCP tool call picked "skills".
+    REASONING = "reasoning"
     DP = "dp"
     VISION = "vision"
     CODING = "coding"
     # Declares that the model's chat template reads ``enable_thinking`` — i.e.
-    # it can reason in a hidden block before answering.  Unlike the others this
-    # is not a routing target (no step asks for a "thinking model"); it is the
+    # it can reason in a hidden block before answering.  Not to be confused
+    # with REASONING above, which is a routing target: this one describes how
+    # a model answers, that one describes what it is picked for.  Unlike the
+    # others this is not a routing target at all; it is the
     # capability the model picker reads to show the toggle, and what gates the
     # per-request ``thinking`` flag on /v1/chat/completions.  See
     # ``SLPModel.thinking_default`` for whether it starts on.
     THINKING = "thinking"
+
+    @classmethod
+    def _missing_(cls, value):
+        """Resolve names this capability used to go by.
+
+        Capability strings outlive the code that named them: they sit in
+        ``config.json``, in a desktop client built against an earlier release,
+        and in the model-host protocol between a child and a host that may not
+        have been restarted together.  Mapping the old spelling here is what
+        keeps any of those from raising instead of routing.
+        """
+        if isinstance(value, str) and value.strip().lower() == "skills":
+            return cls.REASONING
+        return None
 	
 class Document:
 	def __init__(self, **kwargs) -> None:

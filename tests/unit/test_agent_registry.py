@@ -135,9 +135,28 @@ class TestPersistence:
 
         reloaded = AgentRegistry(str(tmp_path)).load()
 
-        assert reloaded.supervisor == {"pid": os.getpid(), "port": 38540}
+        assert reloaded.supervisor["pid"] == os.getpid()
+        assert reloaded.supervisor["port"] == 38540
         assert reloaded.model_host["address"] == "/tmp/model-host.sock"
         assert reloaded.get("alpha").port == 41000
+
+    def test_the_supervisor_record_carries_its_start_time(self, registry, tmp_path):
+        """What a child reads to tell a successor from a recycled pid.
+
+        A restarted supervisor adopts the children of the old one, so a child
+        whose parent has gone looks here for a replacement.  A bare pid is not
+        enough to identify one: reuse would hand the child a stranger to live
+        behind forever.
+        """
+        from smartloop.supervisor.parent_watch import process_started_at
+
+        registry.set_supervisor(os.getpid(), 38540)
+
+        reloaded = AgentRegistry(str(tmp_path)).load()
+
+        assert reloaded.supervisor["started_at"] == pytest.approx(
+            process_started_at(os.getpid())
+        )
 
     def test_a_new_supervisor_does_not_adopt_dead_children(self, registry, tmp_path):
         """A pid file outliving its process is the normal result of a crash."""

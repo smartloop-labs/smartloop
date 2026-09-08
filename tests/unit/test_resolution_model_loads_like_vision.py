@@ -90,7 +90,7 @@ class TestTheReasoningModelLoadsWithoutTheReserve:
     def test_every_other_capability_keeps_the_reserve(self, svc):
         """Waiving it is specific to the step that has no fallback worth
         having — a skills or dp model that doesn't fit still steps down."""
-        _, _, fits = _resolve(svc, "skills", [_ws_model("gemma4-4b")])
+        _, _, fits = _resolve(svc, "reasoning", [_ws_model("gemma4-4b")])
 
         assert fits.call_args.kwargs["reserve_gb"] is None
 

@@ -12,6 +12,7 @@ per project.
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -19,6 +20,9 @@ import time
 import httpx
 import pytest
 
+from smartloop.supervisor.parent_watch import (
+    parent_environment, process_started_at,
+)
 from smartloop.supervisor.pool import ProjectAgentPool
 from smartloop.supervisor.registry import AgentRegistry, process_alive
 
@@ -74,6 +78,17 @@ def pool(home, child_env):
         def _environment(self, project_id):
             env = dict(child_env)
             env["SLP_PROJECT_ID"] = project_id
+            # Keep the parent link the real pool adds.  Replacing the whole
+            # environment used to drop it, which left these children — real,
+            # detached processes — with nothing tying them to the test run
+            # that spawned them; an interrupted run leaked agents that were
+            # still up hours later.
+            env.update(parent_environment())
+            # Notice fast: the default 5s/30s is tuned for surviving a
+            # supervisor restart, and a test that asserts on orphan cleanup
+            # should not wait out a real handover window.
+            env["SLP_PARENT_WATCH_INTERVAL_S"] = "0.5"
+            env["SLP_PARENT_WATCH_GRACE_S"] = "1"
             return env
 
     made = _Pool(
@@ -238,3 +253,111 @@ class TestTheClientContractIsUnchanged:
         httpx.get(f"{supervisor}/health", timeout=30)
 
         assert pool.registry.all() == []
+
+
+class TestOrphanedAgents:
+    """A real agent, a real parent, and the parent taken away.
+
+    The regression this exists for was observable in ``ps``: agents reparented
+    to init, alive for hours after the run that spawned them was interrupted,
+    each still holding its project's task queue and MCP children.  Children are
+    spawned detached — on purpose, so a Ctrl-C reaches the supervisor alone —
+    which is why the link has to be watched from the child rather than
+    inherited from the OS.
+    """
+
+    @staticmethod
+    def _spawn_agent(child_env, home, parent_pid, parent_started_at):
+        from smartloop.supervisor.parent_watch import (
+            PARENT_PID_ENV, PARENT_STARTED_AT_ENV,
+        )
+
+        env = dict(child_env)
+        env["SLP_PROJECT_ID"] = "alpha"
+        env[PARENT_PID_ENV] = str(parent_pid)
+        env[PARENT_STARTED_AT_ENV] = repr(parent_started_at)
+        env["SLP_PARENT_WATCH_INTERVAL_S"] = "0.5"
+        env["SLP_PARENT_WATCH_GRACE_S"] = "1"
+        return subprocess.Popen(
+            [sys.executable, "-m", "smartloop.api.project_agent",
+             "--project", "alpha", "--log-level", "warning"],
+            env=env, stdin=subprocess.DEVNULL,
+            start_new_session=(os.name != "nt"),
+        )
+
+    @staticmethod
+    def _await_serving(agent, home, timeout=120):
+        from smartloop.supervisor.registry import read_project_agent
+
+        project_dir = str(home / "ws-e2e" / "alpha")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            assert agent.poll() is None, "the agent exited during startup"
+            published = read_project_agent(project_dir)
+            if published and published[0] == agent.pid:
+                try:
+                    if httpx.get(f"http://127.0.0.1:{published[1]}/health",
+                                 timeout=5).status_code == 200:
+                        return published[1]
+                except httpx.HTTPError:
+                    pass
+            time.sleep(0.1)
+        raise AssertionError("the agent never became healthy")
+
+    def test_an_agent_exits_when_its_supervisor_is_killed(self, child_env, home):
+        parent = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        agent = None
+        try:
+            started_at = process_started_at(parent.pid)
+            agent = self._spawn_agent(child_env, home, parent.pid, started_at)
+            self._await_serving(agent, home)
+
+            # SIGKILL, not terminate: a supervisor that shuts down cleanly
+            # stops its children itself.  The orphan is what happens when it
+            # never gets the chance.
+            parent.kill()
+            parent.wait(timeout=10)
+
+            assert agent.wait(timeout=90) is not None
+            assert not process_alive(agent.pid)
+        finally:
+            for process in (agent, parent):
+                if process is None:
+                    continue
+                try:
+                    process.kill()
+                    process.wait(timeout=10)
+                except Exception:
+                    pass
+
+    def test_an_agent_keeps_serving_while_its_supervisor_lives(
+        self, child_env, home
+    ):
+        """The watch must not be a liveness bug of its own."""
+        parent = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        agent = None
+        try:
+            started_at = process_started_at(parent.pid)
+            agent = self._spawn_agent(child_env, home, parent.pid, started_at)
+            port = self._await_serving(agent, home)
+
+            time.sleep(3)  # several poll intervals and grace periods
+
+            assert agent.poll() is None
+            assert httpx.get(f"http://127.0.0.1:{port}/health",
+                             timeout=10).status_code == 200
+        finally:
+            for process in (agent, parent):
+                if process is None:
+                    continue
+                try:
+                    process.kill()
+                    process.wait(timeout=10)
+                except Exception:
+                    pass

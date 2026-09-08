@@ -288,7 +288,7 @@ class Planner:
         """
         priority = (
             (ModelCapability.VISION, has_attachments),
-            (ModelCapability.SKILLS, has_matched_skills),
+            (ModelCapability.REASONING, has_matched_skills),
             (ModelCapability.DP, has_document_context),
             (ModelCapability.GENERAL, True),
         )
