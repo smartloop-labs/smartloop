@@ -62,7 +62,7 @@ def _service(*models):
     # Stand in for the GGUF resolve + fit guard + llama.cpp load.
     svc._load_workspace_llm = MagicMock(
         name="_load_workspace_llm",
-        side_effect=lambda ws_model, reason: MagicMock(name=f"llm_{ws_model.model_name}"),
+        side_effect=lambda ws_model, reason, reserve_gb=None: MagicMock(name=f"llm_{ws_model.model_name}"),
     )
     return svc
 
@@ -123,7 +123,7 @@ def test_pinned_model_serves_a_capability_it_does_not_declare():
 
 def test_unloadable_pinned_model_falls_back_rather_than_failing():
     svc = _service(_ws_model("chat-model", ["general"]))
-    svc._load_workspace_llm.side_effect = lambda ws_model, reason: None
+    svc._load_workspace_llm.side_effect = lambda ws_model, reason, reserve_gb=None: None
 
     assert svc._get_llm_for_capability("dp") is None
 
@@ -192,7 +192,7 @@ def test_multi_selection_large_model_detection_still_runs():
 def broken_pin():
     """One model selected, but it has no GGUF / doesn't fit / faulted."""
     svc = _service(_ws_model("chat-model", ["general"]))
-    svc._load_workspace_llm.side_effect = lambda ws_model, reason: None
+    svc._load_workspace_llm.side_effect = lambda ws_model, reason, reserve_gb=None: None
     return svc
 
 

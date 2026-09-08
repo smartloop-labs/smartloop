@@ -926,7 +926,8 @@ class ModelService:
             return None
         return f"needs ~{needed_gb:.1f}GB, {free_gb:.1f}GB free"
 
-    def _load_workspace_llm(self, ws_model, reason: str) -> Optional[BaseLLM]:
+    def _load_workspace_llm(self, ws_model, reason: str,
+                            reserve_gb: Optional[float] = None) -> Optional[BaseLLM]:
         """Return a resident (or freshly loaded) instance of one workspace
         model, or ``None`` when it has no GGUF, faulted, or won't fit.
 
@@ -934,6 +935,12 @@ class ModelService:
         per-model cache, honours a GPU-fault eviction, applies the fit guard
         (evicting prior-step models to make room) and loads.  ``reason`` names
         the caller in the logs — a capability, or ``pinned``.
+
+        ``reserve_gb`` overrides the headroom the fit guard keeps for the main
+        model — see :meth:`_large_model_fits`.  A step that has its own model
+        and no use for a fallback (image OCR, tool resolution) passes 0 so the
+        step runs on the model it asked for rather than degrading to the
+        router model over headroom nothing else is about to claim.
         """
         workspace = self._model.workspace
         cache_key = f"_cap_llm_{ws_model.model_name}"
@@ -997,10 +1004,12 @@ class ModelService:
             # model.  First eagerly release prior steps' capability models
             # (and the on-demand large model) and retry — that frees enough
             # VRAM to run this model on a memory-tight device.
-            if not self._large_model_fits(gguf_path, cap, ws_model.model_name):
+            if not self._large_model_fits(gguf_path, cap, ws_model.model_name,
+                                          reserve_gb=reserve_gb):
                 if not (
                     self._evict_capability_models(keep_model_name=ws_model.model_name)
-                    and self._large_model_fits(gguf_path, cap, ws_model.model_name)
+                    and self._large_model_fits(gguf_path, cap, ws_model.model_name,
+                                               reserve_gb=reserve_gb)
                 ):
                     logger.warning(
                         "[capability-model] %s doesn't fit alongside the "
@@ -1173,10 +1182,25 @@ class ModelService:
         # one the user picked.  A selection that declares no 'general' at all
         # is the exception: it covers only its own capability, so a vision-only
         # model gets the image step and not the conversation around it.
+        # Reasoning is the tool-resolution step's model, the way the vision
+        # model is the image step's: MCPAgent asks for it by capability and
+        # runs it with thinking=True whatever the picker's per-model setting
+        # says, because the monologue is stripped before anything reads the
+        # JSON tool call.  So it loads on the same terms as vision — without
+        # the headroom the fit guard keeps for the main model.  Keeping that
+        # reserve here bought nothing: the alternative to loading it is
+        # resolving the tool call on the small router model, which is the
+        # outcome the routing exists to avoid.
+        reserve_gb = (
+            0.0 if self._cap_name(capability) == ModelCapability.THINKING.value
+            else None
+        )
+
         pinned = self._pinned_model(capability)
         if pinned is not None:
             llm = self._load_workspace_llm(
                 pinned, f"pinned, capability '{self._cap_name(capability)}'",
+                reserve_gb=reserve_gb,
             )
             if llm is None:
                 logger.warning(
@@ -1205,6 +1229,7 @@ class ModelService:
             # GGUF, faulted, or doesn't fit — rather than the tiny default.
             llm = self._load_workspace_llm(
                 ws_model, f"capability '{self._cap_name(capability)}'",
+                reserve_gb=reserve_gb,
             )
             if llm is not None:
                 return llm
