@@ -67,6 +67,25 @@ class AppSettings(BaseSettings):
     # multi-process workers (each with its own model copy) were removed because
     # same-device copies serialize in the driver anyway.
     n_parallel: int = Field(default=1, validation_alias="slp_n_parallel")
+    # Prompt-processing batch (llama.cpp n_batch).  Prefill is what a long
+    # prompt costs — the whole tool catalog an MCP step is resolved against,
+    # a document being summarized — and it runs one batch at a time, so 512
+    # made a 3k-token prompt six passes when a GPU could do it in two.  Raised
+    # on a GPU backend (see LlmFactory), where the buffer it grows is measured
+    # in tens of MB; 0 keeps llama.cpp's own default.
+    llm_n_batch: int = Field(
+        default=0,
+        validation_alias="slp_llm_n_batch",
+        description="llama.cpp n_batch; 0 = choose from the device.",
+    )
+    # Generation threads (llama.cpp n_threads).  Only the layers that are not
+    # offloaded run on them, so this matters most on a CPU-only load — where a
+    # flat 4 left most of the machine idle.  0 = choose from the device.
+    llm_n_threads: int = Field(
+        default=0,
+        validation_alias="slp_llm_n_threads",
+        description="llama.cpp n_threads; 0 = choose from the device.",
+    )
     # Context window for each LLM worker's model copy.  0 (default) = no cap:
     # Cap applied to the MAIN model's (auto-sized) context window.  Its KV
     # cache otherwise scales to the whole device, leaving nothing for the

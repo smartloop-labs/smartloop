@@ -251,6 +251,36 @@ class LlmFactory:
             return False
 
     @staticmethod
+    def _batch_and_threads(n_gpu_layers: int, logger: Logger) -> tuple[int, int]:
+        """``(n_batch, n_threads)`` for this load.
+
+        Both were fixed at 512 and 4 "for memory efficiency", and both are paid
+        on every prompt.  ``n_batch`` is the prefill batch: a 3k-token prompt —
+        a tool catalog, a document — went through it six times where a GPU can
+        take it in two, and the buffer it grows is tens of megabytes, not
+        gigabytes.  ``n_threads`` only drives the layers that are *not*
+        offloaded, so 4 costs little on a GPU load and most of the machine on a
+        CPU one.
+
+        Overridable with ``SLP_LLM_N_BATCH`` / ``SLP_LLM_N_THREADS`` for a
+        device where the defaults are wrong.
+        """
+        offloaded = n_gpu_layers != 0
+        n_batch, n_threads = (1024, 4) if offloaded else (512, os.cpu_count() or 4)
+        try:
+            from smartloop.config.app_settings import AppSettings
+            settings = AppSettings()
+            n_batch = settings.llm_n_batch or n_batch
+            n_threads = settings.llm_n_threads or n_threads
+        except Exception:
+            pass
+        logger.info(
+            "[model] n_batch=%d, n_threads=%d (n_gpu_layers=%d)",
+            n_batch, n_threads, n_gpu_layers,
+        )
+        return n_batch, n_threads
+
+    @staticmethod
     def _template_reads_thinking(llm) -> bool:
         """True when the loaded GGUF's own chat template can reason.
 
@@ -444,11 +474,14 @@ class LlmFactory:
             )
             n_ctx = max_n_ctx
 
+        n_batch, n_threads = LlmFactory._batch_and_threads(
+            llama_config.n_gpu_layers, logger,
+        )
         config = {
             'model_path': path,
             'n_ctx': n_ctx,
-            'n_batch': 512,  # Smaller batch size for memory efficiency
-            'n_threads': 4,  # Limit CPU threads
+            'n_batch': n_batch,
+            'n_threads': n_threads,
             **llama_config.model_dump()
         }
 

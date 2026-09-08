@@ -192,6 +192,31 @@ class LlamaCpp(BaseLLM[Llama]):
         """
         return hasattr(self.model, "_slp_thinking")
 
+    @staticmethod
+    def _rate(
+        prompt_tokens: int,
+        generated: int,
+        start_time: float,
+        first_token_at: Optional[float],
+    ) -> str:
+        """`` | 512 prompt, ttft 1.8s, 12.4 tok/s`` for a generation.
+
+        "Slow" is not actionable and neither is a wall-clock total: a long
+        prompt on a fast model and a short prompt on a model that fell back to
+        CPU take the same ten seconds and want opposite fixes.  Prefill (time
+        to the first token, which the prompt pays for) and decode rate (what
+        the weights and the offload decide) separate them, and both are free to
+        measure here.
+        """
+        if not generated or first_token_at is None:
+            return ""
+        ttft = first_token_at - start_time
+        decode = max(1e-6, time.time() - first_token_at)
+        return (
+            f" | {prompt_tokens} prompt, ttft {ttft:.2f}s, "
+            f"{generated / decode:.1f} tok/s"
+        )
+
     @contextlib.contextmanager
     def _thinking_override(self, thinking: Optional[bool]):
         """Force the reasoning block on or off for one call.
@@ -287,6 +312,7 @@ class LlamaCpp(BaseLLM[Llama]):
                 parts: List[str] = []
                 chunk_count = 0
                 cancelled = False
+                first_token_at: Optional[float] = None
                 for chunk in stream:
                     # Check for cancellation between chunks.
                     if self._cancelled is not None and self._cancelled.is_set():
@@ -304,6 +330,8 @@ class LlamaCpp(BaseLLM[Llama]):
                             text = choice['text'] or ""
 
                     if text:
+                        if first_token_at is None:
+                            first_token_at = time.time()
                         parts.append(text)
                         chunk_count += 1
 
@@ -311,6 +339,7 @@ class LlamaCpp(BaseLLM[Llama]):
                 self.logger.info(
                     f"{'Cancelled' if cancelled else 'Completed'} | "
                     f"chunks={chunk_count} elapsed={elapsed:.3f}s"
+                    f"{self._rate(prompt_tokens, chunk_count, start_time, first_token_at)}"
                 )
                 # A reasoning model's <think> block is not the answer: every
                 # caller from here on treats this string as one (JSON planning,
@@ -357,6 +386,8 @@ class LlamaCpp(BaseLLM[Llama]):
             )
 
             chunk_count = 0
+            start_time = time.time()
+            first_token_at: Optional[float] = None
             # Reasoning is withheld from the stream rather than shown and then
             # retracted; the tags can split across chunks, so the filter is
             # stateful and spans the whole stream.
@@ -367,6 +398,8 @@ class LlamaCpp(BaseLLM[Llama]):
                     break
 
                 chunk_count += 1
+                if first_token_at is None:
+                    first_token_at = time.time()
                 # Extract text from llama_cpp CreateChatCompletionStreamResponse format
                 text = ""
 
@@ -413,6 +446,15 @@ class LlamaCpp(BaseLLM[Llama]):
 
             if chunk_count == 0:
                 self.logger.warning("No chunks received from stream")
+            else:
+                self.logger.info(
+                    "Streamed | chunks=%d elapsed=%.3fs%s",
+                    chunk_count, time.time() - start_time,
+                    self._rate(
+                        self.get_num_tokens(prompt), chunk_count,
+                        start_time, first_token_at,
+                    ),
+                )
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:

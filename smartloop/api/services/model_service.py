@@ -2886,7 +2886,14 @@ class ModelService:
         if pinned_model is not None:
             pinned = self._pinned_llm(capability)
             if pinned is not None:
-                logger.info(
+                # DEBUG, not INFO: this resolution runs for *every* generation
+                # the process serves, not only the final answer — with a model
+                # host in front of it, that is each of a project agent's
+                # planning, matching and resolution calls, each logging
+                # "[response] … (capability='None')" for a decision that was
+                # never about the response.  Which model wrote the answer is
+                # reported once, by `_report_response_model`.
+                logger.debug(
                     "[response] Using the sole selected model (capability='%s')",
                     self._cap_name(capability),
                 )
@@ -4021,9 +4028,20 @@ class ModelService:
         """Register a local (stdio) MCP server to a project (by ID or current).
 
         Follows the standard MCP stdio config: the caller supplies the
-        ``command`` (e.g. ``uvx``, ``npx``) and ``args``. The command must be
-        installed and on PATH on the host system — it is launched as-is, no
-        rewriting. Built-in Smartloop servers use FastMCP modules launched via
+        ``command`` (``uvx``, ``npx``, ``python``, a path to a program, …) and
+        ``args``, and they are persisted and launched exactly as given.  The
+        command must be installed on the host; it is resolved to its full path
+        at launch (``LocalMCPClient._resolve_command``) but never rewritten.
+
+        Nothing here knows what a launcher wants.  Registration used to fold
+        ``uvx <pkg>`` into ``uvx --from <pkg> <pkg>`` and swap ``uvx`` for
+        ``uv tool run``, which meant the command a user configured was not the
+        command that ran — invisible in the UI, wrong for every launcher that
+        is not uv, and a second place to keep in step with a tool's own CLI.
+        A configuration that does not work is now a configuration that can be
+        read and corrected.
+
+        Built-in Smartloop servers use FastMCP modules launched via
         ``<python> -m smartloop...`` and are registered separately.
         """
         if not command:
@@ -4047,26 +4065,6 @@ class ModelService:
                 "Provide the package or module name, e.g. args=['yahoo-finance-mcp'] "
                 "for uvx, args=['-y', '@scope/pkg'] for npx, or args=['-m', 'module']."
             )
-
-        # Normalise bare `uvx <pkg>` → `uvx --from <pkg> <pkg>` so uvx
-        # always knows both the package to install and the executable to run.
-        if (
-            command == "uvx"
-            and len(args) == 1
-            and not args[0].startswith("-")
-            and "--from" not in args
-        ):
-            pkg = args[0]
-            args = ["--from", pkg, pkg]
-
-        # `uvx` is only a ~340KB trampoline that execs the real `uv` binary,
-        # which it locates *solely* as a sibling file next to itself (it does
-        # not search PATH). A system with `uvx` but no adjacent `uv` therefore
-        # fails. Since `uvx <args>` is exactly `uv tool run <args>`, prefer the
-        # self-contained `uv` binary when it is available on PATH.
-        if command == "uvx" and shutil.which("uv"):
-            command = "uv"
-            args = ["tool", "run", *args]
 
         if name is None:
             # Derive a display name from the package/script, i.e. the first

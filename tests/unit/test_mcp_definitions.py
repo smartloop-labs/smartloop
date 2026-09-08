@@ -259,3 +259,83 @@ class TestFindingTheFileForAServer:
             "smartloop.mcp.definition_loader.definitions", lambda: found,
         )
         assert definition_for(self._Server(name="notion")) is None
+
+
+class TestNothingRewritesTheCommand:
+    """What a connection configures is what runs.
+
+    Registration used to fold `uvx <pkg>` into `uvx --from <pkg> <pkg>` and
+    swap `uvx` for `uv tool run` — so the command in the config was not the
+    command that ran, invisibly, and only ever correctly for uv.
+    """
+
+    def _register(self, command, args):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from smartloop.api.services.model_service import ModelService
+
+        project = SimpleNamespace(
+            id="p1", name="proj", project_dir="/tmp/p1", mcp_servers=[],
+        )
+        svc = MagicMock()
+        svc._get_project = MagicMock(return_value=project)
+        svc._model = MagicMock()
+        svc._mcp_server_to_dict = ModelService._mcp_server_to_dict
+        with patch("smartloop.api.services.model_service.LocalMCPClient"):
+            ModelService.add_local_mcp_server(
+                svc, command=command, args=args, project_id="p1",
+            )
+        return project.mcp_servers[0].config
+
+    def test_a_bare_uvx_package_is_stored_as_written(self):
+        config = self._register("uvx", ["yahoo-finance-mcp"])
+        assert (config.command, config.args) == ("uvx", ["yahoo-finance-mcp"])
+
+    def test_an_npx_invocation_is_stored_as_written(self):
+        config = self._register("npx", ["-y", "@example/some-mcp"])
+        assert (config.command, config.args) == ("npx", ["-y", "@example/some-mcp"])
+
+    def test_a_command_line_in_one_string_is_only_split(self):
+        config = self._register("uv tool run --from pkg pkg", [])
+        assert (config.command, config.args) == (
+            "uv", ["tool", "run", "--from", "pkg", "pkg"],
+        )
+
+    def test_a_program_path_needs_no_arguments(self):
+        config = self._register("/opt/bin/my-mcp", [])
+        assert (config.command, config.args) == ("/opt/bin/my-mcp", [])
+
+
+class TestTheCommandIsResolvedToItsPath:
+    """Which `uvx` — the app's PATH is not the shell's, so a command a user
+    verified in a terminal can be missing from the process that launches it."""
+
+    def _client(self, command, args=("--from", "pkg", "pkg")):
+        from smartloop.mcp.local_client import LocalMCPClient
+
+        return LocalMCPClient(command=command, args=list(args))
+
+    def test_a_command_on_the_path_resolves_to_its_full_path(self, tmp_path):
+        program = tmp_path / "uvx"
+        program.write_text("#!/bin/sh\n")
+        program.chmod(0o755)
+
+        resolved = self._client("uvx")._resolve_command({"PATH": str(tmp_path)})
+
+        assert resolved == str(program)
+
+    def test_an_absolute_path_is_used_as_given(self):
+        assert self._client("/opt/bin/my-mcp", ())._resolve_command({}) == "/opt/bin/my-mcp"
+
+    def test_a_command_nowhere_on_the_path_is_left_to_the_os(self):
+        # The OS produces the error rather than this inventing one.
+        assert self._client("definitely-not-installed")._resolve_command(
+            {"PATH": "/nonexistent"}
+        ) == "definitely-not-installed"
+
+    def test_a_built_in_server_runs_under_the_current_runtime(self):
+        import sys
+
+        client = self._client("python", ("-m", "smartloop.api.mcp.system_server"))
+        assert client._resolve_command({}) == sys.executable
