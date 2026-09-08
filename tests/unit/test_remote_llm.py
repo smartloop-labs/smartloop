@@ -147,11 +147,11 @@ class TestCapabilityStaysOnTheHost:
         assert ("generate", "x", None) in client.calls
 
     def test_the_context_size_is_asked_for_this_capability(self, client):
-        llm = RemoteLLM(client, capability=ModelCapability.SKILLS)
+        llm = RemoteLLM(client, capability=ModelCapability.REASONING)
 
         llm.get_max_tokens()
 
-        assert ("response_max_context_tokens", ModelCapability.SKILLS) in client.calls
+        assert ("response_max_context_tokens", ModelCapability.REASONING) in client.calls
 
 
 class TestWhatTheUserIsToldTheModelIs:
@@ -218,10 +218,10 @@ class TestWhatTheUserIsToldTheModelIs:
 
         svc._llm_for_response = _selection
 
-        label = svc.response_model_label(ModelCapability.SKILLS)
+        label = svc.response_model_label(ModelCapability.REASONING)
 
         # Same selection call the response makes...
-        assert asked == [ModelCapability.SKILLS]
+        assert asked == [ModelCapability.REASONING]
         # ...and the same label the old SSE would have carried for it.
         assert label == ModelService._model_label(_Chosen())
 
@@ -401,4 +401,4 @@ class TestTheServiceHandsOutRemoteHandles:
         llm = service._get_large_llm()
 
         assert isinstance(llm, RemoteLLM)
-        assert llm.capability == ModelCapability.SKILLS
+        assert llm.capability == ModelCapability.REASONING

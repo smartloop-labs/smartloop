@@ -24,6 +24,7 @@ import logging
 import os
 import socket
 import sys
+import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -146,16 +147,77 @@ def run(project_id: str, host: str = "127.0.0.1", port: int = 0,
     config = uvicorn.Config(app, host=host, port=port, log_level=log_level,
                             log_config=None)
     server = uvicorn.Server(config)
+    watch = _watch_the_supervisor(server)
     try:
         if sock is not None:
             server.run(sockets=[sock])
         else:
             server.run()
     finally:
+        if watch is not None:
+            watch.stop()
         if project_dir:
             from smartloop.supervisor.registry import _clear_project_files
 
             _clear_project_files(project_dir)
+
+
+#: How long an orphaned agent is given to shut down cleanly before it is taken
+#: down the blunt way.  An orphan is often orphaned *because* something in it
+#: is wedged — a hung MCP call, a request blocked on a model host that died
+#: with the supervisor — and the lifespan shutdown that stops a healthy process
+#: can then block forever, which would leave exactly the process this is here
+#: to remove.
+ORPHAN_SHUTDOWN_GRACE_SECONDS = 20.0
+
+
+def _watch_the_supervisor(server):
+    """Exit if the supervisor that spawned this agent goes away.
+
+    A child is spawned detached, so nothing in the OS links the two: before
+    this, a supervisor that was killed rather than stopped left its children
+    serving projects that no longer had a router in front of them, holding
+    their task queues, MCP stdio children and model-host connections open
+    until the machine rebooted.
+
+    Asking uvicorn to exit rather than exiting here: the lifespan shutdown is
+    what closes the SQLite handles, drains the task queue and terminates this
+    project's MCP grandchildren, and skipping it would trade one orphan for
+    several.  The hard exit is only the backstop for when that does not
+    return.
+    """
+    from smartloop.config import AppSettings
+    from smartloop.supervisor.parent_watch import start_parent_watch
+
+    def shut_down() -> None:
+        server.should_exit = True
+        # Daemon, so the backstop never becomes the delay: when the graceful
+        # shutdown does return, the process exits at once and takes the
+        # pending timer with it instead of waiting out the grace period and
+        # then hard-exiting a process that had already finished.
+        backstop = threading.Timer(ORPHAN_SHUTDOWN_GRACE_SECONDS, _hard_exit)
+        backstop.daemon = True
+        backstop.start()
+
+    try:
+        home_dir = AppSettings().home_dir
+    except Exception:
+        home_dir = None
+    return start_parent_watch(shut_down, home_dir=home_dir)
+
+
+def _hard_exit() -> None:
+    """Last resort: leave without running interpreter shutdown.
+
+    ``os._exit`` because the graceful path has already been given its chance
+    and did not return — a ``sys.exit`` from this timer thread would only
+    raise in the timer thread and leave the process exactly where it was.
+    """
+    logger.error(
+        "[project-agent] orphan shutdown did not finish in %.0fs; exiting hard",
+        ORPHAN_SHUTDOWN_GRACE_SECONDS,
+    )
+    os._exit(1)
 
 
 def main() -> None:

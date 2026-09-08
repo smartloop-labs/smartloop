@@ -404,3 +404,113 @@ class TestRestartBackoff:
     def test_one_project_s_backoff_is_its_own(self, pool):
         pool.note_exit("alpha", uptime=1.0)
         assert "beta" not in pool._backoff
+
+
+class TestNothingIsLeftBehind:
+    """A detached child that nobody holds a handle to is an orphan.
+
+    The pool spawns children in their own process group so a Ctrl-C in the
+    terminal reaches the supervisor alone. That is deliberate, and it is also
+    what makes a leak permanent: a process the pool has forgotten cannot be
+    stopped, waited on, or found again through the registry.
+    """
+
+    def test_the_child_is_told_who_its_parent_is(self, pool):
+        from smartloop.supervisor.parent_watch import (
+            PARENT_PID_ENV, PARENT_STARTED_AT_ENV, process_started_at,
+        )
+
+        env = pool._environment("alpha")
+
+        assert env[PARENT_PID_ENV] == str(os.getpid())
+        assert float(env[PARENT_STARTED_AT_ENV]) == pytest.approx(
+            process_started_at(os.getpid())
+        )
+
+    def test_a_child_that_never_goes_healthy_is_not_left_running(self, workspace):
+        """It published a port, so it was spawned — and then went silent."""
+        silent = tmp_script(workspace, textwrap.dedent('''
+            import os, sys, threading
+            project_dir = sys.argv[1]
+            os.makedirs(project_dir, exist_ok=True)
+            with open(os.path.join(project_dir, "agent.pid"), "w") as fh:
+                fh.write(str(os.getpid()))
+            with open(os.path.join(project_dir, "agent.port"), "w") as fh:
+                fh.write("1")   # nothing is listening there
+            threading.Event().wait()
+        '''), name="silent_agent.py")
+        pool = ProjectAgentPool(
+            registry=AgentRegistry(workspace["home"]),
+            project_dir_for=workspace["project_dir_for"],
+            start_timeout=2,
+            command_for=lambda project_id: [
+                sys.executable, silent,
+                workspace["project_dir_for"](project_id) or "",
+            ],
+        )
+
+        with pytest.raises(ChildStartError):
+            pool.ensure("alpha")
+
+        assert pool._processes == {}
+
+    def test_a_start_interrupted_partway_stops_the_child(self, workspace):
+        """Ctrl-C through a cold start used to leave the child behind.
+
+        The handle was only recorded once the child was healthy, so anything
+        raised while waiting for it — including a ``KeyboardInterrupt``, which
+        is not an ``Exception`` — dropped the one reference to a detached
+        process.
+        """
+        pool = ProjectAgentPool(
+            registry=AgentRegistry(workspace["home"]),
+            project_dir_for=workspace["project_dir_for"],
+            start_timeout=30,
+            command_for=lambda project_id: [
+                sys.executable, workspace["stub"],
+                workspace["project_dir_for"](project_id) or "",
+            ],
+        )
+        spawned: list = []
+        original = pool._await_health
+
+        def interrupt(project_id, process, record):
+            spawned.append(process)
+            raise KeyboardInterrupt
+
+        pool._await_health = interrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            pool.ensure("alpha")
+
+        assert spawned, "the child was never spawned"
+        assert not process_alive(spawned[0].pid)
+        assert pool._processes == {}
+
+    def test_stop_all_reaches_a_child_the_registry_never_learned_about(
+        self, workspace,
+    ):
+        """A shutdown that lands mid-start still has to take the child with it."""
+        pool = ProjectAgentPool(
+            registry=AgentRegistry(workspace["home"]),
+            project_dir_for=workspace["project_dir_for"],
+            command_for=lambda project_id: [
+                sys.executable, workspace["stub"],
+                workspace["project_dir_for"](project_id) or "",
+            ],
+        )
+        record = pool.ensure("alpha")
+        # Exactly the state a crash between spawning and recording leaves:
+        # a live child, a handle, and nothing in the registry.
+        pool.registry.remove("alpha", workspace["project_dir_for"]("alpha"))
+
+        pool.stop_all()
+
+        assert not process_alive(record.pid)
+
+
+def tmp_script(workspace, source: str, name: str) -> str:
+    path = os.path.join(os.path.dirname(workspace["stub"]), name)
+    with open(path, "w") as fh:
+        fh.write(source)
+    return path

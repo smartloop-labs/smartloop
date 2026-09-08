@@ -42,7 +42,7 @@ class Qwen3_5_2bModel(GenericModel):
     def default_capabilities() -> list[ModelCapability]:
         return [
             ModelCapability.GENERAL,
-            ModelCapability.SKILLS,
+            ModelCapability.REASONING,
             ModelCapability.DP,
             ModelCapability.VISION,
             ModelCapability.THINKING,

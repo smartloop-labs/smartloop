@@ -132,7 +132,65 @@ class Supervisor:
         if adopted:
             logger.info("[supervisor] adopted running agents for %s",
                         ", ".join(adopted))
+        self._reclaim_strays()
         logger.info("[supervisor] ready on port %d", port)
+
+    def _reclaim_strays(self) -> list[str]:
+        """Take back agents that are running but in nobody's registry.
+
+        The registry is how a new supervisor finds the children an old one
+        left, so anything missing from it is invisible: a stray keeps its
+        project's task queue and MCP children alive, holds the port recorded
+        beside the project, and — before the parent watch — never exited.  The
+        registry goes missing more easily than it sounds: a workspace whose
+        home was wiped, an agent from a test run against a temporary home, a
+        crash between spawning a child and recording it.
+
+        A project directory still describes itself (``agent.pid``,
+        ``agent.port``), so that is what is read here.  A stray that answers
+        ``/health`` is adopted rather than killed — it is a warm process
+        serving the right project, and once it is in the registry this
+        supervisor is the successor its parent watch will find.  One that does
+        not answer is stopped, and its project's next request starts a fresh
+        one.
+        """
+        from smartloop.supervisor.pool import terminate_pid
+        from smartloop.supervisor.registry import (
+            AgentRecord, process_alive, read_project_agent,
+        )
+        from smartloop.workspace import Workspace
+
+        workspace = Workspace.load()
+        if workspace is None:
+            return []
+
+        reclaimed: list[str] = []
+        for project in workspace.projects:
+            published = read_project_agent(project.project_dir)
+            if published is None:
+                continue
+            pid, port = published
+            if not process_alive(pid):
+                continue
+            known = self.registry.get(project.id)
+            if known is not None and known.pid == pid:
+                continue  # already adopted above
+
+            record = AgentRecord(project.id, pid, port)
+            if _answers_health(record.base_url):
+                logger.info(
+                    "[supervisor] reclaiming stray agent for %s (pid %d, port %d)",
+                    project.id, pid, port,
+                )
+                self.registry.add(record, project.project_dir)
+                reclaimed.append(project.id)
+            else:
+                logger.warning(
+                    "[supervisor] stray agent for %s (pid %d) is not answering; "
+                    "stopping it", project.id, pid,
+                )
+                terminate_pid(pid, timeout=10.0)
+        return reclaimed
 
     def _start_model_host(self) -> Optional[str]:
         """Run the model host in this process, on a background thread.
@@ -212,6 +270,16 @@ class Supervisor:
                 "memory_limit_bytes": self.memory_limit_bytes or None,
             },
         }
+
+
+def _answers_health(base_url: str, timeout: float = 5.0) -> bool:
+    """Whether something is serving the agent contract at *base_url*."""
+    import httpx
+
+    try:
+        return httpx.get(f"{base_url}/health", timeout=timeout).status_code == 200
+    except Exception:
+        return False
 
 
 def _rss(pid: Optional[int], psutil) -> Optional[int]:

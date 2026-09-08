@@ -187,8 +187,20 @@ class AgentRegistry:
             _clear_project_files(project_dir)
 
     def set_supervisor(self, pid: int, port: int) -> None:
+        """Record the supervisor, with the start time that identifies it.
+
+        ``started_at`` is here for the children: a child watching its parent
+        has to tell a live supervisor from a recycled pid, and a successor it
+        finds in this file is a process it has never seen.  Without the start
+        time an orphan whose pid was reused reads as supervised and stays up
+        forever.  See :mod:`smartloop.supervisor.parent_watch`.
+        """
+        from smartloop.supervisor.parent_watch import process_started_at
+
         with self._lock:
-            self._supervisor = {"pid": pid, "port": port}
+            self._supervisor = {
+                "pid": pid, "port": port, "started_at": process_started_at(pid),
+            }
             self.save()
 
     def set_model_host(self, pid: Optional[int], address: Optional[str]) -> None:

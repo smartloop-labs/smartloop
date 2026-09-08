@@ -184,13 +184,24 @@ class ProjectAgentPool:
                 f"could not spawn an agent for project {project_id}: {exc}"
             ) from exc
 
-        project_dir = self.project_dir_for(project_id)
-        port = self._await_port(project_id, process, project_dir)
-        record = AgentRecord(project_id, process.pid, port)
-        self._await_health(project_id, process, record)
-
+        # Own the handle from the moment it exists.  Recording it only after
+        # the child was healthy left every failure in between — a start
+        # timeout, an exception, a KeyboardInterrupt through this frame —
+        # holding the one reference to a detached process, which is exactly
+        # how an agent ends up reparented to init and running for hours.
         with self._lock:
             self._processes[project_id] = process
+        try:
+            project_dir = self.project_dir_for(project_id)
+            port = self._await_port(project_id, process, project_dir)
+            record = AgentRecord(project_id, process.pid, port)
+            self._await_health(project_id, process, record)
+        except BaseException:
+            with self._lock:
+                self._processes.pop(project_id, None)
+            self._terminate(process, timeout=5.0)
+            raise
+
         self.registry.add(record, project_dir)
         logger.info(
             "[supervisor] project %s ready on port %d (pid %d)",
@@ -211,8 +222,15 @@ class ProjectAgentPool:
         ]
 
     def _environment(self, project_id: str) -> dict:
+        from smartloop.supervisor.parent_watch import parent_environment
+
         env = dict(os.environ)
         env["SLP_PROJECT_ID"] = project_id
+        # Detaching the child (below) is what keeps Ctrl-C off it; this is what
+        # stops that detachment from outliving us.  A child that finds no
+        # supervisor behind this pid — and no replacement in the registry —
+        # shuts itself down rather than serving a project nobody can reach.
+        env.update(parent_environment())
         if self.model_host_address:
             env["SLP_MODEL_HOST"] = self.model_host_address
             # The whole point of the host is that the weights are loaded once.
@@ -330,7 +348,7 @@ class ProjectAgentPool:
             if record is not None and record.alive:
                 # Adopted from a previous supervisor: we have a pid but no
                 # handle, so signal it directly.
-                _signal_pid(record.pid, timeout)
+                terminate_pid(record.pid, timeout)
                 return True
             return False
 
@@ -342,6 +360,21 @@ class ProjectAgentPool:
                 self.stop(project_id, timeout)
             except Exception:
                 logger.exception("[supervisor] failed to stop project %s", project_id)
+
+        # Anything we spawned but never registered — a child that was still
+        # starting when the shutdown arrived.  Driven off the handles rather
+        # than the registry, because the registry only learns about a child
+        # once it is healthy, and a half-started one is just as detached.
+        with self._lock:
+            stragglers = list(self._processes.items())
+            self._processes.clear()
+        for project_id, process in stragglers:
+            logger.info("[supervisor] stopping unregistered agent for %s (pid %d)",
+                        project_id, process.pid)
+            try:
+                self._terminate(process, timeout)
+            except Exception:
+                logger.exception("[supervisor] failed to stop pid %d", process.pid)
 
     def _terminate(self, process: subprocess.Popen, timeout: float) -> None:
         if process.poll() is not None:
@@ -485,7 +518,7 @@ def _process_started_at(process: subprocess.Popen) -> float:
         return time.time()
 
 
-def _signal_pid(pid: int, timeout: float) -> None:
+def terminate_pid(pid: int, timeout: float) -> None:
     """Terminate a process we did not spawn and therefore cannot ``wait`` on.
 
     Through psutil, which spells "ask it to stop, then insist" portably.

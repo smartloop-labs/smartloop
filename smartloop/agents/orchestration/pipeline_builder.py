@@ -310,7 +310,7 @@ class PipelineBuilder:
                 continue
             if has_skill and step.step_type == StepType.TOOL:
                 step.model_tier = ModelTier.LARGE
-                step.capability = detected_capability or ModelCapability.SKILLS
+                step.capability = detected_capability or ModelCapability.REASONING
             else:
                 step.model_tier = ModelTier.SMALL
                 if detected_capability:

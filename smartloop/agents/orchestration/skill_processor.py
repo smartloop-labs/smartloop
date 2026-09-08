@@ -137,9 +137,9 @@ class SkillProcessor:
 
         # Skill matching is an intent judgement the small orchestrator model is
         # poor at (it defaults to picking the only listed skill). Prefer the
-        # 'skills'-capability model, but only when it is resident or fits — a
+        # 'reasoning'-capability model, but only when it is resident or fits — a
         # memory-tight device falls back to the mini instead of risking an OOM.
-        match_llm = self._models.decision_llm(ModelCapability.SKILLS)
+        match_llm = self._models.decision_llm(ModelCapability.REASONING)
         logger.info("[models] SKILL_MATCH → %s", self._models.model_label(match_llm))
 
         matched_skills = self.explorer.match_skills(
@@ -369,11 +369,11 @@ class SkillProcessor:
             # no skills-capable model fits.
             #
             # ``purpose`` is what the user is told.  The capability is how the
-            # model is chosen, and saying "Loading model for skills…" directly
+            # model is chosen, and saying "Loading model for reasoning…" directly
             # under "Synthesizing the final answer…" reports an internal routing
             # tag as though it were a second, unrelated step.
             synth_llm = self._models.llm_for_tier(
-                ModelTier.LARGE, ModelCapability.SKILLS,
+                ModelTier.LARGE, ModelCapability.REASONING,
                 purpose="the final answer",
             )
             logger.info(

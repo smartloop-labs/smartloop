@@ -96,7 +96,7 @@ class ModelRouter:
         told the model is for.  The two are not the same thing.  Synthesis
         routes on the ``skills`` capability because a skill's answer should be
         written by a skills-capable model, but the user is watching the final
-        answer being written, and "Loading model for skills…" names an internal
+        answer being written, and "Loading model for reasoning…" names an internal
         routing tag rather than the work in progress.
         """
         if tier == ModelTier.LARGE:
@@ -302,7 +302,7 @@ class ModelRouter:
     # internal terms; map them to human-readable text before surfacing in SSEs.
     _CAPABILITY_LABELS = {
         ModelCapability.GENERAL.value: "general",
-        ModelCapability.SKILLS.value: "skills",
+        ModelCapability.REASONING.value: "reasoning",
         ModelCapability.DP.value: "document processing",
         ModelCapability.VISION.value: "vision",
         ModelCapability.CODING.value: "coding",
@@ -371,7 +371,7 @@ class ModelRouter:
         workspace where one model serves both, read as the model being picked
         twice —
 
-            Selected qwen3.5-2b for skills
+            Selected qwen3.5-2b for reasoning
             Selected qwen3.5-2b for tool resolution
 
         — where the second line told the user nothing the first had not.  Work
@@ -432,7 +432,7 @@ class ModelRouter:
         be resolved, and say why when the reason is known.
 
         Deliberately does not name the capability: no capability model was
-        found, so "Selected sl-mini for skills" reads as though one had been
+        found, so "Selected sl-mini for reasoning" reads as though one had been
         chosen for that work.  Shares the selection dedupe key, so a later real
         resolution for the same capability does not report twice.
         """

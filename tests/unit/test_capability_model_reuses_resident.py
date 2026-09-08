@@ -80,7 +80,7 @@ class TestResidentModelsAreReused:
         svc._large_llm = MagicMock(name="resident_large")
         svc._large_model_name = "sl-4b"
 
-        llm, loaded = _resolve(svc, "skills", [_ws_model("sl-4b")])
+        llm, loaded = _resolve(svc, "reasoning", [_ws_model("sl-4b")])
 
         assert llm is svc._large_llm
         assert not loaded
