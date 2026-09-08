@@ -1356,36 +1356,20 @@ async def stream_chunks(
         alnum = sum(ch.isalnum() for ch in stripped)
         return alnum < 3
 
-    def _fence_guard(streamed: str) -> str:
-        """A separator that keeps leaked output from swallowing the retry.
-
-        The degenerate opening has already gone out, and it is usually an
-        unclosed ``` — which in markdown eats everything after it.  Close it
-        first so the replacement renders as an answer rather than as the body
-        of a code block the model never finished.
-        """
-        if streamed.count("```") % 2:
-            return "\n```\n\n"
-        return "\n\n" if streamed.strip() else ""
-
     def _stream_into_queue():
         """Run the sync stream in a thread and put chunks in queue.
 
-        Every chunk goes out the moment it arrives.  The opening of a
-        tool-synthesis answer used to be withheld until 20 alphanumeric
-        characters had been generated, so that a degenerate output (small
-        models often emit just ```) could be replaced rather than retracted.
-        That bought the retry at the cost of the first words of every such
-        answer — and a markdown preamble ("## Summary\n\n**") counted none of
-        its characters toward the threshold, so the wait was open-ended: dead
-        air, then a burst, then normal streaming.  Pacing the opening is the
-        client's business, not this layer's.
-
-        A degenerate output is still caught, at the end, and corrected by
-        appending the retry — the two or three characters that leaked are
-        cheaper than holding back every answer that turns out fine.
+        When tool context is present we buffer only the OPENING of the
+        stream so a degenerate output (small models often emit just ```)
+        can be detected and replaced by a non-streaming retry.  Once we
+        see enough real content we flush the buffer and stream normally
+        so larger, capable models don't lose streaming UX.
         """
         collected: list[str] = []
+        # Only buffer for tool-synthesis; regular chat streams immediately.
+        buffered = orchestrator_context is not None
+        opening_chars = 0
+        _ALNUM_STREAM_THRESHOLD = 20
 
         try:
             # Through the model client rather than the service directly: the
@@ -1406,7 +1390,19 @@ async def stream_chunks(
                 if not text:
                     continue
                 collected.append(text)
-                loop.call_soon_threadsafe(queue.put_nowait, text)
+
+                if not buffered:
+                    loop.call_soon_threadsafe(queue.put_nowait, text)
+                    continue
+
+                # Still in the opening-buffer window.
+                opening_chars += sum(ch.isalnum() for ch in text)
+                if opening_chars >= _ALNUM_STREAM_THRESHOLD:
+                    # Enough real content — flush buffered chunks and
+                    # switch to normal streaming mode for the remainder.
+                    for t in collected:
+                        loop.call_soon_threadsafe(queue.put_nowait, t)
+                    buffered = False
         except Exception as e:
             logger.error(f"Error in sync stream: {e}")
             loop.call_soon_threadsafe(queue.put_nowait, Exception(str(e)))
@@ -1418,6 +1414,11 @@ async def stream_chunks(
             return
 
         response = "".join(collected)
+
+        # If we already flushed the buffer we've been streaming — done.
+        if not buffered:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+            return
 
         if orchestrator_context and _is_degenerate(response):
             logger.warning(
@@ -1446,13 +1447,13 @@ async def stream_chunks(
                     retry = ""
 
             if retry and not _is_degenerate(retry):
-                replacement = retry
+                response = retry
             else:
                 logger.warning(
                     "[stream] Simplified retry also degenerate (%r) — returning guidance message",
                     (retry or "")[:40],
                 )
-                replacement = (
+                response = (
                     "**No response generated.**\n\n"
                     "The current model wasn't able to synthesize the "
                     "fetched content. This usually means the loaded "
@@ -1466,11 +1467,9 @@ async def stream_chunks(
                     "the small default router model."
                 )
 
-            # Appended, not substituted: what the model produced is already
-            # on the client.
-            loop.call_soon_threadsafe(
-                queue.put_nowait, _fence_guard(response) + replacement,
-            )
+        if orchestrator_context and response:
+            # Emit the (possibly retried) full response as one chunk.
+            loop.call_soon_threadsafe(queue.put_nowait, response)
 
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
