@@ -209,3 +209,59 @@ class TestTheReasoningModelIsAnnouncedAsWork:
 
         assert router.reasoning_llm(agent_llm) is agent_llm
         assert self._messages(progress) == []
+
+    def _multi_model_router(self, capability_llm):
+        """Two or more models selected: the request itself runs on the small
+        router model, so a capability model is always a real switch."""
+        router_llm = _llm("Slp Orchestra Mini")
+        router_llm.supports_thinking = False
+        progress = MagicMock()
+        router = ModelRouter(
+            orchestrator_llm=router_llm,
+            agent_llm=router_llm,
+            capability_llm_provider=lambda cap: capability_llm(cap),
+            capability_available=lambda cap: capability_llm(cap) is not None,
+        )
+        router.begin_request(progress)
+        return router, router_llm, progress
+
+    def test_a_model_already_announced_is_not_announced_again(self):
+        """One model serving two capabilities is one selection, not two.
+
+        Synthesis names it for ``skills``; the tool call lands on the same
+        model a moment later.  Both are switches away from the router model,
+        so neither is suppressed by the "already in use" check — and the user
+        read the same model being picked twice:
+
+            Selected qwen3.5-2b for skills
+            Selected qwen3.5-2b for tool resolution
+        """
+        worker = _llm("Qwen3.5 2B")
+        worker.supports_thinking = True
+        router, router_llm, progress = self._multi_model_router(lambda cap: worker)
+
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.reasoning_llm(router_llm)
+
+        selected = [m for m in self._messages(progress) if m.startswith("Selected")]
+        assert selected == ["Selected Qwen3.5 2B for skills"]
+
+    def test_a_different_model_for_the_tool_call_is_still_announced(self):
+        """Suppression is about repetition, not about the second event: work
+        moving to another model is exactly what the line is for."""
+        worker = _llm("Qwen3.5 2B")
+        worker.supports_thinking = False
+        reasoner = _llm("Qwen3 4B")
+        reasoner.supports_thinking = True
+        router, router_llm, progress = self._multi_model_router(
+            lambda cap: reasoner if cap == ModelCapability.THINKING.value else worker,
+        )
+
+        router.llm_for_tier(ModelTier.LARGE, ModelCapability.SKILLS)
+        router.reasoning_llm(router_llm)
+
+        selected = [m for m in self._messages(progress) if m.startswith("Selected")]
+        assert selected == [
+            "Selected Qwen3.5 2B for skills",
+            "Selected Qwen3 4B for tool resolution",
+        ]

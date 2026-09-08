@@ -324,6 +324,10 @@ class ModelRouter:
         self._emitted_model_events.add(key)
         return False
 
+    def _model_event_fired(self, key: str) -> bool:
+        """True if this model SSE already fired — without recording it."""
+        return key in getattr(self, "_emitted_model_events", ())
+
     def _event_label(
         self, capability: Optional[str], purpose: Optional[str],
     ) -> tuple:
@@ -354,15 +358,36 @@ class ModelRouter:
         llm: BaseLLM,
         purpose: Optional[str] = None,
     ) -> None:
-        """Surface the selected capability model as an SSE. Emitted once per
-        capability/request (a fan-out resolves the model once per document)."""
+        """Surface the selected capability model as an SSE.
+
+        Emitted once per capability/request — a fan-out resolves the model once
+        per document — and, where nothing announced a load, once per model.
+
+        A "Selected …" line answers the "Loading model for …" line before it,
+        so a step that promised a load always reports what it got, even when
+        that is a model the user has already seen.  A step that promised
+        nothing has only the switch to report, and a model already named this
+        turn is not a switch: resolving a tool call after synthesis, on a
+        workspace where one model serves both, read as the model being picked
+        twice —
+
+            Selected qwen3.5-2b for skills
+            Selected qwen3.5-2b for tool resolution
+
+        — where the second line told the user nothing the first had not.  Work
+        moving to a *different* model is still announced, every time.
+        """
         label, key = self._event_label(capability, purpose)
         if not key or self._model_event_seen(f"selected:{key}"):
             return
-        self.emit(
-            "model", "processing",
-            f"Selected {self.model_label(llm)} for {label}",
-        )
+        name = self.model_label(llm)
+        # Recorded whichever way this goes: a line that answered a load has
+        # named the model, so a later step that promised nothing has nothing
+        # left to add about it.
+        first_mention = not self._model_event_seen(f"selected-model:{name}")
+        if not first_mention and not self._model_event_fired(f"loading:{key}"):
+            return
+        self.emit("model", "processing", f"Selected {name} for {label}")
 
     # Why a capability model was skipped, phrased for the user.  ``memory`` is
     # the one they can act on — close something, or deselect a model — so it
