@@ -178,7 +178,7 @@ class ModelRouter:
             return fallback
         if not self._capability_model_exists(capability):
             return fallback
-        resolved = self.decision_llm(capability)
+        resolved = self.decision_llm(capability, purpose=self._RESOLUTION_PURPOSE)
         if resolved is not None and getattr(resolved, "supports_thinking", False):
             logger.info(
                 "[models] tool resolution → %s (thinking)",
@@ -204,9 +204,21 @@ class ModelRouter:
             )
             return True
 
-    def decision_llm(self, capability: Optional[str]) -> BaseLLM:
+    #: What the user is told a reasoning model was picked for.  ``thinking``
+    #: is an internal routing tag — it is excluded from the capabilities the
+    #: API reports (see ``api/routers/models.py``) and it names a property of
+    #: the model rather than the work, so "Selected qwen3.5-2b for thinking"
+    #: tells the reader nothing about what is happening.
+    _RESOLUTION_PURPOSE = "tool resolution"
+
+    def decision_llm(
+        self, capability: Optional[str], purpose: Optional[str] = None,
+    ) -> BaseLLM:
         """Resolve a capability model for a low-value *decision* node
         (skill matching, multi-step planning, MCP tool selection).
+
+        ``purpose`` is what the user is told the model is for, in place of the
+        capability tag — see :meth:`llm_for_tier` on why the two differ.
 
         Unlike :meth:`_llm_for_tier`, this never forces a generic large-model
         load: it uses the capability model only when it is already resident or
@@ -226,7 +238,14 @@ class ModelRouter:
                         "[models] decision capability '%s' → %s",
                         capability, self.model_label(llm),
                     )
-                    self.emit_model_selected(capability, llm)
+                    # Nothing was switched when the capability resolves to the
+                    # model this request is already running on.  Announcing it
+                    # anyway puts a second "Selected …" beside the first,
+                    # naming one model twice under two labels — which is what
+                    # a single-model workspace saw for every MCP step, since
+                    # the model that reasons is also the one that answers.
+                    if llm is not self.agent_llm:
+                        self.emit_model_selected(capability, llm, purpose)
                     return llm
             except Exception as e:
                 logger.warning(

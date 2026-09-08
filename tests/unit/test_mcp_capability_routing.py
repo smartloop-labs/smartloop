@@ -137,3 +137,75 @@ class TestToolResolutionTakesTheOverride:
         # The pick and its required argument come out of the same call.
         assert resolved.arguments == {"title": "Login is broken"}
         default_llm.invoke.assert_called_once()
+
+
+class TestTheReasoningModelIsAnnouncedAsWork:
+    """What the user is told about the model that resolves a tool call.
+
+    ``thinking`` is an internal routing tag: the API leaves it out of the
+    capabilities it reports, and it names a property of the model rather than
+    the work in progress.  Surfaced verbatim it read "Selected qwen3.5-2b for
+    thinking" — and on the single-model workspace where that model also writes
+    the answer, it landed directly beside "Selected qwen3.5-2b for the
+    response": one model, twice, under two labels.
+    """
+
+    def _router(self, capability_llm):
+        agent_llm = _llm("Qwen3.5 2B")
+        agent_llm.supports_thinking = False
+        progress = MagicMock()
+        router = ModelRouter(
+            orchestrator_llm=agent_llm,
+            agent_llm=agent_llm,
+            capability_llm_provider=lambda cap: capability_llm,
+            capability_available=lambda cap: capability_llm is not None,
+        )
+        router.begin_request(progress)
+        return router, agent_llm, progress
+
+    def _messages(self, progress):
+        return [call.args[2] for call in progress.call_args_list]
+
+    def test_a_switch_is_announced_as_tool_resolution(self):
+        reasoner = _llm("Qwen3 4B")
+        reasoner.supports_thinking = True
+        router, agent_llm, progress = self._router(reasoner)
+
+        assert router.reasoning_llm(agent_llm) is reasoner
+
+        messages = self._messages(progress)
+        assert messages == ["Selected Qwen3 4B for tool resolution"]
+        assert not any("thinking" in m for m in messages)
+
+    def test_landing_on_the_model_already_in_use_is_not_announced(self):
+        """Nothing was switched, so there is nothing to report."""
+        agent_llm = _llm("Qwen3.5 2B")
+        agent_llm.supports_thinking = False
+        progress = MagicMock()
+        router = ModelRouter(
+            orchestrator_llm=agent_llm,
+            agent_llm=agent_llm,
+            # The workspace's reasoning model *is* the model this request runs
+            # on — the single-model case.
+            capability_llm_provider=lambda cap: agent_llm,
+            capability_available=lambda cap: True,
+        )
+        router.begin_request(progress)
+
+        router.reasoning_llm(agent_llm)
+
+        assert self._messages(progress) == []
+
+    def test_a_fallback_that_already_reasons_is_kept_and_silent(self):
+        reasoner = _llm("Qwen3 4B")
+        reasoner.supports_thinking = True
+        router, _agent_llm, progress = self._router(_llm("Gemma 3n E2B"))
+
+        assert router.reasoning_llm(reasoner) is reasoner
+        assert self._messages(progress) == []
+
+    def test_no_reasoning_model_in_the_workspace_says_nothing(self):
+        router, agent_llm, progress = self._router(None)
+
+        assert router.reasoning_llm(agent_llm) is agent_llm
+        assert self._messages(progress) == []

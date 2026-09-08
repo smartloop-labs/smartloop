@@ -2907,23 +2907,33 @@ class ModelService:
             return self._llm
 
         if capability:
+            # These three are DEBUG for the same reason the sole-selected-model
+            # line above is: this resolution answers every question asked of
+            # the service, not just "who writes the answer".  A project agent's
+            # remote handle asks for the capability's context window, whether
+            # it reasons and how to label it before generating anything, so one
+            # MCP tool-resolution call printed the same decision four to eight
+            # times — and printed it as "for final response", which that call
+            # is not.  The outcome is reported once, where it belongs:
+            # ``[models] RESPONSE → …`` for the answer, ``[models] RESOLVE(…)``
+            # for a tool step, and the progress SSE for the user.
             cap_llm = self._get_llm_for_capability(capability)
             if cap_llm is not None and cap_llm is not self._llm:
-                logger.info(
-                    "[response] Using capability='%s' LLM for final response",
+                logger.debug(
+                    "[response] Using capability='%s' LLM",
                     self._cap_name(capability),
                 )
                 self._report_response_model(capability, cap_llm)
                 return cap_llm
             large_llm = self._get_large_llm()
             if large_llm is not None and large_llm is not self._llm:
-                logger.info(
+                logger.debug(
                     "[response] Capability='%s' unavailable — falling back to large LLM",
                     self._cap_name(capability),
                 )
                 self._report_response_model(capability, large_llm)
                 return large_llm
-            logger.info(
+            logger.debug(
                 "[response] Capability='%s' unavailable and no larger model — using default LLM",
                 self._cap_name(capability),
             )
