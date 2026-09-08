@@ -189,8 +189,9 @@ class LlamaCpp(BaseLLM[Llama]):
 
         The flag is bound onto the ``Llama`` at load and only for a model whose
         template reads ``enable_thinking`` (see ``LlmFactory._bind_thinking``),
-        so its presence is the answer.  Its *value* is the user's setting for
-        visible answers, which a caller can override per call.
+        so its presence is the answer.  Its *value* is what the flag is set to
+        between calls and no longer decides any of them: every call says what
+        it wants and unspecified means off (see :meth:`_requested_thinking`).
         """
         return hasattr(self.model, "_slp_thinking")
 
@@ -234,6 +235,26 @@ class LlamaCpp(BaseLLM[Llama]):
                 f"{(generated - OPENING_TOKENS) / rest:.1f})"
             )
         return f" | {prompt_tokens} prompt, ttft {ttft:.2f}s, {rate}"
+
+    @staticmethod
+    def _requested_thinking(kwargs: Dict[str, Any]) -> bool:
+        """Whether this call asked to reason.  Unspecified means no.
+
+        Reasoning is opt-in per call, not a mode the model sits in.  A <think>
+        block is worth its tokens where it changes the outcome — resolving an
+        MCP tool call, which has to pick the tool *and* fill its arguments —
+        and it is pure latency everywhere else: classification, planning,
+        skill matching, per-document extraction and synthesis all parse a
+        short answer out of the reply and throw the monologue away.  Those
+        calls used to inherit whatever the model was loaded with, so turning
+        reasoning on for a model made the whole turn slower with nothing to
+        show for it.
+
+        The only caller that opts in is ``MCPAgent.resolve``.  Short decision
+        calls were already covered by :meth:`_thinking_for_budget`; this covers
+        the ones with room to think, which are the expensive ones.
+        """
+        return bool(kwargs.get("thinking"))
 
     @contextlib.contextmanager
     def _thinking_override(self, thinking: Optional[bool]):
@@ -315,7 +336,7 @@ class LlamaCpp(BaseLLM[Llama]):
                 # The guard only has to span the call itself: the chat handler
                 # renders the template (where enable_thinking is read) eagerly
                 # and returns an already-prompted token generator.
-                with self._thinking_override(kwargs.get("thinking")), \
+                with self._thinking_override(self._requested_thinking(kwargs)), \
                         self._thinking_for_budget(available_tokens):
                     stream = self.model.create_chat_completion(
                         messages=messages,
@@ -396,7 +417,7 @@ class LlamaCpp(BaseLLM[Llama]):
             messages = self.create_messages_from_prompt(prompt)
             available_tokens = self._get_available_tokens(prompt)
 
-            with self._thinking_override(kwargs.get("thinking")):
+            with self._thinking_override(self._requested_thinking(kwargs)):
                 stream = self.model.create_chat_completion(
                     messages=messages,
                     max_tokens=available_tokens,

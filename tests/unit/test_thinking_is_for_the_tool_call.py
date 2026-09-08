@@ -79,6 +79,37 @@ class TestTheFlagIsScopedToOneCall:
             pass  # no attribute to set, and no exception either
 
 
+class TestReasoningIsOptInPerCall:
+    """A call that does not ask to reason does not reason.
+
+    Short decision calls were already covered by the budget floor, but
+    classification, planning, per-document extraction and synthesis all leave
+    room to think and none of them use the thought: they parse a label, a plan
+    or a paragraph out of the reply and drop the monologue.  Inheriting the
+    model's loaded flag made every one of those calls slower on a model the
+    user had turned reasoning on for, with nothing to show for it.
+    """
+
+    def test_a_call_that_says_nothing_does_not_reason(self):
+        assert LlamaCpp._requested_thinking({}) is False
+
+    def test_an_explicit_none_is_not_an_opt_in(self):
+        """What a call carries over the model host socket when nobody asked."""
+        assert LlamaCpp._requested_thinking({"thinking": None}) is False
+
+    def test_asking_for_it_is_honoured(self):
+        assert LlamaCpp._requested_thinking({"thinking": True}) is True
+
+    def test_the_loaded_flag_does_not_decide_a_call(self):
+        llm = _wrapper(True)   # a model loaded with reasoning on
+
+        with llm._thinking_override(llm._requested_thinking({})):
+            assert llm.model._slp_thinking is False
+
+        # Restored, so the model is left as it was found.
+        assert llm.model._slp_thinking is True
+
+
 class TestWhoAsksForWhat:
     def test_the_resolve_call_asks_to_reason(self):
         clear_resolution_cache()
