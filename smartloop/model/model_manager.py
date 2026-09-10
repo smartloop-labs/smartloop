@@ -126,15 +126,20 @@ class ModelManager:
             if ws_model is None:
                 ws_model = workspace.add_model(config.model_name, t.model_id(), config=config)
 
-            # Switch to requested project if specified in config
+            # A ``project_id`` in the config used to be applied by moving the
+            # workspace's ``current`` flag onto that project.  It resolves
+            # through the request/process binding now
+            # (:py:attr:`Workspace.current_project`), so there is nothing to
+            # switch here: the caller that named the project is already bound to
+            # it, and writing the flag would move the UI's selection for every
+            # other reader — a workspace-owned field a pinned process cannot
+            # persist in any case.
             if config.project_id and workspace.projects:
-                target = next(
-                    (p for p in workspace.projects if p.id == config.project_id),
-                    None,
-                )
-                if target is not None:
-                    for p in workspace.projects:
-                        p.current = (p.id == target.id)
+                if not any(p.id == config.project_id for p in workspace.projects):
+                    logger.warning(
+                        "[model] config names project %s, which is not in this "
+                        "workspace", config.project_id,
+                    )
 
             # Load model id from persisted config, or generate a new one
             if os.path.exists(Workspace.config_file):

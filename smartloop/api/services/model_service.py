@@ -30,7 +30,7 @@ from smartloop.llms.thinking import strip_thinking
 from smartloop.types import ModelCapability
 from smartloop.workspace import DocumentInfo, DocumentStatus, MCPServer, Workspace
 from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPServerStatus, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
-from smartloop.workspace.context import own_project
+from smartloop.workspace.context import own_project, use_project
 from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
 from smartloop.db.feedback_indexer import FeedbackIndexer
@@ -3132,13 +3132,22 @@ class ModelService:
 
         Delegates to Model.add_document() which processes, indexes, and saves.
         Returns info about the added documents.
+
+        *project_id* is *bound* for the call rather than written to the
+        ``current`` flag.  ``GenericModel.add_document`` resolves the project
+        through :py:attr:`Workspace.current_project`, which reads the binding
+        before the flag — so the binding reaches it just the same, without
+        moving the selection every other reader shares.
         """
-        if project_id:
-            project = self._get_project(project_id)
-            # Set as current temporarily so Model.add_source works against it
-            for p in self._model.workspace.projects:
-                p.current = (p.id == project_id)
-        new_docs = self._model.add_source(source, progress_callback=progress_callback)
+        self._initialize_workspace()
+        with use_project(project_id):
+            project = (
+                self._get_project(project_id) if project_id
+                else self._model.workspace.current_project
+            )
+            if project is None:
+                raise ValueError("No active project")
+            new_docs = self._model.add_source(source, progress_callback=progress_callback)
         return {
             "added": [doc.to_info(project.project_dir).model_dump() for doc in (new_docs or [])]
         }
@@ -3152,33 +3161,36 @@ class ModelService:
         """
         self._initialize_workspace()
 
-        if project_id:
-            project = self._get_project(project_id)
-            for p in self._model.workspace.projects:
-                p.current = (p.id == project_id)
-        else:
-            project = self._model.workspace.current_project
+        # Bound, not flipped: see :meth:`add_document`.  The registration below
+        # writes into whichever project ``current_project`` resolves to, and a
+        # binding gets it there without moving the workspace's selection —
+        # which a pinned process could not persist anyway.
+        with use_project(project_id):
+            project = (
+                self._get_project(project_id) if project_id
+                else self._model.workspace.current_project
+            )
             if not project:
                 raise ValueError("No active project")
 
-        # Register the document with PENDING status (no heavy processing).
-        new_docs = self._model.slp_model.add_document(source, cwd=cwd, generate_filename=generate_filename)
+            # Register the document with PENDING status (no heavy processing).
+            new_docs = self._model.slp_model.add_document(source, cwd=cwd, generate_filename=generate_filename)
 
-        if not new_docs:
-            return {
-                "status": "skipped",
-                "message": "Document(s) already exist in the project",
-                "documents": [],
-            }
+            if not new_docs:
+                return {
+                    "status": "skipped",
+                    "message": "Document(s) already exist in the project",
+                    "documents": [],
+                }
 
-        # Enqueue BEFORE saving config so that when the watcher detects
-        # the config change the queue already contains the document IDs.
-        indexer = self._task_queue.get_task("indexer")
-        if indexer is not None:
-            indexer.enqueue(new_docs)
+            # Enqueue BEFORE saving config so that when the watcher detects
+            # the config change the queue already contains the document IDs.
+            indexer = self._task_queue.get_task("indexer")
+            if indexer is not None:
+                indexer.enqueue(new_docs)
 
-        # Persist config so the watcher also sees the change as a fallback.
-        self._model.save()
+            # Persist config so the watcher also sees the change as a fallback.
+            self._model.save()
 
         return {
             "status": "pending",
