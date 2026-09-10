@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import os
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -207,7 +208,7 @@ class MCPDefinition(BaseModel):
         """
         if self.command:
             command, embedded = split_command_line(self.command)
-            return command, [*embedded, *self.args]
+            return os.path.expanduser(command) if command else None, [*embedded, *self.args]
         if self.package:
             command, args = split_command_line(self.package)
             if command is None:

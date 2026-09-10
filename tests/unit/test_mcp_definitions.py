@@ -177,6 +177,11 @@ command = "uv tool run --from pkg pkg"
         d = parse_definitions(text, "test")["inline"]
         assert d.launch == ("uv", ["tool", "run", "--from", "pkg", "pkg"])
 
+    def test_a_command_expands_home_directory(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/tester")
+        d = MCPDefinition(name="local", command="~/.local/craft mcp")
+        assert d.launch == ("/home/tester/.local/craft", ["mcp"])
+
     def test_args_may_be_written_as_one_string(self):
         # How everyone writes a command down, and how every other MCP client
         # displays one; iterating it per character is the alternative.
