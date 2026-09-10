@@ -63,7 +63,13 @@ _HOP_BY_HOP = frozenset({
 
 #: Paths whose body may name a project.  Kept explicit so the supervisor never
 #: reads a body it has no reason to.
-_BODY_ROUTED_PATHS = ("/v1/chat/completions",)
+#:
+#: ``/v1/feedback`` is here because its POST carries ``project_id`` in the body
+#: while its GET and DELETE carry it in the query string — so without this the
+#: three halves of one endpoint were answered by two different processes, and
+#: the POST was the one that ended up writing a project's feedback index from
+#: outside the child that owns it.
+_BODY_ROUTED_PATHS = ("/v1/chat/completions", "/v1/feedback")
 
 #: ``/v1/projects/<id>`` — the project record itself, with or without a
 #: sub-resource after it.

@@ -1554,14 +1554,23 @@ class ModelService:
 
     # --------------------------------------------------------------- feedback
 
-    def _ensure_feedback_indexer(self) -> FeedbackIndexer:
-        current_project = self._model.workspace.current_project
-        if not current_project:
+    def _ensure_feedback_indexer(self, project: Optional["Project"] = None) -> FeedbackIndexer:
+        """The feedback index for *project*, or for whatever is bound.
+
+        *project* is explicit wherever the caller has already resolved one.
+        Resolving it here through ``current_project`` was wrong on any request
+        that names its project in the *body* rather than the path: nothing binds
+        those, so the index was built for the project the UI had *selected* and
+        a thumbs-up on one project was embedded into another's.
+        """
+        if project is None:
+            project = self._model.workspace.current_project
+        if not project:
             raise ValueError("No active project")
-        cache = self._caches(current_project.id)
+        cache = self._caches(project.id)
         if cache.feedback_indexer is None:
             cache.feedback_indexer = FeedbackIndexer(
-                project_dir=current_project.project_dir,
+                project_dir=project.project_dir,
                 logger=logger,
                 base_dir=self._model.workspace.workspace_dir,
             )
@@ -1602,7 +1611,7 @@ class ModelService:
         selected_project = self._get_project(project_id)
 
         feedback_store = FeedbackStore(selected_project.project_dir)
-        indexer = self._ensure_feedback_indexer()
+        indexer = self._ensure_feedback_indexer(selected_project)
 
         # Update rating on the conversation message
         target.rating = rating
@@ -1685,7 +1694,7 @@ class ModelService:
         feedback_store = FeedbackStore(project.project_dir)
         existing = feedback_store.find(session_id, message_id)
         if existing:
-            indexer = self._ensure_feedback_indexer()
+            indexer = self._ensure_feedback_indexer(project)
             indexer.remove_feedback(existing.feedback_id)
             feedback_store.remove(existing.feedback_id)
 

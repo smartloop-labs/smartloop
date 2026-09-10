@@ -101,6 +101,11 @@ def child():
         payload = await request.json()
         return {"served_by": "child", "project_id": payload.get("project_id")}
 
+    @app.post("/v1/feedback")
+    async def feedback(request: __import__("fastapi").Request):
+        payload = await request.json()
+        return {"served_by": "child", "project_id": payload.get("project_id")}
+
     @app.get("/v1/projects/{project_id}/stream")
     async def stream(project_id: str):
         async def body():
@@ -168,9 +173,16 @@ class TestReadingTheProjectFromABody:
     def test_an_empty_project_id_does_not_count(self):
         assert project_from_body(b'{"project_id": ""}') is None
 
-    def test_only_chat_is_routed_by_its_body(self):
+    def test_chat_is_routed_by_its_body(self):
         assert routes_by_body({"path": "/v1/chat/completions"}) is True
+
+    def test_feedback_is_routed_by_its_body(self):
+        """Its POST names the project in the body; its GET/DELETE in the query."""
+        assert routes_by_body({"path": "/v1/feedback"}) is True
+
+    def test_nothing_else_is(self):
         assert routes_by_body({"path": "/v1/models"}) is False
+        assert routes_by_body({"path": "/v1/projects"}) is False
 
 
 class TestWhatOnlyTheWorkspaceCanAnswer:
@@ -311,6 +323,17 @@ class TestWhatGetsForwarded:
 
         assert response.json() == {"served_by": "child", "project_id": "beta"}
         assert supervisor_app.state.pool.requested == ["beta"]
+
+    def test_a_feedback_post_reaches_the_project_it_names(self, supervisor_app):
+        """The POST used to be answered here, indexing into the wrong project."""
+        response = TestClient(supervisor_app).post(
+            "/v1/feedback",
+            json={"session_id": "s1", "message_id": "m1",
+                  "project_id": "gamma", "rating": "up"},
+        )
+
+        assert response.json() == {"served_by": "child", "project_id": "gamma"}
+        assert supervisor_app.state.pool.requested == ["gamma"]
 
     def test_a_chat_request_naming_no_project_stays_here(self, supervisor_app):
         response = TestClient(supervisor_app).post(
