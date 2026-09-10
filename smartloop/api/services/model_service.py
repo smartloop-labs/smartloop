@@ -30,7 +30,9 @@ from smartloop.llms.thinking import strip_thinking
 from smartloop.types import ModelCapability
 from smartloop.workspace import DocumentInfo, DocumentStatus, MCPServer, Workspace
 from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPServerStatus, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
-from smartloop.workspace.context import own_project, use_project
+from smartloop.workspace.context import (
+    own_project, pinned_project_id, projects_delegated, use_project,
+)
 from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
 from smartloop.db.feedback_indexer import FeedbackIndexer
@@ -4338,14 +4340,30 @@ class ModelService:
         ).start()
 
     def pending_mcp_servers(self) -> list[tuple[str, str]]:
-        """``(project_id, server_id)`` for every server still awaiting provisioning.
+        """``(project_id, server_id)`` for servers this process may provision.
 
         Used by the MCP task at startup to adopt servers whose provisioning was
         interrupted (the app quit between registration and discovery).
+
+        Only ever this process's own projects.  Provisioning ends in a write to
+        the project's ``project.json``, so adopting another project's server
+        means doing the slow half of registration — a real MCP handshake, then
+        LLM enrichment — and then dropping the result at save, leaving the
+        server ``PENDING`` to be adopted again on the next cycle, forever:
+
+        * a per-project child adopts its own project and no other;
+        * a supervisor adopts nothing.  It has delegated every project to a
+          child, and that child is the tier that can persist the answer — it
+          picks the server up when it next starts.
         """
         self._initialize_workspace()
+        if projects_delegated():
+            return []
+        pinned = pinned_project_id()
         pending: list[tuple[str, str]] = []
         for project in self._model.workspace.projects:
+            if pinned is not None and project.id != pinned:
+                continue
             for server in project.mcp_servers:
                 if server.system:
                     continue
