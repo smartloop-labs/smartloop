@@ -280,6 +280,62 @@ class TestStopping:
             assert not process_alive(record.pid)
 
 
+class TestReleasingADeletedProject:
+    """The one lifecycle event that has to reach the pool.
+
+    Everything else the pool stops — idle, over the ceiling, crashed — is a
+    project that starts again on its next request.  A deleted one does not, and
+    a child left running would go on serving a directory that is about to be
+    removed underneath it.
+    """
+
+    @pytest.fixture
+    def supervisor(self, pool, workspace):
+        from smartloop.supervisor.service import Supervisor
+
+        made = Supervisor(home_dir=workspace["home"])
+        made.pool = pool
+        return made
+
+    def test_releasing_stops_the_agent(self, supervisor, pool):
+        record = pool.ensure("alpha")
+
+        assert supervisor.release("alpha") is True
+
+        for _ in range(100):
+            if not process_alive(record.pid):
+                break
+            time.sleep(0.05)
+        assert not process_alive(record.pid)
+        assert pool.registry.get("alpha") is None
+
+    def test_releasing_a_project_with_no_agent_is_not_an_error(self, supervisor):
+        assert supervisor.release("alpha") is False
+
+    def test_releasing_leaves_the_other_projects_serving(self, supervisor, pool):
+        beta = pool.ensure("beta")
+        pool.ensure("alpha")
+
+        supervisor.release("alpha")
+
+        assert process_alive(beta.pid)
+
+    def test_releasing_forgets_the_restart_backoff(self, supervisor, pool):
+        """A future project reusing this id must not inherit its penalty."""
+        pool.note_exit("alpha", uptime=0.0)
+        assert pool._backoff.get("alpha")
+
+        supervisor.release("alpha")
+
+        assert pool._backoff.get("alpha") is None
+
+    def test_releasing_without_a_supervisor_is_a_no_op(self):
+        """In a child, and under --no-supervised, there is no pool to ask."""
+        from smartloop.supervisor.service import release_project
+
+        assert release_project("alpha") is False
+
+
 class TestTheSweep:
     def test_an_idle_agent_is_stopped(self, pool):
         pool.idle_ttl = 60

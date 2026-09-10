@@ -30,6 +30,7 @@ from smartloop.llms.thinking import strip_thinking
 from smartloop.types import ModelCapability
 from smartloop.workspace import DocumentInfo, DocumentStatus, MCPServer, Workspace
 from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPServerStatus, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
+from smartloop.workspace.context import own_project
 from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
 from smartloop.db.feedback_indexer import FeedbackIndexer
@@ -3475,7 +3476,10 @@ class ModelService:
         # model registry so the project sidebar starts from the defaults.
         workspace.sync_project_models(project)
         self._model.workspace.projects.append(project)
-        self._model.save()
+        # No child owns this project yet — it has never been served — so this
+        # process writes its first ``project.json`` itself.
+        with own_project(project_id):
+            self._model.save()
 
         # A caller-supplied ``cwd`` is recorded for reference only — nothing is
         # ever located through it.  Skills, documents, MCP docs and the
@@ -3485,7 +3489,8 @@ class ModelService:
             project.cwd = os.path.abspath(os.path.expanduser(cwd))
         os.makedirs(project.skills_dir, exist_ok=True)
         os.makedirs(project.documents_dir, exist_ok=True)
-        self._model.save()
+        with own_project(project_id):
+            self._model.save()
         logger.info(f"[create_project] State dir: {project.project_dir}")
 
         # Drop any slot left over from a project that reused this id, so the
@@ -3584,11 +3589,24 @@ class ModelService:
         return [self._project_to_dict(p) for p in ws.projects]
 
     def delete_project(self, project_id: str) -> dict:
-        """Delete a project by ID."""
+        """Delete a project by ID.
+
+        Runs in the process that owns the workspace record — the supervisor, or
+        the single server under ``--no-supervised``.  It cannot run in the
+        project's own agent: removing the project from the list is a write to
+        ``config.json``, and a pinned save writes only ``project.json`` — the
+        file this method is about to delete along with the directory holding it.
+        """
         self._ensure_model()
 
         workspace = self._model.workspace
         project = next((p for p in workspace.projects if p.id == project_id), None)
+        if project is None:
+            # Same reason ``_get_project`` re-reads: the cached singleton can
+            # predate a project created by the CLI, or by ``import_project``,
+            # which works on its own detached ``Workspace.load()`` instance.
+            workspace.reload()
+            project = next((p for p in workspace.projects if p.id == project_id), None)
         if project is None:
             raise ValueError(f"Project not found: {project_id}")
 
@@ -3617,7 +3635,16 @@ class ModelService:
         # Release the deleted project's store handles; its directory is gone.
         self._drop_caches(project_id)
 
-        self._model.save()
+        # Claim the project being removed: under supervision this process
+        # writes only the workspace record, and the claim is what says this one
+        # file — now a deleted directory — is ours to have stopped keeping.
+        with own_project(project_id):
+            self._model.save()
+
+        # The singleton still lists the project for anyone who resolves the
+        # workspace afresh; drop it so the next Workspace.init() re-reads what
+        # was just written, exactly as create_project does.
+        Workspace.reset()
 
         return {"id": project_id, "deleted": True, "message": "Project deleted successfully"}
 

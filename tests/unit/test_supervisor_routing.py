@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 from smartloop.supervisor.routing import (
     ProjectRoutingMiddleware, forwardable_headers, project_from_body,
-    read_body, replay_body, response_headers, routes_by_body,
+    project_to_proxy, read_body, replay_body, response_headers, routes_by_body,
 )
 
 
@@ -128,6 +128,14 @@ def supervisor_app(child):
     async def projects():
         return {"served_by": "supervisor"}
 
+    @app.delete("/v1/projects/{project_id}")
+    async def delete_project(project_id: str):
+        return {"served_by": "supervisor", "project_id": project_id}
+
+    @app.post("/v1/projects/import")
+    async def import_project():
+        return {"served_by": "supervisor"}
+
     @app.post("/v1/chat/completions")
     async def chat_here():
         return {"served_by": "supervisor"}
@@ -163,6 +171,68 @@ class TestReadingTheProjectFromABody:
     def test_only_chat_is_routed_by_its_body(self):
         assert routes_by_body({"path": "/v1/chat/completions"}) is True
         assert routes_by_body({"path": "/v1/models"}) is False
+
+
+class TestWhatOnlyTheWorkspaceCanAnswer:
+    """A delete is the one thing a project's own agent cannot do to itself.
+
+    Removing a project means removing it from a list that lives only in
+    ``config.json``, which a pinned save never writes — and could not write
+    here anyway, since the pinned project is the one leaving the list.
+    Forwarded, the child deleted its own directory and persisted nothing.
+    Every other write to a project record leaves the project in existence, so
+    it still goes to the child that owns it.
+    """
+
+    def _scope(self, path: str, method: str = "GET", query: str = "") -> dict:
+        return {"type": "http", "method": method, "path": path,
+                "query_string": query.encode()}
+
+    def test_a_sub_resource_belongs_to_the_child(self):
+        assert project_to_proxy(self._scope("/v1/projects/abc/documents")) == "abc"
+
+    def test_a_nested_sub_resource_too(self):
+        assert project_to_proxy(self._scope("/v1/projects/abc/mcp/tools/count")) == "abc"
+
+    def test_a_delete_is_not_forwarded(self):
+        assert project_to_proxy(self._scope("/v1/projects/abc", "DELETE")) is None
+
+    def test_a_delete_of_a_sub_resource_still_is(self):
+        """Deleting a document is the child's; only the project itself is not."""
+        assert project_to_proxy(
+            self._scope("/v1/projects/abc/documents/d1", "DELETE")
+        ) == "abc"
+
+    def test_a_rename_still_belongs_to_the_child(self):
+        """It writes ``web_search_enabled`` and skills — project state, not the index."""
+        assert project_to_proxy(self._scope("/v1/projects/abc", "PATCH")) == "abc"
+
+    def test_the_collection_is_not_forwarded(self):
+        assert project_to_proxy(self._scope("/v1/projects")) is None
+
+    def test_import_is_a_verb_not_a_project_id(self):
+        assert project_to_proxy(self._scope("/v1/projects/import", "POST")) is None
+
+    def test_the_query_string_still_names_a_project(self):
+        assert project_to_proxy(self._scope("/v1/feedback", query="project_id=xyz")) == "xyz"
+
+    def test_a_malformed_query_string_is_not_fatal(self):
+        scope = self._scope("/v1/models")
+        scope["query_string"] = b"\xff\xfe=%%"
+        assert project_to_proxy(scope) is None
+
+    def test_a_delete_is_answered_by_the_supervisor(self, supervisor_app):
+        response = TestClient(supervisor_app).delete("/v1/projects/alpha")
+
+        assert response.json() == {"served_by": "supervisor", "project_id": "alpha"}
+        # Not merely answered here — no agent was started to answer it.
+        assert supervisor_app.state.pool.requested == []
+
+    def test_an_import_does_not_start_an_agent_called_import(self, supervisor_app):
+        response = TestClient(supervisor_app).post("/v1/projects/import")
+
+        assert response.json() == {"served_by": "supervisor"}
+        assert supervisor_app.state.pool.requested == []
 
 
 class TestHeaderHandling:

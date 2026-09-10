@@ -29,12 +29,14 @@ from smartloop.workspace.context import use_project
 _PATH_PROJECT_RE = re.compile(r"/projects/([^/]+)")
 
 
-def _project_from_scope(scope: dict) -> Optional[str]:
-    """The project this request addresses, from its path or query string."""
-    match = _PATH_PROJECT_RE.search(scope.get("path") or "")
-    if match:
-        return match.group(1) or None
+def _project_from_query(scope: dict) -> Optional[str]:
+    """The ``project_id`` in a request's query string, if there is one.
 
+    Split out because the supervisor's routing asks a narrower question about
+    the path — which project a request should be *forwarded* to, which is not
+    every project a request is about — but the same one about the query.  See
+    :func:`smartloop.supervisor.routing.project_to_proxy`.
+    """
     raw_query = scope.get("query_string") or b""
     if not raw_query:
         return None
@@ -43,6 +45,14 @@ def _project_from_scope(scope: dict) -> Optional[str]:
     except Exception:
         return None
     return values[0] if values else None
+
+
+def _project_from_scope(scope: dict) -> Optional[str]:
+    """The project this request addresses, from its path or query string."""
+    match = _PATH_PROJECT_RE.search(scope.get("path") or "")
+    if match:
+        return match.group(1) or None
+    return _project_from_query(scope)
 
 
 class ProjectScopeMiddleware:

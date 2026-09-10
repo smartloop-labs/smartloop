@@ -20,6 +20,14 @@ Three layers resolve, in order:
 3. ``None`` — the caller falls back to the ``current`` flag, which after this
    change means only "the project the UI has selected".
 
+Ownership
+---------
+Binding says which project a piece of work is *about*; :func:`delegate_projects`
+and :func:`own_project` say whose state a process may *write*.  The supervisor
+delegates every project's own file to the child pinned to it, and claims one
+back only for the operations that straddle a child's lifetime — create, import,
+delete.  :meth:`~smartloop.workspace.workspace.Workspace.save` reads both.
+
 Threads
 -------
 A context variable does not cross a thread boundary on its own, and the chat
@@ -77,6 +85,65 @@ def pin_project(project_id: Optional[str]) -> None:
 def pinned_project_id() -> Optional[str]:
     """The project this process is pinned to, or ``None`` when unpinned."""
     return _pinned_project_id
+
+
+#: Whether this process has handed every project's own state to someone else.
+#: Set by the supervisor, which spawns a child per project: from that moment the
+#: files under each ``project_dir`` belong to those children, and the supervisor
+#: keeps only ``config.json``.  Not a context variable for the same reason the
+#: pin is not — it is a property of the process.
+_projects_delegated: bool = False
+
+
+def delegate_projects(delegated: bool = True) -> None:
+    """Declare that per-project state is owned by other processes.
+
+    Called by the supervisor when its pool comes up, and cleared when it goes
+    down.  :meth:`~smartloop.workspace.workspace.Workspace.save` reads this to
+    decide whether it may write every project's file or only the workspace
+    record — see :func:`own_project` for the exception.
+    """
+    global _projects_delegated
+    with _pin_lock:
+        _projects_delegated = delegated
+    logger.info("[project-context] per-project state delegated=%s", delegated)
+
+
+def projects_delegated() -> bool:
+    """Whether another process owns each project's own state."""
+    return _projects_delegated
+
+
+#: The project whose file this unit of work is entitled to write, in a process
+#: that has otherwise delegated them.
+_owned_project_id: ContextVar[Optional[str]] = ContextVar(
+    "smartloop_owned_project_id", default=None
+)
+
+
+@contextmanager
+def own_project(project_id: Optional[str]) -> Iterator[Optional[str]]:
+    """Claim *project_id*'s own state for the duration of the block.
+
+    The supervisor delegates project files to its children, but three
+    operations happen either side of a child's existence and must still write
+    one: creating a project, importing one, and deleting one.  Claiming it says
+    which file this save is allowed to touch, so the claim stays as narrow as
+    the operation instead of re-opening the whole workspace to writes.
+    """
+    if not project_id:
+        yield None
+        return
+    token = _owned_project_id.set(project_id)
+    try:
+        yield project_id
+    finally:
+        _owned_project_id.reset(token)
+
+
+def owned_project_id() -> Optional[str]:
+    """The project claimed by :func:`own_project`, if any."""
+    return _owned_project_id.get()
 
 
 def active_project_id() -> Optional[str]:

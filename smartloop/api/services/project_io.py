@@ -16,6 +16,7 @@ from typing import Optional
 from uuid import uuid4
 
 from smartloop.config.app_settings import AppSettings
+from smartloop.workspace.context import own_project
 from smartloop.workspace.workspace import Workspace
 
 logger = logging.getLogger(__name__)
@@ -289,7 +290,10 @@ def import_project(zip_path: Path, name: Optional[str] = None) -> dict:
         # an archive carries no model_settings, so without this the project's
         # defaults would be decided lazily at its first models read.
         workspace.sync_project_models(new_project)
-        workspace.save()
+        # Nothing is serving this project yet, so its first ``project.json`` is
+        # ours to write even where per-project files belong to the children.
+        with own_project(new_project.id):
+            workspace.save()
         Workspace.reset()
 
         return {

@@ -13,7 +13,9 @@ import os
 import pytest
 
 from smartloop.workspace import migrations
-from smartloop.workspace.context import pin_project
+from smartloop.workspace.context import (
+    delegate_projects, own_project, pin_project,
+)
 from smartloop.workspace.migrations import (
     MONOLITH_BACKUP_SUFFIX, split_project_state,
 )
@@ -30,6 +32,7 @@ def home(tmp_path, monkeypatch):
     Workspace.reset()
     yield tmp_path
     pin_project(None)
+    delegate_projects(False)
     Workspace.reset()
 
 
@@ -191,6 +194,69 @@ class TestOneWriterPerProject:
 
         assert (home / "config.json").read_text() == before
         assert "not in this workspace" in caplog.text
+
+
+class TestTheSupervisorDoesNotWriteWhatItDelegated:
+    """The clobber, one tier up.
+
+    A supervisor holds one ``Workspace`` for the life of the process and saves
+    it whenever anything workspace-level changes.  Writing every project's file
+    from that snapshot would republish it over the documents and MCP servers
+    the children have indexed since — the same loss the split removed between
+    two peers, reappearing between a parent and its children.
+    """
+
+    def test_it_writes_the_workspace_record_and_nothing_else(self, home):
+        _workspace(home).save()
+
+        supervisor = Workspace.load()
+        delegate_projects(True)
+
+        # A child registers a server while the supervisor holds its snapshot.
+        child = Workspace.load()
+        pin_project("alpha")
+        child.projects[0].mcp_servers.append(MCPServer(id="new", name="added by the child"))
+        child.save()
+        pin_project(None)
+
+        # Anything workspace-level then makes the supervisor save.
+        supervisor.projects[1].current = True
+        supervisor.projects[0].current = False
+        supervisor.save()
+
+        reloaded = Workspace.load()
+        assert [s.name for s in reloaded.projects[0].mcp_servers] == [
+            "alpha server", "added by the child",
+        ]
+        assert reloaded.current_project.id == "beta"  # the record was written
+
+    def test_a_claimed_project_is_still_written(self, home):
+        """Create, import and delete write a file no child owns yet."""
+        _workspace(home).save()
+
+        ws = Workspace.load()
+        delegate_projects(True)
+        ws.projects[0].sessions.append("claimed")
+        ws.projects[1].sessions.append("not-claimed")
+        with own_project("alpha"):
+            ws.save()
+
+        reloaded = Workspace.load()
+        assert reloaded.projects[0].sessions == ["alpha-session", "claimed"]
+        assert reloaded.projects[1].sessions == ["beta-session"]
+
+    def test_an_unsupervised_process_still_writes_everything(self, home):
+        """The single-server fallback and the CLI own every project there is."""
+        _workspace(home).save()
+
+        ws = Workspace.load()
+        ws.projects[0].sessions.append("added")
+        ws.projects[1].sessions.append("added")
+        ws.save()
+
+        reloaded = Workspace.load()
+        assert reloaded.projects[0].sessions == ["alpha-session", "added"]
+        assert reloaded.projects[1].sessions == ["beta-session", "added"]
 
 
 class TestMigratingOffTheMonolith:

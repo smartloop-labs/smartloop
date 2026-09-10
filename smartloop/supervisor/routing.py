@@ -15,24 +15,40 @@ the supervisor and reaches the client without waiting for the next one.
 
 Which requests are project-scoped:
 
-* a ``project_id`` in the path (``/v1/projects/<id>/...``) or query string —
-  read from the ASGI scope, no body needed;
+* a project id in the path (``/v1/projects/<id>``, with or without a
+  sub-resource after it) — read from the ASGI scope, no body needed;
+* a ``project_id`` in the query string — same;
 * a ``project_id`` in a JSON body — chat, essentially.  The body has to be read
   to forward it anyway, so reading it to route costs nothing extra.
 
 Everything else is workspace-level — models, releases, auth, users, the project
-list itself — and the supervisor answers it from its own app.
+list — and the supervisor answers it from its own app.
+
+Two of those need saying out loud, because a path that merely *contains* a
+project-shaped segment used to be enough to forward it:
+
+* **a delete** is the one operation on a project that its own agent cannot
+  carry out.  Removing a project means removing it from a list that lives only
+  in the workspace record, which a pinned ``Workspace.save()`` never writes —
+  and could not write here even in principle, since the project it is pinned to
+  is the one leaving the list.  Forwarded, it deleted its own directory and then
+  persisted nothing, leaving the record behind and the agent running.  Every
+  *other* write to a project record leaves the project in existence, so the
+  child's own file is still the right place for it and it still goes there;
+* **``/v1/projects/import``** names a verb, not a project.  Read as an id it had
+  the supervisor try to start an agent for a project called "import".
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Awaitable, Callable, Optional
 
 import httpx
 
-from smartloop.api.middleware import _project_from_scope
+from smartloop.api.middleware import _project_from_query
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +64,20 @@ _HOP_BY_HOP = frozenset({
 #: Paths whose body may name a project.  Kept explicit so the supervisor never
 #: reads a body it has no reason to.
 _BODY_ROUTED_PATHS = ("/v1/chat/completions",)
+
+#: ``/v1/projects/<id>`` — the project record itself, with or without a
+#: sub-resource after it.
+_PROJECT_PATH_RE = re.compile(r"/projects/([^/]+)(?P<rest>/.+)?$")
+
+#: Verbs on the project collection.  They occupy the same slot in the path as a
+#: project id and are emphatically not one — reading ``import`` as a project had
+#: the supervisor try to cold-start an agent for it.  Listed rather than
+#: pattern-matched so adding one is a decision, not an accident.
+_COLLECTION_ACTIONS = frozenset({"/v1/projects/import"})
+
+#: Methods on a project record that its own agent cannot serve.  Only the
+#: delete: it is the one that takes the project out of the workspace record.
+_WORKSPACE_ONLY_ITEM_METHODS = frozenset({"DELETE"})
 
 
 async def read_body(receive: Callable[[], Awaitable[dict]]) -> bytes:
@@ -98,6 +128,26 @@ def project_from_body(body: bytes) -> Optional[str]:
 def routes_by_body(scope: dict) -> bool:
     """Whether this request's project can only be found in its body."""
     return (scope.get("path") or "") in _BODY_ROUTED_PATHS
+
+
+def project_to_proxy(scope: dict) -> Optional[str]:
+    """The project this request should be *forwarded* to, or ``None``.
+
+    Narrower than :func:`~smartloop.api.middleware._project_from_scope`, which
+    answers a different question — which project a request is *about*, for
+    binding — and still binds the ones answered here.
+    """
+    path = scope.get("path") or ""
+    if path in _COLLECTION_ACTIONS:
+        return None
+
+    match = _PROJECT_PATH_RE.search(path)
+    if match:
+        if (match.group("rest") is None
+                and scope.get("method") in _WORKSPACE_ONLY_ITEM_METHODS):
+            return None
+        return match.group(1) or None
+    return _project_from_query(scope)
 
 
 def forwardable_headers(raw_headers: list[tuple[bytes, bytes]]) -> dict:
@@ -196,7 +246,7 @@ class ProjectRoutingMiddleware:
             await self.app(scope, receive, send)
             return
 
-        project_id = _project_from_scope(scope)
+        project_id = project_to_proxy(scope)
         body = b""
         if project_id is None and routes_by_body(scope):
             body = await read_body(receive)

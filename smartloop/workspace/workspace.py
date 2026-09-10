@@ -15,7 +15,9 @@ from smartloop.config import ModelConfig, AppSettings
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name
 from smartloop.types import ModelCapability
-from smartloop.workspace.context import active_project_id, pinned_project_id
+from smartloop.workspace.context import (
+    active_project_id, owned_project_id, pinned_project_id, projects_delegated,
+)
 from smartloop.workspace.types import Document, DocumentInfo, DocumentStatus, Skill
 
 _settings = AppSettings()
@@ -726,7 +728,19 @@ class Workspace(BaseModel):
 
         Only this model is pinned: a blanket ``sync_project_models`` would also
         detach every unrelated model in every project from future defaults.
+
+        Does nothing in a per-project agent child.  Writing every *sibling*
+        project's settings is precisely what a pinned process may not do — its
+        ``save()`` writes one file — so pinning there would produce entries that
+        are dropped on the way to disk while the caller believed the leak had
+        been sealed.
         """
+        if pinned_project_id() is not None:
+            logger.warning(
+                "[workspace] not pinning %s across projects: this process owns "
+                "only project %s", model_name, pinned_project_id(),
+            )
+            return
         if self.is_bootstrap_model(model_name):
             return  # holds no per-project entry by design
         for project in self.projects:
@@ -749,6 +763,16 @@ class Workspace(BaseModel):
         """
         if self.is_bootstrap_model(model_name):
             return  # always enabled, not a configurable default
+        if pinned_project_id() is not None:
+            # ``enabled`` lives on the workspace record, which a pinned process
+            # never writes.  Promoting here would look like it worked and be
+            # gone on the next load — along with the pin above that keeps it
+            # from leaking into projects that never asked for it.
+            logger.warning(
+                "[workspace] not promoting %s to a workspace default: this "
+                "process owns only project %s", model_name, pinned_project_id(),
+            )
+            return
         ws = self.get_model(model_name)
         if ws is None or ws.enabled:
             return  # nothing to leak, skip the pin
@@ -987,8 +1011,20 @@ class Workspace(BaseModel):
           :func:`~smartloop.workspace.context.pin_project`) writes **only** its
           own ``project.json`` — the workspace record belongs to the
           supervisor, and a child writing it would clobber its siblings;
-        * an unpinned process — today's single server, the supervisor, the CLI
-          — writes the workspace record and every project's file.
+        * the supervisor, which has delegated every project to a child (see
+          :func:`~smartloop.workspace.context.delegate_projects`), writes the
+          workspace record and *nothing else* — unless it has explicitly
+          claimed one project with
+          :func:`~smartloop.workspace.context.own_project`, which is how
+          create, import and delete still write a file no child owns yet.
+          Without this the clobber simply moved tiers: the supervisor holds one
+          ``Workspace`` for its whole life, so writing every project's file
+          would republish a start-of-process snapshot over the documents and
+          MCP servers children had indexed since;
+        * any other unpinned process — the ``--no-supervised`` single server,
+          the CLI — writes the workspace record and every project's file, which
+          is what it has always done: under that fallback it is the only
+          process there is.
 
         ``SLP_LEGACY_CONFIG=1`` restores the single-document format; see
         :func:`_legacy_layout`.
@@ -1013,12 +1049,26 @@ class Workspace(BaseModel):
                     )
                 return
 
-            for project in self.projects or []:
+            for project in self._writable_projects():
                 project.save_state()
             _atomic_write_json(
                 self.config_file,
                 self._workspace_record([p.to_index() for p in (self.projects or [])]),
             )
+
+    def _writable_projects(self) -> List["Project"]:
+        """The projects whose own file this unpinned process may write.
+
+        Every one of them, unless the projects have been delegated to
+        per-project children — then only the one explicitly claimed, if any.
+        """
+        projects = self.projects or []
+        if not projects_delegated():
+            return list(projects)
+        owned = owned_project_id()
+        if not owned:
+            return []
+        return [p for p in projects if p.id == owned]
 
     @classmethod
     def _hydrate_projects(cls, ws_data: dict) -> dict:
