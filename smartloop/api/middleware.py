@@ -28,6 +28,19 @@ from smartloop.workspace.context import use_project
 #: ``/v1/projects/<id>/...`` — the id segment as the routers declare it.
 _PATH_PROJECT_RE = re.compile(r"/projects/([^/]+)")
 
+#: Verbs on the project collection.  They sit in the same slot in the path as
+#: a project id and are emphatically not one, so the pattern above has to be
+#: told about them: reading ``import`` as a project bound a request to a
+#: project called "import", and the first thing that resolved the binding
+#: warned about a workspace member that could never exist.
+#:
+#: Listed rather than pattern-matched so adding one is a decision, not an
+#: accident.  The supervisor's routing reads the same set to decide what never
+#: to forward (see :func:`smartloop.supervisor.routing.project_to_proxy`) —
+#: one list, because a path that names no project must neither bind one nor be
+#: proxied to one.
+_COLLECTION_ACTIONS = frozenset({"/v1/projects/import"})
+
 
 def _project_from_query(scope: dict) -> Optional[str]:
     """The ``project_id`` in a request's query string, if there is one.
@@ -49,7 +62,10 @@ def _project_from_query(scope: dict) -> Optional[str]:
 
 def _project_from_scope(scope: dict) -> Optional[str]:
     """The project this request addresses, from its path or query string."""
-    match = _PATH_PROJECT_RE.search(scope.get("path") or "")
+    path = scope.get("path") or ""
+    if path in _COLLECTION_ACTIONS:
+        return None
+    match = _PATH_PROJECT_RE.search(path)
     if match:
         return match.group(1) or None
     return _project_from_query(scope)

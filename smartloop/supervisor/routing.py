@@ -48,7 +48,7 @@ from typing import Awaitable, Callable, Optional
 
 import httpx
 
-from smartloop.api.middleware import _project_from_query
+from smartloop.api.middleware import _COLLECTION_ACTIONS, _project_from_query
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +75,13 @@ _BODY_ROUTED_PATHS = ("/v1/chat/completions", "/v1/feedback")
 #: sub-resource after it.
 _PROJECT_PATH_RE = re.compile(r"/projects/([^/]+)(?P<rest>/.+)?$")
 
-#: Verbs on the project collection.  They occupy the same slot in the path as a
-#: project id and are emphatically not one — reading ``import`` as a project had
-#: the supervisor try to cold-start an agent for it.  Listed rather than
-#: pattern-matched so adding one is a decision, not an accident.
-_COLLECTION_ACTIONS = frozenset({"/v1/projects/import"})
+# ``_COLLECTION_ACTIONS`` — the verbs on the project collection, which occupy
+# the same slot in the path as a project id and are emphatically not one — is
+# imported from the binding middleware rather than repeated here.  Reading
+# ``import`` as a project had the supervisor try to cold-start an agent for
+# it; the copy left behind in the middleware then went on binding requests to
+# the same project that cannot exist.  One list means the next verb added
+# cannot be fixed in one layer and missed in the other.
 
 #: Methods on a project record that its own agent cannot serve.  Only the
 #: delete: it is the one that takes the project out of the workspace record.
