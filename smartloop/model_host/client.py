@@ -175,6 +175,17 @@ class ModelClient(ABC):
         """Release any transport this client holds. In-process: nothing."""
 
 
+    def refresh_project(self, project_id: Optional[str]) -> bool:
+        """Pick up any write to *project_id*'s own state before serving it.
+
+        Default no-op: a client that reaches the device over the wire is not
+        the process holding the workspace, so there is nothing local to
+        refresh.  Overridden where the device and the workspace are in the
+        same process.
+        """
+        return False
+
+
 class InProcessModelClient(ModelClient):
     """The device is owned by this process — call straight through.
 
@@ -185,6 +196,10 @@ class InProcessModelClient(ModelClient):
 
     def __init__(self, model_service) -> None:
         self._service = model_service
+
+    def refresh_project(self, project_id: Optional[str]) -> bool:
+        """The workspace is right here, so a child's write is one read away."""
+        return self._service.refresh_project_state(project_id)
 
     def generate(self, prompt, model_name=None, capability=None,
                  max_tokens=None, thinking=None) -> str:

@@ -437,6 +437,18 @@ class ModelService:
         self._ensure_model()
         return self._model.workspace
 
+    def refresh_project_state(self, project_id: Optional[str]) -> bool:
+        """Pick up a child's write to *project_id*'s own file, if there is one.
+
+        The model host runs in this process and answers for whichever project
+        asked, but a project's own state is written by the child pinned to it.
+        Without this the host decides from the copy it took when the project
+        first appeared — see :meth:`Workspace.refresh_project`.
+        """
+        if not project_id or self._model is None or not self._model.workspace:
+            return False
+        return self._model.workspace.refresh_project(project_id)
+
     def _initialize_workspace(self) -> None:
         """Ensure the workspace is loaded, raising if it cannot be resolved."""
         self._ensure_model()

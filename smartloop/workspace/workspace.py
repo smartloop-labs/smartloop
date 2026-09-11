@@ -10,7 +10,9 @@ from typing import Any, ClassVar, Dict, Optional, Set, List
 from pathlib import Path
 
 from uuid import uuid4
-from pydantic import BaseModel, computed_field, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel, computed_field, ConfigDict, Field, PrivateAttr, field_validator,
+)
 from smartloop.config import ModelConfig, AppSettings
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name
@@ -530,6 +532,12 @@ class Workspace(BaseModel):
     _save_lock: ClassVar[threading.Lock] = threading.Lock()
     #: Resolved on access, not at import — see :class:`_ConfigFilePath`.
     config_file: ClassVar[Any] = _ConfigFilePath()
+
+    #: Last ``project.json`` mtime this instance has read, per project.  Per
+    #: *instance*, not shared: two instances can hold different vintages of the
+    #: same project, and a map shared between them would let one skip a re-read
+    #: the other had already accounted for.
+    _state_mtimes: Dict[str, int] = PrivateAttr(default_factory=dict)
 
     id: str
     projects: List[Project] = []
@@ -1259,6 +1267,59 @@ class Workspace(BaseModel):
             return workspace
         except (json.JSONDecodeError, ValueError):
             return None
+
+    def refresh_project(self, project_id: str) -> bool:
+        """Re-read one project's own file if someone has written it since.
+
+        Under supervision a project's own state belongs to the child pinned to
+        it, and this process holds a copy taken when it first learned the
+        project existed.  Nothing tells it when that copy goes out of date, so
+        anything deciding from per-project state here decides from a snapshot:
+        a model disabled in a project went on answering that project's
+        requests, because the model host runs in the supervisor and resolved
+        selection against settings the child had already overwritten.
+
+        Narrower than :meth:`reload`, which re-reads every project: this is
+        called on the host's request path, where the bound project is the only
+        one that matters.  Gated on the file's mtime, so the usual cost is one
+        ``stat`` and the read happens only when a child actually wrote.
+
+        The workspace record stays authoritative for the fields it owns — the
+        selection is the workspace's answer, not the project's (see
+        :data:`_WORKSPACE_OWNED_PROJECT_FIELDS`) — and the existing
+        :class:`Project` is updated in place rather than replaced, so a caller
+        already holding it sees the new state instead of a detached object.
+
+        Returns True when something was re-read.
+        """
+        if not project_id:
+            return False
+        project = next(
+            (p for p in (self.projects or []) if p.id == project_id), None,
+        )
+        if project is None or not project.project_dir:
+            return False
+        try:
+            mtime = os.stat(project_state_path(project.project_dir)).st_mtime_ns
+        except OSError:
+            return False
+        if self._state_mtimes.get(project_id) == mtime:
+            return False
+        state = read_project_state(project.project_dir)
+        # Record the mtime even for an unreadable file: a project.json that is
+        # missing or corrupt is not going to become readable by being stat-ed
+        # once per frame, and read_project_state has already logged it.
+        self._state_mtimes[project_id] = mtime
+        if not state:
+            return False
+        fresh = Project(**{
+            **state, "id": project.id, "project_dir": project.project_dir,
+        })
+        for name in type(project).model_fields:
+            if name in _WORKSPACE_OWNED_PROJECT_FIELDS or name in ("id", "project_dir"):
+                continue
+            setattr(project, name, getattr(fresh, name))
+        return True
 
     def reload(self) -> None:
         """Re-read workspace state from disk into this instance.
