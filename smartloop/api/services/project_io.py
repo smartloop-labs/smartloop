@@ -164,17 +164,29 @@ def export_project(project_id: str) -> Path:
 
 # ── Import ──────────────────────────────────────────────────────────────
 
-def import_project(zip_path: Path, name: Optional[str] = None) -> dict:
+def import_project(zip_path: Path, name: Optional[str] = None,
+                   workspace: Optional[Workspace] = None) -> dict:
     """Import a project from a zip archive.
 
     Args:
         zip_path: Path to the zip file.
         name: Optional new name for the imported project.  When provided the
               imported project is renamed to this instead of the original.
+        workspace: The instance to import into.  A caller that holds a live
+              workspace must pass it.  Importing into a detached
+              ``Workspace.load()`` leaves that caller's own instance without
+              the project: every later read resolves it to the wrong project
+              (see ``Workspace.current_project``), and the next save writes a
+              project list the imported one is absent from — which is how an
+              imported project lost its ``config.json`` entry while its
+              directory, documents and index sat intact on disk.  Defaults to
+              a fresh load for the CLI, which holds no instance to keep in
+              step.
 
     Returns a dict with the new project metadata.
     """
-    workspace = Workspace.load()
+    if workspace is None:
+        workspace = Workspace.load()
     if workspace is None:
         raise ValueError("Workspace not initialized")
 

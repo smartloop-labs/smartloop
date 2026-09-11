@@ -419,6 +419,23 @@ class ModelService:
 
         return Workspace.init(model_config)
 
+    def live_workspace(self) -> Workspace:
+        """The workspace instance this process actually serves from.
+
+        Narrower than :meth:`_ensure_workspace`, which falls back to
+        ``Workspace.load()`` — a *detached* instance, fresh per call — when no
+        model is initialised yet.  Reading through a detached instance is
+        harmless; mutating one is not.  Whatever a caller adds to it is
+        invisible to this process's own reads, and the next save from the
+        instance it does serve writes a project list without it.
+
+        Use this anywhere a project is created or adopted outside
+        ``create_project``.
+
+        """
+        self._ensure_model()
+        return self._model.workspace
+
     def _initialize_workspace(self) -> None:
         """Ensure the workspace is loaded, raising if it cannot be resolved."""
         self._ensure_model()

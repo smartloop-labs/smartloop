@@ -5,10 +5,11 @@ import os
 import tempfile
 from typing import Optional
 
-from fastapi import APIRouter, Form, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 
 from smartloop.api.model import ProjectResponse
+from smartloop.api.services import ModelService, get_model_service
 from smartloop.api.services.project_io import export_project, import_project
 
 logger = logging.getLogger(__name__)
@@ -52,15 +53,24 @@ async def export_project_endpoint(project_id: str):
 async def import_project_endpoint(
     file: UploadFile = File(...),
     name: Optional[str] = Form(default=None, description="Override the project name"),
+    model_service: ModelService = Depends(get_model_service),
 ):
-    """Import a project from a zip archive."""
+    """Import a project from a zip archive.
+
+    Answered by the supervisor — ``/v1/projects/import`` names a verb, not a
+    project, so it is never forwarded to a child (see
+    ``smartloop.api.middleware._COLLECTION_ACTIONS``) — and the workspace it
+    imports into has to be the one this process serves from, or the project
+    exists on disk and nowhere in the process that just created it.
+    """
     tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
     try:
         contents = await file.read()
         tmp.write(contents)
         tmp.close()
 
-        result = import_project(tmp.name, name=name)
+        result = import_project(tmp.name, name=name,
+                                workspace=model_service.live_workspace())
         return ProjectResponse(**result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
