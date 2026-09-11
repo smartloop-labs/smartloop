@@ -405,7 +405,17 @@ class ModelService:
         exists yet.
         """
         if self._model is not None:
-            return self._model.workspace
+            workspace = self._model.workspace
+            if pinned_project_id() is not None:
+                # A child holds the workspace it loaded at spawn, and the model
+                # registry inside it is written by the process that owns
+                # config.json — so a model downloaded since is invisible here
+                # until the child restarts.  Gated on the file's mtime, and
+                # only in a child: the owner must not re-read its own record
+                # out from under mutations it has not saved yet (/v1/init
+                # registers a model well before it persists one).
+                workspace.refresh_models()
+            return workspace
 
         workspace = Workspace.load()
         if workspace is not None:

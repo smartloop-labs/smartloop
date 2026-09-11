@@ -11,7 +11,8 @@ from pathlib import Path
 
 from uuid import uuid4
 from pydantic import (
-    BaseModel, computed_field, ConfigDict, Field, PrivateAttr, field_validator,
+    BaseModel, computed_field, ConfigDict, Field, PrivateAttr, ValidationError,
+    field_validator,
 )
 from smartloop.config import ModelConfig, AppSettings
 from smartloop.config import SUPPORTED_MODELS
@@ -538,6 +539,10 @@ class Workspace(BaseModel):
     #: same project, and a map shared between them would let one skip a re-read
     #: the other had already accounted for.
     _state_mtimes: Dict[str, int] = PrivateAttr(default_factory=dict)
+
+    #: Last ``config.json`` mtime this instance has read its models from.
+    #: Per instance for the same reason as :attr:`_state_mtimes`.
+    _models_mtime: Optional[int] = PrivateAttr(default=None)
 
     id: str
     projects: List[Project] = []
@@ -1319,6 +1324,64 @@ class Workspace(BaseModel):
             if name in _WORKSPACE_OWNED_PROJECT_FIELDS or name in ("id", "project_dir"):
                 continue
             setattr(project, name, getattr(fresh, name))
+        return True
+
+    def refresh_models(self) -> bool:
+        """Re-read the registered models if the workspace record has moved on.
+
+        The mirror of :meth:`refresh_project`.  That one carries a child's
+        write up to the process holding the device; this carries the workspace
+        owner's write *down* to a child.  Weights are workspace-wide — one
+        shared ``models_dir``, one registry in ``config.json``, written only by
+        whoever owns that file — so a model downloaded while a child is running
+        is invisible to it: the child holds the workspace it loaded at spawn,
+        and ``_ensure_workspace`` re-reads from disk only while no model
+        pipeline exists.  :meth:`reload` does not help, by design — it refreshes
+        the project list and nothing else.
+
+        The visible symptom is a model that downloaded successfully and then
+        cannot be used: absent from ``GET /v1/projects/<id>/models``, and a 404
+        from the ``PATCH`` that would enable it, both answered by the child.
+
+        Only the model registry is taken.  The project list is not: a child
+        holds project state its own siblings own, and adopting a sibling's
+        record here would undo the split that keeps one process from
+        overwriting another's work.
+
+        Returns True when something was re-read.
+        """
+        try:
+            mtime = os.stat(self.config_file).st_mtime_ns
+        except OSError:
+            return False
+        if self._models_mtime == mtime:
+            return False
+        # Record it either way: an unreadable or malformed config will not
+        # become readable by being stat-ed again on the next request.
+        self._models_mtime = mtime
+        try:
+            with open(self.config_file, "r") as fh:
+                content = fh.read().strip()
+            if not content:
+                return False
+            models = (json.loads(content).get("workspace") or {}).get("models")
+        except (OSError, json.JSONDecodeError, ValueError, AttributeError):
+            return False
+        if not isinstance(models, list):
+            return False
+        try:
+            fresh = [WorkspaceModel.model_validate(m) for m in models]
+        except ValidationError:
+            logger.warning(
+                "[workspace] could not read the model registry from %s; "
+                "keeping the one we have", self.config_file,
+            )
+            return False
+        for model in fresh:
+            # Same re-anchoring ``load`` does: nothing persisted is trusted as
+            # a location, so the weights are found under *this* home.
+            model.models_dir = self.models_dir
+        self.models = fresh
         return True
 
     def reload(self) -> None:
