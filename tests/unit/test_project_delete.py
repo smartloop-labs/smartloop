@@ -13,7 +13,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from smartloop.workspace.context import delegate_projects, pin_project
+from smartloop.workspace.context import (
+    active_project_id, delegate_projects, pin_project, use_project,
+)
 from smartloop.workspace.workspace import (
     MCPServer, Project, Workspace, read_project_state,
 )
@@ -124,6 +126,58 @@ class TestTheRecordAndTheDirectoryGoTogether:
     def test_an_unknown_project_is_refused(self, service):
         with pytest.raises(ValueError, match="Project not found"):
             service.delete_project("gamma")
+
+
+class TestTheBindingThePathLeftBehind:
+    """A delete arrives bound to the project it is about to remove.
+
+    ``ProjectScopeMiddleware`` binds the id out of the path, and that binding
+    is still live once the project is gone.  Resolving it then warns about an
+    absence this request was asked to create — and ``save()`` does resolve it,
+    because the record it writes comes from a ``model_dump`` and
+    ``current_project`` is a computed field.  The sentence it logs is the one
+    a genuinely stale binding produces, so emitting it here buries the real
+    thing in false alarms.
+    """
+
+    def test_a_delete_bound_to_its_own_project_is_quiet(self, service, home, caplog):
+        caplog.set_level("WARNING", logger="smartloop.workspace.workspace")
+
+        with use_project("alpha"):
+            service.delete_project("alpha")
+
+        assert not [r for r in caplog.records
+                    if "is not in this workspace" in r.getMessage()], (
+            "the delete warned about the project it had just removed"
+        )
+
+    def test_the_record_is_still_written_correctly(self, service, home):
+        """Unbinding must not change what the delete persists."""
+        with use_project("alpha"):
+            service.delete_project("alpha")
+
+        assert _project_ids(home) == ["beta"]
+        assert _config(home)["workspace"]["projects"][0]["current"] is True
+
+    def test_the_binding_is_restored_for_the_rest_of_the_request(self, service, home):
+        """Scoped, not cleared: whatever ran the delete gets its context back."""
+        with use_project("alpha"):
+            service.delete_project("alpha")
+            assert active_project_id() == "alpha"
+
+    def test_a_stale_binding_still_warns(self, service, home, caplog):
+        """The warning has to survive for the case it was written for.
+
+        Bound to a project this workspace never had — the symptom of a
+        detached instance — it must still say so.
+        """
+        caplog.set_level("WARNING", logger="smartloop.workspace.workspace")
+
+        with use_project("never-existed"):
+            service._model.workspace.save()
+
+        assert [r for r in caplog.records
+                if "is not in this workspace" in r.getMessage()]
 
 
 class TestUnderSupervision:

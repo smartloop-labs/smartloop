@@ -31,7 +31,8 @@ from smartloop.types import ModelCapability
 from smartloop.workspace import DocumentInfo, DocumentStatus, MCPServer, Workspace
 from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPServerStatus, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
 from smartloop.workspace.context import (
-    own_project, pinned_project_id, projects_delegated, use_project,
+    own_project, pinned_project_id, projects_delegated, unbind_project,
+    use_project,
 )
 from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
@@ -3665,26 +3666,34 @@ class ModelService:
         # under ``project_dir``, already removed above.  Deleting a project
         # must never delete the user's files.
 
-        # Remove from workspace
-        workspace.projects = [p for p in workspace.projects if p.id != project_id]
+        # The request arrived on a path naming this project, so it is still
+        # bound to it — and from the next line the project does not exist.
+        # Anything resolving the binding now warns about the absence this
+        # method was asked to create, and ``save()`` resolves it: the record
+        # it writes comes from a ``model_dump``, and ``current_project`` is a
+        # computed field.
+        with unbind_project():
+            # Remove from workspace
+            workspace.projects = [p for p in workspace.projects if p.id != project_id]
 
-        # If deleted project was current, set the first remaining project as current
-        if was_current and workspace.projects:
-            workspace.projects[0].current = True
+            # If deleted project was current, set the first remaining project as current
+            if was_current and workspace.projects:
+                workspace.projects[0].current = True
 
-        # Release the deleted project's store handles; its directory is gone.
-        self._drop_caches(project_id)
+            # Release the deleted project's store handles; its directory is gone.
+            self._drop_caches(project_id)
 
-        # Claim the project being removed: under supervision this process
-        # writes only the workspace record, and the claim is what says this one
-        # file — now a deleted directory — is ours to have stopped keeping.
-        with own_project(project_id):
-            self._model.save()
+            # Claim the project being removed: under supervision this process
+            # writes only the workspace record, and the claim is what says this
+            # one file — now a deleted directory — is ours to have stopped
+            # keeping.
+            with own_project(project_id):
+                self._model.save()
 
-        # The singleton still lists the project for anyone who resolves the
-        # workspace afresh; drop it so the next Workspace.init() re-reads what
-        # was just written, exactly as create_project does.
-        Workspace.reset()
+            # The singleton still lists the project for anyone who resolves the
+            # workspace afresh; drop it so the next Workspace.init() re-reads
+            # what was just written, exactly as create_project does.
+            Workspace.reset()
 
         return {"id": project_id, "deleted": True, "message": "Project deleted successfully"}
 

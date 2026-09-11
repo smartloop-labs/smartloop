@@ -172,6 +172,33 @@ def use_project(project_id: Optional[str]) -> Iterator[Optional[str]]:
         _active_project_id.reset(token)
 
 
+@contextmanager
+def unbind_project() -> Iterator[None]:
+    """Resolve as if no project were named, for the duration of the block.
+
+    :func:`use_project` deliberately treats a falsy id as a no-op — a caller
+    that named no project should keep falling through rather than pin to
+    nothing — so this is the explicit form for the one case that means it:
+    work that has just removed the project it is bound to.
+
+    Deleting a project arrives on a path that names it, so the request stays
+    bound to it after the removal.  Anything resolving that binding then warns
+    about an absence the request was asked to create, and
+    :meth:`~smartloop.workspace.workspace.Workspace.save` does resolve it —
+    ``current_project`` is a computed field, so every ``model_dump`` reaches
+    it.  The warning is the same sentence a genuinely stale binding produces,
+    which is reason enough not to emit it where nothing is wrong.
+
+    The process pin is left alone: a pinned child never reaches an operation
+    like this, because removing a project is the workspace owner's work.
+    """
+    token = _active_project_id.set(None)
+    try:
+        yield
+    finally:
+        _active_project_id.reset(token)
+
+
 def set_active_project(project_id: Optional[str]):
     """Bind *project_id* and return the token to reset with.
 
