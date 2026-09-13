@@ -117,7 +117,15 @@ class Supervisor:
 
     def start(self, port: int) -> None:
         """Bring up the model host and the pool, and record ourselves."""
+        from smartloop.workspace.context import delegate_projects
+
         self.registry.set_supervisor(os.getpid(), port)
+
+        # From here each project's own file belongs to the child pinned to it.
+        # Declared before the pool exists rather than after, so a save on the
+        # way up cannot republish this process's snapshot over a project a
+        # reclaimed agent is already serving.
+        delegate_projects(True)
 
         address = self._start_model_host()
         self.pool = ProjectAgentPool(
@@ -230,6 +238,9 @@ class Supervisor:
 
     def stop(self) -> None:
         """Stop the children, then the host. Children first: they use it."""
+        from smartloop.workspace.context import delegate_projects
+
+        delegate_projects(False)
         if self.pool is not None:
             self.pool.stop_reaper()
             self.pool.stop_all()
@@ -239,6 +250,23 @@ class Supervisor:
             self.model_host = None
         self.registry.set_model_host(None, None)
         logger.info("[supervisor] stopped")
+
+    def release(self, project_id: str) -> bool:
+        """Stop the agent pinned to *project_id* and forget its backoff.
+
+        For a project that is going away — the only lifecycle event that has to
+        reach the pool.  Everything else the pool stops (idle, over the RSS
+        ceiling, crashed) is a project that will be started again on its next
+        request; this one will not, and leaving the child up would have it
+        serving a project whose directory is about to be removed underneath it.
+
+        Returns whether there was an agent to stop.
+        """
+        if self.pool is None:
+            return False
+        stopped = self.pool.stop(project_id)
+        self.pool.clear_backoff(project_id)
+        return stopped
 
     # -- reporting ----------------------------------------------------------
 
@@ -305,6 +333,18 @@ _supervisor_lock = threading.Lock()
 def get_supervisor() -> Optional[Supervisor]:
     """The running supervisor, or ``None`` when it was explicitly disabled."""
     return _supervisor
+
+
+def release_project(project_id: str) -> bool:
+    """Stop *project_id*'s agent, if this process is supervising one.
+
+    A no-op in a child and under ``--no-supervised``, where there is no pool and
+    the process serving the request is the only one there is.
+    """
+    supervisor = get_supervisor()
+    if supervisor is None:
+        return False
+    return supervisor.release(project_id)
 
 
 def start_supervisor(port: int, idle_ttl: Optional[float] = None) -> Supervisor:

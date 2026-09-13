@@ -30,6 +30,10 @@ from smartloop.llms.thinking import strip_thinking
 from smartloop.types import ModelCapability
 from smartloop.workspace import DocumentInfo, DocumentStatus, MCPServer, Workspace
 from smartloop.workspace import Project, MCPServer, MCPServerConfig, MCPServerStatus, MCPToolDefinition, Skill, MCPServerType, RemoteMCPServerConfig
+from smartloop.workspace.context import (
+    own_project, pinned_project_id, projects_delegated, unbind_project,
+    use_project,
+)
 from smartloop.db import ChunkResult, StoreFactory
 from smartloop.db.workspace_indexer import WorkspaceIndexer, WORKSPACE_COLLECTION
 from smartloop.db.feedback_indexer import FeedbackIndexer
@@ -401,7 +405,17 @@ class ModelService:
         exists yet.
         """
         if self._model is not None:
-            return self._model.workspace
+            workspace = self._model.workspace
+            if pinned_project_id() is not None:
+                # A child holds the workspace it loaded at spawn, and the model
+                # registry inside it is written by the process that owns
+                # config.json — so a model downloaded since is invisible here
+                # until the child restarts.  Gated on the file's mtime, and
+                # only in a child: the owner must not re-read its own record
+                # out from under mutations it has not saved yet (/v1/init
+                # registers a model well before it persists one).
+                workspace.refresh_models()
+            return workspace
 
         workspace = Workspace.load()
         if workspace is not None:
@@ -415,6 +429,35 @@ class ModelService:
             )
 
         return Workspace.init(model_config)
+
+    def live_workspace(self) -> Workspace:
+        """The workspace instance this process actually serves from.
+
+        Narrower than :meth:`_ensure_workspace`, which falls back to
+        ``Workspace.load()`` — a *detached* instance, fresh per call — when no
+        model is initialised yet.  Reading through a detached instance is
+        harmless; mutating one is not.  Whatever a caller adds to it is
+        invisible to this process's own reads, and the next save from the
+        instance it does serve writes a project list without it.
+
+        Use this anywhere a project is created or adopted outside
+        ``create_project``.
+
+        """
+        self._ensure_model()
+        return self._model.workspace
+
+    def refresh_project_state(self, project_id: Optional[str]) -> bool:
+        """Pick up a child's write to *project_id*'s own file, if there is one.
+
+        The model host runs in this process and answers for whichever project
+        asked, but a project's own state is written by the child pinned to it.
+        Without this the host decides from the copy it took when the project
+        first appeared — see :meth:`Workspace.refresh_project`.
+        """
+        if not project_id or self._model is None or not self._model.workspace:
+            return False
+        return self._model.workspace.refresh_project(project_id)
 
     def _initialize_workspace(self) -> None:
         """Ensure the workspace is loaded, raising if it cannot be resolved."""
@@ -1551,14 +1594,23 @@ class ModelService:
 
     # --------------------------------------------------------------- feedback
 
-    def _ensure_feedback_indexer(self) -> FeedbackIndexer:
-        current_project = self._model.workspace.current_project
-        if not current_project:
+    def _ensure_feedback_indexer(self, project: Optional["Project"] = None) -> FeedbackIndexer:
+        """The feedback index for *project*, or for whatever is bound.
+
+        *project* is explicit wherever the caller has already resolved one.
+        Resolving it here through ``current_project`` was wrong on any request
+        that names its project in the *body* rather than the path: nothing binds
+        those, so the index was built for the project the UI had *selected* and
+        a thumbs-up on one project was embedded into another's.
+        """
+        if project is None:
+            project = self._model.workspace.current_project
+        if not project:
             raise ValueError("No active project")
-        cache = self._caches(current_project.id)
+        cache = self._caches(project.id)
         if cache.feedback_indexer is None:
             cache.feedback_indexer = FeedbackIndexer(
-                project_dir=current_project.project_dir,
+                project_dir=project.project_dir,
                 logger=logger,
                 base_dir=self._model.workspace.workspace_dir,
             )
@@ -1599,7 +1651,7 @@ class ModelService:
         selected_project = self._get_project(project_id)
 
         feedback_store = FeedbackStore(selected_project.project_dir)
-        indexer = self._ensure_feedback_indexer()
+        indexer = self._ensure_feedback_indexer(selected_project)
 
         # Update rating on the conversation message
         target.rating = rating
@@ -1682,7 +1734,7 @@ class ModelService:
         feedback_store = FeedbackStore(project.project_dir)
         existing = feedback_store.find(session_id, message_id)
         if existing:
-            indexer = self._ensure_feedback_indexer()
+            indexer = self._ensure_feedback_indexer(project)
             indexer.remove_feedback(existing.feedback_id)
             feedback_store.remove(existing.feedback_id)
 
@@ -3131,13 +3183,22 @@ class ModelService:
 
         Delegates to Model.add_document() which processes, indexes, and saves.
         Returns info about the added documents.
+
+        *project_id* is *bound* for the call rather than written to the
+        ``current`` flag.  ``GenericModel.add_document`` resolves the project
+        through :py:attr:`Workspace.current_project`, which reads the binding
+        before the flag — so the binding reaches it just the same, without
+        moving the selection every other reader shares.
         """
-        if project_id:
-            project = self._get_project(project_id)
-            # Set as current temporarily so Model.add_source works against it
-            for p in self._model.workspace.projects:
-                p.current = (p.id == project_id)
-        new_docs = self._model.add_source(source, progress_callback=progress_callback)
+        self._initialize_workspace()
+        with use_project(project_id):
+            project = (
+                self._get_project(project_id) if project_id
+                else self._model.workspace.current_project
+            )
+            if project is None:
+                raise ValueError("No active project")
+            new_docs = self._model.add_source(source, progress_callback=progress_callback)
         return {
             "added": [doc.to_info(project.project_dir).model_dump() for doc in (new_docs or [])]
         }
@@ -3151,33 +3212,36 @@ class ModelService:
         """
         self._initialize_workspace()
 
-        if project_id:
-            project = self._get_project(project_id)
-            for p in self._model.workspace.projects:
-                p.current = (p.id == project_id)
-        else:
-            project = self._model.workspace.current_project
+        # Bound, not flipped: see :meth:`add_document`.  The registration below
+        # writes into whichever project ``current_project`` resolves to, and a
+        # binding gets it there without moving the workspace's selection —
+        # which a pinned process could not persist anyway.
+        with use_project(project_id):
+            project = (
+                self._get_project(project_id) if project_id
+                else self._model.workspace.current_project
+            )
             if not project:
                 raise ValueError("No active project")
 
-        # Register the document with PENDING status (no heavy processing).
-        new_docs = self._model.slp_model.add_document(source, cwd=cwd, generate_filename=generate_filename)
+            # Register the document with PENDING status (no heavy processing).
+            new_docs = self._model.slp_model.add_document(source, cwd=cwd, generate_filename=generate_filename)
 
-        if not new_docs:
-            return {
-                "status": "skipped",
-                "message": "Document(s) already exist in the project",
-                "documents": [],
-            }
+            if not new_docs:
+                return {
+                    "status": "skipped",
+                    "message": "Document(s) already exist in the project",
+                    "documents": [],
+                }
 
-        # Enqueue BEFORE saving config so that when the watcher detects
-        # the config change the queue already contains the document IDs.
-        indexer = self._task_queue.get_task("indexer")
-        if indexer is not None:
-            indexer.enqueue(new_docs)
+            # Enqueue BEFORE saving config so that when the watcher detects
+            # the config change the queue already contains the document IDs.
+            indexer = self._task_queue.get_task("indexer")
+            if indexer is not None:
+                indexer.enqueue(new_docs)
 
-        # Persist config so the watcher also sees the change as a fallback.
-        self._model.save()
+            # Persist config so the watcher also sees the change as a fallback.
+            self._model.save()
 
         return {
             "status": "pending",
@@ -3475,7 +3539,10 @@ class ModelService:
         # model registry so the project sidebar starts from the defaults.
         workspace.sync_project_models(project)
         self._model.workspace.projects.append(project)
-        self._model.save()
+        # No child owns this project yet — it has never been served — so this
+        # process writes its first ``project.json`` itself.
+        with own_project(project_id):
+            self._model.save()
 
         # A caller-supplied ``cwd`` is recorded for reference only — nothing is
         # ever located through it.  Skills, documents, MCP docs and the
@@ -3485,7 +3552,8 @@ class ModelService:
             project.cwd = os.path.abspath(os.path.expanduser(cwd))
         os.makedirs(project.skills_dir, exist_ok=True)
         os.makedirs(project.documents_dir, exist_ok=True)
-        self._model.save()
+        with own_project(project_id):
+            self._model.save()
         logger.info(f"[create_project] State dir: {project.project_dir}")
 
         # Drop any slot left over from a project that reused this id, so the
@@ -3584,11 +3652,24 @@ class ModelService:
         return [self._project_to_dict(p) for p in ws.projects]
 
     def delete_project(self, project_id: str) -> dict:
-        """Delete a project by ID."""
+        """Delete a project by ID.
+
+        Runs in the process that owns the workspace record — the supervisor, or
+        the single server under ``--no-supervised``.  It cannot run in the
+        project's own agent: removing the project from the list is a write to
+        ``config.json``, and a pinned save writes only ``project.json`` — the
+        file this method is about to delete along with the directory holding it.
+        """
         self._ensure_model()
 
         workspace = self._model.workspace
         project = next((p for p in workspace.projects if p.id == project_id), None)
+        if project is None:
+            # Same reason ``_get_project`` re-reads: the cached singleton can
+            # predate a project created by the CLI, or by ``import_project``,
+            # which works on its own detached ``Workspace.load()`` instance.
+            workspace.reload()
+            project = next((p for p in workspace.projects if p.id == project_id), None)
         if project is None:
             raise ValueError(f"Project not found: {project_id}")
 
@@ -3607,17 +3688,34 @@ class ModelService:
         # under ``project_dir``, already removed above.  Deleting a project
         # must never delete the user's files.
 
-        # Remove from workspace
-        workspace.projects = [p for p in workspace.projects if p.id != project_id]
+        # The request arrived on a path naming this project, so it is still
+        # bound to it — and from the next line the project does not exist.
+        # Anything resolving the binding now warns about the absence this
+        # method was asked to create, and ``save()`` resolves it: the record
+        # it writes comes from a ``model_dump``, and ``current_project`` is a
+        # computed field.
+        with unbind_project():
+            # Remove from workspace
+            workspace.projects = [p for p in workspace.projects if p.id != project_id]
 
-        # If deleted project was current, set the first remaining project as current
-        if was_current and workspace.projects:
-            workspace.projects[0].current = True
+            # If deleted project was current, set the first remaining project as current
+            if was_current and workspace.projects:
+                workspace.projects[0].current = True
 
-        # Release the deleted project's store handles; its directory is gone.
-        self._drop_caches(project_id)
+            # Release the deleted project's store handles; its directory is gone.
+            self._drop_caches(project_id)
 
-        self._model.save()
+            # Claim the project being removed: under supervision this process
+            # writes only the workspace record, and the claim is what says this
+            # one file — now a deleted directory — is ours to have stopped
+            # keeping.
+            with own_project(project_id):
+                self._model.save()
+
+            # The singleton still lists the project for anyone who resolves the
+            # workspace afresh; drop it so the next Workspace.init() re-reads
+            # what was just written, exactly as create_project does.
+            Workspace.reset()
 
         return {"id": project_id, "deleted": True, "message": "Project deleted successfully"}
 
@@ -4299,14 +4397,30 @@ class ModelService:
         ).start()
 
     def pending_mcp_servers(self) -> list[tuple[str, str]]:
-        """``(project_id, server_id)`` for every server still awaiting provisioning.
+        """``(project_id, server_id)`` for servers this process may provision.
 
         Used by the MCP task at startup to adopt servers whose provisioning was
         interrupted (the app quit between registration and discovery).
+
+        Only ever this process's own projects.  Provisioning ends in a write to
+        the project's ``project.json``, so adopting another project's server
+        means doing the slow half of registration — a real MCP handshake, then
+        LLM enrichment — and then dropping the result at save, leaving the
+        server ``PENDING`` to be adopted again on the next cycle, forever:
+
+        * a per-project child adopts its own project and no other;
+        * a supervisor adopts nothing.  It has delegated every project to a
+          child, and that child is the tier that can persist the answer — it
+          picks the server up when it next starts.
         """
         self._initialize_workspace()
+        if projects_delegated():
+            return []
+        pinned = pinned_project_id()
         pending: list[tuple[str, str]] = []
         for project in self._model.workspace.projects:
+            if pinned is not None and project.id != pinned:
+                continue
             for server in project.mcp_servers:
                 if server.system:
                     continue

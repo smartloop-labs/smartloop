@@ -345,6 +345,90 @@ class TestImportProject:
                 p.stop()
 
 
+class TestImportingIntoTheCallersWorkspace:
+    """Where an import lands when the caller already holds a workspace.
+
+    ``import_project`` used to build its own ``Workspace.load()``, save, and
+    return.  The caller's instance — the one the API server serves every
+    request from — never learned the project existed.  Every later read
+    resolved it to whichever project was selected, and the first save from
+    that instance wrote a project list the imported one was missing from,
+    taking its ``config.json`` entry with it while the directory, the
+    documents and the index stayed on disk.
+    """
+
+    def test_the_project_lands_in_the_instance_the_caller_passed(self, workspace_env):
+        from smartloop.api.services.project_io import export_project, import_project
+
+        env = workspace_env
+        patches = _patch_settings(env)
+        for p in patches:
+            p.start()
+        try:
+            live = Workspace.load()
+            assert len(live.projects) == 1
+
+            result = import_project(export_project(env["project"].id), workspace=live)
+
+            assert [p.id for p in live.projects if p.id == result["id"]], (
+                "the imported project is missing from the instance it was imported into"
+            )
+            assert len(live.projects) == 2
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_a_later_save_keeps_the_imported_project(self, workspace_env):
+        """The regression: the caller saves, and the import survives it.
+
+        This is the failure as it actually happened — nothing here touches the
+        import again.  The caller simply persists something unrelated (a
+        selection change) afterwards, which is enough to drop a project the
+        instance was never told about.
+        """
+        from smartloop.api.services.project_io import export_project, import_project
+
+        env = workspace_env
+        patches = _patch_settings(env)
+        for p in patches:
+            p.start()
+        try:
+            live = Workspace.load()
+            imported = import_project(export_project(env["project"].id), workspace=live)
+
+            # Something unrelated moves the selection and persists it.
+            live.projects[0].current = True
+            live.save()
+
+            on_disk = json.loads(Path(env["config_file"]).read_text())
+            ids = [p["id"] for p in on_disk["workspace"]["projects"]]
+            assert imported["id"] in ids, (
+                "a save from the caller's workspace erased the imported project"
+            )
+            assert len(ids) == 2
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_no_workspace_still_loads_one(self, workspace_env):
+        """The CLI holds no instance, so the default is unchanged."""
+        from smartloop.api.services.project_io import export_project, import_project
+
+        env = workspace_env
+        patches = _patch_settings(env)
+        for p in patches:
+            p.start()
+        try:
+            result = import_project(export_project(env["project"].id))
+            on_disk = json.loads(Path(env["config_file"]).read_text())
+            assert result["id"] in [
+                p["id"] for p in on_disk["workspace"]["projects"]
+            ]
+        finally:
+            for p in patches:
+                p.stop()
+
+
 class TestExportImportRoundTrip:
     def test_full_cycle(self, workspace_env):
         """Export → import produces a new project with matching data but new ID."""

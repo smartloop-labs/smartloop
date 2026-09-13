@@ -22,6 +22,19 @@ from smartloop.model_host.client import (
 from smartloop.model_host.host import ModelHost, _unlink_stale_socket
 
 
+class _FakeConn:
+    """Enough socket for :meth:`ModelHost._handle_frame` to answer into."""
+
+    def __init__(self) -> None:
+        self.sent = b""
+
+    def sendall(self, data) -> None:
+        self.sent += data
+
+    def settimeout(self, _timeout) -> None:
+        pass
+
+
 class FakeDevice(ModelClient):
     """Stands in for the process that owns the GPU."""
 
@@ -706,3 +719,81 @@ class TestTheBenchmarkReport:
         assert "1.20x slower" in report      # first chunk
         assert "1.11x slower" in report      # throughput
         assert "InProcessModelClient" in report
+
+
+class TestTheHostReadsTheProjectsOwnStateFirst:
+    """Whose answer the host gives when the project's owner has moved on.
+
+    Model selection depends on per-project settings, and those are written by
+    the child pinned to the project while the host runs in the supervisor,
+    holding a copy from whenever it first saw that project.  Nothing
+    invalidates the copy, so a model disabled in a project went on answering
+    that project's requests until the app was restarted.  The host asks its
+    client to catch up before it binds.
+    """
+
+    def test_the_project_is_refreshed_before_it_is_bound(self):
+        from smartloop.workspace.context import active_project_id
+
+        seen: list = []
+        device = FakeDevice()
+
+        def refresh(project_id):
+            # Ordering is the point: refreshing after the bind would resolve
+            # this operation against the copy we came in with.
+            seen.append((project_id, active_project_id()))
+            return True
+
+        device.refresh_project = refresh
+        host = ModelHost(device, "127.0.0.1:0")
+
+        host._handle_frame(_FakeConn(), 1, {
+            "id": "r1", "op": "generate",
+            "args": {"prompt": "hi", "project_id": "alpha"},
+        })
+
+        assert seen == [("alpha", None)]
+
+    def test_a_refresh_failure_does_not_fail_the_operation(self):
+        """A project.json we cannot read is not a reason to refuse to answer."""
+        device = FakeDevice()
+        device.refresh_project = lambda project_id: (_ for _ in ()).throw(
+            OSError("no such file")
+        )
+        host = ModelHost(device, "127.0.0.1:0")
+        conn = _FakeConn()
+
+        host._handle_frame(conn, 1, {
+            "id": "r1", "op": "generate",
+            "args": {"prompt": "hi", "project_id": "alpha"},
+        })
+
+        assert ("generate", "hi", None, None) in device.calls
+        assert b"answer to hi" in conn.sent
+
+    def test_an_unprojected_frame_still_works(self):
+        """The CLI and the single-server fallback name no project."""
+        device = FakeDevice()
+        host = ModelHost(device, "127.0.0.1:0")
+        conn = _FakeConn()
+
+        host._handle_frame(conn, 1, {
+            "id": "r1", "op": "generate", "args": {"prompt": "hi"},
+        })
+
+        assert b"answer to hi" in conn.sent
+
+
+class TestTheInProcessClientCanRefresh:
+    def test_it_asks_the_service(self):
+        calls: list = []
+        service = type("S", (), {
+            "refresh_project_state": lambda self, pid: calls.append(pid) or True,
+        })()
+        assert InProcessModelClient(service).refresh_project("alpha") is True
+        assert calls == ["alpha"]
+
+    def test_a_remote_client_has_nothing_to_refresh(self):
+        """Over the wire the workspace lives on the other side."""
+        client = RemoteModelClient.__new__(RemoteModelClient)
+        assert client.refresh_project("alpha") is False

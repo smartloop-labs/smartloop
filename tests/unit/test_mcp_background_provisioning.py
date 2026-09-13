@@ -17,8 +17,17 @@ from smartloop.api.services.model_service import ModelService
 from smartloop.mcp.client import MCPConnectResult, MCPDiscoveryError
 from smartloop.tasks.mcp_task import MCPTask
 from smartloop.workspace import MCPServerStatus, MCPToolDefinition
+from smartloop.workspace.context import delegate_projects, pin_project
 
 _TOOLS = [MCPToolDefinition(name="search", description="d", input_schema={"type": "object"})]
+
+
+@pytest.fixture(autouse=True)
+def _clear_process_scope():
+    """The pin and the delegation flag are process-global; never leak one."""
+    yield
+    pin_project(None)
+    delegate_projects(False)
 
 
 def _project():
@@ -293,6 +302,60 @@ class TestMCPTaskQueue:
     def test_status_reports_the_queue_for_health(self):
         status = MCPTask(logger=MagicMock()).mcp_status
         assert status == {"queued": 0, "provisioning": 0}
+
+
+class TestAdoptionIsScopedToTheProcessSOwnProjects:
+    """Provisioning ends in a write, so only the owner may adopt.
+
+    A pass finishes by recording ``ready``/``failed`` on the server, which is a
+    write to that project's ``project.json``.  A process that cannot make that
+    write would do the whole slow half of registration and then throw the
+    answer away, leaving the server ``PENDING`` and re-adopting it every cycle.
+    """
+
+    def _svc_with(self, *projects):
+        svc = MagicMock()
+        svc._initialize_workspace = MagicMock()
+        svc._model.workspace.projects = list(projects)
+        return svc
+
+    def _pending_project(self, pid):
+        return SimpleNamespace(
+            id=pid,
+            mcp_servers=[SimpleNamespace(
+                id=f"{pid}-srv", system=False, status=MCPServerStatus.PENDING,
+            )],
+        )
+
+    def test_a_child_adopts_only_the_project_it_is_pinned_to(self):
+        svc = self._svc_with(self._pending_project("alpha"),
+                             self._pending_project("beta"))
+        pin_project("beta")
+
+        assert ModelService.pending_mcp_servers(svc) == [("beta", "beta-srv")]
+
+    def test_a_supervisor_adopts_nothing(self):
+        """Its children own those files; each picks its own server up."""
+        svc = self._svc_with(self._pending_project("alpha"),
+                             self._pending_project("beta"))
+        delegate_projects(True)
+
+        assert ModelService.pending_mcp_servers(svc) == []
+
+    def test_the_single_server_fallback_still_adopts_everything(self):
+        svc = self._svc_with(self._pending_project("alpha"),
+                             self._pending_project("beta"))
+
+        assert ModelService.pending_mcp_servers(svc) == [
+            ("alpha", "alpha-srv"), ("beta", "beta-srv"),
+        ]
+
+    def test_a_system_server_is_never_adopted(self):
+        project = self._pending_project("alpha")
+        project.mcp_servers[0].system = True
+        svc = self._svc_with(project)
+
+        assert ModelService.pending_mcp_servers(svc) == []
 
 
 class TestIdleSignal:

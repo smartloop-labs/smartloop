@@ -8,6 +8,7 @@ MCP servers through it. These tests pin the behaviour that replaced it.
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,7 @@ from smartloop.workspace.context import (
     pinned_project_id,
     use_project,
 )
+from smartloop.workspace.types import Document
 from smartloop.workspace.workspace import Project, Workspace
 
 
@@ -211,6 +213,85 @@ class TestCarryingTheBindingIntoThreads:
             assert [f.result(timeout=15) for f in futures] == ["beta"] * 4
         finally:
             pool.shutdown(wait=True)
+
+
+class TestAddingADocumentBindsRatherThanFlipping:
+    """The last place that still moved the selection to do its work.
+
+    ``add_document`` / ``add_document_async`` used to set ``current`` on the
+    addressed project and clear it on every other one, purely so that
+    ``GenericModel.add_document`` — which resolves through
+    ``Workspace.current_project`` — would write into the right place.  In a
+    per-project child that write cannot persist (``current`` belongs to the
+    workspace record), and under the single-server fallback it *did* persist:
+    uploading a document silently moved the project the UI was looking at.
+    """
+
+    @pytest.fixture
+    def service(self, workspace, monkeypatch):
+        from smartloop.api.services.model_service import ModelService
+
+        monkeypatch.setattr(ModelService, "_instance", None, raising=False)
+        made = ModelService.__new__(ModelService)
+        ModelService.__init__(made)
+
+        seen: dict = {}
+
+        class _SlpModel:
+            def add_document(self, source, cwd=None, generate_filename=False):
+                # Exactly how the real one resolves its target.
+                project = workspace.current_project
+                seen["project_id"] = project.id if project else None
+                return [Document(id="d1", path=f"{project.project_dir}/d1.md")]
+
+        made._model = SimpleNamespace(
+            workspace=workspace,
+            slp_model=_SlpModel(),
+            save=lambda: seen.setdefault("saved", True),
+            add_source=lambda source, progress_callback=None: _SlpModel().add_document(source),
+        )
+        made._initialize_workspace = lambda: None
+        made.seen = seen
+        yield made
+        ModelService._instance = None
+
+    def test_the_addressed_project_receives_the_document(self, service, workspace):
+        """Even though a different project is the one marked ``current``."""
+        assert workspace.current_project.id == "alpha"
+
+        service.add_document_async("/tmp/f.md", project_id="beta")
+
+        assert service.seen["project_id"] == "beta"
+
+    def test_the_selection_does_not_move(self, service, workspace):
+        service.add_document_async("/tmp/f.md", project_id="beta")
+
+        assert [p.id for p in workspace.projects if p.current] == ["alpha"]
+
+    def test_the_binding_does_not_outlive_the_call(self, service):
+        service.add_document_async("/tmp/f.md", project_id="beta")
+
+        assert active_project_id() is None
+
+    def test_it_works_the_same_in_a_pinned_child(self, service, workspace):
+        """A child is pinned to gamma; an explicit project_id still wins."""
+        pin_project("gamma")
+
+        service.add_document_async("/tmp/f.md", project_id="beta")
+
+        assert service.seen["project_id"] == "beta"
+        assert [p.id for p in workspace.projects if p.current] == ["alpha"]
+
+    def test_an_unnamed_project_falls_back_to_the_selection(self, service):
+        service.add_document_async("/tmp/f.md")
+
+        assert service.seen["project_id"] == "alpha"
+
+    def test_the_synchronous_path_binds_too(self, service, workspace):
+        service.add_document("/tmp/f.md", project_id="beta")
+
+        assert service.seen["project_id"] == "beta"
+        assert [p.id for p in workspace.projects if p.current] == ["alpha"]
 
 
 class TestProjectContext:

@@ -198,7 +198,24 @@ class ModelHost:
             # model answers depends on that project's settings, and the host's
             # own "current" project is the UI's selection, which is somebody
             # else's answer.
-            with use_project(args.get("project_id")):
+            #
+            # Those settings are written by the child pinned to the project,
+            # and this process holds a copy taken when it first learned the
+            # project existed.  Nothing invalidates that copy, so without the
+            # refresh a model disabled in a project kept answering for it —
+            # the picker said one thing, the host resolved another, and only a
+            # restart reconciled them.  Best-effort: a project whose own file
+            # cannot be read is a reason to answer from what we have, not to
+            # fail the generation.
+            project_id = args.get("project_id")
+            try:
+                self.client.refresh_project(project_id)
+            except Exception as exc:
+                logger.warning(
+                    "[model-host] could not refresh project %s: %s",
+                    project_id, exc,
+                )
+            with use_project(project_id):
                 if op == "stream":
                     self._handle_stream(conn, conn_id, request_id, args)
                 else:

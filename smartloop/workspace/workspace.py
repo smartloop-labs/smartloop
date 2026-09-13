@@ -10,12 +10,17 @@ from typing import Any, ClassVar, Dict, Optional, Set, List
 from pathlib import Path
 
 from uuid import uuid4
-from pydantic import BaseModel, computed_field, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel, computed_field, ConfigDict, Field, PrivateAttr, ValidationError,
+    field_validator,
+)
 from smartloop.config import ModelConfig, AppSettings
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name
 from smartloop.types import ModelCapability
-from smartloop.workspace.context import active_project_id, pinned_project_id
+from smartloop.workspace.context import (
+    active_project_id, owned_project_id, pinned_project_id, projects_delegated,
+)
 from smartloop.workspace.types import Document, DocumentInfo, DocumentStatus, Skill
 
 _settings = AppSettings()
@@ -529,6 +534,16 @@ class Workspace(BaseModel):
     #: Resolved on access, not at import — see :class:`_ConfigFilePath`.
     config_file: ClassVar[Any] = _ConfigFilePath()
 
+    #: Last ``project.json`` mtime this instance has read, per project.  Per
+    #: *instance*, not shared: two instances can hold different vintages of the
+    #: same project, and a map shared between them would let one skip a re-read
+    #: the other had already accounted for.
+    _state_mtimes: Dict[str, int] = PrivateAttr(default_factory=dict)
+
+    #: Last ``config.json`` mtime this instance has read its models from.
+    #: Per instance for the same reason as :attr:`_state_mtimes`.
+    _models_mtime: Optional[int] = PrivateAttr(default=None)
+
     id: str
     projects: List[Project] = []
     models: List[WorkspaceModel] = []
@@ -726,7 +741,19 @@ class Workspace(BaseModel):
 
         Only this model is pinned: a blanket ``sync_project_models`` would also
         detach every unrelated model in every project from future defaults.
+
+        Does nothing in a per-project agent child.  Writing every *sibling*
+        project's settings is precisely what a pinned process may not do — its
+        ``save()`` writes one file — so pinning there would produce entries that
+        are dropped on the way to disk while the caller believed the leak had
+        been sealed.
         """
+        if pinned_project_id() is not None:
+            logger.warning(
+                "[workspace] not pinning %s across projects: this process owns "
+                "only project %s", model_name, pinned_project_id(),
+            )
+            return
         if self.is_bootstrap_model(model_name):
             return  # holds no per-project entry by design
         for project in self.projects:
@@ -749,6 +776,16 @@ class Workspace(BaseModel):
         """
         if self.is_bootstrap_model(model_name):
             return  # always enabled, not a configurable default
+        if pinned_project_id() is not None:
+            # ``enabled`` lives on the workspace record, which a pinned process
+            # never writes.  Promoting here would look like it worked and be
+            # gone on the next load — along with the pin above that keeps it
+            # from leaking into projects that never asked for it.
+            logger.warning(
+                "[workspace] not promoting %s to a workspace default: this "
+                "process owns only project %s", model_name, pinned_project_id(),
+            )
+            return
         ws = self.get_model(model_name)
         if ws is None or ws.enabled:
             return  # nothing to leak, skip the pin
@@ -987,8 +1024,20 @@ class Workspace(BaseModel):
           :func:`~smartloop.workspace.context.pin_project`) writes **only** its
           own ``project.json`` — the workspace record belongs to the
           supervisor, and a child writing it would clobber its siblings;
-        * an unpinned process — today's single server, the supervisor, the CLI
-          — writes the workspace record and every project's file.
+        * the supervisor, which has delegated every project to a child (see
+          :func:`~smartloop.workspace.context.delegate_projects`), writes the
+          workspace record and *nothing else* — unless it has explicitly
+          claimed one project with
+          :func:`~smartloop.workspace.context.own_project`, which is how
+          create, import and delete still write a file no child owns yet.
+          Without this the clobber simply moved tiers: the supervisor holds one
+          ``Workspace`` for its whole life, so writing every project's file
+          would republish a start-of-process snapshot over the documents and
+          MCP servers children had indexed since;
+        * any other unpinned process — the ``--no-supervised`` single server,
+          the CLI — writes the workspace record and every project's file, which
+          is what it has always done: under that fallback it is the only
+          process there is.
 
         ``SLP_LEGACY_CONFIG=1`` restores the single-document format; see
         :func:`_legacy_layout`.
@@ -1013,12 +1062,26 @@ class Workspace(BaseModel):
                     )
                 return
 
-            for project in self.projects or []:
+            for project in self._writable_projects():
                 project.save_state()
             _atomic_write_json(
                 self.config_file,
                 self._workspace_record([p.to_index() for p in (self.projects or [])]),
             )
+
+    def _writable_projects(self) -> List["Project"]:
+        """The projects whose own file this unpinned process may write.
+
+        Every one of them, unless the projects have been delegated to
+        per-project children — then only the one explicitly claimed, if any.
+        """
+        projects = self.projects or []
+        if not projects_delegated():
+            return list(projects)
+        owned = owned_project_id()
+        if not owned:
+            return []
+        return [p for p in projects if p.id == owned]
 
     @classmethod
     def _hydrate_projects(cls, ws_data: dict) -> dict:
@@ -1209,6 +1272,117 @@ class Workspace(BaseModel):
             return workspace
         except (json.JSONDecodeError, ValueError):
             return None
+
+    def refresh_project(self, project_id: str) -> bool:
+        """Re-read one project's own file if someone has written it since.
+
+        Under supervision a project's own state belongs to the child pinned to
+        it, and this process holds a copy taken when it first learned the
+        project existed.  Nothing tells it when that copy goes out of date, so
+        anything deciding from per-project state here decides from a snapshot:
+        a model disabled in a project went on answering that project's
+        requests, because the model host runs in the supervisor and resolved
+        selection against settings the child had already overwritten.
+
+        Narrower than :meth:`reload`, which re-reads every project: this is
+        called on the host's request path, where the bound project is the only
+        one that matters.  Gated on the file's mtime, so the usual cost is one
+        ``stat`` and the read happens only when a child actually wrote.
+
+        The workspace record stays authoritative for the fields it owns — the
+        selection is the workspace's answer, not the project's (see
+        :data:`_WORKSPACE_OWNED_PROJECT_FIELDS`) — and the existing
+        :class:`Project` is updated in place rather than replaced, so a caller
+        already holding it sees the new state instead of a detached object.
+
+        Returns True when something was re-read.
+        """
+        if not project_id:
+            return False
+        project = next(
+            (p for p in (self.projects or []) if p.id == project_id), None,
+        )
+        if project is None or not project.project_dir:
+            return False
+        try:
+            mtime = os.stat(project_state_path(project.project_dir)).st_mtime_ns
+        except OSError:
+            return False
+        if self._state_mtimes.get(project_id) == mtime:
+            return False
+        state = read_project_state(project.project_dir)
+        # Record the mtime even for an unreadable file: a project.json that is
+        # missing or corrupt is not going to become readable by being stat-ed
+        # once per frame, and read_project_state has already logged it.
+        self._state_mtimes[project_id] = mtime
+        if not state:
+            return False
+        fresh = Project(**{
+            **state, "id": project.id, "project_dir": project.project_dir,
+        })
+        for name in type(project).model_fields:
+            if name in _WORKSPACE_OWNED_PROJECT_FIELDS or name in ("id", "project_dir"):
+                continue
+            setattr(project, name, getattr(fresh, name))
+        return True
+
+    def refresh_models(self) -> bool:
+        """Re-read the registered models if the workspace record has moved on.
+
+        The mirror of :meth:`refresh_project`.  That one carries a child's
+        write up to the process holding the device; this carries the workspace
+        owner's write *down* to a child.  Weights are workspace-wide — one
+        shared ``models_dir``, one registry in ``config.json``, written only by
+        whoever owns that file — so a model downloaded while a child is running
+        is invisible to it: the child holds the workspace it loaded at spawn,
+        and ``_ensure_workspace`` re-reads from disk only while no model
+        pipeline exists.  :meth:`reload` does not help, by design — it refreshes
+        the project list and nothing else.
+
+        The visible symptom is a model that downloaded successfully and then
+        cannot be used: absent from ``GET /v1/projects/<id>/models``, and a 404
+        from the ``PATCH`` that would enable it, both answered by the child.
+
+        Only the model registry is taken.  The project list is not: a child
+        holds project state its own siblings own, and adopting a sibling's
+        record here would undo the split that keeps one process from
+        overwriting another's work.
+
+        Returns True when something was re-read.
+        """
+        try:
+            mtime = os.stat(self.config_file).st_mtime_ns
+        except OSError:
+            return False
+        if self._models_mtime == mtime:
+            return False
+        # Record it either way: an unreadable or malformed config will not
+        # become readable by being stat-ed again on the next request.
+        self._models_mtime = mtime
+        try:
+            with open(self.config_file, "r") as fh:
+                content = fh.read().strip()
+            if not content:
+                return False
+            models = (json.loads(content).get("workspace") or {}).get("models")
+        except (OSError, json.JSONDecodeError, ValueError, AttributeError):
+            return False
+        if not isinstance(models, list):
+            return False
+        try:
+            fresh = [WorkspaceModel.model_validate(m) for m in models]
+        except ValidationError:
+            logger.warning(
+                "[workspace] could not read the model registry from %s; "
+                "keeping the one we have", self.config_file,
+            )
+            return False
+        for model in fresh:
+            # Same re-anchoring ``load`` does: nothing persisted is trusted as
+            # a location, so the weights are found under *this* home.
+            model.models_dir = self.models_dir
+        self.models = fresh
+        return True
 
     def reload(self) -> None:
         """Re-read workspace state from disk into this instance.

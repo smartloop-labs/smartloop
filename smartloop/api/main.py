@@ -115,7 +115,27 @@ def _bootstrap_orchestrator_model(model_service) -> None:
     Used as a fallback when the orchestrator GGUF is missing on disk (e.g. a
     workspace created before the model was bootstrapped). Mirrors the core of
     the ``POST /v1/bootstrap`` endpoint without the SSE streaming.
+
+    Workspace-owner work, like the token refresh and release polling below:
+    the weights live in one shared ``models_dir`` and the record of them lives
+    in ``config.json``, which a per-project agent never writes.  A child that
+    ran this would download a copy of the weights per project and then lose the
+    ``downloaded`` flag at save, so the next start would do it again.  Children
+    normally never reach here because the pool sets
+    ``SLP_API_PRELOAD_MODEL=0`` — but only when there is a model host to reach
+    (``pool._environment``), so with the host disabled or failed they inherit
+    the supervisor's preload setting and do arrive.
     """
+    if pinned_project_id() is not None:
+        logger.warning(
+            "[bootstrap] orchestrator model is missing, but this process serves "
+            "only project %s; leaving the download to the workspace owner",
+            pinned_project_id(),
+        )
+        raise FileNotFoundError(
+            "orchestrator model is not downloaded and this process does not own "
+            "the workspace"
+        )
     from smartloop.model.downloader.artifact_downloader import SLPArtifactDownloader
 
     workspace = model_service._ensure_workspace()

@@ -77,6 +77,12 @@ slp = "main:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Pytest keeps the last three runs' temp directories, for every test rather
+# than only the ones that failed.  With a suite this size that is three copies
+# of every fixture's scratch space sitting around between runs; keep the
+# current run, and within it only what a failure might need explaining.
+tmp_path_retention_count = 1
+tmp_path_retention_policy = "failed"
 filterwarnings = [
     "ignore:builtin type Swig.*:DeprecationWarning",
     "ignore:builtin type swigvarlink:DeprecationWarning",

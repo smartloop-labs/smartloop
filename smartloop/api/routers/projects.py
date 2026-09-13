@@ -90,8 +90,20 @@ async def delete_project(
     project_id: str,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """Delete a project by ID."""
+    """Delete a project by ID.
+
+    Answered here rather than by the project's own agent: the project record
+    lives in the workspace file, which only this process writes (see
+    :mod:`smartloop.supervisor.routing`).  So the agent has to be stopped from
+    here too — and before the record goes, because the pool finds the child's
+    port files through the workspace entry it is about to lose.
+    """
+    from smartloop.supervisor.service import release_project
+
     try:
+        if release_project(project_id):
+            logger.info("[projects] stopped the agent for %s before deleting it",
+                        project_id)
         result = model_service.delete_project(project_id)
         return DeleteProjectResponse(**result)
     except ValueError as e:

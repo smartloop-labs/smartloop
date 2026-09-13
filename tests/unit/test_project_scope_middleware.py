@@ -38,6 +38,31 @@ class TestReadingTheProjectOffTheScope:
     def test_the_collection_itself_names_no_project(self):
         assert _project_from_scope(_scope("/v1/projects")) is None
 
+    def test_a_collection_verb_is_not_a_project(self):
+        """``import`` sits where an id sits and is not one.
+
+        Bound as a project it produced "bound project import is not in this
+        workspace" the moment anything resolved it — a warning about a
+        workspace member that cannot exist, in the middle of an import that
+        had otherwise succeeded.
+        """
+        assert _project_from_scope(_scope("/v1/projects/import")) is None
+
+    def test_the_two_layers_read_the_same_list(self):
+        """Binding and routing agree on what is not a project.
+
+        They disagreed once: the supervisor stopped forwarding ``import``
+        while the middleware went on binding it.  The next verb added must
+        not be able to land in one layer only.
+        """
+        from smartloop.api.middleware import _COLLECTION_ACTIONS
+        from smartloop.supervisor import routing
+
+        assert routing._COLLECTION_ACTIONS is _COLLECTION_ACTIONS
+        for path in _COLLECTION_ACTIONS:
+            assert _project_from_scope(_scope(path)) is None
+            assert routing.project_to_proxy({**_scope(path), "method": "POST"}) is None
+
     def test_a_malformed_query_string_is_not_fatal(self):
         scope = {"type": "http", "path": "/v1/models", "query_string": b"\xff\xfe=%%"}
         assert _project_from_scope(scope) is None
