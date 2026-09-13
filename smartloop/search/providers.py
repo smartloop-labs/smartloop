@@ -1,12 +1,12 @@
 """Web search client for the WebSearchAgent.
 
-Search runs against Smartloop's hosted ``/v1/websearch`` endpoint, which
-resolves the account's registered provider server-side. Providers used to be
-registered here — a Brave API key in the local credential store — but that tied
+Search runs against Smartloop's hosted ``/v1/websearch`` endpoint, which runs
+the query server-side on Smartloop's own credentials. Providers used to be
+configured here — a Brave API key in the local credential store — but that tied
 web search to one machine and left the hosted API unable to tell whether search
-was usable. Registration now lives on the account (managed from the web app),
-so this side stays deliberately blind: it asks for links and treats a 401/403
-as "search is off".
+was usable. Nothing is configured on this side any more: it asks for links and
+treats a 401/403 (unavailable) or 429 (the month's allowance is spent) as
+"search is off".
 
 The HTTP itself belongs to :class:`~smartloop.platform.client.SLPPlatformClient`
 like every other platform call; what lives here is the search-specific policy —
@@ -47,9 +47,9 @@ class SearchProviderError(Exception):
 class SearchAuthError(SearchProviderError):
     """The endpoint refused the request (401/403).
 
-    Means web search is unavailable for this account — the plan doesn't
-    include it, or no search provider has been registered. Either way the
-    agent silently skips searching.
+    Means web search is unavailable for this account — search is not
+    configured on the server, or the month's allowance is spent. Either way
+    the agent silently skips searching.
     """
 
 
@@ -89,7 +89,7 @@ def hosted_search_available(ttl: float = _STATUS_TTL_SECONDS) -> bool:
     """Whether the hosted endpoint would actually serve a search.
 
     Asks ``GET /v1/websearch/status``, which answers for the whole account:
-    signed in, and a provider registered. Checking it up front means the
+    signed in, with searches left this month. Checking it up front means the
     orchestrator skips the search step outright rather than running the query
     normalizer, calling the endpoint and discarding a 403.
 

@@ -228,6 +228,18 @@ class SLPPlatformClient:
         }, PermissionError)
         return resp.json()
 
+    def delete_current_user(self) -> None:
+        """DELETE /v1/users/me (auth required). Permanently deletes the account."""
+        try:
+            resp = httpx.delete(self._url(_USERS_ME), headers=self._headers(self._auth_headers_fn()),
+                                timeout=_TIMEOUT)
+        except httpx.TransportError as e:
+            raise ConnectionError(f"Connection error: {e}") from e
+
+        _raise_for_status(resp, {
+            401: "Authentication failed. Token may be expired or invalid.",
+        }, PermissionError)
+
     def refresh_access_token(self, refresh_token: str) -> dict:
         """POST /v1/auth/jwt/refresh with a refresh token.
 
@@ -278,10 +290,11 @@ class SLPPlatformClient:
 
         The endpoint resolves the account's registered search provider
         server-side, so this side never sees a provider name or an API key.
-        A 401/403 means search is unavailable for the account — no plan, or no
-        provider registered — and raises ``PermissionError``; every other
-        failure is a ``ConnectionError``, which callers must be free to treat
-        as transient rather than as "search is off".
+        A 401/403 means search is unavailable for the account, and a 429 means
+        its monthly allowance is spent; both raise ``PermissionError``, because
+        both mean "stop searching" rather than "try again". Every other failure
+        is a ``ConnectionError``, which callers must be free to treat as
+        transient.
         """
         try:
             resp = httpx.get(self._url(_WEBSEARCH), headers=self._headers(self._auth_headers_fn()),
@@ -289,7 +302,7 @@ class SLPPlatformClient:
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
-        if resp.status_code in (401, 403):
+        if resp.status_code in (401, 403, 429):
             raise PermissionError(
                 f"Web search endpoint rejected the token (HTTP {resp.status_code})")
         _raise_for_status(resp)
@@ -302,11 +315,12 @@ class SLPPlatformClient:
     def web_search_status(self, timeout: int = _SEARCH_STATUS_TIMEOUT) -> bool:
         """GET /v1/websearch/status (auth required). Whether search would serve.
 
-        Answers for the whole account: signed in, with a provider registered.
-        Raises ``PermissionError`` on 401/403 and ``ConnectionError`` on
-        anything else, keeping "search is off" distinguishable from "the check
-        did not complete" — see :func:`smartloop.search.providers.hosted_search_available`,
-        which fails open on the latter.
+        Answers for the whole account: signed in, and with searches left in the
+        month's allowance. Raises ``PermissionError`` on 401/403 and
+        ``ConnectionError`` on anything else, keeping "search is off"
+        distinguishable from "the check did not complete" — see
+        :func:`smartloop.search.providers.hosted_search_available`, which fails
+        open on the latter.
         """
         try:
             resp = httpx.get(self._url(_WEBSEARCH_STATUS), headers=self._headers(self._auth_headers_fn()),

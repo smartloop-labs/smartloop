@@ -269,6 +269,18 @@ class TestWebSearch:
         with pytest.raises(PermissionError, match=str(status)):
             client.web_search("bikes", 5)
 
+    def test_spent_allowance_raises_permission_error_not_connection_error(
+        self, stub_server
+    ):
+        """429 means the month's searches are used up — stop searching, don't
+        retry it as if the endpoint had blipped."""
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch": (429, {"detail": "limit reached"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(PermissionError, match="429"):
+            client.web_search("bikes", 5)
+
     def test_server_error_raises_connection_error(self, stub_server):
         base_url, handler = stub_server
         handler.routes = {"/v1/websearch": (500, {"detail": "boom"})}
