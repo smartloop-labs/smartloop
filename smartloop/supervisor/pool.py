@@ -40,7 +40,34 @@ logger = logging.getLogger(__name__)
 DEFAULT_IDLE_TTL_SECONDS = 900.0
 
 #: How long to wait for a freshly spawned child to answer /health.
-DEFAULT_START_TIMEOUT_SECONDS = 120.0
+#:
+#: Windows gets a longer default. A cold child imports torch, llama-cpp-python's
+#: Vulkan backend and friends — a pile of native DLLs that real-time antivirus
+#: (Defender included) scans synchronously the first time each one is mapped
+#: in. That routinely costs the first start of the day 60-120+ seconds on
+#: Windows, with nothing wrong: the same import is near-instant on macOS/Linux,
+#: which have no equivalent per-file scan in the load path. Once Defender has
+#: cached a clean verdict for those files subsequent starts are fast again, so
+#: this only needs to cover the worst case, not the common one.
+#:
+#: ``SLP_AGENT_START_TIMEOUT_S`` overrides either default, for a box slow enough
+#: (or fast enough) that neither guess fits.
+def _default_start_timeout_seconds() -> float:
+    raw = (os.environ.get("SLP_AGENT_START_TIMEOUT_S") or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            logger.warning(
+                "[supervisor] SLP_AGENT_START_TIMEOUT_S=%r is not a number; "
+                "using the platform default", raw,
+            )
+    return 240.0 if os.name == "nt" else 120.0
+
+
+DEFAULT_START_TIMEOUT_SECONDS = _default_start_timeout_seconds()
 
 #: Restart backoff, matching the single-process policy it is lifted from.
 _BACKOFF_START = 1.0
@@ -80,7 +107,7 @@ class ProjectAgentPool:
         registry: AgentRegistry,
         project_dir_for: Callable[[str], Optional[str]],
         idle_ttl: float = DEFAULT_IDLE_TTL_SECONDS,
-        start_timeout: float = DEFAULT_START_TIMEOUT_SECONDS,
+        start_timeout: Optional[float] = None,
         model_host_address: Optional[str] = None,
         command_for: Optional[Callable[[str], list]] = None,
         memory_limit_bytes: int = DEFAULT_MEMORY_LIMIT_BYTES,
@@ -88,7 +115,13 @@ class ProjectAgentPool:
         self.registry = registry
         self.project_dir_for = project_dir_for
         self.idle_ttl = idle_ttl
-        self.start_timeout = start_timeout
+        # Read at construction, not at import: the environment variable that
+        # can override it is set by a launcher before the supervisor starts,
+        # not before this module is first imported.
+        self.start_timeout = (
+            _default_start_timeout_seconds() if start_timeout is None
+            else start_timeout
+        )
         self.model_host_address = model_host_address
         self.memory_limit_bytes = memory_limit_bytes
         # How a child is launched.  Overridable so the lifecycle can be
