@@ -37,22 +37,24 @@ class LlmFactory:
 
         Returns True if the probe succeeded, False if the subprocess crashed,
         or None if the subprocess raised a normal Python exception (exit code > 0).
-        """
-        if getattr(sys, 'frozen', False):
-            # PyInstaller bundle: sys.executable is the app binary, not Python.
-            # Skip subprocess probe; fall through to in-process load.
-            return None
 
-        probe_script = (
-            "import sys, json\n"
-            "from llama_cpp import Llama\n"
-            "config = json.loads(sys.argv[1])\n"
-            "llm = Llama(**config)\n"
-            "del llm\n"
-        )
+        Also the only thing standing between a GPU-init hang and a project
+        agent that never comes up: nothing here bounds ``Llama(**config)`` in
+        the main process, so a driver that hangs instead of failing (Vulkan on
+        Windows has done this on some Intel iGPU drivers) blocks forever with
+        no fallback. ``subprocess.run``'s ``timeout`` kills a probe that hangs
+        this way, which is what turns "stuck loading the model forever" into
+        "falls back to CPU and starts".  A frozen (PyInstaller) build used to
+        skip this probe entirely — ``sys.executable`` there is the app binary,
+        not a Python interpreter, so ``-c <script>`` could not run — but the
+        binary already knows how to re-exec ``-m <module>`` (``main.py``, used
+        to spawn the project agent and model host the same way), so the probe
+        runs as a module for exactly the same reason those do, and a frozen
+        Windows build gets the same protection as a dev one.
+        """
         try:
             result = subprocess.run(
-                [sys.executable, "-c", probe_script, json.dumps(config)],
+                [sys.executable, "-m", "smartloop.llms.model_probe", json.dumps(config)],
                 timeout=120,
                 capture_output=True,
             )
