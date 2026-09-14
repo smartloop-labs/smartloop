@@ -3354,9 +3354,27 @@ class ModelService:
         # pre-download).  OCR / image understanding is handled on demand by the
         # vision-capable model loaded in-process via get_vision_llm().
 
-        # Indexer task (auto=True — watches for pending documents)
-        indexer = IndexerTask(workspace=workspace, logger=logger)
-        self._task_queue.register(indexer)
+        # Indexer task (auto=True — watches for pending documents).
+        #
+        # Not in a process that has delegated its projects.  Each child runs an
+        # IndexerTask pinned to its own project; one here would own no project
+        # and fall back to the ``current`` flag, and ``_scan_documents`` reads
+        # the documents folder off disk rather than draining its own queue — so
+        # it picks up whatever a child just wrote and indexes it a second time.
+        # Observed live: the same three PDFs indexed by both the supervisor and
+        # the project's own agent, with the duplicated embedding pass leaving
+        # too little memory for the large model to load, which reached the user
+        # as an answer that had quietly fallen back to the default model.
+        #
+        # Nothing is lost by skipping it.  A delegating ``save()`` keeps only
+        # the workspace record (see :meth:`Workspace._writable_projects`), so
+        # the document state this task exists to persist would be discarded
+        # anyway, while its manifest and vector-store writes landed — leaving
+        # the two disagreeing about what is indexed.
+        indexer = None
+        if not projects_delegated():
+            indexer = IndexerTask(workspace=workspace, logger=logger)
+            self._task_queue.register(indexer)
 
         # MCP task (auto=True — owns background provisioning of newly
         # registered servers)
@@ -3381,7 +3399,8 @@ class ModelService:
         self._task_queue.start_auto_tasks()
 
         # Start the indexer watcher thread
-        indexer.start_watcher()
+        if indexer is not None:
+            indexer.start_watcher()
 
         # Start the MCP loop: it adopts any server left pending by a previous
         # run and runs the first content refresh cycle immediately, so a

@@ -19,6 +19,7 @@ from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
 from smartloop.platform import ModelAccessError, get_platform_service
+from smartloop.workspace.context import projects_delegated
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["init"])
@@ -314,8 +315,14 @@ async def init(
             async for event in _ensure_project(model_service, workspace, cwd=request.cwd):
                 yield event
 
-            # 4. Start background tasks (indexer, etc.) if not already running
-            if model_service._task_queue.get_task("indexer") is None:
+            # 4. Start background tasks (indexer, etc.) if not already running.
+            #    Under supervision no indexer is registered at all (see
+            #    ``ModelService.setup_tasks``), so asking whether one is
+            #    running would re-run the whole setup on every call —
+            #    replacing the MCP task and orphaning the loop it had
+            #    already started.
+            if (not projects_delegated()
+                    and model_service._task_queue.get_task("indexer") is None):
                 model_service.setup_tasks(workspace)
 
             # 5. Load model (only if a GGUF is available)
@@ -431,8 +438,14 @@ async def bootstrap(
             # 4. Ensure model pipeline
             model_service._ensure_model()
 
-            # 5. Start background tasks (indexer, etc.) if not already running
-            if model_service._task_queue.get_task("indexer") is None:
+            # 5. Start background tasks (indexer, etc.) if not already running.
+            #    Under supervision no indexer is registered at all (see
+            #    ``ModelService.setup_tasks``), so asking whether one is
+            #    running would re-run the whole setup on every call —
+            #    replacing the MCP task and orphaning the loop it had
+            #    already started.
+            if (not projects_delegated()
+                    and model_service._task_queue.get_task("indexer") is None):
                 model_service.setup_tasks(workspace)
 
             # 6. Create bare project (no skills yet — LLM not loaded)
