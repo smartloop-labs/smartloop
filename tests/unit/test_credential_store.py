@@ -188,3 +188,70 @@ class TestConcurrentWritesKeepBoth:
         # Every read landed on one whole version or another — never on ``None``,
         # which is what a torn file decrypts to.
         assert seen and all(v is not None for v in seen)
+
+
+class TestTheOAuthPairIsWrittenAsOne:
+    """A rotated pair reaches disk in one file version, or not at all.
+
+    Storing the two halves separately leaves a readable state holding the new
+    access token beside the refresh token that was just spent to mint it.  A
+    crash there makes it permanent: the next redemption presents a spent token,
+    is refused, and reads the refusal as "re-login required".  With a
+    single-use refresh token that window is unrecoverable rather than untidy.
+    """
+
+    def test_a_rotated_pair_is_one_write(self, monkeypatch):
+        writes = []
+        real = credential_store._save_creds
+        monkeypatch.setattr(
+            credential_store, "_save_creds",
+            lambda creds: (writes.append(dict(creds)), real(creds))[1],
+        )
+
+        credential_store.set_tokens("new-at", "new-rt")
+
+        assert len(writes) == 1, f"the pair reached disk in {len(writes)} versions"
+        assert writes[0]["access_token"] == "new-at"
+        assert writes[0]["refresh_token"] == "new-rt"
+
+    def test_no_version_pairs_a_new_access_token_with_the_old_refresh_token(self, monkeypatch):
+        credential_store.set_tokens("old-at", "old-rt")
+
+        seen = []
+        real = credential_store._save_creds
+        monkeypatch.setattr(
+            credential_store, "_save_creds",
+            lambda creds: (seen.append(dict(creds)), real(creds))[1],
+        )
+
+        credential_store.set_tokens("new-at", "new-rt")
+
+        assert not [
+            c for c in seen
+            if c.get("access_token") == "new-at" and c.get("refresh_token") == "old-rt"
+        ], "a reader could observe the new access token beside the spent refresh token"
+
+    def test_an_unrotated_refresh_token_is_left_alone(self):
+        """The endpoint does not always rotate; ``None`` must not erase."""
+        credential_store.set_tokens("old-at", "old-rt")
+        credential_store.set_tokens("new-at", None)
+
+        assert credential_store.get_access_token() == "new-at"
+        assert credential_store.get_refresh_token() == "old-rt"
+
+    def test_clearing_drops_both_in_one_version(self, monkeypatch):
+        credential_store.set_tokens("at", "rt")
+
+        writes = []
+        real = credential_store._save_creds
+        monkeypatch.setattr(
+            credential_store, "_save_creds",
+            lambda creds: (writes.append(dict(creds)), real(creds))[1],
+        )
+
+        credential_store.clear_tokens()
+
+        assert len(writes) == 1
+        assert credential_store.get_access_token() is None
+        assert credential_store.get_refresh_token() is None
+

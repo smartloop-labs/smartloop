@@ -164,8 +164,7 @@ def _redeem(client: Optional[SLPPlatformClient] = None) -> bool:
     try:
         data = client.refresh_access_token(refresh_token)
     except PermissionError:
-        credential_store.clear_access_token()
-        credential_store.clear_refresh_token()
+        credential_store.clear_tokens()
         logger.info(
             "Cleared tokens after 401 from refresh endpoint — re-login required"
         )
@@ -178,9 +177,7 @@ def _redeem(client: Optional[SLPPlatformClient] = None) -> bool:
     if not access:
         logger.warning("Refresh endpoint returned no access token")
         return False
-    credential_store.set_access_token(access)
-    if data.get("refresh_token"):
-        credential_store.set_refresh_token(data["refresh_token"])
+    credential_store.set_tokens(access, data.get("refresh_token"))
     logger.info("Tokens refreshed via /v1/auth/jwt/refresh")
     return True
 
