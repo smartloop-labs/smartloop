@@ -11,6 +11,7 @@ the status they would have been.
 """
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,16 +28,24 @@ PAID_MODEL = "gemma3-12b"
 
 
 @pytest.fixture
-def model_service(tmp_path):
+def model_service(tmp_path_factory):
     """A model service whose workspace has no weights on disk.
 
-    ``models_dir`` points into an empty tmp dir, so ``_gguf_exists`` is False
+    ``models_dir`` points into an empty temp dir, so ``_gguf_exists`` is False
     and every request in this module takes the "needs download" path.
+
+    Deliberately not the test's ``tmp_path``: ``no_real_downloads`` scans that
+    tree afterwards for stray ``.gguf`` files, and one test here plants a fake
+    one to mean "these weights are already on disk".  The guard cannot tell
+    that apart from a download that escaped the stub, and it should not have to
+    — so the workspace keeps its files where the guard is not looking, the same
+    arrangement ``test_init_promotes_a_downloaded_model`` uses.
     """
+    home = tmp_path_factory.mktemp("slp-home")
     workspace = Workspace(
         id="ws-test",
-        workspace_dir=str(tmp_path),
-        models_dir=str(tmp_path / "models"),
+        workspace_dir=str(home),
+        models_dir=str(home / "models"),
     )
     workspace.models.append(WorkspaceModel(
         model_name=PAID_MODEL,
@@ -282,11 +291,15 @@ class TestInitOnAFreshProcess:
         assert cold_service.mark_model_downloaded.call_args.args[0] == PAID_MODEL
 
     def test_already_downloaded_also_survives_a_fresh_process(
-        self, client, cold_service, monkeypatch, tmp_path
+        self, client, cold_service
     ):
         """The model_ready branch dereferenced the same None."""
-        model_dir = tmp_path / "models" / "google/gemma-3-12b-it"
-        model_dir.mkdir(parents=True)
+        # Where the route will look, rather than a path built to match it: the
+        # workspace resolves ``model_dir`` from its own ``models_dir``, so
+        # asking it keeps the sentinel and the lookup from drifting apart.
+        workspace = cold_service._ensure_workspace.return_value
+        model_dir = Path(workspace.get_model(PAID_MODEL).model_dir)
+        model_dir.mkdir(parents=True, exist_ok=True)
         (model_dir / "weights.gguf").write_bytes(b"\0")
 
         resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
