@@ -170,7 +170,14 @@ class TestProjectSetters:
 
 
 class TestPromoteToWorkspaceDefault:
-    """Enabling a model in one project makes it a default for future ones."""
+    """Downloading a model makes it a default for projects created after.
+
+    The trigger is the download, not the enable: ``/v1/init`` calls this once
+    the weights land (``tests/api/test_init_promotes_a_downloaded_model.py``),
+    and the project route deliberately does not
+    (``TestEnablingAModelIsProjectScoped`` in
+    ``tests/api/test_project_models.py``).
+    """
 
     def test_promote_flips_the_workspace_default(self):
         ws = _make_workspace()

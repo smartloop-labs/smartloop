@@ -437,16 +437,16 @@ async def update_project_model(
         pm = workspace.project_model(project, model_name)
 
         if request.enabled is not None:
+            # Project-scoped, and only that.  Turning on a model that is
+            # already in the workspace says nothing about what other projects
+            # should start with, so nothing here touches the app-default —
+            # a model earns that by being *downloaded* (see /v1/init), not by
+            # being switched on somewhere.
             pm.enabled = request.enabled
-            if request.enabled:
-                # Enabling here also makes the model an app-default, so projects
-                # created later start with it.  Existing projects are pinned
-                # first and keep what they resolve to today.
-                workspace.promote_model_to_workspace_default(model_name)
-            else:
+            if not request.enabled:
                 # Deselecting must also free any VRAM it still holds — the
                 # enabled flag only gates future loads, not an already-resident
-                # instance.
+                # instance.  This half stays workspace-wide: the device is.
                 model_service.unload_model_by_name(model_name)
 
         if request.is_active is not None:

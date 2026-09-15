@@ -278,36 +278,48 @@ class TestBootstrapModelIsNotConfigurablePerProject:
             assert bootstrap not in names
 
 
-class TestEnablePromotesWorkspaceDefault:
-    """Enabling a model in a project makes it a default for future projects.
+class TestEnablingAModelIsProjectScoped:
+    """Switching a model on for a project says nothing about the workspace.
 
-    Downloads are workspace-wide, so a model pulled for one project should be
-    on offer to the ones created afterwards without a second download.  The
-    projects that already exist are left alone: had the user wanted the model
-    there, they would have enabled it and triggered the download themselves.
+    A model earns a place among the app-defaults by being *downloaded* — that
+    is the act that adds it to the workspace, and ``/v1/init`` promotes it
+    there (see ``test_init_promotes_a_downloaded_model.py``).  Turning on a
+    model that is already present is one project's preference and must not
+    reach ``config.json``.
+
+    It could not anyway, which is how the old behaviour went unnoticed: under
+    supervision this route is proxied to the child pinned to the project, and
+    a child writes only its own ``project.json``.  The promotion attempted
+    here was discarded at save, so a model downloaded from inside a project
+    stayed disabled workspace-wide forever.
     """
 
-    def test_enable_flips_the_workspace_default(self, isolated_workspace, client):
+    def test_enable_does_not_flip_the_workspace_default(self, isolated_workspace, client):
         assert client.patch(
             "/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": True}
         ).status_code == 200
 
         ws = {m["model_name"]: m for m in client.get("/v1/models/workspace").json()}
-        assert ws["qwen2-vl-2b"]["enabled"] is True
+        assert ws["qwen2-vl-2b"]["enabled"] is False
 
-    def test_existing_projects_are_pinned_not_promoted(self, isolated_workspace, client):
+    def test_the_enable_still_lands_on_the_project(self, isolated_workspace, client):
+        client.patch("/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": True})
+
+        p1 = {m["model_name"]: m for m in client.get("/v1/projects/p1/models").json()}
+        assert p1["qwen2-vl-2b"]["enabled"] is True
+
+        p1_saved = _saved_project(isolated_workspace["config_file"], "p1")
+        entry = next(m for m in p1_saved["model_settings"] if m["model_name"] == "qwen2-vl-2b")
+        assert entry["enabled"] is True
+
+    def test_sibling_projects_are_untouched(self, isolated_workspace, client):
         client.patch("/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": True})
 
         p2 = {m["model_name"]: m for m in client.get("/v1/projects/p2/models").json()}
         assert p2["qwen2-vl-2b"]["enabled"] is False
 
-        # p2 had no entry for the model before the enable; it must have gained an
-        # explicit one, otherwise it would read through to the new default.
-        p2_saved = _saved_project(isolated_workspace["config_file"], "p2")
-        entry = next(m for m in p2_saved["model_settings"] if m["model_name"] == "qwen2-vl-2b")
-        assert entry["enabled"] is False
-
-    def test_project_created_afterwards_inherits_the_model(self, isolated_workspace, client):
+    def test_a_project_created_afterwards_does_not_inherit_it(self, isolated_workspace, client):
+        """The workspace default never moved, so there is nothing to inherit."""
         from smartloop.api.services import get_model_service
 
         client.patch("/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": True})
@@ -320,15 +332,14 @@ class TestEnablePromotesWorkspaceDefault:
         workspace.save()
 
         p3 = {m["model_name"]: m for m in client.get("/v1/projects/p3/models").json()}
-        assert p3["qwen2-vl-2b"]["enabled"] is True
+        assert p3["qwen2-vl-2b"]["enabled"] is False
 
-    def test_disable_does_not_demote_the_default(self, isolated_workspace, client):
-        """Promotion is one-way — one project opting out keeps the default."""
-        client.patch("/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": True})
-        client.patch("/v1/projects/p1/models/qwen2-vl-2b", json={"enabled": False})
+    def test_disable_leaves_the_workspace_default_alone_too(self, isolated_workspace, client):
+        """Neither direction reaches the workspace record from this route."""
+        client.patch("/v1/projects/p1/models/gemma3-4b", json={"enabled": False})
 
         ws = {m["model_name"]: m for m in client.get("/v1/models/workspace").json()}
-        assert ws["qwen2-vl-2b"]["enabled"] is True
+        assert ws["gemma3-4b"]["enabled"] is True
 
 
 class TestWorkspaceDefaultEdit:
