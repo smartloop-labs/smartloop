@@ -28,7 +28,7 @@ PAID_MODEL = "gemma3-12b"
 
 
 @pytest.fixture
-def model_service(tmp_path_factory):
+def model_service(tmp_path_factory, monkeypatch):
     """A model service whose workspace has no weights on disk.
 
     ``models_dir`` points into an empty temp dir, so ``_gguf_exists`` is False
@@ -42,6 +42,14 @@ def model_service(tmp_path_factory):
     arrangement ``test_init_promotes_a_downloaded_model`` uses.
     """
     home = tmp_path_factory.mktemp("slp-home")
+    # ``save()`` writes ``Workspace.config_file``, which resolves from
+    # ``SLP_HOME`` and *not* from ``workspace_dir`` — config.json sits one level
+    # above a workspace, so it cannot be derived from it.  Setting the two dirs
+    # below therefore sandboxes everything except the file the routes here
+    # actually persist, and ``/v1/init`` now really does persist it.  Without
+    # this the suite overwrites the developer's own ``~/.smartloop/config.json``
+    # with this fixture's workspace.
+    monkeypatch.setenv("SLP_HOME", str(home))
     workspace = Workspace(
         id="ws-test",
         workspace_dir=str(home),
