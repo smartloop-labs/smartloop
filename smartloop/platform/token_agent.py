@@ -3,6 +3,13 @@
 Two entry points over the same operation: a background loop started from the
 API server lifespan, and :func:`refresh_access_token_now` for callers that
 have just been told their access token is dead and want it back immediately.
+
+Both run in the workspace owner and nowhere else.  Under supervision this
+process is one of N+1 sharing a single credential file — a supervisor plus an
+agent child per project — and the refresh token is single-use: redeeming it
+twice gets the loser a 401, which reads as "the refresh token is dead" and
+clears both credentials.  Nothing here can see another process, so the guard is
+ownership rather than locking; see :func:`refresh_access_token_now`.
 """
 
 import asyncio
@@ -16,6 +23,7 @@ from typing import Optional
 from smartloop.auth import credential_store
 from smartloop.config import AppSettings
 from smartloop.platform.client import SLPPlatformClient
+from smartloop.workspace.context import owns_workspace, pinned_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +71,11 @@ def _needs_refresh() -> bool:
 #: event loop, and a request thread whose call just came back 401 — and with
 #: single-use rotating refresh tokens the second redemption of the same token is
 #: refused, which clears both credentials and logs the user out.
+#:
+#: Two, and only two, because a pinned process declines before reaching here
+#: (:func:`refresh_access_token_now`).  Without that gate there would be one
+#: more per agent child, on a lock that does not span processes and so would
+#: not order them.
 _refresh_lock = threading.Lock()
 
 #: How long a failed redemption suppresses the next attempt.  The lock alone
@@ -84,8 +97,35 @@ def refresh_access_token_now(client: Optional[SLPPlatformClient] = None) -> bool
     collapse onto one redemption: whoever holds the lock does the work, and the
     rest find the token already replaced and report success without spending the
     refresh token a second time.
+
+    Workspace-owner work.  Everything above that keeps two *threads* from
+    double-redeeming is process-local, so it says nothing about two
+    *processes* — and under supervision there are N+1 of them against one
+    credential file.  A child racing the supervisor's background loop spends
+    the rotated token twice, and the refusal that comes back is read by
+    :func:`_redeem` as a dead refresh token, clearing both credentials: a full
+    logout of every project, which is the failure this function exists to
+    prevent.
+
+    So a pinned process declines, and it costs it nothing.  The retry in
+    :meth:`SLPPlatformClient._authed` is keyed on the credentials having
+    *changed*, not on what this returned, so declining leaves the caller with
+    the 401 it already had — exactly what it had before the refresh was
+    widened to every call site.  And because :mod:`credential_store` caches
+    nothing, a child picks up a token the owner rotated on its very next read,
+    with no redemption and no message passing.
+
+    This is a statement about process topology, not a safety property: it holds
+    because only the owner writes, not because writing is safe.
     """
     global _last_failure_at
+
+    if not owns_workspace():
+        logger.debug(
+            "[token] refresh declined in project agent %s — redemption "
+            "belongs to the workspace owner", pinned_project_id(),
+        )
+        return False
 
     before = credential_store.get_access_token()
     with _refresh_lock:

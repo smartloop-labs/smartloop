@@ -87,6 +87,25 @@ def pinned_project_id() -> Optional[str]:
     return _pinned_project_id
 
 
+def owns_workspace() -> bool:
+    """Whether this process owns workspace-level state.
+
+    The positive form of ``pinned_project_id() is None``.  True in the
+    supervisor, in a ``--no-supervised`` single server, and in the CLI; false in
+    a per-project agent child, which is pinned to one project and shares
+    ``config.json``, ``models_dir`` and the credential store with N siblings it
+    has no way to coordinate with.
+
+    Ownership, not binding.  :func:`pinned_project_id` says which project this
+    process serves; this says whether it may act for the workspace as a whole.
+    Workspace-level background work is already gated on it (the token refresh
+    and release-poll loops in :mod:`smartloop.api.main`), and so is redeeming
+    the refresh token — see
+    :func:`smartloop.platform.token_agent.refresh_access_token_now`.
+    """
+    return _pinned_project_id is None
+
+
 #: Whether this process has handed every project's own state to someone else.
 #: Set by the supervisor, which spawns a child per project: from that moment the
 #: files under each ``project_dir`` belong to those children, and the supervisor

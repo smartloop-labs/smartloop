@@ -171,6 +171,10 @@ class TestConcurrentCallersRedeemOnce:
     tokens, the second redemption of the same token is *refused* — which takes
     the 401 branch and clears both credentials, logging the user out on what was
     a successful refresh.
+
+    Two, because these run in the workspace owner.  A pinned agent child is a
+    third caller the lock below could not order, and it declines instead — see
+    ``test_token_refresh_is_workspace_work``.
     """
 
     def test_the_refresh_token_is_spent_once(self):
