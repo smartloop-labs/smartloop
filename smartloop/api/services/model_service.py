@@ -3592,7 +3592,13 @@ class ModelService:
         except Exception as e:
             logger.warning(f"Could not initialize vector store: {e}")
 
-        self._setup_project_tools(project)
+        # Claimed for the same reason the two saves above are: this installs
+        # the system MCP server, and ``install_system_tools_server`` persists
+        # it itself.  Left unclaimed, a delegating supervisor wrote none of it
+        # — the project came up without its tools and only grew them back when
+        # a child first loaded a model for it.
+        with own_project(project_id):
+            self._setup_project_tools(project)
 
         # Write explicitly provided skills to disk
         if skills:
