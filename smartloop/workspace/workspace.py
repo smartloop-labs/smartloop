@@ -747,11 +747,27 @@ class Workspace(BaseModel):
         ``save()`` writes one file — so pinning there would produce entries that
         are dropped on the way to disk while the caller believed the leak had
         been sealed.
+
+        Nor in a supervisor that has delegated its projects, for the same
+        reason arrived at from the other side: there ``save()`` writes no
+        project file at all (see :meth:`_writable_projects`), so the entries
+        appended here are discarded just as silently — and the caller goes on
+        to move the app-default believing the leak was sealed, which is the
+        one outcome the pin exists to prevent.  Each project instead pins
+        itself lazily through :meth:`sync_project_models` on its next
+        project-route read or write, where the child that owns the file is the
+        one doing the writing.
         """
         if pinned_project_id() is not None:
             logger.warning(
                 "[workspace] not pinning %s across projects: this process owns "
                 "only project %s", model_name, pinned_project_id(),
+            )
+            return
+        if projects_delegated():
+            logger.warning(
+                "[workspace] not pinning %s across projects: their state "
+                "belongs to the per-project agents", model_name,
             )
             return
         if self.is_bootstrap_model(model_name):
