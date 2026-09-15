@@ -19,6 +19,7 @@ from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
 from smartloop.platform import ModelAccessError, get_platform_service
+from smartloop.workspace.context import projects_delegated
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["init"])
@@ -209,7 +210,23 @@ async def _ensure_project(model_service, workspace, cwd=None):
 
 
 async def _setup_project_services(model_service):
-    """Install MCP servers and generate skills — requires LLM to be loaded."""
+    """Install MCP servers and generate skills — requires LLM to be loaded.
+
+    Not in a process that has delegated its projects.  The save below carries
+    both halves of the result — the servers ``_setup_project_tools``
+    registered, and the ``system`` flag that records the work as done — and it
+    claims no project, so on a delegating supervisor ``_writable_projects()``
+    drops every one of them.  The flag going with them is what made this
+    re-run on each init, provisioning the same stdio servers again in a
+    process that does not own the project they belong to.
+
+    The project's own agent does it instead, and its save persists: it runs
+    ``_setup_project_tools`` for the project it is pinned to when it loads a
+    model (``ModelService.load_model``), and ``create_project`` has already
+    installed them once under its own claim.
+    """
+    if projects_delegated():
+        return
     current = model_service._model.workspace.current_project
     if not current or current.system:
         return
@@ -302,6 +319,24 @@ async def init(
 
                 model_service.mark_model_downloaded(target, workspace=workspace)
 
+                # A model earns its place among the app-defaults by arriving,
+                # not by being switched on.  This is the only branch where a
+                # download actually ran, and it is the event the promotion
+                # belongs to: the model is new to the workspace, so "on by
+                # default from now on" is the answer the user just gave by
+                # fetching it.  Switching on a model that was already here is
+                # project-scoped and deliberately does not reach this (see
+                # ``update_project_model``).
+                #
+                # It has to happen here rather than in that route for a second
+                # reason: ``/v1/init`` names no project in its path, so under
+                # supervision it is answered by the process that owns
+                # ``config.json``.  The project route is proxied to the child
+                # pinned to that project, which cannot write the workspace
+                # record at all — a promotion there was discarded at save.
+                workspace.promote_model_to_workspace_default(target)
+                workspace.save()
+
             # ``mark_model_downloaded`` persisted the workspace, so config.json
             # is on disk and the platform service can bind the workspace DB and
             # persist the catalog.
@@ -314,8 +349,14 @@ async def init(
             async for event in _ensure_project(model_service, workspace, cwd=request.cwd):
                 yield event
 
-            # 4. Start background tasks (indexer, etc.) if not already running
-            if model_service._task_queue.get_task("indexer") is None:
+            # 4. Start background tasks (indexer, etc.) if not already running.
+            #    Under supervision no indexer is registered at all (see
+            #    ``ModelService.setup_tasks``), so asking whether one is
+            #    running would re-run the whole setup on every call —
+            #    replacing the MCP task and orphaning the loop it had
+            #    already started.
+            if (not projects_delegated()
+                    and model_service._task_queue.get_task("indexer") is None):
                 model_service.setup_tasks(workspace)
 
             # 5. Load model (only if a GGUF is available)
@@ -431,8 +472,14 @@ async def bootstrap(
             # 4. Ensure model pipeline
             model_service._ensure_model()
 
-            # 5. Start background tasks (indexer, etc.) if not already running
-            if model_service._task_queue.get_task("indexer") is None:
+            # 5. Start background tasks (indexer, etc.) if not already running.
+            #    Under supervision no indexer is registered at all (see
+            #    ``ModelService.setup_tasks``), so asking whether one is
+            #    running would re-run the whole setup on every call —
+            #    replacing the MCP task and orphaning the loop it had
+            #    already started.
+            if (not projects_delegated()
+                    and model_service._task_queue.get_task("indexer") is None):
                 model_service.setup_tasks(workspace)
 
             # 6. Create bare project (no skills yet — LLM not loaded)
