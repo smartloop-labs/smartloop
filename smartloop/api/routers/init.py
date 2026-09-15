@@ -303,6 +303,24 @@ async def init(
 
                 model_service.mark_model_downloaded(target, workspace=workspace)
 
+                # A model earns its place among the app-defaults by arriving,
+                # not by being switched on.  This is the only branch where a
+                # download actually ran, and it is the event the promotion
+                # belongs to: the model is new to the workspace, so "on by
+                # default from now on" is the answer the user just gave by
+                # fetching it.  Switching on a model that was already here is
+                # project-scoped and deliberately does not reach this (see
+                # ``update_project_model``).
+                #
+                # It has to happen here rather than in that route for a second
+                # reason: ``/v1/init`` names no project in its path, so under
+                # supervision it is answered by the process that owns
+                # ``config.json``.  The project route is proxied to the child
+                # pinned to that project, which cannot write the workspace
+                # record at all — a promotion there was discarded at save.
+                workspace.promote_model_to_workspace_default(target)
+                workspace.save()
+
             # ``mark_model_downloaded`` persisted the workspace, so config.json
             # is on disk and the platform service can bind the workspace DB and
             # persist the catalog.

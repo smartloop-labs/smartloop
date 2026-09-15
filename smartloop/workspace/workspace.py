@@ -785,10 +785,16 @@ class Workspace(BaseModel):
     def promote_model_to_workspace_default(self, model_name: str) -> None:
         """Make *model_name* an app-default for projects created from now on.
 
-        One-way: enabling a model in a project promotes it, disabling never
-        demotes it, so the default set only grows as models are downloaded.
-        Existing projects are pinned first and keep whatever they resolve to
-        today — a user who wanted the model there would have enabled it.
+        Called when a model is *downloaded* (``/v1/init``), not when one is
+        switched on.  Fetching a model is the act that says it belongs to this
+        workspace, so it is the one that answers "should new projects start
+        with it?"; turning on a model that was already here says only what one
+        project wants, and ``update_project_model`` keeps it that way.
+
+        One-way regardless: nothing demotes a model, so the default set only
+        grows as models arrive.  Existing projects are pinned first and keep
+        whatever they resolve to today — a user who wanted the model there
+        would have enabled it.
         """
         if self.is_bootstrap_model(model_name):
             return  # always enabled, not a configurable default
