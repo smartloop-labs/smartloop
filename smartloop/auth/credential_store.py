@@ -199,6 +199,43 @@ def clear_refresh_token() -> None:
     _clear(_REFRESH_TOKEN)
 
 
+# -- the OAuth pair, written as one --------------------------------------
+
+def set_tokens(access: str, refresh: str | None = None) -> None:
+    """Store the access token, and the rotated refresh token with it.
+
+    One file version for the pair.  Storing them with two calls leaves a
+    moment where the new access token is on disk beside the refresh token that
+    was just spent to mint it, and a crash or a kill in that moment makes the
+    state permanent: the next redemption presents a spent token, is refused,
+    and reads the refusal as "re-login required".  A single-use refresh token
+    makes that window unrecoverable rather than merely untidy.
+
+    *refresh* is optional because the endpoint does not always rotate; ``None``
+    leaves the stored one alone.
+    """
+    with _write_lock:
+        creds = _load_creds()
+        creds[_ACCESS_TOKEN] = access
+        if refresh:
+            creds[_REFRESH_TOKEN] = refresh
+        _save_creds(creds)
+
+
+def clear_tokens() -> None:
+    """Drop both OAuth credentials in one file version.
+
+    The counterpart to :func:`set_tokens`, for the refusal that ends the
+    session: clearing them one at a time leaves a readable state holding a
+    refresh token whose access token is already gone.
+    """
+    with _write_lock:
+        creds = _load_creds()
+        creds.pop(_ACCESS_TOKEN, None)
+        creds.pop(_REFRESH_TOKEN, None)
+        _save_creds(creds)
+
+
 # -- unified resolver ------------------------------------------------------
 
 def get_active_token() -> str | None:
