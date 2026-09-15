@@ -121,7 +121,12 @@ def refresh_access_token_now(client: Optional[SLPPlatformClient] = None) -> bool
     global _last_failure_at
 
     if not owns_workspace():
-        logger.debug(
+        # At info, like the matching decline in ``auth._resolve_user``.  This is
+        # the guard that keeps one project's 401 from clearing the whole
+        # workspace's credentials, so "did it fire?" is a question worth being
+        # able to answer from a log a user sent in — at debug the answer is
+        # that nothing was recorded either way.
+        logger.info(
             "[token] refresh declined in project agent %s — redemption "
             "belongs to the workspace owner", pinned_project_id(),
         )
