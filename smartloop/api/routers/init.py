@@ -20,6 +20,7 @@ from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
 from smartloop.platform import get_platform_service
 from smartloop.workspace.context import projects_delegated
+from smartloop.workspace.workspace import is_mmproj_gguf
 from smartloop.api.routers._errors import status_for
 
 logger = logging.getLogger(__name__)
@@ -72,13 +73,42 @@ def _seed_model_catalog() -> None:
 
 
 def _gguf_exists(model_dir: str) -> bool:
-    """Check whether a .gguf file exists in model_dir or its bin/ subdirectory."""
-    if not os.path.isdir(model_dir):
+    """Whether *model_dir* holds servable weights — not merely *a* GGUF.
+
+    This decides whether ``/v1/init`` downloads at all, so anything it accepts
+    is something the route then reports as ready and never revisits.  Asking
+    only "is there a ``.gguf`` here?" accepted two states that are not a model,
+    and an interrupted multi-file download produces one or the other depending
+    on which file finished first:
+
+    * **A leftover ``.part``.**  Bytes are written to that sidecar and renamed
+      only once the checksum matches, so its presence is the downloader saying
+      a file is unfinished.  Seen live: a restart during the final verify left
+      ``mmproj`` renamed and the 2GB weights still ``.part``, and because the
+      companion satisfied the old check every later ``/v1/init`` answered
+      "already available" — the weights could never arrive, and the model was
+      permanently broken while the UI showed it ready.
+    * **Only an ``mmproj`` companion.**  A vision projector is not weights.
+      :func:`~smartloop.workspace.workspace.resolve_gguf_path` already excludes
+      these when it looks for something to load, so a directory holding one and
+      nothing else resolves to no model at all.
+
+    Both directions are covered: the ``.part`` rule catches the main weights
+    finishing first (mmproj still transferring, vision would be silently
+    missing), and the mmproj rule catches the companion finishing first.
+
+    Deliberately still local and cheap — no artifact list is fetched to compare
+    against, because this runs before entitlement is settled and its only job is
+    to decide whether to ask.  A file that is absent without leaving a ``.part``
+    is not detected here; the download that follows is what reconciles that.
+    """
+    dirs = [d for d in (model_dir, os.path.join(model_dir, "bin")) if os.path.isdir(d)]
+    if not dirs:
         return False
-    if any(f.endswith(".gguf") for f in os.listdir(model_dir)):
-        return True
-    bin_dir = os.path.join(model_dir, "bin")
-    return os.path.isdir(bin_dir) and any(f.endswith(".gguf") for f in os.listdir(bin_dir))
+    listings = [f for d in dirs for f in os.listdir(d)]
+    if any(f.endswith(".part") for f in listings):
+        return False
+    return any(f.endswith(".gguf") and not is_mmproj_gguf(f) for f in listings)
 
 
 async def _download_and_stream(downloader, model_id: str, model_name: str,

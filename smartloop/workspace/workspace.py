@@ -131,7 +131,7 @@ def read_project_state(project_dir: str) -> Optional[dict]:
     return project if isinstance(project, dict) else None
 
 
-def _is_mmproj_gguf(filename: str) -> bool:
+def is_mmproj_gguf(filename: str) -> bool:
     """True when a GGUF is a vision mmproj / CLIP projector (not main weights)."""
     name = os.path.basename(filename).lower()
     return "mmproj" in name or "clip" in name
@@ -993,7 +993,7 @@ class Workspace(BaseModel):
         if ws_model and ws_model.bin_dir and os.path.isdir(ws_model.bin_dir):
             quantize = (ws_model.config.quantize if ws_model.config else "").upper()
             gguf_files = [f for f in os.listdir(ws_model.bin_dir)
-                          if f.endswith(".gguf") and not _is_mmproj_gguf(f)]
+                          if f.endswith(".gguf") and not is_mmproj_gguf(f)]
             if quantize:
                 for f in gguf_files:
                     if f.upper().endswith(f"-{quantize}.GGUF"):
@@ -1008,7 +1008,7 @@ class Workspace(BaseModel):
         model_dir = self.model_dir_for(model_id)
         if os.path.isdir(model_dir):
             for f in os.listdir(model_dir):
-                if f.endswith(".gguf") and not _is_mmproj_gguf(f):
+                if f.endswith(".gguf") and not is_mmproj_gguf(f):
                     return os.path.join(model_dir, f)
         return exact
 
