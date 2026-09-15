@@ -8,6 +8,7 @@ import pytest
 
 from smartloop.auth import credential_store
 from smartloop.platform.client import ModelAccessError, SLPPlatformClient
+from smartloop.workspace.context import pin_project
 
 
 class _StubHandler(BaseHTTPRequestHandler):
@@ -736,3 +737,78 @@ class TestTelemetryCannotLogYouOut:
 
         assert not [r for r in handler.requests if "refresh" in r["path"]]
         assert credential_store.get_refresh_token() == "rt"
+
+
+class TestAProjectAgentDoesNotRedeem:
+    """A pinned process answers its own 401 rather than spending the token.
+
+    ``_authed`` asks its ``refresh_fn`` and then compares credentials.  In an
+    agent child the hook declines — redeeming a single-use refresh token is the
+    workspace owner's job — so the comparison finds nothing changed and the
+    original 401 stands.  That is what these endpoints did before the refresh
+    was widened to all of them, so nothing regresses; what must not happen is
+    the child reaching the refresh endpoint at all.
+    """
+
+    def test_a_401_in_a_pinned_process_is_returned_as_is(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/users/me": (401, {"detail": "Unauthorized"})}
+        credential_store.set_access_token("expired")
+        credential_store.set_refresh_token("rt")
+        pin_project("alpha")
+
+        client = SLPPlatformClient(base_url)
+        with pytest.raises(PermissionError):
+            client.get_current_user()
+
+        assert len(handler.requests) == 1, "the 401 was retried"
+        assert not [r for r in handler.requests if "refresh" in r["path"]]
+        assert credential_store.get_refresh_token() == "rt"
+
+    def test_a_pinned_process_picks_up_a_token_the_owner_rotated(self, stub_server):
+        """Declining still recovers, because nothing is cached.
+
+        ``auth_headers_fn`` here stands in for the credential file: the second
+        read sees what the supervisor wrote during the round trip.  ``_authed``
+        re-reads after the 401, finds the headers changed, and retries with the
+        new token — without this process redeeming anything.
+        """
+        base_url, handler = stub_server
+        user = {"email": "chris@example.com", "name": "Chris"}
+        handler.routes = {"/v1/users/me": [(401, {"detail": "Unauthorized"}), (200, user)]}
+        pin_project("alpha")
+
+        reads = {"n": 0}
+
+        def auth_headers():
+            reads["n"] += 1
+            token = "expired" if reads["n"] == 1 else "rotated-by-the-owner"
+            return {"Authorization": f"Bearer {token}"}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=auth_headers)
+        assert client.get_current_user() == user
+
+        sent = [r["headers"].get("Authorization") for r in handler.requests]
+        assert sent == ["Bearer expired", "Bearer rotated-by-the-owner"]
+        assert not [r for r in handler.requests if "refresh" in r["path"]]
+
+    def test_web_search_in_a_child_reports_off_without_redeeming(self, stub_server):
+        """The chat path is how a child reaches the platform most often.
+
+        A 401 here becomes "search is off for this account", which is the right
+        answer from inside a child: it cannot tell a stale token from a plan
+        without search.  What it must not do is spend the refresh token to find
+        out.
+        """
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch/status": (401, {"detail": "Unauthorized"})}
+        credential_store.set_access_token("expired")
+        credential_store.set_refresh_token("rt")
+        pin_project("alpha")
+
+        with pytest.raises(PermissionError):
+            SLPPlatformClient(base_url).web_search_status()
+
+        assert not [r for r in handler.requests if "refresh" in r["path"]]
+        assert credential_store.get_refresh_token() == "rt"
+

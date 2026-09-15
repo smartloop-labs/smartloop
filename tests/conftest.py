@@ -30,6 +30,23 @@ def _reset_refresh_cooldown():
 
 
 @pytest.fixture(autouse=True)
+def _reset_project_pin():
+    """Unpin the process around every test.
+
+    The pin is process-wide by design — an agent child sets it once at spawn —
+    so a test that pins and does not clean up leaks into every test that runs
+    after it.  That failure is quiet in the worst way: a leaked pin makes the
+    workspace-owner checks answer False, so refresh tests stop calling anything
+    and assertions about "did not redeem" keep passing for the wrong reason.
+    """
+    from smartloop.workspace.context import pin_project
+
+    pin_project(None)
+    yield
+    pin_project(None)
+
+
+@pytest.fixture(autouse=True)
 def _restore_root_logging():
     """Snapshot and restore the root logger around every test.
 

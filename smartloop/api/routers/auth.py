@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from smartloop.auth import credential_store
 from smartloop.platform import get_platform_service
 from smartloop.config.app_settings import AppSettings
+from smartloop.workspace.context import owns_workspace, pinned_project_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -140,6 +141,21 @@ def _resolve_user() -> Optional[UserInfo]:
         # that was always local to auth status: drop the dead access token so
         # later requests fall back to the developer token.  A refresh token that
         # was itself rejected has already been cleared by the refresh agent.
+        #
+        # Dropping it is workspace-owner work.  Routing normally keeps this
+        # endpoint on the supervisor, but a project is resolved from a
+        # ``project_id`` query parameter on *any* path, so a stray
+        # ``/v1/auth/status?project_id=X`` is proxied to an agent child — which
+        # would delete the whole workspace's access token on the strength of one
+        # project's 401.  A child also cannot tell a dead credential from one the
+        # owner has already replaced, because it never saw the replacement.
+        if not owns_workspace():
+            logger.info(
+                "401 from the platform API in project agent %s — leaving the "
+                "credential to the workspace owner", pinned_project_id(),
+            )
+            return None
+
         if credential_store.get_access_token():
             credential_store.clear_access_token()
             logger.warning("Cleared expired access token after 401 from platform API")

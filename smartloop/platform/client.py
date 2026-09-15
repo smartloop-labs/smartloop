@@ -121,7 +121,10 @@ class SLPPlatformClient:
     refresh_fn : callable, optional
         Redeems the refresh token, returning whether a new access token was
         stored.  Called once per 401 by :meth:`_authed`.  Defaults to
-        :meth:`_refresh_credentials`.
+        :meth:`_refresh_credentials`.  May legitimately decline and do
+        nothing — a per-project agent child does, because redeeming a
+        single-use token belongs to the process that owns the credential
+        store.  :meth:`_authed` handles that without needing to know.
     """
 
     def __init__(
@@ -192,6 +195,19 @@ class SLPPlatformClient:
           request succeeded.
         * The refresh can report success without changing what we send, in
           which case resending is a guaranteed second 401.
+
+        Two properties fall out of comparing credentials rather than trusting
+        the hook, and both are relied on elsewhere:
+
+        * The hook may decline entirely.  In a per-project agent child it does,
+          because redemption belongs to the workspace owner; the headers are
+          then unchanged and the caller gets the 401 it already had, which is
+          what these endpoints did before the refresh was widened to all of
+          them.
+        * A process that never refreshes still recovers.  ``current`` is
+          re-read after the 401, and ``credential_store`` caches nothing — so
+          a token another process rotated during the round trip is picked up
+          here, and the retry goes out with it.
         """
         sent = self._auth_headers_fn()
         resp = send(self._headers(sent))

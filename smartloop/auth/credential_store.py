@@ -126,6 +126,13 @@ def _save_creds(creds: dict) -> None:
 #: Process-local.  A second process (the CLI alongside a running server) can
 #: still interleave; :func:`_save_creds` keeps that from corrupting the file,
 #: but the lost-update window remains and wants a real file lock.
+#:
+#: The supervisor's agent children are deliberately not in that set.  They read
+#: this store constantly and never write it: the one write they could reach,
+#: redeeming the refresh token, is declined in a pinned process
+#: (:func:`smartloop.platform.token_agent.refresh_access_token_now`).  Readers
+#: take no lock at all and do not need one — :func:`_save_creds` renames a
+#: finished file into place, so a reader sees one whole version or the other.
 _write_lock = threading.RLock()
 
 
