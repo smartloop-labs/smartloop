@@ -210,7 +210,23 @@ async def _ensure_project(model_service, workspace, cwd=None):
 
 
 async def _setup_project_services(model_service):
-    """Install MCP servers and generate skills — requires LLM to be loaded."""
+    """Install MCP servers and generate skills — requires LLM to be loaded.
+
+    Not in a process that has delegated its projects.  The save below carries
+    both halves of the result — the servers ``_setup_project_tools``
+    registered, and the ``system`` flag that records the work as done — and it
+    claims no project, so on a delegating supervisor ``_writable_projects()``
+    drops every one of them.  The flag going with them is what made this
+    re-run on each init, provisioning the same stdio servers again in a
+    process that does not own the project they belong to.
+
+    The project's own agent does it instead, and its save persists: it runs
+    ``_setup_project_tools`` for the project it is pinned to when it loads a
+    model (``ModelService.load_model``), and ``create_project`` has already
+    installed them once under its own claim.
+    """
+    if projects_delegated():
+        return
     current = model_service._model.workspace.current_project
     if not current or current.system:
         return
