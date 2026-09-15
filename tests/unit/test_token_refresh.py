@@ -289,3 +289,62 @@ class TestTheLoopRunsBeforeItSleeps:
                 await token_agent.run_token_refresh_loop()
 
         assert len(cycles) == 2
+
+
+class TestTheLoopDoesNotBlockTheEventLoop:
+    """Redemption is synchronous; the loop that drives it must not be.
+
+    ``refresh_access_token_now`` is a blocking httpx POST with a 10s budget,
+    taken behind a lock a request thread may already hold.  Awaited inline it
+    stalls the whole event loop — and under supervision that loop is the
+    supervisor's, which proxies every project's chat stream through it byte by
+    byte, so one expired token would pause generation everywhere at once.
+    """
+
+    async def test_other_work_runs_while_a_redemption_is_in_flight(self):
+        """Ordering, not elapsed time.
+
+        A blocking call does not make this hang — the redemption still returns
+        eventually and everything queued behind it still runs.  What gives it
+        away is *when*: inline, the refresh finishes before any other task gets
+        a turn.  So the assertion is that the other task ran first, not that
+        the test was quick.
+        """
+        import asyncio
+
+        credential_store.set_refresh_token("rt")
+        credential_store.set_access_token(_jwt(-10))   # expired: force a refresh
+
+        redeeming = threading.Event()
+        release = threading.Event()
+        order = []
+
+        def _slow_refresh(client):
+            redeeming.set()
+            release.wait(timeout=5)
+            order.append("refresh-done")
+            return True
+
+        async def _other_work():
+            for _ in range(3):
+                await asyncio.sleep(0)
+                order.append("tick")
+
+        with patch.object(token_agent, "refresh_access_token_now", _slow_refresh):
+            loop_task = asyncio.create_task(token_agent.run_token_refresh_loop())
+            other = asyncio.create_task(_other_work())
+
+            await asyncio.to_thread(redeeming.wait, 5)
+            await other
+
+            assert order == ["tick", "tick", "tick"], (
+                "the redemption ran to completion before the event loop got a "
+                f"turn — it is blocking the loop (order was {order})"
+            )
+
+            release.set()
+            loop_task.cancel()
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass

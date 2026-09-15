@@ -201,7 +201,14 @@ async def run_token_refresh_loop() -> None:
     while True:
         try:
             if _needs_refresh():
-                refresh_access_token_now(client)
+                # Off the event loop.  Redemption is a synchronous httpx POST
+                # with a 10s budget, taken behind a lock a request thread may
+                # already hold.  Awaiting it inline stalls this loop for as
+                # long as that takes — and under supervision this loop belongs
+                # to the supervisor, which is proxying every project's chat
+                # stream through it byte by byte.  One expired token would
+                # pause generation for every project at once.
+                await asyncio.to_thread(refresh_access_token_now, client)
         except Exception:  # a bad cycle must not kill the loop
             logger.warning("Token refresh cycle failed", exc_info=True)
         await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
