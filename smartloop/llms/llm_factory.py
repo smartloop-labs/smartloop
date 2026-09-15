@@ -509,16 +509,23 @@ class LlmFactory:
 
         logger.info(f"Loading model with config: n_ctx={n_ctx}, n_gpu_layers={config['n_gpu_layers']}, model_size={model_size_gb:.1f}GB")
 
-        # Probe in subprocess first to detect crashes (SIGABRT/segfault)
-        # that would kill the main process.
-        # Use a minimal context for the probe — we only need to know if the
-        # model can be loaded at all, not whether the full context fits.
-        # Returns: True (success), False (crash/signal), None (Python exception)
-        # Skipped when probe=False: a caller that is already a disposable
-        # subprocess gains nothing from a nested probe, which would only add
-        # another concurrent model load competing for the GPU.
-        probe_config = {**config, 'n_ctx': 512}
-        probe_result = LlmFactory._probe_model_load(path, probe_config, logger) if probe else None
+        # Probe in subprocess first to detect crashes (SIGABRT/segfault) —
+        # and hangs, since subprocess.run's timeout kills a probe that never
+        # comes back — that would otherwise take down or wedge the main
+        # process.
+        #
+        # Probed at the *real* n_ctx, not a shrunk-down stand-in: a GPU
+        # backend can succeed at a small context and then hang or fail
+        # allocating the KV cache for the real one — observed on Windows with
+        # a Vulkan/Intel-iGPU driver that hung during init only once the
+        # context (and so the VRAM it asks for) was large enough. A probe
+        # that used a token n_ctx would report success and send that same
+        # hang straight into the unprotected in-process load right below.
+        # Returns: True (success), False (crash/signal/hang), None (Python
+        # exception).  Skipped when probe=False: a caller that is already a
+        # disposable subprocess gains nothing from a nested probe, which would
+        # only add another concurrent model load competing for the GPU.
+        probe_result = LlmFactory._probe_model_load(path, config, logger) if probe else None
         if probe_result is False:
             # Subprocess crashed with a signal — try progressively safer configs
             fallback_configs = []
@@ -532,7 +539,10 @@ class LlmFactory:
             last_stderr = ""
             for label, fallback in fallback_configs:
                 logger.warning(f"Trying {label} config: n_ctx={fallback['n_ctx']}, n_gpu_layers={fallback['n_gpu_layers']}")
-                result = LlmFactory._probe_model_load(path, {**fallback, 'n_ctx': 512}, logger)
+                # Same reasoning as the initial probe: test the context this
+                # fallback would really run at, not a smaller one that could
+                # hide the same size-dependent hang or OOM.
+                result = LlmFactory._probe_model_load(path, fallback, logger)
                 if result is not False:
                     # True = clean success, None = Python exception (safe to try in-process)
                     config = fallback
