@@ -55,6 +55,11 @@ class MCPTask(BaseTask):
         self._inflight_lock = threading.Lock()
         self._inflight: set = set()
         self._pending_seeded: bool = False
+        #: Makes :meth:`start_loop` idempotent under concurrent callers.  Two
+        #: reach it — ``start_auto_tasks()`` and ``setup_tasks``'s
+        #: ``start_watcher()`` — and its guard was a check on a field it then
+        #: assigned, so both could pass it before either published a thread.
+        self._start_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -85,18 +90,19 @@ class MCPTask(BaseTask):
     # ------------------------------------------------------------------
 
     def start_loop(self) -> None:
-        if self._loop_thread and self._loop_thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._executor = ThreadPoolExecutor(
-            max_workers=max(2, min(4, (os.cpu_count() or 2))),
-            thread_name_prefix="mcp-worker",
-        )
-        self._loop_thread = threading.Thread(
-            target=self._event_loop, name="mcp-loop", daemon=True,
-        )
-        self._loop_thread.start()
-        self.logger.info("[MCP] Event loop started")
+        with self._start_lock:
+            if self._loop_thread and self._loop_thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._executor = ThreadPoolExecutor(
+                max_workers=max(2, min(4, (os.cpu_count() or 2))),
+                thread_name_prefix="mcp-worker",
+            )
+            self._loop_thread = threading.Thread(
+                target=self._event_loop, name="mcp-loop", daemon=True,
+            )
+            self._loop_thread.start()
+            self.logger.info("[MCP] Event loop started")
 
     # Alias matching IndexerTask, so setup_tasks reads the same for both.
     def start_watcher(self) -> None:

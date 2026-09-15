@@ -64,6 +64,9 @@ class IndexerTask(BaseTask):
         self._executor: Optional[ThreadPoolExecutor] = None
         self._workspace_lock = threading.Lock()
         self._inflight_lock = threading.Lock()
+        #: See :class:`~smartloop.tasks.mcp_task.MCPTask` — same guard, same
+        #: two callers, same race.
+        self._start_lock = threading.Lock()
         self._inflight: set = set()
         self._last_scan: float = 0.0
         self._SCAN_INTERVAL: float = 5.0
@@ -111,20 +114,21 @@ class IndexerTask(BaseTask):
     # ------------------------------------------------------------------
 
     def start_loop(self) -> None:
-        if self._loop_thread and self._loop_thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._executor = ThreadPoolExecutor(
-            max_workers=self._max_workers,
-            thread_name_prefix="index-worker",
-        )
-        self._loop_thread = threading.Thread(
-            target=self._event_loop,
-            name="index-loop",
-            daemon=True,
-        )
-        self._loop_thread.start()
-        self.logger.info(f"[Indexer] Event loop started ({self._max_workers} worker(s))")
+        with self._start_lock:
+            if self._loop_thread and self._loop_thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._max_workers,
+                thread_name_prefix="index-worker",
+            )
+            self._loop_thread = threading.Thread(
+                target=self._event_loop,
+                name="index-loop",
+                daemon=True,
+            )
+            self._loop_thread.start()
+            self.logger.info(f"[Indexer] Event loop started ({self._max_workers} worker(s))")
 
     def _event_loop(self) -> None:
         self._set_status(TaskStatus.PENDING, "Waiting for documents")
