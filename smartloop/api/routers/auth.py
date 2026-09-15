@@ -268,9 +268,7 @@ def oauth_callback(request: OAuthCallbackRequest):
     browser to the webapp with the minted JWT.  The webapp then POSTs the
     token(s) here so the local server can store them in the credential store.
     """
-    credential_store.set_access_token(request.access_token)
-    if request.refresh_token:
-        credential_store.set_refresh_token(request.refresh_token)
+    credential_store.set_tokens(request.access_token, request.refresh_token)
 
     _log_token_received("POST", request.access_token, request.refresh_token)
     _refresh_platform_cache()
@@ -299,9 +297,7 @@ def oauth_callback_get(
     Safari blocks mixed-content fetch (HTTPS→HTTP) so the webapp falls back
     to a full-page navigation with tokens as query params.
     """
-    credential_store.set_access_token(access_token)
-    if refresh_token:
-        credential_store.set_refresh_token(refresh_token)
+    credential_store.set_tokens(access_token, refresh_token)
 
     _log_token_received("GET", access_token, refresh_token)
     _refresh_platform_cache()
