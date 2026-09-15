@@ -138,11 +138,11 @@ class ModelEntry(BaseModel):
             return None
 
 
+# Sync on purpose: the platform client is synchronous, and a 401 now costs
+# a refresh and a retry on top of the original call.  On the event loop
+# that stalls every in-flight chat stream; declared sync, FastAPI runs it
+# in the threadpool.  See ``auth_status`` in the auth router.
 @router.get("/models", response_model=list[ModelEntry])
-    # Sync on purpose: the platform client is synchronous, and a 401 now costs
-    # a refresh and a retry on top of the original call.  On the event loop
-    # that stalls every in-flight chat stream; declared sync, FastAPI runs it
-    # in the threadpool.  See ``auth_status`` in the auth router.
 def list_models(
     model_service: ModelService = Depends(get_model_service),
     svc: PlatformService = Depends(get_platform_service),
