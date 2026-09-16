@@ -1552,9 +1552,71 @@ async def stream_chunks(
     # reused for both the session record and the client event — the two used to
     # scan the same response independently.
     verified_citations = None
+    # Silence budget for the producer thread — see stream_stall_timeout_s.
+    from smartloop.config.app_settings import AppSettings
+    _stall_timeout = AppSettings().stream_stall_timeout_s
     try:
         while True:
-            item = await queue.get()
+            if _stall_timeout > 0:
+                try:
+                    item = await asyncio.wait_for(
+                        queue.get(), timeout=_stall_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    # Nothing at all for the whole budget.  The producer is
+                    # either inside a native call that cannot be preempted or
+                    # still queued behind one on ``_executor``; either way it
+                    # is not coming back on its own, and waiting longer only
+                    # means the client waits forever.  Signal cancellation
+                    # (observed between tokens, so it lands whenever the thread
+                    # next surfaces) and close the stream properly — an error
+                    # the user can read, a finish_reason, and [DONE] — rather
+                    # than leaving an open SSE response spinning.
+                    cancelled.set()
+                    logger.error(
+                        "[stream] no output for %.0fs — abandoning the "
+                        "generation (%d chunk(s) so far)",
+                        _stall_timeout, len(full_response_parts),
+                    )
+                    yield _status_event(
+                        "streaming", "error",
+                        f"Generation stalled after {_stall_timeout:.0f}s",
+                    )
+                    stall_chunk = ChatCompletionChunk(
+                        model=stream_model,
+                        choices=[ChunkChoice(
+                            index=0,
+                            delta=DeltaContent(content=(
+                                "\n\n**Generation stopped.**\n\n"
+                                "The model produced nothing for "
+                                f"{_stall_timeout:.0f}s and the request was "
+                                "abandoned. The device may still be busy with "
+                                "an earlier request, or the loaded model may "
+                                "be too large for this machine. Try again, or "
+                                "pick a smaller model in "
+                                "**Settings → Models**."
+                            )),
+                            finish_reason=None,
+                        )],
+                    )
+                    yield f"data: {stall_chunk.model_dump_json()}\n\n"
+                    stall_final = ChatCompletionChunk(
+                        model=stream_model,
+                        choices=[ChunkChoice(
+                            index=0,
+                            delta=DeltaContent(),
+                            finish_reason="stop",
+                        )],
+                    )
+                    yield f"data: {stall_final.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+                    # Returns through the ``finally`` below, which sets
+                    # ``cancelled`` again (harmless) and persists whatever text
+                    # did arrive.  Model cleanup still belongs to the producer
+                    # thread — it is very likely mid-inference right now.
+                    return
+            else:
+                item = await queue.get()
 
             if item is None:
                 # Stream complete
@@ -1789,6 +1851,9 @@ async def _complete_without_streaming(
     model_service: ModelService,
 ):
     """The non-streaming half of ``create_chat_completion``."""
+    # A generation the timeout below gave up on, still running on its worker.
+    # Read by the ``finally``, which must not free models out from under it.
+    abandoned_generation = None
     try:
         # See stream_chunks: the endpoint has already bound this, but the
         # helper is also called directly.
@@ -1893,9 +1958,24 @@ async def _complete_without_streaming(
                 None, bind(_prepare_citation_sources), citations, model_service,
             )
 
-        # Run sync completion in thread pool
+        # Run sync completion in thread pool, under the same silence budget
+        # the streaming path applies — this await had no deadline at all, so a
+        # generation that wedged (or one queued behind a wedged predecessor on
+        # the single-worker ``_executor``) held the request open indefinitely.
+        # ``generate`` takes no cancellation event, so the budget can only
+        # abandon the future: the worker keeps running until it unwinds, and
+        # the client gets an error instead of nothing.
+        #
+        # Note the budget means something slightly different here.  A stream
+        # has chunks to reset it, so it only ever measures silence; a
+        # non-streaming call has no progress signal at all, so the same number
+        # necessarily bounds the whole generation.  Raise
+        # ``slp_stream_stall_timeout_s`` if a client asks for long answers with
+        # stream:false on hardware slow enough to spend minutes on one.
         response_capability = ModelCapability.GENERAL if orchestrator_context else None
-        response_text = await loop.run_in_executor(
+        from smartloop.config.app_settings import AppSettings
+        _stall_timeout = AppSettings().stream_stall_timeout_s
+        _generation = loop.run_in_executor(
             _executor,
             # No reasoning on the answer — see the streaming path above.
             bind(lambda: model_service.model_client.generate(
@@ -1903,6 +1983,22 @@ async def _complete_without_streaming(
                 thinking=False,
             )),
         )
+        if _stall_timeout > 0:
+            try:
+                response_text = await asyncio.wait_for(
+                    _generation, timeout=_stall_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[chat] generation exceeded %.0fs — abandoning the worker "
+                    "and returning an error", _stall_timeout,
+                )
+                abandoned_generation = _generation
+                raise RuntimeError(
+                    f"Generation timed out after {_stall_timeout:.0f}s"
+                )
+        else:
+            response_text = await _generation
 
         # Auto file-write: if user asked to create/generate/write, save LLM response to file
         _out_cwd = _request_cwd(model_service)
@@ -1972,4 +2068,16 @@ async def _complete_without_streaming(
         # defers this to stream_chunks' finally (which fires when the stream
         # drains, not when the StreamingResponse object is returned here).
         if not request.stream:
-            model_service.unload_auxiliary_models()
+            if abandoned_generation is not None:
+                # The worker never came back — it is very likely inside a
+                # native llama.cpp call right now, and closing its context
+                # here would segfault the server rather than fail this one
+                # request (the same hazard the orchestration timeout avoids).
+                # Wait for the thread to unwind; if it never does, the
+                # auxiliary models stay resident, which beats a crash.
+                _unload_when_idle(
+                    abandoned_generation, model_service,
+                    abandoned_generation.get_loop(),
+                )
+            else:
+                model_service.unload_auxiliary_models()
