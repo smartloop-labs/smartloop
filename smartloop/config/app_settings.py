@@ -213,6 +213,25 @@ class AppSettings(BaseSettings):
         validation_alias="slp_orchestrate_timeout_s",
         description="Max seconds for one orchestration pass before it is cancelled; 0 disables.",
     )
+    # The same guard for the answer itself.  Orchestration is bounded above,
+    # but the response stream that follows it used to wait on its producer
+    # thread with no deadline at all: if that thread never produced a token —
+    # wedged inside llama.cpp, or queued behind an earlier generation that is
+    # (the answer runs on a single-worker pool) — the request hung until the
+    # client gave up, with no error and no [DONE].  "It gets stuck and stays
+    # stuck forever" is that path.
+    #
+    # Measured as *silence*, not total time: every chunk that arrives restarts
+    # the clock, so a long answer never trips it however long it runs.  Larger
+    # than orchestrate_timeout_s because the first token legitimately waits for
+    # a model load and the prompt eval of a full context, which on a cold CPU
+    # machine is minutes; only nothing-at-all for this long means stuck.
+    # 0 disables the watchdog.
+    stream_stall_timeout_s: float = Field(
+        default=300.0,
+        validation_alias="slp_stream_stall_timeout_s",
+        description="Max seconds of silence from the response stream before it is abandoned; 0 disables.",
+    )
     # --- per-project agent processes (see smartloop.supervisor) ------------
     # How long a project agent may sit unused before the supervisor stops it,
     # returning its baseline RSS.  A child carries FastAPI, the SQLite index
