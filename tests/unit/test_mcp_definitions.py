@@ -12,6 +12,7 @@ now, and nothing here indexes anything.
 """
 
 import os
+import pwd
 
 import pytest
 
@@ -22,6 +23,7 @@ from smartloop.mcp.definition_loader import (
     reload_definitions,
     user_definition_paths,
 )
+from smartloop.mcp import definitions as definitions_module
 from smartloop.mcp.definitions import MCPDefinition, definition_for, retired_fields
 
 _MINIMAL = '''
@@ -181,6 +183,32 @@ command = "uv tool run --from pkg pkg"
         monkeypatch.setenv("HOME", "/home/tester")
         d = MCPDefinition(name="local", command="~/.local/craft mcp")
         assert d.launch == ("/home/tester/.local/craft", ["mcp"])
+
+    def test_a_tilde_reads_past_an_app_sandbox_container(self, monkeypatch):
+        # Inside the macOS App Sandbox $HOME is the container, not the user's
+        # home, so `~/.local/bin/craft` expanded to a path under
+        # .../Containers/<id>/Data that nothing had ever installed into — the
+        # ENOENT every local server added to the sandboxed build failed with.
+        monkeypatch.setenv(
+            "HOME", "/Users/tester/Library/Containers/ai.smartloop.studio/Data",
+        )
+        monkeypatch.setattr(
+            definitions_module, "real_home", lambda: "/Users/tester",
+        )
+        d = MCPDefinition(name="local", command="~/.local/bin/craft mcp")
+        assert d.launch == ("/Users/tester/.local/bin/craft", ["mcp"])
+
+    def test_the_real_home_is_the_passwd_record_under_a_container(self, monkeypatch):
+        monkeypatch.setenv(
+            "HOME", "/Users/tester/Library/Containers/ai.smartloop.studio/Data",
+        )
+        assert definitions_module.real_home() == pwd.getpwuid(os.getuid()).pw_dir
+
+    def test_an_ordinary_home_env_var_is_still_honoured(self, monkeypatch):
+        # A service unit or a test that sets $HOME means it; only the container
+        # spelling is overridden.
+        monkeypatch.setenv("HOME", "/home/tester")
+        assert definitions_module.real_home() == "/home/tester"
 
     def test_args_may_be_written_as_one_string(self):
         # How everyone writes a command down, and how every other MCP client
