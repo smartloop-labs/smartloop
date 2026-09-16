@@ -34,6 +34,12 @@ _TIMEOUT = 30
 _SEARCH_TIMEOUT = 15
 _SEARCH_STATUS_TIMEOUT = 5
 
+#: The refresh grant is a single small POST, and it lands *inside* another
+#: call's budget — the web-search gate allows itself 5s precisely because it
+#: sits in front of a user-visible turn, and inheriting the 30s control-plane
+#: timeout let one 401 turn that into 40s.
+_REFRESH_TIMEOUT = 10
+
 
 def _user_agent() -> str:
     """Identify this client to the API.
@@ -64,13 +70,43 @@ class ModelAccessError(PermissionError):
     """
 
 
+def _is_transient(status_code: int) -> bool:
+    """Whether *status_code* says "try again" rather than "this caller may not".
+
+    A 429 is a rate limit and a 5xx is the platform having a bad moment.  Neither
+    is a verdict about the credentials, so neither may be reported as one.
+    """
+    return status_code == 429 or status_code >= 500
+
+
 def _raise_for_status(resp: httpx.Response, error_map: dict[int, str] | None = None,
                       error_cls: type[Exception] = ConnectionError) -> None:
+    """Raise *error_cls* for a non-2xx response, tagged with the upstream status.
+
+    The status is attached as ``status_code`` on the exception so callers can
+    classify the failure without re-deriving it from the message.  The API
+    router turns it back into an HTTP status for its own client, and a message
+    is a bad channel for that: it is written for a person to read, and it gets
+    reworded.
+
+    *error_cls* names what a refusal means for this endpoint, but it does not get
+    to claim a transient failure as one: a 429 or 5xx is always a
+    ``ConnectionError``.  Callers act on the distinction — the refresh agent
+    clears both tokens on a ``PermissionError``, and the cache-through service
+    only serves stale data for a ``ConnectionError`` — so letting a platform blip
+    arrive as "your credentials are bad" logs the user out over an outage.
+    """
     if resp.is_success:
         return
+    if _is_transient(resp.status_code):
+        error_cls = ConnectionError
     if error_map and resp.status_code in error_map:
-        raise error_cls(error_map[resp.status_code])
-    raise error_cls(f"API error ({resp.status_code}): {resp.reason_phrase}")
+        message = error_map[resp.status_code]
+    else:
+        message = f"API error ({resp.status_code}): {resp.reason_phrase}"
+    exc = error_cls(message)
+    exc.status_code = resp.status_code
+    raise exc
 
 
 class SLPPlatformClient:
@@ -82,15 +118,39 @@ class SLPPlatformClient:
         API base URL, e.g. ``https://api.smartloop.ai``.
     auth_headers_fn : callable, optional
         Returns auth headers dict. Defaults to ``platform_auth.auth_headers``.
+    refresh_fn : callable, optional
+        Redeems the refresh token, returning whether a new access token was
+        stored.  Called once per 401 by :meth:`_authed`.  Defaults to
+        :meth:`_refresh_credentials`.  May legitimately decline and do
+        nothing — a per-project agent child does, because redeeming a
+        single-use token belongs to the process that owns the credential
+        store.  :meth:`_authed` handles that without needing to know.
     """
 
     def __init__(
         self,
         base_url: str,
         auth_headers_fn: Callable[[], dict[str, str]] = platform_auth.auth_headers,
+        refresh_fn: Optional[Callable[[], bool]] = None,
     ):
         self._base_url = base_url.rstrip("/")
         self._auth_headers_fn = auth_headers_fn
+        self._refresh_fn = refresh_fn or self._refresh_credentials
+
+    def _refresh_credentials(self) -> bool:
+        """Redeem the stored refresh token for a new access token.
+
+        Redeems against *this* client, so the refresh goes to the host that just
+        answered 401 rather than to whatever ``AppSettings`` names — the two are
+        the same in production, and only one of them is true in a test.
+
+        No recursion: :meth:`refresh_access_token` is unauthenticated and does
+        not route through :meth:`_authed`.  Imported late because ``token_agent``
+        imports this module.
+        """
+        from smartloop.platform.token_agent import refresh_access_token_now
+
+        return refresh_access_token_now(self)
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"
@@ -103,6 +163,62 @@ class SLPPlatformClient:
         worth seeing at the call site.
         """
         return {"User-Agent": _user_agent(), **(auth or {})}
+
+    def _authed(self, send: Callable[[dict[str, str]], httpx.Response]) -> httpx.Response:
+        """Send an authenticated request, redeeming the refresh token once on a 401.
+
+        An access token expiring mid-session is the ordinary case, not an error:
+        the user has a refresh token on disk and nothing about their session has
+        actually ended.  Leaving each endpoint to notice that for itself is how
+        the local reactive refresh ended up living at one call site out of ten,
+        with a model download answering "sign in to download this model" while a
+        perfectly good refresh token sat unused.
+
+        Keyed on the status, not the exception, so it stays clear of the
+        ``PermissionError`` hierarchy: a 403 is a verdict about this account's
+        plan (:class:`ModelAccessError`), and re-minting the same identity cannot
+        change it.  Only a 401 says the token itself is stale.
+
+        *send* is called with the headers to use rather than being handed a
+        prepared request, so the retry re-reads ``auth_headers_fn`` and picks up
+        whatever the refresh left behind.
+
+        The retry is keyed on the credentials having actually *changed*, not on
+        what the refresh reported.  The two are not the same, and both
+        directions were wrong:
+
+        * The refresh can fail and still leave us better off.  Redeeming a dead
+          refresh token clears both OAuth credentials, after which
+          ``auth_headers`` falls back to the developer token — a credential that
+          works.  Keyed on the boolean, that request failed with "sign in to
+          download this model" for a user who was signed in, and the next
+          request succeeded.
+        * The refresh can report success without changing what we send, in
+          which case resending is a guaranteed second 401.
+
+        Two properties fall out of comparing credentials rather than trusting
+        the hook, and both are relied on elsewhere:
+
+        * The hook may decline entirely.  In a per-project agent child it does,
+          because redemption belongs to the workspace owner; the headers are
+          then unchanged and the caller gets the 401 it already had, which is
+          what these endpoints did before the refresh was widened to all of
+          them.
+        * A process that never refreshes still recovers.  ``current`` is
+          re-read after the 401, and ``credential_store`` caches nothing — so
+          a token another process rotated during the round trip is picked up
+          here, and the retry goes out with it.
+        """
+        sent = self._auth_headers_fn()
+        resp = send(self._headers(sent))
+        if resp.status_code != 401:
+            return resp
+
+        self._refresh_fn()
+        current = self._auth_headers_fn()
+        if current == sent:
+            return resp
+        return send(self._headers(current))
 
     def list_bootstrap_models(self) -> list[dict]:
         """GET /v1/bootstrap/models (no auth). Returns the array of model entries."""
@@ -122,12 +238,16 @@ class SLPPlatformClient:
     def list_models(self) -> list[dict]:
         """GET /v1/models (auth optional). Returns list of model entries."""
         try:
-            resp = httpx.get(self._url(_MODELS), headers=self._headers(self._auth_headers_fn()),
-                             timeout=_TIMEOUT)
+            resp = self._authed(
+                lambda h: httpx.get(self._url(_MODELS), headers=h, timeout=_TIMEOUT))
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         if resp.status_code == 401:
+            # Still refused after :meth:`_authed` tried the refresh token, so the
+            # credentials are genuinely dead.  The catalog is public, so ask
+            # again anonymously rather than showing an empty picker — the entries
+            # come back with ``is_accessible`` false, which is honest.
             try:
                 resp = httpx.get(self._url(_MODELS),
                                  headers=self._headers(), timeout=_TIMEOUT)
@@ -158,8 +278,8 @@ class SLPPlatformClient:
     def list_mcp_catalog(self) -> list[dict]:
         """GET /v1/mcp-catalog (auth required). Returns list of curated MCP server catalog entries."""
         try:
-            resp = httpx.get(self._url(_MCP_CATALOG), headers=self._headers(self._auth_headers_fn()),
-                             timeout=_TIMEOUT)
+            resp = self._authed(
+                lambda h: httpx.get(self._url(_MCP_CATALOG), headers=h, timeout=_TIMEOUT))
         except httpx.ConnectError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
@@ -178,23 +298,40 @@ class SLPPlatformClient:
         403 for anything the caller's plan doesn't grant.  That 403 is raised as
         :class:`ModelAccessError` so callers can tell "not on your plan" apart
         from the 401 that means the token itself is bad.
+
+        Failures are split by whether retrying could change the answer, because
+        the two lead somewhere different.  ``ConnectionError`` covers the
+        transient ones (429, 5xx): the download route is rate-limited per IP and
+        anonymous downloads now reach that limit, so a 429 means "wait a moment",
+        not "upgrade your plan".  ``PermissionError`` covers the verdicts about
+        this caller and this model (401/403/404), which no amount of retrying
+        fixes.  Every one of them carries ``status_code``.
+
+        The transient half is :func:`_raise_for_status`'s rule for every endpoint
+        now, so the messages below are all this method has to supply.
         """
         try:
-            resp = httpx.get(self._url(_MODEL_DOWNLOAD.format(model_name)),
-                             headers=self._headers(self._auth_headers_fn()), timeout=_TIMEOUT)
+            resp = self._authed(
+                lambda h: httpx.get(self._url(_MODEL_DOWNLOAD.format(model_name)),
+                                    headers=h, timeout=_TIMEOUT))
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
         if resp.status_code == 403:
-            raise ModelAccessError(
+            exc = ModelAccessError(
                 f"Model '{model_name}' is not available on your current plan. "
                 "Please upgrade to access this model."
             )
+            exc.status_code = 403
+            raise exc
 
         _raise_for_status(resp, {
-            401: "Authentication failed. Check your SLP_DEVELOPER_TOKEN.",
+            # Reaches an end user in the app, so it says what they can do about
+            # it rather than naming an env var they have never set.
+            401: "Sign in to download this model.",
             404: f"Model '{model_name}' not found on server.",
-            500: f"Server error while fetching model '{model_name}' artifacts."
+            429: "Too many download requests. Please wait a moment and try again.",
+            500: f"Server error while fetching model '{model_name}' artifacts.",
         }, PermissionError)
 
         artifacts = resp.json().get("artifacts", {})
@@ -205,8 +342,8 @@ class SLPPlatformClient:
     def get_current_user(self) -> dict:
         """GET /v1/users/me (auth required). Returns user profile dict."""
         try:
-            resp = httpx.get(self._url(_USERS_ME), headers=self._headers(self._auth_headers_fn()),
-                             timeout=_TIMEOUT)
+            resp = self._authed(
+                lambda h: httpx.get(self._url(_USERS_ME), headers=h, timeout=_TIMEOUT))
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
@@ -218,8 +355,9 @@ class SLPPlatformClient:
     def update_current_user(self, payload: dict) -> dict:
         """PATCH /v1/users/me (auth required). Returns updated user profile dict."""
         try:
-            resp = httpx.patch(self._url(_USERS_ME), headers=self._headers(self._auth_headers_fn()),
-                               json=payload, timeout=_TIMEOUT)
+            resp = self._authed(
+                lambda h: httpx.patch(self._url(_USERS_ME), headers=h,
+                                      json=payload, timeout=_TIMEOUT))
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
@@ -247,7 +385,8 @@ class SLPPlatformClient:
         """
         try:
             resp = httpx.post(self._url(_JWT_REFRESH), headers=self._headers(),
-                              json={"refresh_token": refresh_token}, timeout=_TIMEOUT)
+                              json={"refresh_token": refresh_token},
+                              timeout=_REFRESH_TIMEOUT)
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
@@ -263,9 +402,9 @@ class SLPPlatformClient:
     def get_model_upload_url(self, model_name: str, filename: str) -> dict:
         """POST /v1/models/{name}/upload (auth required). Returns {url, blob_path, expires_at}."""
         try:
-            resp = httpx.post(self._url(_MODEL_UPLOAD.format(model_name)),
-                              headers=self._headers(self._auth_headers_fn()),
-                              json={"filename": filename}, timeout=_TIMEOUT)
+            resp = self._authed(
+                lambda h: httpx.post(self._url(_MODEL_UPLOAD.format(model_name)), headers=h,
+                                     json={"filename": filename}, timeout=_TIMEOUT))
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
@@ -277,8 +416,15 @@ class SLPPlatformClient:
 
     def push_token_usage(self, record: dict, timeout: int = 10) -> None:
         """POST /v1/usage/tokens (auth required). Fire-and-forget telemetry."""
+        # Deliberately not through :meth:`_authed`.  A 401 here would redeem the
+        # refresh token, and a refresh endpoint answering 401 clears both
+        # credentials — so a fire-and-forget telemetry POST, whose every failure
+        # is swallowed by the except below, could log the user out with no
+        # visible cause.  Usage records are flushed in batches, so it would do
+        # it once per queued record.
         try:
-            resp = httpx.post(self._url(_USAGE_TOKENS), headers=self._headers(self._auth_headers_fn()),
+            resp = httpx.post(self._url(_USAGE_TOKENS),
+                              headers=self._headers(self._auth_headers_fn()),
                               json=record, timeout=timeout)
             _raise_for_status(resp)
         except Exception as e:
@@ -297,8 +443,9 @@ class SLPPlatformClient:
         transient.
         """
         try:
-            resp = httpx.get(self._url(_WEBSEARCH), headers=self._headers(self._auth_headers_fn()),
-                             params={"q": query, "count": count}, timeout=timeout)
+            resp = self._authed(
+                lambda h: httpx.get(self._url(_WEBSEARCH), headers=h,
+                                    params={"q": query, "count": count}, timeout=timeout))
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 
@@ -323,8 +470,8 @@ class SLPPlatformClient:
         open on the latter.
         """
         try:
-            resp = httpx.get(self._url(_WEBSEARCH_STATUS), headers=self._headers(self._auth_headers_fn()),
-                             timeout=timeout)
+            resp = self._authed(
+                lambda h: httpx.get(self._url(_WEBSEARCH_STATUS), headers=h, timeout=timeout))
         except httpx.TransportError as e:
             raise ConnectionError(f"Connection error: {e}") from e
 

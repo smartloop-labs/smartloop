@@ -18,7 +18,10 @@ from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
-from smartloop.platform import ModelAccessError, PlatformService, get_platform_service
+from smartloop.platform import get_platform_service
+from smartloop.workspace.context import projects_delegated
+from smartloop.workspace.workspace import is_mmproj_gguf
+from smartloop.api.routers._errors import status_for
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["init"])
@@ -38,6 +41,14 @@ class InitRequest(BaseModel):
 def _sse_event(data: dict, event: str = "progress") -> str:
     """Format a dict as an SSE event string."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _error_event(exc: Exception) -> str:
+    """Terminal SSE frame for a failed stream, tagged with a status code."""
+    return _sse_event(
+        {"status": "error", "code": status_for(exc), "message": str(exc)},
+        event="error",
+    )
 
 
 def _seed_model_catalog() -> None:
@@ -61,57 +72,54 @@ def _seed_model_catalog() -> None:
         logger.warning("Could not schedule model catalog seed", exc_info=True)
 
 
-async def _plan_denies(svc: PlatformService, model_name: str) -> bool:
-    """True when the cloud catalog says this model is off the caller's plan.
-
-    A free model downloads with no token at all, so the only thing worth
-    checking before starting the stream is the plan — and the catalog already
-    carries the answer the model picker rendered (``access_level`` plus the
-    per-user ``is_accessible``).  Answering here lets ``/v1/init`` reply with a
-    real HTTP 403 instead of a 200 stream that fails later.
-
-    Deliberately fail-open: an unclassified model, an empty catalog or an
-    unreachable platform must not block a download.  The platform re-checks
-    when the signed URLs are fetched and answers 403 itself, so a stale cache
-    costs a late error, never a wrongly-allowed download.
-
-    ``list_models`` is usually a cache read, but a cold cache turns it into a
-    sync cloud call with a 30s timeout — run it off the loop so a slow platform
-    stalls this request only, not every other one in flight.
-    """
-    loop = asyncio.get_event_loop()
-    try:
-        catalog = await loop.run_in_executor(None, svc.list_models)
-    except Exception:
-        logger.warning("Could not resolve model access level; deferring to the platform",
-                       exc_info=True)
-        return False
-
-    entry = next(
-        (m for m in catalog
-         if canonical_model_name(m.get("name", "")) == model_name),
-        None,
-    )
-    if entry is None:
-        return False
-    access_level = entry.get("access_level")
-    is_paid = access_level not in (None, "free")
-    return is_paid and not entry.get("is_accessible", False)
-
-
 def _gguf_exists(model_dir: str) -> bool:
-    """Check whether a .gguf file exists in model_dir or its bin/ subdirectory."""
-    if not os.path.isdir(model_dir):
+    """Whether *model_dir* holds servable weights — not merely *a* GGUF.
+
+    This decides whether ``/v1/init`` downloads at all, so anything it accepts
+    is something the route then reports as ready and never revisits.  Asking
+    only "is there a ``.gguf`` here?" accepted two states that are not a model,
+    and an interrupted multi-file download produces one or the other depending
+    on which file finished first:
+
+    * **A leftover ``.part``.**  Bytes are written to that sidecar and renamed
+      only once the checksum matches, so its presence is the downloader saying
+      a file is unfinished.  Seen live: a restart during the final verify left
+      ``mmproj`` renamed and the 2GB weights still ``.part``, and because the
+      companion satisfied the old check every later ``/v1/init`` answered
+      "already available" — the weights could never arrive, and the model was
+      permanently broken while the UI showed it ready.
+    * **Only an ``mmproj`` companion.**  A vision projector is not weights.
+      :func:`~smartloop.workspace.workspace.resolve_gguf_path` already excludes
+      these when it looks for something to load, so a directory holding one and
+      nothing else resolves to no model at all.
+
+    Both directions are covered: the ``.part`` rule catches the main weights
+    finishing first (mmproj still transferring, vision would be silently
+    missing), and the mmproj rule catches the companion finishing first.
+
+    Deliberately still local and cheap — no artifact list is fetched to compare
+    against, because this runs before entitlement is settled and its only job is
+    to decide whether to ask.  A file that is absent without leaving a ``.part``
+    is not detected here; the download that follows is what reconciles that.
+    """
+    dirs = [d for d in (model_dir, os.path.join(model_dir, "bin")) if os.path.isdir(d)]
+    if not dirs:
         return False
-    if any(f.endswith(".gguf") for f in os.listdir(model_dir)):
-        return True
-    bin_dir = os.path.join(model_dir, "bin")
-    return os.path.isdir(bin_dir) and any(f.endswith(".gguf") for f in os.listdir(bin_dir))
+    listings = [f for d in dirs for f in os.listdir(d)]
+    if any(f.endswith(".part") for f in listings):
+        return False
+    return any(f.endswith(".gguf") and not is_mmproj_gguf(f) for f in listings)
 
 
 async def _download_and_stream(downloader, model_id: str, model_name: str,
-                                is_bootstrap: bool = False):
-    """Download model files and stream progress."""
+                                is_bootstrap: bool = False,
+                                artifacts: dict[str, str] | None = None):
+    """Download model files and stream progress.
+
+    *artifacts* carries a signed-URL map already resolved by the caller (see
+    :meth:`SLPArtifactDownloader.resolve_artifacts`), so entitlement is settled
+    before this stream opens and the URLs are minted once.
+    """
     progress_queue: Queue[dict] = Queue()
     _last_progress_time: dict[str, float] = {}
 
@@ -135,7 +143,8 @@ async def _download_and_stream(downloader, model_id: str, model_name: str,
         if is_bootstrap:
             downloader.bootstrap_download(progress_callback=on_progress)
         else:
-            downloader.download(model_id=model_id, progress_callback=on_progress)
+            downloader.download(model_id=model_id, progress_callback=on_progress,
+                                artifacts=artifacts)
 
     download_task = loop.run_in_executor(None, _do_download)
 
@@ -204,7 +213,23 @@ async def _ensure_project(model_service, workspace, cwd=None):
 
 
 async def _setup_project_services(model_service):
-    """Install MCP servers and generate skills — requires LLM to be loaded."""
+    """Install MCP servers and generate skills — requires LLM to be loaded.
+
+    Not in a process that has delegated its projects.  The save below carries
+    both halves of the result — the servers ``_setup_project_tools``
+    registered, and the ``system`` flag that records the work as done — and it
+    claims no project, so on a delegating supervisor ``_writable_projects()``
+    drops every one of them.  The flag going with them is what made this
+    re-run on each init, provisioning the same stdio servers again in a
+    process that does not own the project they belong to.
+
+    The project's own agent does it instead, and its save persists: it runs
+    ``_setup_project_tools`` for the project it is pinned to when it loads a
+    model (``ModelService.load_model``), and ``create_project`` has already
+    installed them once under its own claim.
+    """
+    if projects_delegated():
+        return
     current = model_service._model.workspace.current_project
     if not current or current.system:
         return
@@ -239,7 +264,6 @@ def _get_project_info(workspace, model_name: str) -> Optional[dict]:
 async def init(
     request: InitRequest,
     model_service: ModelService = Depends(get_model_service),
-    svc: PlatformService = Depends(get_platform_service),
 ):
     """Initialize the workspace and download the model.
 
@@ -264,35 +288,63 @@ async def init(
                                        enabled=request.project_id is None)
 
     model_dir = ws_model.model_dir
-    needs_download = not _gguf_exists(model_dir)
 
-    # Free models download anonymously, so there is no auth gate here — only a
-    # plan gate.  The 403 is raised before the stream opens so the client sees
-    # it as an HTTP status (the UI turns it into an upgrade prompt) rather than
-    # having to read it out of an SSE error event.
-    if needs_download and await _plan_denies(svc, target):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Model {display_model_name(target)} is not available on your current plan.",
-        )
+    # Settle entitlement before the response starts. There is no credential
+    # pre-flight — FREE models download anonymously and the platform is the
+    # authority on the rest — but the answer has to arrive as a status code:
+    # once StreamingResponse begins, the request has already committed to 200
+    # and a refusal can only be described inside the body. Resolving here also
+    # means the signed URLs are minted once, which matters because the download
+    # route is rate-limited per IP.
+    downloader = None
+    artifacts = None
+    if not _gguf_exists(model_dir):
+        downloader = SLPArtifactDownloader(workspace, logger)
+        try:
+            artifacts = await asyncio.get_event_loop().run_in_executor(
+                None, downloader.resolve_artifacts, ws_model.model_id
+            )
+        except (PermissionError, ConnectionError) as exc:
+            # Same classifier the stream's error frame uses.  Keeping a second
+            # rule here is how the two halves of this endpoint came to disagree:
+            # the fallback was 403, so an unwritable models directory answered
+            # "not on your plan" before the stream and 500 inside it.
+            raise HTTPException(status_code=status_for(exc), detail=str(exc))
 
     async def event_stream():
         try:
             # 1. Download if needed
-            if _gguf_exists(model_dir):
+            if downloader is None:
                 yield _sse_event({"status": "model_ready", "message": f"Model {display_model_name(target)} already available."})
-                model_service.mark_model_downloaded(target)
-                model_service._model.save()
+                model_service.mark_model_downloaded(target, workspace=workspace)
             else:
-                downloader = SLPArtifactDownloader(workspace, logger)
-                async for event in _download_and_stream(downloader, ws_model.model_id, target):
+                async for event in _download_and_stream(downloader, ws_model.model_id, target,
+                                                        artifacts=artifacts):
                     yield event
 
-                model_service.mark_model_downloaded(target)
-                model_service._model.save()
+                model_service.mark_model_downloaded(target, workspace=workspace)
 
-            # Workspace config.json exists after the save above, so the
-            # platform service can bind the workspace DB and persist the catalog.
+                # A model earns its place among the app-defaults by arriving,
+                # not by being switched on.  This is the only branch where a
+                # download actually ran, and it is the event the promotion
+                # belongs to: the model is new to the workspace, so "on by
+                # default from now on" is the answer the user just gave by
+                # fetching it.  Switching on a model that was already here is
+                # project-scoped and deliberately does not reach this (see
+                # ``update_project_model``).
+                #
+                # It has to happen here rather than in that route for a second
+                # reason: ``/v1/init`` names no project in its path, so under
+                # supervision it is answered by the process that owns
+                # ``config.json``.  The project route is proxied to the child
+                # pinned to that project, which cannot write the workspace
+                # record at all — a promotion there was discarded at save.
+                workspace.promote_model_to_workspace_default(target)
+                workspace.save()
+
+            # ``mark_model_downloaded`` persisted the workspace, so config.json
+            # is on disk and the platform service can bind the workspace DB and
+            # persist the catalog.
             _seed_model_catalog()
 
             # 2. Ensure model pipeline
@@ -302,8 +354,14 @@ async def init(
             async for event in _ensure_project(model_service, workspace, cwd=request.cwd):
                 yield event
 
-            # 4. Start background tasks (indexer, etc.) if not already running
-            if model_service._task_queue.get_task("indexer") is None:
+            # 4. Start background tasks (indexer, etc.) if not already running.
+            #    Under supervision no indexer is registered at all (see
+            #    ``ModelService.setup_tasks``), so asking whether one is
+            #    running would re-run the whole setup on every call —
+            #    replacing the MCP task and orphaning the loop it had
+            #    already started.
+            if (not projects_delegated()
+                    and model_service._task_queue.get_task("indexer") is None):
                 model_service.setup_tasks(workspace)
 
             # 5. Load model (only if a GGUF is available)
@@ -327,16 +385,9 @@ async def init(
                 "project": _get_project_info(model_service._model.workspace, target),
             }, event="complete")
 
-        except ModelAccessError as exc:
-            # The plan gate above runs off a cached catalog, so the platform's
-            # own 403 can still land here (stale cache, or a plan that changed
-            # mid-download).  The status line is already 200 by now, so the code
-            # rides on the event for the UI to handle like the pre-stream 403.
-            logger.warning("Init denied by plan: %s", exc)
-            yield _sse_event({"status": "error", "code": 403, "message": str(exc)}, event="error")
         except Exception as exc:
             logger.exception("Init failed")
-            yield _sse_event({"status": "error", "message": str(exc)}, event="error")
+            yield _error_event(exc)
 
     return StreamingResponse(
         event_stream(),
@@ -411,19 +462,29 @@ async def bootstrap(
                 async for event in _download_and_stream(downloader, bootstrap_model_id, bootstrap_name, is_bootstrap=True):
                     yield event
 
-                model_service.mark_model_downloaded(bootstrap_name)
+                model_service.mark_model_downloaded(bootstrap_name, workspace=workspace)
                 existing_model_name = bootstrap_name
-                workspace.save()
 
-            # Workspace is on disk in both branches above, so the platform
-            # service can bind the workspace DB and persist the catalog.
+            # Both branches above mutated this workspace -- a downloaded flag
+            # on a model whose weights were already on disk, or a freshly
+            # registered bootstrap model -- and only the download branch used
+            # to persist it, so the flag the other branch set never reached
+            # disk.  Saving here covers both; config.json is then on disk for
+            # the platform service to bind the workspace DB against.
+            workspace.save()
             _seed_model_catalog()
 
             # 4. Ensure model pipeline
             model_service._ensure_model()
 
-            # 5. Start background tasks (indexer, etc.) if not already running
-            if model_service._task_queue.get_task("indexer") is None:
+            # 5. Start background tasks (indexer, etc.) if not already running.
+            #    Under supervision no indexer is registered at all (see
+            #    ``ModelService.setup_tasks``), so asking whether one is
+            #    running would re-run the whole setup on every call —
+            #    replacing the MCP task and orphaning the loop it had
+            #    already started.
+            if (not projects_delegated()
+                    and model_service._task_queue.get_task("indexer") is None):
                 model_service.setup_tasks(workspace)
 
             # 6. Create bare project (no skills yet — LLM not loaded)
@@ -448,7 +509,7 @@ async def bootstrap(
 
         except Exception as exc:
             logger.exception("Bootstrap failed")
-            yield _sse_event({"status": "error", "message": str(exc)}, event="error")
+            yield _error_event(exc)
 
     return StreamingResponse(
         event_stream(),

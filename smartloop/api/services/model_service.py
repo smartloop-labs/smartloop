@@ -53,8 +53,7 @@ from smartloop import ConversationStore, MessageInput
 from smartloop.api.config import api_settings
 from smartloop.config.app_settings import AppSettings
 
-from smartloop.auth import credential_store
-from smartloop.model.downloader import SLPArtifactDownloader, HFDownloader
+from smartloop.model.downloader import SLPArtifactDownloader
 from smartloop.tasks import (
     TaskQueue,
     DownloaderTask,
@@ -3310,8 +3309,12 @@ class ModelService:
 
         workspace = self._model.workspace if self._model else self._ensure_workspace()
 
-        downloader_cls = SLPArtifactDownloader if credential_store.has_credentials() else HFDownloader
-        downloader = downloader_cls(workspace, logger)
+        # Not gated on credentials.  The platform serves free models to anonymous
+        # callers and is the only authority on the rest, so a logged-out user
+        # downloading a free model belongs here — sending them to HuggingFace
+        # instead (with no HF token either) failed on a model ``/v1/init`` would
+        # have delivered, because that path stopped gating and this one did not.
+        downloader = SLPArtifactDownloader(workspace, logger)
 
         def _on_download_complete(task, status, _message):
             from smartloop.tasks.base_task import TaskStatus
@@ -3354,9 +3357,27 @@ class ModelService:
         # pre-download).  OCR / image understanding is handled on demand by the
         # vision-capable model loaded in-process via get_vision_llm().
 
-        # Indexer task (auto=True — watches for pending documents)
-        indexer = IndexerTask(workspace=workspace, logger=logger)
-        self._task_queue.register(indexer)
+        # Indexer task (auto=True — watches for pending documents).
+        #
+        # Not in a process that has delegated its projects.  Each child runs an
+        # IndexerTask pinned to its own project; one here would own no project
+        # and fall back to the ``current`` flag, and ``_scan_documents`` reads
+        # the documents folder off disk rather than draining its own queue — so
+        # it picks up whatever a child just wrote and indexes it a second time.
+        # Observed live: the same three PDFs indexed by both the supervisor and
+        # the project's own agent, with the duplicated embedding pass leaving
+        # too little memory for the large model to load, which reached the user
+        # as an answer that had quietly fallen back to the default model.
+        #
+        # Nothing is lost by skipping it.  A delegating ``save()`` keeps only
+        # the workspace record (see :meth:`Workspace._writable_projects`), so
+        # the document state this task exists to persist would be discarded
+        # anyway, while its manifest and vector-store writes landed — leaving
+        # the two disagreeing about what is indexed.
+        indexer = None
+        if not projects_delegated():
+            indexer = IndexerTask(workspace=workspace, logger=logger)
+            self._task_queue.register(indexer)
 
         # MCP task (auto=True — owns background provisioning of newly
         # registered servers)
@@ -3381,7 +3402,8 @@ class ModelService:
         self._task_queue.start_auto_tasks()
 
         # Start the indexer watcher thread
-        indexer.start_watcher()
+        if indexer is not None:
+            indexer.start_watcher()
 
         # Start the MCP loop: it adopts any server left pending by a previous
         # run and runs the first content refresh cycle immediately, so a
@@ -3573,7 +3595,13 @@ class ModelService:
         except Exception as e:
             logger.warning(f"Could not initialize vector store: {e}")
 
-        self._setup_project_tools(project)
+        # Claimed for the same reason the two saves above are: this installs
+        # the system MCP server, and ``install_system_tools_server`` persists
+        # it itself.  Left unclaimed, a delegating supervisor wrote none of it
+        # — the project came up without its tools and only grew them back when
+        # a child first loaded a model for it.
+        with own_project(project_id):
+            self._setup_project_tools(project)
 
         # Write explicitly provided skills to disk
         if skills:
@@ -3766,17 +3794,32 @@ class ModelService:
         except Exception:
             pass
 
-    def mark_model_downloaded(self, model_name: str) -> None:
+    def mark_model_downloaded(self, model_name: str, workspace: Optional[Workspace] = None) -> None:
         """Record that *model_name*'s weights are present in the workspace.
 
         Weights live in one shared ``models_dir`` and are added or removed for
         the whole workspace, so this is a single workspace-level flag — there
         is no per-project download state to keep in step with it.
+
+        Persists what it mutated, rather than leaving that to the caller.  The
+        workspace resolved here is not always ``self._model.workspace``: on a
+        fresh process ``_model`` is still None, so a caller reaching for it to
+        save would fail on the line after this one.
+
+        *workspace* must be passed by any caller holding unsaved edits, and a
+        caller that registered the model with ``add_model`` always is.  On a
+        cold process ``_ensure_workspace`` returns ``Workspace.load()``, which
+        builds a *new* instance per call and deliberately skips the singleton
+        cache — so resolving one here would read the model back off disk
+        without the caller's addition, skip the flag for a model it cannot
+        find, and then save that stale instance over the caller's.
         """
-        workspace = self._model.workspace if self._model is not None else self._ensure_workspace()
+        if workspace is None:
+            workspace = self._model.workspace if self._model is not None else self._ensure_workspace()
         ws = workspace.get_model(model_name)
         if ws is not None:
             ws.downloaded = True
+        workspace.save()
 
     def _cleanup_gpu_cache(self):
         """Clear GPU cache to free up memory after unloading models."""

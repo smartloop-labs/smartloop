@@ -30,7 +30,7 @@ from smartloop.api.routers import auth_router, chat_router, documents_router, pr
 from smartloop.api.services import get_model_service, get_api_client
 from smartloop.config import AppSettings
 from smartloop.workspace import Workspace
-from smartloop.workspace.context import pinned_project_id
+from smartloop.workspace.context import owns_workspace, pinned_project_id
 from smartloop.utils.log_utils import print_logo
 from smartloop.workspace.migrations import migrate_project_state, split_project_state
 from smartloop.platform.token_agent import run_token_refresh_loop
@@ -208,9 +208,13 @@ async def lifespan(app: FastAPI):
     # Credentials and releases are workspace-level, and belong to whoever owns
     # the workspace.  A per-project agent skips them: N children polling the
     # same release endpoint and refreshing the same token is N times the work
-    # for one answer, and they would race each other writing the credential
-    # store.  Whoever owns the workspace does it once.
-    workspace_owner = pinned_project_id() is None
+    # for one answer.  Whoever owns the workspace does it once.
+    #
+    # This gate is about the duplicated work, not about safety.  The race it
+    # used to also describe — children writing the credential store underneath
+    # each other — is closed at the redemption itself, which a pinned process
+    # declines outright; see refresh_access_token_now.
+    workspace_owner = owns_workspace()
     token_refresh_task = (
         asyncio.create_task(run_token_refresh_loop()) if workspace_owner else None
     )

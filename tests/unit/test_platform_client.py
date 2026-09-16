@@ -6,26 +6,58 @@ from threading import Thread
 
 import pytest
 
+from smartloop.auth import credential_store
 from smartloop.platform.client import ModelAccessError, SLPPlatformClient
+from smartloop.workspace.context import pin_project
 
 
 class _StubHandler(BaseHTTPRequestHandler):
-    """Minimal HTTP handler that serves canned responses."""
+    """Minimal HTTP handler that serves canned responses.
 
-    # Class-level response config — set by fixtures before each test
+    A route's value is ``(status, body)``, or a *list* of them to be served one
+    per request — which is how a test says "401 first, then 200", the shape every
+    refresh-and-retry assertion needs.  The last entry repeats once the list runs
+    out, so a retry that should not have happened still gets an answer rather
+    than hanging the test.
+
+    Every request is recorded in :attr:`requests` so a test can assert on what
+    went out, not just on what came back — the header the retry carried is the
+    whole point of a refresh.
+    """
+
+    # Class-level config — reset by the fixture before each test
     routes: dict = {}
+    requests: list = []
 
-    def do_GET(self):
+    def _respond(self):
         path = self.path.split("?")[0]
-        if path in self.routes:
-            status, body = self.routes[path]
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(body).encode())
-        else:
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        self.requests.append({
+            "method": self.command,
+            "path": path,
+            "headers": dict(self.headers),
+            "body": body,
+        })
+
+        entry = self.routes.get(path)
+        if entry is None:
             self.send_response(404)
             self.end_headers()
+            return
+        if isinstance(entry, list):
+            status, payload = entry[0] if len(entry) == 1 else entry.pop(0)
+        else:
+            status, payload = entry
+
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode())
+
+    do_GET = _respond
+    do_POST = _respond
+    do_PATCH = _respond
 
     def log_message(self, *args):
         pass  # suppress stderr
@@ -38,6 +70,8 @@ def stub_server():
     port = server.server_address[1]
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    _StubHandler.routes = {}
+    _StubHandler.requests = []
     yield f"http://127.0.0.1:{port}", _StubHandler
     server.shutdown()
 
@@ -160,7 +194,9 @@ class TestGetModelArtifacts:
         }
 
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
-        with pytest.raises(PermissionError, match="Authentication failed"):
+        # Reaches an end user in the app, so it says what they can do about it
+        # rather than naming an env var they have never set.
+        with pytest.raises(PermissionError, match="Sign in"):
             client.get_model_artifacts("slp-orchestra-mini")
 
     def test_404_raises_permission_error(self, stub_server):
@@ -198,6 +234,53 @@ class TestGetModelArtifacts:
         assert client.get_model_artifacts("gemma3-4b") == {
             "model.gguf": "https://storage/model.gguf",
         }
+
+    def test_429_raises_connection_error(self, stub_server):
+        """Rate limiting is transient, so it must not be typed as a plan problem.
+
+        The download route is rate-limited per IP, which anonymous downloads now
+        reach. Classing a 429 as a PermissionError would tell the user to
+        upgrade when what they need is to wait.
+        """
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/slp-orchestra-mini/download": (429, {"detail": "rate limited"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError) as exc:
+            client.get_model_artifacts("slp-orchestra-mini")
+        assert not isinstance(exc.value, PermissionError)
+        assert exc.value.status_code == 429
+
+    def test_server_error_raises_connection_error(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/slp-orchestra-mini/download": (500, {"detail": "boom"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError) as exc:
+            client.get_model_artifacts("slp-orchestra-mini")
+        assert not isinstance(exc.value, PermissionError)
+        assert exc.value.status_code == 500
+
+    def test_errors_carry_the_upstream_status(self, stub_server):
+        """Callers classify by status, not by matching message text.
+
+        /v1/init reads this back off the exception to choose its own HTTP
+        status, and a message is a bad channel for that: it is written for a
+        person and it gets reworded.
+        """
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/gemma3-12b/download": (403, {"detail": "upgrade"}),
+        }
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ModelAccessError) as exc:
+            client.get_model_artifacts("gemma3-12b")
+        assert exc.value.status_code == 403
 
 
 class TestGetLatestRelease:
@@ -377,10 +460,355 @@ class TestGetCurrentUser:
         with pytest.raises(PermissionError, match="expired or invalid"):
             client.get_current_user()
 
-    def test_500_raises_permission_error(self, stub_server):
+    def test_a_server_error_is_transient_not_a_verdict(self, stub_server):
+        """A 500 is the platform having a bad moment, not a bad credential.
+
+        It used to arrive as ``PermissionError`` — the endpoint's *error_cls* was
+        applied to every non-2xx — which sent it down the expired-token path: the
+        cache-through service refuses to serve stale data for it, and the refresh
+        agent clears both tokens on it.  A platform blip logged the user out.
+        """
         base_url, handler = stub_server
         handler.routes = {"/v1/users/me": (500, {"detail": "Internal Server Error"})}
 
         client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
-        with pytest.raises(PermissionError, match="API error"):
+        with pytest.raises(ConnectionError, match="API error") as exc:
             client.get_current_user()
+        assert not isinstance(exc.value, PermissionError)
+        assert exc.value.status_code == 500
+
+    def test_a_rate_limit_is_transient_too(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/users/me": (429, {"detail": "Too Many Requests"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError):
+            client.get_current_user()
+
+
+class TestRefreshOn401:
+    """Every authenticated call redeems the refresh token once on a 401.
+
+    This used to live at a single call site — ``_resolve_user``, behind
+    ``/v1/auth/status`` — so a model download answered "Sign in to download this
+    model" and web search quietly reported itself off, both while a working
+    refresh token sat on disk.  It belongs to the client, where the 401 actually
+    arrives and every endpoint gets it.
+    """
+
+    def _client(self, base_url, refreshes, token=lambda: "expired"):
+        """A client whose refresh swaps the token the next request will send."""
+        state = {"token": token()}
+
+        def auth_headers():
+            return {"Authorization": f"Bearer {state['token']}"}
+
+        def refresh():
+            refreshes.append(state["token"])
+            state["token"] = "fresh"
+            return True
+
+        return SLPPlatformClient(base_url, auth_headers_fn=auth_headers, refresh_fn=refresh)
+
+    def test_a_401_is_retried_with_the_refreshed_token(self, stub_server):
+        base_url, handler = stub_server
+        user = {"email": "chris@example.com", "name": "Chris"}
+        handler.routes = {"/v1/users/me": [(401, {"detail": "Unauthorized"}), (200, user)]}
+        refreshes = []
+
+        client = self._client(base_url, refreshes)
+        assert client.get_current_user() == user
+
+        assert len(refreshes) == 1
+        assert len(handler.requests) == 2
+        # The retry re-read auth_headers_fn rather than reusing the prepared
+        # headers — otherwise it would resend the token that just failed.
+        assert handler.requests[0]["headers"]["Authorization"] == "Bearer expired"
+        assert handler.requests[1]["headers"]["Authorization"] == "Bearer fresh"
+
+    def test_a_403_is_not_a_stale_token(self, stub_server):
+        """A plan refusal is about the account, not the credential.
+
+        ``ModelAccessError`` subclasses ``PermissionError``, so keying the retry
+        on the exception type would re-mint the same identity and ask again for a
+        model the plan still does not grant.  Keyed on the status, it cannot.
+        """
+        base_url, handler = stub_server
+        handler.routes = {"/v1/models/gemma3-12b/download": (403, {"detail": "forbidden"})}
+        refreshes = []
+
+        client = self._client(base_url, refreshes)
+        with pytest.raises(ModelAccessError):
+            client.get_model_artifacts("gemma3-12b")
+
+        assert refreshes == []
+        assert len(handler.requests) == 1
+
+    def test_nothing_to_refresh_with_means_no_retry(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/models/sl-mini/download": (401, {"detail": "Unauthorized"})}
+
+        client = SLPPlatformClient(
+            base_url, auth_headers_fn=lambda: {}, refresh_fn=lambda: False,
+        )
+        with pytest.raises(PermissionError, match="Sign in"):
+            client.get_model_artifacts("sl-mini")
+
+        assert len(handler.requests) == 1
+
+    def test_the_retry_happens_once(self, stub_server):
+        """A token the platform keeps refusing must not become a request loop."""
+        base_url, handler = stub_server
+        handler.routes = {"/v1/users/me": (401, {"detail": "Unauthorized"})}
+        refreshes = []
+
+        client = self._client(base_url, refreshes)
+        with pytest.raises(PermissionError):
+            client.get_current_user()
+
+        assert len(refreshes) == 1
+        assert len(handler.requests) == 2
+
+    def test_the_refresh_goes_to_the_host_that_refused(self, stub_server):
+        """The default hook redeems against this client, not ``AppSettings``.
+
+        Resolving the base URL from settings instead means a client built for
+        any other host sends its refresh token somewhere it does not belong.
+        """
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/users/me": [(401, {"detail": "Unauthorized"}), (200, {"email": "c@e.com"})],
+            "/v1/auth/jwt/refresh": (200, {"access_token": "fresh"}),
+        }
+
+        credential_store.set_access_token("expired")
+        credential_store.set_refresh_token("rt")
+        client = SLPPlatformClient(base_url)  # no refresh_fn — the default hook
+        assert client.get_current_user() == {"email": "c@e.com"}
+
+        assert [r["path"] for r in handler.requests] == [
+            "/v1/users/me", "/v1/auth/jwt/refresh", "/v1/users/me",
+        ]
+        assert credential_store.get_access_token() == "fresh"
+
+    def test_the_catalog_refreshes_before_falling_back_to_anonymous(self, stub_server):
+        """``list_models`` degrades to anonymous, but only as a last resort.
+
+        Going straight to the anonymous retry left a signed-in user looking at a
+        free-tier catalog — every entry ``is_accessible`` false — with no signal
+        that their token had merely expired.
+        """
+        base_url, handler = stub_server
+        models = [{"name": "sl-mini"}]
+        handler.routes = {"/v1/models": [(401, {"detail": "Unauthorized"}), (200, models)]}
+        refreshes = []
+
+        client = self._client(base_url, refreshes)
+        assert client.list_models() == models
+
+        assert len(refreshes) == 1
+        assert handler.requests[1]["headers"]["Authorization"] == "Bearer fresh"
+
+
+class TestRefreshAccessToken:
+    """The refresh grant itself — the one call that must never be misread.
+
+    Its failures are acted on destructively: ``refresh_access_token_now`` clears
+    both credentials on a ``PermissionError``.  Nothing exercised this endpoint
+    directly before; every refresh test mocked it out.
+    """
+
+    _PATH = "/v1/auth/jwt/refresh"
+
+    def test_it_posts_the_token_unauthenticated(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {self._PATH: (200, {"access_token": "new", "refresh_token": "rotated"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {"Authorization": "Bearer dead"})
+        data = client.refresh_access_token("old-rt")
+
+        assert data == {"access_token": "new", "refresh_token": "rotated"}
+        sent = handler.requests[0]
+        assert sent["method"] == "POST"
+        assert json.loads(sent["body"]) == {"refresh_token": "old-rt"}
+        # Sending the dead access token alongside would invite the endpoint to
+        # judge it rather than the refresh token.
+        assert "Authorization" not in sent["headers"]
+
+    def test_a_401_is_a_dead_refresh_token(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {self._PATH: (401, {"detail": "Unauthorized"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(PermissionError, match="expired or revoked"):
+            client.refresh_access_token("old-rt")
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503])
+    def test_a_transient_failure_is_not_a_dead_refresh_token(self, stub_server, status):
+        """The regression this whole review started from.
+
+        Every non-2xx took the endpoint's ``PermissionError``, and the refresh
+        agent clears *both* tokens on that — so one bad minute on the platform
+        logged every user out permanently, with no way back but a re-login.
+        """
+        base_url, handler = stub_server
+        handler.routes = {self._PATH: (status, {"detail": "nope"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ConnectionError) as exc:
+            client.refresh_access_token("old-rt")
+        assert not isinstance(exc.value, PermissionError)
+
+    def test_a_reply_without_an_access_token_raises(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {self._PATH: (200, {"token_type": "Bearer"})}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=lambda: {})
+        with pytest.raises(ValueError, match="missing access_token"):
+            client.refresh_access_token("old-rt")
+
+
+class TestTheRetryFollowsTheCredential:
+    """``_authed`` retries when the credentials *changed*, not when the refresh
+    reported success. The two come apart in both directions.
+    """
+
+    def test_a_dead_oauth_token_falls_back_to_the_developer_token(self, stub_server):
+        """Redeeming a dead refresh token clears both OAuth credentials — and
+        leaves a working developer token behind.
+
+        Keyed on the refresh's return value that read as failure, so the request
+        was abandoned with "Sign in to download this model" for a user who was
+        signed in, and the identical next request succeeded.
+        """
+        base_url, handler = stub_server
+        handler.routes = {
+            "/v1/models/sl-mini/download": [
+                (401, {"detail": "Unauthorized"}),
+                (200, {"artifacts": {"m.gguf": "https://blob/m.gguf"}}),
+            ],
+            "/v1/auth/jwt/refresh": (401, {"detail": "revoked"}),
+        }
+        credential_store.set_access_token("expired")
+        credential_store.set_refresh_token("revoked-rt")
+        credential_store.set_token("sk-dev-good")
+
+        client = SLPPlatformClient(base_url)
+        assert client.get_model_artifacts("sl-mini") == {"m.gguf": "https://blob/m.gguf"}
+
+        assert credential_store.get_access_token() is None
+        assert credential_store.get_refresh_token() is None
+        sent = [r["headers"] for r in handler.requests if r["path"].endswith("/download")]
+        assert sent[0]["Authorization"] == "Bearer expired"
+        assert sent[1]["X-Api-Key"] == "sk-dev-good"
+
+    def test_an_unchanged_credential_is_not_resent(self, stub_server):
+        """A refresh that reports success without changing what we send would
+        only buy a guaranteed second 401."""
+        base_url, handler = stub_server
+        handler.routes = {"/v1/users/me": (401, {"detail": "Unauthorized"})}
+
+        client = SLPPlatformClient(
+            base_url,
+            auth_headers_fn=lambda: {"Authorization": "Bearer same"},
+            refresh_fn=lambda: True,
+        )
+        with pytest.raises(PermissionError):
+            client.get_current_user()
+
+        assert len(handler.requests) == 1
+
+
+class TestTelemetryCannotLogYouOut:
+    def test_a_401_on_usage_does_not_redeem_the_refresh_token(self, stub_server):
+        """``push_token_usage`` is fire-and-forget and swallows every failure.
+
+        Routed through ``_authed`` it could redeem the refresh token, and a
+        refresh endpoint answering 401 clears both credentials — so a telemetry
+        POST could log the user out with nothing visible but a log line. Records
+        flush in batches, so it would do it once per queued record.
+        """
+        base_url, handler = stub_server
+        handler.routes = {"/v1/usage/tokens": (401, {"detail": "Unauthorized"})}
+        credential_store.set_access_token("expired")
+        credential_store.set_refresh_token("rt")
+
+        SLPPlatformClient(base_url).push_token_usage({"tokens": 1})
+
+        assert not [r for r in handler.requests if "refresh" in r["path"]]
+        assert credential_store.get_refresh_token() == "rt"
+
+
+class TestAProjectAgentDoesNotRedeem:
+    """A pinned process answers its own 401 rather than spending the token.
+
+    ``_authed`` asks its ``refresh_fn`` and then compares credentials.  In an
+    agent child the hook declines — redeeming a single-use refresh token is the
+    workspace owner's job — so the comparison finds nothing changed and the
+    original 401 stands.  That is what these endpoints did before the refresh
+    was widened to all of them, so nothing regresses; what must not happen is
+    the child reaching the refresh endpoint at all.
+    """
+
+    def test_a_401_in_a_pinned_process_is_returned_as_is(self, stub_server):
+        base_url, handler = stub_server
+        handler.routes = {"/v1/users/me": (401, {"detail": "Unauthorized"})}
+        credential_store.set_access_token("expired")
+        credential_store.set_refresh_token("rt")
+        pin_project("alpha")
+
+        client = SLPPlatformClient(base_url)
+        with pytest.raises(PermissionError):
+            client.get_current_user()
+
+        assert len(handler.requests) == 1, "the 401 was retried"
+        assert not [r for r in handler.requests if "refresh" in r["path"]]
+        assert credential_store.get_refresh_token() == "rt"
+
+    def test_a_pinned_process_picks_up_a_token_the_owner_rotated(self, stub_server):
+        """Declining still recovers, because nothing is cached.
+
+        ``auth_headers_fn`` here stands in for the credential file: the second
+        read sees what the supervisor wrote during the round trip.  ``_authed``
+        re-reads after the 401, finds the headers changed, and retries with the
+        new token — without this process redeeming anything.
+        """
+        base_url, handler = stub_server
+        user = {"email": "chris@example.com", "name": "Chris"}
+        handler.routes = {"/v1/users/me": [(401, {"detail": "Unauthorized"}), (200, user)]}
+        pin_project("alpha")
+
+        reads = {"n": 0}
+
+        def auth_headers():
+            reads["n"] += 1
+            token = "expired" if reads["n"] == 1 else "rotated-by-the-owner"
+            return {"Authorization": f"Bearer {token}"}
+
+        client = SLPPlatformClient(base_url, auth_headers_fn=auth_headers)
+        assert client.get_current_user() == user
+
+        sent = [r["headers"].get("Authorization") for r in handler.requests]
+        assert sent == ["Bearer expired", "Bearer rotated-by-the-owner"]
+        assert not [r for r in handler.requests if "refresh" in r["path"]]
+
+    def test_web_search_in_a_child_reports_off_without_redeeming(self, stub_server):
+        """The chat path is how a child reaches the platform most often.
+
+        A 401 here becomes "search is off for this account", which is the right
+        answer from inside a child: it cannot tell a stale token from a plan
+        without search.  What it must not do is spend the refresh token to find
+        out.
+        """
+        base_url, handler = stub_server
+        handler.routes = {"/v1/websearch/status": (401, {"detail": "Unauthorized"})}
+        credential_store.set_access_token("expired")
+        credential_store.set_refresh_token("rt")
+        pin_project("alpha")
+
+        with pytest.raises(PermissionError):
+            SLPPlatformClient(base_url).web_search_status()
+
+        assert not [r for r in handler.requests if "refresh" in r["path"]]
+        assert credential_store.get_refresh_token() == "rt"
+

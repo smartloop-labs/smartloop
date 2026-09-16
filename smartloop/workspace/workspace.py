@@ -131,7 +131,7 @@ def read_project_state(project_dir: str) -> Optional[dict]:
     return project if isinstance(project, dict) else None
 
 
-def _is_mmproj_gguf(filename: str) -> bool:
+def is_mmproj_gguf(filename: str) -> bool:
     """True when a GGUF is a vision mmproj / CLIP projector (not main weights)."""
     name = os.path.basename(filename).lower()
     return "mmproj" in name or "clip" in name
@@ -747,11 +747,27 @@ class Workspace(BaseModel):
         ``save()`` writes one file — so pinning there would produce entries that
         are dropped on the way to disk while the caller believed the leak had
         been sealed.
+
+        Nor in a supervisor that has delegated its projects, for the same
+        reason arrived at from the other side: there ``save()`` writes no
+        project file at all (see :meth:`_writable_projects`), so the entries
+        appended here are discarded just as silently — and the caller goes on
+        to move the app-default believing the leak was sealed, which is the
+        one outcome the pin exists to prevent.  Each project instead pins
+        itself lazily through :meth:`sync_project_models` on its next
+        project-route read or write, where the child that owns the file is the
+        one doing the writing.
         """
         if pinned_project_id() is not None:
             logger.warning(
                 "[workspace] not pinning %s across projects: this process owns "
                 "only project %s", model_name, pinned_project_id(),
+            )
+            return
+        if projects_delegated():
+            logger.warning(
+                "[workspace] not pinning %s across projects: their state "
+                "belongs to the per-project agents", model_name,
             )
             return
         if self.is_bootstrap_model(model_name):
@@ -769,10 +785,16 @@ class Workspace(BaseModel):
     def promote_model_to_workspace_default(self, model_name: str) -> None:
         """Make *model_name* an app-default for projects created from now on.
 
-        One-way: enabling a model in a project promotes it, disabling never
-        demotes it, so the default set only grows as models are downloaded.
-        Existing projects are pinned first and keep whatever they resolve to
-        today — a user who wanted the model there would have enabled it.
+        Called when a model is *downloaded* (``/v1/init``), not when one is
+        switched on.  Fetching a model is the act that says it belongs to this
+        workspace, so it is the one that answers "should new projects start
+        with it?"; turning on a model that was already here says only what one
+        project wants, and ``update_project_model`` keeps it that way.
+
+        One-way regardless: nothing demotes a model, so the default set only
+        grows as models arrive.  Existing projects are pinned first and keep
+        whatever they resolve to today — a user who wanted the model there
+        would have enabled it.
         """
         if self.is_bootstrap_model(model_name):
             return  # always enabled, not a configurable default
@@ -971,7 +993,7 @@ class Workspace(BaseModel):
         if ws_model and ws_model.bin_dir and os.path.isdir(ws_model.bin_dir):
             quantize = (ws_model.config.quantize if ws_model.config else "").upper()
             gguf_files = [f for f in os.listdir(ws_model.bin_dir)
-                          if f.endswith(".gguf") and not _is_mmproj_gguf(f)]
+                          if f.endswith(".gguf") and not is_mmproj_gguf(f)]
             if quantize:
                 for f in gguf_files:
                     if f.upper().endswith(f"-{quantize}.GGUF"):
@@ -986,7 +1008,7 @@ class Workspace(BaseModel):
         model_dir = self.model_dir_for(model_id)
         if os.path.isdir(model_dir):
             for f in os.listdir(model_dir):
-                if f.endswith(".gguf") and not _is_mmproj_gguf(f):
+                if f.endswith(".gguf") and not is_mmproj_gguf(f):
                     return os.path.join(model_dir, f)
         return exact
 

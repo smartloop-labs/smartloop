@@ -349,6 +349,26 @@ class TestWhatGetsForwarded:
         )
         assert response.json()["query"] == "project_id=alpha&limit=5"
 
+    @pytest.mark.parametrize("path", ["/v1/models", "/v1/auth/status", "/v1/users/me"])
+    def test_a_workspace_endpoint_naming_a_project_is_proxied_too(self, supervisor_app, path):
+        """A ``project_id`` in the query proxies *any* path, workspace ones included.
+
+        Worth pinning because a good deal of reasoning elsewhere depends on it.
+        These endpoints read and write workspace-level state — the model
+        catalogue, the credential store — and it is tempting to assume routing
+        keeps them on the supervisor because they carry no project in their
+        path.  It does not: the query parameter is enough, so the handlers
+        themselves have to know which process they are in.  See the ownership
+        guards in ``token_agent.refresh_access_token_now`` and
+        ``auth._resolve_user``.
+        """
+        from smartloop.supervisor.routing import project_to_proxy
+
+        assert project_to_proxy({
+            "type": "http", "method": "GET", "path": path,
+            "query_string": b"project_id=alpha",
+        }) == "alpha"
+
     def test_the_body_and_headers_survive_the_hop(self, supervisor_app):
         response = TestClient(supervisor_app).post(
             "/v1/probe?project_id=alpha",

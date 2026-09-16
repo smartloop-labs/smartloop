@@ -8,6 +8,26 @@ from smartloop.api.routers.auth import UserInfo
 from smartloop.auth import credential_store
 
 _RESOLVE_USER = "smartloop.api.routers.auth._resolve_user"
+_PLATFORM_SERVICE = "smartloop.api.routers.auth.get_platform_service"
+
+
+@pytest.fixture(autouse=True)
+def _no_network():
+    """Keep the auth router off the real platform API.
+
+    ``_refresh_platform_cache`` resolves the service through the module, not
+    through FastAPI's dependency graph, so the ``platform_service`` override in
+    ``conftest`` does not reach it — every credential-setting test here was
+    quietly calling out to api.smartloop.ai and relying on the handler's
+    try/except to swallow the result.
+
+    That stopped being survivable once a 401 started redeeming the refresh
+    token: a test storing a fake token got a real 401, refreshed against the
+    real endpoint, got a second 401, and had both credentials cleared out from
+    under its own assertions.
+    """
+    with patch(_PLATFORM_SERVICE, return_value=MagicMock()):
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +37,13 @@ def _no_platform_call():
     patcher.start()
     yield patcher
     patcher.stop()
+
+
+def _unauthorized() -> PermissionError:
+    """A platform 401 as the client actually raises it, status attached."""
+    exc = PermissionError("Authentication failed")
+    exc.status_code = 401
+    return exc
 
 
 class TestAuthStatus:
@@ -73,16 +100,20 @@ class TestAuthStatus:
         assert data["user"] is None
 
 class TestExpiredAccessToken:
-    """A 401 on /v1/users/me means the access token is dead — but a refresh
-    token can mint a new one, so it is redeemed before anything is thrown away.
-    Deleting first logged the user out until the background loop's next tick,
-    up to a full refresh interval later, with a working refresh token on disk.
+    """What ``_resolve_user`` still owns after the refresh moved into the client.
+
+    Redeeming the refresh token used to happen here, which is why this was the
+    only path in the app that recovered from an expired token.  It now happens in
+    :meth:`SLPPlatformClient._authed`, so a ``PermissionError`` arriving here has
+    already survived a refresh attempt — see
+    ``tests/unit/test_platform_client.py::TestRefreshOn401`` for that half.  What
+    is left is the disposal: drop the dead access token so later requests fall
+    back to the developer token, and leave a *transient* failure alone.
     """
 
-    _SERVICE = "smartloop.api.routers.auth.get_platform_service"
-    _REFRESH = "smartloop.platform.client.SLPPlatformClient.refresh_access_token"
+    _SERVICE = _PLATFORM_SERVICE
 
-    def _status(self, _no_platform_call, client, get_user, refresh):
+    def _status(self, _no_platform_call, client, get_user):
         # Stop the autouse fixture so the real _resolve_user runs.
         #
         # Patched at the *service* boundary, not the client: the service caches
@@ -90,81 +121,16 @@ class TestExpiredAccessToken:
         # a warm cache to satisfy later calls — no request, no 401, nothing to
         # assert.  That cache leaking between tests is what made this file fail
         # intermittently depending on execution order.
-        #
-        # And both calls are patched so the test never reaches the network: it
-        # otherwise POSTed a fake refresh token to api.smartloop.ai and its
-        # result depended on what came back.
         _no_platform_call.stop()
         try:
             service = MagicMock()
             service.get_current_user = MagicMock(**get_user)
-            with patch(self._SERVICE, return_value=service), \
-                    patch(self._REFRESH, **refresh):
+            with patch(self._SERVICE, return_value=service):
                 return client.get("/v1/auth/status").json()
         finally:
             _no_platform_call.start()
 
-    def test_a_valid_refresh_token_restores_the_session(
-        self, _no_platform_call, client,
-    ):
-        credential_store.set_access_token("expired-jwt")
-        credential_store.set_refresh_token("old-rt")
-
-        data = self._status(
-            _no_platform_call, client,
-            # 401 first, then the retry on the refreshed token succeeds.
-            get_user={"side_effect": [
-                PermissionError("Authentication failed"),
-                {"email": "chris@example.com", "name": "Chris"},
-            ]},
-            refresh={"return_value": {
-                "access_token": "fresh-jwt", "refresh_token": "new-rt",
-            }},
-        )
-
-        assert credential_store.get_access_token() == "fresh-jwt"
-        assert credential_store.get_refresh_token() == "new-rt"
-        assert data["authenticated"] is True
-        assert data["method"] == "access_token"
-        assert data["user"] == {"email": "chris@example.com", "name": "Chris"}
-
-    def test_a_rotated_refresh_token_is_optional(self, _no_platform_call, client):
-        """The endpoint may return only a new access token."""
-        credential_store.set_access_token("expired-jwt")
-        credential_store.set_refresh_token("old-rt")
-
-        self._status(
-            _no_platform_call, client,
-            get_user={"side_effect": [
-                PermissionError("Authentication failed"),
-                {"email": "chris@example.com"},
-            ]},
-            refresh={"return_value": {"access_token": "fresh-jwt"}},
-        )
-
-        assert credential_store.get_access_token() == "fresh-jwt"
-        assert credential_store.get_refresh_token() == "old-rt"
-
-    def test_a_dead_refresh_token_clears_both_and_falls_back(
-        self, _no_platform_call, client,
-    ):
-        """Retrying a rejected refresh token cannot help — re-login required."""
-        credential_store.set_access_token("expired-jwt")
-        credential_store.set_refresh_token("old-rt")
-        credential_store.set_token("sk-dev-valid")
-
-        data = self._status(
-            _no_platform_call, client,
-            get_user={"side_effect": PermissionError("Authentication failed")},
-            refresh={"side_effect": PermissionError("Authentication failed")},
-        )
-
-        assert credential_store.get_access_token() is None
-        assert credential_store.get_refresh_token() is None
-        assert data["authenticated"] is True
-        assert data["method"] == "developer_token"
-
-    def test_no_refresh_token_still_purges_the_stale_one(
+    def test_a_dead_access_token_is_dropped_for_the_developer_token(
         self, _no_platform_call, client,
     ):
         credential_store.set_access_token("expired-jwt")
@@ -172,28 +138,65 @@ class TestExpiredAccessToken:
 
         data = self._status(
             _no_platform_call, client,
-            get_user={"side_effect": PermissionError("Authentication failed")},
-            refresh={"side_effect": AssertionError("must not be called")},
+            get_user={"side_effect": _unauthorized()},
         )
 
         assert credential_store.get_access_token() is None
+        assert data["authenticated"] is True
         assert data["method"] == "developer_token"
 
-    def test_a_refresh_outage_leaves_the_refresh_token_alone(
+    def test_the_refresh_token_is_not_collateral(
         self, _no_platform_call, client,
     ):
-        """A network failure is not proof the token is bad — keep it to retry."""
+        """Only the refresh *endpoint* gets to decide the refresh token is dead.
+
+        A 401 from ``/v1/users/me`` says nothing about it, and the refresh agent
+        has already cleared it if its own call was refused.
+        """
         credential_store.set_access_token("expired-jwt")
-        credential_store.set_refresh_token("old-rt")
+        credential_store.set_refresh_token("still-good-rt")
 
         self._status(
             _no_platform_call, client,
-            get_user={"side_effect": PermissionError("Authentication failed")},
-            refresh={"side_effect": ConnectionError("platform unreachable")},
+            get_user={"side_effect": _unauthorized()},
         )
 
         assert credential_store.get_access_token() is None
-        assert credential_store.get_refresh_token() == "old-rt"
+        assert credential_store.get_refresh_token() == "still-good-rt"
+
+    def test_only_a_401_discards_the_token(self, _no_platform_call, client):
+        """403 and 404 arrive here as PermissionError too — they are not the
+        token's fault, and an API deploy that moves a route should not log
+        everyone out of the desktop client."""
+        for status in (403, 404):
+            credential_store.set_access_token("good-jwt")
+            exc = PermissionError(f"API error ({status})")
+            exc.status_code = status
+
+            data = self._status(
+                _no_platform_call, client, get_user={"side_effect": exc},
+            )
+
+            assert credential_store.get_access_token() == "good-jwt", status
+            assert data["user"] is None
+
+    def test_an_outage_is_not_a_logout(self, _no_platform_call, client):
+        """A platform blip now arrives as ConnectionError, not PermissionError.
+
+        It used to arrive as the latter — every non-2xx took the endpoint's
+        error class — and this path would then throw away a perfectly good
+        access token because the platform had a bad minute.
+        """
+        credential_store.set_access_token("good-jwt")
+
+        data = self._status(
+            _no_platform_call, client,
+            get_user={"side_effect": ConnectionError("platform unreachable")},
+        )
+
+        assert credential_store.get_access_token() == "good-jwt"
+        assert data["authenticated"] is True
+        assert data["user"] is None
 
 
 class TestSetToken:
@@ -285,3 +288,66 @@ class TestOAuthCallback:
         })
         assert resp.status_code == 200
         assert credential_store.get_access_token() == "new-jwt"
+
+    def test_the_safari_fallback_stores_both_and_redirects(self, client):
+        """Safari blocks the HTTPS→HTTP fetch, so the webapp navigates instead.
+
+        Untested until now, which is uncomfortable for the one login path a
+        whole browser depends on.
+        """
+        resp = client.get(
+            "/v1/auth/callback",
+            params={"access_token": "jwt-via-get", "refresh_token": "rt-via-get"},
+            follow_redirects=False,
+        )
+
+        assert resp.status_code == 307
+        assert "mode=desktop" in resp.headers["location"]
+        assert credential_store.get_access_token() == "jwt-via-get"
+        assert credential_store.get_refresh_token() == "rt-via-get"
+
+    def test_the_safari_fallback_needs_an_access_token(self, client):
+        resp = client.get("/v1/auth/callback", follow_redirects=False)
+        assert resp.status_code == 422
+
+
+class TestSigningInClearsTheSearchGate:
+    """Whether hosted search will serve is cached for a minute, per account.
+
+    Signing in with that cache holding the logged-out "no" left web search
+    skipping itself for the first minute of the session — the orchestrator asks
+    the gate before it runs the query, so the whole step disappeared.
+    ``reset_status_cache`` existed for exactly this and nothing called it.
+    """
+
+    def _gate_says_no(self):
+        from smartloop.search import providers
+
+        providers.reset_status_cache()
+        with patch.object(providers, "_platform_client") as pc:
+            pc.return_value.web_search_status = MagicMock(
+                side_effect=PermissionError("not signed in"))
+            credential_store.set_token("sk-dev")  # so the gate gets past has_credentials
+            assert providers.hosted_search_available() is False
+        credential_store.clear_token()
+
+    def test_a_login_reopens_the_gate(self, client):
+        from smartloop.search import providers
+
+        self._gate_says_no()
+
+        client.post("/v1/auth/callback", json={"access_token": "jwt-fresh"})
+
+        assert providers._status_cache is None, (
+            "the stale 'search is off' survived the login"
+        )
+
+    def test_a_logout_reopens_it_too(self, client):
+        from smartloop.search import providers
+
+        credential_store.set_access_token("jwt")
+        self._gate_says_no()
+
+        client.delete("/v1/auth/token")
+
+        assert providers._status_cache is None
