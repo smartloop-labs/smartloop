@@ -12,12 +12,10 @@ The host is deliberately thin: it holds the models and answers the operations
 in :class:`~smartloop.model_host.client.ModelClient`.  Everything project-shaped
 stays in the agent that asked.
 
-Transport: gRPC (see :mod:`smartloop.model_host.model_host_pb2_grpc`), on a
-unix socket where one exists and loopback TCP where it does not (Windows).
-The old length-prefixed JSON framing over raw sockets was the same wire on both,
-but it hand-rolled what gRPC does out of the box — framing, cancellation,
-reconnection — and the hand-rolled part is exactly where a cross-platform
-transport has to be trusted most.
+Transport: gRPC is the only supported IPC path (see
+:mod:`smartloop.model_host.model_host_pb2_grpc`).  It listens on a unix socket
+where one exists and loopback TCP where it does not (Windows); there is no
+second framing mode or direct socket fallback.
 """
 
 from __future__ import annotations

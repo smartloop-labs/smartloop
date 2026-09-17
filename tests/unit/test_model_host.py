@@ -168,10 +168,12 @@ class TestAddresses:
             "/home/x/.smartloop/model-host.sock"
 
 
-class TestTheDefaultIsInProcess:
-    def test_no_host_configured_means_no_transport(self, monkeypatch, device):
+class TestTheDefaultUsesGrpc:
+    def test_no_host_configured_still_uses_the_grpc_client(self, monkeypatch, device):
         monkeypatch.delenv("SLP_MODEL_HOST", raising=False)
-        assert isinstance(get_model_client(device), InProcessModelClient)
+        client = get_model_client(device)
+        assert isinstance(client, RemoteModelClient)
+        assert client.address.endswith("model-host.sock") or client.address.startswith("127.0.0.1:")
 
     def test_a_configured_host_selects_the_socket_client(self, monkeypatch, device):
         monkeypatch.setenv("SLP_MODEL_HOST", "/tmp/somewhere.sock")
@@ -179,9 +181,10 @@ class TestTheDefaultIsInProcess:
         assert isinstance(client, RemoteModelClient)
         assert client.address == "/tmp/somewhere.sock"
 
-    def test_an_empty_setting_is_treated_as_unset(self, monkeypatch, device):
+    def test_an_empty_setting_is_still_grpc(self, monkeypatch, device):
         monkeypatch.setenv("SLP_MODEL_HOST", "   ")
-        assert isinstance(get_model_client(device), InProcessModelClient)
+        client = get_model_client(device)
+        assert isinstance(client, RemoteModelClient)
 
 
 class TestTheInProcessClient:

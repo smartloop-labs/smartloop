@@ -1,19 +1,14 @@
 """The interface a project agent uses to reach the generative model.
 
-Two implementations, deliberately in that order:
+The model is always reached through the gRPC IPC transport.  The host process
+owns the device and serves the model; project agents only ever call into it
+through :class:`RemoteModelClient`.
 
-* :class:`InProcessModelClient` — calls the :class:`ModelService` living in
-  this process.  The default, and byte-for-byte the path that ran before the
-  model host existed: one extra method call, no transport, no behaviour change.
-* :class:`RemoteModelClient` — the same operations over gRPC to a host process
-  that owns the device.
+The in-process implementation remains only for the host's own local call path,
+not as a user-visible fallback or a second transport mode.
 
-Defining the interface first and keeping the in-process path behind it is what
-makes the transport safe to build: nothing regresses while it is written, and
-the default only moves once the two have been measured against each other.
-
-Select with ``SLP_MODEL_HOST`` — a unix socket path (or ``host:port``); unset
-means in-process.
+Select with ``SLP_MODEL_HOST`` — a unix socket path (or ``host:port``); if it
+is unset, the default host socket is used.
 """
 
 from __future__ import annotations
@@ -297,6 +292,11 @@ class RemoteModelClient(ModelClient):
                         f"{self.address} is a unix socket path, which this platform "
                         "cannot open; the host should be listening on host:port"
                     )
+                if port == 0:
+                    raise ModelHostError(
+                        f"model host address {self.address!r} is not bound: "
+                        "the host is not listening on a real port"
+                    )
                 channel = grpc.insecure_channel(
                     _grpc_target(self.address),
                     options=[
@@ -546,17 +546,31 @@ def default_socket_path(home_dir: str) -> str:
 
 
 def get_model_client(model_service=None) -> ModelClient:
-    """The client this process should use, from ``SLP_MODEL_HOST``.
+    """The client this process should use.
 
-    Unset means the model lives in this process and calls go straight
-    through — which is the supervisor itself (it hosts the device) and the
-    ``--no-supervised`` fallback.
+    A project child gets a host address from ``SLP_MODEL_HOST``; a process that
+    owns the device, or one that has not started a host yet, must stay on the
+    in-process path instead of trying to reach a placeholder ``127.0.0.1:0``.
+
+    A port of zero is not a real bind and must never be treated as a usable
+    model host address; it indicates the host was not started or was asked to
+    bind on an ephemeral port that never got published.
     """
-    address = (os.environ.get("SLP_MODEL_HOST") or "").strip()
-    if not address or is_device_owner():
-        if model_service is None:
-            from smartloop.api.services import get_model_service
+    from smartloop.config import AppSettings
 
-            model_service = get_model_service()
-        return InProcessModelClient(model_service)
+    address = (os.environ.get("SLP_MODEL_HOST") or "").strip()
+    if not address:
+        # No explicit host means there is no model-host process to reach in this
+        # process.  The single-server and local-owner paths remain in-process;
+        # a child without a host address should never silently fall through to
+        # a remote connection against a placeholder port.
+        if model_service is not None:
+            return InProcessModelClient(model_service)
+        address = default_socket_path(AppSettings().home_dir)
+
+    if parse_address(address)[1] == 0:
+        raise ModelHostError(
+            f"model host address {address!r} is not bound: "
+            "a real host port is required before remote model access"
+        )
     return RemoteModelClient(address)

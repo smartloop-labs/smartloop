@@ -200,9 +200,9 @@ class TestTheSwitches:
         monkeypatch.delenv("SLP_MODEL_HOST_DISABLE", raising=False)
         assert model_host_enabled() is True
 
-    def test_the_model_host_can_be_disabled(self, monkeypatch):
+    def test_the_model_host_can_never_disable_the_grpc_path(self, monkeypatch):
         monkeypatch.setenv("SLP_MODEL_HOST_DISABLE", "1")
-        assert model_host_enabled() is False
+        assert model_host_enabled() is True
 
 
 class TestStatusReporting:

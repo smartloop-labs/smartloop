@@ -63,6 +63,43 @@ class Model(BaseModel):
 class ModelManager:
 
     @staticmethod
+    def _purge_stale_project_id(workspace: Workspace, config: ModelConfig, logger: logging.Logger) -> ModelConfig:
+        if not config.project_id or not workspace.projects:
+            return config
+        if any(p.id == config.project_id for p in workspace.projects):
+            return config
+
+        logger.warning(
+            "[model] config names project %s, which is not in this workspace; clearing stale project binding",
+            config.project_id,
+        )
+        config.project_id = None
+        ws_model = workspace.get_model(config.model_name)
+        if ws_model and ws_model.config:
+            ws_model.config.project_id = None
+
+        if os.path.exists(Workspace.config_file):
+            try:
+                with open(Workspace.config_file, "r") as f:
+                    raw = f.read().strip()
+                if raw:
+                    data = json.loads(raw)
+                    if isinstance(data, dict) and isinstance(data.get("workspace"), dict):
+                        models = data["workspace"].get("models")
+                        if isinstance(models, list):
+                            for model in models:
+                                if isinstance(model, dict) and model.get("model_name") == config.model_name:
+                                    cfg = model.get("config")
+                                    if isinstance(cfg, dict):
+                                        cfg["project_id"] = None
+                                        break
+                    with open(Workspace.config_file, "w") as f:
+                        json.dump(data, f, indent=4)
+            except Exception:
+                pass
+        return config
+
+    @staticmethod
     def _load_model(t: Type[T], config: ModelConfig) -> Model:
         if not os.path.exists(Workspace.config_file):
             return ModelManager._create_new_model(t, config)
@@ -97,6 +134,7 @@ class ModelManager:
                         active_ws_model.config = ModelConfig.model_validate(merged)
                     else:
                         active_ws_model.config = config
+                ModelManager._purge_stale_project_id(model.workspace, config, logging.getLogger(__name__))
                 # Merge config only — don't change workspace active model
 
                 return model
@@ -134,12 +172,7 @@ class ModelManager:
             # it, and writing the flag would move the UI's selection for every
             # other reader — a workspace-owned field a pinned process cannot
             # persist in any case.
-            if config.project_id and workspace.projects:
-                if not any(p.id == config.project_id for p in workspace.projects):
-                    logger.warning(
-                        "[model] config names project %s, which is not in this "
-                        "workspace", config.project_id,
-                    )
+            config = ModelManager._purge_stale_project_id(workspace, config, logger)
 
             # Load model id from persisted config, or generate a new one
             if os.path.exists(Workspace.config_file):

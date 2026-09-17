@@ -53,21 +53,19 @@ _remote_lock = threading.Lock()
 
 
 def _remote_embedder():
-    """The model host to embed through, or ``None`` to embed locally.
+    """The embedding model is reached through the gRPC model host.
 
-    BGE-M3 is ~417 MB.  Loading it in every per-project agent would multiply
-    that by the number of open projects for no benefit — the vectors are
-    identical whoever computes them — so a child hands the work to the process
-    that already holds the model.  The host itself always embeds locally: it
-    *is* the model, and delegating would be a call to itself.
+    No direct in-process path is permitted here: the embedder is always served
+    by the host over the same IPC transport as generation requests.
     """
     global _remote
 
-    from smartloop.model_host.client import is_device_owner
+    from smartloop.config import AppSettings
+    from smartloop.model_host.client import default_socket_path
 
     address = (os.environ.get("SLP_MODEL_HOST") or "").strip()
-    if not address or is_device_owner():
-        return None
+    if not address:
+        address = default_socket_path(AppSettings().home_dir)
     if _remote is not None and _remote.address == address:
         return _remote
     with _remote_lock:
