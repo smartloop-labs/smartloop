@@ -41,6 +41,7 @@ project-shaped segment used to be enough to forward it:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -266,7 +267,12 @@ class ProjectRoutingMiddleware:
             return
 
         try:
-            record = pool.ensure(project_id)
+            # ``ensure`` is synchronous and, for a cold project, can block for
+            # minutes waiting on a child's port and health check. Run it off
+            # the event loop thread — otherwise that wait freezes the whole
+            # supervisor, including every other project's already-running
+            # requests, for as long as the cold start takes.
+            record = await asyncio.to_thread(pool.ensure, project_id)
         except Exception as exc:
             # A project that cannot be started is the supervisor's problem to
             # report, not a reason to answer from the wrong process.
