@@ -3,7 +3,7 @@
 The model is the one thing that cannot be per-project: same-device weight
 copies serialize in the driver and each carries its own KV cache, so N projects
 would mean N resident copies competing for one device. The split therefore runs
-between project work and inference — these tests cover the seam and the socket
+between project work and inference — these tests cover the seam and the gRPC
 transport across it.
 """
 
@@ -11,28 +11,40 @@ import os
 import threading
 import time
 
+import grpc
 import numpy as np
 import pytest
 
-from smartloop.model_host import protocol
+from smartloop.model_host import model_host_pb2 as pb2
 from smartloop.model_host.client import (
     InProcessModelClient, ModelClient, ModelHostError, RemoteModelClient,
-    default_socket_path, get_model_client, parse_address,
+    _grpc_target, default_socket_path, get_model_client, parse_address,
 )
-from smartloop.model_host.host import ModelHost, _unlink_stale_socket
+from smartloop.model_host.host import ModelHost, _ModelHostServicer, _unlink_stale_socket
 
 
-class _FakeConn:
-    """Enough socket for :meth:`ModelHost._handle_frame` to answer into."""
+class _FakeContext:
+    """Enough of a gRPC context for :class:`_ModelHostServicer` to run into."""
 
     def __init__(self) -> None:
-        self.sent = b""
+        self._code = None
+        self._details = None
+        self._aborted = False
 
-    def sendall(self, data) -> None:
-        self.sent += data
+    def is_active(self) -> bool:
+        return True
 
-    def settimeout(self, _timeout) -> None:
-        pass
+    def abort(self, code, details):
+        self._code = code
+        self._details = details
+        self._aborted = True
+        raise RuntimeError(f"{code}: {details}")
+
+    def set_code(self, code) -> None:
+        self._code = code
+
+    def set_details(self, details) -> None:
+        self._details = details
 
 
 class FakeDevice(ModelClient):
@@ -130,71 +142,6 @@ def client(host):
     remote.close()
 
 
-class TestFraming:
-    def test_a_frame_round_trips(self, tmp_path):
-        import socket
-
-        left, right = socket.socketpair()
-        try:
-            protocol.send_frame(left, {"id": 1, "hello": "world"})
-            assert protocol.recv_frame(right) == {"id": 1, "hello": "world"}
-        finally:
-            left.close()
-            right.close()
-
-    def test_generated_text_needs_no_escaping(self, tmp_path):
-        """Why length-prefixed rather than newline-delimited."""
-        import socket
-
-        left, right = socket.socketpair()
-        try:
-            payload = {"text": "line one\nline two\n\nand \x00 a null"}
-            protocol.send_frame(left, payload)
-            assert protocol.recv_frame(right) == payload
-        finally:
-            left.close()
-            right.close()
-
-    def test_a_closed_peer_is_reported(self):
-        import socket
-
-        left, right = socket.socketpair()
-        left.close()
-        with pytest.raises(protocol.ConnectionClosed):
-            protocol.recv_frame(right)
-        right.close()
-
-    def test_an_oversized_frame_is_refused(self):
-        import socket
-
-        left, right = socket.socketpair()
-        try:
-            left.sendall(protocol._HEADER.pack(protocol.MAX_FRAME_BYTES + 1))
-            with pytest.raises(protocol.ProtocolError):
-                protocol.recv_frame(right)
-        finally:
-            left.close()
-            right.close()
-
-
-class TestArrayTransport:
-    def test_an_embedding_matrix_survives_the_wire(self):
-        original = np.random.rand(4, 8).astype(np.float32)
-        assert np.array_equal(
-            protocol.decode_array(protocol.encode_array(original)), original
-        )
-
-    def test_none_passes_through(self):
-        assert protocol.encode_array(None) is None
-        assert protocol.decode_array(None) is None
-
-    def test_a_non_contiguous_view_is_packed_correctly(self):
-        original = np.random.rand(4, 8).astype(np.float32)[:, ::2]
-        assert np.array_equal(
-            protocol.decode_array(protocol.encode_array(original)), original
-        )
-
-
 class TestAddresses:
     @pytest.mark.parametrize("address,expected", [
         ("/tmp/model-host.sock", ("/tmp/model-host.sock", None)),
@@ -205,6 +152,16 @@ class TestAddresses:
     ])
     def test_parsing(self, address, expected):
         assert parse_address(address) == expected
+
+    @pytest.mark.parametrize("address,target", [
+        ("/tmp/model-host.sock", "unix:/tmp/model-host.sock"),
+        ("unix:///tmp/a.sock", "unix:/tmp/a.sock"),
+        ("127.0.0.1:9000", "127.0.0.1:9000"),
+        (":9000", "127.0.0.1:9000"),
+    ])
+    def test_the_grpc_target(self, address, target):
+        """How gRPC is asked to reach an address: unix-prefixed or host:port."""
+        assert _grpc_target(address) == target
 
     def test_the_default_lives_in_the_home(self):
         assert default_socket_path("/home/x/.smartloop") == \
@@ -308,7 +265,7 @@ class TestTheInProcessClient:
         assert ("load_model",) in service.calls
 
 
-class TestTheSocketTransport:
+class TestTheGrpcTransport:
     def test_generate(self, client, device):
         assert client.generate("who?", capability="general") == "answer to who?"
         assert ("generate", "who?", None, "general") in device.calls
@@ -337,6 +294,18 @@ class TestTheSocketTransport:
         assert result.dtype == np.float32
         assert np.array_equal(result, np.arange(6, dtype=np.float32).reshape(2, 3))
 
+    def test_a_non_contiguous_view_is_contiguised_by_the_host(self, host, device):
+        original = np.random.rand(4, 8).astype(np.float32)[:, ::2]
+        device.encode_texts = lambda texts, base_dir=None: original
+
+        client = RemoteModelClient(host.address, timeout=15)
+        try:
+            result = client.encode_texts(["x", "y", "z", "w"])
+        finally:
+            client.close()
+        assert result.shape == (4, 4)
+        assert np.array_equal(result, original)
+
     def test_an_unavailable_embedder_comes_back_as_none(self, client):
         assert client.encode_texts([]) is None
 
@@ -347,7 +316,7 @@ class TestTheSocketTransport:
         assert ("unload_auxiliary_models", False) in device.calls
         assert ("unload_embedding_model",) in device.calls
 
-    def test_many_requests_share_one_connection(self, client, device):
+    def test_many_requests_travel_on_one_channel(self, client, device):
         for _ in range(5):
             client.generate("hi")
         assert len([c for c in device.calls if c[0] == "generate"]) == 5
@@ -366,9 +335,10 @@ class TestFailures:
         device.fail_with = None
         assert client.generate("again") == "answer to again"
 
-    def test_an_unknown_operation_is_refused(self, client):
-        with pytest.raises(ModelHostError, match="unknown operation"):
-            client._call("teleport")
+    def test_a_stream_error_surfaces_at_the_caller(self, client, device):
+        device.fail_with = ValueError("no model loaded")
+        with pytest.raises(ModelHostError, match="no model loaded"):
+            list(client.stream("hi"))
 
     def test_an_unreachable_host_is_reported_clearly(self, tmp_path):
         client = RemoteModelClient(str(tmp_path / "not-there.sock"), timeout=2)
@@ -410,7 +380,7 @@ class TestCancellation:
                 cancelled.set()
 
         # Both ends stop: the client stops receiving, and — the point of
-        # sending CANCEL rather than just hanging up — the device stops being
+        # cancelling rather than just hanging up — the device stops being
         # asked for tokens it would compute for nobody.
         assert len(received) < 50
         assert device.yielded < 50
@@ -436,12 +406,13 @@ class TestSelectionIsScopedToTheAskingProject:
     """
 
     def test_the_requesting_project_reaches_the_host(self, host, tmp_path):
-        from smartloop.model_host.client import RemoteModelClient
         from smartloop.workspace.context import pin_project
 
         seen: list = []
         host.client.model_label = lambda capability=None: seen.append(
-            __import__("smartloop.workspace.context", fromlist=["x"]).active_project_id()
+            __import__(
+                "smartloop.workspace.context", fromlist=["x"]
+            ).active_project_id()
         ) or "label"
 
         pin_project("beta")
@@ -455,7 +426,6 @@ class TestSelectionIsScopedToTheAskingProject:
         assert seen == ["beta"]
 
     def test_two_projects_are_not_confused_for_each_other(self, host):
-        from smartloop.model_host.client import RemoteModelClient
         from smartloop.workspace.context import active_project_id, pin_project
 
         host.client.model_label = lambda capability=None: active_project_id() or "none"
@@ -474,7 +444,6 @@ class TestSelectionIsScopedToTheAskingProject:
 
     def test_an_unpinned_caller_binds_nothing(self, host):
         """The supervisor's own calls keep resolving through its selection."""
-        from smartloop.model_host.client import RemoteModelClient
         from smartloop.workspace.context import active_project_id, pin_project
 
         host.client.model_label = lambda capability=None: active_project_id() or "unbound"
@@ -489,7 +458,7 @@ class TestSelectionIsScopedToTheAskingProject:
 
 class TestConcurrency:
     def test_several_agents_share_one_host(self, host, device):
-        """Three project agents, three connections, one device."""
+        """Three project agents, three channels, one device."""
         results: dict[int, str] = {}
         errors: list = []
         start = threading.Barrier(3, timeout=10)
@@ -513,8 +482,8 @@ class TestConcurrency:
         assert not errors
         assert results == {n: f"answer to agent-{n}" for n in range(3)}
 
-    def test_one_client_serializes_its_own_requests(self, client, device):
-        """The exchange holds the connection, so frames never interleave."""
+    def test_one_client_multiplexes_its_own_requests(self, client, device):
+        """gRPC interleaves RPCs on one channel without corrupting any."""
         errors: list = []
         results: list = []
 
@@ -745,12 +714,10 @@ class TestTheHostReadsTheProjectsOwnStateFirst:
             return True
 
         device.refresh_project = refresh
-        host = ModelHost(device, "127.0.0.1:0")
+        servicer = _ModelHostServicer(device)
 
-        host._handle_frame(_FakeConn(), 1, {
-            "id": "r1", "op": "generate",
-            "args": {"prompt": "hi", "project_id": "alpha"},
-        })
+        servicer.Generate(pb2.GenerateRequest(prompt="hi", project_id="alpha"),
+                          _FakeContext())
 
         assert seen == [("alpha", None)]
 
@@ -760,28 +727,25 @@ class TestTheHostReadsTheProjectsOwnStateFirst:
         device.refresh_project = lambda project_id: (_ for _ in ()).throw(
             OSError("no such file")
         )
-        host = ModelHost(device, "127.0.0.1:0")
-        conn = _FakeConn()
+        servicer = _ModelHostServicer(device)
 
-        host._handle_frame(conn, 1, {
-            "id": "r1", "op": "generate",
-            "args": {"prompt": "hi", "project_id": "alpha"},
-        })
+        reply = servicer.Generate(
+            pb2.GenerateRequest(prompt="hi", project_id="alpha"), _FakeContext(),
+        )
 
         assert ("generate", "hi", None, None) in device.calls
-        assert b"answer to hi" in conn.sent
+        assert reply.text == "answer to hi"
 
-    def test_an_unprojected_frame_still_works(self):
+    def test_an_unprojected_request_still_works(self):
         """The CLI and the single-server fallback name no project."""
         device = FakeDevice()
-        host = ModelHost(device, "127.0.0.1:0")
-        conn = _FakeConn()
+        servicer = _ModelHostServicer(device)
 
-        host._handle_frame(conn, 1, {
-            "id": "r1", "op": "generate", "args": {"prompt": "hi"},
-        })
+        reply = servicer.Generate(
+            pb2.GenerateRequest(prompt="hi"), _FakeContext(),
+        )
 
-        assert b"answer to hi" in conn.sent
+        assert reply.text == "answer to hi"
 
 
 class TestTheInProcessClientCanRefresh:

@@ -97,7 +97,8 @@ class RemoteLLM(BaseLLM):
         **kwargs: Any,
     ) -> Iterator[GenerationChunk]:
         # ``_cancelled`` is set by the caller between calls, exactly as it is
-        # on the local LLM; here it travels to the host as a cancel frame.
+        # on the local LLM; here it cancels the gRPC stream the host is serving
+        # from, which the host observes between chunks.
         for text in self.client.stream(
             prompt, capability=self._capability, cancelled=self._cancelled,
             thinking=kwargs.get("thinking"),

@@ -27,6 +27,9 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.9
 
+# Model host IPC (covers Windows, which has no AF_UNIX)
+grpcio>=1.83.0
+
 # Utilities and Configuration
 pydantic==2.12.5
 pydantic-settings>=2.10.1

@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package smartloop.model_host.v1;
+
+// The seam between project work and inference, over gRPC instead of bespoke
+// length-prefixed JSON frames.
+//
+// The generative model cannot be per-project (VRAM copies), so each agent
+// child reaches the one process that owns the device through this service.
+// Every RPC carries the requesting ``project_id``: model selection depends on
+// per-project settings, and the host has to resolve it against *that* project,
+// not against whichever one the UI happens to have selected in the supervisor.
+//
+// Cancellation of a streamed generation is the gRPC cancellation itself: the
+// client aborts the server-streaming ``Stream`` RPC and the server observes it
+// between chunks, at the same granularity in-process cancellation has — a
+// native llama.cpp call cannot be interrupted mid-token either.
+
+service ModelHost {
+  // Complete a prompt in one call and return the whole response.
+  rpc Generate(GenerateRequest) returns (GenerateResponse);
+
+  // Complete a prompt, yielding text as it is produced.
+  rpc Stream(StreamRequest) returns (stream StreamChunk);
+
+  // Embed texts, or signal that the embedder is unavailable (empty shape).
+  rpc EncodeTexts(EncodeTextsRequest) returns (EncodeTextsResponse);
+
+  // Questions about what is resident, and lifecycle.  Each carries the
+  // requesting project, because which model answers for that project is
+  // project-scoped even here.
+  rpc IsLoaded(ProjectRequest) returns (BoolReply);
+  rpc SupportsThinking(SupportsThinkingRequest) returns (BoolReply);
+  rpc ModelName(ProjectRequest) returns (StringReply);
+  rpc ModelLabel(ModelLabelRequest) returns (StringReply);
+  rpc CountTokens(CountTokensRequest) returns (IntReply);
+  rpc MaxContextTokens(ProjectRequest) returns (IntReply);
+  rpc ResponseMaxContextTokens(ResponseMaxContextRequest) returns (IntReply);
+  rpc HasCapabilityModel(HasCapabilityRequest) returns (BoolReply);
+  rpc IdleSeconds(ProjectRequest) returns (FloatReply);
+  rpc LoadModel(ProjectRequest) returns (StringReply);
+  rpc UnloadAuxiliaryModels(UnloadAuxiliaryRequest) returns (Empty);
+  rpc UnloadEmbeddingModel(ProjectRequest) returns (Empty);
+}
+
+message Empty {}
+
+// The requesting project, for operations that carry nothing else.
+message ProjectRequest {
+  string project_id = 1;
+}
+
+message GenerateRequest {
+  string prompt = 1;
+  string model_name = 2;
+  string capability = 3;
+  optional int32 max_tokens = 4;
+  optional bool thinking = 5;
+  string project_id = 6;
+}
+
+message GenerateResponse {
+  string text = 1;
+}
+
+message StreamRequest {
+  string prompt = 1;
+  string model_name = 2;
+  string capability = 3;
+  optional bool thinking = 4;
+  string project_id = 5;
+}
+
+message StreamChunk {
+  string text = 1;
+}
+
+message EncodeTextsRequest {
+  repeated string texts = 1;
+  string base_dir = 2;
+  string project_id = 3;
+}
+
+// A float32 buffer plus its shape.  An empty ``shape`` means "no embedder".
+message EncodeTextsResponse {
+  repeated int32 shape = 1;
+  bytes data = 2;
+}
+
+message SupportsThinkingRequest {
+  string capability = 1;
+  string project_id = 2;
+}
+
+message ModelLabelRequest {
+  string capability = 1;
+  string project_id = 2;
+}
+
+message CountTokensRequest {
+  string text = 1;
+  string project_id = 2;
+}
+
+message ResponseMaxContextRequest {
+  string capability = 1;
+  string project_id = 2;
+}
+
+message HasCapabilityRequest {
+  string capability = 1;
+  string project_id = 2;
+}
+
+message UnloadAuxiliaryRequest {
+  bool include_embedding = 1;
+  string project_id = 2;
+}
+
+message BoolReply {
+  bool value = 1;
+}
+
+message StringReply {
+  string value = 1;
+}
+
+message IntReply {
+  int32 value = 1;
+}
+
+message FloatReply {
+  double value = 1;
+}
