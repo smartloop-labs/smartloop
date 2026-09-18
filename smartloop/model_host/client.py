@@ -220,7 +220,12 @@ class InProcessModelClient(ModelClient):
     def encode_texts(self, texts, base_dir=None):
         from smartloop.db import embeddings
 
-        return embeddings.encode_texts(texts, base_dir=base_dir)
+        # ``encode_local``, not ``encode_texts``: this process owns the
+        # embedder, and this is also the host's own serving path.  Asking the
+        # routing entry point would let a host serve ``EncodeTexts`` by
+        # sending one — a call it can only answer by sending another, one
+        # gRPC worker consumed per hop.
+        return embeddings.encode_local(texts, base_dir=base_dir)
 
     def is_loaded(self) -> bool:
         return self._service.is_loaded()
@@ -320,10 +325,17 @@ class RemoteModelClient(ModelClient):
             self._channel = None
             self._stub = None
 
-    def _unary(self, method: str, request):
-        """Run one unary RPC and return its message, or raise :class:`ModelHostError`."""
+    def _unary(self, method: str, request, timeout: Optional[float] = None):
+        """Run one unary RPC and return its message, or raise :class:`ModelHostError`.
+
+        *timeout* overrides the client-wide default for a single call, so a
+        latency-sensitive path can impose its own deadline (and fall back to
+        whatever it does without the host) without reshaping every caller.
+        """
         try:
-            return getattr(self._connect(), method)(request, timeout=self._timeout)
+            return getattr(self._connect(), method)(
+                request, timeout=self._timeout if timeout is None else timeout
+            )
         except grpc.RpcError as exc:
             if exc.code() == grpc.StatusCode.UNAVAILABLE:
                 # The host is gone (crashed, restarted, or never there).  A
@@ -382,10 +394,10 @@ class RemoteModelClient(ModelClient):
             if call is not None:
                 call.cancel()
 
-    def encode_texts(self, texts, base_dir=None):
+    def encode_texts(self, texts, base_dir=None, timeout: Optional[float] = None):
         request = pb2.EncodeTextsRequest(texts=list(texts), base_dir=base_dir or "")
         request.project_id = pinned_project_id() or ""
-        reply = self._unary("EncodeTexts", request)
+        reply = self._unary("EncodeTexts", request, timeout=timeout)
         if not reply.shape:
             return None
         return np.frombuffer(reply.data, dtype=np.float32).reshape(reply.shape)

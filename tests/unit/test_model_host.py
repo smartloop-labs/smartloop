@@ -169,11 +169,16 @@ class TestAddresses:
 
 
 class TestTheDefaultUsesGrpc:
-    def test_no_host_configured_still_uses_the_grpc_client(self, monkeypatch, device):
+    """A host address selects gRPC; its absence means there is no host to use.
+
+    The process holding the device must never resolve a client to its own
+    socket.  Doing so is not a slower route to the same answer — it is a
+    request the host can only serve by making the same request again.
+    """
+
+    def test_no_host_configured_stays_in_process(self, monkeypatch, device):
         monkeypatch.delenv("SLP_MODEL_HOST", raising=False)
-        client = get_model_client(device)
-        assert isinstance(client, RemoteModelClient)
-        assert client.address.endswith("model-host.sock") or client.address.startswith("127.0.0.1:")
+        assert isinstance(get_model_client(device), InProcessModelClient)
 
     def test_a_configured_host_selects_the_socket_client(self, monkeypatch, device):
         monkeypatch.setenv("SLP_MODEL_HOST", "/tmp/somewhere.sock")
@@ -181,10 +186,20 @@ class TestTheDefaultUsesGrpc:
         assert isinstance(client, RemoteModelClient)
         assert client.address == "/tmp/somewhere.sock"
 
-    def test_an_empty_setting_is_still_grpc(self, monkeypatch, device):
+    def test_an_empty_setting_is_no_setting(self, monkeypatch, device):
+        """A blank value is how an unset variable arrives through a shell."""
         monkeypatch.setenv("SLP_MODEL_HOST", "   ")
-        client = get_model_client(device)
+        assert isinstance(get_model_client(device), InProcessModelClient)
+
+    def test_a_process_without_a_device_resolves_the_default_socket(
+        self, monkeypatch,
+    ):
+        """No model service to fall back on: the host's own address is the answer."""
+        monkeypatch.delenv("SLP_MODEL_HOST", raising=False)
+        client = get_model_client()
         assert isinstance(client, RemoteModelClient)
+        assert (client.address.endswith("model-host.sock")
+                or client.address.startswith("127.0.0.1:"))
 
 
 class TestTheInProcessClient:
@@ -296,6 +311,29 @@ class TestTheGrpcTransport:
         result = client.encode_texts(["a", "b"])
         assert result.dtype == np.float32
         assert np.array_equal(result, np.arange(6, dtype=np.float32).reshape(2, 3))
+
+    def test_encode_texts_can_impose_its_own_deadline(self, monkeypatch):
+        """A per-call timeout is the caller's, while the default stays the client's."""
+        from smartloop.model_host.client import RemoteModelClient
+
+        client = RemoteModelClient("127.0.0.1:0", timeout=15)  # never connects
+        seen = {}
+
+        class _Reply:
+            shape = [1, 4]
+            data = np.array([[0.1, 0.2, 0.3, 0.4]], dtype=np.float32).tobytes()
+
+        def fake_unary(method, request, timeout=None):
+            seen["timeout"] = timeout
+            return _Reply()
+
+        monkeypatch.setattr(client, "_unary", fake_unary)
+
+        assert client.encode_texts(["hello"], timeout=7.5) is not None
+        assert seen["timeout"] == 7.5
+
+        client.encode_texts(["default"])
+        assert seen["timeout"] is None  # _unary applies the client-wide default
 
     def test_a_non_contiguous_view_is_contiguised_by_the_host(self, host, device):
         original = np.random.rand(4, 8).astype(np.float32)[:, ::2]
@@ -631,6 +669,53 @@ class TestTheEmbedderIsSharedNotCopied:
 
         assert np.array_equal(result, np.arange(6, dtype=np.float32).reshape(2, 3))
         assert any(c[0] == "encode_texts" for c in device.calls)
+
+    def test_the_host_does_not_serve_an_encode_by_asking_for_one(self, monkeypatch):
+        """The regression: a host answering EncodeTexts by sending EncodeTexts.
+
+        Each hop took a gRPC worker and held it for the client-wide 600s
+        deadline, so one citation check parked the whole pool on calls only
+        that pool could serve.  Everything behind it — generation included —
+        waited, and the caller saw ``Deadline Exceeded``.
+        """
+        from smartloop.db import embeddings
+        from smartloop.model_host.client import InProcessModelClient
+
+        # An address is set and this process owns the device: exactly the
+        # supervisor's situation, where the host runs in the serving process.
+        monkeypatch.setenv("SLP_MODEL_HOST", "/tmp/model-host.sock")
+        monkeypatch.setattr(
+            embeddings, "_remote_embedder",
+            lambda: pytest.fail("the host asked a model host to embed for it"),
+        )
+        monkeypatch.setattr(
+            embeddings, "encode_local",
+            lambda texts, base_dir=None: np.zeros((len(texts), 3), dtype=np.float32),
+        )
+
+        served = InProcessModelClient(object()).encode_texts(["a", "b"])
+
+        assert served.shape == (2, 3)
+
+    def test_a_per_call_deadline_reaches_the_remote_host(self, monkeypatch):
+        """The chat verification budget must travel down to the RPC itself."""
+        from smartloop.db import embeddings
+
+        class _Remote:
+            def __init__(self):
+                self.received = None
+
+            def encode_texts(self, texts, base_dir=None, timeout=None):
+                self.received = (texts, base_dir, timeout)
+                return None
+
+        remote = _Remote()
+        monkeypatch.setattr(embeddings, "_remote_embedder", lambda: remote)
+        monkeypatch.setattr(embeddings, "_get_model", lambda *_a, **_k: object())
+
+        embeddings.encode_texts(["a"], "/tmp/ws", timeout=30.0)
+
+        assert remote.received == (["a"], "/tmp/ws", 30.0)
 
     def test_warmup_is_a_no_op_in_a_child(self, host, monkeypatch):
         from smartloop.db import embeddings

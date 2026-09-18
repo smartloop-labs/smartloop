@@ -53,19 +53,32 @@ _remote_lock = threading.Lock()
 
 
 def _remote_embedder():
-    """The embedding model is reached through the gRPC model host.
+    """The model host to embed through, or ``None`` to embed in this process.
 
-    No direct in-process path is permitted here: the embedder is always served
-    by the host over the same IPC transport as generation requests.
+    BGE-M3 is ~417 MB.  Loading it in every per-project agent would multiply
+    that by the number of open projects for no benefit — the vectors are
+    identical whoever computes them — so a child hands the work to the process
+    that already holds the model.
+
+    Two processes have nobody to hand it to, and both are this recursion's
+    base case:
+
+    * **The host itself.**  It *is* the embedder; delegating would be a call to
+      itself.  ``EncodeTexts`` would answer by issuing another ``EncodeTexts``,
+      one gRPC worker per hop, until the pool was full and every thread was
+      parked on a call that only it could serve.
+    * **A process that was given no host address.**  The supervisor sets
+      ``SLP_MODEL_HOST`` for every child it starts, so an absent address means
+      there is no host to share — the ``--no-supervised`` server, the CLI — and
+      the work is done here rather than sent to a socket nobody is listening on.
     """
     global _remote
 
-    from smartloop.config import AppSettings
-    from smartloop.model_host.client import default_socket_path
+    from smartloop.model_host.client import is_device_owner
 
     address = (os.environ.get("SLP_MODEL_HOST") or "").strip()
-    if not address:
-        address = default_socket_path(AppSettings().home_dir)
+    if not address or is_device_owner():
+        return None
     if _remote is not None and _remote.address == address:
         return _remote
     with _remote_lock:
@@ -204,10 +217,22 @@ def warmup(base_dir: Optional[str] = None) -> None:
 
     A no-op when a model host owns the embedder: it is already warm there, and
     loading a second copy here is the cost this avoids.
+
+    Loading the GGUF only allocates the llama.cpp context — the Metal/Vulkan
+    kernels aren't compiled until the first ``embed()`` call, which is exactly
+    the latency this exists to hide.  So a trivial encode is run here too,
+    mirroring how :meth:`ModelService._warmup_inference` primes the KV cache
+    with a real ``invoke()`` rather than just loading the LLM weights.
     """
     if _remote_embedder() is not None:
         return
-    _get_model(base_dir)
+    model = _get_model(base_dir)
+    if model is None:
+        return
+    try:
+        model.encode("warmup", show_progress_bar=False)
+    except Exception as e:
+        logger.warning("[embeddings] warmup encode failed: %s", e)
 
 
 def device_idle_seconds() -> float:
@@ -246,23 +271,39 @@ def device_idle_seconds() -> float:
 
 def encode_texts(
     texts: List[str], base_dir: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> Optional[np.ndarray]:
     """Encode *texts* into a dense embedding matrix.
 
     Returns an ``(N, dim)`` numpy array, or ``None`` when the model is
     unavailable.  Routed to the model host when one owns the embedder, so every
-    project agent shares a single resident copy.
+    project agent shares a single resident copy.  *timeout* is a per-call RPC
+    deadline passed on to the host when routing remotely.
     """
     remote = _remote_embedder()
     if remote is not None:
         try:
-            return remote.encode_texts(texts, base_dir=base_dir)
+            return remote.encode_texts(texts, base_dir=base_dir, timeout=timeout)
         except Exception as exc:
             # Same contract as a failed local load: callers fall back to
             # TF-IDF rather than the child quietly loading its own model.
             logger.warning("[embeddings] model host encoding failed: %s", exc)
             return None
 
+    return encode_local(texts, base_dir)
+
+
+def encode_local(
+    texts: List[str], base_dir: Optional[str] = None,
+) -> Optional[np.ndarray]:
+    """Encode *texts* with this process's own model, routing nowhere.
+
+    What the host calls to serve an ``EncodeTexts`` request.  It is a separate
+    entry point rather than a flag on :func:`encode_texts` so that the serving
+    path cannot re-enter the routing decision at all: the host asking
+    :func:`encode_texts` to embed is the host asking who should embed, and one
+    wrong answer there is a request that answers itself forever.
+    """
     model = _get_model(base_dir)
     if model is None:
         return None

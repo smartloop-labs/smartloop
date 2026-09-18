@@ -423,7 +423,7 @@ def _bag(text: str) -> list:
 
 def _stub_encoder(monkeypatch, calls=None):
     """Install a deterministic bag-of-words embedder in place of the model."""
-    def encode_texts(texts, base_dir=None):
+    def encode_texts(texts, base_dir=None, timeout=None):
         if calls is not None:
             calls.append(list(texts))
         # A text with none of the vocabulary still needs a non-zero vector:
@@ -524,13 +524,13 @@ def test_verification_falls_back_to_the_lexical_check_without_an_embedder(monkey
     # No embedding model on this install: degrade to the weaker text check
     # rather than switching verification off and crediting everything.
     monkeypatch.setattr("smartloop.db.embeddings.encode_texts",
-                        lambda texts, base_dir=None: None)
+                        lambda texts, base_dir=None, timeout=None: None)
     assert _verified_citations([_cit()], "The camera sensor is a Hasselblad.") == []
     assert len(_verified_citations([_cit()], "Contoso paid Jordan Rivera $1,000.00")) == 1
 
 
 def test_an_embedder_that_raises_never_costs_the_answer_its_sources(monkeypatch):
-    def boom(texts, base_dir=None):
+    def boom(texts, base_dir=None, timeout=None):
         raise RuntimeError("llama context died")
 
     monkeypatch.setattr("smartloop.db.embeddings.encode_texts", boom)
@@ -637,7 +637,7 @@ def test_the_chunk_text_never_leaks_to_the_client(monkeypatch):
 
 def test_the_lexical_fallback_also_judges_on_chunks(monkeypatch):
     monkeypatch.setattr("smartloop.db.embeddings.encode_texts",
-                        lambda texts, base_dir=None: None)
+                        lambda texts, base_dir=None, timeout=None: None)
     answer = "Contoso paid Jordan Rivera $1,000.00 for contract work services."
     by_chunk = _chunked(chunks=[CAMERA_CHUNK], extract=INVOICE)
     assert _verified_citations([by_chunk], answer) == []

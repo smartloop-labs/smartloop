@@ -297,7 +297,7 @@ async def test_the_sources_are_embedded_while_the_answer_is_still_streaming():
     encoded = []
     sources_done = threading.Event()
 
-    def encode(texts, base_dir=None):
+    def encode(texts, base_dir=None, timeout=None):
         encoded.append(list(texts))
         sources_done.set()
         return _fake_vectors(texts)
@@ -325,7 +325,7 @@ async def test_once_the_answer_arrives_only_the_answer_is_embedded():
     # been done earlier.
     encoded = []
 
-    def encode(texts, base_dir=None):
+    def encode(texts, base_dir=None, timeout=None):
         encoded.append(list(texts))
         return _fake_vectors(texts)
 
@@ -341,7 +341,7 @@ async def test_a_web_style_source_is_windowed_and_embedded_up_front():
     """A citation with only a fetched page, which is what a web result is."""
     encoded = []
 
-    def encode(texts, base_dir=None):
+    def encode(texts, base_dir=None, timeout=None):
         encoded.append(list(texts))
         return _fake_vectors(texts)
 
@@ -362,7 +362,7 @@ async def test_an_interrupt_never_embeds_the_answer():
     release = threading.Event()
     encoded = []
 
-    def encode(texts, base_dir=None):
+    def encode(texts, base_dir=None, timeout=None):
         encoded.append(list(texts))
         return _fake_vectors(texts)
 

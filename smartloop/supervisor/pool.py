@@ -33,6 +33,7 @@ from typing import Callable, Dict, Optional
 import httpx
 
 from smartloop.supervisor.registry import AgentRecord, AgentRegistry
+from smartloop.supervisor.spawn import DetachedProcess, popen_detached_devnull
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +54,6 @@ _BACKOFF_RESET_AFTER = 120.0
 #: take the machine down with it. Stopping that one child returns the memory
 #: and leaves every other project serving; the next request starts it again.
 DEFAULT_MEMORY_LIMIT_BYTES = 0
-
-
-def _detached_process_kwargs() -> dict:
-    """Popen arguments that put a child in its own process group."""
-    if os.name == "nt":
-        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
-    return {"start_new_session": True}
 
 
 class ChildStartError(RuntimeError):
@@ -152,7 +146,7 @@ class ProjectAgentPool:
         # How a child is launched.  Overridable so the lifecycle can be
         # exercised against a process that does not load a model.
         self._command_for = command_for or self._default_command
-        self._processes: Dict[str, subprocess.Popen] = {}
+        self._processes: Dict[str, subprocess.Popen | DetachedProcess] = {}
         self._backoff: Dict[str, float] = {}
         self._locks: Dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
@@ -222,21 +216,14 @@ class ProjectAgentPool:
         env = self._environment(project_id)
         logger.info("[supervisor] starting project agent for %s", project_id)
         try:
-            process = subprocess.Popen(
-                command,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                # A child's own logging goes to the workspace log; leaving the
-                # pipes unread would eventually block it on a full buffer.
-                stdout=None,
-                stderr=None,
-                # Detach from our console/process group so a Ctrl-C in the
-                # terminal reaches the supervisor only — it then stops the
-                # children itself, in order, after the model host they use.
-                # subprocess ignores start_new_session on Windows, which needs
-                # the creation flag instead.
-                **_detached_process_kwargs(),
-            )
+            # Detach from our console/process group so a Ctrl-C in the terminal
+            # reaches the supervisor only — it then stops the children itself,
+            # in order, after the model host they use.  Detachment and the
+            # close_fds hygiene come from spawn.py, which uses posix_spawn so
+            # no fork() is taken: a fork() while the host's gRPC server is
+            # mid-RPC is exactly the class of crash this pool is built to
+            # contain.  Windows falls back to the creation-flag Popen.
+            process = popen_detached_devnull(command, env)
         except OSError as exc:
             raise ChildStartError(
                 f"could not spawn an agent for project {project_id}: {exc}"
