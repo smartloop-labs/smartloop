@@ -1,25 +1,19 @@
 """The interface a project agent uses to reach the generative model.
 
-Two implementations, deliberately in that order:
+The model is always reached through the gRPC IPC transport.  The host process
+owns the device and serves the model; project agents only ever call into it
+through :class:`RemoteModelClient`.
 
-* :class:`InProcessModelClient` — calls the :class:`ModelService` living in
-  this process.  The default, and byte-for-byte the path that ran before the
-  model host existed: one extra method call, no transport, no behaviour change.
-* :class:`RemoteModelClient` — the same operations over a unix socket to a host
-  process that owns the device.
+The in-process implementation remains only for the host's own local call path,
+not as a user-visible fallback or a second transport mode.
 
-Defining the interface first and keeping the in-process path behind it is what
-makes the transport safe to build: nothing regresses while it is written, and
-the default only moves once the two have been measured against each other.
-
-Select with ``SLP_MODEL_HOST`` — a socket path (or ``host:port``); unset means
-in-process.
+Select with ``SLP_MODEL_HOST`` — a unix socket path (or ``host:port``); if it
+is unset, the default host socket is used.
 """
 
 from __future__ import annotations
 
 import hashlib
-import itertools
 import logging
 import os
 import socket
@@ -28,13 +22,12 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Iterator, List, Optional
 
+import grpc
 import numpy as np
 
-from smartloop.model_host import protocol
+from smartloop.model_host import model_host_pb2 as pb2
+from smartloop.model_host import model_host_pb2_grpc as pb2_grpc
 from smartloop.workspace.context import pinned_project_id
-from smartloop.model_host.protocol import (
-    CANCEL, CHUNK, ERROR, REQUEST, RESULT, ConnectionClosed, ProtocolError,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +41,11 @@ _device_owner = False
 #: than guessed from the platform, which is what CPython's own ``socketpair``
 #: does — Windows builds simply do not define it.
 HAS_UNIX_SOCKETS = hasattr(socket, "AF_UNIX")
+
+#: grpcio's default cap on a received message is 4 MiB; an embedding batch can
+#: exceed that.  Mirrors the server's own ceiling so a large payload is
+#: refused on both sides at the same limit.
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
 def mark_device_owner() -> None:
@@ -93,8 +91,8 @@ class ModelClient(ABC):
         """Complete *prompt*, yielding text as it is produced.
 
         *cancelled* is cooperative and observed between tokens — a native
-        llama.cpp call cannot be interrupted mid-token, in-process or over a
-        socket.
+        llama.cpp call cannot be interrupted mid-token, in-process or over the
+        wire.
         """
 
     # -- embedding ----------------------------------------------------------
@@ -222,7 +220,12 @@ class InProcessModelClient(ModelClient):
     def encode_texts(self, texts, base_dir=None):
         from smartloop.db import embeddings
 
-        return embeddings.encode_texts(texts, base_dir=base_dir)
+        # ``encode_local``, not ``encode_texts``: this process owns the
+        # embedder, and this is also the host's own serving path.  Asking the
+        # routing entry point would let a host serve ``EncodeTexts`` by
+        # sending one — a call it can only answer by sending another, one
+        # gRPC worker consumed per hop.
+        return embeddings.encode_local(texts, base_dir=base_dir)
 
     def is_loaded(self) -> bool:
         return self._service.is_loaded()
@@ -263,189 +266,221 @@ class InProcessModelClient(ModelClient):
 
 
 class RemoteModelClient(ModelClient):
-    """The device is owned by a model host — talk to it over a socket.
+    """The device is owned by a model host — talk to it over gRPC.
 
-    One connection, serialized by a lock: the protocol interleaves nothing, and
-    a project agent's concurrency is already bounded by the host's own
-    ``n_parallel`` budget, so a connection pool would only move the queue
-    without widening it.
+    One channel, used by every thread: gRPC multiplexes RPCs on it, and a
+    project agent's concurrency is already bounded by the host's own
+    ``n_parallel`` budget, so a pool would only move the queue without
+    widening it.
 
-    The connection is opened lazily and re-opened on failure, so a host restart
-    costs the in-flight request rather than the client.
+    The channel is opened lazily and reconnects transparently on failure, so a
+    host restart costs the in-flight request rather than the client.
     """
 
     def __init__(self, address: str, timeout: float = 600.0) -> None:
         self.address = address
         self._timeout = timeout
-        self._sock: Optional[socket.socket] = None
-        self._lock = threading.RLock()
-        self._ids = itertools.count(1)
+        self._channel: Optional[grpc.Channel] = None
+        self._stub: Optional[pb2_grpc.ModelHostStub] = None
+        self._lock = threading.Lock()
 
     # -- transport ----------------------------------------------------------
 
-    def _connect(self) -> socket.socket:
-        if self._sock is not None:
-            return self._sock
-        host, port = parse_address(self.address)
-        if port is None:
-            if not HAS_UNIX_SOCKETS:
-                raise ModelHostError(
-                    f"{self.address} is a unix socket path, which this platform "
-                    "cannot open; the host should be listening on host:port"
+    def _connect(self) -> pb2_grpc.ModelHostStub:
+        if self._stub is not None:
+            return self._stub
+        with self._lock:
+            if self._stub is None:
+                host, port = parse_address(self.address)
+                if port is None and not HAS_UNIX_SOCKETS:
+                    raise ModelHostError(
+                        f"{self.address} is a unix socket path, which this platform "
+                        "cannot open; the host should be listening on host:port"
+                    )
+                if port == 0:
+                    raise ModelHostError(
+                        f"model host address {self.address!r} is not bound: "
+                        "the host is not listening on a real port"
+                    )
+                channel = grpc.insecure_channel(
+                    _grpc_target(self.address),
+                    options=[
+                        ("grpc.max_send_message_length", MAX_MESSAGE_BYTES),
+                        ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
+                    ],
                 )
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(self._timeout)
-            sock.connect(host)
-        else:
-            sock = socket.create_connection((host, port), timeout=self._timeout)
-        self._sock = sock
-        logger.info("[model-host] connected to %s", self.address)
-        return sock
-
-    def _drop(self) -> None:
-        sock, self._sock = self._sock, None
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
+                self._channel = channel
+                self._stub = pb2_grpc.ModelHostStub(channel)
+                logger.info("[model-host] connected to %s", self.address)
+            return self._stub
 
     def close(self) -> None:
         with self._lock:
             self._drop()
 
-    def _call(self, op: str, **args):
-        """Send *op* and return its single result.
+    def _drop(self) -> None:
+        """Close the channel and forget it, so the next call reconnects."""
+        if self._channel is not None:
+            self._channel.close()
+            self._channel = None
+            self._stub = None
 
-        The exchange is closed explicitly rather than left to the collector.
-        It holds the connection lock for its whole body, and abandoning the
-        generator would leave releasing that lock to whenever the object
-        happens to be finalised — which works under CPython's refcounting and
-        would deadlock the next thread anywhere it does not.
+    def _unary(self, method: str, request, timeout: Optional[float] = None):
+        """Run one unary RPC and return its message, or raise :class:`ModelHostError`.
+
+        *timeout* overrides the client-wide default for a single call, so a
+        latency-sensitive path can impose its own deadline (and fall back to
+        whatever it does without the host) without reshaping every caller.
         """
-        exchange = self._exchange(op, args, streaming=False)
         try:
-            for value in exchange:
-                return value
-            return None
-        finally:
-            exchange.close()
-
-    def _exchange(self, op: str, args: dict, streaming: bool,
-                  cancelled: Optional[threading.Event] = None) -> Iterator:
-        """Run one request to completion, yielding chunks then the result.
-
-        Holds the connection lock for the whole exchange — including a
-        streamed generation, which is what serializes this client's requests.
-        """
-        with self._lock:
-            request_id = next(self._ids)
-            try:
-                sock = self._connect()
-                # Model selection is project-scoped — per-project settings
-                # override the workspace defaults — so the host has to resolve
-                # it against *this* project, not against whichever one the UI
-                # happens to have selected in the supervisor.
-                args = {**args, "project_id": pinned_project_id()}
-                protocol.send_frame(
-                    sock, {"id": request_id, "type": REQUEST, "op": op, "args": args},
-                )
-                cancel_sent = False
-                while True:
-                    if (streaming and cancelled is not None
-                            and cancelled.is_set() and not cancel_sent):
-                        # Advisory: the host stops between tokens, and the
-                        # terminal frame still arrives, so the connection stays
-                        # usable for the next request.
-                        protocol.send_frame(sock, {"id": request_id, "type": CANCEL})
-                        cancel_sent = True
-                    frame = protocol.recv_frame(sock)
-                    if frame.get("id") != request_id:
-                        raise ProtocolError(
-                            f"host answered request {frame.get('id')}, expected {request_id}"
-                        )
-                    kind = frame.get("type")
-                    if kind == CHUNK:
-                        yield frame.get("text", "")
-                    elif kind == RESULT:
-                        yield frame.get("value")
-                        return
-                    elif kind == ERROR:
-                        raise ModelHostError(frame.get("error") or "model host failed")
-                    else:
-                        raise ProtocolError(f"unexpected frame type {kind!r}")
-            except (OSError, ConnectionClosed) as exc:
+            return getattr(self._connect(), method)(
+                request, timeout=self._timeout if timeout is None else timeout
+            )
+        except grpc.RpcError as exc:
+            if exc.code() == grpc.StatusCode.UNAVAILABLE:
+                # The host is gone (crashed, restarted, or never there).  A
+                # dead channel caches that failure; drop it so the next call
+                # reconnects instead of re-raising.
                 self._drop()
-                raise ModelHostError(f"model host at {self.address} is unreachable: {exc}") from exc
+            raise _rpc_error(self.address, exc) from exc
 
     # -- ModelClient --------------------------------------------------------
 
     def generate(self, prompt, model_name=None, capability=None,
                  max_tokens=None, thinking=None) -> str:
-        return self._call("generate", prompt=prompt, model_name=model_name,
-                          capability=capability, max_tokens=max_tokens,
-                          thinking=thinking) or ""
+        request = pb2.GenerateRequest(prompt=prompt or "")
+        if model_name:
+            request.model_name = model_name
+        if capability:
+            request.capability = capability
+        if max_tokens is not None:
+            request.max_tokens = max_tokens
+        if thinking is not None:
+            request.thinking = thinking
+        request.project_id = pinned_project_id() or ""
+        reply = self._unary("Generate", request)
+        return reply.text or ""
 
     def stream(self, prompt, model_name=None, capability=None, cancelled=None,
                thinking=None):
-        stream = self._exchange(
-            "stream",
-            {"prompt": prompt, "model_name": model_name,
-             "capability": capability, "thinking": thinking},
-            streaming=True,
-            cancelled=cancelled,
-        )
-        for item in stream:
-            # The terminal RESULT frame closes the stream and carries nothing.
-            if item is None:
-                return
-            yield item
+        request = pb2.StreamRequest(prompt=prompt or "")
+        if model_name:
+            request.model_name = model_name
+        if capability:
+            request.capability = capability
+        if thinking is not None:
+            request.thinking = thinking
+        request.project_id = pinned_project_id() or ""
 
-    def encode_texts(self, texts, base_dir=None):
-        return protocol.decode_array(
-            self._call("encode_texts", texts=list(texts), base_dir=base_dir)
-        )
+        call = None
+        try:
+            call = self._connect().Stream(request, timeout=None)
+            for item in call:
+                if cancelled is not None and cancelled.is_set():
+                    # Advisory, exactly like the old cancel frame: the host
+                    # stops between tokens, and the connection stays usable
+                    # for the next request.
+                    call.cancel()
+                    return
+                yield item.text
+        except grpc.RpcError as exc:
+            if exc.code() == grpc.StatusCode.UNAVAILABLE:
+                self._drop()
+            raise _rpc_error(self.address, exc) from exc
+        finally:
+            # Abandoned mid-way (a caller that broke out of the loop) must
+            # cancel the RPC server-side, or a generation would be computed
+            # for nobody.  Harmless once the stream has finished.
+            if call is not None:
+                call.cancel()
+
+    def encode_texts(self, texts, base_dir=None, timeout: Optional[float] = None):
+        request = pb2.EncodeTextsRequest(texts=list(texts), base_dir=base_dir or "")
+        request.project_id = pinned_project_id() or ""
+        reply = self._unary("EncodeTexts", request, timeout=timeout)
+        if not reply.shape:
+            return None
+        return np.frombuffer(reply.data, dtype=np.float32).reshape(reply.shape)
 
     def is_loaded(self) -> bool:
-        return bool(self._call("is_loaded"))
+        return bool(self._bool_reply("IsLoaded").value)
 
     def supports_thinking(self, capability=None) -> bool:
-        return bool(self._call("supports_thinking", capability=capability))
+        request = pb2.SupportsThinkingRequest(capability=capability or "")
+        request.project_id = pinned_project_id() or ""
+        return self._unary("SupportsThinking", request).value
 
     def model_name(self) -> Optional[str]:
-        return self._call("model_name")
+        return self._str_reply("ModelName").value or None
 
     def model_label(self, capability=None) -> str:
-        return self._call("model_label", capability=capability) or ""
+        request = pb2.ModelLabelRequest(capability=capability or "")
+        request.project_id = pinned_project_id() or ""
+        return self._unary("ModelLabel", request).value or ""
 
     def count_tokens(self, text: str) -> int:
-        return int(self._call("count_tokens", text=text) or 0)
+        request = pb2.CountTokensRequest(text=text or "")
+        request.project_id = pinned_project_id() or ""
+        return self._unary("CountTokens", request).value
 
     def max_context_tokens(self) -> int:
-        return int(self._call("max_context_tokens") or 0)
+        return self._int_reply("MaxContextTokens").value
 
     def response_max_context_tokens(self, capability=None) -> int:
-        return int(self._call("response_max_context_tokens",
-                              capability=capability) or 0)
+        request = pb2.ResponseMaxContextRequest(capability=capability or "")
+        request.project_id = pinned_project_id() or ""
+        return self._unary("ResponseMaxContextTokens", request).value
 
     def has_capability_model(self, capability: str) -> bool:
-        return bool(self._call("has_capability_model", capability=capability))
+        request = pb2.HasCapabilityRequest(capability=capability or "")
+        request.project_id = pinned_project_id() or ""
+        return self._unary("HasCapabilityModel", request).value
 
     def idle_seconds(self) -> float:
-        return float(self._call("idle_seconds") or 0.0)
+        return self._float_reply("IdleSeconds").value
 
     def load_model(self) -> Optional[str]:
-        return self._call("load_model")
+        return self._str_reply("LoadModel").value or None
 
     def unload_auxiliary_models(self, include_embedding: bool = True) -> None:
-        self._call("unload_auxiliary_models", include_embedding=include_embedding)
+        request = pb2.UnloadAuxiliaryRequest(include_embedding=include_embedding)
+        request.project_id = pinned_project_id() or ""
+        self._unary("UnloadAuxiliaryModels", request)
 
     def unload_embedding_model(self) -> None:
-        self._call("unload_embedding_model")
+        self._unary("UnloadEmbeddingModel", self._project_request())
+
+    # -- request/reply helpers ---------------------------------------------
+
+    def _project_request(self) -> pb2.ProjectRequest:
+        return pb2.ProjectRequest(project_id=pinned_project_id() or "")
+
+    def _bool_reply(self, method: str) -> pb2.BoolReply:
+        return self._unary(method, self._project_request())
+
+    def _str_reply(self, method: str) -> pb2.StringReply:
+        return self._unary(method, self._project_request())
+
+    def _int_reply(self, method: str) -> pb2.IntReply:
+        return self._unary(method, self._project_request())
+
+    def _float_reply(self, method: str) -> pb2.FloatReply:
+        return self._unary(method, self._project_request())
 
 
 class ModelHostError(RuntimeError):
     """The model host refused, failed, or could not be reached."""
+
+
+def _rpc_error(address: str, exc: grpc.RpcError) -> ModelHostError:
+    """Describe a failed RPC the way a failing socket used to be described."""
+    code = exc.code()
+    details = exc.details() or str(code)
+    if code == grpc.StatusCode.UNAVAILABLE:
+        return ModelHostError(f"model host at {address} is unreachable: {details}")
+    if code == grpc.StatusCode.CANCELLED:
+        return ModelHostError(f"model host at {address} cancelled the call: {details}")
+    return ModelHostError(f"model host at {address} failed: {details}")
 
 
 def parse_address(address: str) -> tuple[str, Optional[int]]:
@@ -465,6 +500,14 @@ def parse_address(address: str) -> tuple[str, Optional[int]]:
     if sep and port.isdigit():
         return (host or "127.0.0.1"), int(port)
     return address, None
+
+
+def _grpc_target(address: str) -> str:
+    """How gRPC addresses *address*: ``unix:``-prefixed or ``host:port``."""
+    host, port = parse_address(address)
+    if port is None:
+        return f"unix:{host}"
+    return f"{host}:{port}"
 
 
 #: Longest a unix socket path may be. ``sockaddr_un.sun_path`` is 108 bytes on
@@ -515,17 +558,31 @@ def default_socket_path(home_dir: str) -> str:
 
 
 def get_model_client(model_service=None) -> ModelClient:
-    """The client this process should use, from ``SLP_MODEL_HOST``.
+    """The client this process should use.
 
-    Unset means the model lives in this process and calls go straight
-    through — which is the supervisor itself (it hosts the device) and the
-    ``--no-supervised`` fallback.
+    A project child gets a host address from ``SLP_MODEL_HOST``; a process that
+    owns the device, or one that has not started a host yet, must stay on the
+    in-process path instead of trying to reach a placeholder ``127.0.0.1:0``.
+
+    A port of zero is not a real bind and must never be treated as a usable
+    model host address; it indicates the host was not started or was asked to
+    bind on an ephemeral port that never got published.
     """
-    address = (os.environ.get("SLP_MODEL_HOST") or "").strip()
-    if not address or is_device_owner():
-        if model_service is None:
-            from smartloop.api.services import get_model_service
+    from smartloop.config import AppSettings
 
-            model_service = get_model_service()
-        return InProcessModelClient(model_service)
+    address = (os.environ.get("SLP_MODEL_HOST") or "").strip()
+    if not address:
+        # No explicit host means there is no model-host process to reach in this
+        # process.  The single-server and local-owner paths remain in-process;
+        # a child without a host address should never silently fall through to
+        # a remote connection against a placeholder port.
+        if model_service is not None:
+            return InProcessModelClient(model_service)
+        address = default_socket_path(AppSettings().home_dir)
+
+    if parse_address(address)[1] == 0:
+        raise ModelHostError(
+            f"model host address {address!r} is not bound: "
+            "a real host port is required before remote model access"
+        )
     return RemoteModelClient(address)

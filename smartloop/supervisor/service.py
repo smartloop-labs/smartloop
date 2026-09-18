@@ -66,13 +66,10 @@ def supervision_enabled() -> bool:
 def model_host_enabled() -> bool:
     """Whether the supervisor should run a model host for its children.
 
-    On by default under supervision, because it is the thing that makes
-    per-project processes affordable: without it every child loads its own copy
-    of the weights into the same device.  ``SLP_MODEL_HOST_DISABLE=1`` opts out
-    for debugging a single child.
+    The gRPC IPC path is the only supported transport; any opt-out is ignored so
+    the shared model host remains the default and the only routing choice.
     """
-    return (os.environ.get("SLP_MODEL_HOST_DISABLE", "").strip().lower()
-            not in ("1", "true", "yes"))
+    return True
 
 
 class Supervisor:
@@ -209,11 +206,6 @@ class Supervisor:
         reach it over the socket exactly as they would a separate host, so
         splitting it out later changes nothing on their side.
         """
-        if not model_host_enabled():
-            logger.info("[supervisor] model host disabled; children load their own")
-            self.registry.set_model_host(None, None)
-            return None
-
         from smartloop.api.services import get_model_service
         from smartloop.model_host.client import (
             InProcessModelClient, default_socket_path,

@@ -420,6 +420,14 @@ _MAX_WINDOWS = 8
 _CITATION_MAX_DISTANCE = _MIN_BEST_DISTANCE
 _CITATION_CUTOFF_MARGIN = 0.30
 
+#: RPC budget for the verification-time encode calls against the model host
+#: (seconds).  Verification is a nicety layered on top of an already-streamed
+#: answer, so it must never hold the pause hostage: when the host is busy
+#: embedding an in-flight generation, these calls time out and the check falls
+#: back to lexical matching instead of silently extending the wait by the
+#: client's 600s default.
+_VERIFY_ENCODE_TIMEOUT_S = 30.0
+
 
 def _windows(text: str) -> list:
     """*text* split into overlapping windows the embedder can take whole.
@@ -507,7 +515,9 @@ def _semantic_distances(citations: list, response: str, base_dir) -> list | None
         owners.extend([i] * len(texts))
         pending.extend(texts)
 
-    encoded = encode_texts(answer_windows + pending, base_dir)
+    encoded = encode_texts(
+        answer_windows + pending, base_dir, timeout=_VERIFY_ENCODE_TIMEOUT_S,
+    )
     if encoded is None or len(encoded) != len(answer_windows) + len(pending):
         # No embedding model on this install, or encoding failed.
         return None
@@ -746,7 +756,9 @@ def _prepare_citation_sources(citations, model_service) -> None:
             warmup(base_dir)
             return
 
-        encoded = encode_texts(pending, base_dir)
+        encoded = encode_texts(
+            pending, base_dir, timeout=_VERIFY_ENCODE_TIMEOUT_S,
+        )
         if encoded is None:
             return
         for (citation, i), vector in zip(slots, encoded):

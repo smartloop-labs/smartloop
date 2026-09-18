@@ -33,6 +33,7 @@ from typing import Callable, Dict, Optional
 import httpx
 
 from smartloop.supervisor.registry import AgentRecord, AgentRegistry
+from smartloop.supervisor.spawn import DetachedProcess, popen_detached_devnull
 
 logger = logging.getLogger(__name__)
 
@@ -55,15 +56,66 @@ _BACKOFF_RESET_AFTER = 120.0
 DEFAULT_MEMORY_LIMIT_BYTES = 0
 
 
-def _detached_process_kwargs() -> dict:
-    """Popen arguments that put a child in its own process group."""
-    if os.name == "nt":
-        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
-    return {"start_new_session": True}
-
-
 class ChildStartError(RuntimeError):
     """A project agent could not be started, or never became healthy."""
+
+
+def _is_own_pid(launcher_pid: int, candidate_pid: int) -> bool:
+    """Whether *candidate_pid* is the process we spawned, or one it launched.
+
+    Some Python installs on Windows point ``sys.executable`` at a ``python.exe``
+    that is itself a launcher: it starts the real interpreter as a child and
+    simply waits on it, so ``Popen.pid`` names the launcher while the project
+    agent's own ``os.getpid()`` — the one it publishes — names the grandchild.
+    Direct equality is the common case; walking descendants covers that one,
+    without which a launcher-style interpreter can never pass this check and
+    every cold start times out and retries forever.
+    """
+    if launcher_pid == candidate_pid:
+        return True
+    try:
+        import psutil
+        return any(
+            child.pid == candidate_pid
+            for child in psutil.Process(launcher_pid).children(recursive=True)
+        )
+    except Exception:
+        return False
+
+
+def _live_children(pid: int) -> list:
+    """Snapshot of *pid*'s live children, before anything might kill it.
+
+    Has to be taken before termination, not after: once a process has exited,
+    ``psutil`` can no longer be asked what its children were, and the whole
+    point of this is to find a real project agent process still running
+    under a launcher-style interpreter (see :func:`_is_own_pid`) after that
+    launcher is gone.
+    """
+    try:
+        import psutil
+        return psutil.Process(pid).children(recursive=True)
+    except Exception:
+        return []
+
+
+def _kill_all(procs) -> None:
+    """Best-effort kill of every process in *procs*, waited on to completion.
+
+    ``Popen.terminate()``/``kill()`` reach only the process we hold the handle
+    for. On Windows nothing propagates that to a child a launcher-style
+    interpreter started, so without this the real project agent process is
+    orphaned rather than stopped whenever the launcher and the worker are
+    different pids. The wait matters as much as the kill: without it, a
+    caller checking liveness right after ``stop()`` returns can still catch
+    the process before Windows has reaped it.
+    """
+    for proc in procs:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
 
 class ProjectAgentPool:
@@ -94,7 +146,7 @@ class ProjectAgentPool:
         # How a child is launched.  Overridable so the lifecycle can be
         # exercised against a process that does not load a model.
         self._command_for = command_for or self._default_command
-        self._processes: Dict[str, subprocess.Popen] = {}
+        self._processes: Dict[str, subprocess.Popen | DetachedProcess] = {}
         self._backoff: Dict[str, float] = {}
         self._locks: Dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
@@ -164,21 +216,14 @@ class ProjectAgentPool:
         env = self._environment(project_id)
         logger.info("[supervisor] starting project agent for %s", project_id)
         try:
-            process = subprocess.Popen(
-                command,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                # A child's own logging goes to the workspace log; leaving the
-                # pipes unread would eventually block it on a full buffer.
-                stdout=None,
-                stderr=None,
-                # Detach from our console/process group so a Ctrl-C in the
-                # terminal reaches the supervisor only — it then stops the
-                # children itself, in order, after the model host they use.
-                # subprocess ignores start_new_session on Windows, which needs
-                # the creation flag instead.
-                **_detached_process_kwargs(),
-            )
+            # Detach from our console/process group so a Ctrl-C in the terminal
+            # reaches the supervisor only — it then stops the children itself,
+            # in order, after the model host they use.  Detachment and the
+            # close_fds hygiene come from spawn.py, which uses posix_spawn so
+            # no fork() is taken: a fork() while the host's gRPC server is
+            # mid-RPC is exactly the class of crash this pool is built to
+            # contain.  Windows falls back to the creation-flag Popen.
+            process = popen_detached_devnull(command, env)
         except OSError as exc:
             raise ChildStartError(
                 f"could not spawn an agent for project {project_id}: {exc}"
@@ -193,8 +238,8 @@ class ProjectAgentPool:
             self._processes[project_id] = process
         try:
             project_dir = self.project_dir_for(project_id)
-            port = self._await_port(project_id, process, project_dir)
-            record = AgentRecord(project_id, process.pid, port)
+            real_pid, port = self._await_port(project_id, process, project_dir)
+            record = AgentRecord(project_id, real_pid, port)
             self._await_health(project_id, process, record)
         except BaseException:
             with self._lock:
@@ -247,12 +292,19 @@ class ProjectAgentPool:
         return env
 
     def _await_port(self, project_id: str, process: subprocess.Popen,
-                    project_dir: Optional[str]) -> int:
+                    project_dir: Optional[str]) -> tuple[int, int]:
         """Wait for the child to publish the port it bound.
 
         The child writes ``agent.port`` beside its project as soon as it has
         one, before uvicorn finishes starting, so this resolves well before the
         model is loaded.
+
+        Returns ``(pid, port)`` rather than just the port: on some Windows
+        Python installs, the interpreter named by ``sys.executable`` is itself
+        a launcher that starts the real interpreter as a child and waits on
+        it, so ``process.pid`` names the launcher while the project agent's
+        own ``os.getpid()`` — the pid it publishes — names the grandchild.
+        The caller needs that real pid to track and stop the right process.
         """
         from smartloop.supervisor.registry import read_project_agent
 
@@ -268,8 +320,8 @@ class ProjectAgentPool:
                     f"{process.returncode} before binding a port"
                 )
             published = read_project_agent(project_dir)
-            if published and published[0] == process.pid:
-                return published[1]
+            if published and _is_own_pid(process.pid, published[0]):
+                return published
             time.sleep(0.05)
         self._kill(process)
         raise ChildStartError(
@@ -377,7 +429,9 @@ class ProjectAgentPool:
                 logger.exception("[supervisor] failed to stop pid %d", process.pid)
 
     def _terminate(self, process: subprocess.Popen, timeout: float) -> None:
+        descendants = _live_children(process.pid)
         if process.poll() is not None:
+            _kill_all(descendants)
             return
         try:
             process.terminate()
@@ -388,14 +442,17 @@ class ProjectAgentPool:
             self._kill(process)
         except OSError:
             pass
+        _kill_all(descendants)
 
     @staticmethod
     def _kill(process: subprocess.Popen) -> None:
+        descendants = _live_children(process.pid)
         try:
             process.kill()
             process.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
             pass
+        _kill_all(descendants)
 
     # -- the reaper ---------------------------------------------------------
 

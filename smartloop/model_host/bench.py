@@ -1,9 +1,9 @@
 """Measure a client against the in-process path before switching the default.
 
 The transport is the risky part of moving the model out of the agent: it sits
-on the inference hot path, and a per-token frame that costs more than a token
-is worth would show up as a slower answer, not as an error.  So the default
-does not move on argument — it moves on a number from here.
+on the inference hot path, and a per-message overhead that costs more than the
+token it delivers would show up as a slower answer, not as an error.  So the
+default does not move on argument — it moves on a number from here.
 
 Run against whatever this process would use::
 

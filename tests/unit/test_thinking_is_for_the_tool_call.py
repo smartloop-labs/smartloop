@@ -177,14 +177,14 @@ class TestTheFlagReachesTheModelHost:
 
         assert client.stream.call_args.kwargs["thinking"] is False
 
-    def test_the_host_serves_what_the_frame_asked_for(self):
-        from smartloop.model_host.host import _OPERATIONS
+    def test_the_host_serves_what_the_request_asked_for(self):
+        from smartloop.model_host import model_host_pb2 as pb2
+        from smartloop.model_host.host import _ModelHostServicer
 
         served = MagicMock()
         served.generate.return_value = "ok"
-        _OPERATIONS["generate"](served, {
-            "prompt": "hi", "thinking": True, "max_tokens": 1024,
-        })
+        request = pb2.GenerateRequest(prompt="hi", thinking=True, max_tokens=1024)
+        _ModelHostServicer(served).Generate(request, MagicMock())
 
         assert served.generate.call_args.kwargs["thinking"] is True
         assert served.generate.call_args.kwargs["max_tokens"] == 1024

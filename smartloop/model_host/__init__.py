@@ -1,8 +1,8 @@
 """The generative model, factored out of the per-project process.
 
-See :mod:`smartloop.model_host.protocol` for why the model is the one thing
-that must not be per-project, and :mod:`smartloop.model_host.client` for the
-interface a project agent reaches it through.
+See :mod:`smartloop.model_host.client` for the interface a project agent
+reaches the model through, and :mod:`smartloop.model_host.host` for the
+process that owns it.
 """
 
 from smartloop.model_host.client import (
