@@ -22,6 +22,7 @@ from smartloop.workspace.context import (
     active_project_id, owned_project_id, pinned_project_id, projects_delegated,
 )
 from smartloop.workspace.types import Document, DocumentInfo, DocumentStatus, Skill
+from smartloop.paths import expand_home
 
 _settings = AppSettings()
 logger = logging.getLogger(__name__)
@@ -55,7 +56,7 @@ def _home_dir() -> str:
     environment, so the home has to be re-read at the moment it is needed.
     """
     home = os.environ.get("SLP_HOME")
-    return os.path.expanduser(home) if home else _settings.home_dir
+    return expand_home(home) if home else _settings.home_dir
 
 
 class _ConfigFilePath:
@@ -71,7 +72,7 @@ class _ConfigFilePath:
     def __get__(self, obj, owner=None) -> str:
         override = os.environ.get("SLP_CONFIG_FILE")
         if override:
-            return os.path.expanduser(override)
+            return expand_home(override)
         return os.path.join(_home_dir(), "config.json")
 
 
@@ -423,11 +424,10 @@ class Project (BaseModel):
 
         Anchored to ``project_dir`` — i.e. under the framework's own home —
         never to a client-supplied path.  ``project_dir`` derives from
-        ``AppSettings.home_dir``, so it follows ``SLP_HOME`` and, under the
-        macOS App Sandbox, moves into the app container automatically.  A
-        client-supplied absolute path would not: it would keep pointing at the
-        real home the sandbox denies, leaving the app reading one workspace
-        and writing another.
+        ``AppSettings.home_dir``, which is ``SLP_HOME`` else ``~/.smartloop``
+        in every build, sandboxed or not.  A client-supplied absolute path
+        would not follow it, leaving the app reading one workspace and writing
+        another.
         """
         return os.path.join(self.project_dir, "skills")
 
@@ -448,7 +448,7 @@ class Project (BaseModel):
         since the path may be unreadable under the App Sandbox or simply
         absent on the copy.
         """
-        return os.path.expanduser(self.cwd) if self.cwd else None
+        return expand_home(self.cwd) if self.cwd else None
 
     def get_skills(self) -> List["Skill"]:
         """Read skills from disk (SKILL.md files), the single source of truth."""

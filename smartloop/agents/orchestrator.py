@@ -44,6 +44,7 @@ from smartloop.agents.orchestration.step_executor import StepExecutor
 from smartloop.agents.orchestration.tool_fanout import ToolFanout
 from smartloop.agents.orchestration.response_builder import ResponseBuilder
 from smartloop.agents.orchestration.pipeline_builder import PipelineBuilder
+from smartloop.paths import expand_home
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +255,7 @@ class SLPOrchestrator:
     ) -> _OrchestratorContext:
         """Build the shared orchestrator context from input parameters."""
         available_servers = self._steps.build_available_servers(mcp_servers)
-        effective_cwd = os.path.expanduser(cwd or project_dir or os.getcwd())
+        effective_cwd = expand_home(cwd or project_dir or os.getcwd())
 
         mcp_tool_contexts: List[MCPToolContext] = []
         for srv in available_servers:

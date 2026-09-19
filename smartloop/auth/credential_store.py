@@ -14,6 +14,7 @@ import logging
 import os
 import stat
 import threading
+from smartloop.paths import expand_home, real_home
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,8 @@ _REFRESH_TOKEN = "refresh_token"
 # -- file-based storage ----------------------------------------------------
 
 def _slp_home() -> str:
-    return os.path.expanduser(os.environ.get("SLP_HOME", "~/.smartloop"))
+    slp_home = os.environ.get("SLP_HOME")
+    return expand_home(slp_home) if slp_home else os.path.join(real_home(), ".smartloop")
 
 
 def _key_path() -> str:

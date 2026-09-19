@@ -32,7 +32,9 @@ from smartloop.config import AppSettings
 from smartloop.workspace import Workspace
 from smartloop.workspace.context import owns_workspace, pinned_project_id
 from smartloop.utils.log_utils import print_logo
-from smartloop.workspace.migrations import migrate_project_state, split_project_state
+from smartloop.workspace.migrations import (
+    adopt_confined_home, migrate_project_state, split_project_state,
+)
 from smartloop.platform.token_agent import run_token_refresh_loop
 from smartloop.platform.release_agent import run_release_poll_loop
 from smartloop import __version__
@@ -170,6 +172,18 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Smartloop API server...")
     logger.info(f"Debug mode setting: {api_settings.debug_mode}")
 
+    # The framework home is ~/.smartloop in every build, so the app and the
+    # CLI share one workspace.  A build that shipped before the home was
+    # resolved past the sandbox left its state under the rewritten $HOME —
+    # inside the App Sandbox container, or under ~/snap/smartloop/<rev> — so
+    # bring that forward before anything reads the home.  Best-effort: a
+    # sandbox that denies the real home leaves the install running where it
+    # already is, which is worse than the move but better than not starting.
+    try:
+        adopt_confined_home(api_settings.home_dir)
+    except Exception:
+        logger.exception("Adopting the sandboxed home failed; continuing startup")
+
     workspace = Workspace.load()
 
     # When supervising, this process owns the port, the workspace record and
@@ -183,8 +197,8 @@ async def lifespan(app: FastAPI):
             logger.exception("Supervisor failed to start; serving projects in-process")
 
     # Skills/documents moved from the user-space folder into project_dir so
-    # they follow the framework's home (SLP_HOME, or the App Sandbox
-    # container).  Fold in anything left at the old location.  Best-effort:
+    # they follow the framework's home (SLP_HOME, else ~/.smartloop).  Fold in
+    # anything left at the old location.  Best-effort:
     # the old path may be unreadable under the sandbox, which is precisely the
     # case this migration exists for, so it must never block startup.
     try:

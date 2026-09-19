@@ -17,6 +17,7 @@ from collections import deque
 from typing import Optional
 
 from smartloop.workspace import MCPToolDefinition
+from smartloop.paths import expand_home
 from .client import (
     MCPConnectResult,
     MCPServerInfo,
@@ -49,7 +50,7 @@ class LocalMCPClient:
         self.command = command
         self.args = args
         self.env = env or {}
-        self.cwd = str(os.path.expanduser(cwd)) if cwd else None
+        self.cwd = expand_home(str(cwd)) if cwd else None
         self.timeout = timeout
         self._process: Optional[subprocess.Popen] = None
         self._request_id = 0

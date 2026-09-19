@@ -25,6 +25,7 @@ import logging
 import os
 import shutil
 from typing import TYPE_CHECKING, Optional
+from smartloop.paths import confined_home, expand_home, real_home
 
 if TYPE_CHECKING:  # pragma: no cover
     from smartloop.workspace.workspace import Project, Workspace
@@ -49,9 +50,9 @@ def _legacy_roots(project: "Project") -> list[str]:
     """
     roots: list[str] = []
     if project.cwd:
-        roots.append(os.path.expanduser(project.cwd))
+        roots.append(expand_home(project.cwd))
     if project.name:
-        roots.append(os.path.expanduser(os.path.join("~/smartloop", project.name)))
+        roots.append(os.path.join(real_home(), "smartloop", project.name))
     # De-duplicate while preserving order.
     return list(dict.fromkeys(roots))
 
@@ -127,6 +128,123 @@ def migrate_project_state(workspace: "Workspace") -> dict:
                         "y" if count == 1 else "ies", src, dest,
                     )
     return migrated
+
+
+# ---------------------------------------------------------------------------
+# a sandbox container's framework home → the real ~/.smartloop
+# ---------------------------------------------------------------------------
+#
+# The framework home is ``~/.smartloop`` in every build, so one install serves
+# the app and the CLI alike.  Builds that shipped before the home was resolved
+# past the sandbox put it under the rewritten ``$HOME`` instead — inside the
+# App Sandbox container, or under ``~/snap/smartloop/<revision>`` — and those
+# installs still have their workspace, projects and model weights there.  This
+# brings them forward.
+
+#: Dropped in the old home once its contents have been brought forward, so a
+#: second start does not walk the tree again.  Names the destination, which is
+#: the only thing anyone reading it afterwards wants to know.
+ADOPTED_MARKER = ".adopted-into-real-home"
+
+
+def _move_entry(src: str, dest: str) -> bool:
+    """Move one top-level entry of the old home across.  True when it lands.
+
+    A rename, not a copy: the model weights under ``<workspace>/models`` run
+    to gigabytes, and both sandboxes put their rewritten home on the same
+    volume as the real one, so this costs nothing and needs no free space.
+    Done per entry rather than per tree so that one unreadable directory
+    leaves the rest of the migration intact — and leaves itself where it was,
+    rather than half-copied.
+    """
+    if os.path.exists(dest):
+        # Already brought forward (or created afresh by a newer build); the
+        # copy that is already at the real home is the one in use.
+        return False
+    try:
+        shutil.move(src, dest)
+        return True
+    except OSError:
+        logger.warning("[adopt] could not move %s → %s", src, dest, exc_info=True)
+        return False
+
+
+def adopt_confined_home(dest: str) -> Optional[str]:
+    """Bring a sandbox-located framework home forward to *dest*.
+
+    *dest* is the real ``~/.smartloop``.  Returns the old home when something
+    was actually moved out of it, else ``None``.
+
+    Declines rather than guesses in the two cases where it cannot know what
+    the user wants:
+
+    * ``SLP_HOME`` is set — somebody pinned the home deliberately (a service
+      unit, a test, a packaged build that means to stay in its container) and
+      that instruction outranks this migration;
+    * *dest* already holds a ``config.json`` — there are two live workspaces,
+      and silently merging them would be a guess about which project list is
+      the real one.  The user keeps both and is told.
+
+    Best-effort throughout, like every migration here: under the App Sandbox
+    the real home is readable only with the entitlement to match, and a denial
+    must leave the install running out of its container rather than fail.
+    """
+    if os.environ.get("SLP_HOME"):
+        return None
+
+    old_home = confined_home()
+    if not old_home:
+        return None
+
+    src = os.path.join(old_home, ".smartloop")
+    if os.path.normpath(src) == os.path.normpath(dest):
+        return None
+    if not _is_readable_dir(src):
+        return None
+    if os.path.exists(os.path.join(src, ADOPTED_MARKER)):
+        return None
+
+    if os.path.exists(os.path.join(dest, "config.json")):
+        logger.warning(
+            "[adopt] %s already holds a workspace; leaving the sandboxed one "
+            "at %s alone. Point SLP_HOME at it to use it instead.", dest, src,
+        )
+        return None
+
+    try:
+        entries = sorted(os.listdir(src))
+    except OSError:
+        logger.warning("[adopt] could not read %s", src, exc_info=True)
+        return None
+
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError:
+        # The sandbox denying the real home is the expected failure here, and
+        # it is not fatal: the old home is untouched and still serves.
+        logger.warning("[adopt] could not create %s", dest, exc_info=True)
+        return None
+
+    moved = 0
+    for name in entries:
+        if name == ADOPTED_MARKER:
+            continue
+        if _move_entry(os.path.join(src, name), os.path.join(dest, name)):
+            moved += 1
+
+    if not moved:
+        return None
+
+    logger.info("[adopt] moved %d entr%s from %s → %s",
+                moved, "y" if moved == 1 else "ies", src, dest)
+    try:
+        with open(os.path.join(src, ADOPTED_MARKER), "w", encoding="utf-8") as fh:
+            fh.write(dest + "\n")
+    except OSError:
+        # Only a fast path for the next start; the emptied directory and the
+        # config.json now at *dest* both already stop a second run.
+        logger.debug("[adopt] could not write the marker in %s", src, exc_info=True)
+    return src
 
 
 # ---------------------------------------------------------------------------

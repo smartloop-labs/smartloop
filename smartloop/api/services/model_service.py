@@ -64,6 +64,7 @@ from smartloop.tasks import (
 )
 from smartloop.utils import normalize_path
 from smartloop.db import embeddings
+from smartloop.paths import expand_home
 
 _settings = AppSettings()
 
@@ -3571,7 +3572,7 @@ class ModelService:
         # workspace index all live under ``project_dir``, so the framework
         # stays self-contained: copy <home_dir> anywhere and it runs as-is.
         if cwd:
-            project.cwd = os.path.abspath(os.path.expanduser(cwd))
+            project.cwd = os.path.abspath(expand_home(cwd))
         os.makedirs(project.skills_dir, exist_ok=True)
         os.makedirs(project.documents_dir, exist_ok=True)
         with own_project(project_id):
@@ -4261,7 +4262,7 @@ class ModelService:
                 raise ValueError("No current project found")
 
         server_id = str(uuid4())[:8]
-        resolved_cwd = str(Path(cwd).expanduser()) if cwd else None
+        resolved_cwd = expand_home(str(cwd)) if cwd else None
         resolved_env = env or {}
 
         server = MCPServer(
@@ -5407,7 +5408,7 @@ class ModelService:
         if not cwd or self._llm is None:
             return None
 
-        cwd = os.path.expanduser(cwd)
+        cwd = expand_home(cwd)
         content_to_write = llm_response
 
         # Check for bare "write" command — write last assistant response from history

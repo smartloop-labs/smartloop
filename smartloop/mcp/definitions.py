@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from smartloop.paths import expand_home, real_home  # noqa: F401  (re-exported)
+
 
 def normalize_name(name: str) -> str:
     """Lowercase *name* with separators stripped: ``notion-search`` → ``notionsearch``.
@@ -79,51 +81,10 @@ def launcher_for(package: str) -> Tuple[str, List[str]]:
 # ------------------------------------------------------------- home directory
 #
 # A definition writes a local server's path the way anyone would — `command =
-# "~/.local/bin/craft"` — and `$HOME` is what expands the tilde.  Inside the
-# macOS App Sandbox that env var is not the user's home: it is
-# `~/Library/Containers/<bundle-id>/Data`, a directory nothing the user
-# installed has ever been in.
-
-#: How macOS spells the App Sandbox container it rewrites ``$HOME`` to.
-_SANDBOX_HOME_MARKER = "/Library/Containers/"
-
-
-def real_home() -> str:
-    """The user's home, reading past an App Sandbox container.
-
-    ``$HOME`` still wins everywhere else — a service unit or a test that sets
-    it means it.  Only the container spelling is overridden, and only with
-    what ``getpwuid`` reports, which the sandbox leaves alone: a tilde that
-    expanded into the container resolved to a path that was never going to
-    exist, so every local server added to the sandboxed build failed with an
-    ENOENT naming a directory the user had never heard of.
-    """
-    home = os.environ.get("HOME") or ""
-    if _SANDBOX_HOME_MARKER not in home:
-        return os.path.expanduser("~")
-    try:
-        import pwd
-        return pwd.getpwuid(os.getuid()).pw_dir or home
-    except Exception:
-        # No passwd record to read (or no `pwd` module at all, on Windows).
-        # The container home is wrong, but it is the only answer left.
-        return home
-
-
-def expand_home(path: str) -> str:
-    """``~``-expand *path* against :func:`real_home`.
-
-    ``~otheruser/...`` names somebody else's home and is left to
-    ``expanduser``, which is the only thing that knows how to resolve it.
-    """
-    if not path.startswith("~"):
-        return path
-    if path == "~":
-        return real_home()
-    if path.startswith("~/"):
-        return os.path.join(real_home(), path[2:])
-    return os.path.expanduser(path)
-
+# "~/.local/bin/craft"` — and `$HOME` is what expands the tilde.  Under the
+# store sandboxes that env var is not the user's home, so the tilde is
+# expanded against :func:`smartloop.paths.real_home` instead; re-exported here
+# because this is where `launch` reaches for it.
 
 # --------------------------------------------------------------- retired keys
 #
