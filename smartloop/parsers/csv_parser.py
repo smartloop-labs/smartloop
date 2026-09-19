@@ -3,11 +3,12 @@ from .base_parser import BaseParser
 
 import os
 import csv
+from smartloop.paths import expand_home
 
 class CsvParser(BaseParser):
 
     def parse(self):
-        filepath = os.path.expanduser(self.file_path)
+        filepath = expand_home(self.file_path)
        
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
@@ -21,7 +22,7 @@ class CsvParser(BaseParser):
         Validates the CSV file structure.
         Ensures the file is not empty and all rows have the same number of columns as the header.
         """
-        filepath = os.path.expanduser(self.file_path)
+        filepath = expand_home(self.file_path)
 
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
@@ -44,7 +45,7 @@ class CsvParser(BaseParser):
         """
         Converts the CSV file content to a Markdown table format.
         """
-        filepath = os.path.expanduser(self.file_path)
+        filepath = expand_home(self.file_path)
 
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")

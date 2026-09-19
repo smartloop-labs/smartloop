@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from smartloop.auth import credential_store     
 from smartloop.constants import BOOTSTRAP_MODEL, canonical_model_name
+from smartloop.paths import expand_home, real_home
 
 class AppSettings(BaseSettings):
     """Application settings using Pydantic"""
@@ -279,5 +280,5 @@ class AppSettings(BaseSettings):
         otherwise defaults to ~/.smartloop.
         """
         if self.slp_home:
-            return os.path.expanduser(self.slp_home)
-        return os.path.expanduser("~/.smartloop")
+            return expand_home(self.slp_home)
+        return os.path.join(real_home(), ".smartloop")

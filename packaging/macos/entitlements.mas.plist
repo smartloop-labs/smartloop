@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Mac App Store build.  Separate from entitlements.mac.plist, which is the
+  Developer ID / hardened-runtime file: the `com.apple.security.cs.*` keys it
+  carries are rejected on App Store submission, and the App Sandbox key here
+  would sandbox the Developer ID build if the two were merged.
+
+  The framework home is ~/.smartloop in every build so the app and the `slp`
+  CLI share one workspace.  Inside the App Sandbox that path resolves
+  correctly (see smartloop/paths.py) but is unreadable without the temporary
+  exception below, which App Review requires a written justification for.
+  If the exception is refused, the fallback is to set SLP_HOME to the
+  container path when spawning the backend — the app then keeps its own
+  workspace and no longer shares one with the CLI.
+-->
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <!-- The Python backend is spawned as a child and must stay sandboxed. -->
+    <key>com.apple.security.inherit</key>
+    <true/>
+
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+
+    <!-- Project folders the user picks, and keeping them across launches. -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+
+    <!-- The shared framework home. Requires review justification. -->
+    <key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
+    <array>
+      <string>/.smartloop/</string>
+    </array>
+  </dict>
+</plist>

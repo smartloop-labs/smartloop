@@ -21,6 +21,7 @@ from smartloop.loader import ModelLoader
 from smartloop.model.slp_model import SLPModel
 from smartloop.model.downloader import SLPDownloader
 from smartloop.llms.base_llm import BaseLLM
+from smartloop.paths import expand_home
 
 if TYPE_CHECKING:
     from smartloop.workspace import Workspace
@@ -219,8 +220,7 @@ class GenericModel(SLPModel):
         # Documents are project state, so they always land under project_dir —
         # never under a caller-supplied cwd.  ``cwd`` is the user's own folder
         # for file/bash tools; writing ingested copies there put project state
-        # outside the framework's home, where it could not follow SLP_HOME or
-        # the macOS App Sandbox container.
+        # outside the framework's home, where it could not follow SLP_HOME.
         dest_dir = Path(current_project.documents_dir)
 
         documents: list[Document] = []
@@ -260,7 +260,7 @@ class GenericModel(SLPModel):
                 if source.lower().startswith("file://"):
                     source = source[7:]
                 source = normalize_path(source)
-            source_path = Path(source).expanduser() if isinstance(source, str) else source
+            source_path = Path(expand_home(source)) if isinstance(source, str) else source
 
             if source_path.is_dir():
                 for file in os.listdir(source_path):
