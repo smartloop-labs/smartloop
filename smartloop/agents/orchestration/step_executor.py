@@ -31,6 +31,7 @@ from smartloop.agents.planner import (
     PlanStep, StepType, SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
 )
 from smartloop.utils.mcp_result_formatter import ResultFormatter
+from smartloop.paths import expand_home
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +222,7 @@ class StepExecutor:
         tool_name = step.tool_name or ""
         has_explicit_tool = bool(step.tool_name)
         directive = step.instruction or user_message
-        work_dir = os.path.expanduser(cwd or project_dir or os.getcwd())
+        work_dir = expand_home(cwd or project_dir or os.getcwd())
 
         logger.info(
             f"[step] {step.server_name}/{tool_name}, cwd={work_dir}, "
@@ -673,7 +674,7 @@ class StepExecutor:
         tool_name = step.tool_name or ""
         has_explicit_tool = bool(step.tool_name)
         directive = step.instruction or user_message
-        work_dir = os.path.expanduser(cwd or os.getcwd())
+        work_dir = expand_home(cwd or os.getcwd())
 
         logger.info(
             f"[resolve] {step.server_name}/{tool_name}, cwd={work_dir}, "

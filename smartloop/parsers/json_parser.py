@@ -11,6 +11,7 @@ import json
 import os
 
 from .base_parser import BaseParser
+from smartloop.paths import expand_home
 
 
 def looks_like_json(file_path: str) -> bool:
@@ -21,7 +22,7 @@ def looks_like_json(file_path: str) -> bool:
     loaded just to reject it.
     """
     try:
-        with open(os.path.expanduser(file_path), "r", encoding="utf-8") as fh:
+        with open(expand_home(file_path), "r", encoding="utf-8") as fh:
             head = fh.read(64)
     except (OSError, UnicodeDecodeError):
         return False
@@ -32,7 +33,7 @@ def looks_like_json(file_path: str) -> bool:
 class JsonParser(BaseParser):
 
     def parse(self) -> str:
-        filepath = os.path.expanduser(self.file_path)
+        filepath = expand_home(self.file_path)
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
 

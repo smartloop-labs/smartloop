@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from smartloop.llms import BaseLLM
 from smartloop.types import ModelCapability
+from smartloop.paths import expand_home
 
 # Tool name constants — duplicated here to avoid circular imports with
 # smartloop.agents.mcp.server_selector.
@@ -1154,7 +1155,7 @@ def _extract_paths(text: str, cwd: str) -> List[str]:
     found: List[str] = []
     for m in _PATH_RE.finditer(text):
         raw = m.group(1).rstrip(".,;:!?")
-        expanded = os.path.expanduser(raw)
+        expanded = expand_home(raw)
         if not os.path.isabs(expanded):
             expanded = os.path.join(cwd, expanded)
         expanded = os.path.normpath(expanded)
