@@ -19,6 +19,12 @@ Models are kept when the workspace says they are in use — ``enabled`` (the
 picker's flag), ``is_active``, the default orchestrator, or resident in
 ``ModelService`` — plus the bundled ``smartloop-ai`` and ``embeddings`` trees,
 which the framework cannot run without.
+
+One case overrides all of that: a directory holding only a ``.part`` sidecar
+is a download that died, and none of those reasons can be true of bytes that
+never finished arriving.  Such a tree is always removable (unless the model is
+somehow resident), because the next download deletes it anyway — see
+``_weights_state``.
 """
 
 import logging
@@ -33,7 +39,7 @@ from typing import Any, Optional
 
 from smartloop.config.app_settings import AppSettings
 from smartloop.utils.logging_setup import DEFAULT_BACKUP_COUNT, truncate_log_file
-from smartloop.workspace.workspace import Workspace
+from smartloop.workspace.workspace import Workspace, is_mmproj_gguf
 
 logger = logging.getLogger(__name__)
 _settings = AppSettings()
@@ -239,6 +245,37 @@ def _keep_model_ids(workspace: Workspace, model_service: Any) -> dict[str, str]:
 
 # ── Scanners ───────────────────────────────────────────────────────────────
 
+def _weights_state(model_dir: str) -> tuple[bool, bool]:
+    """Return ``(has_weights, has_part)`` for a model directory.
+
+    ``has_weights`` means a complete, servable GGUF is present.  An ``mmproj``
+    companion alone does not count — a vision projector is not weights, and
+    ``resolve_gguf_path`` already skips those when looking for something to
+    load.  ``has_part`` means the downloader left an unfinished sidecar: bytes
+    go to ``<name>.part`` and are renamed onto the final path only once the
+    transfer completes and the MD5 matches, so the suffix is the downloader
+    saying this file never arrived.
+
+    These are the two signals ``_gguf_exists`` in the init router reads, kept
+    apart here because this caller needs to distinguish "nothing usable
+    arrived" (the tree is dead weight) from "the weights landed but a
+    companion did not" (keep it — ``_download_artifacts`` checksums the
+    finished file, skips it, and refetches only the rest).
+    """
+    dirs = [d for d in (model_dir, os.path.join(model_dir, "bin")) if os.path.isdir(d)]
+    listings = []
+    for d in dirs:
+        try:
+            listings.extend(os.listdir(d))
+        except OSError:
+            continue
+    has_part = any(f.endswith(".part") for f in listings)
+    has_weights = any(
+        f.endswith(".gguf") and not is_mmproj_gguf(f) for f in listings
+    )
+    return has_weights, has_part
+
+
 def _scan_models(workspace: Workspace, model_service: Any) -> list[dict]:
     """One row per ``models/<org>/<repo>`` directory present on disk."""
     models_dir = workspace.models_dir
@@ -257,17 +294,44 @@ def _scan_models(workspace: Workspace, model_service: Any) -> list[dict]:
         for repo in _dirs_in(os.path.join(models_dir, org), skip_hidden=True):
             model_id = f"{org}/{repo}"
             entry = by_id.get(model_id)
-            keep_reason = "bundled" if org in _BUNDLED_ORGS else keep.get(model_id)
+            path = os.path.join(models_dir, org, repo)
+            loaded = bool(entry and entry.model_name in resident)
+
+            # An abandoned download: a ``.part`` and nothing servable beside it.
+            # This overrides every keep reason below, because those all answer
+            # "is this model in use?" and none of them can be true of bytes
+            # that never finished arriving — ``enabled`` is the picker's flag,
+            # set when the user asked for the model, not when it landed.  A
+            # half-downloaded tree is exactly what the next download click
+            # unlinks on its way to starting over (``_download_file`` removes a
+            # pre-existing ``.part`` rather than resuming onto it), so keeping
+            # it reserves disk for something nothing will ever read — and on a
+            # full disk that deadlocks the user, since the only offer the UI
+            # can make is the download this space is blocking.
+            has_weights, has_part = _weights_state(path)
+            partial = has_part and not has_weights
+
+            if partial and not loaded:
+                # ``loaded`` still wins: a resident context means this really is
+                # open right now, whatever the directory looks like, and that is
+                # the one state where unlinking is a use-after-free.  The two
+                # shouldn't overlap (weights resolve before a load, so a loaded
+                # model has them) but the cost of the guard is a boolean.
+                keep_reason = None
+            else:
+                keep_reason = "bundled" if org in _BUNDLED_ORGS else keep.get(model_id)
+
             rows.append(_row(
-                os.path.join(models_dir, org, repo),
+                path,
                 removable=True,
                 keep_reason=keep_reason,
                 model_id=model_id,
+                partial=partial,
                 model_name=entry.model_name if entry else None,
                 downloaded=bool(entry.downloaded) if entry else False,
                 enabled=bool(entry.enabled) if entry else False,
                 is_active=bool(entry.is_active) if entry else False,
-                loaded=bool(entry and entry.model_name in resident),
+                loaded=loaded,
                 # No workspace entry means an aborted or orphaned download.
                 registered=entry is not None,
             ))
