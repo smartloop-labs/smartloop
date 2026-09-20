@@ -13,6 +13,9 @@ from smartloop.model.downloader.artifact_downloader import (
     SLPArtifactDownloader,
     StaleDownloadURLError,
     _aggregate_error,
+    _classified,
+    _is_retryable_error,
+    _is_transient_error,
 )
 from smartloop.platform import ModelAccessError
 
@@ -226,3 +229,51 @@ class TestAggregateErrorKeepsTheFailureKind:
             ("b.gguf", httpx.ConnectError("y")),
         ])
         assert "Failed to download 2 file(s): a.gguf, b.gguf" == str(result)
+
+    def test_disk_full_is_transient_but_not_in_flight_retryable(self):
+        # Freeing some space and retrying is the canonical retry — the most
+        # retryable failure there is — so the batch must classify as transient
+        # for the client.  It must stay out of _is_retryable_error: a disk that
+        # cannot accept bytes has to fail fast, not grind through backoff
+        # against a full platter.
+        exc = OSError(28, "No space left on device")
+        assert _is_transient_error(exc) is True
+        assert _is_retryable_error(exc) is False
+        result = _aggregate_error([("model.gguf", exc)])
+        assert isinstance(result, ConnectionError)
+
+    def test_disk_full_message_names_the_disk_not_just_the_file(self):
+        # The old message said "Failed to download 1 file(s): model.gguf",
+        # which reads the same as a dropped socket and drops the one fact that
+        # has an action: the disk is full.
+        result = _aggregate_error([
+            ("model.gguf", OSError(28, "No space left on device")),
+        ])
+        assert "no space left on device" in str(result)
+        assert "model.gguf" in str(result)
+
+    def test_disk_full_wrapped_by_the_chunked_path_is_still_seen(self):
+        # The chunked path preserves the cause's kind by wrapping the OSError
+        # in a classified exception (keeping it as __cause__); both frames have
+        # to be read for the disk-full to surface.
+        raw = OSError(28, "No space left on device")
+        wrapped = _classified(
+            "Chunk download failed for model.gguf (bytes 0-100): "
+            "[Errno 28] No space left on device",
+            _is_transient_error(raw),
+        )
+        wrapped.__cause__ = raw
+        result = _aggregate_error([("model.gguf", wrapped)])
+        assert isinstance(result, ConnectionError)
+        assert "no space left on device" in str(result)
+
+    def test_disk_full_does_not_mask_a_permanent_failure(self):
+        # Freeing space fixes the disk-full file, but an MD5 mismatch is
+        # unfixable — a batch with both must not promise a retry will help.
+        result = _aggregate_error([
+            ("a.gguf", OSError(28, "No space left on device")),
+            ("b.gguf", RuntimeError("MD5 verification failed after 3 attempts")),
+        ])
+        assert isinstance(result, RuntimeError)
+        assert not isinstance(result, ConnectionError)
+        assert "no space left on device" in str(result)

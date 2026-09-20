@@ -545,3 +545,138 @@ class TestCleanup:
         result = storage_service.run_cleanup(model_service=env["service"], logs=True)
 
         assert result["usage"]["categories"]["logs"]["reclaimable"] == 0
+
+
+def _make_partial(models_dir, model_id, *, keep=(), part=("weights.gguf.part",)):
+    """Rewrite *model_id*'s directory to a given set of files.
+
+    *keep* lands as finished files, *part* as unfinished sidecars.  The
+    fixture's own ``weights.gguf`` is cleared first so each case states the
+    whole directory rather than inheriting a stray complete file.
+    """
+    target = os.path.join(models_dir, model_id)
+    for name in os.listdir(target):
+        os.remove(os.path.join(target, name))
+    for name in keep:
+        _write(os.path.join(target, name), "w" * 100)
+    for name in part:
+        _write(os.path.join(target, name), "p" * 100)
+    return target
+
+
+class TestAbandonedDownloads:
+    """A directory holding only a ``.part`` is a download that died.
+
+    The keep rules all answer "is this model in use?", and none of them can be
+    true of bytes that never arrived — ``enabled`` in particular is set when
+    the user asks for a model, not when it lands.  Protecting such a tree
+    strands the space on a model nothing can load, and on a full disk that is
+    a deadlock: the only remedy the UI offers is the download this space
+    blocks.
+    """
+
+    def test_abandoned_partial_is_removable_though_enabled(self, env):
+        _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        dead = rows["google/gemma-4-e4b-it"]
+        assert dead["partial"] is True
+        assert dead["removable"] is True
+        assert dead["keep_reason"] is None
+
+    def test_abandoned_partial_beats_a_project_pin(self, env):
+        # The strongest keep reason there is: off app-wide but pinned on by a
+        # project.  Still nothing to protect.
+        env["project"].model_settings.append(
+            ProjectModel(model_name="gemma3-4b", enabled=True)
+        )
+        _make_partial(env["models_dir"], "google/gemma-3-4b-it")
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-3-4b-it"]["removable"] is True
+
+    def test_abandoned_partial_beats_bundled(self, env):
+        # A half-downloaded orchestrator cannot run the framework either, and
+        # keeping it leaves no way to free space for the retry.
+        _make_partial(env["models_dir"], "smartloop-ai/slp-orchestra-mini")
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["smartloop-ai/slp-orchestra-mini"]["removable"] is True
+
+    def test_weights_that_landed_survive_a_partial_companion(self, env):
+        # The interrupted-multi-file case: main weights finished, the vision
+        # projector did not.  The downloader checksums the finished file and
+        # refetches only the rest, so deleting the tree would throw away real
+        # progress — this is the one .part case that must be kept.
+        _make_partial(
+            env["models_dir"], "google/gemma-4-e4b-it",
+            keep=("weights.gguf",), part=("mmproj-gemma-4.gguf.part",),
+        )
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        kept = rows["google/gemma-4-e4b-it"]
+        assert kept["partial"] is False
+        assert kept["removable"] is False
+        assert kept["keep_reason"] == "enabled"
+
+    def test_a_finished_mmproj_alone_is_not_weights(self, env):
+        # The mirror image: the projector landed, the weights are still
+        # transferring.  A projector is not something that can be served, so
+        # this tree is as dead as one holding only .part files.
+        _make_partial(
+            env["models_dir"], "google/gemma-4-e4b-it",
+            keep=("mmproj-gemma-4.gguf",), part=("weights.gguf.part",),
+        )
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-4-e4b-it"]["partial"] is True
+        assert rows["google/gemma-4-e4b-it"]["removable"] is True
+
+    def test_a_resident_model_is_kept_even_when_partial(self, env):
+        # Shouldn't be reachable — weights resolve before a load — but a
+        # resident context is the one state where unlinking is a native
+        # use-after-free, so it outranks the partial rule.
+        env["service"].__dict__["_cap_llm_gemma3-4b"] = object()
+        _make_partial(env["models_dir"], "google/gemma-3-4b-it")
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-3-4b-it"]["removable"] is False
+        assert rows["google/gemma-3-4b-it"]["keep_reason"] == "loaded"
+
+    def test_complete_models_are_not_flagged_partial(self, env):
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert all(r["partial"] is False for r in rows.values())
+
+    def test_an_in_flight_download_is_refused_outright(self, env):
+        # The race the partial rule could otherwise open: those .part files
+        # belong to a transfer happening right now.  The busy check is what
+        # keeps the sweep off them, so it has to hold with models=True.
+        _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+        env["service"]._task_queue.get_status.return_value = {"status": "running"}
+
+        with pytest.raises(RuntimeError, match="downloader"):
+            storage_service.run_cleanup(model_service=env["service"], models=True)
+
+        assert os.path.exists(os.path.join(env["models_dir"], "google/gemma-4-e4b-it"))
+
+    def test_the_sweep_reclaims_an_abandoned_partial(self, env):
+        dead = _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+
+        result = storage_service.run_cleanup(model_service=env["service"], models=True)
+
+        assert not os.path.exists(dead)
+        assert any(d["path"] == dead for d in result["deleted"])
+
+    def test_partial_bytes_are_reported_as_reclaimable(self, env):
+        _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+
+        usage = storage_service.compute_usage(model_service=env["service"])
+
+        assert usage["categories"]["models"]["reclaimable"] >= 100

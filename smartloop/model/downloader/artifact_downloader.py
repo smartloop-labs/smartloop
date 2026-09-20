@@ -1,6 +1,7 @@
+import errno
 import hashlib
-import os
 import logging
+import os
 import random
 import threading
 import time
@@ -98,6 +99,21 @@ class StaleDownloadURLError(ConnectionError):
     """
 
 
+def _is_disk_full(exc: Exception) -> bool:
+    """True when *exc* — or the failure it wraps — is an out-of-space OSError.
+
+    The chunked path wraps the transfer's ``OSError`` in a classified
+    ``ConnectionError`` before it reaches ``_aggregate_error`` (see
+    ``_classified``), so the errno may live on ``__cause__`` rather than on the
+    exception itself — follow the chain instead of reading one frame.
+    """
+    while exc is not None:
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            return True
+        exc = exc.__cause__
+    return False
+
+
 def _is_retryable_error(exc: Exception) -> bool:
     """True for transient failures worth retrying (network blips, 5xx, 429)."""
     if isinstance(exc, httpx.HTTPStatusError):
@@ -114,7 +130,16 @@ def _is_transient_error(exc: Exception) -> bool:
     retries immediately. This decides how the failure is described to whoever
     asked for the download, and a stale signed URL belongs here even though
     retrying the same URL is pointless: re-requesting the download works.
+
+    A full disk is the point of :func:`_is_transient_error`: retrying the same
+    URL *is* pointless, nobody can run out of space forever, and some space
+    just got freed.  Classification lives on this side, not
+    :func:`_is_retryable_error`, so the transfer itself still fails fast — a
+    disk that cannot accept bytes must not grind through
+    ``MAX_DOWNLOAD_ATTEMPTS`` with backoff.
     """
+    if _is_disk_full(exc):
+        return True
     if _is_retryable_error(exc):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
@@ -140,10 +165,25 @@ def _aggregate_error(failed: "list[tuple[str, Exception]]") -> Exception:
 
     Transient only when *every* file failed transiently: one unfixable file
     means the download stays broken, so promising a retry would be a lie.
+
+    Names a disk-full when that is what happened.  The previous message listed
+    nothing but filenames, so an out-of-disk failure read exactly like a
+    dropped socket, and the one piece of information that has an action — "no
+    space left on device" — never reached the client.
     """
     message = (f"Failed to download {len(failed)} file(s): "
                f"{', '.join(name for name, _ in failed)}")
-    return _classified(message, all(_is_transient_error(exc) for _, exc in failed))
+    if any(_is_disk_full(exc) for _, exc in failed):
+        message += " — no space left on device"
+    result = _classified(message, all(_is_transient_error(exc) for _, exc in failed))
+    for _, exc in failed:
+        if _is_disk_full(exc):
+            # Keep the errno reachable: ``status_for`` walks ``__cause__`` to
+            # answer 507 rather than 502, and the classified remap above would
+            # otherwise discard the only frame that still has it.
+            result.__cause__ = exc
+            break
+    return result
 
 
 def _backoff_delay(attempt: int) -> float:
