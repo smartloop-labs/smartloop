@@ -6,7 +6,24 @@ who raised it, and a router that reads it as one of them answers "sign in" to a
 full disk.
 """
 
+import errno
+
 from smartloop.platform import ModelAccessError
+
+
+def _is_disk_full(exc: Exception) -> bool:
+    """True when *exc* — or the failure it wraps — is an out-of-space OSError.
+
+    The download path wraps a raw ENOSPC in a classified ``ConnectionError``
+    (``_classified`` keeps the cause as ``__cause__``), so the errno is not
+    always on the exception itself — follow the chain before declaring it a
+    network failure.
+    """
+    while exc is not None:
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            return True
+        exc = exc.__cause__
+    return False
 
 
 def status_for(exc: Exception) -> int:
@@ -27,6 +44,11 @@ def status_for(exc: Exception) -> int:
         return status
     if isinstance(exc, ModelAccessError):
         return 403
+    if _is_disk_full(exc):
+        # The most retryable failure there is (free some space and try again),
+        # and not a network problem — so neither 500 nor 502 says it right.
+        # 507 is how the client tells "refill the disk" from "it broke".
+        return 507
     # Transfers that died on a dropped socket, a stale signed URL or an upstream
     # 5xx are aggregated into a ConnectionError by ``_aggregate_error``.
     if isinstance(exc, ConnectionError):
