@@ -801,15 +801,26 @@ def run_cleanup(
             if callable(reset):
                 reset()
 
+        # Kept as text so the record can be re-emitted below.  A sweep that
+        # empties server.log destroys the lines it has already written, so
+        # without this the one log that says what was just deleted is the one
+        # the deletion erases.
+        audit: list[str] = []
+        truncated_log = False
+
         for category, row in planned:
-            ok, error = _remove(row["path"], truncate=row.get("action") == "truncate")
+            truncate = row.get("action") == "truncate"
+            ok, error = _remove(row["path"], truncate=truncate)
             if ok:
                 deleted.append({
                     "category": category, "path": row["path"], "bytes": row["bytes"],
                 })
+                audit.append(f"Removed {row['path']} ({row['bytes']} bytes)")
                 logger.info("[storage] Removed %s (%s bytes)", row["path"], row["bytes"])
+                truncated_log = truncated_log or truncate
             else:
                 failed.append({"category": category, "path": row["path"], "error": error})
+                audit.append(f"Could not remove {row['path']}: {error}")
                 logger.warning("[storage] Could not remove %s: %s", row["path"], error)
 
         if model_rows:
@@ -819,6 +830,19 @@ def run_cleanup(
             }
             models_marked = _mark_models_removed(workspace, deleted_ids)
             _prune_empty_orgs(workspace)
+
+        if truncated_log:
+            # Everything logged above is gone from server.log now.  Replaying it
+            # is not merely tidier than ordering the log sweep first: handlers
+            # are fed through a QueueListener, so a record emitted before the
+            # truncate can still be sitting in the queue when the stream is
+            # reopened.  Position in the sweep cannot make the record reliable;
+            # writing it again afterwards can.
+            logger.info("[storage] Sweep record, replayed after server.log was emptied:")
+            for line in audit:
+                logger.info("[storage] %s", line)
+            if models_marked:
+                logger.info("[storage] Marked as removed: %s", ", ".join(models_marked))
     finally:
         _release_inference(model_service, held)
 
