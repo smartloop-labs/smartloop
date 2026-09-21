@@ -6,6 +6,7 @@ must *not* happen.
 """
 
 import json
+import logging
 import os
 import threading
 from unittest.mock import MagicMock, patch
@@ -467,6 +468,46 @@ class TestCleanup:
         assert not os.path.exists(log + ".1")
         assert not os.path.exists(log + ".2")
         assert result["freed"] == 300 + 500 + 700
+
+    def test_log_sweep_replays_its_record_after_emptying_the_log(self, env, caplog):
+        """Emptying server.log must not erase the record of the same sweep.
+
+        Deletions are logged as they happen, so a sweep that also truncates the
+        log destroys its own audit trail — the one thing a "where did my model
+        go?" report needs.  The record is therefore written again once the log
+        is empty.
+        """
+        gemma = os.path.join(env["models_dir"], "google", "gemma-3-4b-it")
+
+        with caplog.at_level(logging.INFO, logger=storage_service.logger.name):
+            storage_service.run_cleanup(
+                model_service=env["service"], models=True, logs=True,
+            )
+
+        messages = [r.getMessage() for r in caplog.records]
+        replay_at = next(
+            (i for i, m in enumerate(messages) if "replayed after server.log" in m),
+            None,
+        )
+        assert replay_at is not None, "no record was replayed after the truncate"
+
+        survives = messages[replay_at:]
+        assert any(gemma in m and "Removed" in m for m in survives), (
+            "the model deletion is missing from the record that outlives the truncate"
+        )
+        assert any("server.log" in m and "Removed" in m for m in survives)
+        assert any("gemma3-4b" in m for m in survives), (
+            "models_marked is part of the record too"
+        )
+
+    def test_sweep_without_logs_does_not_replay(self, env, caplog):
+        """Nothing truncated the log, so the first record still stands."""
+        with caplog.at_level(logging.INFO, logger=storage_service.logger.name):
+            storage_service.run_cleanup(model_service=env["service"], models=True)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("replayed" in m for m in messages)
+        assert sum(1 for m in messages if "Removed" in m and "gemma-3-4b-it" in m) == 1
 
     def test_version_cleanup_keeps_the_running_install(self, env):
         storage_service.run_cleanup(model_service=env["service"], versions=True)
