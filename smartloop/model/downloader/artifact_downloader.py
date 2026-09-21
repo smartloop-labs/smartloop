@@ -15,6 +15,7 @@ from smartloop.platform import SLPPlatformClient
 from smartloop.config import AppSettings
 from smartloop.constants import canonical_model_name, display_model_name, platform_model_name
 from smartloop.model.downloader.artifact_source import SLPModelSource, SLPBootstrapSource
+from smartloop.model.downloader.inflight import downloading
 from smartloop.model.downloader.slp_downloader import SLPDownloader, DownloadProgress, ProgressCallback, AggregateProgress
 from smartloop.workspace import Workspace
 
@@ -587,13 +588,18 @@ class SLPArtifactDownloader(SLPDownloader):
             raise ValueError(f"No GGUF artifact found for bootstrap model '{resolved_name}'")
 
         local_dir = os.path.join(self.workspace.models_dir, model_id)
-        os.makedirs(local_dir, exist_ok=True)
 
-        self.logger.info(f"Bootstrap downloading model: {display_model_name(resolved_name)}")
+        # Marked from the makedirs, not from _download_artifacts: the directory
+        # exists — and is ours — before the first byte lands, and a disk sweep
+        # landing in that gap would delete it out from under us.
+        with downloading(local_dir):
+            os.makedirs(local_dir, exist_ok=True)
 
-        return self._download_artifacts(artifacts, local_dir, progress_callback,
-                                        log_prefix="Bootstrap model", log_dir=local_dir,
-                                        label=display_model_name(resolved_name))
+            self.logger.info(f"Bootstrap downloading model: {display_model_name(resolved_name)}")
+
+            return self._download_artifacts(artifacts, local_dir, progress_callback,
+                                            log_prefix="Bootstrap model", log_dir=local_dir,
+                                            label=display_model_name(resolved_name))
 
     @staticmethod
     def _resolve_model_id(model_name: str) -> str:
@@ -676,12 +682,16 @@ class SLPArtifactDownloader(SLPDownloader):
         # After the entitlement call, not before: a refused download should not
         # leave an empty model directory behind for the workspace to trip over.
         local_dir = os.path.join(self.workspace.models_dir, model_id)
-        os.makedirs(local_dir, exist_ok=True)
 
-        if not artifacts:
-            self.logger.info(f"[ok] No GGUF files to download")
-            return Path(local_dir)
+        # See bootstrap_download: the mark has to cover the makedirs, not just
+        # the transfer, or a sweep can delete the directory between the two.
+        with downloading(local_dir):
+            os.makedirs(local_dir, exist_ok=True)
 
-        return self._download_artifacts(artifacts, local_dir, progress_callback,
-                                        log_prefix="Model", log_dir=local_dir,
-                                        label=display_model_name(model_name))
+            if not artifacts:
+                self.logger.info(f"[ok] No GGUF files to download")
+                return Path(local_dir)
+
+            return self._download_artifacts(artifacts, local_dir, progress_callback,
+                                            log_prefix="Model", log_dir=local_dir,
+                                            label=display_model_name(model_name))
