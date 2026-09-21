@@ -15,6 +15,7 @@ from uuid import uuid4
 import pytest
 
 from smartloop.api.services import storage_service
+from smartloop.model.downloader.inflight import downloading
 from smartloop.config.app_settings import AppSettings
 from smartloop.workspace.workspace import Project, ProjectModel, Workspace, WorkspaceModel
 
@@ -155,7 +156,14 @@ def env(home):
     service._large_model_name = None
     service._vision_model_name = None
     service.__dict__["_task_queue"] = MagicMock()
-    service._task_queue.get_status.return_value = {"status": "idle"}
+    # Answer only for tasks that are really registered.  A blanket return value
+    # let a test name any task and get a reply, which is how two tests came to
+    # assert that a "downloader" task guarded downloads when nothing has ever
+    # registered one.  Mirrors TaskQueue.get_status.
+    service._task_queue.get_status.side_effect = lambda name=None: (
+        {"status": "idle"} if name == "indexer"
+        else {"error": f"Unknown task: {name}"}
+    )
     service._inference_lock = MagicMock()
     service._inference_lock.acquire.return_value = True
 
@@ -565,11 +573,23 @@ class TestCleanup:
         assert result["models_marked"] == []
         assert os.path.exists(os.path.join(env["models_dir"], "google/gemma-3-4b-it"))
 
-    def test_refuses_while_the_downloader_is_running(self, env):
-        env["service"]._task_queue.get_status.return_value = {"status": "running"}
+    def test_refuses_while_the_indexer_is_running(self, env):
+        env["service"]._task_queue.get_status.side_effect = (
+            lambda name=None: {"status": "running"}
+        )
 
-        with pytest.raises(RuntimeError, match="downloader"):
-            storage_service.run_cleanup(model_service=env["service"], models=True)
+        with pytest.raises(RuntimeError, match="indexer"):
+            storage_service.run_cleanup(
+                model_service=env["service"], orphan_projects=True,
+            )
+
+    def test_a_running_indexer_does_not_block_a_model_sweep(self, env):
+        """The indexer writes project trees, not model weights."""
+        env["service"]._task_queue.get_status.side_effect = (
+            lambda name=None: {"status": "running"}
+        )
+
+        storage_service.run_cleanup(model_service=env["service"], models=True)
 
     def test_refuses_when_inference_will_not_drain(self, env):
         env["service"]._inference_lock.acquire.return_value = False
@@ -695,17 +715,79 @@ class TestAbandonedDownloads:
 
         assert all(r["partial"] is False for r in rows.values())
 
-    def test_an_in_flight_download_is_refused_outright(self, env):
-        # The race the partial rule could otherwise open: those .part files
-        # belong to a transfer happening right now.  The busy check is what
-        # keeps the sweep off them, so it has to hold with models=True.
-        _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
-        env["service"]._task_queue.get_status.return_value = {"status": "running"}
+    def test_an_in_flight_download_is_kept_while_the_rest_is_swept(self, env):
+        """The race the partial rule opens: those .part files belong to a
+        transfer happening right now, and on disk that is indistinguishable
+        from one that died.  The registry is what tells them apart.
 
-        with pytest.raises(RuntimeError, match="downloader"):
-            storage_service.run_cleanup(model_service=env["service"], models=True)
+        Both halves matter.  The live tree survives — and the sweep still runs,
+        reclaiming everything else, because protecting a download must not cost
+        the user the cleanup they asked for.  That is the difference between
+        this and the blanket refusal it replaced.
+        """
+        live = _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+        removable = os.path.join(env["models_dir"], "google/gemma-3-4b-it")
 
-        assert os.path.exists(os.path.join(env["models_dir"], "google/gemma-4-e4b-it"))
+        with downloading(live):
+            result = storage_service.run_cleanup(
+                model_service=env["service"], models=True,
+            )
+
+        assert os.path.exists(live), "the sweep deleted a running download"
+        assert live not in [d["path"] for d in result["deleted"]]
+        assert not os.path.exists(removable), (
+            "protecting the download stopped the rest of the sweep"
+        )
+
+    def test_a_live_download_reports_why_it_was_kept(self, env):
+        live = _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+
+        with downloading(live):
+            rows = _by_model_id(
+                storage_service.compute_usage(model_service=env["service"])
+            )
+            held = rows["google/gemma-4-e4b-it"]
+
+            assert held["keep_reason"] == "downloading"
+            assert held["removable"] is False
+            # Still accurate: it really is a partial tree, it just is not dead.
+            assert held["partial"] is True
+
+        after = _by_model_id(
+            storage_service.compute_usage(model_service=env["service"])
+        )
+        assert after["google/gemma-4-e4b-it"]["removable"] is True, (
+            "the mark outlived the download"
+        )
+
+    def test_a_download_starting_mid_sweep_is_not_deleted(self, env):
+        """The scan is a snapshot, so run_cleanup asks again before each
+        removal.  Here the download starts after planning, which is the window
+        the re-check exists to cover."""
+        live = _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+        state = {"started": False}
+        real_remove = storage_service._remove
+
+        def remove_and_start_a_download(path, **kwargs):
+            state["started"] = True
+            return real_remove(path, **kwargs)
+
+        with patch.object(storage_service, "_remove", remove_and_start_a_download), \
+             patch.object(
+                 storage_service, "is_downloading",
+                 lambda p: state["started"] and p == live,
+             ):
+            result = storage_service.run_cleanup(
+                model_service=env["service"], models=True,
+            )
+
+        assert os.path.exists(live)
+        assert live not in [d["path"] for d in result["deleted"]]
+        assert live not in [f["path"] for f in result["failed"]]
+        assert result["restart_required"] is False
+        assert "gemma4-e4b" not in result["models_marked"], (
+            "a skipped model was recorded as removed"
+        )
 
     def test_the_sweep_reclaims_an_abandoned_partial(self, env):
         dead = _make_partial(env["models_dir"], "google/gemma-4-e4b-it")

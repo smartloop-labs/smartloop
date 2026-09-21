@@ -22,9 +22,14 @@ which the framework cannot run without.
 
 One case overrides all of that: a directory holding only a ``.part`` sidecar
 is a download that died, and none of those reasons can be true of bytes that
-never finished arriving.  Such a tree is always removable (unless the model is
-somehow resident), because the next download deletes it anyway — see
-``_weights_state``.
+never finished arriving.  Such a tree is removable, because the next download
+deletes it anyway — see ``_weights_state``.
+
+Except when the download has not died.  A transfer in progress leaves exactly
+the same thing on disk, so that override is gated on
+``inflight.is_downloading``, which answers the one question the directory
+cannot: is something still writing here.  Without it the sweep deletes a
+running download out from under the downloader.
 """
 
 import logging
@@ -38,6 +43,7 @@ import uuid
 from typing import Any, Optional
 
 from smartloop.config.app_settings import AppSettings
+from smartloop.model.downloader.inflight import is_downloading
 from smartloop.utils.logging_setup import DEFAULT_BACKUP_COUNT, truncate_log_file
 from smartloop.workspace.workspace import Workspace, is_mmproj_gguf
 
@@ -73,8 +79,6 @@ _DELETE_BACKOFF_S = 0.25
 # model sweep.  Deleting weights out from under a decoding context is a native
 # use-after-free, so this is a hard precondition, not an optimization.
 _DRAIN_TIMEOUT_S = 30.0
-
-_BUSY_TASKS = ("downloader",)
 
 
 # ── Paths and sizes ────────────────────────────────────────────────────────
@@ -311,7 +315,13 @@ def _scan_models(workspace: Workspace, model_service: Any) -> list[dict]:
             has_weights, has_part = _weights_state(path)
             partial = has_part and not has_weights
 
-            if partial and not loaded:
+            if is_downloading(path):
+                # Must come first: a download in progress is also a partial one,
+                # and on disk the two are the same thing.  The registry carries
+                # the difference — a transfer that is still writing — which is
+                # the one thing the reasoning above cannot see.
+                keep_reason = "downloading"
+            elif partial and not loaded:
                 # ``loaded`` still wins: a resident context means this really is
                 # open right now, whatever the directory looks like, and that is
                 # the one state where unlinking is a use-after-free.  The two
@@ -583,20 +593,34 @@ def _prune_empty_orgs(workspace: Workspace) -> None:
 
 
 def _refuse_if_busy(model_service: Any, *, needs_indexer: bool) -> None:
-    """Raise ``RuntimeError`` while a task that writes to these trees is running."""
+    """Raise ``RuntimeError`` while the indexer is writing to these trees.
+
+    Downloads are deliberately *not* guarded here.  This used to also check a
+    ``"downloader"`` task, which nothing has ever registered — every download
+    runs through ``/v1/init``, outside the task layer — so the check read as
+    protection while providing none, and the sweep deleted a running download.
+    Replacing it with a registry lookup would be worse than useless in a
+    different way: a global refusal, blocking a logs-only sweep because some
+    unrelated model happens to be downloading.
+
+    Downloads are protected per path instead, where the decision belongs — see
+    ``inflight.is_downloading``, consulted by ``_scan_models`` and again before
+    each removal in ``run_cleanup``.
+    """
+    if not needs_indexer:
+        return
+
     queue = getattr(model_service, "_task_queue", None)
     get_status = getattr(queue, "get_status", None)
     if not callable(get_status):
         return
 
-    names = list(_BUSY_TASKS) + (["indexer"] if needs_indexer else [])
-    for name in names:
-        try:
-            status = get_status(name)
-        except Exception:                            # noqa: BLE001
-            continue
-        if isinstance(status, dict) and status.get("status") == "running":
-            raise RuntimeError(f"Cannot clean up while the {name} task is running")
+    try:
+        status = get_status("indexer")
+    except Exception:                                # noqa: BLE001
+        return
+    if isinstance(status, dict) and status.get("status") == "running":
+        raise RuntimeError("Cannot clean up while the indexer task is running")
 
 
 def _drain_inference(model_service: Any) -> int:
@@ -809,6 +833,18 @@ def run_cleanup(
         truncated_log = False
 
         for category, row in planned:
+            # Re-asked here because the scan is a snapshot: a download can start
+            # between planning and this line.  The window does not close
+            # entirely — that would mean holding the registry's lock across an
+            # rmtree of a multi-GB tree, stalling every download start — but a
+            # transfer that begins inside it has not written anything yet.
+            if category == "models" and is_downloading(row["path"]):
+                logger.info(
+                    "[storage] Skipping %s: a download started while cleaning",
+                    row["path"],
+                )
+                continue
+
             truncate = row.get("action") == "truncate"
             ok, error = _remove(row["path"], truncate=truncate)
             if ok:
