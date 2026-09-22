@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import os
+from pathlib import Path
 
 import pytest
 
@@ -17,7 +18,18 @@ from smartloop.model.downloader.artifact_downloader import (
     _is_retryable_error,
     _is_transient_error,
 )
+from smartloop.model.downloader import inflight
+from smartloop.model.downloader.inflight import is_downloading
 from smartloop.platform import ModelAccessError
+
+
+@pytest.fixture(autouse=True)
+def _clear_inflight():
+    """The registry is process-global, so a leaked mark would silently make a
+    later test's ``is_downloading`` assertion pass for the wrong reason."""
+    inflight._active.clear()
+    yield
+    inflight._active.clear()
 
 
 class TestComputeLocalMd5:
@@ -277,3 +289,117 @@ class TestAggregateErrorKeepsTheFailureKind:
         assert isinstance(result, RuntimeError)
         assert not isinstance(result, ConnectionError)
         assert "no space left on device" in str(result)
+
+
+class TestTheTransferMarksItselfInFlight:
+    """The registry only protects a download if the downloader registers one.
+
+    ``test_inflight`` proves the registry works and ``test_storage_service``
+    proves the sweep consults it — but both sides write their own
+    ``downloading()``, so deleting the two ``with`` blocks in
+    ``artifact_downloader`` left the whole suite green while the sweep went
+    back to deleting live transfers.  These tests are the seam between them.
+    """
+
+    def _downloader(self, tmp_path, artifacts=None):
+        resolved = artifacts or {}
+
+        class Source:
+            def get_artifacts(self, model_name):
+                return dict(resolved)
+
+        downloader = SLPArtifactDownloader.__new__(SLPArtifactDownloader)
+        downloader.workspace = type("WS", (), {"models_dir": str(tmp_path)})()
+        downloader.logger = logging.getLogger("test")
+        downloader._model_source = Source()
+        return downloader
+
+    def test_download_holds_the_mark_across_the_transfer(self, tmp_path):
+        downloader = self._downloader(tmp_path, {"model.gguf": "https://signed/x"})
+        seen = {}
+
+        def record(artifacts, local_dir, *args, **kwargs):
+            seen["marked"] = is_downloading(local_dir)
+            return Path(local_dir)
+
+        downloader._download_artifacts = record
+        downloader.download("google/gemma-3-4b-it")
+
+        assert seen["marked"] is True, "the transfer ran unmarked"
+        assert inflight._active == {}, "the mark outlived the download"
+
+    def test_bootstrap_download_holds_the_mark_across_the_transfer(self, tmp_path):
+        downloader = self._downloader(tmp_path)
+
+        class BootstrapSource:
+            def list_models(self):
+                return [{"name": "slp-orchestra-mini"}]
+
+            def get_artifacts(self, name):
+                return {"model.gguf": "https://signed/x"}
+
+        downloader._bootstrap_source = BootstrapSource()
+        seen = {}
+
+        def record(artifacts, local_dir, *args, **kwargs):
+            seen["marked"] = is_downloading(local_dir)
+            return Path(local_dir)
+
+        downloader._download_artifacts = record
+        downloader.bootstrap_download()
+
+        assert seen["marked"] is True, "the bootstrap transfer ran unmarked"
+        assert inflight._active == {}
+
+    def test_the_mark_covers_the_makedirs(self, tmp_path, monkeypatch):
+        """The property both code comments claim and neither test proved.
+
+        The directory is created *inside* the marked block, so a sweep cannot
+        land in the gap between "the tree exists" and "someone is writing to
+        it" — on disk those two are the same thing.
+        """
+        downloader = self._downloader(tmp_path, {"model.gguf": "https://signed/x"})
+        local_dir = os.path.join(str(tmp_path), "google/gemma-3-4b-it")
+        seen = {}
+        real_makedirs = os.makedirs
+
+        def record(path, *args, **kwargs):
+            if str(path) == local_dir:
+                seen["marked"] = is_downloading(path)
+            return real_makedirs(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "makedirs", record)
+        downloader._download_artifacts = lambda *a, **k: Path(local_dir)
+        downloader.download("google/gemma-3-4b-it")
+
+        assert seen.get("marked") is True, (
+            "the model directory was created before the mark was taken"
+        )
+
+    def test_a_refused_download_leaves_the_registry_clean(self, tmp_path):
+        class DenyingSource:
+            def get_artifacts(self, model_name):
+                raise ModelAccessError("nope")
+
+        downloader = self._downloader(tmp_path)
+        downloader._model_source = DenyingSource()
+
+        with pytest.raises(ModelAccessError):
+            downloader.download("google/gemma-3-4b-it")
+
+        assert inflight._active == {}
+
+    def test_a_failed_transfer_releases_the_mark(self, tmp_path):
+        # The mark is taken in a context manager precisely so the unwinding
+        # path cannot forget it; a wedged entry would keep the sweep away from
+        # that tree for the life of the process.
+        downloader = self._downloader(tmp_path, {"model.gguf": "https://signed/x"})
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("model.gguf: MD5 verification failed")
+
+        downloader._download_artifacts = boom
+        with pytest.raises(RuntimeError):
+            downloader.download("google/gemma-3-4b-it")
+
+        assert inflight._active == {}, "a failed transfer wedged the registry"
