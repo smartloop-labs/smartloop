@@ -854,3 +854,94 @@ class TestAbandonedDownloads:
         usage = storage_service.compute_usage(model_service=env["service"])
 
         assert usage["categories"]["models"]["reclaimable"] >= 100
+
+
+class TestValidateRefusesBadPaths:
+    """The traversal and symlink rails, exercised directly.
+
+    Every other test in this file feeds ``_validate`` paths its own scanners
+    produced, so the refusals never fire and the rails are asserted only
+    indirectly — "the protected files survived". That is the wrong shape of
+    evidence for the guard standing between a POST body and ``shutil.rmtree``.
+    Note in particular that the ``"../../../etc"`` case in the model_ids
+    parametrize does not reach here at all: ``_plan_cleanup`` rejects it first
+    as an unknown model id.
+    """
+
+    def test_home_itself_is_refused(self, env):
+        with pytest.raises(ValueError, match="home directory itself"):
+            storage_service._validate(env["home_dir"], "models", env["workspace"])
+
+    def test_a_path_outside_home_is_refused(self, env):
+        escape = os.path.join(env["outside"], "precious.txt")
+        with pytest.raises(ValueError, match="escapes"):
+            storage_service._validate(escape, "cache", env["workspace"])
+
+    def test_traversal_out_of_the_models_dir_is_refused(self, env):
+        escape = os.path.join(env["models_dir"], "..", "..", "..", "outside")
+        with pytest.raises(ValueError, match="escapes"):
+            storage_service._validate(escape, "models", env["workspace"])
+
+    @pytest.mark.parametrize("name", PROTECTED_FILES)
+    def test_a_never_delete_basename_is_refused(self, env, name):
+        target = os.path.join(env["home_dir"], name)
+        with pytest.raises(ValueError, match="Protected path"):
+            storage_service._validate(target, "cache", env["workspace"])
+
+    def test_a_symlink_is_refused(self, env):
+        link = os.path.join(env["models_dir"], "google", "link")
+        assert os.path.islink(link), "fixture no longer builds the symlink"
+        with pytest.raises(ValueError, match="symlink"):
+            storage_service._validate(link, "models", env["workspace"])
+
+    def test_a_model_path_at_the_wrong_depth_is_refused(self, env):
+        # models/<org> is one level short of a model directory.
+        org_only = os.path.join(env["models_dir"], "google")
+        with pytest.raises(ValueError, match="models/<org>/<repo>"):
+            storage_service._validate(org_only, "models", env["workspace"])
+
+    def test_the_running_install_is_refused(self, env):
+        target = os.path.join(env["home_dir"], CURRENT_VERSION)
+        with pytest.raises(ValueError, match="running install"):
+            storage_service._validate(target, "versions", env["workspace"])
+
+    def test_a_non_version_directory_is_refused(self, env):
+        target = os.path.join(env["home_dir"], "cache")
+        with pytest.raises(ValueError, match="Not a version directory"):
+            storage_service._validate(target, "versions", env["workspace"])
+
+    @pytest.mark.parametrize("name", ["server.log.0", "server.log.6", "server.log.x"])
+    def test_a_backup_index_outside_the_kept_range_is_refused(self, env, name):
+        # DEFAULT_BACKUP_COUNT is 5, and the bound is compared numerically so
+        # that 10+ does not silently become "any digit".
+        target = os.path.join(env["home_dir"], name)
+        _write(target, "l")
+        with pytest.raises(ValueError, match="Not a server log file"):
+            storage_service._validate(target, "logs", env["workspace"])
+
+    def test_a_kept_backup_index_is_accepted(self, env):
+        target = os.path.join(env["home_dir"], "server.log.1")
+        assert storage_service._validate(
+            target, "logs", env["workspace"]
+        ) == os.path.realpath(target)
+
+    def test_a_path_outside_the_cache_dirs_is_refused(self, env):
+        target = os.path.join(env["home_dir"], "conversations")
+        with pytest.raises(ValueError, match="Not a cache entry"):
+            storage_service._validate(target, "cache", env["workspace"])
+
+    def test_a_live_project_is_refused(self, env):
+        with pytest.raises(ValueError, match="live project"):
+            storage_service._validate(
+                env["project"].project_dir, "orphan_projects", env["workspace"]
+            )
+
+    def test_a_non_uuid_directory_is_not_a_project(self, env):
+        target = os.path.join(env["workspace_dir"], "not-a-project")
+        with pytest.raises(ValueError):
+            storage_service._validate(target, "orphan_projects", env["workspace"])
+
+    def test_an_unknown_category_is_refused(self, env):
+        target = os.path.join(env["home_dir"], "cache", "slp-1.1.0.tar.gz")
+        with pytest.raises(ValueError, match="Unknown category"):
+            storage_service._validate(target, "conversations", env["workspace"])
