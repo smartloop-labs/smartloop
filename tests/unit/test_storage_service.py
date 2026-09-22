@@ -269,6 +269,46 @@ class TestComputeUsage:
 
         assert rows["google/gemma-3-4b-it"]["removable"] is True
 
+    def test_a_model_every_project_disabled_is_removable_though_the_default_is_on(self, env):
+        """The workspace entry is a template, not a scope.
+
+        It holds the defaults a *new* project is seeded from, so a model it
+        enables is not thereby in use by anything. Treating it as a scope of
+        its own made the app-default pin weights every existing project had
+        turned off — and since the model picker only ever writes project
+        overrides, that was disk the UI could never offer to reclaim.
+        """
+        # gemma4-e4b is enabled on the workspace entry (see MODELS).
+        env["project"].model_settings.append(
+            ProjectModel(model_name="gemma4-e4b", enabled=False)
+        )
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-4-e4b-it"]["removable"] is True
+        assert rows["google/gemma-4-e4b-it"]["keep_reason"] is None
+
+    def test_a_project_without_an_override_still_inherits_the_default(self, env):
+        # The other half of the same rule: dropping the workspace scope must not
+        # cost the template its meaning. This project says nothing about
+        # gemma4-e4b, so it reads through to the app-default and keeps it.
+        assert not env["project"].model_settings
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-4-e4b-it"]["removable"] is False
+        assert rows["google/gemma-4-e4b-it"]["keep_reason"] == "enabled"
+
+    def test_with_no_projects_the_default_is_consulted_directly(self, env):
+        # Nothing to read through, so the template is all there is — otherwise
+        # a fresh workspace would offer its just-downloaded weights for deletion.
+        env["workspace"].projects.clear()
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-4-e4b-it"]["removable"] is False
+        assert rows["google/gemma-4-e4b-it"]["keep_reason"] == "enabled"
+
     def test_the_bootstrap_model_resolves_under_its_legacy_name(self, env):
         # config.json written before the rename records slp-orchestra-mini;
         # canonicalization has to keep it resolving to the same entry.
