@@ -230,10 +230,20 @@ def _keep_model_ids(workspace: Workspace, model_service: Any) -> dict[str, str]:
 
     # Resolved per scope, not read off the workspace entry: ``enabled`` and
     # ``is_active`` can be overridden per project, so a model turned off
-    # app-wide may still be pinned on in a project that is using it.  The
-    # ``None`` scope reads through to the workspace entry (see
-    # ``Workspace.project_model``), which covers the app-default case.
-    for scope in (None, *workspace.projects):
+    # app-wide may still be pinned on in a project that is using it.
+    #
+    # Real projects only — the workspace entry is deliberately *not* a scope of
+    # its own.  It is a template: the defaults a **new** project is seeded from,
+    # not a place anything runs.  A model it enables is therefore not thereby in
+    # use, and treating it as a scope made the app-default pin weights that
+    # every existing project had turned off — reclaimable disk the UI could
+    # never offer, because the model picker only writes project overrides.
+    # Nothing is lost by dropping it: a project with no override still reads
+    # through to that default (``effective_model_enabled``), so the template
+    # keeps its meaning through the projects that inherit it.  With no projects
+    # at all there is nothing to read through, so consult the default directly
+    # rather than declaring every downloaded model collectible.
+    for scope in (list(workspace.projects) or [None]):
         for m in workspace.models:
             if workspace.effective_model_active(m.model_name, scope):
                 mark(m.model_id, "active")
