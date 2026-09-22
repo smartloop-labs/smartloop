@@ -181,12 +181,15 @@ def shutdown_logging(listener: Optional[logging.handlers.QueueListener] = None) 
 def truncate_log_file(home_dir: str) -> int:
     """Empty ``<home_dir>/server.log`` and return the bytes reclaimed.
 
-    Truncating the file alone is not enough while the server is running: the
-    ``RotatingFileHandler`` keeps writing at its own offset, so the next line
-    lands past a hole and the file reads back at its old size.  When the
-    listener is up we close its stream, truncate, and reopen — the handler
-    opens in append mode, so writing resumes at zero.  Falls back to a plain
-    truncate when no listener is registered (CLI, tests).
+    When the listener is up we close its stream, truncate, and reopen.  On
+    POSIX that is belt and braces — the handler opens in append mode, so
+    ``O_APPEND`` puts every later write at EOF and ``shouldRollover`` seeks to
+    the end before measuring, which means a bare truncate already resumes at
+    zero without rotating.  Windows is the reason it is here: a file another
+    handle holds open cannot be truncated, so the ``open(..., "r+")`` below
+    would fail outright with the handler's stream still attached.
+
+    Falls back to a plain truncate when no listener is registered (CLI, tests).
     """
     log_path = Path(home_dir) / "server.log"
     try:
