@@ -162,6 +162,17 @@ def _load_workspace(model_service: Any = None) -> Workspace:
     Always the singleton the rest of the process is using — never a fresh
     ``Workspace.load()`` copy, since mutating and saving that would clobber
     whatever the running server has in memory.
+
+    Per-project state is re-read before returning.  Under supervision a
+    project's own file is written by the child pinned to it, while this process
+    holds the copy it took when the project first appeared and nothing tells it
+    when that copy went stale — the case ``Workspace.refresh_project`` exists
+    for.  Every keep reason below resolves ``enabled``/``is_active`` per project
+    (see ``_keep_model_ids``), so without this the sweep decides what to delete
+    from a snapshot: weights a child has just turned off look in use for as long
+    as the copy lasts, and — the direction that actually costs something —
+    weights a child has just turned *on* look collectible.  Mtime-gated, so the
+    usual cost is one ``stat`` per project.
     """
     workspace = None
     if model_service is not None:
@@ -174,6 +185,19 @@ def _load_workspace(model_service: Any = None) -> Workspace:
 
     if not isinstance(workspace, Workspace):
         raise RuntimeError("Workspace not initialized")
+
+    refresh = getattr(model_service, "refresh_project_state", None)
+    if callable(refresh):
+        # Ids first: a refresh re-reads a project record, and iterating the
+        # list while it is being rewritten is not worth the risk.
+        for project_id in [p.id for p in workspace.projects]:
+            try:
+                refresh(project_id)
+            except Exception:                        # noqa: BLE001
+                # A project whose file cannot be read is not a reason to refuse
+                # the whole report; it just keeps the copy we already had.
+                logger.debug("[storage] Could not refresh project %s", project_id)
+
     return workspace
 
 
