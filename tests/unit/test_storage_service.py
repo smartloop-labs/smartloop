@@ -634,6 +634,11 @@ class TestAbandonedDownloads:
     strands the space on a model nothing can load, and on a full disk that is
     a deadlock: the only remedy the UI offers is the download this space
     blocks.
+
+    The bundled orgs are the exception, for the reason the deadlock argument
+    turns on: there the retry is not a thing the user might choose, so the
+    space comes back on its own.  See
+    ``test_a_bundled_partial_is_kept_for_its_retry``.
     """
 
     def test_abandoned_partial_is_removable_though_enabled(self, env):
@@ -658,14 +663,60 @@ class TestAbandonedDownloads:
 
         assert rows["google/gemma-3-4b-it"]["removable"] is True
 
-    def test_abandoned_partial_beats_bundled(self, env):
-        # A half-downloaded orchestrator cannot run the framework either, and
-        # keeping it leaves no way to free space for the retry.
+    def test_a_bundled_partial_is_kept_for_its_retry(self, env):
+        # The inverse of every other case in this class.  A half-downloaded
+        # orchestrator cannot run the framework — which is exactly why it will
+        # be downloaded again, and why the retry (which unlinks the stale
+        # .part itself) reclaims the space without the sweep.  Deleting it
+        # buys nothing and risks racing a writer, so bundled wins.
         _make_partial(env["models_dir"], "smartloop-ai/slp-orchestra-mini")
 
         rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
 
-        assert rows["smartloop-ai/slp-orchestra-mini"]["removable"] is True
+        held = rows["smartloop-ai/slp-orchestra-mini"]
+        assert held["removable"] is False
+        assert held["keep_reason"] == "bundled"
+        # Still an honest description of the directory; it just isn't offered.
+        assert held["partial"] is True
+
+    def test_a_bundled_partial_survives_the_sweep(self, env):
+        held = _make_partial(env["models_dir"], "smartloop-ai/slp-orchestra-mini")
+        removable = _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+
+        result = storage_service.run_cleanup(
+            model_service=env["service"], models=True,
+        )
+
+        assert os.path.exists(held), "the sweep reclaimed bundled weights"
+        assert held not in [d["path"] for d in result["deleted"]]
+        assert not os.path.exists(removable), (
+            "protecting the bundled tree stopped the rest of the sweep"
+        )
+
+    def test_a_live_embedding_fetch_is_never_offered(self, env):
+        """Embedding weights land as loose files directly in
+        ``models/embeddings/`` — ``llama_embeddings._fetch_gguf`` writes the
+        GGUF and its ``.part`` there rather than under an ``<org>/<repo>``
+        pair, and it takes no ``downloading`` mark.
+
+        Two things keep them: ``_dirs_in`` enumerates directories, so loose
+        files never become rows at all, and the org is bundled so anything that
+        *is* a directory under it is held.  The first is an accident of scan
+        depth; this test is what fails loudly if that ever changes.
+        """
+        embeddings = os.path.join(env["models_dir"], "embeddings")
+        os.makedirs(embeddings, exist_ok=True)
+        _write(os.path.join(embeddings, "bge-m3-Q4_K_M.gguf.part"), "p" * 100)
+
+        usage = storage_service.compute_usage(model_service=env["service"])
+        offered = [r["path"] for r in usage["categories"]["models"]["items"]]
+        assert not any(p.startswith(embeddings) for p in offered)
+
+        storage_service.run_cleanup(model_service=env["service"], models=True)
+
+        assert os.path.isfile(
+            os.path.join(embeddings, "bge-m3-Q4_K_M.gguf.part")
+        ), "the sweep deleted an in-flight embedding download"
 
     def test_weights_that_landed_survive_a_partial_companion(self, env):
         # The interrupted-multi-file case: main weights finished, the vision
