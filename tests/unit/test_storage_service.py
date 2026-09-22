@@ -309,6 +309,51 @@ class TestComputeUsage:
         assert rows["google/gemma-4-e4b-it"]["removable"] is False
         assert rows["google/gemma-4-e4b-it"]["keep_reason"] == "enabled"
 
+    def test_every_project_is_refreshed_before_deciding(self, env):
+        """Under supervision a project's file is written by its own child.
+
+        This process holds the copy it took when the project first appeared and
+        nothing tells it when that went stale, so the sweep would otherwise
+        decide what to delete from a snapshot.
+        """
+        storage_service.compute_usage(model_service=env["service"])
+
+        refreshed = [
+            c.args[0] for c in env["service"].refresh_project_state.call_args_list
+        ]
+        assert refreshed == [env["project"].id]
+
+    def test_a_childs_write_reaches_the_decision(self, env):
+        """The direction that actually costs something: a model a child turned
+        back *on* must stop being offered, or the sweep deletes weights a
+        project is using."""
+        # gemma3-4b is off app-wide, so it starts removable.
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+        assert rows["google/gemma-3-4b-it"]["removable"] is True
+
+        # A child enables it and writes its own file; the refresh is what picks
+        # that up on this side.
+        def pick_up_the_write(project_id):
+            env["project"].model_settings.append(
+                ProjectModel(model_name="gemma3-4b", enabled=True)
+            )
+            return True
+
+        env["service"].refresh_project_state.side_effect = pick_up_the_write
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-3-4b-it"]["removable"] is False
+        assert rows["google/gemma-3-4b-it"]["keep_reason"] == "enabled"
+
+    def test_an_unreadable_project_does_not_fail_the_report(self, env):
+        # Keeps the copy already held rather than refusing the whole sweep.
+        env["service"].refresh_project_state.side_effect = OSError("gone")
+
+        usage = storage_service.compute_usage(model_service=env["service"])
+
+        assert usage["categories"]["models"]["items"]
+
     def test_the_bootstrap_model_resolves_under_its_legacy_name(self, env):
         # config.json written before the rename records slp-orchestra-mini;
         # canonicalization has to keep it resolving to the same entry.
