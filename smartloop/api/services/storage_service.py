@@ -302,7 +302,7 @@ def _scan_models(workspace: Workspace, model_service: Any) -> list[dict]:
             loaded = bool(entry and entry.model_name in resident)
 
             # An abandoned download: a ``.part`` and nothing servable beside it.
-            # This overrides every keep reason below, because those all answer
+            # This overrides the keep reasons below, because those all answer
             # "is this model in use?" and none of them can be true of bytes
             # that never finished arriving — ``enabled`` is the picker's flag,
             # set when the user asked for the model, not when it landed.  A
@@ -321,6 +321,20 @@ def _scan_models(workspace: Workspace, model_service: Any) -> list[dict]:
                 # the difference — a transfer that is still writing — which is
                 # the one thing the reasoning above cannot see.
                 keep_reason = "downloading"
+            elif org in _BUNDLED_ORGS:
+                # Above the partial rule, not below it: the framework cannot run
+                # without the orchestrator or the embedder, so their retry is not
+                # a thing the user might choose — it is the next thing that
+                # happens.  That is what makes the deadlock argument above not
+                # apply here.  The retry unlinks the stale ``.part`` itself, so
+                # the space comes back either way and the sweep does not need to
+                # be the one to take it; deleting the tree only risks racing a
+                # writer nothing registered.  Embedding weights in particular are
+                # fetched outside the downloader entirely, by
+                # ``llama_embeddings._fetch_gguf``, which takes no ``downloading``
+                # mark — today those land as loose files that ``_dirs_in`` never
+                # enumerates, so this branch is belt to that accident's braces.
+                keep_reason = "bundled"
             elif partial and not loaded:
                 # ``loaded`` still wins: a resident context means this really is
                 # open right now, whatever the directory looks like, and that is
@@ -329,7 +343,7 @@ def _scan_models(workspace: Workspace, model_service: Any) -> list[dict]:
                 # model has them) but the cost of the guard is a boolean.
                 keep_reason = None
             else:
-                keep_reason = "bundled" if org in _BUNDLED_ORGS else keep.get(model_id)
+                keep_reason = keep.get(model_id)
 
             rows.append(_row(
                 path,
