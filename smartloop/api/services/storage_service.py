@@ -936,6 +936,68 @@ def run_cleanup(
     )
 
 
+def discard_partial_download(*, model_service: Any = None, model_id: str) -> dict:
+    """Remove what a cancelled download left behind, and clear its flags.
+
+    Deletes ``models/<org>/<repo>`` outright rather than picking the ``.part``
+    sidecars out of it.  A vision model downloads its weights and its mmproj
+    projector in parallel, so a cancel routinely lands with one finished and
+    one half-written — and a tree holding published weights and no projector is
+    the shape ``_gguf_exists`` reads as "already available", which would make
+    the model permanently unloadable while the picker showed it ready.  There
+    is no verified-weights-lost hazard in exchange: this runs only when a
+    *running* transfer observed the cancel, so the window between the last
+    ``os.replace`` and the thread unwinding is milliseconds, and a cancel
+    arriving after that finds no registration and never reaches here.
+
+    Deliberately not ``run_cleanup(models=True, model_ids=[model_id])``, for
+    four reasons:
+
+    * ``_plan_cleanup`` raises ``ValueError("Not removable…")`` for any tree the
+      scan does not call ``partial`` — which includes a cancel that landed
+      before a single ``.part`` existed, for a model the caller had enabled;
+    * ``run_cleanup`` re-consults ``is_downloading`` before each removal and
+      would skip this very directory if the mark had not yet been released;
+    * it drains every inference permit with a 30s deadline, which can refuse
+      outright during an active chat — far too heavy for a button press;
+    * it unloads the model and resets the LLM executor, a large user-visible
+      side effect for bytes nothing ever loaded.
+
+    Call only once the transfer's threads have stopped.  Both of the
+    downloader's ``ThreadPoolExecutor`` blocks join on exit, so by the time
+    ``download()`` returns no worker can still hold the file open.
+    """
+    workspace = _load_workspace(model_service)
+    models_dir = workspace.models_dir
+    if not models_dir:
+        raise RuntimeError("Workspace has no models directory")
+
+    path = os.path.join(models_dir, *model_id.split("/"))
+    if not os.path.isdir(path):
+        # Cancelled before a byte landed, or the directory is already gone.
+        # Not an error: the caller asked for the bytes to be absent, and they
+        # are.  No flags are touched either — ``downloaded`` is set only after a
+        # transfer completes, so a download that wrote nothing left nothing to
+        # correct.
+        return {"model_id": model_id, "path": path, "removed": False,
+                "freed": 0, "files": 0, "error": None, "models_marked": []}
+
+    size, files = _walk_size(path)
+    resolved = _validate(path, "models", workspace)
+
+    ok, error = _remove(resolved)
+    if not ok:
+        logger.warning("[storage] Could not discard %s: %s", resolved, error)
+        return {"model_id": model_id, "path": resolved, "removed": False,
+                "freed": 0, "files": 0, "error": error, "models_marked": []}
+
+    logger.info("[storage] Discarded cancelled download %s (%s bytes)", resolved, size)
+    _prune_empty_orgs(workspace)
+    marked = _mark_models_removed(workspace, {model_id})
+    return {"model_id": model_id, "path": resolved, "removed": True,
+            "freed": size, "files": files, "error": None, "models_marked": marked}
+
+
 def _mark_models_removed(workspace: Workspace, deleted_ids: set[str]) -> list[str]:
     """Flip the workspace flags for models whose weights are gone, and persist.
 

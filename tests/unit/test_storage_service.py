@@ -1030,3 +1030,145 @@ class TestValidateRefusesBadPaths:
         target = os.path.join(env["home_dir"], "cache", "slp-1.1.0.tar.gz")
         with pytest.raises(ValueError, match="Unknown category"):
             storage_service._validate(target, "conversations", env["workspace"])
+
+
+class TestDiscardingACancelledDownload:
+    """What a stopped download leaves behind, and what removes it.
+
+    Reached only from the download thread's own unwinding, so every case here
+    assumes the transfer has already stopped.
+    """
+
+    def test_it_removes_the_tree_and_clears_the_flags(self, env):
+        model_id = "google/gemma-3-4b-it"
+        path = _make_partial(env["models_dir"], model_id)
+
+        report = storage_service.discard_partial_download(
+            model_service=env["service"], model_id=model_id)
+
+        assert report["removed"] is True
+        assert report["freed"] > 0
+        assert not os.path.exists(path)
+        entry = next(m for m in env["workspace"].models if m.model_id == model_id)
+        assert not entry.downloaded and not entry.enabled and not entry.is_active
+        assert report["models_marked"] == [entry.model_name]
+
+    def test_it_removes_a_vision_model_that_only_half_arrived(self, env):
+        """Weights without their projector is the state this exists to prevent.
+
+        ``_gguf_exists`` reads such a directory as "already available", so
+        keeping it would leave the model permanently unloadable while the
+        picker showed it ready.
+        """
+        model_id = "google/gemma-3-4b-it"
+        path = _make_partial(env["models_dir"], model_id,
+                             keep=("weights.gguf",), part=("mmproj-model.gguf.part",))
+
+        report = storage_service.discard_partial_download(
+            model_service=env["service"], model_id=model_id)
+
+        assert report["removed"] is True
+        assert not os.path.exists(path)
+
+    def test_it_takes_both_part_files_of_a_vision_model(self, env):
+        model_id = "google/gemma-3-4b-it"
+        path = _make_partial(env["models_dir"], model_id,
+                             part=("weights.gguf.part", "mmproj-model.gguf.part"))
+
+        storage_service.discard_partial_download(
+            model_service=env["service"], model_id=model_id)
+
+        assert not os.path.exists(path)
+
+    def test_it_prunes_the_org_directory_it_empties(self, env):
+        model_id = "mistralai/Ministral-3-3B-Instruct-2512"
+        _make_partial(env["models_dir"], model_id)
+
+        storage_service.discard_partial_download(
+            model_service=env["service"], model_id=model_id)
+
+        assert not os.path.exists(os.path.join(env["models_dir"], "mistralai"))
+
+    def test_it_leaves_an_org_that_still_holds_a_sibling(self, env):
+        _make_partial(env["models_dir"], "google/gemma-3-4b-it")
+
+        storage_service.discard_partial_download(
+            model_service=env["service"], model_id="google/gemma-3-4b-it")
+
+        # gemma-4-e4b-it is still there, so google/ stays.
+        assert os.path.isdir(os.path.join(env["models_dir"], "google", "gemma-4-e4b-it"))
+
+    def test_a_directory_that_never_existed_is_not_an_error(self, env):
+        """Cancelled before a byte landed.  The caller asked for the bytes to
+        be absent, and they are."""
+        report = storage_service.discard_partial_download(
+            model_service=env["service"], model_id="google/never-started")
+
+        assert report["removed"] is False
+        assert report["error"] is None
+        assert report["freed"] == 0
+
+    def test_it_leaves_every_other_model_alone(self, env):
+        _make_partial(env["models_dir"], "google/gemma-3-4b-it")
+
+        storage_service.discard_partial_download(
+            model_service=env["service"], model_id="google/gemma-3-4b-it")
+
+        for _name, model_id, _e, _a in MODELS:
+            if model_id != "google/gemma-3-4b-it":
+                assert os.path.isdir(os.path.join(env["models_dir"], model_id)), model_id
+
+    def test_it_refuses_a_model_id_that_escapes_the_models_dir(self, env):
+        with pytest.raises(ValueError):
+            storage_service.discard_partial_download(
+                model_service=env["service"], model_id="../../..")
+
+    def test_it_refuses_a_shape_that_is_not_org_slash_repo(self, env):
+        with pytest.raises(ValueError, match="models/<org>/<repo>"):
+            storage_service.discard_partial_download(
+                model_service=env["service"], model_id="google")
+
+    def test_it_refuses_to_follow_a_symlink_out_of_home(self, env):
+        """The fixture links models/google/link at a directory outside home.
+
+        The containment rail is the one that fires, not the symlink rail:
+        ``_assert_inside_home`` resolves the path first, so a link pointing out
+        is refused as an escape before anyone asks what kind of file it is.
+        Either way the user's own files are untouched, which is the property
+        that matters.
+        """
+        with pytest.raises(ValueError, match="escapes"):
+            storage_service.discard_partial_download(
+                model_service=env["service"], model_id="google/link")
+        assert os.path.exists(os.path.join(env["outside"], "precious.txt"))
+
+    def test_it_does_not_drain_inference(self, env):
+        """A button press must not wait 30s on permits, and nothing can have
+        weights mapped that never finished downloading."""
+        _make_partial(env["models_dir"], "google/gemma-3-4b-it")
+
+        storage_service.discard_partial_download(
+            model_service=env["service"], model_id="google/gemma-3-4b-it")
+
+        env["service"]._inference_lock.acquire.assert_not_called()
+
+    def test_it_does_not_unload_or_reset_the_executor(self, env):
+        _make_partial(env["models_dir"], "google/gemma-3-4b-it")
+
+        storage_service.discard_partial_download(
+            model_service=env["service"], model_id="google/gemma-3-4b-it")
+
+        env["service"]._unload_model_by_name_unlocked.assert_not_called()
+        env["service"]._reset_llm_executor.assert_not_called()
+
+    def test_it_does_not_consult_the_indexer_guard(self, env):
+        """``run_cleanup`` refuses while the indexer runs; this must not."""
+        _make_partial(env["models_dir"], "google/gemma-3-4b-it")
+        env["service"]._task_queue.get_status.side_effect = lambda name=None: (
+            {"status": "running"} if name == "indexer" else {"error": "unknown"}
+        )
+
+        report = storage_service.discard_partial_download(
+            model_service=env["service"], model_id="google/gemma-3-4b-it")
+
+        assert report["removed"] is True
