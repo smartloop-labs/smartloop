@@ -13,11 +13,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from smartloop.api.config import api_settings
-from smartloop.api.services import ModelService, get_model_service
+from smartloop.api.services import ModelService, get_model_service, storage_service
 from smartloop.config import SUPPORTED_MODELS
 from smartloop.constants import canonical_model_name, display_model_name
 from smartloop.config.model_config import ModelConfig
 from smartloop.model.downloader import SLPArtifactDownloader, DownloadProgress
+from smartloop.model.downloader import cancellation
+from smartloop.model.downloader.cancellation import DownloadCancelled
 from smartloop.platform import get_platform_service
 from smartloop.workspace.context import projects_delegated
 from smartloop.workspace.workspace import is_mmproj_gguf
@@ -48,6 +50,20 @@ def _error_event(exc: Exception) -> str:
     return _sse_event(
         {"status": "error", "code": status_for(exc), "message": str(exc)},
         event="error",
+    )
+
+
+def _cancelled_event(model_name: str) -> str:
+    """Terminal SSE frame for a download the caller stopped.
+
+    Its own event name rather than an ``error`` frame carrying 499, because to
+    the client this is a success: the thing it asked for happened.  A client
+    that read it as an error would show a failure toast for its own button.
+    """
+    return _sse_event(
+        {"status": "cancelled",
+         "message": f"Download of {display_model_name(model_name)} cancelled."},
+        event="cancelled",
     )
 
 
@@ -113,7 +129,8 @@ def _gguf_exists(model_dir: str) -> bool:
 
 async def _download_and_stream(downloader, model_id: str, model_name: str,
                                 is_bootstrap: bool = False,
-                                artifacts: dict[str, str] | None = None):
+                                artifacts: dict[str, str] | None = None,
+                                model_service=None):
     """Download model files and stream progress.
 
     *artifacts* carries a signed-URL map already resolved by the caller (see
@@ -141,10 +158,38 @@ async def _download_and_stream(downloader, model_id: str, model_name: str,
 
     def _do_download():
         if is_bootstrap:
+            # First-run has no enable toggle to click, so bootstrap stays
+            # unregistered and uncancellable for now; its downloader keeps the
+            # private token ``__init__`` gave it, which nothing ever sets.
             downloader.bootstrap_download(progress_callback=on_progress)
-        else:
+            return
+
+        # Claimed and released on this thread, never in the SSE generator.  A
+        # window reload closes the stream and raises ``GeneratorExit`` there,
+        # and a release hung off that would unregister a transfer still
+        # consuming bandwidth — the next cancel would answer "not_found" for a
+        # download that is very much running.  Owning both ends here is what
+        # makes "only an explicit cancel stops a download" true rather than
+        # merely intended.
+        token = cancellation.begin(model_id)
+        downloader.cancel_token = token
+        try:
             downloader.download(model_id=model_id, progress_callback=on_progress,
                                 artifacts=artifacts)
+        except DownloadCancelled:
+            # Before ``end`` below, which is the point of doing it here: the
+            # registration is what keeps a second download from creating the
+            # directory into a tree that is in the middle of being removed.
+            try:
+                storage_service.discard_partial_download(
+                    model_service=model_service, model_id=model_id)
+            except Exception:                        # noqa: BLE001
+                # The cancel succeeded either way; bytes left behind are the
+                # abandoned-download case the storage sweep already collects.
+                logger.exception("Could not discard the cancelled download of %s", model_id)
+            raise
+        finally:
+            cancellation.end(model_id, token)
 
     download_task = loop.run_in_executor(None, _do_download)
 
@@ -319,7 +364,8 @@ async def init(
                 model_service.mark_model_downloaded(target, workspace=workspace)
             else:
                 async for event in _download_and_stream(downloader, ws_model.model_id, target,
-                                                        artifacts=artifacts):
+                                                        artifacts=artifacts,
+                                                        model_service=model_service):
                     yield event
 
                 model_service.mark_model_downloaded(target, workspace=workspace)
@@ -385,6 +431,19 @@ async def init(
                 "project": _get_project_info(model_service._model.workspace, target),
             }, event="complete")
 
+        except DownloadCancelled:
+            # Ahead of the catch-all, which would report the user's own button
+            # press as a 500.  Returning here is also the whole of the cancel's
+            # unwinding: every step above is sequential in this try, so nothing
+            # downstream of the download runs — not ``mark_model_downloaded``,
+            # not ``promote_model_to_workspace_default``, not the workspace
+            # save, the catalog seed, the pipeline, the project, the tasks, the
+            # orchestrator load or the MCP setup.  The ``add_model`` registration
+            # from before the stream is undone by ``discard_partial_download``,
+            # which clears the flags it set.
+            logger.info("Init cancelled for %s", target)
+            yield _cancelled_event(target)
+            return
         except Exception as exc:
             logger.exception("Init failed")
             yield _error_event(exc)
