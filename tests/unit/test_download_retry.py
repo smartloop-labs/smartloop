@@ -14,18 +14,28 @@ from smartloop.model.downloader.artifact_downloader import (
     _backoff_delay,
     _is_retryable_error,
 )
+from smartloop.model.downloader.cancellation import CancelToken
 
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    """Make backoff instant so retry tests don't actually wait."""
-    monkeypatch.setattr(ad.time, "sleep", lambda _s: None)
+    """Make backoff instant so retry tests don't actually wait.
+
+    ``CancelToken.wait`` *is* the retry backoff now — the downloader no longer
+    sleeps at all — and an uncancelled token would block for the real delay.
+    The cumulative window is ~90s, so ``test_exhausts_attempts_then_raises``
+    alone would take a minute and a half.  Returning the token's actual state
+    keeps the substitution honest: a cancelled token still reports cancelled,
+    it just does not wait first.
+    """
+    monkeypatch.setattr(CancelToken, "wait", lambda self, _timeout: self.cancelled)
 
 
-def _downloader():
+def _downloader(cancel: CancelToken | None = None):
     """A downloader instance without running __init__ (no network/workspace)."""
     dl = SLPArtifactDownloader.__new__(SLPArtifactDownloader)
     dl.logger = logging.getLogger("test-downloader")
+    dl.cancel_token = cancel or CancelToken()
     return dl
 
 
