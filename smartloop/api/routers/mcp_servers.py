@@ -249,8 +249,16 @@ async def _try_register_smartloop_mcp_server(
     allowing the caller to fall through to the standard MCP handshake.
     """
     import httpx
+    from urllib.parse import urlsplit, urlunsplit
 
-    info_url = server_url.rstrip("/") + "/info"
+    # Appending to the raw URL puts "/info" inside the query string when the
+    # URL carries one ("...?token=abc/info"), which probes an endpoint that
+    # does not exist and reads as "not a Smartloop server".  Split first so the
+    # suffix lands on the path and the credential survives.
+    parts = urlsplit(server_url)
+    info_url = urlunsplit(
+        parts._replace(path=parts.path.rstrip("/") + "/info")
+    )
 
     def _probe():
         resp = httpx.get(info_url, timeout=10.0)

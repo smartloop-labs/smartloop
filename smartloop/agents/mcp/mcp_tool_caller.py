@@ -124,6 +124,13 @@ class MCPToolCaller:
     def get_access_token(server: "MCPServer") -> Optional[str]:
         if server.oauth_credentials and server.oauth_credentials.access_token:
             return server.oauth_credentials.access_token
+        # A server registered from a URL carrying its own credential
+        # (``?token=...``) keeps it on the remote config, not in OAuth
+        # credentials there are none of.  Discovery already falls back here, so
+        # without the same fallback a static-token connection lists its tools
+        # and then 401s on every call to them.
+        if server.remote_config and server.remote_config.token:
+            return server.remote_config.token
         return None
 
     @staticmethod
