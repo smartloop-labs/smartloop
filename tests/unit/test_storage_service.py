@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import threading
+import time
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -50,6 +51,12 @@ def _write(path, content="x"):
     return path
 
 
+def _age(path: str, seconds: int = storage_service._ORPHAN_MIN_AGE_S + 3600) -> None:
+    """Backdate a path's mtime so the orphan sweep treats it as settled."""
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+
+
 @pytest.fixture()
 def home(tmp_path):
     """A fake ~/.smartloop with every category populated."""
@@ -78,6 +85,12 @@ def home(tmp_path):
     _write(str(project_dir / "documents" / "readme.txt"), "doc")
     orphan_id = str(uuid4())
     _write(str(workspace_dir / orphan_id / "documents" / "stale.txt"), "stale")
+    # Backdated past _ORPHAN_MIN_AGE_S: the sweep leaves a recently touched
+    # directory alone, so an orphan created here and now would never be offered.
+    _age(str(workspace_dir / orphan_id))
+    # An orphan by shape but touched moments ago — the age guard keeps it.
+    fresh_orphan_id = str(uuid4())
+    _write(str(workspace_dir / fresh_orphan_id / "documents" / "live.txt"), "live")
     # A non-uuid directory is not a project shape and must be left alone.
     _write(str(workspace_dir / "not-a-project" / "keep.txt"), "keep")
     _write(str(workspace_dir / "workspace.db"), "db")
@@ -136,6 +149,7 @@ def home(tmp_path):
         "models_dir": str(models_dir),
         "project": project,
         "orphan_id": orphan_id,
+        "fresh_orphan_id": fresh_orphan_id,
         "config_file": str(config_file),
         "session_id": session_id,
         "untracked_id": untracked_id,
@@ -499,6 +513,36 @@ class TestModelUsageGroups:
         # Enabled, but the weights never arrived — the partial rule wins, and
         # the group follows it rather than the picker's flag.
         assert rows["google/gemma-4-e4b-it"]["group"] == "unused"
+
+
+class TestOrphanProjectsSettleFirst:
+    def test_a_recently_touched_orphan_is_left_alone(self, env):
+        rows = _rows(storage_service.compute_usage(model_service=env["service"]),
+                     "orphan_projects")
+
+        ids = [r["project_id"] for r in rows]
+        assert env["orphan_id"] in ids
+        assert env["fresh_orphan_id"] not in ids, (
+            "a directory written moments ago was offered for deletion"
+        )
+
+    def test_the_sweep_leaves_a_fresh_orphan_on_disk(self, env):
+        storage_service.run_cleanup(
+            model_service=env["service"], orphan_projects=True,
+        )
+
+        assert os.path.isdir(
+            os.path.join(env["workspace_dir"], env["fresh_orphan_id"])
+        )
+
+    def test_an_orphan_that_has_settled_is_swept(self, env):
+        storage_service.run_cleanup(
+            model_service=env["service"], orphan_projects=True,
+        )
+
+        assert not os.path.exists(
+            os.path.join(env["workspace_dir"], env["orphan_id"])
+        )
 
 
 class TestCleanup:
