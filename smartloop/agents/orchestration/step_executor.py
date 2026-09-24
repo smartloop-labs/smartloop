@@ -15,7 +15,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from smartloop.llms import BaseLLM
-from smartloop.workspace.workspace import MCPServer, MCPServerType
+from smartloop.workspace.workspace import MCPServer, MCPServerStatus, MCPServerType
 from smartloop.agents.nodes import NodeResult
 from smartloop.agents.mcp.argument_extractor import MCPArgumentExtractor
 from smartloop.agents.mcp.dependency_analyzer import MCPDependencyAnalyzer
@@ -1139,6 +1139,12 @@ class StepExecutor:
             if not server.enabled:
                 continue
             if not server.tools:
+                continue
+            # A connection whose credentials the server has stopped accepting
+            # keeps its cached tool list, so without this the planner goes on
+            # offering tools that can only 401 — and the failure is swallowed,
+            # which reads as "that app has nothing in it".
+            if server.status == MCPServerStatus.FAILED:
                 continue
 
             available.append({

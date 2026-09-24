@@ -39,6 +39,9 @@ class _RecordingClient:
         self.posts.append((url, data))
         return _FakeResponse(self._json)
 
+    def close(self):
+        pass
+
 
 class TestCanonicalResource:
     def test_path_is_significant(self):
@@ -166,11 +169,10 @@ class TestStoredServerRefresh:
     def _refresh(self, server):
         from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 
+        # The stored-config refresh runs through MCPOAuthService, which holds
+        # the client rather than entering it as a context manager.
         client = _RecordingClient()
-        ctx = MagicMock()
-        ctx.__enter__ = MagicMock(return_value=client)
-        ctx.__exit__ = MagicMock(return_value=False)
-        with patch("httpx.Client", return_value=ctx):
+        with patch("httpx.Client", return_value=client):
             caller = MCPToolCaller(arg_extractor=None, result_mapper=None)
             token = caller.refresh_access_token(server)
         return token, client.posts

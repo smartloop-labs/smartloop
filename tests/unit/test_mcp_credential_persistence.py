@@ -37,16 +37,17 @@ def _server(**creds):
 
 
 def _reply(payload):
-    """Patch httpx.Client so the refresh grant returns *payload*."""
+    """Patch httpx.Client so the refresh grant returns *payload*.
+
+    MCPOAuthService holds the client rather than entering it, so the patched
+    constructor stands in for the client itself.
+    """
     resp = MagicMock()
     resp.json = MagicMock(return_value=payload)
     resp.raise_for_status = MagicMock()
     http = MagicMock()
     http.post = MagicMock(return_value=resp)
-    ctx = MagicMock()
-    ctx.__enter__ = MagicMock(return_value=http)
-    ctx.__exit__ = MagicMock(return_value=False)
-    return patch("httpx.Client", return_value=ctx)
+    return patch("httpx.Client", return_value=http)
 
 
 def _reply_from(grant):
@@ -59,10 +60,7 @@ def _reply_from(grant):
 
     http = MagicMock()
     http.post = MagicMock(side_effect=_post)
-    ctx = MagicMock()
-    ctx.__enter__ = MagicMock(return_value=http)
-    ctx.__exit__ = MagicMock(return_value=False)
-    return patch("httpx.Client", return_value=ctx)
+    return patch("httpx.Client", return_value=http)
 
 
 class TestTheRefreshIsWrittenBack:
