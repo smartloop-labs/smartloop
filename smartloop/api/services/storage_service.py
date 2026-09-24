@@ -80,6 +80,14 @@ _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 # by us, but they live under our home and nothing else prunes them.
 _CACHE_DIRS = ("cache", "templates")
 
+# How long a project directory must sit untouched before the sweep will take it.
+# The orphan rule is structural — "config.json does not mention you" — with no
+# other evidence behind it, and the sweep runs without ever being shown in the
+# UI, so a config that loaded short of its full project list would delete live
+# work with nothing on screen having named it.  An orphan is litter left by a
+# bug; it is in no hurry, and waiting a week costs nothing it was going to use.
+_ORPHAN_MIN_AGE_S = 7 * 24 * 60 * 60
+
 # Never removed, whatever category is being swept: credentials, the workspace
 # record itself, liveness markers, install markers, and the desktop app's own DB.
 _NEVER_DELETE = frozenset({
@@ -529,7 +537,15 @@ def _scan_orphan_projects(workspace: Workspace) -> list[dict]:
         path = os.path.join(workspace_dir, name)
         if os.path.realpath(path) in known:
             continue
-        rows.append(_row(path, removable=True, project_id=name))
+        try:
+            age = time.time() - os.stat(path).st_mtime
+        except OSError:
+            continue
+        if age < _ORPHAN_MIN_AGE_S:
+            # Touched recently, so something is still writing here even though
+            # the workspace record does not admit it.  Leave it be.
+            continue
+        rows.append(_row(path, removable=True, project_id=name, age_s=int(age)))
     return rows
 
 
