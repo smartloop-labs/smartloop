@@ -545,6 +545,46 @@ class TestOrphanProjectsSettleFirst:
         )
 
 
+class TestASiblingWorkspaceIsNeverAProject:
+    """Workspaces sit side by side under home, one directory each.
+
+    They are uuid-shaped and hold no projects of *this* workspace, so anything
+    that roots the orphan scan at home rather than at the workspace directory
+    offers another account's entire workspace for deletion.  An empty workspace
+    id does exactly that: os.path.join(home, "") is "<home>/", and realpath
+    normalises it back to home so every downstream check agrees.
+    """
+
+    @staticmethod
+    def _collapsed(env):
+        ws = env["workspace"]
+        ws.id = ""
+        ws.workspace_dir = os.path.join(env["home_dir"], "")
+        return ws
+
+    def test_the_scan_refuses_a_collapsed_workspace_dir(self, env):
+        assert storage_service._scan_orphan_projects(self._collapsed(env)) == []
+
+    def test_validation_refuses_it_too(self, env):
+        ws = self._collapsed(env)
+        sibling = os.path.join(env["home_dir"], str(uuid4()))
+        os.makedirs(sibling)
+
+        with pytest.raises(ValueError, match="home directory"):
+            storage_service._validate(sibling, "orphan_projects", ws)
+
+    def test_a_sibling_workspace_survives_the_sweep(self, env):
+        sibling = os.path.join(env["home_dir"], str(uuid4()))
+        os.makedirs(os.path.join(sibling, "models"))
+        _age(sibling)
+
+        storage_service.run_cleanup(
+            model_service=env["service"], orphan_projects=True,
+        )
+
+        assert os.path.isdir(sibling), "another workspace was swept"
+
+
 class TestCleanup:
     def test_nothing_happens_without_a_category(self, env):
         result = storage_service.run_cleanup(model_service=env["service"])
