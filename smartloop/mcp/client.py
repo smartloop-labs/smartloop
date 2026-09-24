@@ -209,8 +209,17 @@ class MCPClient:
                     body = response.text[:500]
                 except Exception:
                     body = ""
+                # Not a prefix of the header: "Bearer " is seven characters,
+                # so thirty of them is twenty-three characters of a live token —
+                # and this string is logged, and becomes ``last_error``, which
+                # ``GET /projects/{id}/mcp`` hands to the UI.  What the reader
+                # needs is whether a credential was sent, not which one.
                 auth_sent = headers.get("Authorization", "")
-                auth_preview = f"{auth_sent[:30]}..." if len(auth_sent) > 30 else auth_sent
+                if auth_sent:
+                    scheme, _, credential = auth_sent.partition(" ")
+                    auth_preview = f"{scheme} ({len(credential)} chars)"
+                else:
+                    auth_preview = "(none)"
                 detail = (
                     f"Authentication failed (401). "
                     f"WWW-Authenticate: {www_auth or '(none)'}. "

@@ -1,4 +1,3 @@
-import httpx
 import logging
 import re
 import threading
@@ -7,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from smartloop.mcp import MCPClient
 from smartloop.mcp.local_client import LocalMCPClient
-from smartloop.workspace.workspace import MCPServerType
+from smartloop.workspace.workspace import MCPServerStatus, MCPServerType
 
 from .argument_extractor import MCPArgumentExtractor
 from .result_mapper import MCPResultMapper
@@ -221,6 +220,10 @@ class MCPToolCaller:
             return creds.access_token
 
         if not creds or not creds.refresh_token:
+            # Nothing to redeem.  Callers reach this only after a 401, so for a
+            # pasted credential that 401 is the verdict on the credential
+            # itself rather than a sign its token aged out.
+            self.record_credential_rejected(server)
             logger.warning(f"No refresh token available for server '{server.name}'")
             return None
 
@@ -229,52 +232,101 @@ class MCPToolCaller:
             logger.warning(f"No token endpoint configured for server '{server.name}'")
             return None
 
+        from smartloop.mcp.oauth import MCPOAuthService, TokenExchangeError
+
         try:
-            payload = {
-                "grant_type": "refresh_token",
-                "refresh_token": creds.refresh_token,
-                "client_id": creds.client_id,
-            }
-            if creds.client_secret:
-                payload["client_secret"] = creds.client_secret
-            # RFC 8707: a refresh must carry the same resource indicator as the
-            # grant it descends from, or strict servers (monday.com) reject it.
-            if remote.resource:
-                payload["resource"] = remote.resource
-
-            with httpx.Client(timeout=30.0) as http:
-                resp = http.post(remote.token_endpoint, data=payload)
-                resp.raise_for_status()
-                data = resp.json()
-
-            new_access = data.get("access_token")
-            if not new_access:
-                logger.error("Token refresh response missing access_token")
-                return None
-
-            creds.access_token = new_access
-            if data.get("refresh_token"):
-                creds.refresh_token = data["refresh_token"]
-            if data.get("expires_in"):
-                creds.expires_at = time.time() + data["expires_in"]
-
-            if self._persist is not None:
-                try:
-                    self._persist()
-                except Exception as e:
-                    # The token in memory is good, so the call this refresh was
-                    # for should still go ahead; it is the *next* process that
-                    # pays for a failed write.
-                    logger.warning(
-                        f"Refreshed '{server.name}' but could not persist credentials: {e}"
-                    )
-
-            logger.info(f"Refreshed access token for server '{server.name}'")
-            return new_access
-
+            with MCPOAuthService() as oauth:
+                # RFC 8707: a refresh must carry the same resource indicator as
+                # the grant it descends from, or strict servers (monday.com)
+                # reject it.
+                tokens = oauth.refresh_access_token(
+                    token_endpoint=remote.token_endpoint,
+                    refresh_token=creds.refresh_token,
+                    client_id=creds.client_id,
+                    client_secret=creds.client_secret,
+                    resource=remote.resource,
+                )
+        except TokenExchangeError as e:
+            logger.error(f"Token refresh failed for server '{server.name}': {e}")
+            if e.grant_is_dead:
+                # The server has retired this grant.  Re-minting it cannot work
+                # again, so this is the one refusal that should cost the user
+                # their connection — a blip or a 5xx must not.
+                self.record_grant_expired(server)
+            return None
         except Exception as e:
             logger.error(f"Token refresh failed for server '{server.name}': {e}")
             return None
+
+        creds.access_token = tokens.access_token
+        if tokens.refresh_token:
+            creds.refresh_token = tokens.refresh_token
+        if tokens.expires_in:
+            creds.expires_at = time.time() + tokens.expires_in
+
+        self._write_back(server, "Refreshed")
+        logger.info(f"Refreshed access token for server '{server.name}'")
+        return tokens.access_token
+
+    def _write_back(self, server: "MCPServer", what: str) -> None:
+        """Persist a change to *server*, logging rather than raising on failure.
+
+        The state in memory is good, so whatever this change was made for should
+        still go ahead; it is the *next* process that pays for a failed write.
+        """
+        if self._persist is None:
+            return
+        try:
+            self._persist()
+        except Exception as e:
+            logger.warning(
+                f"{what} '{server.name}' but could not persist the change: {e}"
+            )
+
+    def record_credential_rejected(self, server: "MCPServer") -> bool:
+        """Fail a connection whose pasted credential the server refused.
+
+        Only for a credential that was pasted rather than granted.  An OAuth
+        connection has a refresh to fall back on and a failed refresh can be
+        transient, but a token the server has stopped accepting never starts
+        working again on its own.  Left unreported it looks exactly like a tool
+        with no data: ``status: ready``, an empty answer, nothing in the log.
+
+        Returns whether the server's state changed.
+        """
+        remote = server.remote_config
+        if not remote or not remote.token:
+            return False
+        return self._fail(
+            server,
+            "The access token for this connection was rejected. "
+            "Enter a new token to reconnect.",
+        )
+
+    def record_grant_expired(self, server: "MCPServer") -> bool:
+        """Fail a connection whose OAuth grant the server has retired.
+
+        Reached only for ``invalid_grant``/``invalid_client`` — a refusal that
+        re-minting the same grant cannot recover from.  Until this existed a
+        dead connection reported ``ready`` with its full tool list forever,
+        while every call 401'd and was swallowed.
+        """
+        return self._fail(
+            server,
+            "This connection's authorization has expired. Reconnect it to "
+            "keep using it.",
+        )
+
+    def _fail(self, server: "MCPServer", message: str) -> bool:
+        if server.status == MCPServerStatus.FAILED and server.last_error == message:
+            return False
+        server.status = MCPServerStatus.FAILED
+        server.last_error = message
+        logger.warning(
+            f"Server '{server.name}' can no longer authenticate: {message}"
+        )
+        self._write_back(server, "Failed")
+        return True
 
     def validate_argument_values(
         self,

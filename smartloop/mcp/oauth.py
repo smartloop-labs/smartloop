@@ -81,7 +81,34 @@ class ClientRegistrationError(MCPOAuthError):
 
 
 class TokenExchangeError(MCPOAuthError):
-    pass
+    """A token endpoint refused a grant, or could not be reached.
+
+    ``error_code`` is the OAuth 2.0 error identifier from the response body
+    (RFC 6749 §5.2) when the server sent one, and ``None`` for a transport
+    failure.  It is what separates a grant that is dead — ``invalid_grant``,
+    ``invalid_client`` — from a blip: only the first kind means re-minting the
+    same refresh token can never work again, and only the first kind should
+    cost a user their connection.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        error_code: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.error_code = error_code
+        self.status_code = status_code
+
+    #: Error identifiers that mean the grant itself is finished.  A refresh
+    #: token the server has retired, or client credentials it no longer
+    #: recognises, cannot be recovered by trying again.
+    DEAD_GRANT_CODES = frozenset({"invalid_grant", "invalid_client"})
+
+    @property
+    def grant_is_dead(self) -> bool:
+        return self.error_code in self.DEAD_GRANT_CODES
 
 
 class MCPOAuthService:
@@ -338,13 +365,16 @@ class MCPOAuthService:
             )
         except httpx.HTTPStatusError as e:
             error_detail = ""
+            error_code = None
             try:
                 error_data = e.response.json()
-                error_detail = f": {error_data.get('error_description', error_data.get('error', ''))}"
+                error_code = error_data.get("error")
+                error_detail = f": {error_data.get('error_description', error_code or '')}"
             except Exception:
                 pass
             raise TokenExchangeError(
-                f"Token exchange failed: HTTP {e.response.status_code}{error_detail}"
+                f"Token exchange failed: HTTP {e.response.status_code}{error_detail}",
+                error_code=error_code, status_code=e.response.status_code,
             ) from e
         except httpx.RequestError as e:
             raise TokenExchangeError(
@@ -391,13 +421,16 @@ class MCPOAuthService:
             )
         except httpx.HTTPStatusError as e:
             error_detail = ""
+            error_code = None
             try:
                 error_data = e.response.json()
-                error_detail = f": {error_data.get('error_description', error_data.get('error', ''))}"
+                error_code = error_data.get("error")
+                error_detail = f": {error_data.get('error_description', error_code or '')}"
             except Exception:
                 pass
             raise TokenExchangeError(
-                f"Token refresh failed: HTTP {e.response.status_code}{error_detail}"
+                f"Token refresh failed: HTTP {e.response.status_code}{error_detail}",
+                error_code=error_code, status_code=e.response.status_code,
             ) from e
         except httpx.RequestError as e:
             raise TokenExchangeError(
