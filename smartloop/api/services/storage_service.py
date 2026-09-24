@@ -520,6 +520,21 @@ def _scan_orphan_projects(workspace: Workspace) -> list[dict]:
     if not workspace_dir or not os.path.isdir(workspace_dir):
         return []
 
+    # The workspace directory is ``<home>/<workspace-id>``, so it can never be
+    # the home directory itself — but an empty id makes os.path.join collapse it
+    # to exactly that, and realpath then strips the trailing separator so every
+    # later check agrees.  What sits directly under home is one directory per
+    # *workspace*, all uuid-shaped and none of them this workspace's projects,
+    # so the scan below would offer every one of them — on a shared machine,
+    # another account's entire workspace.  Refuse rather than guess.
+    if os.path.realpath(workspace_dir) == _home():
+        logger.warning(
+            "[storage] Workspace directory resolved to the home directory "
+            "(workspace id %r); skipping the orphan-project scan",
+            workspace.id,
+        )
+        return []
+
     known = set()
     for project in workspace.projects:
         if project.project_dir:
@@ -638,6 +653,10 @@ def _validate(path: str, shape: str, workspace: Workspace) -> str:
             raise ValueError(f"Not a cache entry: {path}")
     elif shape == "orphan_projects":
         workspace_dir = os.path.realpath(workspace.workspace_dir or "")
+        # Belt to the scanner's braces: a workspace dir that collapsed onto home
+        # would make every sibling workspace look like a project of this one.
+        if workspace_dir == home:
+            raise ValueError(f"Workspace directory resolved to the home directory: {path}")
         if os.path.dirname(resolved) != workspace_dir:
             raise ValueError(f"Not a project directory: {path}")
         uuid.UUID(os.path.basename(resolved))          # raises ValueError
