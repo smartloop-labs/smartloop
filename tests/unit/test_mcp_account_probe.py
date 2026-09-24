@@ -117,7 +117,9 @@ class TestProbe:
         caller = self._caller(json.dumps({"email": "mehfuz@smartloop.ai"}))
         server = _server(tools=[_tool("notion-get-self"), _tool("notion-search")])
 
-        assert probe_account(server, tool_caller=caller) == "mehfuz@smartloop.ai"
+        assert probe_account(server, tool_caller=caller) == (
+            "mehfuz@smartloop.ai", False,
+        )
         assert caller.call_tool.call_args.kwargs["tool_name"] == "notion-get-self"
         assert caller.call_tool.call_args.kwargs["arguments"] == {}
 
@@ -128,12 +130,16 @@ class TestProbe:
 
     def test_a_failed_call_leaves_the_connection_unlabelled(self):
         caller = self._caller("", success=False)
-        assert probe_account(_server(tools=[_tool("get_self")]), tool_caller=caller) is None
+        assert probe_account(
+            _server(tools=[_tool("get_self")]), tool_caller=caller,
+        ) == (None, False)
 
     def test_a_raising_transport_does_not_break_provisioning(self):
         caller = MCPToolCaller(None, None)
         caller.get_access_token = MagicMock(side_effect=RuntimeError("server went away"))
-        assert probe_account(_server(tools=[_tool("get_self")]), tool_caller=caller) is None
+        assert probe_account(
+            _server(tools=[_tool("get_self")]), tool_caller=caller,
+        ) == (None, False)
 
 
 class TestProvisioningRecordsTheAccount:
@@ -147,7 +153,8 @@ class TestProvisioningRecordsTheAccount:
 
         server = SimpleNamespace(name="notion", account=None, tools=[])
         svc = self._svc(server)
-        with patch("smartloop.mcp.account.probe_account", return_value="mehfuz@smartloop.ai"):
+        with patch("smartloop.mcp.account.probe_account",
+                   return_value=("mehfuz@smartloop.ai", False)):
             ModelService._probe_mcp_account(svc, server)
         assert server.account == "mehfuz@smartloop.ai"
         svc._model.save.assert_called_once()
@@ -157,7 +164,8 @@ class TestProvisioningRecordsTheAccount:
 
         server = SimpleNamespace(name="notion", account="mehfuz@smartloop.ai", tools=[])
         svc = self._svc(server)
-        with patch("smartloop.mcp.account.probe_account", return_value="mehfuz@smartloop.ai"):
+        with patch("smartloop.mcp.account.probe_account",
+                   return_value=("mehfuz@smartloop.ai", False)):
             ModelService._probe_mcp_account(svc, server)
         svc._model.save.assert_not_called()
 
@@ -168,6 +176,63 @@ class TestProvisioningRecordsTheAccount:
 
         server = SimpleNamespace(name="notion", account="mehfuz@smartloop.ai", tools=[])
         svc = self._svc(server)
-        with patch("smartloop.mcp.account.probe_account", return_value=None):
+        with patch("smartloop.mcp.account.probe_account", return_value=(None, False)):
             ModelService._probe_mcp_account(svc, server)
         assert server.account == "mehfuz@smartloop.ai"
+
+
+class TestARotatedTokenIsWrittenBack:
+    """The probe is where a refresh token most often gets spent.
+
+    It runs on every connect and re-index, refreshes on a 401 through the shared
+    read-only path — and used to drop the flag saying it had.  Against a
+    provider that rotates refresh tokens single-use, that left the retired one
+    on disk: the connection worked until the next restart and then could never
+    be renewed, with nothing reporting it.
+    """
+
+    def _svc(self):
+        svc = MagicMock()
+        svc._model = MagicMock()
+        return svc
+
+    def test_a_rotation_is_saved_even_when_the_label_is_unchanged(self):
+        from smartloop.api.services.model_service import ModelService
+
+        server = SimpleNamespace(name="notion", account="mehfuz@smartloop.ai", tools=[])
+        svc = self._svc()
+        with patch("smartloop.mcp.account.probe_account",
+                   return_value=("mehfuz@smartloop.ai", True)):
+            ModelService._probe_mcp_account(svc, server)
+        svc._model.save.assert_called_once()
+
+    def test_a_rotation_is_saved_even_when_there_is_no_label(self):
+        from smartloop.api.services.model_service import ModelService
+
+        server = SimpleNamespace(name="notion", account=None, tools=[])
+        svc = self._svc()
+        with patch("smartloop.mcp.account.probe_account", return_value=(None, True)):
+            ModelService._probe_mcp_account(svc, server)
+        svc._model.save.assert_called_once()
+
+    def test_the_probe_caller_carries_the_persistence_hook(self):
+        """Belt: the hook writes the rotation without waiting for the flag."""
+        from smartloop.api.services.model_service import ModelService
+
+        server = SimpleNamespace(name="notion", account=None, tools=[])
+        svc = self._svc()
+        seen = {}
+        with patch("smartloop.mcp.account.probe_account") as probe:
+            probe.return_value = (None, False)
+            ModelService._probe_mcp_account(svc, server)
+            seen["caller"] = probe.call_args.kwargs["tool_caller"]
+
+        assert seen["caller"]._persist == svc._model.save
+
+    def test_the_flag_reaches_the_caller_from_the_read_only_path(self):
+        """Brace: probe_account forwards what call_read_only reported."""
+        with patch("smartloop.mcp.account.call_read_only",
+                   return_value=("{}", True, None)):
+            assert probe_account(
+                _server(tools=[_tool("get_self")]), tool_caller=MagicMock(),
+            ) == (None, True)

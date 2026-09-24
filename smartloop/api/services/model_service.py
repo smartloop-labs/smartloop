@@ -4559,17 +4559,20 @@ class ModelService:
         One read-only call on the provisioning pass — so it costs a request per
         connect or re-index, never per page load.  Best-effort: a server with no
         identity tool leaves the field alone.
+
+        It is also the call most likely to renew an expired token, because it is
+        the one that runs on every connect and re-index.  It gets a caller with
+        the persistence hook, and the rotation it reports is saved here as well:
+        the probe runs *after* the ``READY`` save and the next chat request opens
+        with ``workspace.reload()``, so a rotation nothing writes is not merely
+        unsaved — it is discarded, leaving on disk a refresh token the provider
+        has already retired and a connection that can never be renewed.
         """
         try:
             from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
             from smartloop.mcp.account import probe_account
 
-            # Given its own caller so a token refreshed by the probe is written
-            # back.  The default caller has no persistence hook, and the probe
-            # discarded the "credentials changed" flag it got back — so the one
-            # call that runs on every connect could rotate a refresh token into
-            # a variable nobody read.
-            account = probe_account(
+            account, credentials_changed = probe_account(
                 server,
                 tool_caller=MCPToolCaller(None, None, persist=self._model.save),
             )
@@ -4578,6 +4581,10 @@ class ModelService:
             return
         if account and account != server.account:
             server.account = account
+            self._model.save()
+        elif credentials_changed:
+            # The hook above has already written them; this covers a caller
+            # built without one, which is how the flag came to be ignored.
             self._model.save()
 
     def _discover_mcp_tools(self, server: "MCPServer") -> None:
