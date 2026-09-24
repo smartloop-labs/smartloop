@@ -1,6 +1,7 @@
 import httpx
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -25,9 +26,15 @@ class MCPToolCaller:
         self.arg_extractor = arg_extractor
         self.result_mapper = result_mapper
         #: Called after a refresh replaces a server's credentials, to write them
-        #: back to the workspace.  Optional because one caller — the content
-        #: crawl — already persists through its own ``on_server_updated`` hook.
+        #: back to the workspace.  The hook is the *only* thing that persists
+        #: them: the content crawl, which used to write them through its own
+        #: ``on_server_updated``, was removed with indexing in ``abc232b``.
         self._persist = persist
+        #: Serializes redemptions.  Parallel step groups and tool fan-out share
+        #: one caller, so several calls can 401 together and each redeem the
+        #: same refresh token — and a provider that issues them single-use
+        #: invalidates the grant on the second attempt.
+        self._refresh_lock = threading.Lock()
 
     def set_persist(self, persist: Optional[Callable[[], None]]) -> None:
         """Install the callback that writes refreshed credentials back to disk."""
@@ -70,6 +77,44 @@ class MCPToolCaller:
                         tool_name, server.name, server_url, result.error,
                     )
                 return result
+
+    def call_with_refresh(
+        self,
+        server: "MCPServer",
+        tool_name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+        cwd: Optional[str] = None,
+    ):
+        """Call a tool, renewing an expired token once and trying again.
+
+        Returns ``(result, refreshed)`` — ``refreshed`` says the server's
+        credentials changed, so a caller that owns the write-back knows there is
+        something to write.  (:attr:`_persist` already handles the callers that
+        do not.)
+
+        Every MCP call path had its own copy of this, and they had drifted: two
+        guarded on a server URL, one reported the rotation, one retried with the
+        wrong tool name, and the collect path — the main one since indexing was
+        replaced by live tool calls — had no retry at all, so an aged-out
+        connection looked to retrieval like an app with nothing in it.
+        """
+        access_token = self.get_access_token(server)
+        result = self.call_tool(
+            server=server, tool_name=tool_name,
+            arguments=arguments, access_token=access_token, cwd=cwd,
+        )
+        if result.success or not result.auth_expired:
+            return result, False
+
+        new_token = self.refresh_access_token(server, stale_token=access_token)
+        if not new_token:
+            return result, False
+
+        result = self.call_tool(
+            server=server, tool_name=tool_name,
+            arguments=arguments, access_token=new_token, cwd=cwd,
+        )
+        return result, True
 
     def find_server(
         self,
@@ -142,7 +187,9 @@ class MCPToolCaller:
             return server.remote_config.token
         return None
 
-    def refresh_access_token(self, server: "MCPServer") -> Optional[str]:
+    def refresh_access_token(
+        self, server: "MCPServer", stale_token: Optional[str] = None,
+    ) -> Optional[str]:
         """Redeem *server*'s refresh token, storing the result on the server.
 
         The new credentials are written back through :attr:`_persist`.  Leaving
@@ -150,11 +197,29 @@ class MCPToolCaller:
         tokens hand back a new one and retire the old, so a refresh during a chat
         turn left the workspace holding a refresh token the provider had already
         invalidated.  The connection kept working until the process restarted and
-        then could never be renewed again — only the content crawl persisted, so
-        which of the two paths happened to run last decided whether a connection
-        survived.
+        then could never be renewed again.
+
+        *stale_token* is the access token the caller's request failed with.
+        Given it, a redemption that lost the race to another thread returns that
+        thread's token instead of spending the refresh token a second time —
+        which is the thing that kills a single-use grant outright.
         """
+        with self._refresh_lock:
+            return self._refresh_locked(server, stale_token)
+
+    def _refresh_locked(
+        self, server: "MCPServer", stale_token: Optional[str],
+    ) -> Optional[str]:
         creds = server.oauth_credentials
+        if stale_token and creds and creds.access_token not in (None, stale_token):
+            # Another caller rotated it while this one waited for the lock.  Its
+            # result is good and already persisted; redeeming again would not
+            # improve on it and, single-use, would invalidate it.
+            logger.info(
+                f"Reusing the token another caller just refreshed for '{server.name}'"
+            )
+            return creds.access_token
+
         if not creds or not creds.refresh_token:
             logger.warning(f"No refresh token available for server '{server.name}'")
             return None
@@ -268,7 +333,6 @@ class MCPToolCaller:
         previous_results: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, str]:
         resolved_ids = {}
-        access_token = self.get_access_token(server)
         properties = input_schema.get('properties', {})
 
         prior_corpus = ""
@@ -297,11 +361,10 @@ class MCPToolCaller:
 
             logger.info(f"[prereq] Calling prerequisite tool: {dep.prerequisite_tool}")
             try:
-                result = self.call_tool(
+                result, _refreshed = self.call_with_refresh(
                     server=server,
                     tool_name=dep.prerequisite_tool,
                     arguments={},
-                    access_token=access_token,
                 )
 
                 if result.success and result.content:

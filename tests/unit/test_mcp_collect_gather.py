@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from smartloop.agents.mcp.explorer import Explorer
+from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 from smartloop.agents.mcp.mcp_agent import ResolvedCall, clear_resolution_cache
 
 
@@ -44,12 +45,14 @@ def _explorer(*, results, resolved):
         return SimpleNamespace(
             success=text is not None,
             content=[{"type": "text", "text": text}] if text else [],
-            is_error=False, error=None,
+            is_error=False, error=None, auth_expired=False,
         )
 
-    ex.tool_caller = MagicMock()
-    ex.tool_caller.call_tool.side_effect = call_tool
-    ex.tool_caller.get_access_token.return_value = None
+    # A real caller with only the transport stubbed: the refresh-and-retry the
+    # collect path now shares with every other MCP path lives on the caller.
+    ex.tool_caller = MCPToolCaller(None, None)
+    ex.tool_caller.call_tool = MagicMock(side_effect=call_tool)
+    ex.tool_caller.get_access_token = MagicMock(return_value=None)
     return ex
 
 
