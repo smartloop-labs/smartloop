@@ -17,7 +17,13 @@ SAMPLE_USAGE = {
     "reclaimable": 300,
     "kept": 700,
     "categories": {
-        "models": {"bytes": 800, "files": 4, "reclaimable": 300, "kept": 500, "items": []},
+        # The group subtotals partition the category: in_use + system +
+        # reclaimable + overhead == bytes.  Kept realistic so this sample does
+        # not drift from what compute_usage actually returns.
+        "models": {
+            "bytes": 800, "files": 4, "reclaimable": 300, "kept": 500, "items": [],
+            "in_use": 400, "system": 90, "overhead": 10,
+        },
     },
 }
 
