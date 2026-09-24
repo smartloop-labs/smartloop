@@ -55,6 +55,24 @@ _settings = AppSettings()
 # leftover under them is protected too.
 _BUNDLED_ORGS = ("smartloop-ai", "embeddings")
 
+# How a model's bytes are presented, keyed by the keep reason the scan already
+# worked out.  The split lives here rather than in the desktop app because the
+# framework is what knows a model is in use — the client only draws it.
+#
+# ``bundled`` is its own group: the orchestrator and the embedder are what the
+# framework runs on, not weights the user picked, so they read as infrastructure
+# rather than as a choice someone made.  Everything else that is held — resident,
+# default, active, enabled in any project, or still arriving — is the user's own
+# footprint and is reported as such.
+_MODEL_GROUPS = {
+    "bundled": "system",
+    "downloading": "in_use",
+    "loaded": "in_use",
+    "default": "in_use",
+    "active": "in_use",
+    "enabled": "in_use",
+}
+
 # Installed framework payloads sit in <home>/<x.y.z>/ next to everything else.
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
@@ -281,6 +299,20 @@ def _keep_model_ids(workspace: Workspace, model_service: Any) -> dict[str, str]:
     return keep
 
 
+def _model_group(keep_reason: Optional[str]) -> str:
+    """Which usage group a model's bytes belong to.
+
+    No keep reason means nothing holds the tree, which is exactly what makes it
+    removable — so ``unused`` and ``reclaimable`` describe the same bytes from
+    two directions and must stay in step.  An unrecognised reason counts as in
+    use: a new way to hold a model should show up as the user's footprint, not
+    quietly become something the UI offers to delete.
+    """
+    if keep_reason is None:
+        return "unused"
+    return _MODEL_GROUPS.get(keep_reason, "in_use")
+
+
 # ── Scanners ───────────────────────────────────────────────────────────────
 
 def _weights_state(model_dir: str) -> tuple[bool, bool]:
@@ -383,6 +415,7 @@ def _scan_models(workspace: Workspace, model_service: Any) -> list[dict]:
                 path,
                 removable=True,
                 keep_reason=keep_reason,
+                group=_model_group(keep_reason),
                 model_id=model_id,
                 partial=partial,
                 model_name=entry.model_name if entry else None,
@@ -741,6 +774,39 @@ def _category(rows: list[dict], total_path: Optional[str] = None, **extra) -> di
     return report
 
 
+def _models_category(workspace: Workspace, model_service: Any) -> dict:
+    """The models report, split into the groups the UI draws as its own bands.
+
+    Reported here rather than derived by the client: which models count as in
+    use is the same judgement ``run_cleanup`` acts on, and a second copy of it
+    in the desktop app is a second copy that can disagree.
+
+    ``reclaimable`` already carries the ``unused`` total — a row is removable
+    exactly when nothing keeps it — so it is not repeated under another name.
+    The four numbers partition the category:
+
+        in_use + system + reclaimable + overhead == bytes
+    """
+    rows = _scan_models(workspace, model_service)
+    report = _category(rows, total_path=workspace.models_dir)
+
+    by_group: dict[str, int] = {}
+    for row in rows:
+        by_group[row["group"]] = by_group.get(row["group"], 0) + row["bytes"]
+
+    report["in_use"] = by_group.get("in_use", 0)
+    report["system"] = by_group.get("system", 0)
+    # Inside the walked tree but holding no row of its own: the hidden
+    # ``embeddings/.locks`` bookkeeping and loose files sitting directly under an
+    # org directory, which is how the embedding GGUF actually lands.  Named so
+    # the client can account for every byte it draws rather than reaching the
+    # same figure by subtraction and calling the result "system".
+    report["overhead"] = max(
+        0, report["bytes"] - report["in_use"] - report["system"] - report["reclaimable"]
+    )
+    return report
+
+
 def compute_usage(*, model_service: Any = None) -> dict:
     """Report what the home directory is using and what can be reclaimed."""
     workspace = _load_workspace(model_service)
@@ -748,9 +814,7 @@ def compute_usage(*, model_service: Any = None) -> dict:
     total, files = _walk_size(home)
 
     categories = {
-        "models": _category(
-            _scan_models(workspace, model_service), total_path=workspace.models_dir
-        ),
+        "models": _models_category(workspace, model_service),
         "versions": _category(_scan_versions()),
         "logs": _category(_scan_logs()),
         "cache": _category(_scan_cache()),

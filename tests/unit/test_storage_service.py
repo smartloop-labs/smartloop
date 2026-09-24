@@ -422,6 +422,85 @@ class TestComputeUsage:
             storage_service.compute_usage(model_service=env["service"])
 
 
+class TestModelUsageGroups:
+    """The split the usage panel draws: in use, framework-owned, reclaimable.
+
+    The UI used to show only what it could delete, so every model the user had
+    turned on vanished into a "System" remainder alongside config.json.  These
+    assert the report names those bytes instead.
+    """
+
+    def test_the_groups_partition_the_category(self, env):
+        models = storage_service.compute_usage(
+            model_service=env["service"]
+        )["categories"]["models"]
+
+        assert (
+            models["in_use"] + models["system"]
+            + models["reclaimable"] + models["overhead"]
+        ) == models["bytes"]
+
+    def test_a_bundled_model_is_framework_not_user_footprint(self, env):
+        models = storage_service.compute_usage(
+            model_service=env["service"]
+        )["categories"]["models"]
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        bootstrap = rows["smartloop-ai/slp-orchestra-mini"]
+        # It is the default *and* active, so it would have been held anyway —
+        # being bundled has to win, or the orchestrator reads as a choice the
+        # user made and shows up under their own usage.
+        assert bootstrap["group"] == "system"
+        assert models["system"] == bootstrap["bytes"]
+
+    def test_a_model_the_user_turned_on_counts_as_theirs(self, env):
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-4-e4b-it"]["group"] == "in_use"
+
+    def test_unused_is_the_same_bytes_as_reclaimable(self, env):
+        usage = storage_service.compute_usage(model_service=env["service"])
+        models = usage["categories"]["models"]
+
+        unused = sum(
+            r["bytes"] for r in models["items"] if r["group"] == "unused"
+        )
+        assert unused == models["reclaimable"]
+        assert {r["model_id"] for r in models["items"] if r["group"] == "unused"} == (
+            REMOVABLE_IDS | {"Qwen/unregistered-model"}
+        )
+
+    def test_overhead_catches_what_has_no_row(self, env):
+        models = storage_service.compute_usage(
+            model_service=env["service"]
+        )["categories"]["models"]
+
+        # The embedding GGUF lands as a loose file under embeddings/ rather than
+        # in an <org>/<repo> tree, so it is inside the walked total and has no
+        # item of its own.  Without overhead those bytes would go unexplained.
+        assert models["overhead"] == 40
+
+    def test_an_arriving_download_is_in_use_not_reclaimable(self, env):
+        live = _make_partial(env["models_dir"], "google/gemma-3-4b-it")
+
+        with downloading(live):
+            rows = _by_model_id(
+                storage_service.compute_usage(model_service=env["service"])
+            )
+
+            # Growing bytes are not space anyone can offer to free.
+            assert rows["google/gemma-3-4b-it"]["group"] == "in_use"
+
+    def test_an_abandoned_download_is_reclaimable(self, env):
+        _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        # Enabled, but the weights never arrived — the partial rule wins, and
+        # the group follows it rather than the picker's flag.
+        assert rows["google/gemma-4-e4b-it"]["group"] == "unused"
+
+
 class TestCleanup:
     def test_nothing_happens_without_a_category(self, env):
         result = storage_service.run_cleanup(model_service=env["service"])
