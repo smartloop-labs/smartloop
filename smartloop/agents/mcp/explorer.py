@@ -724,9 +724,8 @@ Does answering the latest message require a new web search?
             "[collect] calling %s",
             format_call(getattr(server, "name", ""), tool_name, arguments),
         )
-        result = self.tool_caller.call_tool(
+        result, _refreshed = self.tool_caller.call_with_refresh(
             server=server, tool_name=tool_name, arguments=arguments,
-            access_token=self.tool_caller.get_access_token(server),
         )
         if not result.success or not result.content:
             logger.info(
@@ -778,20 +777,9 @@ Does answering the latest message require a new web search?
                 f"Reading {index} of {len(calls)} from {server_name}: "
                 f"{format_call('', detail_tool, arguments)}",
             )
-            result = self.tool_caller.call_tool(
+            result, _refreshed = self.tool_caller.call_with_refresh(
                 server=server, tool_name=detail_tool, arguments=arguments,
-                access_token=self.tool_caller.get_access_token(server),
             )
-            # The other three call paths renew an expired token and try again;
-            # this one returned "" instead, so a connected app whose token had
-            # simply aged out looked to retrieval like an app with nothing in it.
-            if not result.success and result.auth_expired:
-                new_token = self.tool_caller.refresh_access_token(server)
-                if new_token:
-                    result = self.tool_caller.call_tool(
-                        server=server, tool_name=tool_name,
-                        arguments=arguments, access_token=new_token,
-                    )
             if not result.success or not result.content:
                 continue
             text = "\n".join(

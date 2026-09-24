@@ -10,12 +10,17 @@ was reading three Notion pages was indistinguishable from a hang.
 from unittest.mock import MagicMock
 
 from smartloop.agents.mcp.explorer import Explorer
+from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 
 
 def _explorer():
     exp = Explorer.__new__(Explorer)
     exp.mcp_agent = MagicMock()
-    exp.tool_caller = MagicMock()
+    # A real caller with the transport stubbed — the refresh-and-retry every
+    # MCP path shares lives on the caller, not at each call site.
+    exp.tool_caller = MCPToolCaller(None, None)
+    exp.tool_caller.call_tool = MagicMock()
+    exp.tool_caller.get_access_token = MagicMock(return_value=None)
     exp.arg_extractor = MagicMock()
     return exp
 
@@ -73,6 +78,7 @@ class TestTheFollowUpFetchesAreReported:
         exp = _explorer()
         result = MagicMock()
         result.success = True
+        result.auth_expired = False
         result.content = [{"type": "text", "text": "the page body"}]
         exp.tool_caller.call_tool.return_value = result
 

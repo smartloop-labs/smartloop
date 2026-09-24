@@ -461,7 +461,6 @@ class StepExecutor:
 
         input_schema = tool_schema.get('input_schema', {}) or {}
         server_url = self.tool_caller.get_server_url(server)
-        access_token = self.tool_caller.get_access_token(server)
 
         if not server_url and server.server_type != MCPServerType.LOCAL:
             logger.warning(f"[step] No server URL configured for: {step.server_name}")
@@ -609,18 +608,9 @@ class StepExecutor:
                     del arguments[k]
 
         logger.info(f"[step] Calling '{tool_name}' with arguments: {arguments}")
-        result = self.tool_caller.call_tool(
-            server=server, tool_name=tool_name,
-            arguments=arguments, access_token=access_token,
+        result, _refreshed = self.tool_caller.call_with_refresh(
+            server=server, tool_name=tool_name, arguments=arguments,
         )
-
-        if not result.success and result.auth_expired and server_url:
-            new_token = self.tool_caller.refresh_access_token(server)
-            if new_token:
-                result = self.tool_caller.call_tool(
-                    server=server, tool_name=tool_name,
-                    arguments=arguments, access_token=new_token,
-                )
 
         if not result.success:
             logger.warning(f"[step] '{tool_name}' failed: {result.error}")
@@ -1106,22 +1096,10 @@ class StepExecutor:
 
         Returns ``(formatted_content, raw_content)`` or ``None`` on failure.
         """
-        access_token = self.tool_caller.get_access_token(server)
-        server_url = self.tool_caller.get_server_url(server)
-
         logger.info(f"[execute] Calling '{tool_name}' with arguments: {arguments}")
-        result = self.tool_caller.call_tool(
-            server=server, tool_name=tool_name,
-            arguments=arguments, access_token=access_token, cwd=cwd,
+        result, _refreshed = self.tool_caller.call_with_refresh(
+            server=server, tool_name=tool_name, arguments=arguments, cwd=cwd,
         )
-
-        if not result.success and result.auth_expired and server_url:
-            new_token = self.tool_caller.refresh_access_token(server)
-            if new_token:
-                result = self.tool_caller.call_tool(
-                    server=server, tool_name=tool_name,
-                    arguments=arguments, access_token=new_token, cwd=cwd,
-                )
 
         if not result.success:
             logger.warning(f"[execute] '{tool_name}' failed: {result.error}")

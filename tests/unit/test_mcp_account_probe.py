@@ -12,6 +12,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 from smartloop.mcp.account import (
     extract_account,
     probe_account,
@@ -101,12 +102,15 @@ class TestExtraction:
 
 class TestProbe:
     def _caller(self, payload, success=True):
-        caller = MagicMock()
-        caller.get_access_token.return_value = "tok"
-        caller.call_tool.return_value = SimpleNamespace(
-            success=success, is_error=False, error=None,
+        # A real caller with the transport stubbed: the refresh-and-retry that
+        # every MCP path shares lives on the caller, so a MagicMock standing in
+        # for the whole class would not exercise the dispatch under test.
+        caller = MCPToolCaller(None, None)
+        caller.get_access_token = MagicMock(return_value="tok")
+        caller.call_tool = MagicMock(return_value=SimpleNamespace(
+            success=success, is_error=False, error=None, auth_expired=False,
             content=[{"type": "text", "text": payload}],
-        )
+        ))
         return caller
 
     def test_the_identity_tool_is_called_with_no_arguments(self):
@@ -127,8 +131,8 @@ class TestProbe:
         assert probe_account(_server(tools=[_tool("get_self")]), tool_caller=caller) is None
 
     def test_a_raising_transport_does_not_break_provisioning(self):
-        caller = MagicMock()
-        caller.get_access_token.side_effect = RuntimeError("server went away")
+        caller = MCPToolCaller(None, None)
+        caller.get_access_token = MagicMock(side_effect=RuntimeError("server went away"))
         assert probe_account(_server(tools=[_tool("get_self")]), tool_caller=caller) is None
 
 
