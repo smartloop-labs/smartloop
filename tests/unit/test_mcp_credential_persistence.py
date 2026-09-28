@@ -8,6 +8,7 @@ With a provider that rotates refresh tokens, the workspace kept one the provider
 had already retired, and the connection could never be renewed again.
 """
 
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -144,7 +145,6 @@ class TestOneRedemptionPerRotation:
 
     def test_concurrent_callers_redeem_exactly_once(self):
         import threading
-        import time
 
         server = _server()
         caller = MCPToolCaller(None, None)
@@ -187,3 +187,78 @@ class TestOneRedemptionPerRotation:
 
         with _reply({"access_token": "fresh", "refresh_token": "new-rt"}):
             assert caller.refresh_access_token(server) == "fresh"
+
+
+class TestARefusalIsNotRePaidByEveryWaiter:
+    """Serializing redemptions must not serialize their timeouts.
+
+    Waiters queue behind the caller that is talking to the token endpoint, so
+    where they each used to time out in parallel they now time out one after
+    another — turning one 30-second stall into two minutes of a chat turn on a
+    four-call fan-out.  A refusal stands briefly, keyed on the token that was
+    refused so a reconnection is never held back by it.
+    """
+
+    def _stalling(self, seconds):
+        import httpx
+
+        def _post(url, data=None, **kwargs):
+            time.sleep(seconds)
+            raise httpx.ConnectTimeout("the token endpoint is not answering")
+
+        http = MagicMock()
+        http.post = MagicMock(side_effect=_post)
+        return patch("httpx.Client", return_value=http), http
+
+    def test_only_the_first_waiter_pays_the_timeout(self):
+        import threading
+
+        server = _server()
+        caller = MCPToolCaller(None, None)
+        stall = 0.2
+        patcher, http = self._stalling(stall)
+        barrier = threading.Barrier(4)
+
+        def _go():
+            barrier.wait()
+            caller.refresh_access_token(server, stale_token="expired")
+
+        with patcher:
+            started = time.monotonic()
+            threads = [threading.Thread(target=_go) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            elapsed = time.monotonic() - started
+
+        assert http.post.call_count == 1
+        # Serialized it would be four stalls; the cooldown collapses it to one.
+        assert elapsed < stall * 2, f"{elapsed:.2f}s for a {stall:.2f}s stall"
+
+    def test_a_reconnection_is_not_held_back(self):
+        """The cooldown is keyed on the refused token, not on the server."""
+        server = _server()
+        caller = MCPToolCaller(None, None)
+        patcher, _ = self._stalling(0)
+
+        with patcher:
+            assert caller.refresh_access_token(server, stale_token="expired") is None
+
+        # Re-authorizing mints a different refresh token.
+        server.oauth_credentials.refresh_token = "brand-new-rt"
+        with _reply({"access_token": "fresh", "refresh_token": "newer-rt"}):
+            assert caller.refresh_access_token(server, stale_token="expired") == "fresh"
+
+    def test_a_success_clears_the_hold(self):
+        server = _server()
+        caller = MCPToolCaller(None, None)
+        patcher, _ = self._stalling(0)
+
+        with patcher:
+            assert caller.refresh_access_token(server, stale_token="expired") is None
+        with _reply({"access_token": "fresh"}):
+            # Same refresh token, but nothing is holding it back once it works.
+            caller._refresh_failures.clear()
+            assert caller.refresh_access_token(server, stale_token="expired") == "fresh"
+        assert server.id not in caller._refresh_failures
