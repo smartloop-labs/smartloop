@@ -2,7 +2,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from smartloop.mcp import MCPClient
 from smartloop.mcp.local_client import LocalMCPClient
@@ -15,6 +15,14 @@ if TYPE_CHECKING:
     from smartloop.workspace.workspace import MCPServer
 
 logger = logging.getLogger(__name__)
+
+#: How long a refusal stands before the same refresh token is offered again.
+#: Serializing redemptions means a token endpoint that hangs is waited on once
+#: per caller in turn rather than once in parallel, so without this a fan-out of
+#: four calls turns one 30-second timeout into two minutes of a chat turn.  It
+#: is keyed on the token that failed, so a reconnection — which mints a
+#: different one — is never held back by it.
+_REFRESH_FAILURE_COOLDOWN_S = 30.0
 
 
 class MCPToolCaller:
@@ -34,6 +42,10 @@ class MCPToolCaller:
         #: same refresh token — and a provider that issues them single-use
         #: invalidates the grant on the second attempt.
         self._refresh_lock = threading.Lock()
+        #: ``server id -> (refresh token that was refused, when to retry it)``.
+        #: The other half of serializing: waiters must not each re-pay a
+        #: timeout the first one already established.
+        self._refresh_failures: Dict[str, Tuple[str, float]] = {}
 
     def set_persist(self, persist: Optional[Callable[[], None]]) -> None:
         """Install the callback that writes refreshed credentials back to disk."""
@@ -232,6 +244,13 @@ class MCPToolCaller:
             logger.warning(f"No token endpoint configured for server '{server.name}'")
             return None
 
+        refused, retry_at = self._refresh_failures.get(server.id, (None, 0.0))
+        if refused == creds.refresh_token and time.monotonic() < retry_at:
+            logger.info(
+                f"Not retrying the refused refresh token for '{server.name}' yet"
+            )
+            return None
+
         from smartloop.mcp.oauth import MCPOAuthService, TokenExchangeError
 
         try:
@@ -248,6 +267,7 @@ class MCPToolCaller:
                 )
         except TokenExchangeError as e:
             logger.error(f"Token refresh failed for server '{server.name}': {e}")
+            self._note_refusal(server, creds.refresh_token)
             if e.grant_is_dead:
                 # The server has retired this grant.  Re-minting it cannot work
                 # again, so this is the one refusal that should cost the user
@@ -256,8 +276,10 @@ class MCPToolCaller:
             return None
         except Exception as e:
             logger.error(f"Token refresh failed for server '{server.name}': {e}")
+            self._note_refusal(server, creds.refresh_token)
             return None
 
+        self._refresh_failures.pop(server.id, None)
         creds.access_token = tokens.access_token
         if tokens.refresh_token:
             creds.refresh_token = tokens.refresh_token
@@ -267,6 +289,12 @@ class MCPToolCaller:
         self._write_back(server, "Refreshed")
         logger.info(f"Refreshed access token for server '{server.name}'")
         return tokens.access_token
+
+    def _note_refusal(self, server: "MCPServer", refresh_token: str) -> None:
+        """Hold *refresh_token* back briefly after the endpoint refused it."""
+        self._refresh_failures[server.id] = (
+            refresh_token, time.monotonic() + _REFRESH_FAILURE_COOLDOWN_S,
+        )
 
     def _write_back(self, server: "MCPServer", what: str) -> None:
         """Persist a change to *server*, logging rather than raising on failure.
