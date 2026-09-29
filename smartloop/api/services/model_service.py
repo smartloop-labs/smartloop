@@ -4574,18 +4574,51 @@ class ModelService:
 
             account, credentials_changed = probe_account(
                 server,
-                tool_caller=MCPToolCaller(None, None, persist=self._model.save),
+                tool_caller=MCPToolCaller(
+                    None, None, persist=lambda: self._persist_mcp_server(server),
+                ),
             )
         except Exception as e:
             logger.debug("[mcp-account] probe failed for '%s': %s", server.name, e)
             return
+
+        changed = credentials_changed
         if account and account != server.account:
             server.account = account
-            self._model.save()
-        elif credentials_changed:
-            # The hook above has already written them; this covers a caller
-            # built without one, which is how the flag came to be ignored.
-            self._model.save()
+            changed = True
+        if changed:
+            # The hook above has already written a rotation; this covers a
+            # caller built without one, which is how the flag came to be
+            # ignored in the first place.
+            self._persist_mcp_server(server)
+
+    def _persist_mcp_server(self, server: "MCPServer") -> None:
+        """Save *server*'s state onto the workspace this service holds now.
+
+        ``Workspace.reload()`` rebinds ``projects`` wholesale — whatever its
+        docstring says about keeping references valid — and a chat request opens
+        with one.  So a provisioning pass that started before it is mutating an
+        object the workspace no longer contains, and a plain ``save()``
+        serializes the list that replaced it: the rotated refresh token goes to
+        the orphan and the retired one stays on disk.
+
+        Carrying the fields a probe can change onto the live object first is
+        what makes the write land.  A server that is simply gone — deleted while
+        the pass ran — is left gone rather than resurrected.
+        """
+        live = next(
+            (s
+             for p in (self._model.workspace.projects or [])
+             for s in (p.mcp_servers or [])
+             if s.id == server.id),
+            None,
+        )
+        if live is not None and live is not server:
+            live.oauth_credentials = server.oauth_credentials
+            live.account = server.account
+            live.status = server.status
+            live.last_error = server.last_error
+        self._model.save()
 
     def _discover_mcp_tools(self, server: "MCPServer") -> None:
         """Fill in a server's tools, launching or connecting as needed."""
