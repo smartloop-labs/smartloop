@@ -16,7 +16,9 @@ permissions:
   id-token: write
 
 env:
-  GCS_BUCKET: gs://smartloop-gcp-us-east-releases
+  # Releases live in Cloudflare R2 (no egress charge) and are served at
+  # dl.smartloop.ai; see slp-infra-project cloudflare/README.md.
+  R2_BUCKET: smartloop-releases
 
 jobs:
   build-linux:
@@ -376,28 +378,31 @@ jobs:
       - name: Generate checksums
         run: sha256sum *-slp.* > checksums-sha256.txt
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Upload to GCS
+      # The aws CLI on the runner talks to R2's S3 API. Single-part PUTs
+      # (every archive is under the 5 GB limit) keep each object's ETag its
+      # MD5. Retags re-upload the same version, so objects are cached for an
+      # hour rather than forever.
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
         run: |
+          for s in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL; do
+            [ -n "${!s}" ] || { echo "::error::R2 secret for $s is not set"; exit 1; }
+          done
           TAG="${{ inputs.tag || github.ref_name }}"
           VERSION="${TAG#v}"
-          DEST="$GCS_BUCKET/slp/${VERSION}"
-          gsutil -m cp \
-            linux-amd64-slp.tar.gz \
-            darwin-arm64-slp.tar.gz \
-            windows-amd64-slp.zip \
-            checksums-sha256.txt \
-            "$DEST/"
+          DEST="s3://$R2_BUCKET/slp/${VERSION}"
+          aws configure set default.s3.multipart_threshold 5GB
+          for f in linux-amd64-slp.tar.gz darwin-arm64-slp.tar.gz windows-amd64-slp.zip checksums-sha256.txt; do
+            aws s3 cp "$f" "$DEST/$f" --cache-control "public, max-age=3600" --no-progress
+          done
           echo "Uploaded to $DEST"
-          gsutil ls -l "$DEST/"
+          aws s3 ls "$DEST/"
 
       - name: Create GitHub Release
         env:
