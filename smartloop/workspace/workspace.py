@@ -132,6 +132,57 @@ def read_project_state(project_dir: str) -> Optional[dict]:
     return project if isinstance(project, dict) else None
 
 
+def _carry_fields(target: BaseModel, source: BaseModel) -> None:
+    """Copy every field of *source* onto *target*, merging nested id lists."""
+    for name in type(target).model_fields:
+        _carry_field(target, name, getattr(source, name))
+
+
+def _carry_field(target: BaseModel, name: str, incoming: Any) -> None:
+    """Set one field, reusing the records already there when it is a list."""
+    current = getattr(target, name, None)
+    if isinstance(current, list) and isinstance(incoming, list):
+        setattr(target, name, _merge_records_by_id(current, incoming))
+    else:
+        setattr(target, name, incoming)
+
+
+def _merge_records_by_id(current: List[Any], fresh: List[Any]) -> List[Any]:
+    """Reconcile two lists of id-keyed records, keeping the objects we hold.
+
+    Returns a list in *fresh* order — disk decides what exists and in what
+    order.  A record that is still there is the *same object* as before with
+    its fields brought up to date; one that is new is taken as it came; one
+    that has gone is dropped.
+
+    Identity is the whole point.  Background passes hold individual records,
+    not the list: the provisioning pass holds the :class:`MCPServer` whose
+    token it is rotating, the indexer holds the :class:`Document` it is marking
+    indexed.  Rebuilding the list leaves them writing to a detached object that
+    the next ``save()`` cannot see, so the write is not merely late — it is
+    gone.
+
+    Lists of anything else (plain strings, records with no id) are not
+    reconcilable this way and are taken wholesale.
+    """
+    held = {
+        record.id: record
+        for record in current
+        if isinstance(record, BaseModel) and getattr(record, "id", None) is not None
+    }
+    if not held:
+        return fresh
+    merged: List[Any] = []
+    for record in fresh:
+        existing = held.get(getattr(record, "id", None))
+        if existing is None or type(existing) is not type(record):
+            merged.append(record)
+            continue
+        _carry_fields(existing, record)
+        merged.append(existing)
+    return merged
+
+
 def is_mmproj_gguf(filename: str) -> bool:
     """True when a GGUF is a vision mmproj / CLIP projector (not main weights)."""
     name = os.path.basename(filename).lower()
@@ -1314,8 +1365,9 @@ class Workspace(BaseModel):
         The workspace record stays authoritative for the fields it owns — the
         selection is the workspace's answer, not the project's (see
         :data:`_WORKSPACE_OWNED_PROJECT_FIELDS`) — and the existing
-        :class:`Project` is updated in place rather than replaced, so a caller
-        already holding it sees the new state instead of a detached object.
+        :class:`Project` is updated in place rather than replaced, down to the
+        records inside it, so a caller already holding the project or one of
+        its servers sees the new state instead of a detached object.
 
         Returns True when something was re-read.
         """
@@ -1345,7 +1397,7 @@ class Workspace(BaseModel):
         for name in type(project).model_fields:
             if name in _WORKSPACE_OWNED_PROJECT_FIELDS or name in ("id", "project_dir"):
                 continue
-            setattr(project, name, getattr(fresh, name))
+            _carry_field(project, name, getattr(fresh, name))
         return True
 
     def refresh_models(self) -> bool:
@@ -1412,12 +1464,26 @@ class Workspace(BaseModel):
         Refreshes project list and document statuses so queries see
         documents that were indexed by background workers since the
         last load.
+
+        Projects, and the records inside them, are updated *in place*: a
+        caller already holding one goes on holding the object this workspace
+        serializes.  This used to rebind ``self.projects`` wholesale while
+        claiming otherwise, and a chat request opens with a reload — so a
+        background pass that started earlier was mutating an object the
+        workspace no longer contained, and the next ``save()`` wrote the list
+        that had replaced it.  An MCP token rotated by the provisioning probe
+        went that way: to the orphan, while the refresh token the provider had
+        already retired stayed on disk.
+
+        What this does *not* do is make an unsaved mutation survive a reload
+        that lands on top of it — the fields still come from disk.  A pass that
+        mutates and then saves has to treat that pair as one step; see
+        ``ModelService._persist_mcp_server``.
         """
         fresh = Workspace.load()
         if fresh is None:
             return
-        # Update projects in-place so references stay valid
-        self.projects = fresh.projects
+        self.projects = _merge_records_by_id(self.projects or [], fresh.projects or [])
 
     @classmethod
     def reset(cls) -> None:

@@ -4595,16 +4595,20 @@ class ModelService:
     def _persist_mcp_server(self, server: "MCPServer") -> None:
         """Save *server*'s state onto the workspace this service holds now.
 
-        ``Workspace.reload()`` rebinds ``projects`` wholesale — whatever its
-        docstring says about keeping references valid — and a chat request opens
-        with one.  So a provisioning pass that started before it is mutating an
-        object the workspace no longer contains, and a plain ``save()``
-        serializes the list that replaced it: the rotated refresh token goes to
-        the orphan and the retired one stays on disk.
+        ``Workspace.reload()`` keeps references valid now, so in the ordinary
+        case the lookup below finds the very object this pass is holding and
+        the carry-over is a no-op.  It stays because a reload is not the only
+        way the two come apart: ``_ensure_workspace`` hands out a fresh
+        ``Workspace`` per call on a cold process, so a pass can outlive the
+        workspace instance it read its server from, and re-finding by id before
+        saving is what makes the write land on the one that will be
+        serialized.  A server that is simply gone — deleted while the pass
+        ran — is left gone rather than resurrected.
 
-        Carrying the fields a probe can change onto the live object first is
-        what makes the write land.  A server that is simply gone — deleted while
-        the pass ran — is left gone rather than resurrected.
+        It does *not* rescue a rotation from a reload that lands between the
+        mutation and this call: those fields are re-read from disk, and by then
+        the object holds what the provider has already retired.  Mutating and
+        saving is still two steps, and that window is still open.
         """
         live = next(
             (s
