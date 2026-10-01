@@ -174,6 +174,68 @@ def _authorization_error_detail(
     return detail
 
 
+def _reject_unexpected_issuer(state, iss):
+    """Refuse a redirect that did not come from the server we sent the user to.
+
+    RFC 9207.  Without it a client that talks to more than one authorization
+    server can be walked into a mix-up: the attacker starts a flow against a
+    server it controls, returns a code issued there to this callback, and the
+    code is redeemed at the *honest* server's token endpoint — which is the one
+    named in the session.  The ``iss`` parameter is what distinguishes the two,
+    and Clerk already sends it.
+
+    Absence is checked as well as mismatch.  A server that advertises the
+    parameter and then omits it is either not the server it claims to be or has
+    had the parameter stripped in transit; treating a missing value as "nothing
+    to check" would hand the attacker the bypass for free.
+
+    Runs before anything else in the callback, so a response that fails it costs
+    nothing: the authorization code is never presented to the token endpoint and
+    the pending session stays untouched for the real redirect.
+    """
+    if not state:
+        return None
+    session = _pending_oauth_sessions.get(state)
+    if not session:
+        # No session to compare against. The handler below reports that as the
+        # expired-session case it already is.
+        return None
+
+    expected = session.get("issuer")
+    advertised = bool(session.get("issuer_parameter_supported"))
+
+    if not expected:
+        # RFC 8414 makes issuer mandatory, so this is a malformed metadata
+        # document and there is nothing to compare against. Refuse only when the
+        # server also claimed it would identify itself, because then it has
+        # contradicted itself; otherwise this is the pre-RFC-9207 status quo.
+        if not advertised:
+            return None
+        detail = "it advertises the issuer parameter but published no issuer"
+    elif iss:
+        if iss == expected:
+            return None
+        detail = f"expected {expected!r}, got {iss!r}"
+    elif advertised:
+        detail = "it advertises the issuer parameter but the response carried none"
+    else:
+        # Publishes an issuer, does not send the parameter. Common, and not
+        # something the client can hold against it.
+        return None
+    logger.error(
+        "[mcp-oauth] rejecting authorization response for state=%s: %s",
+        state, detail,
+    )
+    return HTMLResponse(
+        "<html><body><h2>Authorization failed</h2>"
+        "<p>This response did not come from the authorization server the "
+        "connection was started with, so it was not used.</p>"
+        f"<p>{escape(detail)}</p>"
+        "<p>You can close this window and try again.</p></body></html>",
+        status_code=400,
+    )
+
+
 def _retry_authorization_without_scope(state, error):
     """Reissue the authorization once, asking for no scopes at all.
 
@@ -581,6 +643,12 @@ async def _register_remote_mcp_server(
             "client_secret": registration.client_secret,
             "token_endpoint": oauth_metadata.token_endpoint,
             "authorization_endpoint": oauth_metadata.authorization_endpoint,
+            # RFC 9207: who the redirect is expected to come back from, and
+            # whether that server promised to say so.
+            "issuer": oauth_metadata.issuer,
+            "issuer_parameter_supported": (
+                oauth_metadata.authorization_response_iss_parameter_supported
+            ),
             "resource": resource,
             "callback_url": callback_url,
             "name": (curated.display_name if curated else None) or request.name,
@@ -834,6 +902,7 @@ async def mcp_oauth_callback_for_project(
     project_id: str,
     code: str = None,
     state: str = None,
+    iss: str = None,
     error: str = None,
     error_description: str = None,
     error_uri: str = None,
@@ -847,7 +916,7 @@ async def mcp_oauth_callback_for_project(
     :func:`_default_callback_url`.
     """
     return await _complete_oauth_redirect(
-        code=code, state=state, error=error,
+        code=code, state=state, iss=iss, error=error,
         error_description=error_description, error_uri=error_uri,
         model_service=model_service, routed_project_id=project_id,
     )
@@ -857,6 +926,7 @@ async def mcp_oauth_callback_for_project(
 async def mcp_oauth_callback(
     code: str = None,
     state: str = None,
+    iss: str = None,
     error: str = None,
     error_description: str = None,
     error_uri: str = None,
@@ -871,7 +941,7 @@ async def mcp_oauth_callback(
     success for a connection it dropped.
     """
     return await _complete_oauth_redirect(
-        code=code, state=state, error=error,
+        code=code, state=state, iss=iss, error=error,
         error_description=error_description, error_uri=error_uri,
         model_service=model_service, routed_project_id=None,
     )
@@ -880,6 +950,7 @@ async def mcp_oauth_callback(
 async def _complete_oauth_redirect(
     code: str = None,
     state: str = None,
+    iss: str = None,
     error: str = None,
     error_description: str = None,
     error_uri: str = None,
@@ -888,6 +959,12 @@ async def _complete_oauth_redirect(
 ):
     """Exchange the code for tokens, discover tools, and register the server."""
     from smartloop.mcp.oauth import MCPOAuthError
+
+    # Before anything reads this response — including the invalid_scope retry,
+    # which would otherwise reissue an authorization on an attacker's say-so.
+    wrong_issuer = _reject_unexpected_issuer(state, iss)
+    if wrong_issuer is not None:
+        return wrong_issuer
 
     if error:
         # RFC 6749 §4.1.2.1 sends three fields and only ``error`` is from a fixed

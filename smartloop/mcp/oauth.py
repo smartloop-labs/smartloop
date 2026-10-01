@@ -35,6 +35,11 @@ class OAuthMetadata:
     grant_types_supported: list[str] = None
     code_challenge_methods_supported: list[str] = None
     resource: Optional[str] = None
+    #: RFC 9207 §3.  When the server says it sends ``iss`` on the authorization
+    #: response, a response arriving *without* one must be rejected — otherwise
+    #: an attacker strips the parameter to get back the behaviour it defends
+    #: against.
+    authorization_response_iss_parameter_supported: bool = False
 
     def __post_init__(self):
         if self.scopes_supported is None:
@@ -258,6 +263,9 @@ class MCPOAuthService:
             grant_types_supported=data.get("grant_types_supported", []),
             code_challenge_methods_supported=data.get("code_challenge_methods_supported", []),
             resource=data.get("resource"),
+            authorization_response_iss_parameter_supported=bool(
+                data.get("authorization_response_iss_parameter_supported", False)
+            ),
         )
 
     def register_client(
