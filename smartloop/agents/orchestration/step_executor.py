@@ -15,7 +15,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from smartloop.llms import BaseLLM
-from smartloop.workspace.workspace import MCPServer, MCPServerStatus, MCPServerType
+from smartloop.workspace.workspace import MCPServer, MCPServerType
 from smartloop.agents.nodes import NodeResult
 from smartloop.agents.mcp.argument_extractor import MCPArgumentExtractor
 from smartloop.agents.mcp.dependency_analyzer import MCPDependencyAnalyzer
@@ -29,6 +29,7 @@ from smartloop.agents.orchestration.context import _OrchestratorContext
 from smartloop.agents.orchestration.response_builder import ResponseBuilder
 from smartloop.agents.planner import (
     PlanStep, StepType, SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
+    mcp_connection_is_usable,
 )
 from smartloop.utils.mcp_result_formatter import ResultFormatter
 from smartloop.paths import expand_home
@@ -1136,15 +1137,9 @@ class StepExecutor:
     def build_available_servers(self, mcp_servers: List[MCPServer]) -> List[Dict[str, Any]]:
         available = []
         for server in mcp_servers:
-            if not server.enabled:
+            if not mcp_connection_is_usable(server):
                 continue
             if not server.tools:
-                continue
-            # A connection whose credentials the server has stopped accepting
-            # keeps its cached tool list, so without this the planner goes on
-            # offering tools that can only 401 — and the failure is swallowed,
-            # which reads as "that app has nothing in it".
-            if server.status == MCPServerStatus.FAILED:
                 continue
 
             available.append({
