@@ -235,6 +235,11 @@ class MCPOAuthCredentials(BaseModel):
     refresh_token: Optional[str] = None
     expires_at: Optional[float] = None
     token_type: str = "Bearer"
+    # What the grant actually came back with (RFC 6749 §5.1), which need not be
+    # what was asked for: a server may narrow the set and say so here. Persisted
+    # because it is the only record of what this connection may do — without it
+    # a down-scoped grant is invisible until a tool call fails.
+    scope: Optional[str] = None
 
 
 class MCPServerStatus(str, Enum):

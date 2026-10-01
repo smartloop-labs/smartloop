@@ -310,6 +310,11 @@ class MCPToolCaller:
             creds.refresh_token = tokens.refresh_token
         if tokens.expires_in:
             creds.expires_at = time.time() + tokens.expires_in
+        if tokens.scope:
+            # A refresh may come back narrower than the grant it descends from
+            # (RFC 6749 §6 allows the server to narrow, never to widen). Record
+            # it, or the stored scope describes a grant that no longer exists.
+            creds.scope = tokens.scope
 
         self._write_back(server, "Refreshed")
         logger.info(f"Refreshed access token for server '{server.name}'")

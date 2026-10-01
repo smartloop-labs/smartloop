@@ -283,7 +283,7 @@ class TestPostAuthDiscoveryDiagnostics:
             def exchange_code_for_tokens(self, **kwargs):
                 return MagicMock(
                     access_token="at", token_type="Bearer",
-                    refresh_token=None, expires_in=None,
+                    refresh_token=None, expires_in=None, scope=None,
                 )
 
         client = MagicMock()
