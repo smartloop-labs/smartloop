@@ -40,6 +40,32 @@ SYSTEM_TOOLS_SERVER_NAME = "smartloop"
 FETCH_SERVER_ID = "__fetch__"
 
 
+def mcp_connection_is_usable(server: Any) -> bool:
+    """Whether a registered connection can still be called at all.
+
+    Three places build a list of connections to offer the model — the
+    planner's catalog, the collect pass and the MCP agent's tool catalog — and
+    each grew its own filter.  They drifted: only the planner's checked whether
+    the connection could still authenticate, so a connection whose grant the
+    provider had retired went on being offered by the other two.  It keeps its
+    cached tool list, so it looks healthy, and every call 401s into a silent
+    skip — which reads as "that app has nothing in it" rather than "reconnect
+    it".
+
+    Only the two conditions that are genuinely common live here.  Which
+    connections a caller cares about — whether the system-tools server belongs
+    in its list, whether a server with no tools is worth an entry — is that
+    caller's own policy and stays at the call site.
+
+    Read duck-typed: callers pass stand-ins in tests, and ``status`` arrives
+    either as :class:`MCPServerStatus` or as its bare string value.
+    """
+    if not getattr(server, "enabled", True):
+        return False
+    status = getattr(server, "status", None)
+    return getattr(status, "value", status) != "failed"
+
+
 class ModelTier(str, Enum):
     """Which model tier a step should run on."""
     SMALL = "small"    # Routing, classification, arg extraction (1B)

@@ -16,7 +16,10 @@ from pydantic import BaseModel, Field
 
 from smartloop.llms import BaseLLM
 
-from smartloop.agents.planner import PlanStep, StepType, MCPToolContext, SYSTEM_TOOLS_SERVER_ID
+from smartloop.agents.planner import (
+    PlanStep, StepType, MCPToolContext, SYSTEM_TOOLS_SERVER_ID,
+    mcp_connection_is_usable,
+)
 
 from .server_selector import (
     EXPLORE_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL,
@@ -571,7 +574,7 @@ Does answering the latest message require a new web search?
 
         servers = [
             s for s in mcp_servers
-            if getattr(s, "enabled", True)
+            if mcp_connection_is_usable(s)
             and not getattr(s, "system", False)
             and getattr(s, "id", None) != SYSTEM_TOOLS_SERVER_ID
             and (getattr(s, "tools", None) or [])
