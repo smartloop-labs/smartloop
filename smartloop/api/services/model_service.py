@@ -41,7 +41,9 @@ from smartloop.feedback_store import FeedbackStore, FeedbackEntry, ConversationT
 from smartloop.model.model_manager import Model
 from smartloop.mcp.definitions import split_command_line
 from smartloop.mcp.local_client import LocalMCPClient
-from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
+from smartloop.mcp.client import (
+    MCPAuthExpiredError, MCPLaunchError, MCPDiscoveryError,
+)
 from smartloop.agents.orchestrator import SLPOrchestrator
 from smartloop.agents.orchestration.model_router import ModelRouter
 from smartloop.agents.planner import SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME, FETCH_SERVER_ID
@@ -4520,6 +4522,14 @@ class ModelService:
         try:
             if not server.tools:
                 self._discover_mcp_tools(server)
+        except MCPAuthExpiredError:
+            # Already marked and explained by the refresh attempt, and the
+            # message names what the user has to do.  Saving is still ours.
+            self._model.save()
+            logger.warning(
+                "[mcp-provision] '%s' can no longer authenticate", server.name,
+            )
+            return {"status": "failed", "error": server.last_error}
         except MCPDiscoveryError as exc:
             server.status = MCPServerStatus.FAILED
             server.last_error = str(exc)
@@ -4635,14 +4645,34 @@ class ModelService:
             raise MCPDiscoveryError("This connection has no server URL.")
 
         from smartloop.mcp import MCPClient
-        token = None
-        if server.oauth_credentials and server.oauth_credentials.access_token:
-            token = server.oauth_credentials.access_token
-        elif server.remote_config and server.remote_config.token:
-            token = server.remote_config.token
+        from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 
-        with MCPClient() as client:
-            result = client.connect_and_discover_tools(server_url, access_token=token)
+        # Discovery runs on the stored credentials, so it ages out exactly as a
+        # tool call does — and used to report an expired token as a transport
+        # failure, which is how re-checking a renewable connection could mark it
+        # broken.  The caller owns reading the token, renewing it and writing
+        # the rotation back; it is the same machinery the call paths use.
+        caller = MCPToolCaller(
+            None, None, persist=lambda: self._persist_mcp_server(server),
+        )
+        token = caller.get_access_token(server)
+
+        def _connect(access_token):
+            with MCPClient() as client:
+                return client.connect_and_discover_tools(
+                    server_url, access_token=access_token,
+                )
+
+        result = _connect(token)
+        if result is not None and not result.success and result.auth_expired:
+            new_token = caller.refresh_access_token(server, stale_token=token)
+            if new_token:
+                result = _connect(new_token)
+            elif server.status == MCPServerStatus.FAILED:
+                # refresh_access_token diagnosed a retired grant and has already
+                # said so on the record; don't bury that under a wire message.
+                raise MCPAuthExpiredError(server.last_error or "")
+
         if not result or not result.success:
             raise MCPDiscoveryError(
                 self._friendly_discovery_error(
@@ -4719,6 +4749,15 @@ class ModelService:
 
         server.status = MCPServerStatus.PENDING
         server.last_error = None
+        # Drop the cached catalog, because that cache is what made a retry a
+        # no-op: the provisioning pass only discovers when a server has no
+        # tools, and a connection whose authorization died keeps every tool
+        # discovery ever found.  So "refresh" cleared the failure, skipped
+        # discovery, and set the connection READY again without a single
+        # network call — the user pressed the one button offered and was told
+        # the problem was solved.  Re-discovering is also what picks up tools
+        # the server has gained or lost since.
+        server.tools = []
         self._model.save()
         self._queue_mcp_provisioning(project, server)
         return self._mcp_server_to_dict(server)

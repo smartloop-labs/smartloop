@@ -42,6 +42,19 @@ class MCPDiscoveryError(MCPClientError):
     pass
 
 
+class MCPAuthExpiredError(MCPDiscoveryError):
+    """Discovery failed because the connection can no longer authenticate.
+
+    Separate from its parent because the two want different reporting.  An
+    ordinary discovery failure describes what went wrong on the wire; this one
+    has already been diagnosed — the refresh was attempted and the provider
+    refused the grant — and the connection has been marked with the sentence
+    that tells the user to reconnect it.  Raising the generic error here would
+    have that sentence overwritten by a transport message.
+    """
+    pass
+
+
 @dataclass
 class MCPServerInfo:
     name: Optional[str] = None
@@ -59,6 +72,11 @@ class MCPConnectResult:
     error: Optional[str] = None
     resource_hint: Optional[str] = None  # resource URI from 401 WWW-Authenticate
     resource_metadata_url: Optional[str] = None  # PRM metadata URL from 401 WWW-Authenticate
+    #: The server rejected the token (HTTP 401), as on a tool call.  Discovery
+    #: runs with the same credentials and ages out the same way, so a caller
+    #: re-checking a connection needs to tell "renew and try again" from "this
+    #: endpoint is dead" — and reported only the latter until this existed.
+    auth_expired: bool = False
 
 
 @dataclass
@@ -358,6 +376,7 @@ class MCPClient:
                 error=str(e),
                 resource_hint=resource_hint,
                 resource_metadata_url=resource_metadata_url,
+                auth_expired=getattr(e, "status_code", None) == 401,
             )
         except MCPProtocolError as e:
             return MCPConnectResult(success=False, error=str(e))
