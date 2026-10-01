@@ -12,7 +12,7 @@ from html import escape
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from smartloop.config import AppSettings
 
@@ -172,6 +172,56 @@ def _authorization_error_detail(
         else:
             detail += f"<p>{escape(error_uri)}</p>"
     return detail
+
+
+def _retry_authorization_without_scope(state, error):
+    """Reissue the authorization once, asking for no scopes at all.
+
+    A server can refuse the very set it published.  The PRM list is what RFC
+    9728 §2 says to ask for, but it describes the resource rather than the
+    client, and a client registered through DCR may be permitted less than the
+    resource advertises.  There is nothing to negotiate against — the error
+    names at most one offending scope, and dropping that one is a guess — so
+    the one useful retry is to name none and let the server apply the default
+    for the client it registered.
+
+    Exactly once.  ``scope_retry`` is what stops a server that refuses the empty
+    request too from bouncing the browser between here and the authorize
+    endpoint forever.  The session survives because this runs before the pop,
+    and the state is safe to reuse because a refused authorization issued no
+    code.
+    """
+    if error != "invalid_scope" or not state:
+        return None
+    session = _pending_oauth_sessions.get(state)
+    if not session or session.get("scope_retry"):
+        return None
+    # Nothing to drop, or no challenge to rebuild the request around (a session
+    # from a client driving the flow itself).
+    if not session.get("scope") or not session.get("code_challenge"):
+        return None
+
+    from smartloop.mcp import MCPOAuthService
+
+    logger.info(
+        "[mcp-oauth] %s refused scope %r for state=%s; retrying with none",
+        session.get("server_url"), session["scope"], state,
+    )
+    session["scope_retry"] = True
+    # Record what the second attempt actually asks for, so whatever the grant
+    # comes back with is compared against the right request.
+    session["scope"] = None
+
+    auth_url = MCPOAuthService().build_authorization_url(
+        authorization_endpoint=session["authorization_endpoint"],
+        client_id=session["client_id"],
+        redirect_uri=session["callback_url"],
+        state=state,
+        code_challenge=session["code_challenge"],
+        scope=None,
+        resource=session.get("resource"),
+    )
+    return RedirectResponse(auth_url, status_code=302)
 
 
 def _oauth_success_page(
@@ -849,6 +899,9 @@ async def _complete_oauth_redirect(
             "error=%s description=%s uri=%s",
             state, error, error_description, error_uri,
         )
+        retry = _retry_authorization_without_scope(state, error)
+        if retry is not None:
+            return retry
         return HTMLResponse(
             "<html><body><h2>Authorization failed</h2>"
             f"{_authorization_error_detail(error, error_description, error_uri)}"
