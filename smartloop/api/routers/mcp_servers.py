@@ -985,10 +985,21 @@ async def _complete_oauth_redirect(
             # refused, or it succeeded and the server offered nothing. Collapsing
             # both into "no tools available" hides the reason (a dead transport,
             # a rejected token, a grant with no product scopes), so name it.
-            reason = connect_result.error or (
-                "The server completed the MCP handshake but exposes no tools. "
-                "This usually means the authorization granted no scopes."
-            )
+            # The grant is right here, so report what it came back with rather
+            # than guessing that scopes were the problem.
+            if connect_result.error:
+                reason = connect_result.error
+            elif token_response.scope:
+                reason = (
+                    "The server completed the MCP handshake but exposes no "
+                    "tools. The authorization granted: "
+                    f"{token_response.scope}."
+                )
+            else:
+                reason = (
+                    "The server completed the MCP handshake but exposes no "
+                    "tools, and the authorization came back naming no scopes."
+                )
             logger.error(
                 "Tool discovery failed after OAuth for %s: %s",
                 session["server_url"],
@@ -1027,6 +1038,7 @@ async def _complete_oauth_redirect(
             refresh_token=token_response.refresh_token,
             expires_at=expires_at,
             token_type=token_response.token_type,
+            scope=token_response.scope,
             project_id=session["project_id"],
             server_info=server_info_dict,
             # Curated copy stashed at register time wins over whatever the
@@ -1199,6 +1211,7 @@ async def complete_mcp_oauth(
             refresh_token=token_response.refresh_token,
             expires_at=expires_at,
             token_type=token_response.token_type,
+            scope=token_response.scope,
             project_id=project_id,
             server_info=server_info_dict,
             description=session.get("description") or (si.description if si else None),

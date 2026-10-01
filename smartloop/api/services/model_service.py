@@ -4082,6 +4082,7 @@ class ModelService:
         refresh_token: str | None = None,
         expires_at: float | None = None,
         token_type: str = "Bearer",
+        scope: str | None = None,
         project_id: str | None = None,
         server_info: dict | None = None,
         description: str | None = None,
@@ -4112,6 +4113,7 @@ class ModelService:
                 refresh_token=refresh_token,
                 expires_at=expires_at,
                 token_type=token_type,
+                scope=scope,
             )
 
         server = MCPServer(

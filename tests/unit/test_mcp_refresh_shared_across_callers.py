@@ -56,7 +56,7 @@ class _Exchange:
         time.sleep(self._delay)
         return SimpleNamespace(
             access_token=f"fresh-{n}", refresh_token=f"rt-{n + 1}",
-            expires_in=3600, token_type="Bearer",
+            expires_in=3600, token_type="Bearer", scope=None,
         )
 
 
