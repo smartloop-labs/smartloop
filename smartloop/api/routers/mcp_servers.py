@@ -468,10 +468,26 @@ async def _register_remote_mcp_server(
                 code_verifier, code_challenge = MCPOAuthService.generate_pkce()
                 state = MCPOAuthService.generate_state()
 
-                scopes = oauth_metadata.scopes_supported or (
-                    prm.scopes_supported if prm else None
+                # RFC 9728 §2 defines the PRM list as the scope values "used in
+                # authorization requests to request access to this protected
+                # resource" — the one list that describes *this* server. An
+                # authorization server's RFC 8414 scopes_supported is a catalog of
+                # everything it knows across every resource it fronts, so asking for
+                # all of it both overreaches (§7.2: "as limited a scope as possible")
+                # and gets refused, since a client registered through DCR is rarely
+                # permitted the whole catalog. Clerk publishes openid there and
+                # forbids it to DCR clients, which is how asking for everything
+                # turned into invalid_scope on a server that wanted three scopes.
+                #
+                # A resource that declares nothing gets no scope parameter at all,
+                # which leaves the authorization server to apply its own default for
+                # the registered client. That is the least-privilege answer; guessing
+                # a set on its behalf is what this replaced.
+                scope = (
+                    " ".join(prm.scopes_supported)
+                    if prm and prm.scopes_supported
+                    else None
                 )
-                scope = " ".join(scopes) if scopes else None
 
                 # RFC 8707 resource indicator, required by MCP auth (rev 2025-06-18).
                 # Prefer the identifier the resource server publishes for itself; fall
@@ -492,11 +508,11 @@ async def _register_remote_mcp_server(
                     resource=resource,
                 )
 
-            return (oauth_metadata, registration, code_verifier,
-                    state, resource, auth_url)
+            return (oauth_metadata, registration, code_verifier, code_challenge,
+                    state, scope, resource, auth_url)
 
-        (oauth_metadata, registration, code_verifier,
-         state, resource, auth_url) = await _offload(_oauth_discover)
+        (oauth_metadata, registration, code_verifier, code_challenge,
+         state, scope, resource, auth_url) = await _offload(_oauth_discover)
 
         # Store session for the GET callback to use
         _purge_oauth_state()
@@ -506,6 +522,11 @@ async def _register_remote_mcp_server(
             "server_url": clean_url,
             "state": state,
             "code_verifier": code_verifier,
+            # The challenge is kept beside the verifier so an authorization that
+            # has to be reissued — see the invalid_scope retry in the callback —
+            # can be rebuilt without re-deriving it.
+            "code_challenge": code_challenge,
+            "scope": scope,
             "client_id": registration.client_id,
             "client_secret": registration.client_secret,
             "token_endpoint": oauth_metadata.token_endpoint,
