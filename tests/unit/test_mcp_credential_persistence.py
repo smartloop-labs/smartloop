@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from smartloop.agents.mcp import mcp_tool_caller as mod
 from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 
 
@@ -259,6 +260,7 @@ class TestARefusalIsNotRePaidByEveryWaiter:
             assert caller.refresh_access_token(server, stale_token="expired") is None
         with _reply({"access_token": "fresh"}):
             # Same refresh token, but nothing is holding it back once it works.
-            caller._refresh_failures.clear()
+            # The hold is shared across callers now, so it is cleared there.
+            mod._refresh_failures.clear()
             assert caller.refresh_access_token(server, stale_token="expired") == "fresh"
-        assert server.id not in caller._refresh_failures
+        assert server.id not in mod._refresh_failures

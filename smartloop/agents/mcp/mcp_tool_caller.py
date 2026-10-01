@@ -24,6 +24,40 @@ logger = logging.getLogger(__name__)
 #: different one — is never held back by it.
 _REFRESH_FAILURE_COOLDOWN_S = 30.0
 
+#: Redemption state, shared by every caller rather than held per instance.
+#:
+#: A refresh token is a property of the connection, not of whoever is holding it
+#: at the time, and callers are built freely — one per orchestrator, a fresh one
+#: for each provisioning probe, another for each read-only call that is not
+#: passed one.  Per-instance locks therefore serialized a single orchestrator's
+#: fan-out and nothing else, so a probe and a chat turn could redeem the same
+#: single-use token in parallel and invalidate the grant between them: exactly
+#: what the serialization was added to prevent.
+#:
+#: Keyed per server, so a connection waiting on a slow token endpoint does not
+#: hold up every other connection's renewal.
+_refresh_registry_lock = threading.Lock()
+_refresh_locks: Dict[str, threading.Lock] = {}
+#: ``server id -> (refresh token that was refused, when to retry it)``.
+_refresh_failures: Dict[str, Tuple[str, float]] = {}
+
+
+def _lock_for(server_id: str) -> threading.Lock:
+    """The redemption lock for one connection, created on first use."""
+    with _refresh_registry_lock:
+        lock = _refresh_locks.get(server_id)
+        if lock is None:
+            lock = threading.Lock()
+            _refresh_locks[server_id] = lock
+        return lock
+
+
+def reset_refresh_state() -> None:
+    """Forget every lock and cooldown (tests, and a workspace reload)."""
+    with _refresh_registry_lock:
+        _refresh_locks.clear()
+        _refresh_failures.clear()
+
 
 class MCPToolCaller:
     """Handles MCP server communication: tool calls, server lookup, auth, and prerequisites."""
@@ -37,15 +71,6 @@ class MCPToolCaller:
         #: them: the content crawl, which used to write them through its own
         #: ``on_server_updated``, was removed with indexing in ``abc232b``.
         self._persist = persist
-        #: Serializes redemptions.  Parallel step groups and tool fan-out share
-        #: one caller, so several calls can 401 together and each redeem the
-        #: same refresh token — and a provider that issues them single-use
-        #: invalidates the grant on the second attempt.
-        self._refresh_lock = threading.Lock()
-        #: ``server id -> (refresh token that was refused, when to retry it)``.
-        #: The other half of serializing: waiters must not each re-pay a
-        #: timeout the first one already established.
-        self._refresh_failures: Dict[str, Tuple[str, float]] = {}
 
     def set_persist(self, persist: Optional[Callable[[], None]]) -> None:
         """Install the callback that writes refreshed credentials back to disk."""
@@ -215,7 +240,7 @@ class MCPToolCaller:
         thread's token instead of spending the refresh token a second time —
         which is the thing that kills a single-use grant outright.
         """
-        with self._refresh_lock:
+        with _lock_for(server.id):
             return self._refresh_locked(server, stale_token)
 
     def _refresh_locked(
@@ -244,7 +269,7 @@ class MCPToolCaller:
             logger.warning(f"No token endpoint configured for server '{server.name}'")
             return None
 
-        refused, retry_at = self._refresh_failures.get(server.id, (None, 0.0))
+        refused, retry_at = _refresh_failures.get(server.id, (None, 0.0))
         if refused == creds.refresh_token and time.monotonic() < retry_at:
             logger.info(
                 f"Not retrying the refused refresh token for '{server.name}' yet"
@@ -279,7 +304,7 @@ class MCPToolCaller:
             self._note_refusal(server, creds.refresh_token)
             return None
 
-        self._refresh_failures.pop(server.id, None)
+        _refresh_failures.pop(server.id, None)
         creds.access_token = tokens.access_token
         if tokens.refresh_token:
             creds.refresh_token = tokens.refresh_token
@@ -292,7 +317,7 @@ class MCPToolCaller:
 
     def _note_refusal(self, server: "MCPServer", refresh_token: str) -> None:
         """Hold *refresh_token* back briefly after the endpoint refused it."""
-        self._refresh_failures[server.id] = (
+        _refresh_failures[server.id] = (
             refresh_token, time.monotonic() + _REFRESH_FAILURE_COOLDOWN_S,
         )
 
