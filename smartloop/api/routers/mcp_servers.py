@@ -9,8 +9,12 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from html import escape
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
+
+from smartloop.config import AppSettings
 
 from smartloop.api.model import (
     MCPDefinitionRequest,
@@ -290,7 +294,6 @@ async def _try_register_smartloop_mcp_server(
 async def _register_remote_mcp_server(
     request: MCPRegisterRequest,
     model_service: ModelService,
-    http_request: Request | None,
     project_id: str,
     curated=None,
 ) -> MCPRegisterResponse:
@@ -394,8 +397,7 @@ async def _register_remote_mcp_server(
 
     # Fall back to OAuth
     try:
-        base_url = str(http_request.base_url).rstrip("/") if http_request else "http://localhost:38540"
-        callback_url = request.callback_url or f"{base_url}/v1/mcp/oauth/callback"
+        callback_url = request.callback_url or _default_callback_url(project_id)
 
         def _oauth_discover():
             """Blocking OAuth discovery + dynamic client registration.
@@ -623,7 +625,6 @@ async def delete_mcp_server_from_project(
 async def register_mcp_server(
     project_id: str,
     request: MCPRegisterRequest,
-    http_request: Request = None,
     model_service: ModelService = Depends(get_model_service),
 ):
     """Unified MCP server registration (project-scoped).
@@ -641,7 +642,7 @@ async def register_mcp_server(
     if server_type == "local":
         return await _register_local_mcp_server(request, model_service, project_id, curated)
     return await _register_remote_mcp_server(
-        request, model_service, http_request, project_id, curated,
+        request, model_service, project_id, curated,
     )
 
 
@@ -649,7 +650,6 @@ async def register_mcp_server(
 async def register_mcp_from_definition(
     project_id: str,
     request: MCPDefinitionRequest,
-    http_request: Request = None,
     model_service: ModelService = Depends(get_model_service),
 ):
     """Install a connection from a dropped-in TOML file.
@@ -723,8 +723,28 @@ async def register_mcp_from_definition(
         return_url="smartloop://mcp-authorization",
     )
     return await register_mcp_server(
-        project_id=project_id, request=register,
-        http_request=http_request, model_service=model_service,
+        project_id=project_id, request=register, model_service=model_service,
+    )
+
+
+@router.get("/projects/{project_id}/mcp/oauth/callback", response_class=HTMLResponse)
+async def mcp_oauth_callback_for_project(
+    project_id: str,
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Where a provider's redirect lands, scoped to the project it belongs to.
+
+    The project in the path is what gets this request forwarded to the child
+    that owns it, which is both where the pending session was stored and the
+    only process whose ``save()`` writes that project's file.  See
+    :func:`_default_callback_url`.
+    """
+    return await _complete_oauth_redirect(
+        code=code, state=state, error=error,
+        model_service=model_service, routed_project_id=project_id,
     )
 
 
@@ -735,9 +755,28 @@ async def mcp_oauth_callback(
     error: str = None,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """OAuth callback endpoint. The OAuth provider redirects here with the authorization code.
-    Exchanges the code for tokens, discovers tools, and registers the MCP server.
+    """The unscoped redirect target, kept for a client that asks for it.
+
+    Nothing generates this URL any more — :func:`_default_callback_url` scopes
+    it to the project — but a caller may still pass it as ``callback_url``, and
+    an unsupervised server can serve it correctly because it owns every
+    project.  Under supervision it cannot, and says so rather than reporting
+    success for a connection it dropped.
     """
+    return await _complete_oauth_redirect(
+        code=code, state=state, error=error,
+        model_service=model_service, routed_project_id=None,
+    )
+
+
+async def _complete_oauth_redirect(
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    model_service: ModelService = Depends(get_model_service),
+    routed_project_id: Optional[str] = None,
+):
+    """Exchange the code for tokens, discover tools, and register the server."""
     from smartloop.mcp.oauth import MCPOAuthError
 
     if error:
@@ -772,6 +811,23 @@ async def mcp_oauth_callback(
             "<p>OAuth session not found. Please try again.</p></body></html>",
             status_code=400,
         )
+
+    project_id = session.get("project_id")
+    if routed_project_id is not None and routed_project_id != project_id:
+        # The redirect was addressed to one project and the session belongs to
+        # another: this is the wrong child, and its workspace has no such
+        # project to save into.
+        logger.error(
+            "[mcp-oauth] callback routed to project %s but state=%s belongs to %s",
+            routed_project_id, state, project_id,
+        )
+        return _wrong_process_page(routed_project_id)
+    if not _can_persist_project(project_id):
+        logger.error(
+            "[mcp-oauth] callback for project %s reached a process that cannot "
+            "write it; refusing before the code is spent", project_id,
+        )
+        return _wrong_process_page(project_id)
 
     try:
         # Exchange code for tokens
@@ -888,6 +944,68 @@ async def mcp_oauth_callback(
 
 
 # ---- OAuth flow endpoints ----
+
+
+def _default_callback_url(project_id: str) -> str:
+    """Where the provider sends the browser back when the client names nowhere.
+
+    Two things matter and both used to be wrong, because this was built from
+    ``request.base_url``.
+
+    It is addressed to the **supervisor's** public port rather than whatever
+    port served the registration.  Under supervision that was the child's
+    ephemeral one, so the redirect URI registered with the provider named a
+    port that disappears when the child is idle-reaped — and the authorization
+    only has to outlive it for the user to come back to a refused connection.
+
+    And it is **scoped to the project**, so the supervisor forwards the
+    redirect to the child that owns it (see
+    :func:`smartloop.supervisor.routing.project_to_proxy`).  The unscoped path
+    is the one route here with no project in it, which left it answered by the
+    supervisor: the pending session was in the child's memory, and a supervisor
+    that has delegated its projects writes no ``project.json`` at all, so the
+    grant it had just completed went nowhere.
+    """
+    return (
+        f"http://localhost:{AppSettings().api_port}"
+        f"/v1/projects/{project_id}/mcp/oauth/callback"
+    )
+
+
+def _can_persist_project(project_id: Optional[str]) -> bool:
+    """Whether a server saved here would reach *project_id*'s own file.
+
+    ``Workspace.save()`` writes a project's file only for the process that owns
+    the project, and says nothing when it declines — so a callback answered in
+    the wrong process returns a success page for a connection that was never
+    written.  Checked before the code is exchanged, because an authorization
+    code is single-use: burning it and then failing to persist leaves the user
+    with no way forward but to start again.
+    """
+    from smartloop.workspace.context import (
+        owned_project_id, pinned_project_id, projects_delegated,
+    )
+    if not project_id:
+        return False
+    pinned = pinned_project_id()
+    if pinned is not None:
+        return pinned == project_id
+    if projects_delegated():
+        return owned_project_id() == project_id
+    # Unpinned and undelegated — the --no-supervised server or the CLI, which
+    # is the only process there is and writes every project's file.
+    return True
+
+
+def _wrong_process_page(project_id: Optional[str]) -> HTMLResponse:
+    return HTMLResponse(
+        "<html><body><h2>Registration failed</h2>"
+        "<p>This authorization was completed by a part of Smartloop that "
+        f"cannot save connections for project {escape(str(project_id))}.</p>"
+        "<p>You can close this window and add the connection again.</p>"
+        "</body></html>",
+        status_code=500,
+    )
 
 
 @router.post("/projects/{project_id}/mcp/oauth/callback", response_model=MCPServerResponse)

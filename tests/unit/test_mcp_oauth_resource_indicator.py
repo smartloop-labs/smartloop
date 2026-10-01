@@ -244,7 +244,6 @@ class TestRegisterFlowPlumbing:
                 router_mod._register_remote_mcp_server(
                     request=MCPRegisterRequest(server_url=server_url, server_type="remote"),
                     model_service=MagicMock(),
-                    http_request=None,
                     project_id="p1",
                 )
             )

@@ -25,7 +25,7 @@ _RESULT = {
 
 
 def _register(svc, request):
-    return asyncio.run(register_mcp_server("proj-1", request, None, svc))
+    return asyncio.run(register_mcp_server("proj-1", request, svc))
 
 
 def _local_request():
