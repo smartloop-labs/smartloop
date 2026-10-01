@@ -55,12 +55,38 @@ _settings = AppSettings()
 # leftover under them is protected too.
 _BUNDLED_ORGS = ("smartloop-ai", "embeddings")
 
+# How a model's bytes are presented, keyed by the keep reason the scan already
+# worked out.  The split lives here rather than in the desktop app because the
+# framework is what knows a model is in use — the client only draws it.
+#
+# ``bundled`` is its own group: the orchestrator and the embedder are what the
+# framework runs on, not weights the user picked, so they read as infrastructure
+# rather than as a choice someone made.  Everything else that is held — resident,
+# default, active, enabled in any project, or still arriving — is the user's own
+# footprint and is reported as such.
+_MODEL_GROUPS = {
+    "bundled": "system",
+    "downloading": "in_use",
+    "loaded": "in_use",
+    "default": "in_use",
+    "active": "in_use",
+    "enabled": "in_use",
+}
+
 # Installed framework payloads sit in <home>/<x.y.z>/ next to everything else.
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 # Regenerable caches. Both are written by the desktop app / installer rather than
 # by us, but they live under our home and nothing else prunes them.
 _CACHE_DIRS = ("cache", "templates")
+
+# How long a project directory must sit untouched before the sweep will take it.
+# The orphan rule is structural — "config.json does not mention you" — with no
+# other evidence behind it, and the sweep runs without ever being shown in the
+# UI, so a config that loaded short of its full project list would delete live
+# work with nothing on screen having named it.  An orphan is litter left by a
+# bug; it is in no hurry, and waiting a week costs nothing it was going to use.
+_ORPHAN_MIN_AGE_S = 7 * 24 * 60 * 60
 
 # Never removed, whatever category is being swept: credentials, the workspace
 # record itself, liveness markers, install markers, and the desktop app's own DB.
@@ -281,6 +307,20 @@ def _keep_model_ids(workspace: Workspace, model_service: Any) -> dict[str, str]:
     return keep
 
 
+def _model_group(keep_reason: Optional[str]) -> str:
+    """Which usage group a model's bytes belong to.
+
+    No keep reason means nothing holds the tree, which is exactly what makes it
+    removable — so ``unused`` and ``reclaimable`` describe the same bytes from
+    two directions and must stay in step.  An unrecognised reason counts as in
+    use: a new way to hold a model should show up as the user's footprint, not
+    quietly become something the UI offers to delete.
+    """
+    if keep_reason is None:
+        return "unused"
+    return _MODEL_GROUPS.get(keep_reason, "in_use")
+
+
 # ── Scanners ───────────────────────────────────────────────────────────────
 
 def _weights_state(model_dir: str) -> tuple[bool, bool]:
@@ -383,6 +423,7 @@ def _scan_models(workspace: Workspace, model_service: Any) -> list[dict]:
                 path,
                 removable=True,
                 keep_reason=keep_reason,
+                group=_model_group(keep_reason),
                 model_id=model_id,
                 partial=partial,
                 model_name=entry.model_name if entry else None,
@@ -479,6 +520,21 @@ def _scan_orphan_projects(workspace: Workspace) -> list[dict]:
     if not workspace_dir or not os.path.isdir(workspace_dir):
         return []
 
+    # The workspace directory is ``<home>/<workspace-id>``, so it can never be
+    # the home directory itself — but an empty id makes os.path.join collapse it
+    # to exactly that, and realpath then strips the trailing separator so every
+    # later check agrees.  What sits directly under home is one directory per
+    # *workspace*, all uuid-shaped and none of them this workspace's projects,
+    # so the scan below would offer every one of them — on a shared machine,
+    # another account's entire workspace.  Refuse rather than guess.
+    if os.path.realpath(workspace_dir) == _home():
+        logger.warning(
+            "[storage] Workspace directory resolved to the home directory "
+            "(workspace id %r); skipping the orphan-project scan",
+            workspace.id,
+        )
+        return []
+
     known = set()
     for project in workspace.projects:
         if project.project_dir:
@@ -496,7 +552,15 @@ def _scan_orphan_projects(workspace: Workspace) -> list[dict]:
         path = os.path.join(workspace_dir, name)
         if os.path.realpath(path) in known:
             continue
-        rows.append(_row(path, removable=True, project_id=name))
+        try:
+            age = time.time() - os.stat(path).st_mtime
+        except OSError:
+            continue
+        if age < _ORPHAN_MIN_AGE_S:
+            # Touched recently, so something is still writing here even though
+            # the workspace record does not admit it.  Leave it be.
+            continue
+        rows.append(_row(path, removable=True, project_id=name, age_s=int(age)))
     return rows
 
 
@@ -589,6 +653,10 @@ def _validate(path: str, shape: str, workspace: Workspace) -> str:
             raise ValueError(f"Not a cache entry: {path}")
     elif shape == "orphan_projects":
         workspace_dir = os.path.realpath(workspace.workspace_dir or "")
+        # Belt to the scanner's braces: a workspace dir that collapsed onto home
+        # would make every sibling workspace look like a project of this one.
+        if workspace_dir == home:
+            raise ValueError(f"Workspace directory resolved to the home directory: {path}")
         if os.path.dirname(resolved) != workspace_dir:
             raise ValueError(f"Not a project directory: {path}")
         uuid.UUID(os.path.basename(resolved))          # raises ValueError
@@ -741,6 +809,39 @@ def _category(rows: list[dict], total_path: Optional[str] = None, **extra) -> di
     return report
 
 
+def _models_category(workspace: Workspace, model_service: Any) -> dict:
+    """The models report, split into the groups the UI draws as its own bands.
+
+    Reported here rather than derived by the client: which models count as in
+    use is the same judgement ``run_cleanup`` acts on, and a second copy of it
+    in the desktop app is a second copy that can disagree.
+
+    ``reclaimable`` already carries the ``unused`` total — a row is removable
+    exactly when nothing keeps it — so it is not repeated under another name.
+    The four numbers partition the category:
+
+        in_use + system + reclaimable + overhead == bytes
+    """
+    rows = _scan_models(workspace, model_service)
+    report = _category(rows, total_path=workspace.models_dir)
+
+    by_group: dict[str, int] = {}
+    for row in rows:
+        by_group[row["group"]] = by_group.get(row["group"], 0) + row["bytes"]
+
+    report["in_use"] = by_group.get("in_use", 0)
+    report["system"] = by_group.get("system", 0)
+    # Inside the walked tree but holding no row of its own: the hidden
+    # ``embeddings/.locks`` bookkeeping and loose files sitting directly under an
+    # org directory, which is how the embedding GGUF actually lands.  Named so
+    # the client can account for every byte it draws rather than reaching the
+    # same figure by subtraction and calling the result "system".
+    report["overhead"] = max(
+        0, report["bytes"] - report["in_use"] - report["system"] - report["reclaimable"]
+    )
+    return report
+
+
 def compute_usage(*, model_service: Any = None) -> dict:
     """Report what the home directory is using and what can be reclaimed."""
     workspace = _load_workspace(model_service)
@@ -748,9 +849,7 @@ def compute_usage(*, model_service: Any = None) -> dict:
     total, files = _walk_size(home)
 
     categories = {
-        "models": _category(
-            _scan_models(workspace, model_service), total_path=workspace.models_dir
-        ),
+        "models": _models_category(workspace, model_service),
         "versions": _category(_scan_versions()),
         "logs": _category(_scan_logs()),
         "cache": _category(_scan_cache()),

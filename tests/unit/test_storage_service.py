@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import threading
+import time
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -50,6 +51,12 @@ def _write(path, content="x"):
     return path
 
 
+def _age(path: str, seconds: int = storage_service._ORPHAN_MIN_AGE_S + 3600) -> None:
+    """Backdate a path's mtime so the orphan sweep treats it as settled."""
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+
+
 @pytest.fixture()
 def home(tmp_path):
     """A fake ~/.smartloop with every category populated."""
@@ -78,6 +85,12 @@ def home(tmp_path):
     _write(str(project_dir / "documents" / "readme.txt"), "doc")
     orphan_id = str(uuid4())
     _write(str(workspace_dir / orphan_id / "documents" / "stale.txt"), "stale")
+    # Backdated past _ORPHAN_MIN_AGE_S: the sweep leaves a recently touched
+    # directory alone, so an orphan created here and now would never be offered.
+    _age(str(workspace_dir / orphan_id))
+    # An orphan by shape but touched moments ago — the age guard keeps it.
+    fresh_orphan_id = str(uuid4())
+    _write(str(workspace_dir / fresh_orphan_id / "documents" / "live.txt"), "live")
     # A non-uuid directory is not a project shape and must be left alone.
     _write(str(workspace_dir / "not-a-project" / "keep.txt"), "keep")
     _write(str(workspace_dir / "workspace.db"), "db")
@@ -136,6 +149,7 @@ def home(tmp_path):
         "models_dir": str(models_dir),
         "project": project,
         "orphan_id": orphan_id,
+        "fresh_orphan_id": fresh_orphan_id,
         "config_file": str(config_file),
         "session_id": session_id,
         "untracked_id": untracked_id,
@@ -420,6 +434,155 @@ class TestComputeUsage:
 
         with pytest.raises(RuntimeError):
             storage_service.compute_usage(model_service=env["service"])
+
+
+class TestModelUsageGroups:
+    """The split the usage panel draws: in use, framework-owned, reclaimable.
+
+    The UI used to show only what it could delete, so every model the user had
+    turned on vanished into a "System" remainder alongside config.json.  These
+    assert the report names those bytes instead.
+    """
+
+    def test_the_groups_partition_the_category(self, env):
+        models = storage_service.compute_usage(
+            model_service=env["service"]
+        )["categories"]["models"]
+
+        assert (
+            models["in_use"] + models["system"]
+            + models["reclaimable"] + models["overhead"]
+        ) == models["bytes"]
+
+    def test_a_bundled_model_is_framework_not_user_footprint(self, env):
+        models = storage_service.compute_usage(
+            model_service=env["service"]
+        )["categories"]["models"]
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        bootstrap = rows["smartloop-ai/slp-orchestra-mini"]
+        # It is the default *and* active, so it would have been held anyway —
+        # being bundled has to win, or the orchestrator reads as a choice the
+        # user made and shows up under their own usage.
+        assert bootstrap["group"] == "system"
+        assert models["system"] == bootstrap["bytes"]
+
+    def test_a_model_the_user_turned_on_counts_as_theirs(self, env):
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        assert rows["google/gemma-4-e4b-it"]["group"] == "in_use"
+
+    def test_unused_is_the_same_bytes_as_reclaimable(self, env):
+        usage = storage_service.compute_usage(model_service=env["service"])
+        models = usage["categories"]["models"]
+
+        unused = sum(
+            r["bytes"] for r in models["items"] if r["group"] == "unused"
+        )
+        assert unused == models["reclaimable"]
+        assert {r["model_id"] for r in models["items"] if r["group"] == "unused"} == (
+            REMOVABLE_IDS | {"Qwen/unregistered-model"}
+        )
+
+    def test_overhead_catches_what_has_no_row(self, env):
+        models = storage_service.compute_usage(
+            model_service=env["service"]
+        )["categories"]["models"]
+
+        # The embedding GGUF lands as a loose file under embeddings/ rather than
+        # in an <org>/<repo> tree, so it is inside the walked total and has no
+        # item of its own.  Without overhead those bytes would go unexplained.
+        assert models["overhead"] == 40
+
+    def test_an_arriving_download_is_in_use_not_reclaimable(self, env):
+        live = _make_partial(env["models_dir"], "google/gemma-3-4b-it")
+
+        with downloading(live):
+            rows = _by_model_id(
+                storage_service.compute_usage(model_service=env["service"])
+            )
+
+            # Growing bytes are not space anyone can offer to free.
+            assert rows["google/gemma-3-4b-it"]["group"] == "in_use"
+
+    def test_an_abandoned_download_is_reclaimable(self, env):
+        _make_partial(env["models_dir"], "google/gemma-4-e4b-it")
+
+        rows = _by_model_id(storage_service.compute_usage(model_service=env["service"]))
+
+        # Enabled, but the weights never arrived — the partial rule wins, and
+        # the group follows it rather than the picker's flag.
+        assert rows["google/gemma-4-e4b-it"]["group"] == "unused"
+
+
+class TestOrphanProjectsSettleFirst:
+    def test_a_recently_touched_orphan_is_left_alone(self, env):
+        rows = _rows(storage_service.compute_usage(model_service=env["service"]),
+                     "orphan_projects")
+
+        ids = [r["project_id"] for r in rows]
+        assert env["orphan_id"] in ids
+        assert env["fresh_orphan_id"] not in ids, (
+            "a directory written moments ago was offered for deletion"
+        )
+
+    def test_the_sweep_leaves_a_fresh_orphan_on_disk(self, env):
+        storage_service.run_cleanup(
+            model_service=env["service"], orphan_projects=True,
+        )
+
+        assert os.path.isdir(
+            os.path.join(env["workspace_dir"], env["fresh_orphan_id"])
+        )
+
+    def test_an_orphan_that_has_settled_is_swept(self, env):
+        storage_service.run_cleanup(
+            model_service=env["service"], orphan_projects=True,
+        )
+
+        assert not os.path.exists(
+            os.path.join(env["workspace_dir"], env["orphan_id"])
+        )
+
+
+class TestASiblingWorkspaceIsNeverAProject:
+    """Workspaces sit side by side under home, one directory each.
+
+    They are uuid-shaped and hold no projects of *this* workspace, so anything
+    that roots the orphan scan at home rather than at the workspace directory
+    offers another account's entire workspace for deletion.  An empty workspace
+    id does exactly that: os.path.join(home, "") is "<home>/", and realpath
+    normalises it back to home so every downstream check agrees.
+    """
+
+    @staticmethod
+    def _collapsed(env):
+        ws = env["workspace"]
+        ws.id = ""
+        ws.workspace_dir = os.path.join(env["home_dir"], "")
+        return ws
+
+    def test_the_scan_refuses_a_collapsed_workspace_dir(self, env):
+        assert storage_service._scan_orphan_projects(self._collapsed(env)) == []
+
+    def test_validation_refuses_it_too(self, env):
+        ws = self._collapsed(env)
+        sibling = os.path.join(env["home_dir"], str(uuid4()))
+        os.makedirs(sibling)
+
+        with pytest.raises(ValueError, match="home directory"):
+            storage_service._validate(sibling, "orphan_projects", ws)
+
+    def test_a_sibling_workspace_survives_the_sweep(self, env):
+        sibling = os.path.join(env["home_dir"], str(uuid4()))
+        os.makedirs(os.path.join(sibling, "models"))
+        _age(sibling)
+
+        storage_service.run_cleanup(
+            model_service=env["service"], orphan_projects=True,
+        )
+
+        assert os.path.isdir(sibling), "another workspace was swept"
 
 
 class TestCleanup:
