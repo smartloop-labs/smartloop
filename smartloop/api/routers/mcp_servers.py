@@ -143,6 +143,37 @@ def _build_server_response(result: dict) -> MCPServerResponse:
     )
 
 
+def _authorization_error_detail(
+    error: str,
+    error_description: str | None = None,
+    error_uri: str | None = None,
+) -> str:
+    """Render what the authorization server said it objected to.
+
+    ``error`` alone comes from the fixed RFC 6749 §4.1.2.1 enum and so can only
+    ever name a category.  Which scope, which redirect URI, which client — that
+    lives in ``error_description``, and dropping it is the difference between a
+    page the user can act on and the bare word "invalid_scope".
+
+    ``error_uri`` is attacker-controlled in the sense that matters here: it
+    arrives on a redirect from a server we discovered rather than one we
+    configured, so it is only ever rendered as a link when it is an http(s) URL.
+    Anything else (``javascript:`` above all) is shown as inert text.
+    """
+    detail = f"<p>{escape(error)}</p>"
+    if error_description:
+        detail += f"<p>{escape(error_description)}</p>"
+    if error_uri:
+        if error_uri.lower().startswith(("https://", "http://")):
+            detail += (
+                f'<p><a href="{escape(error_uri, quote=True)}" '
+                'rel="noopener noreferrer">More information</a></p>'
+            )
+        else:
+            detail += f"<p>{escape(error_uri)}</p>"
+    return detail
+
+
 def _oauth_success_page(
     server_name: str,
     tool_count: int,
@@ -733,6 +764,8 @@ async def mcp_oauth_callback_for_project(
     code: str = None,
     state: str = None,
     error: str = None,
+    error_description: str = None,
+    error_uri: str = None,
     model_service: ModelService = Depends(get_model_service),
 ):
     """Where a provider's redirect lands, scoped to the project it belongs to.
@@ -744,6 +777,7 @@ async def mcp_oauth_callback_for_project(
     """
     return await _complete_oauth_redirect(
         code=code, state=state, error=error,
+        error_description=error_description, error_uri=error_uri,
         model_service=model_service, routed_project_id=project_id,
     )
 
@@ -753,6 +787,8 @@ async def mcp_oauth_callback(
     code: str = None,
     state: str = None,
     error: str = None,
+    error_description: str = None,
+    error_uri: str = None,
     model_service: ModelService = Depends(get_model_service),
 ):
     """The unscoped redirect target, kept for a client that asks for it.
@@ -765,6 +801,7 @@ async def mcp_oauth_callback(
     """
     return await _complete_oauth_redirect(
         code=code, state=state, error=error,
+        error_description=error_description, error_uri=error_uri,
         model_service=model_service, routed_project_id=None,
     )
 
@@ -773,6 +810,8 @@ async def _complete_oauth_redirect(
     code: str = None,
     state: str = None,
     error: str = None,
+    error_description: str = None,
+    error_uri: str = None,
     model_service: ModelService = Depends(get_model_service),
     routed_project_id: Optional[str] = None,
 ):
@@ -780,8 +819,18 @@ async def _complete_oauth_redirect(
     from smartloop.mcp.oauth import MCPOAuthError
 
     if error:
+        # RFC 6749 §4.1.2.1 sends three fields and only ``error`` is from a fixed
+        # enum.  ``error_description`` is the sentence that says *which* scope, or
+        # *which* redirect URI, the server objected to — the difference between a
+        # diagnosable failure and the bare word "invalid_scope".
+        logger.warning(
+            "[mcp-oauth] provider refused authorization for state=%s: "
+            "error=%s description=%s uri=%s",
+            state, error, error_description, error_uri,
+        )
         return HTMLResponse(
-            f"<html><body><h2>Authorization failed</h2><p>{escape(error)}</p>"
+            "<html><body><h2>Authorization failed</h2>"
+            f"{_authorization_error_detail(error, error_description, error_uri)}"
             "<p>You can close this window.</p></body></html>",
             status_code=400,
         )

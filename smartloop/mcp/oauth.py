@@ -111,6 +111,38 @@ class TokenExchangeError(MCPOAuthError):
         return self.error_code in self.DEAD_GRANT_CODES
 
 
+def _token_error(
+    exc: httpx.HTTPStatusError, label: str
+) -> "TokenExchangeError":
+    """Build a :class:`TokenExchangeError` from an RFC 6749 §5.2 error body.
+
+    All three fields matter and for different reasons.  ``error`` is the fixed
+    enum the retry logic switches on (see ``DEAD_GRANT_CODES``).
+    ``error_description`` is the only part that names *what* was wrong — which
+    scope, which client — and ``error_uri`` points at the provider's own page
+    about it.  A body that is not JSON, or not an OAuth error at all, leaves the
+    status line as the whole story rather than failing a second time in here.
+    """
+    error_code = None
+    detail = ""
+    try:
+        data = exc.response.json()
+        error_code = data.get("error")
+        description = data.get("error_description") or error_code or ""
+        uri = data.get("error_uri")
+        if description:
+            detail = f": {description}"
+        if uri:
+            detail += f" (see {uri})"
+    except Exception:
+        pass
+    return TokenExchangeError(
+        f"{label}: HTTP {exc.response.status_code}{detail}",
+        error_code=error_code,
+        status_code=exc.response.status_code,
+    )
+
+
 class MCPOAuthService:
     """Sync service for handling OAuth flows with remote MCP servers."""
 
@@ -364,18 +396,7 @@ class MCPOAuthService:
                 scope=data.get("scope"),
             )
         except httpx.HTTPStatusError as e:
-            error_detail = ""
-            error_code = None
-            try:
-                error_data = e.response.json()
-                error_code = error_data.get("error")
-                error_detail = f": {error_data.get('error_description', error_code or '')}"
-            except Exception:
-                pass
-            raise TokenExchangeError(
-                f"Token exchange failed: HTTP {e.response.status_code}{error_detail}",
-                error_code=error_code, status_code=e.response.status_code,
-            ) from e
+            raise _token_error(e, "Token exchange failed") from e
         except httpx.RequestError as e:
             raise TokenExchangeError(
                 f"Failed to connect to {token_endpoint}: {str(e)}"
@@ -420,18 +441,7 @@ class MCPOAuthService:
                 scope=data.get("scope"),
             )
         except httpx.HTTPStatusError as e:
-            error_detail = ""
-            error_code = None
-            try:
-                error_data = e.response.json()
-                error_code = error_data.get("error")
-                error_detail = f": {error_data.get('error_description', error_code or '')}"
-            except Exception:
-                pass
-            raise TokenExchangeError(
-                f"Token refresh failed: HTTP {e.response.status_code}{error_detail}",
-                error_code=error_code, status_code=e.response.status_code,
-            ) from e
+            raise _token_error(e, "Token refresh failed") from e
         except httpx.RequestError as e:
             raise TokenExchangeError(
                 f"Failed to connect to {token_endpoint}: {str(e)}"
