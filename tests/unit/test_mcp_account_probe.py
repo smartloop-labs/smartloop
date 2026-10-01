@@ -254,14 +254,14 @@ class TestARotatedTokenIsWrittenBack:
 
 
 class TestTheWriteLandsOnTheLiveWorkspace:
-    """A reload mid-pass must not send the rotation to an orphan.
+    """A pass holding a detached server must not save the rotation to it.
 
-    ``Workspace.reload()`` rebinds ``projects`` wholesale — whatever its
-    docstring says about keeping references valid — and a chat request opens
-    with one.  So a provisioning pass that began earlier is mutating an object
-    the workspace no longer holds, and a plain ``save()`` serializes the list
-    that replaced it: the rotated refresh token goes to the orphan while the
-    refresh token the provider already retired stays on disk.
+    ``Workspace.reload()`` keeps references valid, so this is no longer how a
+    chat request mid-pass behaves — but a pass can still outlive the workspace
+    instance it read its server from, because ``_ensure_workspace`` builds a
+    fresh one per call on a cold process.  Re-finding by id before saving is
+    what puts the rotated refresh token on the object that gets serialized,
+    rather than leaving the one the provider already retired on disk.
     """
 
     def _pair(self):
