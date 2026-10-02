@@ -208,6 +208,16 @@ class ProjectAgentPool:
                 return record
             return self._start(project_id)
 
+    def _output_path(self, project_id: str) -> Optional[str]:
+        """Where a Windows child's raw stdout/stderr go: a crash traceback
+        printed before its logging is up, beside its ``agent.log``.  A file of
+        its own, because ``agent.log`` rotates and Windows will not rename a
+        file another process holds open."""
+        project_dir = self.project_dir_for(project_id)
+        if not project_dir or not os.path.isdir(project_dir):
+            return None
+        return os.path.join(project_dir, "agent.out.log")
+
     def _start(self, project_id: str) -> AgentRecord:
         """Spawn a child and wait for it to answer. Caller holds the lock."""
         self._await_backoff(project_id)
@@ -223,7 +233,9 @@ class ProjectAgentPool:
             # no fork() is taken: a fork() while the host's gRPC server is
             # mid-RPC is exactly the class of crash this pool is built to
             # contain.  Windows falls back to the creation-flag Popen.
-            process = popen_detached_devnull(command, env)
+            process = popen_detached_devnull(
+                command, env, output=self._output_path(project_id),
+            )
         except OSError as exc:
             raise ChildStartError(
                 f"could not spawn an agent for project {project_id}: {exc}"

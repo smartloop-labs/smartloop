@@ -160,21 +160,44 @@ class DetachedProcess:
         os.kill(self.pid, signal.SIGKILL)
 
 
-def popen_detached_devnull(command: list, env: dict | None = None):
+def popen_detached_devnull(command: list, env: dict | None = None,
+                           output: str | None = None):
     """Spawn *command* detached, falling back to a forking ``Popen``.
 
     Returns a ``DetachedProcess`` when ``posix_spawn`` is available and the
     spawn succeeds, and a ``subprocess.Popen`` (same authors: stdin is
     ``/dev/null``, own session via ``start_new_session``) otherwise — so a
     platform or runtime that cannot use ``posix_spawn`` still gets its child.
+
+    On Windows the child does not inherit our stdout/stderr: they are whatever
+    launched the supervisor gave it (a log file, the desktop app's pipes, a
+    console), and passing some of those through ``CreateProcess``'s handle list
+    fails with ``[WinError 50] The request is not supported``.  Its output goes
+    to *output* instead, appended, or nowhere when that is ``None``.  It runs
+    without a console window too: a supervisor started without a console would
+    otherwise give every child a visible one of its own.
     """
-    try:
-        return DetachedProcess(spawn_detached(command, env))
-    except (AttributeError, OSError, ValueError):
-        pass
-    kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)} \
-        if os.name == "nt" else {"start_new_session": True}
-    return subprocess.Popen(
-        command, env=env, stdin=subprocess.DEVNULL, stdout=None, stderr=None,
-        **kwargs,
-    )
+    if os.name != "nt":
+        try:
+            return DetachedProcess(spawn_detached(command, env))
+        except (AttributeError, OSError, ValueError):
+            pass
+        return subprocess.Popen(
+            command, env=env, stdin=subprocess.DEVNULL, stdout=None, stderr=None,
+            start_new_session=True,
+        )
+
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    if output is None:
+        return subprocess.Popen(
+            command, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+    # The child holds its own copy of the handle; ours can close at once.
+    with open(output, "ab") as sink:
+        return subprocess.Popen(
+            command, env=env, stdin=subprocess.DEVNULL,
+            stdout=sink, stderr=subprocess.STDOUT,
+            creationflags=flags,
+        )
