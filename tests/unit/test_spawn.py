@@ -125,3 +125,18 @@ class TestPopenFallback:
 
         assert isinstance(proc, subprocess.Popen)
         assert proc.wait(timeout=10) == 0
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows creation-flag path")
+class TestWindowsSpawn:
+    def test_the_child_writes_to_its_output_file_not_ours(self, tmp_path):
+        output = tmp_path / "agent.out.log"
+        proc = popen_detached_devnull(
+            [sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr)"],
+            output=str(output),
+        )
+        assert proc.wait(timeout=10) == 0
+        assert output.read_text().split() == ["out", "err"]
+
+    def test_with_no_output_file_it_still_spawns(self):
+        proc = popen_detached_devnull([sys.executable, "-c", "print('x')"])
+        assert proc.wait(timeout=10) == 0
