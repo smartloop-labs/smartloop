@@ -1,12 +1,12 @@
-import httpx
 import logging
 import re
+import threading
 import time
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from smartloop.mcp import MCPClient
 from smartloop.mcp.local_client import LocalMCPClient
-from smartloop.workspace.workspace import MCPServerType
+from smartloop.workspace.workspace import MCPServerStatus, MCPServerType
 
 from .argument_extractor import MCPArgumentExtractor
 from .result_mapper import MCPResultMapper
@@ -16,13 +16,65 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: How long a refusal stands before the same refresh token is offered again.
+#: Serializing redemptions means a token endpoint that hangs is waited on once
+#: per caller in turn rather than once in parallel, so without this a fan-out of
+#: four calls turns one 30-second timeout into two minutes of a chat turn.  It
+#: is keyed on the token that failed, so a reconnection — which mints a
+#: different one — is never held back by it.
+_REFRESH_FAILURE_COOLDOWN_S = 30.0
+
+#: Redemption state, shared by every caller rather than held per instance.
+#:
+#: A refresh token is a property of the connection, not of whoever is holding it
+#: at the time, and callers are built freely — one per orchestrator, a fresh one
+#: for each provisioning probe, another for each read-only call that is not
+#: passed one.  Per-instance locks therefore serialized a single orchestrator's
+#: fan-out and nothing else, so a probe and a chat turn could redeem the same
+#: single-use token in parallel and invalidate the grant between them: exactly
+#: what the serialization was added to prevent.
+#:
+#: Keyed per server, so a connection waiting on a slow token endpoint does not
+#: hold up every other connection's renewal.
+_refresh_registry_lock = threading.Lock()
+_refresh_locks: Dict[str, threading.Lock] = {}
+#: ``server id -> (refresh token that was refused, when to retry it)``.
+_refresh_failures: Dict[str, Tuple[str, float]] = {}
+
+
+def _lock_for(server_id: str) -> threading.Lock:
+    """The redemption lock for one connection, created on first use."""
+    with _refresh_registry_lock:
+        lock = _refresh_locks.get(server_id)
+        if lock is None:
+            lock = threading.Lock()
+            _refresh_locks[server_id] = lock
+        return lock
+
+
+def reset_refresh_state() -> None:
+    """Forget every lock and cooldown (tests, and a workspace reload)."""
+    with _refresh_registry_lock:
+        _refresh_locks.clear()
+        _refresh_failures.clear()
+
 
 class MCPToolCaller:
     """Handles MCP server communication: tool calls, server lookup, auth, and prerequisites."""
 
-    def __init__(self, arg_extractor: MCPArgumentExtractor, result_mapper: MCPResultMapper):
+    def __init__(self, arg_extractor: MCPArgumentExtractor, result_mapper: MCPResultMapper,
+                 persist: Optional[Callable[[], None]] = None):
         self.arg_extractor = arg_extractor
         self.result_mapper = result_mapper
+        #: Called after a refresh replaces a server's credentials, to write them
+        #: back to the workspace.  The hook is the *only* thing that persists
+        #: them: the content crawl, which used to write them through its own
+        #: ``on_server_updated``, was removed with indexing in ``abc232b``.
+        self._persist = persist
+
+    def set_persist(self, persist: Optional[Callable[[], None]]) -> None:
+        """Install the callback that writes refreshed credentials back to disk."""
+        self._persist = persist
 
     def call_tool(
         self,
@@ -61,6 +113,44 @@ class MCPToolCaller:
                         tool_name, server.name, server_url, result.error,
                     )
                 return result
+
+    def call_with_refresh(
+        self,
+        server: "MCPServer",
+        tool_name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+        cwd: Optional[str] = None,
+    ):
+        """Call a tool, renewing an expired token once and trying again.
+
+        Returns ``(result, refreshed)`` — ``refreshed`` says the server's
+        credentials changed, so a caller that owns the write-back knows there is
+        something to write.  (:attr:`_persist` already handles the callers that
+        do not.)
+
+        Every MCP call path had its own copy of this, and they had drifted: two
+        guarded on a server URL, one reported the rotation, one retried with the
+        wrong tool name, and the collect path — the main one since indexing was
+        replaced by live tool calls — had no retry at all, so an aged-out
+        connection looked to retrieval like an app with nothing in it.
+        """
+        access_token = self.get_access_token(server)
+        result = self.call_tool(
+            server=server, tool_name=tool_name,
+            arguments=arguments, access_token=access_token, cwd=cwd,
+        )
+        if result.success or not result.auth_expired:
+            return result, False
+
+        new_token = self.refresh_access_token(server, stale_token=access_token)
+        if not new_token:
+            return result, False
+
+        result = self.call_tool(
+            server=server, tool_name=tool_name,
+            arguments=arguments, access_token=new_token, cwd=cwd,
+        )
+        return result, True
 
     def find_server(
         self,
@@ -133,10 +223,44 @@ class MCPToolCaller:
             return server.remote_config.token
         return None
 
-    @staticmethod
-    def refresh_access_token(server: "MCPServer") -> Optional[str]:
+    def refresh_access_token(
+        self, server: "MCPServer", stale_token: Optional[str] = None,
+    ) -> Optional[str]:
+        """Redeem *server*'s refresh token, storing the result on the server.
+
+        The new credentials are written back through :attr:`_persist`.  Leaving
+        them in memory was a slow-acting break: providers that rotate refresh
+        tokens hand back a new one and retire the old, so a refresh during a chat
+        turn left the workspace holding a refresh token the provider had already
+        invalidated.  The connection kept working until the process restarted and
+        then could never be renewed again.
+
+        *stale_token* is the access token the caller's request failed with.
+        Given it, a redemption that lost the race to another thread returns that
+        thread's token instead of spending the refresh token a second time —
+        which is the thing that kills a single-use grant outright.
+        """
+        with _lock_for(server.id):
+            return self._refresh_locked(server, stale_token)
+
+    def _refresh_locked(
+        self, server: "MCPServer", stale_token: Optional[str],
+    ) -> Optional[str]:
         creds = server.oauth_credentials
+        if stale_token and creds and creds.access_token not in (None, stale_token):
+            # Another caller rotated it while this one waited for the lock.  Its
+            # result is good and already persisted; redeeming again would not
+            # improve on it and, single-use, would invalidate it.
+            logger.info(
+                f"Reusing the token another caller just refreshed for '{server.name}'"
+            )
+            return creds.access_token
+
         if not creds or not creds.refresh_token:
+            # Nothing to redeem.  Callers reach this only after a 401, so for a
+            # pasted credential that 401 is the verdict on the credential
+            # itself rather than a sign its token aged out.
+            self.record_credential_rejected(server)
             logger.warning(f"No refresh token available for server '{server.name}'")
             return None
 
@@ -145,41 +269,122 @@ class MCPToolCaller:
             logger.warning(f"No token endpoint configured for server '{server.name}'")
             return None
 
+        refused, retry_at = _refresh_failures.get(server.id, (None, 0.0))
+        if refused == creds.refresh_token and time.monotonic() < retry_at:
+            logger.info(
+                f"Not retrying the refused refresh token for '{server.name}' yet"
+            )
+            return None
+
+        from smartloop.mcp.oauth import MCPOAuthService, TokenExchangeError
+
         try:
-            payload = {
-                "grant_type": "refresh_token",
-                "refresh_token": creds.refresh_token,
-                "client_id": creds.client_id,
-            }
-            if creds.client_secret:
-                payload["client_secret"] = creds.client_secret
-            # RFC 8707: a refresh must carry the same resource indicator as the
-            # grant it descends from, or strict servers (monday.com) reject it.
-            if remote.resource:
-                payload["resource"] = remote.resource
-
-            with httpx.Client(timeout=30.0) as http:
-                resp = http.post(remote.token_endpoint, data=payload)
-                resp.raise_for_status()
-                data = resp.json()
-
-            new_access = data.get("access_token")
-            if not new_access:
-                logger.error("Token refresh response missing access_token")
-                return None
-
-            creds.access_token = new_access
-            if data.get("refresh_token"):
-                creds.refresh_token = data["refresh_token"]
-            if data.get("expires_in"):
-                creds.expires_at = time.time() + data["expires_in"]
-
-            logger.info(f"Refreshed access token for server '{server.name}'")
-            return new_access
-
+            with MCPOAuthService() as oauth:
+                # RFC 8707: a refresh must carry the same resource indicator as
+                # the grant it descends from, or strict servers (monday.com)
+                # reject it.
+                tokens = oauth.refresh_access_token(
+                    token_endpoint=remote.token_endpoint,
+                    refresh_token=creds.refresh_token,
+                    client_id=creds.client_id,
+                    client_secret=creds.client_secret,
+                    resource=remote.resource,
+                )
+        except TokenExchangeError as e:
+            logger.error(f"Token refresh failed for server '{server.name}': {e}")
+            self._note_refusal(server, creds.refresh_token)
+            if e.grant_is_dead:
+                # The server has retired this grant.  Re-minting it cannot work
+                # again, so this is the one refusal that should cost the user
+                # their connection — a blip or a 5xx must not.
+                self.record_grant_expired(server)
+            return None
         except Exception as e:
             logger.error(f"Token refresh failed for server '{server.name}': {e}")
+            self._note_refusal(server, creds.refresh_token)
             return None
+
+        _refresh_failures.pop(server.id, None)
+        creds.access_token = tokens.access_token
+        if tokens.refresh_token:
+            creds.refresh_token = tokens.refresh_token
+        if tokens.expires_in:
+            creds.expires_at = time.time() + tokens.expires_in
+        if tokens.scope:
+            # A refresh may come back narrower than the grant it descends from
+            # (RFC 6749 §6 allows the server to narrow, never to widen). Record
+            # it, or the stored scope describes a grant that no longer exists.
+            creds.scope = tokens.scope
+
+        self._write_back(server, "Refreshed")
+        logger.info(f"Refreshed access token for server '{server.name}'")
+        return tokens.access_token
+
+    def _note_refusal(self, server: "MCPServer", refresh_token: str) -> None:
+        """Hold *refresh_token* back briefly after the endpoint refused it."""
+        _refresh_failures[server.id] = (
+            refresh_token, time.monotonic() + _REFRESH_FAILURE_COOLDOWN_S,
+        )
+
+    def _write_back(self, server: "MCPServer", what: str) -> None:
+        """Persist a change to *server*, logging rather than raising on failure.
+
+        The state in memory is good, so whatever this change was made for should
+        still go ahead; it is the *next* process that pays for a failed write.
+        """
+        if self._persist is None:
+            return
+        try:
+            self._persist()
+        except Exception as e:
+            logger.warning(
+                f"{what} '{server.name}' but could not persist the change: {e}"
+            )
+
+    def record_credential_rejected(self, server: "MCPServer") -> bool:
+        """Fail a connection whose pasted credential the server refused.
+
+        Only for a credential that was pasted rather than granted.  An OAuth
+        connection has a refresh to fall back on and a failed refresh can be
+        transient, but a token the server has stopped accepting never starts
+        working again on its own.  Left unreported it looks exactly like a tool
+        with no data: ``status: ready``, an empty answer, nothing in the log.
+
+        Returns whether the server's state changed.
+        """
+        remote = server.remote_config
+        if not remote or not remote.token:
+            return False
+        return self._fail(
+            server,
+            "The access token for this connection was rejected. "
+            "Enter a new token to reconnect.",
+        )
+
+    def record_grant_expired(self, server: "MCPServer") -> bool:
+        """Fail a connection whose OAuth grant the server has retired.
+
+        Reached only for ``invalid_grant``/``invalid_client`` — a refusal that
+        re-minting the same grant cannot recover from.  Until this existed a
+        dead connection reported ``ready`` with its full tool list forever,
+        while every call 401'd and was swallowed.
+        """
+        return self._fail(
+            server,
+            "This connection's authorization has expired. Reconnect it to "
+            "keep using it.",
+        )
+
+    def _fail(self, server: "MCPServer", message: str) -> bool:
+        if server.status == MCPServerStatus.FAILED and server.last_error == message:
+            return False
+        server.status = MCPServerStatus.FAILED
+        server.last_error = message
+        logger.warning(
+            f"Server '{server.name}' can no longer authenticate: {message}"
+        )
+        self._write_back(server, "Failed")
+        return True
 
     def validate_argument_values(
         self,
@@ -238,7 +443,6 @@ class MCPToolCaller:
         previous_results: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, str]:
         resolved_ids = {}
-        access_token = self.get_access_token(server)
         properties = input_schema.get('properties', {})
 
         prior_corpus = ""
@@ -267,11 +471,10 @@ class MCPToolCaller:
 
             logger.info(f"[prereq] Calling prerequisite tool: {dep.prerequisite_tool}")
             try:
-                result = self.call_tool(
+                result, _refreshed = self.call_with_refresh(
                     server=server,
                     tool_name=dep.prerequisite_tool,
                     arguments={},
-                    access_token=access_token,
                 )
 
                 if result.success and result.content:

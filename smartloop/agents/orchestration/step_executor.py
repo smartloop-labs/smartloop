@@ -29,6 +29,7 @@ from smartloop.agents.orchestration.context import _OrchestratorContext
 from smartloop.agents.orchestration.response_builder import ResponseBuilder
 from smartloop.agents.planner import (
     PlanStep, StepType, SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
+    mcp_connection_is_usable,
 )
 from smartloop.utils.mcp_result_formatter import ResultFormatter
 from smartloop.paths import expand_home
@@ -461,7 +462,6 @@ class StepExecutor:
 
         input_schema = tool_schema.get('input_schema', {}) or {}
         server_url = self.tool_caller.get_server_url(server)
-        access_token = self.tool_caller.get_access_token(server)
 
         if not server_url and server.server_type != MCPServerType.LOCAL:
             logger.warning(f"[step] No server URL configured for: {step.server_name}")
@@ -609,18 +609,9 @@ class StepExecutor:
                     del arguments[k]
 
         logger.info(f"[step] Calling '{tool_name}' with arguments: {arguments}")
-        result = self.tool_caller.call_tool(
-            server=server, tool_name=tool_name,
-            arguments=arguments, access_token=access_token,
+        result, _refreshed = self.tool_caller.call_with_refresh(
+            server=server, tool_name=tool_name, arguments=arguments,
         )
-
-        if not result.success and result.error and "401" in result.error and server_url:
-            new_token = self.tool_caller.refresh_access_token(server)
-            if new_token:
-                result = self.tool_caller.call_tool(
-                    server=server, tool_name=tool_name,
-                    arguments=arguments, access_token=new_token,
-                )
 
         if not result.success:
             logger.warning(f"[step] '{tool_name}' failed: {result.error}")
@@ -1106,22 +1097,10 @@ class StepExecutor:
 
         Returns ``(formatted_content, raw_content)`` or ``None`` on failure.
         """
-        access_token = self.tool_caller.get_access_token(server)
-        server_url = self.tool_caller.get_server_url(server)
-
         logger.info(f"[execute] Calling '{tool_name}' with arguments: {arguments}")
-        result = self.tool_caller.call_tool(
-            server=server, tool_name=tool_name,
-            arguments=arguments, access_token=access_token, cwd=cwd,
+        result, _refreshed = self.tool_caller.call_with_refresh(
+            server=server, tool_name=tool_name, arguments=arguments, cwd=cwd,
         )
-
-        if not result.success and result.error and "401" in result.error and server_url:
-            new_token = self.tool_caller.refresh_access_token(server)
-            if new_token:
-                result = self.tool_caller.call_tool(
-                    server=server, tool_name=tool_name,
-                    arguments=arguments, access_token=new_token, cwd=cwd,
-                )
 
         if not result.success:
             logger.warning(f"[execute] '{tool_name}' failed: {result.error}")
@@ -1158,7 +1137,7 @@ class StepExecutor:
     def build_available_servers(self, mcp_servers: List[MCPServer]) -> List[Dict[str, Any]]:
         available = []
         for server in mcp_servers:
-            if not server.enabled:
+            if not mcp_connection_is_usable(server):
                 continue
             if not server.tools:
                 continue

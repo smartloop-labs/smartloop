@@ -30,6 +30,23 @@ def _reset_refresh_cooldown():
 
 
 @pytest.fixture(autouse=True)
+def _reset_mcp_refresh_state():
+    """Forget MCP redemption locks and cooldowns left by another test.
+
+    The same hazard as :func:`_reset_refresh_cooldown` one tier down: a refusal
+    recorded against a connection holds its refresh token back for thirty
+    seconds, and that state is shared across callers on purpose, so without
+    this a test that exercises a refused refresh makes the next test's
+    legitimate one return None having called nothing.
+    """
+    from smartloop.agents.mcp.mcp_tool_caller import reset_refresh_state
+
+    reset_refresh_state()
+    yield
+    reset_refresh_state()
+
+
+@pytest.fixture(autouse=True)
 def _reset_project_pin():
     """Unpin the process around every test.
 

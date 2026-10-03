@@ -15,5 +15,7 @@ from .feedback import router as feedback_router
 from .project_io import router as project_io_router
 from .releases import router as releases_router
 from .web_search import router as web_search_router
+from .storage import router as storage_router
+from .downloads import router as downloads_router
 
-__all__ = ["auth_router", "chat_router", "documents_router", "projects_router", "assets_router", "mcp_servers_router", "mcp_catalog_router", "models_router", "init_router", "skills_router", "users_router", "feedback_router", "project_io_router", "releases_router", "web_search_router"]
+__all__ = ["auth_router", "chat_router", "documents_router", "projects_router", "assets_router", "mcp_servers_router", "mcp_catalog_router", "models_router", "init_router", "skills_router", "users_router", "feedback_router", "project_io_router", "releases_router", "web_search_router", "storage_router", "downloads_router"]

@@ -138,12 +138,22 @@ def extract_account(payload: Optional[str]) -> Optional[str]:
     return None
 
 
-def probe_account(server: Any, tool_caller: Any = None) -> Optional[str]:
-    """Return the account *server* is linked to, or None.
+def probe_account(
+    server: Any, tool_caller: Any = None,
+) -> Tuple[Optional[str], bool]:
+    """Return ``(account, credentials_changed)`` for *server*.
 
     One read-only call, made through the shared read-only path.  Never
     raises: an unreachable server or a missing identity tool leaves the
     connection unlabelled.
+
+    The second value says the call renewed an expired token, so the caller —
+    which owns the workspace — knows to write it back.  This used to be
+    discarded here, and it is the whole reason a connection could die quietly:
+    the probe runs on every connect and re-index, so against a provider that
+    rotates refresh tokens it redeemed the stored one, received a replacement,
+    and dropped it.  The retired token stayed on disk and the connection could
+    never be renewed again.
     """
     tool_names = [
         (t.get("name") if isinstance(t, dict) else getattr(t, "name", None))
@@ -152,14 +162,14 @@ def probe_account(server: Any, tool_caller: Any = None) -> Optional[str]:
     tool_names = [n for n in tool_names if n]
     tool = resolve_account_tool(tool_names)
     if not tool:
-        return None
+        return None, False
 
-    payload, _changed, error = call_read_only(
+    payload, credentials_changed, error = call_read_only(
         ensure_tool_caller(tool_caller, logger), server, tool, {},
         logger, label="mcp-account",
     )
     if error or not payload:
-        return None
+        return None, credentials_changed
 
     account = extract_account(payload)
     if account:
@@ -167,4 +177,4 @@ def probe_account(server: Any, tool_caller: Any = None) -> Optional[str]:
             "[mcp-account] '%s' is linked as %s (via %s)",
             getattr(server, "name", "?"), account, tool,
         )
-    return account
+    return account, credentials_changed

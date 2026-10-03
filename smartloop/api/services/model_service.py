@@ -41,7 +41,9 @@ from smartloop.feedback_store import FeedbackStore, FeedbackEntry, ConversationT
 from smartloop.model.model_manager import Model
 from smartloop.mcp.definitions import split_command_line
 from smartloop.mcp.local_client import LocalMCPClient
-from smartloop.mcp.client import MCPLaunchError, MCPDiscoveryError
+from smartloop.mcp.client import (
+    MCPAuthExpiredError, MCPLaunchError, MCPDiscoveryError,
+)
 from smartloop.agents.orchestrator import SLPOrchestrator
 from smartloop.agents.orchestration.model_router import ModelRouter
 from smartloop.agents.planner import SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME, FETCH_SERVER_ID
@@ -846,6 +848,26 @@ class ModelService:
             reverse=descending,
         )
 
+    @staticmethod
+    def _lightest_first(candidates: list, ref_caps: set) -> list:
+        """Sort WorkspaceModel candidates smallest-first for a routed step.
+
+        Every candidate already declares the capability, so the smallest one
+        can do the step — and it loads sooner, decodes faster and leaves the
+        most room for whatever runs next.  Size ties go to broader capability
+        coverage, then the newer version: ``_ranked_candidates`` with
+        ``descending=False`` would reverse those tie-breaks too and prefer the
+        narrower, older model.
+        """
+        return sorted(
+            candidates,
+            key=lambda m: (
+                m._rank[0],
+                -len(ref_caps & set(m.effective_capabilities)),
+                -m._rank[1],
+            ),
+        )
+
     def _selected_models(self) -> List:
         """The models the user has actually chosen — enabled *and* downloaded.
 
@@ -1201,13 +1223,13 @@ class ModelService:
         When the user has selected exactly one model, that model is returned
         for every capability it can serve — see :meth:`_pinned_model`.
 
-        Otherwise walks the capability's models largest-first and returns the
+        Otherwise walks the capability's models smallest-first and returns the
         first that is already resident or fits in memory — evicting prior-step
-        capability models to make room when needed.  When the largest doesn't
-        fit it promotes down to the next-largest same-capability model that
-        does, rather than dropping straight to the tiny default.  Returns
-        ``None`` only when no capable model fits (caller then falls back to the
-        default/large model).
+        capability models to make room when needed.  Every candidate declares
+        the capability, so the lightest one is enough for the step and the
+        fastest to load and run; a larger one is used only when the smaller
+        ones have no GGUF, faulted or don't fit.  Returns ``None`` only when no
+        capable model fits (caller then falls back to the default/large model).
         """
         if not self._model or not self._model.workspace:
             logger.warning(
@@ -1254,9 +1276,8 @@ class ModelService:
             return llm
 
         # Candidate selection is project-scoped (per-project model settings
-        # override the workspace defaults); re-rank so same-size models with
-        # broader capability coverage lead.
-        ranked = self._ranked_candidates(
+        # override the workspace defaults); walked lightest-first.
+        ranked = self._lightest_first(
             workspace.ranked_models_for(capability, workspace.current_project),
             ref_caps={capability},
         )
@@ -1268,8 +1289,8 @@ class ModelService:
             return None
 
         for ws_model in ranked:
-            # Walk down to the next-smaller capable model when this one has no
-            # GGUF, faulted, or doesn't fit — rather than the tiny default.
+            # Move up to the next capable model when this one has no GGUF,
+            # faulted, or doesn't fit — rather than the tiny default.
             llm = self._load_workspace_llm(
                 ws_model, f"capability '{self._cap_name(capability)}'",
                 reserve_gb=reserve_gb,
@@ -4021,34 +4042,44 @@ class ModelService:
         Idempotent; returns True if anything was actually unloaded.
         """
         with self._inference_slot():
-            unloaded = False
+            return self._unload_model_by_name_unlocked(model_name)
 
-            if self._large_llm is not None and self._large_model_name == model_name:
-                logger.info("[unload] Releasing deselected large model %s", model_name)
-                self._free_llm(self._large_llm)
-                self._large_llm = None
-                self._large_model_name = None
-                self._large_model_attempted = False
-                unloaded = True
+    def _unload_model_by_name_unlocked(self, model_name: str) -> bool:
+        """``unload_model_by_name`` without taking an inference slot.
 
-            if self._vision_llm is not None and self._vision_model_name == model_name:
-                logger.info("[unload] Releasing deselected vision model %s", model_name)
-                self._free_llm(self._vision_llm)
-                self._vision_llm = None
-                self._vision_model_name = None
-                self._vision_unavailable = False
-                unloaded = True
+        For callers that already hold every permit — storage cleanup drains
+        them all before deleting weights, and ``_inference_lock`` is a plain
+        semaphore, so re-acquiring here would deadlock against the caller.
+        Anyone not already holding the lock must use the public method.
+        """
+        unloaded = False
 
-            cache_key = f"_cap_llm_{model_name}"
-            cached = getattr(self, cache_key, None)
-            if cached is not None and cached is not _GPU_FAULTED:
-                logger.info("[unload] Releasing deselected capability model %s", model_name)
-                self._free_llm(cached)
-                setattr(self, cache_key, None)
-                unloaded = True
+        if self._large_llm is not None and self._large_model_name == model_name:
+            logger.info("[unload] Releasing deselected large model %s", model_name)
+            self._free_llm(self._large_llm)
+            self._large_llm = None
+            self._large_model_name = None
+            self._large_model_attempted = False
+            unloaded = True
 
-            if unloaded:
-                self._cleanup_gpu_cache()
+        if self._vision_llm is not None and self._vision_model_name == model_name:
+            logger.info("[unload] Releasing deselected vision model %s", model_name)
+            self._free_llm(self._vision_llm)
+            self._vision_llm = None
+            self._vision_model_name = None
+            self._vision_unavailable = False
+            unloaded = True
+
+        cache_key = f"_cap_llm_{model_name}"
+        cached = getattr(self, cache_key, None)
+        if cached is not None and cached is not _GPU_FAULTED:
+            logger.info("[unload] Releasing deselected capability model %s", model_name)
+            self._free_llm(cached)
+            setattr(self, cache_key, None)
+            unloaded = True
+
+        if unloaded:
+            self._cleanup_gpu_cache()
 
         return unloaded
 
@@ -4070,6 +4101,7 @@ class ModelService:
         refresh_token: str | None = None,
         expires_at: float | None = None,
         token_type: str = "Bearer",
+        scope: str | None = None,
         project_id: str | None = None,
         server_info: dict | None = None,
         description: str | None = None,
@@ -4100,6 +4132,7 @@ class ModelService:
                 refresh_token=refresh_token,
                 expires_at=expires_at,
                 token_type=token_type,
+                scope=scope,
             )
 
         server = MCPServer(
@@ -4510,6 +4543,14 @@ class ModelService:
         try:
             if not server.tools:
                 self._discover_mcp_tools(server)
+        except MCPAuthExpiredError:
+            # Already marked and explained by the refresh attempt, and the
+            # message names what the user has to do.  Saving is still ours.
+            self._model.save()
+            logger.warning(
+                "[mcp-provision] '%s' can no longer authenticate", server.name,
+            )
+            return {"status": "failed", "error": server.last_error}
         except MCPDiscoveryError as exc:
             server.status = MCPServerStatus.FAILED
             server.last_error = str(exc)
@@ -4549,16 +4590,70 @@ class ModelService:
         One read-only call on the provisioning pass — so it costs a request per
         connect or re-index, never per page load.  Best-effort: a server with no
         identity tool leaves the field alone.
+
+        It is also the call most likely to renew an expired token, because it is
+        the one that runs on every connect and re-index.  It gets a caller with
+        the persistence hook, and the rotation it reports is saved here as well:
+        the probe runs *after* the ``READY`` save and the next chat request opens
+        with ``workspace.reload()``, so a rotation nothing writes is not merely
+        unsaved — it is discarded, leaving on disk a refresh token the provider
+        has already retired and a connection that can never be renewed.
         """
         try:
+            from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
             from smartloop.mcp.account import probe_account
-            account = probe_account(server)
+
+            account, credentials_changed = probe_account(
+                server,
+                tool_caller=MCPToolCaller(
+                    None, None, persist=lambda: self._persist_mcp_server(server),
+                ),
+            )
         except Exception as e:
             logger.debug("[mcp-account] probe failed for '%s': %s", server.name, e)
             return
+
+        changed = credentials_changed
         if account and account != server.account:
             server.account = account
-            self._model.save()
+            changed = True
+        if changed:
+            # The hook above has already written a rotation; this covers a
+            # caller built without one, which is how the flag came to be
+            # ignored in the first place.
+            self._persist_mcp_server(server)
+
+    def _persist_mcp_server(self, server: "MCPServer") -> None:
+        """Save *server*'s state onto the workspace this service holds now.
+
+        ``Workspace.reload()`` keeps references valid now, so in the ordinary
+        case the lookup below finds the very object this pass is holding and
+        the carry-over is a no-op.  It stays because a reload is not the only
+        way the two come apart: ``_ensure_workspace`` hands out a fresh
+        ``Workspace`` per call on a cold process, so a pass can outlive the
+        workspace instance it read its server from, and re-finding by id before
+        saving is what makes the write land on the one that will be
+        serialized.  A server that is simply gone — deleted while the pass
+        ran — is left gone rather than resurrected.
+
+        It does *not* rescue a rotation from a reload that lands between the
+        mutation and this call: those fields are re-read from disk, and by then
+        the object holds what the provider has already retired.  Mutating and
+        saving is still two steps, and that window is still open.
+        """
+        live = next(
+            (s
+             for p in (self._model.workspace.projects or [])
+             for s in (p.mcp_servers or [])
+             if s.id == server.id),
+            None,
+        )
+        if live is not None and live is not server:
+            live.oauth_credentials = server.oauth_credentials
+            live.account = server.account
+            live.status = server.status
+            live.last_error = server.last_error
+        self._model.save()
 
     def _discover_mcp_tools(self, server: "MCPServer") -> None:
         """Fill in a server's tools, launching or connecting as needed."""
@@ -4571,14 +4666,34 @@ class ModelService:
             raise MCPDiscoveryError("This connection has no server URL.")
 
         from smartloop.mcp import MCPClient
-        token = None
-        if server.oauth_credentials and server.oauth_credentials.access_token:
-            token = server.oauth_credentials.access_token
-        elif server.remote_config and server.remote_config.token:
-            token = server.remote_config.token
+        from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 
-        with MCPClient() as client:
-            result = client.connect_and_discover_tools(server_url, access_token=token)
+        # Discovery runs on the stored credentials, so it ages out exactly as a
+        # tool call does — and used to report an expired token as a transport
+        # failure, which is how re-checking a renewable connection could mark it
+        # broken.  The caller owns reading the token, renewing it and writing
+        # the rotation back; it is the same machinery the call paths use.
+        caller = MCPToolCaller(
+            None, None, persist=lambda: self._persist_mcp_server(server),
+        )
+        token = caller.get_access_token(server)
+
+        def _connect(access_token):
+            with MCPClient() as client:
+                return client.connect_and_discover_tools(
+                    server_url, access_token=access_token,
+                )
+
+        result = _connect(token)
+        if result is not None and not result.success and result.auth_expired:
+            new_token = caller.refresh_access_token(server, stale_token=token)
+            if new_token:
+                result = _connect(new_token)
+            elif server.status == MCPServerStatus.FAILED:
+                # refresh_access_token diagnosed a retired grant and has already
+                # said so on the record; don't bury that under a wire message.
+                raise MCPAuthExpiredError(server.last_error or "")
+
         if not result or not result.success:
             raise MCPDiscoveryError(
                 self._friendly_discovery_error(
@@ -4655,6 +4770,15 @@ class ModelService:
 
         server.status = MCPServerStatus.PENDING
         server.last_error = None
+        # Drop the cached catalog, because that cache is what made a retry a
+        # no-op: the provisioning pass only discovers when a server has no
+        # tools, and a connection whose authorization died keeps every tool
+        # discovery ever found.  So "refresh" cleared the failure, skipped
+        # discovery, and set the connection READY again without a single
+        # network call — the user pressed the one button offered and was told
+        # the problem was solved.  Re-discovering is also what picks up tools
+        # the server has gained or lost since.
+        server.tools = []
         self._model.save()
         self._queue_mcp_provisioning(project, server)
         return self._mcp_server_to_dict(server)
@@ -5291,6 +5415,12 @@ class ModelService:
                 executor=self._get_llm_executor(),
             )
             workspace = self._model.workspace
+
+            # A tool call that renews an expired OAuth token mutates the server
+            # in memory; this is what writes it back.  Set here because the
+            # orchestrator has no workspace of its own — the service owns it.
+            orchestrator.tool_caller.set_persist(workspace.save)
+
             project = workspace.current_project
             caps: list[str] = []
             for m in workspace.models:

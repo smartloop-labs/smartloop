@@ -104,20 +104,9 @@ def call_read_only(
     if caller is None:
         return ToolCallResult(None, False, "no MCP tool caller available")
     try:
-        access_token = caller.get_access_token(server)
-        result = caller.call_tool(
-            server=server, tool_name=tool_name,
-            arguments=arguments, access_token=access_token,
+        result, credentials_changed = caller.call_with_refresh(
+            server=server, tool_name=tool_name, arguments=arguments,
         )
-        credentials_changed = False
-        if not result.success and result.error and "401" in str(result.error):
-            new_token = caller.refresh_access_token(server)
-            if new_token:
-                credentials_changed = True
-                result = caller.call_tool(
-                    server=server, tool_name=tool_name,
-                    arguments=arguments, access_token=new_token,
-                )
         if not result.success or result.is_error or not result.content:
             reason = failure_reason(result)
             logger.info(

@@ -45,7 +45,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.utils.json import parse_json_markdown
 
-from smartloop.agents.planner import FETCH_SERVER_ID, SYSTEM_TOOLS_SERVER_ID
+from smartloop.agents.planner import (
+    FETCH_SERVER_ID, SYSTEM_TOOLS_SERVER_ID, mcp_connection_is_usable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -366,7 +368,7 @@ class MCPAgent:
                 continue
             if getattr(server, "system", False):
                 continue
-            if not getattr(server, "enabled", True):
+            if not mcp_connection_is_usable(server):
                 continue
             server_name = getattr(server, "name", None) or server_id
             for tool in getattr(server, "tools", None) or []:

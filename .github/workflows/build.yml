@@ -22,7 +22,18 @@ env:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          # LunarG ships no arm64 apt packages, so arm64 builds on 24.04 where
+          # the distro's own Vulkan headers/glslc are new enough for ggml.
+          # DGX Spark (DGX OS 7) is 24.04-based, so glibc 2.39 is fine there.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Free disk space
         run: |
@@ -49,11 +60,18 @@ jobs:
       # The Vulkan SDK provides the headers, loader, and glslc that the
       # GGML_VULKAN=ON source build of llama-cpp-python needs.
       - name: Install Vulkan SDK
+        if: matrix.arch == 'amd64'
         run: |
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
           sudo apt-get install -y vulkan-sdk
+
+      - name: Install Vulkan headers, loader and glslc (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev glslc spirv-headers spirv-tools
 
       - name: Install dependencies
         run: make build
@@ -84,15 +102,15 @@ jobs:
         run: make archive
 
       - name: Compute SHA256
-        run: sha256sum *-slp.tar.gz | tee linux-amd64-sha256.txt
+        run: sha256sum *-slp.tar.gz | tee linux-${{ matrix.arch }}-sha256.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-amd64-slp
+          name: linux-${{ matrix.arch }}-slp
           path: |
             *-slp.tar.gz
-            linux-amd64-sha256.txt
+            linux-${{ matrix.arch }}-sha256.txt
 
   build-macos:
     runs-on: macos-14
@@ -356,6 +374,12 @@ jobs:
           name: linux-amd64-slp
           path: artifacts/linux-amd64
 
+      - name: Download Linux arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64-slp
+          path: artifacts/linux-arm64
+
       - name: Download macOS artifact
         uses: actions/download-artifact@v4
         with:
@@ -371,6 +395,7 @@ jobs:
       - name: Prepare release assets
         run: |
           mv artifacts/linux-amd64/*-slp.tar.gz linux-amd64-slp.tar.gz
+          mv artifacts/linux-arm64/*-slp.tar.gz linux-arm64-slp.tar.gz
           mv artifacts/darwin-arm64/*-slp.tar.gz darwin-arm64-slp.tar.gz
           mv artifacts/windows-amd64/windows-amd64-slp.zip .
           ls -lh *-slp.*
@@ -398,7 +423,7 @@ jobs:
           VERSION="${TAG#v}"
           DEST="s3://$R2_BUCKET/slp/${VERSION}"
           aws configure set default.s3.multipart_threshold 5GB
-          for f in linux-amd64-slp.tar.gz darwin-arm64-slp.tar.gz windows-amd64-slp.zip checksums-sha256.txt; do
+          for f in linux-amd64-slp.tar.gz linux-arm64-slp.tar.gz darwin-arm64-slp.tar.gz windows-amd64-slp.zip checksums-sha256.txt; do
             aws s3 cp "$f" "$DEST/$f" --cache-control "public, max-age=3600" --no-progress
           done
           echo "Uploaded to $DEST"

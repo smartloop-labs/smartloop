@@ -39,6 +39,9 @@ class _RecordingClient:
         self.posts.append((url, data))
         return _FakeResponse(self._json)
 
+    def close(self):
+        pass
+
 
 class TestCanonicalResource:
     def test_path_is_significant(self):
@@ -166,12 +169,12 @@ class TestStoredServerRefresh:
     def _refresh(self, server):
         from smartloop.agents.mcp.mcp_tool_caller import MCPToolCaller
 
+        # The stored-config refresh runs through MCPOAuthService, which holds
+        # the client rather than entering it as a context manager.
         client = _RecordingClient()
-        ctx = MagicMock()
-        ctx.__enter__ = MagicMock(return_value=client)
-        ctx.__exit__ = MagicMock(return_value=False)
-        with patch("httpx.Client", return_value=ctx):
-            token = MCPToolCaller.refresh_access_token(server)
+        with patch("httpx.Client", return_value=client):
+            caller = MCPToolCaller(arg_extractor=None, result_mapper=None)
+            token = caller.refresh_access_token(server)
         return token, client.posts
 
     def test_persisted_resource_is_replayed(self):
@@ -241,7 +244,6 @@ class TestRegisterFlowPlumbing:
                 router_mod._register_remote_mcp_server(
                     request=MCPRegisterRequest(server_url=server_url, server_type="remote"),
                     model_service=MagicMock(),
-                    http_request=None,
                     project_id="p1",
                 )
             )
@@ -281,7 +283,7 @@ class TestPostAuthDiscoveryDiagnostics:
             def exchange_code_for_tokens(self, **kwargs):
                 return MagicMock(
                     access_token="at", token_type="Bearer",
-                    refresh_token=None, expires_in=None,
+                    refresh_token=None, expires_in=None, scope=None,
                 )
 
         client = MagicMock()

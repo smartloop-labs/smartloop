@@ -33,6 +33,7 @@ from smartloop.utils.logging_setup import (
     setup_root_logging,
     shutdown_logging,
     start_listener,
+    truncate_log_file,
 )
 
 
@@ -280,3 +281,136 @@ def test_server_logging_setup_leaks_no_semaphores(tmp_path):
         time.sleep(0.1)
 
     assert "leaked semaphore" not in stderr, stderr
+
+
+# --------------------------------------------------------------------------
+# truncate_log_file against a running listener
+# --------------------------------------------------------------------------
+
+def _listener_on(tmp_path):
+    """A started listener writing to ``<tmp_path>/server.log``."""
+    queue = _queue.Queue(-1)
+    setup_root_logging(queue, level="DEBUG")
+    return start_listener(
+        queue, home_dir=str(tmp_path), file_level="DEBUG", force_console=False,
+    )
+
+
+def _flush(listener):
+    time.sleep(0.2)
+    for h in listener.handlers:
+        h.flush()
+
+
+def test_truncate_reclaims_the_file_while_the_listener_is_up(tmp_path):
+    listener = _listener_on(tmp_path)
+    log_path = Path(tmp_path) / "server.log"
+    try:
+        for i in range(200):
+            logging.getLogger("truncate.test").info("filler line %d", i)
+        _flush(listener)
+        before = log_path.stat().st_size
+        assert before > 0
+
+        freed = truncate_log_file(str(tmp_path))
+
+        assert freed == before
+        assert log_path.stat().st_size == 0
+    finally:
+        _drain_listener(listener)
+
+
+def test_logging_resumes_at_zero_after_a_truncate(tmp_path):
+    """The contract the sweep depends on: the space actually comes back.
+
+    This pins the observable outcome, not the mechanism.  On POSIX it holds
+    even without the close/reopen — the handler opens in append mode, so
+    ``O_APPEND`` puts the next write at EOF — which is why
+    ``test_truncate_reopens_the_handler_stream`` exists alongside it.
+    """
+    listener = _listener_on(tmp_path)
+    log_path = Path(tmp_path) / "server.log"
+    try:
+        for i in range(500):
+            logging.getLogger("truncate.test").info("filler line %d", i)
+        _flush(listener)
+        before = log_path.stat().st_size
+
+        truncate_log_file(str(tmp_path))
+        logging.getLogger("truncate.test").info("after the sweep")
+        _flush(listener)
+
+        after = log_path.stat().st_size
+        assert after < 1024, (
+            f"log went back to {after} bytes (was {before}) — the handler "
+            "resumed writing past a hole instead of at zero"
+        )
+        assert "after the sweep" in log_path.read_text(encoding="utf-8")
+    finally:
+        _drain_listener(listener)
+
+
+def test_truncate_reopens_the_handler_stream(tmp_path):
+    """The mechanism itself, which no POSIX size assertion can catch.
+
+    Windows refuses to truncate a file another handle holds open, so the
+    stream must be closed before ``open(..., "r+")`` and reopened after.  A
+    macOS run would happily pass every byte-count assertion with the dance
+    removed, so pin the swap directly: same handler, a new stream object.
+    """
+    listener = _listener_on(tmp_path)
+    try:
+        logging.getLogger("truncate.test").info("a line")
+        _flush(listener)
+        handler = next(
+            h for h in listener.handlers
+            if isinstance(h, logging.handlers.RotatingFileHandler)
+        )
+        before = handler.stream
+
+        truncate_log_file(str(tmp_path))
+
+        assert handler.stream is not before, "the stream was never reopened"
+        assert before.closed, "the old stream was left open"
+        assert not handler.stream.closed
+    finally:
+        _drain_listener(listener)
+
+
+def test_truncate_leaves_a_handler_on_another_file_alone(tmp_path):
+    """Handlers are matched by realpath, so an unrelated rotating handler on
+    the same listener keeps its stream and its bytes."""
+    listener = _listener_on(tmp_path)
+    other_path = Path(tmp_path) / "other.log"
+    other = logging.handlers.RotatingFileHandler(str(other_path), encoding="utf-8")
+    other.setFormatter(logging.Formatter(DEFAULT_FORMAT))
+    listener.handlers = tuple(listener.handlers) + (other,)
+    try:
+        for i in range(100):
+            logging.getLogger("truncate.test").info("filler line %d", i)
+        _flush(listener)
+        other_before = other_path.stat().st_size
+        assert other_before > 0
+
+        truncate_log_file(str(tmp_path))
+
+        assert other_path.stat().st_size == other_before
+        assert (Path(tmp_path) / "server.log").stat().st_size == 0
+    finally:
+        _drain_listener(listener)
+        other.close()
+
+
+def test_truncate_on_a_missing_log_reports_nothing_freed(tmp_path):
+    assert truncate_log_file(str(tmp_path)) == 0
+
+
+def test_shutdown_clears_the_listener_reference(tmp_path):
+    """``truncate_log_file`` reads ``_LISTENER``; a stale one would have it
+    closing and reopening handlers belonging to a stopped listener."""
+    listener = _listener_on(tmp_path)
+    assert logging_setup._LISTENER is listener
+
+    shutdown_logging(listener)
+
+    assert logging_setup._LISTENER is None

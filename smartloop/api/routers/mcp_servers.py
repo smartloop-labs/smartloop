@@ -9,8 +9,12 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from html import escape
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+from smartloop.config import AppSettings
 
 from smartloop.api.model import (
     MCPDefinitionRequest,
@@ -137,6 +141,149 @@ def _build_server_response(result: dict) -> MCPServerResponse:
         last_error=result.get("last_error"),
         account=result.get("account"),
     )
+
+
+def _authorization_error_detail(
+    error: str,
+    error_description: str | None = None,
+    error_uri: str | None = None,
+) -> str:
+    """Render what the authorization server said it objected to.
+
+    ``error`` alone comes from the fixed RFC 6749 §4.1.2.1 enum and so can only
+    ever name a category.  Which scope, which redirect URI, which client — that
+    lives in ``error_description``, and dropping it is the difference between a
+    page the user can act on and the bare word "invalid_scope".
+
+    ``error_uri`` is attacker-controlled in the sense that matters here: it
+    arrives on a redirect from a server we discovered rather than one we
+    configured, so it is only ever rendered as a link when it is an http(s) URL.
+    Anything else (``javascript:`` above all) is shown as inert text.
+    """
+    detail = f"<p>{escape(error)}</p>"
+    if error_description:
+        detail += f"<p>{escape(error_description)}</p>"
+    if error_uri:
+        if error_uri.lower().startswith(("https://", "http://")):
+            detail += (
+                f'<p><a href="{escape(error_uri, quote=True)}" '
+                'rel="noopener noreferrer">More information</a></p>'
+            )
+        else:
+            detail += f"<p>{escape(error_uri)}</p>"
+    return detail
+
+
+def _reject_unexpected_issuer(state, iss):
+    """Refuse a redirect that did not come from the server we sent the user to.
+
+    RFC 9207.  Without it a client that talks to more than one authorization
+    server can be walked into a mix-up: the attacker starts a flow against a
+    server it controls, returns a code issued there to this callback, and the
+    code is redeemed at the *honest* server's token endpoint — which is the one
+    named in the session.  The ``iss`` parameter is what distinguishes the two,
+    and Clerk already sends it.
+
+    Absence is checked as well as mismatch.  A server that advertises the
+    parameter and then omits it is either not the server it claims to be or has
+    had the parameter stripped in transit; treating a missing value as "nothing
+    to check" would hand the attacker the bypass for free.
+
+    Runs before anything else in the callback, so a response that fails it costs
+    nothing: the authorization code is never presented to the token endpoint and
+    the pending session stays untouched for the real redirect.
+    """
+    if not state:
+        return None
+    session = _pending_oauth_sessions.get(state)
+    if not session:
+        # No session to compare against. The handler below reports that as the
+        # expired-session case it already is.
+        return None
+
+    expected = session.get("issuer")
+    advertised = bool(session.get("issuer_parameter_supported"))
+
+    if not expected:
+        # RFC 8414 makes issuer mandatory, so this is a malformed metadata
+        # document and there is nothing to compare against. Refuse only when the
+        # server also claimed it would identify itself, because then it has
+        # contradicted itself; otherwise this is the pre-RFC-9207 status quo.
+        if not advertised:
+            return None
+        detail = "it advertises the issuer parameter but published no issuer"
+    elif iss:
+        if iss == expected:
+            return None
+        detail = f"expected {expected!r}, got {iss!r}"
+    elif advertised:
+        detail = "it advertises the issuer parameter but the response carried none"
+    else:
+        # Publishes an issuer, does not send the parameter. Common, and not
+        # something the client can hold against it.
+        return None
+    logger.error(
+        "[mcp-oauth] rejecting authorization response for state=%s: %s",
+        state, detail,
+    )
+    return HTMLResponse(
+        "<html><body><h2>Authorization failed</h2>"
+        "<p>This response did not come from the authorization server the "
+        "connection was started with, so it was not used.</p>"
+        f"<p>{escape(detail)}</p>"
+        "<p>You can close this window and try again.</p></body></html>",
+        status_code=400,
+    )
+
+
+def _retry_authorization_without_scope(state, error):
+    """Reissue the authorization once, asking for no scopes at all.
+
+    A server can refuse the very set it published.  The PRM list is what RFC
+    9728 §2 says to ask for, but it describes the resource rather than the
+    client, and a client registered through DCR may be permitted less than the
+    resource advertises.  There is nothing to negotiate against — the error
+    names at most one offending scope, and dropping that one is a guess — so
+    the one useful retry is to name none and let the server apply the default
+    for the client it registered.
+
+    Exactly once.  ``scope_retry`` is what stops a server that refuses the empty
+    request too from bouncing the browser between here and the authorize
+    endpoint forever.  The session survives because this runs before the pop,
+    and the state is safe to reuse because a refused authorization issued no
+    code.
+    """
+    if error != "invalid_scope" or not state:
+        return None
+    session = _pending_oauth_sessions.get(state)
+    if not session or session.get("scope_retry"):
+        return None
+    # Nothing to drop, or no challenge to rebuild the request around (a session
+    # from a client driving the flow itself).
+    if not session.get("scope") or not session.get("code_challenge"):
+        return None
+
+    from smartloop.mcp import MCPOAuthService
+
+    logger.info(
+        "[mcp-oauth] %s refused scope %r for state=%s; retrying with none",
+        session.get("server_url"), session["scope"], state,
+    )
+    session["scope_retry"] = True
+    # Record what the second attempt actually asks for, so whatever the grant
+    # comes back with is compared against the right request.
+    session["scope"] = None
+
+    auth_url = MCPOAuthService().build_authorization_url(
+        authorization_endpoint=session["authorization_endpoint"],
+        client_id=session["client_id"],
+        redirect_uri=session["callback_url"],
+        state=state,
+        code_challenge=session["code_challenge"],
+        scope=None,
+        resource=session.get("resource"),
+    )
+    return RedirectResponse(auth_url, status_code=302)
 
 
 def _oauth_success_page(
@@ -290,7 +437,6 @@ async def _try_register_smartloop_mcp_server(
 async def _register_remote_mcp_server(
     request: MCPRegisterRequest,
     model_service: ModelService,
-    http_request: Request | None,
     project_id: str,
     curated=None,
 ) -> MCPRegisterResponse:
@@ -394,8 +540,7 @@ async def _register_remote_mcp_server(
 
     # Fall back to OAuth
     try:
-        base_url = str(http_request.base_url).rstrip("/") if http_request else "http://localhost:38540"
-        callback_url = request.callback_url or f"{base_url}/v1/mcp/oauth/callback"
+        callback_url = request.callback_url or _default_callback_url(project_id)
 
         def _oauth_discover():
             """Blocking OAuth discovery + dynamic client registration.
@@ -435,10 +580,26 @@ async def _register_remote_mcp_server(
                 code_verifier, code_challenge = MCPOAuthService.generate_pkce()
                 state = MCPOAuthService.generate_state()
 
-                scopes = oauth_metadata.scopes_supported or (
-                    prm.scopes_supported if prm else None
+                # RFC 9728 §2 defines the PRM list as the scope values "used in
+                # authorization requests to request access to this protected
+                # resource" — the one list that describes *this* server. An
+                # authorization server's RFC 8414 scopes_supported is a catalog of
+                # everything it knows across every resource it fronts, so asking for
+                # all of it both overreaches (§7.2: "as limited a scope as possible")
+                # and gets refused, since a client registered through DCR is rarely
+                # permitted the whole catalog. Clerk publishes openid there and
+                # forbids it to DCR clients, which is how asking for everything
+                # turned into invalid_scope on a server that wanted three scopes.
+                #
+                # A resource that declares nothing gets no scope parameter at all,
+                # which leaves the authorization server to apply its own default for
+                # the registered client. That is the least-privilege answer; guessing
+                # a set on its behalf is what this replaced.
+                scope = (
+                    " ".join(prm.scopes_supported)
+                    if prm and prm.scopes_supported
+                    else None
                 )
-                scope = " ".join(scopes) if scopes else None
 
                 # RFC 8707 resource indicator, required by MCP auth (rev 2025-06-18).
                 # Prefer the identifier the resource server publishes for itself; fall
@@ -459,11 +620,11 @@ async def _register_remote_mcp_server(
                     resource=resource,
                 )
 
-            return (oauth_metadata, registration, code_verifier,
-                    state, resource, auth_url)
+            return (oauth_metadata, registration, code_verifier, code_challenge,
+                    state, scope, resource, auth_url)
 
-        (oauth_metadata, registration, code_verifier,
-         state, resource, auth_url) = await _offload(_oauth_discover)
+        (oauth_metadata, registration, code_verifier, code_challenge,
+         state, scope, resource, auth_url) = await _offload(_oauth_discover)
 
         # Store session for the GET callback to use
         _purge_oauth_state()
@@ -473,10 +634,21 @@ async def _register_remote_mcp_server(
             "server_url": clean_url,
             "state": state,
             "code_verifier": code_verifier,
+            # The challenge is kept beside the verifier so an authorization that
+            # has to be reissued — see the invalid_scope retry in the callback —
+            # can be rebuilt without re-deriving it.
+            "code_challenge": code_challenge,
+            "scope": scope,
             "client_id": registration.client_id,
             "client_secret": registration.client_secret,
             "token_endpoint": oauth_metadata.token_endpoint,
             "authorization_endpoint": oauth_metadata.authorization_endpoint,
+            # RFC 9207: who the redirect is expected to come back from, and
+            # whether that server promised to say so.
+            "issuer": oauth_metadata.issuer,
+            "issuer_parameter_supported": (
+                oauth_metadata.authorization_response_iss_parameter_supported
+            ),
             "resource": resource,
             "callback_url": callback_url,
             "name": (curated.display_name if curated else None) or request.name,
@@ -623,7 +795,6 @@ async def delete_mcp_server_from_project(
 async def register_mcp_server(
     project_id: str,
     request: MCPRegisterRequest,
-    http_request: Request = None,
     model_service: ModelService = Depends(get_model_service),
 ):
     """Unified MCP server registration (project-scoped).
@@ -641,7 +812,7 @@ async def register_mcp_server(
     if server_type == "local":
         return await _register_local_mcp_server(request, model_service, project_id, curated)
     return await _register_remote_mcp_server(
-        request, model_service, http_request, project_id, curated,
+        request, model_service, project_id, curated,
     )
 
 
@@ -649,7 +820,6 @@ async def register_mcp_server(
 async def register_mcp_from_definition(
     project_id: str,
     request: MCPDefinitionRequest,
-    http_request: Request = None,
     model_service: ModelService = Depends(get_model_service),
 ):
     """Install a connection from a dropped-in TOML file.
@@ -723,8 +893,32 @@ async def register_mcp_from_definition(
         return_url="smartloop://mcp-authorization",
     )
     return await register_mcp_server(
-        project_id=project_id, request=register,
-        http_request=http_request, model_service=model_service,
+        project_id=project_id, request=register, model_service=model_service,
+    )
+
+
+@router.get("/projects/{project_id}/mcp/oauth/callback", response_class=HTMLResponse)
+async def mcp_oauth_callback_for_project(
+    project_id: str,
+    code: str = None,
+    state: str = None,
+    iss: str = None,
+    error: str = None,
+    error_description: str = None,
+    error_uri: str = None,
+    model_service: ModelService = Depends(get_model_service),
+):
+    """Where a provider's redirect lands, scoped to the project it belongs to.
+
+    The project in the path is what gets this request forwarded to the child
+    that owns it, which is both where the pending session was stored and the
+    only process whose ``save()`` writes that project's file.  See
+    :func:`_default_callback_url`.
+    """
+    return await _complete_oauth_redirect(
+        code=code, state=state, iss=iss, error=error,
+        error_description=error_description, error_uri=error_uri,
+        model_service=model_service, routed_project_id=project_id,
     )
 
 
@@ -732,17 +926,62 @@ async def register_mcp_from_definition(
 async def mcp_oauth_callback(
     code: str = None,
     state: str = None,
+    iss: str = None,
     error: str = None,
+    error_description: str = None,
+    error_uri: str = None,
     model_service: ModelService = Depends(get_model_service),
 ):
-    """OAuth callback endpoint. The OAuth provider redirects here with the authorization code.
-    Exchanges the code for tokens, discovers tools, and registers the MCP server.
+    """The unscoped redirect target, kept for a client that asks for it.
+
+    Nothing generates this URL any more — :func:`_default_callback_url` scopes
+    it to the project — but a caller may still pass it as ``callback_url``, and
+    an unsupervised server can serve it correctly because it owns every
+    project.  Under supervision it cannot, and says so rather than reporting
+    success for a connection it dropped.
     """
+    return await _complete_oauth_redirect(
+        code=code, state=state, iss=iss, error=error,
+        error_description=error_description, error_uri=error_uri,
+        model_service=model_service, routed_project_id=None,
+    )
+
+
+async def _complete_oauth_redirect(
+    code: str = None,
+    state: str = None,
+    iss: str = None,
+    error: str = None,
+    error_description: str = None,
+    error_uri: str = None,
+    model_service: ModelService = Depends(get_model_service),
+    routed_project_id: Optional[str] = None,
+):
+    """Exchange the code for tokens, discover tools, and register the server."""
     from smartloop.mcp.oauth import MCPOAuthError
 
+    # Before anything reads this response — including the invalid_scope retry,
+    # which would otherwise reissue an authorization on an attacker's say-so.
+    wrong_issuer = _reject_unexpected_issuer(state, iss)
+    if wrong_issuer is not None:
+        return wrong_issuer
+
     if error:
+        # RFC 6749 §4.1.2.1 sends three fields and only ``error`` is from a fixed
+        # enum.  ``error_description`` is the sentence that says *which* scope, or
+        # *which* redirect URI, the server objected to — the difference between a
+        # diagnosable failure and the bare word "invalid_scope".
+        logger.warning(
+            "[mcp-oauth] provider refused authorization for state=%s: "
+            "error=%s description=%s uri=%s",
+            state, error, error_description, error_uri,
+        )
+        retry = _retry_authorization_without_scope(state, error)
+        if retry is not None:
+            return retry
         return HTMLResponse(
-            f"<html><body><h2>Authorization failed</h2><p>{escape(error)}</p>"
+            "<html><body><h2>Authorization failed</h2>"
+            f"{_authorization_error_detail(error, error_description, error_uri)}"
             "<p>You can close this window.</p></body></html>",
             status_code=400,
         )
@@ -772,6 +1011,23 @@ async def mcp_oauth_callback(
             "<p>OAuth session not found. Please try again.</p></body></html>",
             status_code=400,
         )
+
+    project_id = session.get("project_id")
+    if routed_project_id is not None and routed_project_id != project_id:
+        # The redirect was addressed to one project and the session belongs to
+        # another: this is the wrong child, and its workspace has no such
+        # project to save into.
+        logger.error(
+            "[mcp-oauth] callback routed to project %s but state=%s belongs to %s",
+            routed_project_id, state, project_id,
+        )
+        return _wrong_process_page(routed_project_id)
+    if not _can_persist_project(project_id):
+        logger.error(
+            "[mcp-oauth] callback for project %s reached a process that cannot "
+            "write it; refusing before the code is spent", project_id,
+        )
+        return _wrong_process_page(project_id)
 
     try:
         # Exchange code for tokens
@@ -806,10 +1062,21 @@ async def mcp_oauth_callback(
             # refused, or it succeeded and the server offered nothing. Collapsing
             # both into "no tools available" hides the reason (a dead transport,
             # a rejected token, a grant with no product scopes), so name it.
-            reason = connect_result.error or (
-                "The server completed the MCP handshake but exposes no tools. "
-                "This usually means the authorization granted no scopes."
-            )
+            # The grant is right here, so report what it came back with rather
+            # than guessing that scopes were the problem.
+            if connect_result.error:
+                reason = connect_result.error
+            elif token_response.scope:
+                reason = (
+                    "The server completed the MCP handshake but exposes no "
+                    "tools. The authorization granted: "
+                    f"{token_response.scope}."
+                )
+            else:
+                reason = (
+                    "The server completed the MCP handshake but exposes no "
+                    "tools, and the authorization came back naming no scopes."
+                )
             logger.error(
                 "Tool discovery failed after OAuth for %s: %s",
                 session["server_url"],
@@ -848,6 +1115,7 @@ async def mcp_oauth_callback(
             refresh_token=token_response.refresh_token,
             expires_at=expires_at,
             token_type=token_response.token_type,
+            scope=token_response.scope,
             project_id=session["project_id"],
             server_info=server_info_dict,
             # Curated copy stashed at register time wins over whatever the
@@ -888,6 +1156,68 @@ async def mcp_oauth_callback(
 
 
 # ---- OAuth flow endpoints ----
+
+
+def _default_callback_url(project_id: str) -> str:
+    """Where the provider sends the browser back when the client names nowhere.
+
+    Two things matter and both used to be wrong, because this was built from
+    ``request.base_url``.
+
+    It is addressed to the **supervisor's** public port rather than whatever
+    port served the registration.  Under supervision that was the child's
+    ephemeral one, so the redirect URI registered with the provider named a
+    port that disappears when the child is idle-reaped — and the authorization
+    only has to outlive it for the user to come back to a refused connection.
+
+    And it is **scoped to the project**, so the supervisor forwards the
+    redirect to the child that owns it (see
+    :func:`smartloop.supervisor.routing.project_to_proxy`).  The unscoped path
+    is the one route here with no project in it, which left it answered by the
+    supervisor: the pending session was in the child's memory, and a supervisor
+    that has delegated its projects writes no ``project.json`` at all, so the
+    grant it had just completed went nowhere.
+    """
+    return (
+        f"http://localhost:{AppSettings().api_port}"
+        f"/v1/projects/{project_id}/mcp/oauth/callback"
+    )
+
+
+def _can_persist_project(project_id: Optional[str]) -> bool:
+    """Whether a server saved here would reach *project_id*'s own file.
+
+    ``Workspace.save()`` writes a project's file only for the process that owns
+    the project, and says nothing when it declines — so a callback answered in
+    the wrong process returns a success page for a connection that was never
+    written.  Checked before the code is exchanged, because an authorization
+    code is single-use: burning it and then failing to persist leaves the user
+    with no way forward but to start again.
+    """
+    from smartloop.workspace.context import (
+        owned_project_id, pinned_project_id, projects_delegated,
+    )
+    if not project_id:
+        return False
+    pinned = pinned_project_id()
+    if pinned is not None:
+        return pinned == project_id
+    if projects_delegated():
+        return owned_project_id() == project_id
+    # Unpinned and undelegated — the --no-supervised server or the CLI, which
+    # is the only process there is and writes every project's file.
+    return True
+
+
+def _wrong_process_page(project_id: Optional[str]) -> HTMLResponse:
+    return HTMLResponse(
+        "<html><body><h2>Registration failed</h2>"
+        "<p>This authorization was completed by a part of Smartloop that "
+        f"cannot save connections for project {escape(str(project_id))}.</p>"
+        "<p>You can close this window and add the connection again.</p>"
+        "</body></html>",
+        status_code=500,
+    )
 
 
 @router.post("/projects/{project_id}/mcp/oauth/callback", response_model=MCPServerResponse)
@@ -958,6 +1288,7 @@ async def complete_mcp_oauth(
             refresh_token=token_response.refresh_token,
             expires_at=expires_at,
             token_type=token_response.token_type,
+            scope=token_response.scope,
             project_id=project_id,
             server_info=server_info_dict,
             description=session.get("description") or (si.description if si else None),

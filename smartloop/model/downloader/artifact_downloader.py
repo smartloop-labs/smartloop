@@ -1,9 +1,9 @@
+import errno
 import hashlib
-import os
 import logging
+import os
 import random
 import threading
-import time
 
 import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +14,8 @@ from smartloop.platform import SLPPlatformClient
 from smartloop.config import AppSettings
 from smartloop.constants import canonical_model_name, display_model_name, platform_model_name
 from smartloop.model.downloader.artifact_source import SLPModelSource, SLPBootstrapSource
+from smartloop.model.downloader.cancellation import CancelToken, DownloadCancelled
+from smartloop.model.downloader.inflight import downloading
 from smartloop.model.downloader.slp_downloader import SLPDownloader, DownloadProgress, ProgressCallback, AggregateProgress
 from smartloop.workspace import Workspace
 
@@ -98,6 +100,21 @@ class StaleDownloadURLError(ConnectionError):
     """
 
 
+def _is_disk_full(exc: Exception) -> bool:
+    """True when *exc* — or the failure it wraps — is an out-of-space OSError.
+
+    The chunked path wraps the transfer's ``OSError`` in a classified
+    ``ConnectionError`` before it reaches ``_aggregate_error`` (see
+    ``_classified``), so the errno may live on ``__cause__`` rather than on the
+    exception itself — follow the chain instead of reading one frame.
+    """
+    while exc is not None:
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            return True
+        exc = exc.__cause__
+    return False
+
+
 def _is_retryable_error(exc: Exception) -> bool:
     """True for transient failures worth retrying (network blips, 5xx, 429)."""
     if isinstance(exc, httpx.HTTPStatusError):
@@ -114,7 +131,22 @@ def _is_transient_error(exc: Exception) -> bool:
     retries immediately. This decides how the failure is described to whoever
     asked for the download, and a stale signed URL belongs here even though
     retrying the same URL is pointless: re-requesting the download works.
+
+    A full disk is the point of :func:`_is_transient_error`: retrying the same
+    URL *is* pointless, nobody can run out of space forever, and some space
+    just got freed.  Classification lives on this side, not
+    :func:`_is_retryable_error`, so the transfer itself still fails fast — a
+    disk that cannot accept bytes must not grind through
+    ``MAX_DOWNLOAD_ATTEMPTS`` with backoff.
     """
+    if isinstance(exc, DownloadCancelled):
+        # Asked for, so nothing about it is worth retrying or describing as a
+        # blip.  Stated here as well as at every raise site because this is the
+        # function that decides what the client is told, and "transient" would
+        # have the router answer 502 for a button the user just pressed.
+        return False
+    if _is_disk_full(exc):
+        return True
     if _is_retryable_error(exc):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
@@ -140,10 +172,34 @@ def _aggregate_error(failed: "list[tuple[str, Exception]]") -> Exception:
 
     Transient only when *every* file failed transiently: one unfixable file
     means the download stays broken, so promising a retry would be a lie.
+
+    Names a disk-full when that is what happened.  The previous message listed
+    nothing but filenames, so an out-of-disk failure read exactly like a
+    dropped socket, and the one piece of information that has an action — "no
+    space left on device" — never reached the client.
     """
+    for _, exc in failed:
+        if isinstance(exc, DownloadCancelled):
+            # ``as_completed`` hands failures back in whatever order they land,
+            # so a cancel and a sibling's dropped socket in the same instant
+            # could otherwise be reported either way round.  The cancel is the
+            # true account of why the batch stopped, and it is the one the
+            # stream has to see to answer ``cancelled`` instead of ``error``.
+            return exc
+
     message = (f"Failed to download {len(failed)} file(s): "
                f"{', '.join(name for name, _ in failed)}")
-    return _classified(message, all(_is_transient_error(exc) for _, exc in failed))
+    if any(_is_disk_full(exc) for _, exc in failed):
+        message += " — no space left on device"
+    result = _classified(message, all(_is_transient_error(exc) for _, exc in failed))
+    for _, exc in failed:
+        if _is_disk_full(exc):
+            # Keep the errno reachable: ``status_for`` walks ``__cause__`` to
+            # answer 507 rather than 502, and the classified remap above would
+            # otherwise discard the only frame that still has it.
+            result.__cause__ = exc
+            break
+    return result
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -158,19 +214,38 @@ class SLPArtifactDownloader(SLPDownloader):
     files in parallel with MD5 verification and progress reporting.
     """
 
-    def __init__(self, workspace: Workspace, logger: logging.Logger):
+    def __init__(self, workspace: Workspace, logger: logging.Logger,
+                 cancel: CancelToken | None = None):
+        """*cancel* is the token a stop request will raise.
+
+        On the instance rather than threaded through eight signatures: every
+        call site builds its own downloader (``/v1/init``, ``/v1/bootstrap``,
+        ``_bootstrap_orchestrator_model``, ``GenericModel.init``), so there is
+        no sharing hazard, and ``_run_with_retries``'s ``attempt_fn`` closures
+        need no new parameter.  Defaulting to a fresh token rather than to
+        ``None`` means every check point is unconditional — a downloader nobody
+        can cancel simply holds a flag nobody sets.
+        """
         super().__init__(workspace, logger)
+        self.cancel_token = cancel or CancelToken()
         self.settings = AppSettings()
         platform_client = SLPPlatformClient(self.settings.slp_api_base)
         self._model_source = SLPModelSource(platform_client)
         self._bootstrap_source = SLPBootstrapSource(platform_client)
 
     @staticmethod
-    def _compute_local_md5(filepath: str) -> str:
-        """Return the hex-encoded MD5 digest of a local file."""
+    def _compute_local_md5(filepath: str, cancel: CancelToken | None = None) -> str:
+        """Return the hex-encoded MD5 digest of a local file.
+
+        Checked per read because this runs on a finished multi-GB file: a 4 GB
+        digest is seconds of work with no network in it, and a cancel arriving
+        during one would otherwise wait it out with nothing to show for it.
+        """
         md5 = hashlib.md5()
         with open(filepath, "rb") as f:
             for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
+                if cancel is not None:
+                    cancel.check("verification")
                 md5.update(chunk)
         return md5.hexdigest()
 
@@ -199,9 +274,10 @@ class SLPArtifactDownloader(SLPDownloader):
         and non-transient errors propagate immediately.
         """
         for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+            self.cancel_token.check(description)
             try:
                 return attempt_fn(attempt)
-            except PermissionError:
+            except (PermissionError, DownloadCancelled):
                 raise
             except Exception as exc:
                 if not _is_retryable_error(exc) or attempt == MAX_DOWNLOAD_ATTEMPTS:
@@ -212,7 +288,13 @@ class SLPArtifactDownloader(SLPDownloader):
                     f"(attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS}): {exc}. "
                     f"Retrying in {delay:.1f}s"
                 )
-                time.sleep(delay)
+                # The one substitution that makes a cancel prompt during an
+                # outage.  Backoff reaches 30s and the window is ~90s in total,
+                # so a plain sleep here is where a stop request would spend
+                # most of its time waiting on a transfer that is not even
+                # transferring.
+                if self.cancel_token.wait(delay):
+                    raise DownloadCancelled(f"{description} cancelled") from exc
         # Unreachable: the loop either returns or raises on the final attempt.
         raise RuntimeError(f"{description} exhausted retries")
 
@@ -232,6 +314,12 @@ class SLPArtifactDownloader(SLPDownloader):
 
         try:
             return self._run_with_retries("HEAD probe", attempt)
+        except DownloadCancelled:
+            # Above the blanket fallback below, which is the whole reason this
+            # clause exists: swallowed here, a cancel would be reported as "no
+            # size, no digest, no Range support" and the file would go on to
+            # download single-stream and unverified.
+            raise
         except Exception:
             return 0, None, False
 
@@ -246,6 +334,7 @@ class SLPArtifactDownloader(SLPDownloader):
         skipped = 0
 
         for filename, url in artifacts.items():
+            self.cancel_token.check()
             flat_name = os.path.basename(filename)
             local_path = os.path.join(local_dir, flat_name)
             size, remote_md5, accept_ranges = self._get_remote_file_info(url)
@@ -305,6 +394,13 @@ class SLPArtifactDownloader(SLPDownloader):
                     # sandbox denial) — nothing about it improves by letting the
                     # other files finish first.
                     raise
+                except DownloadCancelled:
+                    # Beside the refusal above rather than below with the
+                    # failures: collected into ``failed``, a cancel would be
+                    # collapsed by ``_aggregate_error`` into "failed to
+                    # download 2 file(s)" and the stream would answer with an
+                    # error frame for something the user asked for.
+                    raise
                 except Exception as e:
                     self.logger.error(f"[error] {filename}: {e}")
                     failed.append((filename, e))
@@ -312,6 +408,11 @@ class SLPArtifactDownloader(SLPDownloader):
         if failed:
             raise _aggregate_error(failed)
 
+        # Before the terminal 100% event, not after: a cancel that lands while
+        # the last worker is unwinding would otherwise tell the client the
+        # download completed, and the stream would go on to mark the model
+        # downloaded.
+        self.cancel_token.check()
         aggregate.finish()
         self.logger.info(f"[ok] {log_prefix} downloaded to: {log_dir}")
         return Path(local_dir)
@@ -328,11 +429,17 @@ class SLPArtifactDownloader(SLPDownloader):
         scratch up to ``_MAX_VERIFY_ATTEMPTS`` times before giving up.
         """
         flat_name = os.path.basename(filename)
+
+        # On entry, so a worker the pool starts after the flag was raised exits
+        # before opening a socket.
+        self.cancel_token.check(flat_name)
+
         dest = os.path.join(local_dir, flat_name)
         part = dest + ".part"
         size_mb = size / (1024 * 1024)
 
         for verify_attempt in range(1, _MAX_VERIFY_ATTEMPTS + 1):
+            self.cancel_token.check(flat_name)
             # Start each verification attempt from a clean slate so we never
             # resume onto bytes a previous corrupt attempt wrote.
             if os.path.exists(part):
@@ -355,7 +462,7 @@ class SLPArtifactDownloader(SLPDownloader):
             if not remote_md5:
                 break
 
-            local_md5 = self._compute_local_md5(part)
+            local_md5 = self._compute_local_md5(part, self.cancel_token)
             if local_md5 == remote_md5:
                 break
 
@@ -411,6 +518,11 @@ class SLPArtifactDownloader(SLPDownloader):
                 downloaded = resume_from
                 with open(dest, "ab" if resume_from else "wb") as f:
                     for chunk in resp.iter_bytes(chunk_size=CHUNK_SIZE):
+                        # Raising from inside the ``httpx.stream`` block is what
+                        # closes the socket: unwinding runs its ``__exit__``,
+                        # so the connection goes rather than being left to the
+                        # 60s read timeout.
+                        self.cancel_token.check(flat_name)
                         f.write(chunk)
                         downloaded += len(chunk)
                         if progress_callback:
@@ -437,6 +549,11 @@ class SLPArtifactDownloader(SLPDownloader):
         """
         written = 0  # bytes of THIS chunk already flushed to disk
 
+        # On entry, so a range the pool starts after the flag was raised exits
+        # before opening a socket.  Every model worth downloading is over
+        # CHUNKED_THRESHOLD, so this pool is where a cancel usually lands.
+        self.cancel_token.check(flat_name)
+
         def attempt(_attempt_no: int) -> None:
             nonlocal written
             cur_start = start + written
@@ -451,6 +568,7 @@ class SLPArtifactDownloader(SLPDownloader):
                 with open(dest, "r+b") as f:
                     f.seek(cur_start)
                     for chunk in resp.iter_bytes(chunk_size=RANGE_READ_SIZE):
+                        self.cancel_token.check(flat_name)
                         f.write(chunk)
                         written += len(chunk)
                         if progress_callback:
@@ -499,6 +617,11 @@ class SLPArtifactDownloader(SLPDownloader):
                 chunk_range = futures[future]
                 try:
                     future.result()
+                except DownloadCancelled:
+                    # Above the wrapper below, which would turn it into a
+                    # ConnectionError or a RuntimeError and lose the one thing
+                    # the stream needs to know about it.
+                    raise
                 except Exception as e:
                     # Keep the cause's kind: every model worth downloading is
                     # over CHUNKED_THRESHOLD, so this is the path a real dropped
@@ -547,13 +670,18 @@ class SLPArtifactDownloader(SLPDownloader):
             raise ValueError(f"No GGUF artifact found for bootstrap model '{resolved_name}'")
 
         local_dir = os.path.join(self.workspace.models_dir, model_id)
-        os.makedirs(local_dir, exist_ok=True)
 
-        self.logger.info(f"Bootstrap downloading model: {display_model_name(resolved_name)}")
+        # Marked from the makedirs, not from _download_artifacts: the directory
+        # exists — and is ours — before the first byte lands, and a disk sweep
+        # landing in that gap would delete it out from under us.
+        with downloading(local_dir):
+            os.makedirs(local_dir, exist_ok=True)
 
-        return self._download_artifacts(artifacts, local_dir, progress_callback,
-                                        log_prefix="Bootstrap model", log_dir=local_dir,
-                                        label=display_model_name(resolved_name))
+            self.logger.info(f"Bootstrap downloading model: {display_model_name(resolved_name)}")
+
+            return self._download_artifacts(artifacts, local_dir, progress_callback,
+                                            log_prefix="Bootstrap model", log_dir=local_dir,
+                                            label=display_model_name(resolved_name))
 
     @staticmethod
     def _resolve_model_id(model_name: str) -> str:
@@ -636,12 +764,16 @@ class SLPArtifactDownloader(SLPDownloader):
         # After the entitlement call, not before: a refused download should not
         # leave an empty model directory behind for the workspace to trip over.
         local_dir = os.path.join(self.workspace.models_dir, model_id)
-        os.makedirs(local_dir, exist_ok=True)
 
-        if not artifacts:
-            self.logger.info(f"[ok] No GGUF files to download")
-            return Path(local_dir)
+        # See bootstrap_download: the mark has to cover the makedirs, not just
+        # the transfer, or a sweep can delete the directory between the two.
+        with downloading(local_dir):
+            os.makedirs(local_dir, exist_ok=True)
 
-        return self._download_artifacts(artifacts, local_dir, progress_callback,
-                                        log_prefix="Model", log_dir=local_dir,
-                                        label=display_model_name(model_name))
+            if not artifacts:
+                self.logger.info(f"[ok] No GGUF files to download")
+                return Path(local_dir)
+
+            return self._download_artifacts(artifacts, local_dir, progress_callback,
+                                            log_prefix="Model", log_dir=local_dir,
+                                            label=display_model_name(model_name))

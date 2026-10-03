@@ -17,9 +17,11 @@ class MCPClientError(Exception):
 
 
 class MCPConnectionError(MCPClientError):
-    def __init__(self, message: str, www_authenticate: Optional[str] = None):
+    def __init__(self, message: str, www_authenticate: Optional[str] = None,
+                 status_code: Optional[int] = None):
         super().__init__(message)
         self.www_authenticate = www_authenticate
+        self.status_code = status_code
 
 
 class MCPProtocolError(MCPClientError):
@@ -36,6 +38,19 @@ class MCPDiscoveryError(MCPClientError):
 
     Covers launcher-not-found, handshake failures, and ``tools/list`` errors —
     any condition that leaves us unable to enumerate the server's tools.
+    """
+    pass
+
+
+class MCPAuthExpiredError(MCPDiscoveryError):
+    """Discovery failed because the connection can no longer authenticate.
+
+    Separate from its parent because the two want different reporting.  An
+    ordinary discovery failure describes what went wrong on the wire; this one
+    has already been diagnosed — the refresh was attempted and the provider
+    refused the grant — and the connection has been marked with the sentence
+    that tells the user to reconnect it.  Raising the generic error here would
+    have that sentence overwritten by a transport message.
     """
     pass
 
@@ -57,6 +72,11 @@ class MCPConnectResult:
     error: Optional[str] = None
     resource_hint: Optional[str] = None  # resource URI from 401 WWW-Authenticate
     resource_metadata_url: Optional[str] = None  # PRM metadata URL from 401 WWW-Authenticate
+    #: The server rejected the token (HTTP 401), as on a tool call.  Discovery
+    #: runs with the same credentials and ages out the same way, so a caller
+    #: re-checking a connection needs to tell "renew and try again" from "this
+    #: endpoint is dead" — and reported only the latter until this existed.
+    auth_expired: bool = False
 
 
 @dataclass
@@ -65,6 +85,11 @@ class MCPToolCallResult:
     content: Optional[List[dict]] = None
     is_error: bool = False
     error: Optional[str] = None
+    #: The server rejected the token (HTTP 401), so refreshing it may help.
+    #: Callers used to ask ``"401" in result.error`` instead — a substring test
+    #: against a message that embeds the server's own response body, so any tool
+    #: returning a document mentioning 401 spent a refresh token on nothing.
+    auth_expired: bool = False
 
 
 class MCPClient:
@@ -202,17 +227,27 @@ class MCPClient:
                     body = response.text[:500]
                 except Exception:
                     body = ""
+                # Not a prefix of the header: "Bearer " is seven characters,
+                # so thirty of them is twenty-three characters of a live token —
+                # and this string is logged, and becomes ``last_error``, which
+                # ``GET /projects/{id}/mcp`` hands to the UI.  What the reader
+                # needs is whether a credential was sent, not which one.
                 auth_sent = headers.get("Authorization", "")
-                auth_preview = f"{auth_sent[:30]}..." if len(auth_sent) > 30 else auth_sent
+                if auth_sent:
+                    scheme, _, credential = auth_sent.partition(" ")
+                    auth_preview = f"{scheme} ({len(credential)} chars)"
+                else:
+                    auth_preview = "(none)"
                 detail = (
                     f"Authentication failed (401). "
                     f"WWW-Authenticate: {www_auth or '(none)'}. "
                     f"Response: {body or '(empty)'}. "
                     f"Authorization sent: {auth_preview}"
                 )
-                raise MCPConnectionError(detail, www_authenticate=www_auth)
+                raise MCPConnectionError(detail, www_authenticate=www_auth, status_code=401)
             if response.status_code == 403:
-                raise MCPConnectionError("Authorization failed: Insufficient permissions")
+                raise MCPConnectionError(
+                    "Authorization failed: Insufficient permissions", status_code=403)
 
             response.raise_for_status()
 
@@ -341,6 +376,7 @@ class MCPClient:
                 error=str(e),
                 resource_hint=resource_hint,
                 resource_metadata_url=resource_metadata_url,
+                auth_expired=getattr(e, "status_code", None) == 401,
             )
         except MCPProtocolError as e:
             return MCPConnectResult(success=False, error=str(e))
@@ -409,7 +445,10 @@ class MCPClient:
 
         except (MCPConnectionError, MCPProtocolError) as e:
             logger.error("[mcp-remote] Tool call '%s' on %s failed: %s", tool_name, server_url, e)
-            return MCPToolCallResult(success=False, error=str(e))
+            return MCPToolCallResult(
+                success=False, error=str(e),
+                auth_expired=getattr(e, "status_code", None) == 401,
+            )
         except Exception as e:
             logger.error("[mcp-remote] Tool call '%s' on %s unexpected error: %s", tool_name, server_url, e, exc_info=True)
             return MCPToolCallResult(success=False, error=f"Unexpected error: {str(e)}")

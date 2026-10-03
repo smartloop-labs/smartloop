@@ -156,7 +156,6 @@ def _register(catalog_hit=True, slug=SLUG):
                 request=MCPRegisterRequest(
                     server_url=CATALOG_URL, server_type="remote", catalog_slug=slug,
                 ),
-                http_request=None,
                 model_service=MagicMock(),
             )
         )

@@ -10,6 +10,7 @@ Only failures that happen mid-transfer arrive as SSE error frames, tagged with
 the status they would have been.
 """
 
+import errno
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -20,6 +21,7 @@ from smartloop.api.main import app
 from smartloop.api.routers import init as init_router
 from smartloop.api.routers._errors import status_for
 from smartloop.api.services import ModelService, get_model_service
+from smartloop.model.downloader.artifact_downloader import _aggregate_error
 from smartloop.platform import ModelAccessError
 from smartloop.workspace.workspace import Workspace, WorkspaceModel
 
@@ -203,7 +205,9 @@ class TestMidStreamFailureIsClassifiedByWhatFixesIt:
         (ModelAccessError("not on your plan"), 403),
         # An OSError subclass, and emphatically not an entitlement verdict.
         (PermissionError("[Errno 13] Permission denied: '/models'"), 500),
-        (OSError(28, "No space left on device"), 500),
+        # Out of disk: retryable (free a little and try again) but not a network
+        # failure — 507, not 502/500.
+        (OSError(28, "No space left on device"), 507),
         (RuntimeError("model.gguf: MD5 verification failed"), 500),
     ])
     def test_status_reflects_the_remedy(self, exc, expected):
@@ -250,6 +254,32 @@ class TestMidStreamFailureIsClassifiedByWhatFixesIt:
         errors = [f for f in _frames(resp) if f.get("status") == "error"]
         assert errors, f"no error frame in stream: {resp.text!r}"
         assert errors[0]["code"] == 500
+
+    def test_disk_full_reaches_the_client_as_507(
+        self, client, model_service, monkeypatch
+    ):
+        # The exact shape a real transfer produces: _aggregate_error wraps the
+        # chunked path's ENOSPC, keeps it transient, and names the disk.  The
+        # client must see 507 (free some space and retry) and a message about
+        # the disk — not a bare filename list that could be a dropped socket.
+        _stub_downloader(monkeypatch)
+
+        async def boom(*args, **kwargs):
+            raise _aggregate_error([
+                ("weights.gguf", OSError(errno.ENOSPC, "No space left on device")),
+            ])
+            yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(init_router, "_download_and_stream", boom)
+
+        resp = client.post("/v1/init", json={"model_name": PAID_MODEL})
+
+        assert resp.status_code == 200
+        errors = [f for f in _frames(resp) if f.get("status") == "error"]
+        assert errors, f"no error frame in stream: {resp.text!r}"
+        assert errors[0]["code"] == 507
+        assert "no space left on device" in errors[0]["message"]
+        assert "weights.gguf" in errors[0]["message"]
 
 
 class TestInitOnAFreshProcess:

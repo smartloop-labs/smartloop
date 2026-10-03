@@ -16,7 +16,10 @@ from pydantic import BaseModel, Field
 
 from smartloop.llms import BaseLLM
 
-from smartloop.agents.planner import PlanStep, StepType, MCPToolContext, SYSTEM_TOOLS_SERVER_ID
+from smartloop.agents.planner import (
+    PlanStep, StepType, MCPToolContext, SYSTEM_TOOLS_SERVER_ID,
+    mcp_connection_is_usable,
+)
 
 from .server_selector import (
     EXPLORE_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL,
@@ -571,7 +574,7 @@ Does answering the latest message require a new web search?
 
         servers = [
             s for s in mcp_servers
-            if getattr(s, "enabled", True)
+            if mcp_connection_is_usable(s)
             and not getattr(s, "system", False)
             and getattr(s, "id", None) != SYSTEM_TOOLS_SERVER_ID
             and (getattr(s, "tools", None) or [])
@@ -724,9 +727,8 @@ Does answering the latest message require a new web search?
             "[collect] calling %s",
             format_call(getattr(server, "name", ""), tool_name, arguments),
         )
-        result = self.tool_caller.call_tool(
+        result, _refreshed = self.tool_caller.call_with_refresh(
             server=server, tool_name=tool_name, arguments=arguments,
-            access_token=self.tool_caller.get_access_token(server),
         )
         if not result.success or not result.content:
             logger.info(
@@ -778,9 +780,8 @@ Does answering the latest message require a new web search?
                 f"Reading {index} of {len(calls)} from {server_name}: "
                 f"{format_call('', detail_tool, arguments)}",
             )
-            result = self.tool_caller.call_tool(
+            result, _refreshed = self.tool_caller.call_with_refresh(
                 server=server, tool_name=detail_tool, arguments=arguments,
-                access_token=self.tool_caller.get_access_token(server),
             )
             if not result.success or not result.content:
                 continue
@@ -920,8 +921,15 @@ Does answering the latest message require a new web search?
             # content: when that local index matched, the live call was skipped
             # and the answer came from a snapshot. The snapshot is gone, so the
             # source of truth is the server, asked now.
+            #
+            # Not when a skill matched.  A skill is a procedure, and the plan
+            # built from it makes its tool calls as steps with the skill's
+            # instructions in hand.  Asked here, the server gets the whole
+            # request as one search — for a bare ``/job-match`` that was the
+            # skill's name (``searchCleraRoles(query='job-match')``), and with
+            # the body it is a multi-step procedure no single call answers.
             f_mcp = None
-            if mcp_servers:
+            if mcp_servers and not matched_skills:
                 f_mcp = pool.submit(
                     self._run_mcp, query, mcp_servers, project_dir, mcp_llm,
                     progress,

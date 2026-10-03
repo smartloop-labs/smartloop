@@ -37,7 +37,7 @@ async def _install(toml, home, filename="dropped.toml"):
     """Run the endpoint with registration stubbed, returning (result, request)."""
     registered = {}
 
-    async def _fake_register(project_id, request, http_request, model_service):
+    async def _fake_register(project_id, request, model_service):
         registered["request"] = request
         return {"auth_type": "none", "id": "srv1"}
 
@@ -47,7 +47,6 @@ async def _install(toml, home, filename="dropped.toml"):
         result = await register_mcp_from_definition(
             project_id="p1",
             request=MCPDefinitionRequest(toml=toml, filename=filename),
-            http_request=None,
             model_service=MagicMock(),
         )
     return result, registered.get("request")
