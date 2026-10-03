@@ -13,6 +13,8 @@ LLAMA_VERSION := 0.3.34
 
 ifeq ($(RAW_ARCH),x86_64)
     SERVER_ARCH := amd64
+else ifeq ($(RAW_ARCH),aarch64)
+    SERVER_ARCH := arm64
 else
     SERVER_ARCH := $(RAW_ARCH)
 endif
@@ -50,6 +52,15 @@ endif
 # baseline on Linux/Windows so CI-built binaries don't emit AVX-512 and SIGILL
 # on CPUs that lack it (the failure the old prebuilt-wheel pin guarded against).
 GGML_X86_PORTABLE := -DGGML_NATIVE=OFF -DGGML_AVX2=ON
+# Linux arm64 gets the same treatment: armv8.2-a with dotprod + fp16 covers
+# Graviton2+, Ampere Altra, Grace / DGX Spark and the CI's Cobalt runners
+# without emitting SVE/i8mm that older cores lack.
+GGML_ARM_PORTABLE := -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+ifeq ($(RAW_ARCH),aarch64)
+    GGML_CPU_PORTABLE := $(GGML_ARM_PORTABLE)
+else
+    GGML_CPU_PORTABLE := $(GGML_X86_PORTABLE)
+endif
 
 # GPU backends: Metal + Vulkan (via MoltenVK) on macOS, Vulkan elsewhere.
 # Every platform builds llama-cpp-python from source — there are no prebuilt
@@ -57,7 +68,7 @@ GGML_X86_PORTABLE := -DGGML_NATIVE=OFF -DGGML_AVX2=ON
 ifeq ($(PLATFORM),darwin)
     LLAMA_CMAKE_ARGS := -DGGML_METAL=ON -DGGML_VULKAN=ON
 else
-    LLAMA_CMAKE_ARGS := -DGGML_VULKAN=ON $(GGML_X86_PORTABLE)
+    LLAMA_CMAKE_ARGS := -DGGML_VULKAN=ON $(GGML_CPU_PORTABLE)
 endif
 
 # CMAKE_BUILD_PARALLEL_LEVEL parallelises the ninja/make invocation that pip

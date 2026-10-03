@@ -86,7 +86,7 @@ for sp in site.getsitepackages():
 #    rewritten to point at the bundled dylib; hooks/rthook_vulkan_icd.py aims
 #    the loader at it. Metal remains available as the native backend.
 if sys.platform.startswith('linux'):
-    for _d in ['/usr/lib/x86_64-linux-gnu', '/usr/lib64', '/usr/lib']:
+    for _d in ['/usr/lib/x86_64-linux-gnu', '/usr/lib/aarch64-linux-gnu', '/usr/lib64', '/usr/lib']:
         _p = Path(_d) / 'libvulkan.so.1'
         if _p.exists():
             binaries.append((str(_p), 'llama_cpp/lib'))
