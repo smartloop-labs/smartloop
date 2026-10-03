@@ -113,6 +113,10 @@ class ModelEntry(BaseModel):
     # a model whose capabilities lack "thinking" — the picker shows the toggle
     # only when the model can honor it.
     thinking: bool | None = None
+    # Badged in the picker: light enough on this machine to load quickly and
+    # answer fast.  Decided here, where the RAM and each model's size are
+    # known, rather than re-derived by every client — see _mark_recommended.
+    recommended: bool = False
 
     @field_validator("access_level", mode="before")
     @classmethod
@@ -220,7 +224,64 @@ def list_models(
 
     result.sort(key=lambda entry: (entry.access_level == AccessLevel.free, SUPPORTED_MODELS.get(entry.name).param_size_in_b() if SUPPORTED_MODELS.get(entry.name) else 0), reverse=True)
 
+    _mark_recommended(result, _total_ram_gb())
     return result
+
+
+# Memory-pressure buckets, as a share of total RAM.  The picker draws the same
+# Low / Medium / High / Won't fit tags from these numbers.
+_LOW_PRESSURE_PCT = 10
+_FITS_PCT = 80
+
+
+def _total_ram_gb() -> float | None:
+    try:
+        import psutil
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def _footprint_gb(entry: ModelEntry) -> float | None:
+    """Approximate RAM for *entry*: ~1GB per billion parameters (Q4 weights
+    plus context), the same estimate the picker shows."""
+    model_cls = SUPPORTED_MODELS.get(entry.name)
+    size_b = model_cls.param_size_in_b() if model_cls else 0
+    return float(size_b) if size_b and size_b > 0 else None
+
+
+def _mark_recommended(entries: list, total_gb: float | None) -> None:
+    """Set ``recommended`` on the models to badge for this machine.
+
+    Every capable model at Low memory pressure.  Any capable model can do its
+    capability's work, and a light one loads sooner, answers faster and leaves
+    room for the rest — which is how a step is routed, too (the smallest
+    capable model that fits; see ``ModelService._get_llm_for_capability``).
+    With nothing at Low, the lightest model per capability that fits, so a
+    small machine still gets a recommendation.
+    """
+    if not total_gb:
+        return
+    candidates = []
+    for e in entries:
+        gb = _footprint_gb(e)
+        if gb is None or not e.is_accessible or not e.capabilities:
+            continue
+        pct = gb / total_gb * 100
+        if pct < _FITS_PCT:
+            candidates.append((pct, e))
+
+    low = [e for pct, e in candidates if pct <= _LOW_PRESSURE_PCT]
+    if low:
+        for e in low:
+            e.recommended = True
+        return
+
+    covered: set = set()
+    for _, e in sorted(candidates, key=lambda c: (c[0], -len(c[1].capabilities))):
+        if any(cap not in covered for cap in e.capabilities):
+            e.recommended = True
+            covered.update(e.capabilities)
 
 
 class WorkspaceModelEntry(BaseModel):
