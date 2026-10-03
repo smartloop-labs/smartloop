@@ -525,7 +525,27 @@ class _PortCapturingServer(uvicorn.Server):
                 os.makedirs(os.path.dirname(PORT_FILE), exist_ok=True)
                 with open(PORT_FILE, "w") as f:
                     f.write(str(actual_port))
+                _adopt_bound_port(actual_port)
                 break
+
+
+def _adopt_bound_port(port: int) -> None:
+    """Make the port this server bound the one the settings report.
+
+    Started on port 0 the settings still say 0 after the bind, and they are
+    what the MCP OAuth redirect (``_default_callback_url``) and the in-process
+    MCP base URL are built from — so a provider sent the browser back to
+    ``localhost:0``.  The environment is set too: ``AppSettings()`` is re-read
+    from it, and project children inherit it, so they address the redirect to
+    this public port rather than their own ephemeral one.  The supervisor was
+    started during lifespan startup, before the bind, so its record is fixed
+    here as well.
+    """
+    os.environ["SLP_API_PORT"] = str(port)
+    api_settings.api_port = port
+    supervisor = get_supervisor()
+    if supervisor is not None:
+        supervisor.registry.set_supervisor(os.getpid(), port)
 
 
 def _install_centralized_logging() -> None:
