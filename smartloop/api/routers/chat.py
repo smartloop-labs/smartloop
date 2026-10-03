@@ -35,6 +35,7 @@ from smartloop.api.services import ModelService, get_model_service, get_api_clie
 # user's question — reused below to decide a source is about the answer, so
 # the two ends of the citation contract agree on what "related" means.
 from smartloop.api.services.model_service import _MIN_BEST_DISTANCE
+from smartloop.agents.orchestration.skill_processor import SkillProcessor
 from smartloop.constants import (
     OPENING_TOKENS, SYSTEM_PROMPT, display_model_name, resolve_current_date,
 )
@@ -72,7 +73,10 @@ def _resolve_requested_skill(message: str, skills: list) -> tuple:
     slash-command that names one of the project's skills — matched case- and
     separator-insensitively, so ``/fund-info`` hits a ``fund_info`` skill. The
     remainder of the prompt (after the token) becomes the message; when the user
-    typed only the token, a minimal ``Run the '<name>' skill.`` stands in.
+    typed only the token, the skill's own body stands in.  It used to be a
+    one-line ``Run the '<name>' skill.``, but tool arguments are extracted from
+    the message (never the skill body — see ``StepExecutor``), so a bare
+    ``/morning`` handed its tools the skill's *name* as their input.
 
     Returns ``(None, message)`` unchanged when there is no leading slash-command
     or it names no known skill, so an ordinary prompt that merely starts with a
@@ -88,7 +92,10 @@ def _resolve_requested_skill(message: str, skills: list) -> tuple:
     wanted = norm(token)
     for s in skills:
         if norm(getattr(s, "name", "")) == wanted:
-            cleaned = rest.strip() or f"Run the '{s.name}' skill."
+            cleaned = rest.strip() or (
+                SkillProcessor.strip_frontmatter(getattr(s, "content", "") or "")
+                or f"Run the '{s.name}' skill."
+            )
             return s.name, cleaned
     return None, message
 
@@ -1081,14 +1088,20 @@ async def stream_chunks(
     # copy and the final-answer message), and pass the skill name to the
     # orchestrator, which validates it against the request intent before use.
     requested_skill = None
+    # What the session records as the user's turn.  Normally the same text the
+    # model sees, but a bare ``/<skill>`` is expanded to the skill's body for
+    # the model — the transcript keeps what the user actually typed.
+    session_user_msg = last_user_msg
     _cur_msg = next((m for m in reversed(messages) if m.role == "user"), None)
     if _cur_msg is not None and _cur_msg.content:
-        requested_skill, cleaned = _resolve_requested_skill(
-            _cur_msg.content, project_skills,
-        )
+        _typed = _cur_msg.content
+        requested_skill, cleaned = _resolve_requested_skill(_typed, project_skills)
         if requested_skill:
             _cur_msg.content = cleaned
             last_user_msg = cleaned
+            session_user_msg = (
+                _SLASH_SKILL_RE.match(_typed).group(2).strip() or _typed.strip()
+            )
             logger.info("[skill] user-selected skill: %r", requested_skill)
 
     # Shared cancellation signal for the whole request. Created before
@@ -1251,10 +1264,10 @@ async def stream_chunks(
                 # For image turns, fold the vision model's reading of the image
                 # into the stored user turn so later turns (which no longer carry
                 # the attachment) can still reference what the image contained.
-                user_record = last_user_msg
+                user_record = session_user_msg
                 if image_attachments:
                     user_record = (
-                        f"{last_user_msg}\n\n[Attached image — description]:\n"
+                        f"{session_user_msg}\n\n[Attached image — description]:\n"
                         f"{orchestrator_context}"
                     )
                 model_service.append_to_session(request.session_id, "user", user_record)
@@ -1350,7 +1363,7 @@ async def stream_chunks(
 
     # Store the user message in session history
     if request.session_id and last_user_msg:
-        model_service.append_to_session(request.session_id, "user", last_user_msg)
+        model_service.append_to_session(request.session_id, "user", session_user_msg)
 
     # `cancelled` is created earlier (before orchestration) and reused here so
     # the same signal covers both the planning phase and the response stream.

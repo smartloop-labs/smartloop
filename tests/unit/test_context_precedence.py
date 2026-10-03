@@ -59,12 +59,16 @@ class TestSourcesCombine:
     def test_the_live_mcp_call_is_submitted_whenever_a_server_is_connected(self):
         """Nothing else matching may skip it: the connected servers are one of
         the sources a question is put to, not a fallback for when the local
-        ones come back empty."""
+        ones come back empty.
+
+        A matched skill is the one exception, and it is not a source coming
+        back with something: the skill's plan makes its tool calls as steps
+        (see ``test_mcp_collect_gather.TestAMatchedSkillOwnsItsToolCalls``)."""
         src = inspect.getsource(explorer.Explorer.collect_parallel)
         start = src.index("f_mcp = None")
         block = src[start:start + 300]
 
-        assert "if mcp_servers:" in block
+        assert "if mcp_servers and not matched_skills:" in block
         assert "self._run_mcp" in block
-        # The only condition on it is "is there a server at all".
+        # Beyond that, the only condition on it is "is there a server at all".
         assert "mcp_document_context" not in src

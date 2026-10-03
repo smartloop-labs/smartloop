@@ -921,8 +921,15 @@ Does answering the latest message require a new web search?
             # content: when that local index matched, the live call was skipped
             # and the answer came from a snapshot. The snapshot is gone, so the
             # source of truth is the server, asked now.
+            #
+            # Not when a skill matched.  A skill is a procedure, and the plan
+            # built from it makes its tool calls as steps with the skill's
+            # instructions in hand.  Asked here, the server gets the whole
+            # request as one search — for a bare ``/job-match`` that was the
+            # skill's name (``searchCleraRoles(query='job-match')``), and with
+            # the body it is a multi-step procedure no single call answers.
             f_mcp = None
-            if mcp_servers:
+            if mcp_servers and not matched_skills:
                 f_mcp = pool.submit(
                     self._run_mcp, query, mcp_servers, project_dir, mcp_llm,
                     progress,
