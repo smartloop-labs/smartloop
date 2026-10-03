@@ -263,8 +263,11 @@ def _mark_recommended(entries: list, total_gb: float | None) -> None:
     Reasoning weighs more than the rest: it is the model that resolves tool
     calls, matches skills and plans, and without one those steps fall to the
     small router.  So the lightest reasoning model that fits is recommended
-    even when it is not at Low, and among models of the same size a reasoning
-    one takes the recommendation from the rest.
+    even when it is not at Low.
+
+    Within a size only one kind of model is recommended, so the user is not
+    left to choose between equal-cost badges: a reasoning model first, then
+    the one with the most capabilities.
     """
     if not total_gb:
         return
@@ -298,14 +301,18 @@ def _mark_recommended(entries: list, total_gb: float | None) -> None:
                 e.recommended = True
                 covered.update(e.capabilities)
 
-    # At equal cost the model that can also reason is the better pick, so
-    # within a size that has a recommendation and a reasoning model, the
-    # reasoning model(s) carry it and the others do not.
-    recommended_sizes = {pct for pct, e in ranked if e.recommended}
-    reasoning_sizes = {pct for pct, e in ranked if reasoning in e.capabilities}
+    # One pick per size: at equal cost, the model that can reason, then the
+    # one that does the most.  Only exact ties on both share the badge.
+    def merit(e):
+        return (reasoning in e.capabilities, len(e.capabilities))
+
+    best: dict = {}
     for pct, e in ranked:
-        if pct in recommended_sizes and pct in reasoning_sizes:
-            e.recommended = reasoning in e.capabilities
+        best[pct] = max(best.get(pct, merit(e)), merit(e))
+    recommended_sizes = {pct for pct, e in ranked if e.recommended}
+    for pct, e in ranked:
+        if pct in recommended_sizes:
+            e.recommended = merit(e) == best[pct]
 
 
 class WorkspaceModelEntry(BaseModel):

@@ -115,3 +115,40 @@ def test_the_same_holds_at_low_pressure():
         assert _recommended(entries, 64) == {"small-r", "tiny"}
     finally:
         del SIZES["small-r"]
+
+
+def test_within_a_size_the_most_capable_model_is_recommended():
+    entries = [
+        _entry("small", ["general"]),
+        _entry("small-plus", ["general", "dp", "vision"]),
+    ]
+    SIZES["small-plus"] = 2
+    try:
+        assert _recommended(entries, 64) == {"small-plus"}
+    finally:
+        del SIZES["small-plus"]
+
+
+def test_reasoning_outranks_capability_count_within_a_size():
+    entries = [
+        _entry("small-plus", ["general", "dp", "vision"]),
+        _entry("small-r", ["reasoning"]),
+    ]
+    SIZES["small-plus"] = 2
+    SIZES["small-r"] = 2
+    try:
+        assert _recommended(entries, 64) == {"small-r"}
+    finally:
+        del SIZES["small-plus"], SIZES["small-r"]
+
+
+def test_an_exact_tie_shares_the_badge():
+    entries = [
+        _entry("small", ["general", "vision"]),
+        _entry("small-2", ["general", "dp"]),
+    ]
+    SIZES["small-2"] = 2
+    try:
+        assert _recommended(entries, 64) == {"small", "small-2"}
+    finally:
+        del SIZES["small-2"]
