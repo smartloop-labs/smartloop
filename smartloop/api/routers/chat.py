@@ -129,6 +129,36 @@ def _extract_tool_content(orchestrator_context: str) -> str:
     return orchestrator_context[start + len(marker):].strip()
 
 
+#: A decode that failed for want of memory.  llama.cpp reports it as a
+#: non-zero ``llama_decode`` return (no KV slot, or a compute buffer that could
+#: not be allocated) rather than a typed error, so the message is all there is.
+_DECODE_OOM_RE = re.compile(
+    r"llama_decode returned -?\d+|out of memory|failed to allocate", re.IGNORECASE,
+)
+
+
+def _is_decode_oom(exc: Exception) -> bool:
+    """True when *exc* is generation running out of device memory."""
+    return bool(_DECODE_OOM_RE.search(str(exc)))
+
+
+def _continuation_turn(partial: str) -> str:
+    """A user turn asking the model to finish an answer it was cut off in.
+
+    Appended to the original prompt, where it merges into the last user turn
+    (``create_messages_from_prompt`` folds consecutive same-role turns).  There
+    is no assistant prefill to resume from, so the partial answer is quoted
+    back and the model is told to carry on from its last word.
+    """
+    return (
+        "<user>You were interrupted while answering. The user has already "
+        "received this beginning of your answer:\n\n"
+        f"{_escape_role_tags(partial)}\n\n"
+        "Continue from exactly where it stops. Do not repeat any of it, and do "
+        "not mention the interruption.</user>"
+    )
+
+
 def _escape_role_tags(text: str) -> str:
     """Escape literal role tags in *text* so they don't break the regex in
     ``create_messages_from_prompt``.  Fetched web content can contain
@@ -1396,7 +1426,8 @@ async def stream_chunks(
         opening_chars = 0
         _ALNUM_STREAM_THRESHOLD = 20
 
-        try:
+        def _run(stream_prompt: str) -> None:
+            nonlocal buffered, opening_chars
             # Through the model client rather than the service directly: the
             # default implementation is the same in-process call, but a project
             # agent configured with SLP_MODEL_HOST reaches the shared device
@@ -1407,7 +1438,7 @@ async def stream_chunks(
             # is made and its results are in the context, so a <think> block
             # here only withholds the stream while it is produced.
             for text in model_service.model_client.stream(
-                prompt, request.model, capability=response_capability,
+                stream_prompt, request.model, capability=response_capability,
                 cancelled=cancelled, thinking=False,
             ):
                 if cancelled.is_set():
@@ -1428,6 +1459,34 @@ async def stream_chunks(
                     for t in collected:
                         loop.call_soon_threadsafe(queue.put_nowait, t)
                     buffered = False
+
+        try:
+            try:
+                _run(prompt)
+            except Exception as e:
+                if cancelled.is_set() or not _is_decode_oom(e):
+                    raise
+                # The device ran out of room mid-answer.  What else is resident
+                # by now — the embedding model citation prep loads alongside the
+                # answer, the vision/large/capability models of earlier steps —
+                # is the room it needs, so free all of it and try once more.
+                # The response model reloads on demand with a fresh context.
+                logger.warning(
+                    "[stream] Generation failed (%s) — evicting auxiliary "
+                    "models and retrying once", e,
+                )
+                model_service.model_client.unload_auxiliary_models(
+                    include_embedding=True,
+                )
+                if buffered:
+                    # Nothing reached the client: start over.
+                    collected.clear()
+                    opening_chars = 0
+                    _run(prompt)
+                else:
+                    # The client already has part of the answer and there is
+                    # no taking it back, so ask for the rest of it.
+                    _run(prompt + _continuation_turn("".join(collected)))
         except Exception as e:
             logger.error(f"Error in sync stream: {e}")
             loop.call_soon_threadsafe(queue.put_nowait, Exception(str(e)))
