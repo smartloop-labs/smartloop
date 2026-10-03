@@ -296,14 +296,43 @@ class SkillProcessor:
         blocks are execution directives, not prose — they must be
         removed so the LLM doesn't echo them verbatim.
         """
+        # Strip until nothing changes: a frontmatter block can be followed by
+        # another.  The orchestrator prepends its own ``name:``/``description:``
+        # header to a file that usually has one already, and a skill edited
+        # from the template keeps the placeholder block above the real one —
+        # leaving the second in the body put ``name: job-match`` first in the
+        # message a bare ``/job-match`` sends, and its tools were called with
+        # the skill's name as their query.
+        body = content
+        while True:
+            stripped = SkillProcessor._strip_one_frontmatter(body)
+            if stripped == body:
+                break
+            body = stripped
+        body = body if body else content
+
+        # Defensively strip any legacy ```mcp / ```tool_code fenced blocks so
+        # they never reach the streaming LLM as instructions.
+        body = TOOL_CODE_FENCE_RE.sub("", body).strip()
+
+        return body
+
+    @staticmethod
+    def _strip_one_frontmatter(content: str) -> str:
+        """Remove the leading frontmatter block, fenced or not, from *content*."""
         lines = content.split("\n")
         body_start = 0
         in_frontmatter = False
+        in_unfenced = False
         _FM_KEYS = {"name:", "description:", "tools:"}
 
         for i, line in enumerate(lines):
             stripped = line.strip()
             if stripped == "---":
+                if in_unfenced:
+                    # Closing fence of a block that never opened one.
+                    body_start = i + 1
+                    break
                 if not in_frontmatter:
                     in_frontmatter = True
                     continue
@@ -315,6 +344,7 @@ class SkillProcessor:
                 continue
             # Unfenced frontmatter: lines starting with known keys
             if any(stripped.startswith(k) for k in _FM_KEYS):
+                in_unfenced = True
                 body_start = i + 1
                 continue
             # First non-frontmatter, non-empty line
@@ -322,14 +352,7 @@ class SkillProcessor:
                 body_start = i
                 break
 
-        body = "\n".join(lines[body_start:]).strip()
-        body = body if body else content
-
-        # Defensively strip any legacy ```mcp / ```tool_code fenced blocks so
-        # they never reach the streaming LLM as instructions.
-        body = TOOL_CODE_FENCE_RE.sub("", body).strip()
-
-        return body
+        return "\n".join(lines[body_start:]).strip()
 
     def synthesize(
         self,
@@ -363,10 +386,10 @@ class SkillProcessor:
         )
 
         try:
-            # Synthesis writes the final skill answer, so use the ranked large
-            # model for the skills capability (largest-first via ranked_models_for),
-            # not the small orchestrator. Falls back to the large/agent model when
-            # no skills-capable model fits.
+            # Synthesis writes the final skill answer, so use a model declaring
+            # the reasoning capability (the lightest that fits — see
+            # ModelService._get_llm_for_capability), not the small orchestrator.
+            # Falls back to the large/agent model when no capable model fits.
             #
             # ``purpose`` is what the user is told.  The capability is how the
             # model is chosen, and saying "Loading model for reasoning…" directly

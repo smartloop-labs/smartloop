@@ -186,3 +186,36 @@ class TestTheListingIsFollowedToItsBodies:
         out = ex._run_mcp("outline the pitch", servers, "/tmp")
 
         assert '"id": "abc"' in out
+
+
+class TestAMatchedSkillOwnsItsToolCalls:
+    """With a skill matched, the servers are not asked up front.
+
+    The plan built from the skill calls its tools as steps.  Asked here instead,
+    a server got the whole request as one search — for a bare ``/job-match``
+    that was the skill's own name, ``searchCleraRoles(query='job-match')``.
+    """
+
+    def _collect(self, matched_skills):
+        ex = Explorer.__new__(Explorer)
+        ex._run_mcp = MagicMock(return_value="")
+        ex._search_vector = MagicMock(return_value=None)
+        ex._search_feedback = MagicMock(return_value=None)
+        ex._search_workspace = MagicMock(return_value=None)
+        ex._needs_web_search = MagicMock(return_value=False)
+        ex.web_search_agent = MagicMock()
+        ex.web_search_agent.is_enabled.return_value = False
+        ex.collect_parallel(
+            "Return a list of job matches", model_service=MagicMock(),
+            matched_skills=matched_skills, mcp_servers=[_server("Clera")],
+        )
+        return ex
+
+    def test_the_servers_are_not_asked_when_a_skill_matched(self):
+        ex = self._collect([{"name": "job-match", "content": "..."}])
+        ex._run_mcp.assert_not_called()
+        ex._search_vector.assert_called_once()
+
+    def test_they_are_asked_when_no_skill_matched(self):
+        ex = self._collect(None)
+        ex._run_mcp.assert_called_once()
