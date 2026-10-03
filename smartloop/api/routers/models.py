@@ -263,7 +263,8 @@ def _mark_recommended(entries: list, total_gb: float | None) -> None:
     Reasoning weighs more than the rest: it is the model that resolves tool
     calls, matches skills and plans, and without one those steps fall to the
     small router.  So the lightest reasoning model that fits is recommended
-    even when it is not at Low, and it wins a size tie in the fallback.
+    even when it is not at Low, it wins a size tie in the fallback, and a
+    reasoning model the same size as any recommended model is recommended too.
     """
     if not total_gb:
         return
@@ -290,13 +291,19 @@ def _mark_recommended(entries: list, total_gb: float | None) -> None:
     if low:
         for e in low:
             e.recommended = True
-        return
+    else:
+        covered: set = set()
+        for _, e in ranked:
+            if any(cap not in covered for cap in e.capabilities):
+                e.recommended = True
+                covered.update(e.capabilities)
 
-    covered: set = set()
-    for _, e in ranked:
-        if any(cap not in covered for cap in e.capabilities):
+    # A reasoning model is never passed over for a same-size model that was
+    # recommended: at equal cost, the one that can also reason is the better pick.
+    recommended_sizes = {pct for pct, e in ranked if e.recommended}
+    for pct, e in ranked:
+        if reasoning in e.capabilities and pct in recommended_sizes:
             e.recommended = True
-            covered.update(e.capabilities)
 
 
 class WorkspaceModelEntry(BaseModel):
