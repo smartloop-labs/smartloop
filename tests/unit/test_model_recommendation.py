@@ -88,7 +88,7 @@ def test_a_reasoning_model_wins_a_size_tie_in_the_fallback():
         del SIZES["mid-r"]
 
 
-def test_a_reasoning_model_the_same_size_as_a_recommended_one_is_recommended():
+def test_within_a_size_only_the_reasoning_model_is_recommended():
     entries = [
         _entry("small", ["general", "reasoning"]),
         _entry("mid", ["vision"]),
@@ -96,9 +96,22 @@ def test_a_reasoning_model_the_same_size_as_a_recommended_one_is_recommended():
     ]
     SIZES["mid-r"] = 4
     try:
-        # 16GB, nothing at Low.  small covers general+reasoning, so mid-r adds
-        # no new capability — but mid (same size) is recommended for vision,
-        # and the same-size reasoning model must not be passed over.
-        assert _recommended(entries, 16) == {"small", "mid", "mid-r"}
+        # 16GB, nothing at Low.  mid would be badged for vision, but mid-r is
+        # the same size and can reason, so it takes the badge from mid.
+        assert _recommended(entries, 16) == {"small", "mid-r"}
     finally:
         del SIZES["mid-r"]
+
+
+def test_the_same_holds_at_low_pressure():
+    entries = [
+        _entry("small", ["general", "vision"]),
+        _entry("small-r", ["general", "reasoning"]),
+        _entry("tiny", ["vision"]),
+    ]
+    SIZES["small-r"] = 2
+    try:
+        # 64GB: all three are Low; small and small-r share a size.
+        assert _recommended(entries, 64) == {"small-r", "tiny"}
+    finally:
+        del SIZES["small-r"]
