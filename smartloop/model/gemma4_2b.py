@@ -31,7 +31,6 @@ class Gemma4_2bModel(GenericModel):
     def default_capabilities() -> list[ModelCapability]:
         return [
             ModelCapability.GENERAL,
-            ModelCapability.REASONING,
             ModelCapability.DP,
             ModelCapability.VISION,
             # Gemma 4's chat template reads enable_thinking (defaulting it to
