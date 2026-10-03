@@ -259,6 +259,11 @@ def _mark_recommended(entries: list, total_gb: float | None) -> None:
     capable model that fits; see ``ModelService._get_llm_for_capability``).
     With nothing at Low, the lightest model per capability that fits, so a
     small machine still gets a recommendation.
+
+    Reasoning weighs more than the rest: it is the model that resolves tool
+    calls, matches skills and plans, and without one those steps fall to the
+    small router.  So the lightest reasoning model that fits is recommended
+    even when it is not at Low, and it wins a size tie in the fallback.
     """
     if not total_gb:
         return
@@ -271,14 +276,24 @@ def _mark_recommended(entries: list, total_gb: float | None) -> None:
         if pct < _FITS_PCT:
             candidates.append((pct, e))
 
-    low = [e for pct, e in candidates if pct <= _LOW_PRESSURE_PCT]
+    reasoning = ModelCapability.REASONING.value
+    ranked = sorted(candidates, key=lambda c: (
+        c[0], reasoning not in c[1].capabilities, -len(c[1].capabilities),
+    ))
+    lightest_reasoning = next(
+        (e for _, e in ranked if reasoning in e.capabilities), None,
+    )
+    if lightest_reasoning is not None:
+        lightest_reasoning.recommended = True
+
+    low = [e for pct, e in ranked if pct <= _LOW_PRESSURE_PCT]
     if low:
         for e in low:
             e.recommended = True
         return
 
     covered: set = set()
-    for _, e in sorted(candidates, key=lambda c: (c[0], -len(c[1].capabilities))):
+    for _, e in ranked:
         if any(cap not in covered for cap in e.capabilities):
             e.recommended = True
             covered.update(e.capabilities)

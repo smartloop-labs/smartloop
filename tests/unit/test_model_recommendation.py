@@ -62,3 +62,27 @@ def test_locked_and_capability_less_models_are_never_recommended():
 def test_unknown_ram_recommends_nothing():
     entries = [_entry("tiny", ["general"])]
     assert _recommended(entries, None) == set()
+
+
+def test_the_lightest_reasoning_model_is_recommended_even_above_low():
+    entries = [
+        _entry("tiny", ["general", "vision"]),
+        _entry("big", ["general", "reasoning"]),
+        _entry("huge", ["reasoning"]),  # won't fit
+    ]
+    # 32GB: tiny is Low; big (25%) is not, but it is the only reasoning
+    # model that fits.
+    assert _recommended(entries, 32) == {"tiny", "big"}
+
+
+def test_a_reasoning_model_wins_a_size_tie_in_the_fallback():
+    entries = [
+        _entry("mid", ["general"]),
+        _entry("mid-r", ["general", "reasoning"]),
+    ]
+    SIZES["mid-r"] = 4
+    try:
+        # 16GB: both are 25%, the reasoning one covers 'general' first.
+        assert _recommended(entries, 16) == {"mid-r"}
+    finally:
+        del SIZES["mid-r"]
