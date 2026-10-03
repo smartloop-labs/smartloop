@@ -53,10 +53,6 @@ detect_platform() {
         error "Only Apple Silicon (arm64) is supported on macOS"
     fi
 
-    if [ "$OS" = "linux" ] && [ "$ARCH" != "amd64" ]; then
-        error "Only x86_64 (amd64) is supported on Linux"
-    fi
-
     if [ "$OS" = "windows" ] && [ "$ARCH" != "amd64" ]; then
         error "Only x86_64 (amd64) is supported on Windows"
     fi
