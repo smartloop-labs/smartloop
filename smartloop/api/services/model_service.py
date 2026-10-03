@@ -848,6 +848,26 @@ class ModelService:
             reverse=descending,
         )
 
+    @staticmethod
+    def _lightest_first(candidates: list, ref_caps: set) -> list:
+        """Sort WorkspaceModel candidates smallest-first for a routed step.
+
+        Every candidate already declares the capability, so the smallest one
+        can do the step — and it loads sooner, decodes faster and leaves the
+        most room for whatever runs next.  Size ties go to broader capability
+        coverage, then the newer version: ``_ranked_candidates`` with
+        ``descending=False`` would reverse those tie-breaks too and prefer the
+        narrower, older model.
+        """
+        return sorted(
+            candidates,
+            key=lambda m: (
+                m._rank[0],
+                -len(ref_caps & set(m.effective_capabilities)),
+                -m._rank[1],
+            ),
+        )
+
     def _selected_models(self) -> List:
         """The models the user has actually chosen — enabled *and* downloaded.
 
@@ -1203,13 +1223,13 @@ class ModelService:
         When the user has selected exactly one model, that model is returned
         for every capability it can serve — see :meth:`_pinned_model`.
 
-        Otherwise walks the capability's models largest-first and returns the
+        Otherwise walks the capability's models smallest-first and returns the
         first that is already resident or fits in memory — evicting prior-step
-        capability models to make room when needed.  When the largest doesn't
-        fit it promotes down to the next-largest same-capability model that
-        does, rather than dropping straight to the tiny default.  Returns
-        ``None`` only when no capable model fits (caller then falls back to the
-        default/large model).
+        capability models to make room when needed.  Every candidate declares
+        the capability, so the lightest one is enough for the step and the
+        fastest to load and run; a larger one is used only when the smaller
+        ones have no GGUF, faulted or don't fit.  Returns ``None`` only when no
+        capable model fits (caller then falls back to the default/large model).
         """
         if not self._model or not self._model.workspace:
             logger.warning(
@@ -1256,9 +1276,8 @@ class ModelService:
             return llm
 
         # Candidate selection is project-scoped (per-project model settings
-        # override the workspace defaults); re-rank so same-size models with
-        # broader capability coverage lead.
-        ranked = self._ranked_candidates(
+        # override the workspace defaults); walked lightest-first.
+        ranked = self._lightest_first(
             workspace.ranked_models_for(capability, workspace.current_project),
             ref_caps={capability},
         )
@@ -1270,8 +1289,8 @@ class ModelService:
             return None
 
         for ws_model in ranked:
-            # Walk down to the next-smaller capable model when this one has no
-            # GGUF, faulted, or doesn't fit — rather than the tiny default.
+            # Move up to the next capable model when this one has no GGUF,
+            # faulted, or doesn't fit — rather than the tiny default.
             llm = self._load_workspace_llm(
                 ws_model, f"capability '{self._cap_name(capability)}'",
                 reserve_gb=reserve_gb,

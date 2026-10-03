@@ -386,10 +386,10 @@ class SkillProcessor:
         )
 
         try:
-            # Synthesis writes the final skill answer, so use the ranked large
-            # model for the skills capability (largest-first via ranked_models_for),
-            # not the small orchestrator. Falls back to the large/agent model when
-            # no skills-capable model fits.
+            # Synthesis writes the final skill answer, so use a model declaring
+            # the reasoning capability (the lightest that fits — see
+            # ModelService._get_llm_for_capability), not the small orchestrator.
+            # Falls back to the large/agent model when no capable model fits.
             #
             # ``purpose`` is what the user is told.  The capability is how the
             # model is chosen, and saying "Loading model for reasoning…" directly
