@@ -49,8 +49,10 @@ mod test_explore_ordering {
     #[test]
     fn test_web_is_appended_after_every_local_source() {
         let src = PIPELINE_BUILDER_SRC;
+        // The assembly branch (not the node-construction match arm that
+        // also names `StepType::Explore`).
         let start = src
-            .find("StepType::Explore")
+            .find("if step.step_type == StepType::Explore {")
             .expect("pipeline builder never handles StepType::Explore");
         // Bound the block at the join, so the window cannot silently clip a
         // source and make the ordering assertion vacuous.
@@ -67,12 +69,19 @@ mod test_explore_ordering {
                 .unwrap_or_else(|| panic!("missing from explore assembly: {fragment}"))
         };
 
-        let web = pos("search_ctx.web_context");
+        // The Rust code reads a snapshot of the shared search context taken
+        // under its lock (`let sc = search_ctx.lock().clone();`), so the
+        // fields are read through `sc.` rather than `search_ctx.`.
+        assert!(
+            block.contains("let sc = search_ctx.lock()"),
+            "explore assembly must read the shared search context"
+        );
+        let web = pos("sc.web_context");
         for local in [
-            "search_ctx.vector_context",
-            "search_ctx.workspace_context",
-            "search_ctx.mcp_context",
-            "search_ctx.feedback_context",
+            "sc.vector_context",
+            "sc.workspace_context",
+            "sc.mcp_context",
+            "sc.feedback_context",
         ] {
             assert!(pos(local) < web, "{local} must be appended before web results");
         }
@@ -117,11 +126,30 @@ mod test_sources_combine {
     fn test_the_live_mcp_call_is_submitted_whenever_a_server_is_connected() {
         let src = method_source(EXPLORER_SRC, "collect_parallel");
         let start = src.find("f_mcp").expect("collect_parallel never submits the MCP leg (f_mcp)");
-        let block = window(src, start, 400);
+        // The whole `let f_mcp = ...;` statement (the Rust spelling is wordier
+        // than Python's three lines, so bound it at the blank line ending it
+        // rather than at a fixed width).
+        let end = src[start..].find("\n\n").map_or(src.len(), |i| start + i);
+        let block = window(src, start, (end - start).min(1200));
 
-        // The gate on the MCP leg is "servers connected and no matched skill".
-        let gate = Regex::new(r"(?s)\bif\b[^{]*mcp_servers[^{]*matched_skills[^{]*\{").unwrap();
-        assert!(gate.is_match(block), "MCP leg must be gated on mcp_servers and !matched_skills:\n{block}");
+        // The gate on the MCP leg is "servers connected and no matched skill"
+        // (Python: `if mcp_servers and not matched_skills:`).  In Rust either
+        // an `if` over both, or a `match` on the non-empty server list with an
+        // `if !skill_matched` guard, where `skill_matched` is derived from a
+        // non-empty `matched_skills`.
+        let if_gate = Regex::new(r"(?s)\bif\b[^{]*mcp_servers[^{]*!\s*\w*matched\w*[^{]*\{").unwrap();
+        let match_gate = Regex::new(
+            r"(?s)\bmatch\s+mcp_servers\.filter\(\|\w+\|\s*!\w+\.is_empty\(\)\)\s*\{\s*Some\(\w+\)\s+if\s+!skill_matched\s*=>",
+        )
+        .unwrap();
+        assert!(
+            if_gate.is_match(block) || match_gate.is_match(block),
+            "MCP leg must be gated on mcp_servers and !matched_skills:\n{block}"
+        );
+        if !block.contains("matched_skills") {
+            let derived = Regex::new(r"let skill_matched = matched_skills\.is_some_and\(\|\w+\| !\w+\.is_empty\(\)\)").unwrap();
+            assert!(derived.is_match(src), "skill_matched must mean \"a skill matched\"");
+        }
         assert!(block.contains("run_mcp("));
         // Beyond that, the only condition on it is "is there a server at all".
         assert!(!src.contains("mcp_document_context"));
