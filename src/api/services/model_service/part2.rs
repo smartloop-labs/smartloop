@@ -464,6 +464,9 @@ impl ModelService {
         catalog_slug: Option<&str>,
         project_id: Option<&str>,
     ) -> anyhow::Result<Value> {
+        if let Some(hook) = self.hooks.read().add_local_mcp_server.clone() {
+            return hook(command, project_id);
+        }
         let _ = (command, args, name, env, cwd, description, tags, catalog_slug, project_id);
         todo!()
     }

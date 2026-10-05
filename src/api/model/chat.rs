@@ -136,7 +136,68 @@ impl ChatCompletionRequest {
     /// Pydantic field-constraint validation (`ge`/`le`).  Returns FastAPI-style
     /// 422 error entries (`{"type", "loc", "msg", "input", "ctx"}`); empty when valid.
     pub fn validation_errors(&self) -> Vec<serde_json::Value> {
-        todo!()
+        let mut errors = Vec::new();
+        float_range(&mut errors, "temperature", self.temperature, Some(0.0), Some(2.0));
+        if let Some(max_tokens) = self.max_tokens
+            && max_tokens < 1
+        {
+            errors.push(serde_json::json!({
+                "type": "greater_than_equal",
+                "loc": ["body", "max_tokens"],
+                "msg": "Input should be greater than or equal to 1",
+                "input": max_tokens,
+                "ctx": {"ge": 1},
+            }));
+        }
+        float_range(&mut errors, "top_p", self.top_p, Some(0.0), Some(1.0));
+        float_range(&mut errors, "frequency_penalty", self.frequency_penalty, Some(-2.0), Some(2.0));
+        float_range(&mut errors, "presence_penalty", self.presence_penalty, Some(-2.0), Some(2.0));
+        errors
+    }
+}
+
+/// A bound as pydantic prints it in a message: `0.0` reads "0", `0.5` "0.5".
+fn format_bound(bound: f64) -> String {
+    if bound.fract() == 0.0 && bound.is_finite() {
+        format!("{}", bound as i64)
+    } else {
+        format!("{bound}")
+    }
+}
+
+/// Append the pydantic `ge`/`le` error for a float field outside its range.
+fn float_range(
+    errors: &mut Vec<serde_json::Value>,
+    field: &str,
+    value: Option<f64>,
+    ge: Option<f64>,
+    le: Option<f64>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    if let Some(ge) = ge
+        && !(value >= ge)
+    {
+        errors.push(serde_json::json!({
+            "type": "greater_than_equal",
+            "loc": ["body", field],
+            "msg": format!("Input should be greater than or equal to {}", format_bound(ge)),
+            "input": value,
+            "ctx": {"ge": ge},
+        }));
+        return;
+    }
+    if let Some(le) = le
+        && !(value <= le)
+    {
+        errors.push(serde_json::json!({
+            "type": "less_than_equal",
+            "loc": ["body", field],
+            "msg": format!("Input should be less than or equal to {}", format_bound(le)),
+            "input": value,
+            "ctx": {"le": le},
+        }));
     }
 }
 
@@ -460,4 +521,51 @@ pub struct FeedbackResponse {
     /// Whether the Q&A pair was added to or removed from the vector index.
     #[serde(default)]
     pub indexed: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_the_pydantic_model() {
+        let request: ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "messages": []})).unwrap();
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, Some(1.0));
+        assert_eq!(request.frequency_penalty, Some(0.0));
+        assert!(!request.stream);
+        assert!(request.validation_errors().is_empty());
+    }
+
+    #[test]
+    fn out_of_range_fields_are_reported_like_pydantic() {
+        let request = ChatCompletionRequest {
+            temperature: Some(2.5),
+            max_tokens: Some(0),
+            top_p: Some(-0.1),
+            ..Default::default()
+        };
+        let errors = request.validation_errors();
+        assert_eq!(errors.len(), 3);
+        assert_eq!(errors[0]["loc"], serde_json::json!(["body", "temperature"]));
+        assert_eq!(errors[0]["msg"], "Input should be less than or equal to 2");
+        assert_eq!(errors[1]["msg"], "Input should be greater than or equal to 1");
+        assert_eq!(errors[2]["type"], "greater_than_equal");
+    }
+
+    #[test]
+    fn chunks_serialize_with_their_object_tag() {
+        let chunk = ChatCompletionChunk::new("m", vec![]);
+        let value = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(value["object"], "chat.completion.chunk");
+        let id = value["id"].as_str().unwrap();
+        assert!(id.starts_with("chatcmpl-"));
+        assert_eq!(id.len(), "chatcmpl-".len() + 8);
+        let status = serde_json::to_value(ChatStatusChunk::default()).unwrap();
+        assert_eq!(
+            status,
+            serde_json::json!({"object": "chat.status", "step": "", "status": "processing", "message": ""})
+        );
+    }
 }

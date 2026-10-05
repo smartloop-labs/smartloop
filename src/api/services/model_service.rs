@@ -202,6 +202,11 @@ pub struct ModelServiceHooks {
     pub generate_completion: Option<Arc<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>>,
     /// Replaces `_get_project(project_id)`.
     pub get_project: Option<Arc<dyn Fn(&str) -> anyhow::Result<Project> + Send + Sync>>,
+    /// Replaces `load_model()` (the API tests' `model_service.load_model =
+    /// MagicMock(side_effect=...)`).
+    pub load_model: Option<Arc<dyn Fn() -> anyhow::Result<Arc<dyn BaseLLM>> + Send + Sync>>,
+    /// Replaces `add_local_mcp_server(...)`; receives `(command, project_id)`.
+    pub add_local_mcp_server: Option<Arc<dyn Fn(&str, Option<&str>) -> anyhow::Result<Value> + Send + Sync>>,
 }
 
 /// The process-wide singleton (`ModelService._instance`).
@@ -511,6 +516,9 @@ impl ModelService {
 
     /// Load and cache the orchestrator LLM for the current project.
     pub fn load_model(&self) -> anyhow::Result<Arc<dyn BaseLLM>> {
+        if let Some(hook) = self.hooks.read().load_model.clone() {
+            return hook();
+        }
         todo!()
     }
 
