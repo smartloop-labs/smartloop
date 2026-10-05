@@ -50,7 +50,7 @@ static REFRESH_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// `server id -> (refresh token that was refused, when to retry it)`.
-static REFRESH_FAILURES: Lazy<Mutex<HashMap<String, (String, Instant)>>> =
+pub static REFRESH_FAILURES: Lazy<Mutex<HashMap<String, (String, Instant)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// The redemption lock for one connection, created on first use.
