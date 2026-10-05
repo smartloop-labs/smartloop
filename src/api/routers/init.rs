@@ -108,20 +108,202 @@ impl ProjectServicesHost for ModelService {
     }
 }
 
+/// Everything `/v1/init` and `/v1/bootstrap` ask of the model service (the
+/// FastAPI `Depends(get_model_service)` dependency), as a trait so tests can
+/// hand the routes a stand-in the way the Python tests hand them a
+/// `MagicMock`.  [`ModelService`] is the production implementation.
+pub trait InitModelService: ProjectServicesHost {
+    /// `model_service._ensure_workspace()`.
+    fn ensure_workspace(&self) -> anyhow::Result<SharedWorkspace>;
+    /// `model_service.mark_model_downloaded(name, workspace=workspace)`.
+    fn mark_model_downloaded(&self, model_name: &str, workspace: Option<SharedWorkspace>) -> anyhow::Result<()>;
+    /// `model_service._ensure_model()`.
+    fn ensure_model(&self) -> anyhow::Result<()>;
+    /// `model_service._model.workspace` — an error when no pipeline is loaded
+    /// (Python dereferenced `None`).
+    fn pipeline_workspace(&self) -> anyhow::Result<SharedWorkspace>;
+    /// `model_service.create_project(name=..., description=..., system=...,
+    /// cwd=...)`.
+    fn create_project(&self, name: &str, description: Option<&str>, system: bool, cwd: Option<&str>)
+        -> anyhow::Result<()>;
+    /// `model_service._task_queue.get_task("indexer") is not None`.
+    fn has_indexer_task(&self) -> bool;
+    /// `model_service.setup_tasks(workspace)`.
+    fn setup_tasks(&self, workspace: SharedWorkspace) -> anyhow::Result<()>;
+    /// `model_service._llm is not None`.
+    fn llm_loaded(&self) -> bool;
+    /// `model_service._model_name`.
+    fn loaded_model_name(&self) -> Option<String>;
+    /// `model_service.load_model()`.
+    fn load_model(&self) -> anyhow::Result<()>;
+    /// `storage_service.discard_partial_download(model_service=model_service,
+    /// model_id=model_id)` for a cancelled download.
+    fn discard_partial_download(&self, model_id: &str) -> anyhow::Result<()>;
+}
+
+impl InitModelService for ModelService {
+    fn ensure_workspace(&self) -> anyhow::Result<SharedWorkspace> {
+        ModelService::ensure_workspace(self, None)
+    }
+
+    fn mark_model_downloaded(&self, model_name: &str, workspace: Option<SharedWorkspace>) -> anyhow::Result<()> {
+        ModelService::mark_model_downloaded(self, model_name, workspace)
+    }
+
+    fn ensure_model(&self) -> anyhow::Result<()> {
+        ModelService::ensure_model(self)
+    }
+
+    fn pipeline_workspace(&self) -> anyhow::Result<SharedWorkspace> {
+        self.model.read().as_ref().map(|m| Arc::clone(&m.workspace)).ok_or_else(model_pipeline_missing)
+    }
+
+    fn create_project(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        system: bool,
+        cwd: Option<&str>,
+    ) -> anyhow::Result<()> {
+        ModelService::create_project(self, name, description, system, None, cwd).map(|_| ())
+    }
+
+    fn has_indexer_task(&self) -> bool {
+        let queue = self.task_queue.read().clone();
+        queue.get_task("indexer").is_some()
+    }
+
+    fn setup_tasks(&self, workspace: SharedWorkspace) -> anyhow::Result<()> {
+        ModelService::setup_tasks(self, Some(workspace))
+    }
+
+    fn llm_loaded(&self) -> bool {
+        self.llm.read().is_some()
+    }
+
+    fn loaded_model_name(&self) -> Option<String> {
+        self.model_name.read().clone()
+    }
+
+    fn load_model(&self) -> anyhow::Result<()> {
+        ModelService::load_model(self).map(|_| ())
+    }
+
+    fn discard_partial_download(&self, model_id: &str) -> anyhow::Result<()> {
+        storage_service::discard_partial_download(Some(self as &dyn StorageModelService), model_id)?;
+        Ok(())
+    }
+}
+
 /// The error Python raised reading `model_service._model.<attr>` with no
 /// pipeline loaded.
-fn model_pipeline_missing() -> anyhow::Error {
+pub fn model_pipeline_missing() -> anyhow::Error {
     anyhow::anyhow!("'NoneType' object has no attribute 'workspace'")
 }
 
-/// `model_service._model.workspace`.
-fn pipeline_workspace(model_service: &ModelService) -> anyhow::Result<SharedWorkspace> {
-    model_service
-        .model
-        .read()
-        .as_ref()
-        .map(|m| Arc::clone(&m.workspace))
-        .ok_or_else(model_pipeline_missing)
+/// What the routes ask of the downloader they build
+/// (`SLPArtifactDownloader(workspace, logger)`), as a trait so tests can
+/// substitute one the way the Python tests patch
+/// `init_router.SLPArtifactDownloader`.
+pub trait InitDownloader: Send + Sync {
+    /// `downloader.resolve_artifacts(model_id)`: the signed-URL map.
+    fn resolve_artifacts(&self, model_id: &str) -> anyhow::Result<ArtifactMap>;
+    /// `downloader.cancel_token = token`.
+    fn set_cancel_token(&self, token: CancelToken);
+    /// `downloader.download(model_id=..., progress_callback=...,
+    /// artifacts=...)`.
+    fn download(
+        &self,
+        model_id: &str,
+        progress_callback: Option<ProgressCallback>,
+        artifacts: Option<ArtifactMap>,
+    ) -> anyhow::Result<()>;
+    /// `downloader.bootstrap_download(progress_callback=...)`.
+    fn bootstrap_download(&self, progress_callback: Option<ProgressCallback>) -> anyhow::Result<()>;
+    /// `downloader._bootstrap_source.list_models()`.
+    fn list_bootstrap_models(&self) -> anyhow::Result<Vec<Value>>;
+}
+
+impl InitDownloader for SLPArtifactDownloader {
+    fn resolve_artifacts(&self, model_id: &str) -> anyhow::Result<ArtifactMap> {
+        SLPArtifactDownloader::resolve_artifacts(self, model_id).map_err(download_error_into_anyhow)
+    }
+
+    fn set_cancel_token(&self, token: CancelToken) {
+        SLPArtifactDownloader::set_cancel_token(self, token);
+    }
+
+    fn download(
+        &self,
+        model_id: &str,
+        progress_callback: Option<ProgressCallback>,
+        artifacts: Option<ArtifactMap>,
+    ) -> anyhow::Result<()> {
+        self.download_with_artifacts(model_id, progress_callback, artifacts)
+            .map(|_| ())
+            .map_err(download_error_into_anyhow)
+    }
+
+    fn bootstrap_download(&self, progress_callback: Option<ProgressCallback>) -> anyhow::Result<()> {
+        SLPArtifactDownloader::bootstrap_download(self, None, progress_callback)
+            .map(|_| ())
+            .map_err(download_error_into_anyhow)
+    }
+
+    fn list_bootstrap_models(&self) -> anyhow::Result<Vec<Value>> {
+        self.bootstrap_source().list_models()
+    }
+}
+
+/// Builds the downloader a route uses from the workspace it serves
+/// (`SLPArtifactDownloader(workspace, logger)`).
+pub type DownloaderFactory = Arc<dyn Fn(SharedWorkspace) -> Arc<dyn InitDownloader> + Send + Sync>;
+
+/// The arguments `_download_and_stream` is called with.
+pub struct DownloadStreamArgs {
+    pub downloader: Arc<dyn InitDownloader>,
+    pub model_id: String,
+    pub model_name: String,
+    pub is_bootstrap: bool,
+    pub artifacts: Option<ArtifactMap>,
+    pub model_service: Option<Arc<dyn InitModelService>>,
+}
+
+/// Stands in for [`download_and_stream`].
+pub type DownloadAndStreamFn = Arc<dyn Fn(DownloadStreamArgs) -> SseStream + Send + Sync>;
+
+/// The module-level names the routes resolve at call time, which the Python
+/// tests patch (`init_router.SLPArtifactDownloader`,
+/// `init_router._download_and_stream`).  Each `None` is the real one.
+#[derive(Clone, Default)]
+pub struct InitSeams {
+    /// Replaces `SLPArtifactDownloader(workspace, logger)`.
+    pub downloader_factory: Option<DownloaderFactory>,
+    /// Replaces `_download_and_stream(...)`.
+    pub download_and_stream: Option<DownloadAndStreamFn>,
+}
+
+impl InitSeams {
+    fn make_downloader(&self, workspace: &SharedWorkspace) -> Arc<dyn InitDownloader> {
+        match &self.downloader_factory {
+            Some(factory) => factory(Arc::clone(workspace)),
+            None => Arc::new(SLPArtifactDownloader::new(Arc::clone(workspace), init_logger(), None)),
+        }
+    }
+
+    fn download_and_stream(&self, args: DownloadStreamArgs) -> SseStream {
+        match &self.download_and_stream {
+            Some(hook) => hook(args),
+            None => download_and_stream(
+                args.downloader,
+                args.model_id,
+                args.model_name,
+                args.is_bootstrap,
+                args.artifacts,
+                args.model_service,
+            ),
+        }
+    }
 }
 
 /// The `/v1` router carrying the init routes (`tags=["init"]`).
@@ -306,25 +488,6 @@ fn init_logger() -> SharedLogger {
     Arc::new(InitLogger)
 }
 
-/// What [`storage_service::discard_partial_download`] needs from the model
-/// service: the live workspace (with per-project state re-read).
-struct StorageView(Arc<ModelService>);
-
-impl StorageModelService for StorageView {
-    fn ensure_workspace(&self) -> anyhow::Result<Option<SharedWorkspace>> {
-        Ok(Some(self.0.ensure_workspace(None)?))
-    }
-
-    fn refresh_project_state(&self, project_id: &str) -> anyhow::Result<bool> {
-        Ok(self.0.refresh_project_state(Some(project_id)))
-    }
-
-    fn unload_model_by_name_unlocked(&self, name: &str) -> anyhow::Result<()> {
-        self.0.unload_model_by_name_unlocked(name);
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Catalog seed.
 // ---------------------------------------------------------------------------
@@ -452,21 +615,23 @@ impl Drop for Registration {
 }
 
 /// The download thread's body (`_do_download`).
-fn do_download(
-    downloader: &SLPArtifactDownloader,
+fn do_download<D, S>(
+    downloader: &D,
     model_id: &str,
     is_bootstrap: bool,
     artifacts: Option<ArtifactMap>,
-    model_service: Option<Arc<ModelService>>,
+    model_service: Option<Arc<S>>,
     on_progress: ProgressCallback,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    D: InitDownloader + ?Sized,
+    S: InitModelService + ?Sized,
+{
     if is_bootstrap {
         // First-run has no enable toggle to click, so bootstrap stays
         // unregistered and uncancellable for now; its downloader keeps the
         // private token its constructor gave it, which nothing ever sets.
-        downloader
-            .bootstrap_download(None, Some(on_progress))
-            .map_err(download_error_into_anyhow)?;
+        downloader.bootstrap_download(Some(on_progress))?;
         return Ok(());
     }
 
@@ -480,21 +645,19 @@ fn do_download(
     let _registration = Registration { model_id: model_id.to_string(), token: token.clone() };
     downloader.set_cancel_token(token);
 
-    let result = downloader
-        .download_with_artifacts(model_id, Some(on_progress), artifacts)
-        .map(|_| ())
-        .map_err(download_error_into_anyhow);
+    let result = downloader.download(model_id, Some(on_progress), artifacts);
     if let Err(e) = &result {
         if py_error_kind_of(e) == PyErrorKind::Cancelled {
             // Before the registration is released, which is the point of
             // doing it here: the registration is what keeps a second download
             // from creating the directory into a tree that is in the middle
             // of being removed.
-            let view = model_service.map(StorageView);
-            let discarded = storage_service::discard_partial_download(
-                view.as_ref().map(|v| v as &dyn StorageModelService),
-                model_id,
-            );
+            let discarded = match &model_service {
+                Some(svc) => svc.discard_partial_download(model_id),
+                None => storage_service::discard_partial_download(None, model_id)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::new),
+            };
             if let Err(err) = discarded {
                 // The cancel succeeded either way; bytes left behind are the
                 // abandoned-download case the storage sweep already collects.
@@ -518,14 +681,18 @@ fn do_download(
 /// claims/releases the cancel registration on the download thread, and a
 /// cancelled download discards its partial bytes before re-raising
 /// `DownloadCancelled`.
-pub fn download_and_stream(
-    downloader: Arc<SLPArtifactDownloader>,
+pub fn download_and_stream<D, S>(
+    downloader: Arc<D>,
     model_id: String,
     model_name: String,
     is_bootstrap: bool,
     artifacts: Option<ArtifactMap>,
-    model_service: Option<Arc<ModelService>>,
-) -> SseStream {
+    model_service: Option<Arc<S>>,
+) -> SseStream
+where
+    D: InitDownloader + ?Sized + 'static,
+    S: InitModelService + ?Sized + 'static,
+{
     Box::pin(async_stream::stream! {
         let progress_queue: Arc<Mutex<VecDeque<Value>>> = Arc::new(Mutex::new(VecDeque::new()));
         let last_progress_time: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -573,7 +740,7 @@ pub fn download_and_stream(
             let downloader = Arc::clone(&downloader);
             let model_id = model_id.clone();
             tokio::task::spawn_blocking(move || {
-                do_download(&downloader, &model_id, is_bootstrap, artifacts, model_service, on_progress)
+                do_download(&*downloader, &model_id, is_bootstrap, artifacts, model_service, on_progress)
             })
         };
 
@@ -643,7 +810,10 @@ pub fn download_and_stream(
 /// base model (`api_settings.default_model`) as the orchestrator/main model —
 /// regardless of which model was just downloaded or is active.  A larger
 /// downloaded model is loaded lazily on demand for large-tier steps.
-pub fn load_orchestrator_and_stream(model_service: Arc<ModelService>) -> SseStream {
+pub fn load_orchestrator_and_stream<S>(model_service: Arc<S>) -> SseStream
+where
+    S: InitModelService + ?Sized + 'static,
+{
     Box::pin(async_stream::stream! {
         let name = API_SETTINGS.read().default_model.clone();
         yield Ok(sse_event(
@@ -656,7 +826,7 @@ pub fn load_orchestrator_and_stream(model_service: Arc<ModelService>) -> SseStre
 
         let load_task = {
             let svc = Arc::clone(&model_service);
-            tokio::task::spawn_blocking(move || svc.load_model().map(|_| ()))
+            tokio::task::spawn_blocking(move || svc.load_model())
         };
 
         while !load_task.is_finished() {
@@ -677,7 +847,7 @@ pub fn load_orchestrator_and_stream(model_service: Arc<ModelService>) -> SseStre
             return;
         }
 
-        let loaded = model_service.model_name.read().clone().unwrap_or_else(|| "None".to_string());
+        let loaded = model_service.loaded_model_name().unwrap_or_else(|| "None".to_string());
         yield Ok(sse_event(
             &json!({
                 "status": "model_loaded",
@@ -690,15 +860,14 @@ pub fn load_orchestrator_and_stream(model_service: Arc<ModelService>) -> SseStre
 
 /// Create a bare `general_chat` system project if none exist (no skills/MCP —
 /// LLM not loaded yet).
-pub fn ensure_project(
-    model_service: Arc<ModelService>,
-    workspace: SharedWorkspace,
-    cwd: Option<String>,
-) -> SseStream {
+pub fn ensure_project<S>(model_service: Arc<S>, workspace: SharedWorkspace, cwd: Option<String>) -> SseStream
+where
+    S: InitModelService + ?Sized + 'static,
+{
     // Unused in Python too: the check reads the pipeline's own workspace.
     let _ = workspace;
     Box::pin(async_stream::stream! {
-        let has_projects = match pipeline_workspace(&model_service) {
+        let has_projects = match model_service.pipeline_workspace() {
             Ok(ws) => !ws.read().projects.is_empty(),
             Err(e) => {
                 yield Err(e);
@@ -712,13 +881,7 @@ pub fn ensure_project(
             ));
             let svc = Arc::clone(&model_service);
             let created = blocking(move || {
-                svc.create_project(
-                    "general_chat",
-                    Some("Default general chat project"),
-                    true,
-                    None,
-                    cwd.as_deref(),
-                )
+                svc.create_project("general_chat", Some("Default general chat project"), true, cwd.as_deref())
             })
             .await;
             if let Err(e) = created {
@@ -811,16 +974,15 @@ pub fn get_project_info(workspace: &Workspace, model_name: &str) -> Option<Value
 /// `ModelService::setup_tasks`), so asking whether one is running would
 /// re-run the whole setup on every call — replacing the MCP task and
 /// orphaning the loop it had already started.
-async fn ensure_tasks(model_service: &Arc<ModelService>, workspace: &SharedWorkspace) -> anyhow::Result<()> {
+async fn ensure_tasks(model_service: &Arc<dyn InitModelService>, workspace: &SharedWorkspace) -> anyhow::Result<()> {
     if projects_delegated() {
         return Ok(());
     }
     let svc = Arc::clone(model_service);
     let ws = Arc::clone(workspace);
     blocking(move || {
-        let queue = svc.task_queue.read().clone();
-        if queue.get_task("indexer").is_none() {
-            svc.setup_tasks(Some(ws))?;
+        if !svc.has_indexer_task() {
+            svc.setup_tasks(ws)?;
         }
         Ok(())
     })
@@ -843,9 +1005,19 @@ pub async fn init(body: Bytes) -> Result<Response, HTTPException> {
 /// refusal arrives as an HTTP status (`status_for`); an unknown model is a
 /// 400.  Returns a `text/event-stream` response with `Cache-Control:
 /// no-cache` and `X-Accel-Buffering: no`.
-pub async fn init_with(
+pub async fn init_with<S>(request: InitRequest, model_service: Arc<S>) -> Result<Response, HTTPException>
+where
+    S: InitModelService + 'static,
+{
+    init_with_seams(request, model_service, InitSeams::default()).await
+}
+
+/// [`init_with`] with the downloader and the download stream replaced as
+/// `seams` says.
+pub async fn init_with_seams(
     request: InitRequest,
-    model_service: Arc<ModelService>,
+    model_service: Arc<dyn InitModelService>,
+    seams: InitSeams,
 ) -> Result<Response, HTTPException> {
     let unexpected = |e: anyhow::Error| {
         tracing::error!(target: LOG_TARGET, "Exception in /v1/init: {e:#}");
@@ -854,7 +1026,7 @@ pub async fn init_with(
 
     let workspace = {
         let svc = Arc::clone(&model_service);
-        blocking(move || svc.ensure_workspace(None)).await.map_err(unexpected)?
+        blocking(move || svc.ensure_workspace()).await.map_err(unexpected)?
     };
     let default_model = API_SETTINGS.read().default_model.clone();
     let target = request
@@ -893,13 +1065,13 @@ pub async fn init_with(
     // to 200 and a refusal can only be described inside the body.  Resolving
     // here also means the signed URLs are minted once, which matters because
     // the download route is rate-limited per IP.
-    let mut downloader: Option<Arc<SLPArtifactDownloader>> = None;
+    let mut downloader: Option<Arc<dyn InitDownloader>> = None;
     let mut artifacts: Option<ArtifactMap> = None;
     if !gguf_exists(&model_dir) {
-        let made = Arc::new(SLPArtifactDownloader::new(Arc::clone(&workspace), init_logger(), None));
+        let made = seams.make_downloader(&workspace);
         let resolver = Arc::clone(&made);
         let id = model_id.clone();
-        match blocking(move || resolver.resolve_artifacts(&id).map_err(download_error_into_anyhow)).await {
+        match blocking(move || resolver.resolve_artifacts(&id)).await {
             Ok(resolved) => artifacts = Some(resolved),
             Err(exc) => {
                 return Err(match py_error_kind_of(&exc) {
@@ -938,14 +1110,14 @@ pub async fn init_with(
                 }
                 Some(downloader) => {
                     {
-                        let mut sub = download_and_stream(
+                        let mut sub = seams.download_and_stream(DownloadStreamArgs {
                             downloader,
-                            model_id.clone(),
-                            target.clone(),
-                            false,
+                            model_id: model_id.clone(),
+                            model_name: target.clone(),
+                            is_bootstrap: false,
                             artifacts,
-                            Some(Arc::clone(&model_service)),
-                        );
+                            model_service: Some(Arc::clone(&model_service)),
+                        });
                         while let Some(item) = sub.next().await {
                             yield item?;
                         }
@@ -1005,8 +1177,8 @@ pub async fn init_with(
             ensure_tasks(&model_service, &workspace).await?;
 
             // 5. Load model (only if a GGUF is available)
-            let llm_loaded = model_service.llm.read().is_some();
-            let loaded_name = model_service.model_name.read().clone();
+            let llm_loaded = model_service.llm_loaded();
+            let loaded_name = model_service.loaded_model_name();
             let default_model = API_SETTINGS.read().default_model.clone();
             if !gguf_exists(&model_dir) {
                 yield sse_event(
@@ -1049,7 +1221,7 @@ pub async fn init_with(
 
             // 7. Done
             let project = {
-                let ws = pipeline_workspace(&model_service)?;
+                let ws = model_service.pipeline_workspace()?;
                 let ws = ws.read();
                 get_project_info(&ws, &target)
             };
@@ -1146,7 +1318,20 @@ fn find_existing_model(workspace: &SharedWorkspace) -> Option<String> {
 }
 
 /// [`bootstrap`] with an explicit model service (the FastAPI dependency).
-pub async fn bootstrap_with(request: Option<InitRequest>, model_service: Arc<ModelService>) -> Response {
+pub async fn bootstrap_with<S>(request: Option<InitRequest>, model_service: Arc<S>) -> Response
+where
+    S: InitModelService + 'static,
+{
+    bootstrap_with_seams(request, model_service, InitSeams::default()).await
+}
+
+/// [`bootstrap_with`] with the downloader and the download stream replaced as
+/// `seams` says.
+pub async fn bootstrap_with_seams(
+    request: Option<InitRequest>,
+    model_service: Arc<dyn InitModelService>,
+    seams: InitSeams,
+) -> Response {
     let cwd = request.and_then(|r| r.cwd);
 
     let steps = async_stream::try_stream! {
@@ -1154,15 +1339,15 @@ pub async fn bootstrap_with(request: Option<InitRequest>, model_service: Arc<Mod
         yield sse_event(&json!({"status": "checking", "message": "Checking workspace..."}), "progress");
         let workspace = {
             let svc = Arc::clone(&model_service);
-            blocking(move || svc.ensure_workspace(None)).await?
+            blocking(move || svc.ensure_workspace()).await?
         };
 
         // Fast path: already loaded
-        let llm_loaded = model_service.llm.read().is_some();
+        let llm_loaded = model_service.llm_loaded();
         let has_current = workspace.read().current_project().is_some();
         if llm_loaded && has_current {
             seed_model_catalog();
-            let service_model_name = model_service.model_name.read().clone();
+            let service_model_name = model_service.loaded_model_name();
             let (model_name, project) = {
                 let ws = workspace.read();
                 let model_name = match ws.get_model(None) {
@@ -1199,9 +1384,9 @@ pub async fn bootstrap_with(request: Option<InitRequest>, model_service: Arc<Mod
             }
             None => {
                 // 3. Bootstrap download (GGUF only, no build needed)
-                let downloader = Arc::new(SLPArtifactDownloader::new(Arc::clone(&workspace), init_logger(), None));
-                let source = downloader.bootstrap_source();
-                let bootstrap_models = blocking(move || source.list_models()).await?;
+                let downloader = seams.make_downloader(&workspace);
+                let lister = Arc::clone(&downloader);
+                let bootstrap_models = blocking(move || lister.list_bootstrap_models()).await?;
                 let target = bootstrap_models
                     .first()
                     .ok_or_else(|| anyhow::anyhow!("list index out of range"))?;
@@ -1222,14 +1407,14 @@ pub async fn bootstrap_with(request: Option<InitRequest>, model_service: Arc<Mod
                 }
 
                 {
-                    let mut sub = download_and_stream(
+                    let mut sub = seams.download_and_stream(DownloadStreamArgs {
                         downloader,
-                        bootstrap_model_id,
-                        bootstrap_name.clone(),
-                        true,
-                        None,
-                        None,
-                    );
+                        model_id: bootstrap_model_id,
+                        model_name: bootstrap_name.clone(),
+                        is_bootstrap: true,
+                        artifacts: None,
+                        model_service: None,
+                    });
                     while let Some(item) = sub.next().await {
                         yield item?;
                     }
@@ -1289,7 +1474,7 @@ pub async fn bootstrap_with(request: Option<InitRequest>, model_service: Arc<Mod
 
         // 9. Done
         let project = {
-            let ws = pipeline_workspace(&model_service)?;
+            let ws = model_service.pipeline_workspace()?;
             let ws = ws.read();
             get_project_info(&ws, &existing_model_name)
         };
