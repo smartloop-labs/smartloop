@@ -12,6 +12,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde_json::Value;
 
+use crate::model::downloader::artifact_downloader::DownloadError;
 use crate::platform::SLPPlatformClient;
 
 /// `{filename: signed_url}`, in the order the platform returned them.
@@ -43,14 +44,18 @@ pub trait ArtifactPlatformClient: Send + Sync {
     fn list_bootstrap_models(&self) -> anyhow::Result<Vec<Value>>;
 }
 
+/// Platform failures are passed on as [`crate::platform::PlatformError`]
+/// inside the `anyhow::Error`, so callers can downcast to recover the kind
+/// (`ModelAccessError`, `PermissionError`, `ConnectionError`, ...).
 impl ArtifactPlatformClient for SLPPlatformClient {
     fn get_model_artifacts(&self, model_name: &str) -> anyhow::Result<ArtifactMap> {
-        let _ = model_name;
-        todo!()
+        let pairs = SLPPlatformClient::get_model_artifacts(self, model_name).map_err(anyhow::Error::new)?;
+        Ok(pairs.into_iter().collect())
     }
 
     fn list_bootstrap_models(&self) -> anyhow::Result<Vec<Value>> {
-        todo!()
+        let models = SLPPlatformClient::list_bootstrap_models(self).map_err(anyhow::Error::new)?;
+        Ok(models.into_iter().map(Value::Object).collect())
     }
 }
 
@@ -68,8 +73,7 @@ impl SLPModelSource {
 
 impl ArtifactSource for SLPModelSource {
     fn get_artifacts(&self, model_name: &str) -> anyhow::Result<ArtifactMap> {
-        let _ = (model_name, &self.platform_client);
-        todo!()
+        self.platform_client.get_model_artifacts(model_name)
     }
 
     fn requires_auth(&self) -> bool {
@@ -91,18 +95,60 @@ impl SLPBootstrapSource {
 
     /// Fetch and cache the bootstrap model list.
     pub fn list_models(&self) -> anyhow::Result<Vec<Value>> {
-        let _ = (&self.platform_client, &self.models);
-        todo!()
+        let mut models = self.models.lock();
+        if models.is_none() {
+            *models = Some(self.platform_client.list_bootstrap_models()?);
+        }
+        Ok(models.clone().unwrap_or_default())
     }
 }
 
+/// The `name` of a bootstrap catalog entry, if it has one (`m.get("name")`).
+pub fn entry_name(entry: &Value) -> Option<&str> {
+    entry.get("name").and_then(Value::as_str)
+}
+
+/// `", ".join(m.get("name", "?") for m in models)`.
+pub fn available_names(models: &[Value]) -> String {
+    models.iter().map(|m| entry_name(m).unwrap_or("?")).collect::<Vec<_>>().join(", ")
+}
+
+/// A catalog entry's `artifacts` dict as an [`ArtifactMap`] (empty when absent).
+pub fn entry_artifacts(entry: &Value) -> ArtifactMap {
+    entry
+        .get("artifacts")
+        .and_then(Value::as_object)
+        .map(|artifacts| {
+            artifacts
+                .iter()
+                .map(|(name, url)| {
+                    let url = url.as_str().map(str::to_string).unwrap_or_else(|| url.to_string());
+                    (name.clone(), url)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl ArtifactSource for SLPBootstrapSource {
-    /// Errors (ValueError in Python) with
+    /// Errors (ValueError in Python, [`DownloadError::Value`] here) with
     /// `"Model '<name>' not found in bootstrap. Available: a, b"` or
     /// `"No artifacts returned for bootstrap model '<name>'"`.
     fn get_artifacts(&self, model_name: &str) -> anyhow::Result<ArtifactMap> {
-        let _ = model_name;
-        todo!()
+        let models = self.list_models()?;
+        let Some(target) = models.iter().find(|m| entry_name(m) == Some(model_name)) else {
+            return Err(anyhow::Error::new(DownloadError::Value(format!(
+                "Model '{model_name}' not found in bootstrap. Available: {}",
+                available_names(&models)
+            ))));
+        };
+        let artifacts = entry_artifacts(target);
+        if artifacts.is_empty() {
+            return Err(anyhow::Error::new(DownloadError::Value(format!(
+                "No artifacts returned for bootstrap model '{model_name}'"
+            ))));
+        }
+        Ok(artifacts)
     }
 }
 
