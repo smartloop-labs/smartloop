@@ -9,3 +9,8 @@ pub mod sqlite_store;
 pub mod store;
 pub mod store_factory;
 pub mod workspace_indexer;
+
+pub use metadata_extractor::extract_document_metadata;
+pub use sqlite_store::IndexStore;
+pub use store::ChunkResult;
+pub use store_factory::StoreFactory;

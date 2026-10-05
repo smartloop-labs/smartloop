@@ -12,3 +12,12 @@ pub mod qwen2_vl_2b;
 pub mod qwen3_5_2b;
 pub mod slp_model;
 pub mod workers;
+
+pub use gemma4_2b::Gemma4_2bModel;
+pub use gemma4_4b::Gemma4_4bModel;
+pub use gemma_it::GemmaItModel;
+pub use gemma_it_text::GemmaItTextModel;
+pub use ministral_3b::Ministral3bModel;
+pub use qwen2_vl_2b::Qwen2VL_2bModel;
+pub use qwen3_5_2b::Qwen3_5_2bModel;
+pub use slp_model::SLPModel;

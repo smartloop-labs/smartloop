@@ -8,3 +8,7 @@ pub mod definitions;
 pub mod local_client;
 pub mod oauth;
 pub mod read_only_calls;
+
+pub use client::{MCPClient, MCPConnectResult, MCPToolCallResult};
+pub use local_client::LocalMCPClient;
+pub use oauth::MCPOAuthService;
