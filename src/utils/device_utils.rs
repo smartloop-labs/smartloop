@@ -5,6 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Logger name of the Python module.
+const LOGGER: &str = "smartloop.utils.device_utils";
+
 /// Detected compute device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DeviceType {
@@ -67,48 +70,84 @@ impl Default for DeviceConfig {
     }
 }
 
+/// Total system memory in GiB (psutil `virtual_memory().total / 1024**3`),
+/// or `None` when it cannot be determined.
+fn total_memory_gb() -> Option<f64> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let total = sys.total_memory();
+    if total == 0 {
+        return None;
+    }
+    Some(total as f64 / (1024f64 * 1024.0 * 1024.0))
+}
+
 impl DeviceConfig {
     /// Detect the device and attention implementation.
     pub fn new() -> Self {
-        todo!()
+        let device = Self::detect_device();
+        let attn_implementation = Self::get_attention_implementation(device);
+        Self { device, attn_implementation }
     }
 
     /// Detect the best available device via llama.cpp.
     fn detect_device() -> DeviceType {
-        todo!()
+        if llama_gpu_offload() {
+            return if cfg!(target_os = "macos") { DeviceType::Mps } else { DeviceType::Cuda };
+        }
+        DeviceType::Cpu
     }
 
     /// Human-readable description of the device.
     pub fn get_device_description(&self) -> String {
-        todo!()
+        match self.device {
+            DeviceType::Cuda => "NVIDIA GPU",
+            DeviceType::Mps => "Apple Metal GPU",
+            DeviceType::Cpu => "CPU",
+        }
+        .to_string()
     }
 
     /// Best attention implementation for the device ("sdpa" or "eager").
     fn get_attention_implementation(device: DeviceType) -> String {
-        let _ = device;
-        todo!()
+        match device {
+            DeviceType::Cuda | DeviceType::Mps => "sdpa",
+            DeviceType::Cpu => "eager",
+        }
+        .to_string()
     }
 
     /// Configuration for llama.cpp based on the device.
     pub fn get_llama_cpp_config(&self, n_parallel: u32) -> LlamaCppConfig {
-        let _ = n_parallel;
-        todo!()
+        let n_gpu_layers = if crate::llms::llama::llama_supports_gpu_offload() { -1 } else { 0 };
+        LlamaCppConfig { n_gpu_layers, verbose: false, n_parallel: n_parallel.max(1) }
     }
 
     /// Optimal batch size based on device.
     pub fn get_batch_size(&self) -> usize {
-        todo!()
+        match self.device {
+            DeviceType::Cuda => 4,
+            DeviceType::Mps => match total_memory_gb() {
+                Some(total_memory_gb) => ((total_memory_gb / 4.0) as usize).clamp(2, 8),
+                None => 4,
+            },
+            DeviceType::Cpu => 2,
+        }
     }
 
     /// Log the current device configuration.
     pub fn log_config(&self) {
-        todo!()
+        tracing::info!(target: LOGGER, "Device Configuration:");
+        tracing::info!(target: LOGGER, "  Device: {}", self.device.value());
+        tracing::info!(target: LOGGER, "  Attention implementation: {}", self.attn_implementation);
     }
 }
 
 /// Get a device configuration instance (and log it).
 pub fn get_device_config() -> DeviceConfig {
-    todo!()
+    let config = DeviceConfig::new();
+    config.log_config();
+    config
 }
 
 /// True when the linked llama.cpp was built with a GPU backend.
@@ -117,23 +156,39 @@ pub fn get_device_config() -> DeviceConfig {
 /// GPU availability and device memory are managed by llama.cpp / the backend
 /// (Vulkan, Metal, CUDA) — VRAM is never probed directly.
 pub fn llama_gpu_offload() -> bool {
-    todo!()
+    // Python wraps the llama_cpp import + call in `except Exception: return False`.
+    std::panic::catch_unwind(crate::llms::llama::llama_supports_gpu_offload).unwrap_or(false)
 }
 
 /// Check if running on Apple Silicon (macOS).
 pub fn is_apple_silicon() -> bool {
-    todo!()
+    cfg!(target_os = "macos")
 }
 
 /// Upper bound (tokens) the llama.cpp factory will auto-size a model's
-/// context window to on this device when no explicit cap is set
-/// (131072 on >=32GB, 65536 on >=16GB, else 32768 on Apple Silicon; 8192
-/// elsewhere).
+/// context window to on this device when no explicit cap is set.
+///
+/// Mirrors the Apple Silicon logic in `LlmFactory::get_llama_cpp_instance`
+/// (131072 on >=32GB, 65536 on >=16GB, else 32768; the factory then picks the
+/// smaller of this bound and the memory-derived estimate).  Memory estimators
+/// (worker-pool sizing, large-model fit guard) use this so "no cap" still
+/// accounts for a realistic KV-cache footprint instead of zero.
 pub fn max_auto_context_tokens() -> u32 {
-    todo!()
+    if is_apple_silicon() {
+        if let Some(total_gb) = total_memory_gb() {
+            return if total_gb >= 32.0 {
+                131072
+            } else if total_gb >= 16.0 {
+                65536
+            } else {
+                32768
+            };
+        }
+    }
+    8192
 }
 
 /// True on Apple Silicon with a llama.cpp Metal (GPU offload) backend.
 pub fn is_mps() -> bool {
-    todo!()
+    cfg!(target_os = "macos") && llama_gpu_offload()
 }
