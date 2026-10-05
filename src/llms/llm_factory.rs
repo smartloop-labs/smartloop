@@ -52,7 +52,7 @@ pub fn cpu_count() -> usize {
 /// Vulkan-only llama.cpp must not get CUDA-specific load options — so the
 /// answer comes from llama.cpp itself: the CUDA feature it was compiled with,
 /// or a registered CUDA backend device.
-fn llama_cpp_has_cuda_backend() -> bool {
+pub fn llama_cpp_has_cuda_backend() -> bool {
     if cfg!(feature = "cuda") {
         return true;
     }
