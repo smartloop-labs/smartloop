@@ -27,6 +27,7 @@ use serial_test::serial;
 use smartloop::api::routers::downloads;
 use smartloop::api::routers::init::{self as init_router_module, InitRequest};
 use smartloop::api::services::ModelService;
+use smartloop::api::services::model_service::ModelServiceError;
 use smartloop::model::downloader::artifact_downloader::SLPArtifactDownloader;
 use smartloop::model::downloader::artifact_source::ArtifactMap;
 use smartloop::model::downloader::cancellation::{self, DownloadCancelled, Event};
@@ -249,11 +250,11 @@ mod test_resolving_the_model {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "needs a seam to make ModelService::ensure_workspace fail (the Python test sets \
-                `_ensure_workspace.side_effect = RuntimeError(...)` on a MagicMock); the api units own it"]
     async fn test_a_workspace_failure_is_a_503() {
         let fx = Fixture::new(true);
-        *fx.service.model.write() = None;
+        fx.service.hooks.write().ensure_workspace = Some(Arc::new(|_config| {
+            Err(ModelServiceError::runtime("Workspace not initialized"))
+        }));
 
         let (status, _body) = fx.delete(MODEL_NAME, 0).await;
 
