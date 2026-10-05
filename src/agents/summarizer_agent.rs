@@ -4,7 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::agents::agent::{Agent, PromptTemplate, SharedLLM};
+use crate::agents::agent::{parse_output, repair_json, Agent, PromptTemplate, SharedLLM};
+
+/// Logger name used for this agent's messages.
+const LOG_TARGET: &str = "smartloop.agents.summarizer_agent";
 
 /// A summary and its keywords.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -40,7 +43,17 @@ impl SummarizerAgent {
 
     /// Summarize `document`; errors yield an empty summary.
     pub fn invoke(&self, document: &str) -> SummarizerResponse {
-        let _ = document;
-        todo!()
+        let attempt = || -> anyhow::Result<SummarizerResponse> {
+            let formatted_prompt = self.base.prompt.format(&[("document", document)])?;
+            let response = self.base.llm.invoke(&formatted_prompt, None, None);
+            parse_output::<SummarizerResponse>(&repair_json(&response))
+        };
+        match attempt() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target: LOG_TARGET, "Error generating prompts: {}", e);
+                SummarizerResponse { text: String::new(), keywords: Vec::new() }
+            }
+        }
     }
 }
