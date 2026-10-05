@@ -1771,3 +1771,7 @@ fn supervisor_stub_entry() {
 }
 
 // ===== END unit: supervisor =======================================================
+
+// ===== agents_core (begin) =====
+pub mod agents_core;
+// ===== agents_core (end) =====
