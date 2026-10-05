@@ -335,8 +335,10 @@ pub struct SLPArtifactDownloader {
     workspace: Option<SharedWorkspace>,
     models_dir_override: Option<PathBuf>,
     pub logger: SharedLogger,
-    /// The token a stop request will raise.
-    pub cancel_token: CancelToken,
+    /// The token a stop request will raise.  Replaceable after construction
+    /// (`downloader.cancel_token = token` in Python): `/v1/init` claims the
+    /// registry entry on its download thread and hands the token over there.
+    cancel_token: parking_lot::RwLock<CancelToken>,
     pub settings: Option<AppSettings>,
     model_source: Arc<dyn ArtifactSource>,
     bootstrap_source: Arc<dyn BootstrapArtifactSource>,
@@ -361,6 +363,22 @@ impl SLPArtifactDownloader {
     pub fn for_tests(models_dir: Option<PathBuf>, logger: SharedLogger, cancel: Option<CancelToken>) -> Self {
         let _ = (models_dir, logger, cancel);
         todo!()
+    }
+
+    /// The token a stop request will raise (a handle to the same flag).
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel_token.read().clone()
+    }
+
+    /// Replace the token every later check consults.
+    pub fn set_cancel_token(&self, token: CancelToken) {
+        *self.cancel_token.write() = token;
+    }
+
+    /// The bootstrap catalog source (`_bootstrap_source`), which
+    /// `POST /v1/bootstrap` lists to pick the first-run model.
+    pub fn bootstrap_source(&self) -> Arc<dyn BootstrapArtifactSource> {
+        self.bootstrap_source.clone()
     }
 
     /// Replace the authenticated model source (`_model_source`).
