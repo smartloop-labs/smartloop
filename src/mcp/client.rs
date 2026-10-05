@@ -229,13 +229,17 @@ impl HttpTransport for ReqwestTransport {
         for (k, v) in headers {
             req = req.header(k.as_str(), v.as_str());
         }
+        let has_ct = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
         req = match body {
             HttpBody::Json(value) => {
-                let has_ct = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
                 let req = req.body(value.to_string());
                 if has_ct { req } else { req.header("Content-Type", "application/json") }
             }
-            HttpBody::Form(pairs) => req.form(pairs),
+            HttpBody::Form(pairs) => {
+                let encoded: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let req = req.body(crate::mcp::oauth::urlencode(&encoded));
+                if has_ct { req } else { req.header("Content-Type", "application/x-www-form-urlencoded") }
+            }
         };
         let resp = req.send().map_err(|e| e.to_string())?;
         Self::finish(resp)

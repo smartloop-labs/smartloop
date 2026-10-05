@@ -254,8 +254,9 @@ fn quote_plus(s: &str) -> String {
     out
 }
 
-/// `urllib.parse.urlencode` over ordered pairs.
-fn urlencode(params: &[(&str, &str)]) -> String {
+/// `urllib.parse.urlencode` over ordered pairs (also how httpx encodes a
+/// `data=` form body).
+pub(crate) fn urlencode(params: &[(&str, &str)]) -> String {
     params
         .iter()
         .map(|(k, v)| format!("{}={}", quote_plus(k), quote_plus(v)))
