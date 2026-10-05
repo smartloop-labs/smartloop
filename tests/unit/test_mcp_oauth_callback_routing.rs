@@ -153,6 +153,18 @@ mod the_callback_refuses_rather_than_spend_the_code {
         }
     }
 
+    /// These tests need two serial keys at once: `mcp_global` (the router's
+    /// pending OAuth sessions and hooks, shared with every other MCP test) and
+    /// the default one (the process pin / delegation that
+    /// `ProcessScopeReset` owns, shared with the other workspace tests).
+    /// `#[serial]` cannot name the default key alongside another, so the test
+    /// holds `mcp_global` through the attribute and takes the default key
+    /// here -- the same order `ServiceEnv` takes them in, so it cannot
+    /// deadlock.
+    async fn with_process_scope(body: impl std::future::Future<Output = ()>) {
+        serial_test::local_async_serial_core(vec![""], None, body).await;
+    }
+
     fn setup_method() {
         module::PENDING_OAUTH_SESSIONS.lock().clear();
         module::COMPLETED_OAUTH_RESPONSES.lock().clear();
@@ -208,25 +220,31 @@ mod the_callback_refuses_rather_than_spend_the_code {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_a_delegating_supervisor_refuses_before_exchanging() {
-        let _reset = ProcessScopeReset::new();
-        let _hooks = HooksReset;
-        setup_method();
-        let (response, exchanged) = call(None, "p1", true).await;
-        assert_eq!(response.status_code(), 500);
-        assert_eq!(exchanged, 0, "the code was exchanged");
+        with_process_scope(async {
+            let _reset = ProcessScopeReset::new();
+            let _hooks = HooksReset;
+            setup_method();
+            let (response, exchanged) = call(None, "p1", true).await;
+            assert_eq!(response.status_code(), 500);
+            assert_eq!(exchanged, 0, "the code was exchanged");
+        })
+        .await;
     }
 
     /// The redirect named one project; the session belongs to another.
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_a_mismatched_route_refuses_before_exchanging() {
-        let _reset = ProcessScopeReset::new();
-        let _hooks = HooksReset;
-        setup_method();
-        let (response, exchanged) = call(Some("p2"), "p1", false).await;
-        assert_eq!(response.status_code(), 500);
-        assert_eq!(exchanged, 0, "the code was exchanged");
+        with_process_scope(async {
+            let _reset = ProcessScopeReset::new();
+            let _hooks = HooksReset;
+            setup_method();
+            let (response, exchanged) = call(Some("p2"), "p1", false).await;
+            assert_eq!(response.status_code(), 500);
+            assert_eq!(exchanged, 0, "the code was exchanged");
+        })
+        .await;
     }
 }

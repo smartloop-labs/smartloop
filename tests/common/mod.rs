@@ -784,6 +784,53 @@ pub mod mcp {
         /// What every request made while the env lives was answered by.
         pub http: Arc<FakeHttp>,
         _http: smartloop::mcp::client::HttpTransportOverride,
+        /// Declared last so it is released after `Drop` has put the
+        /// process-wide workspace state back.
+        _scope: ProcessScopeLock,
+    }
+
+    /// Holds the default `#[serial]` key for as long as it lives.
+    ///
+    /// `ServiceEnv` sets process-wide workspace state -- the project pin, the
+    /// config file and the settings home -- that the `#[serial]` workspace
+    /// tests own and reset under the default key, while its users run under
+    /// `#[serial(mcp_global)]` for the MCP state.  They need both keys, and
+    /// the attribute cannot name the default one next to another, so the
+    /// default key is taken here, after `mcp_global`.  Everything that holds
+    /// both takes them in that order (`mcp_global`, then the default), so it
+    /// cannot deadlock.
+    ///
+    /// serial_test only hands its lock out around a closure, and the guard is
+    /// tied to the thread that took it, so a helper thread takes the key and
+    /// sits on it until this is dropped.
+    pub struct ProcessScopeLock {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        holder: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ProcessScopeLock {
+        pub fn acquire() -> Self {
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                futures::executor::block_on(serial_test::local_async_serial_core(vec![""], None, async move {
+                    let _ = acquired_tx.send(());
+                    // Released when the sender is dropped.
+                    let _ = release_rx.recv();
+                }));
+            });
+            acquired_rx.recv().expect("the default serial key was taken");
+            Self { release: Some(release_tx), holder: Some(holder) }
+        }
+    }
+
+    impl Drop for ProcessScopeLock {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            if let Some(holder) = self.holder.take() {
+                let _ = holder.join();
+            }
+        }
     }
 
     impl ServiceEnv {
@@ -792,6 +839,7 @@ pub mod mcp {
             use smartloop::model::model_manager::Model;
             use smartloop::workspace::workspace::{Project, Workspace};
 
+            let scope = ProcessScopeLock::acquire();
             // conftest's autouse `_reset_project_pin`: an unpinned process
             // writes every project's file.
             smartloop::workspace::context::pin_project(None);
@@ -819,7 +867,7 @@ pub mod mcp {
             // injected model as the loaded default and keep it.
             *model_service.model_name.write() =
                 Some(smartloop::api::config::api_settings().default_model);
-            Self { model_service, workspace, home, http: fake, _http: http }
+            Self { model_service, workspace, home, http: fake, _http: http, _scope: scope }
         }
 
         /// Store `server` on the project.
