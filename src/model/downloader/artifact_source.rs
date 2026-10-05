@@ -31,8 +31,9 @@ pub trait ArtifactSource: Send + Sync {
 
 /// An artifact source that can also list the bootstrap catalog.
 pub trait BootstrapArtifactSource: ArtifactSource {
-    /// Fetch (and cache) the bootstrap model list (`list[dict]`).
-    fn list_models(&self) -> anyhow::Result<Vec<Value>>;
+    /// Fetch (and cache) the bootstrap model list (`list[dict]`).  The
+    /// cached list is shared, so repeated calls hand back the same object.
+    fn list_models(&self) -> anyhow::Result<Arc<Vec<Value>>>;
 }
 
 /// The slice of [`SLPPlatformClient`] the artifact sources use; a trait so
@@ -84,7 +85,7 @@ impl ArtifactSource for SLPModelSource {
 /// Unauthenticated artifact source using the `/v1/bootstrap/models` endpoint.
 pub struct SLPBootstrapSource {
     platform_client: Arc<dyn ArtifactPlatformClient>,
-    models: Mutex<Option<Vec<Value>>>,
+    models: Mutex<Option<Arc<Vec<Value>>>>,
 }
 
 impl SLPBootstrapSource {
@@ -93,13 +94,16 @@ impl SLPBootstrapSource {
         Self { platform_client, models: Mutex::new(None) }
     }
 
-    /// Fetch and cache the bootstrap model list.
-    pub fn list_models(&self) -> anyhow::Result<Vec<Value>> {
+    /// Fetch and cache the bootstrap model list.  Every call after the first
+    /// returns the same cached list (`first is second` in Python).
+    pub fn list_models(&self) -> anyhow::Result<Arc<Vec<Value>>> {
         let mut models = self.models.lock();
-        if models.is_none() {
-            *models = Some(self.platform_client.list_bootstrap_models()?);
+        if let Some(cached) = models.as_ref() {
+            return Ok(Arc::clone(cached));
         }
-        Ok(models.clone().unwrap_or_default())
+        let fetched = Arc::new(self.platform_client.list_bootstrap_models()?);
+        *models = Some(Arc::clone(&fetched));
+        Ok(fetched)
     }
 }
 
@@ -153,7 +157,7 @@ impl ArtifactSource for SLPBootstrapSource {
 }
 
 impl BootstrapArtifactSource for SLPBootstrapSource {
-    fn list_models(&self) -> anyhow::Result<Vec<Value>> {
+    fn list_models(&self) -> anyhow::Result<Arc<Vec<Value>>> {
         SLPBootstrapSource::list_models(self)
     }
 }

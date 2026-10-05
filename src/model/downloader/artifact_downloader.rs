@@ -285,17 +285,25 @@ impl DownloadError {
     /// [`DownloadError`] (e.g. a bootstrap `ValueError`) is unwrapped so its
     /// kind survives the trip through `anyhow`.
     pub fn from_source(err: anyhow::Error) -> Self {
-        match err.downcast::<DownloadError>() {
-            Ok(inner) => inner,
+        let err = match err.downcast::<DownloadError>() {
+            Ok(inner) => return inner,
+            Err(err) => err,
+        };
+        match err.downcast::<DownloadCancelled>() {
+            Ok(cancelled) => DownloadError::Cancelled(cancelled),
             Err(err) => DownloadError::Source(err),
         }
     }
 
-    /// Convert into an `anyhow::Error`; a [`DownloadError::Source`] hands back
-    /// the original error so callers can downcast it directly.
+    /// Convert into an `anyhow::Error`.  A [`DownloadError::Source`] hands
+    /// back the original error and a plain cancel becomes a bare
+    /// [`DownloadCancelled`], so callers can downcast either directly; every
+    /// other kind stays a [`DownloadError`] (see [`cancelled_in`] for a
+    /// lookup that finds a cancel in any of these shapes).
     pub fn into_anyhow(self) -> anyhow::Error {
         match self {
             DownloadError::Source(err) => err,
+            DownloadError::Cancelled(cancelled) => anyhow::Error::new(cancelled),
             other => anyhow::Error::new(other),
         }
     }
@@ -385,6 +393,19 @@ impl DownloadError {
             _ => None,
         }
     }
+}
+
+/// The [`DownloadCancelled`] an `anyhow::Error` carries, whether as a bare
+/// cancel or as a [`DownloadError`] cancel anywhere in its chain — the
+/// `isinstance(exc, DownloadCancelled)` test for errors that crossed an
+/// `anyhow` boundary (e.g. [`SLPDownloader::download`]).
+pub fn cancelled_in(err: &anyhow::Error) -> Option<DownloadCancelled> {
+    err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<DownloadCancelled>()
+            .cloned()
+            .or_else(|| cause.downcast_ref::<DownloadError>().and_then(DownloadError::as_cancelled).cloned())
+    })
 }
 
 /// Python's `ConnectionError` subclasses among OS errors.
@@ -713,7 +734,7 @@ impl ArtifactSource for UnconfiguredSource {
 }
 
 impl BootstrapArtifactSource for UnconfiguredSource {
-    fn list_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+    fn list_models(&self) -> anyhow::Result<Arc<Vec<serde_json::Value>>> {
         anyhow::bail!("no bootstrap source configured")
     }
 }
@@ -769,8 +790,10 @@ pub struct SLPArtifactDownloader {
     workspace: Option<SharedWorkspace>,
     models_dir_override: Option<PathBuf>,
     pub logger: SharedLogger,
-    /// The token a stop request will raise.
-    pub cancel_token: CancelToken,
+    /// The token a stop request will raise.  Replaceable after construction
+    /// (`downloader.cancel_token = token` in Python): `/v1/init` claims the
+    /// registry entry on its download thread and hands the token over there.
+    cancel_token: parking_lot::RwLock<CancelToken>,
     pub settings: Option<AppSettings>,
     model_source: Arc<dyn ArtifactSource>,
     bootstrap_source: Arc<dyn BootstrapArtifactSource>,
@@ -798,7 +821,7 @@ impl SLPArtifactDownloader {
             workspace: Some(workspace),
             models_dir_override: None,
             logger,
-            cancel_token: cancel.unwrap_or_default(),
+            cancel_token: parking_lot::RwLock::new(cancel.unwrap_or_default()),
             settings: Some(settings),
             model_source: Arc::new(SLPModelSource::new(platform_client.clone())),
             bootstrap_source: Arc::new(SLPBootstrapSource::new(platform_client)),
@@ -818,7 +841,7 @@ impl SLPArtifactDownloader {
             workspace: None,
             models_dir_override: models_dir,
             logger,
-            cancel_token: cancel.unwrap_or_default(),
+            cancel_token: parking_lot::RwLock::new(cancel.unwrap_or_default()),
             settings: None,
             model_source: Arc::new(UnconfiguredSource),
             bootstrap_source: Arc::new(UnconfiguredSource),
@@ -828,6 +851,16 @@ impl SLPArtifactDownloader {
             download_chunk_hook: Mutex::new(None),
             chunk_workers_override: Mutex::new(None),
         }
+    }
+
+    /// The token a stop request will raise (a handle to the same flag).
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel_token.read().clone()
+    }
+
+    /// Replace the token every later check consults.
+    pub fn set_cancel_token(&self, token: CancelToken) {
+        *self.cancel_token.write() = token;
     }
 
     /// Replace the authenticated model source (`_model_source`).
@@ -926,7 +959,7 @@ impl SLPArtifactDownloader {
         attempt_fn: &mut dyn FnMut(u32) -> DownloadResult<T>,
     ) -> DownloadResult<T> {
         for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
-            self.cancel_token.check(description)?;
+            self.cancel_token().check(description)?;
             let exc = match attempt_fn(attempt) {
                 Ok(value) => return Ok(value),
                 Err(exc) => exc,
@@ -945,7 +978,7 @@ impl SLPArtifactDownloader {
             // outage.  Backoff reaches 30s and the window is ~90s in total, so
             // a plain sleep here is where a stop request would spend most of
             // its time waiting on a transfer that is not even transferring.
-            if self.cancel_token.wait(delay) {
+            if self.cancel_token().wait(delay) {
                 return Err(DownloadError::CancelledBy {
                     cancelled: DownloadCancelled(format!("{description} cancelled")),
                     cause: Box::new(exc),
@@ -1007,7 +1040,7 @@ impl SLPArtifactDownloader {
         let mut skipped = 0usize;
 
         for (filename, url) in artifacts {
-            self.cancel_token.check("download")?;
+            self.cancel_token().check("download")?;
             let flat_name = basename(filename);
             let local_path = local_dir.join(flat_name);
             let (size, remote_md5, accept_ranges) = self.get_remote_file_info(url)?;
@@ -1101,7 +1134,7 @@ impl SLPArtifactDownloader {
         // the last worker is unwinding would otherwise tell the client the
         // download completed, and the stream would go on to mark the model
         // downloaded.
-        self.cancel_token.check("download")?;
+        self.cancel_token().check("download")?;
         aggregate.finish();
         self.logger.info(&format!("[ok] {log_prefix} downloaded to: {}", log_dir.display()));
         Ok(local_dir.to_path_buf())
@@ -1132,14 +1165,14 @@ impl SLPArtifactDownloader {
 
         // On entry, so a worker the pool starts after the flag was raised
         // exits before opening a socket.
-        self.cancel_token.check(flat_name)?;
+        self.cancel_token().check(flat_name)?;
 
         let dest = local_dir.join(flat_name);
         let part = PathBuf::from(format!("{}.part", dest.display()));
         let size_mb = size as f64 / (1024.0 * 1024.0);
 
         for verify_attempt in 1..=MAX_VERIFY_ATTEMPTS {
-            self.cancel_token.check(flat_name)?;
+            self.cancel_token().check(flat_name)?;
             // Start each verification attempt from a clean slate so we never
             // resume onto bytes a previous corrupt attempt wrote.
             if part.exists() {
@@ -1165,7 +1198,7 @@ impl SLPArtifactDownloader {
                 break;
             };
 
-            let local_md5 = Self::compute_local_md5(&part, Some(&self.cancel_token))?;
+            let local_md5 = Self::compute_local_md5(&part, Some(&self.cancel_token()))?;
             if local_md5 == expected {
                 break;
             }
@@ -1245,7 +1278,7 @@ impl SLPArtifactDownloader {
                 // Returning from inside the stream is what closes the socket:
                 // dropping `resp` drops the connection rather than leaving it
                 // to the 60s read timeout.
-                self.cancel_token.check(flat_name)?;
+                self.cancel_token().check(flat_name)?;
                 file.write_all(&chunk)?;
                 downloaded += chunk.len() as u64;
                 if let Some(callback) = &progress_callback {
@@ -1282,7 +1315,7 @@ impl SLPArtifactDownloader {
         // On entry, so a range the pool starts after the flag was raised exits
         // before opening a socket.  Every model worth downloading is over
         // CHUNKED_THRESHOLD, so this pool is where a cancel usually lands.
-        self.cancel_token.check(flat_name)?;
+        self.cancel_token().check(flat_name)?;
 
         let mut attempt = |_attempt_no: u32| -> DownloadResult<()> {
             let cur_start = start + written;
@@ -1299,7 +1332,7 @@ impl SLPArtifactDownloader {
             let mut file = OpenOptions::new().read(true).write(true).open(dest)?;
             file.seek(SeekFrom::Start(cur_start))?;
             while let Some(chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
-                self.cancel_token.check(flat_name)?;
+                self.cancel_token().check(flat_name)?;
                 file.write_all(&chunk)?;
                 written += chunk.len() as u64;
                 if let Some(callback) = &progress_callback {
