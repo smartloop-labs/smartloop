@@ -13,12 +13,24 @@
 //! `Step` here is a stage of the orchestration itself — evaluating retrieved
 //! context, reducing documents — and a single Step may build many DAG nodes.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 use crate::agents::mcp::explorer::SearchContext;
 use crate::agents::nodes::{AgentNode, NodeHandler};
 use crate::agents::orchestration::context::{OrchestratorContext, SharedOrchestratorContext};
 
 /// One DAG node and the handler that runs it.
 pub type NodePair = (AgentNode, NodeHandler);
+
+/// The request's search context as threaded through DAG handlers.  Python
+/// shared one mutable `SearchContext` object: the judge clears the sources it
+/// rejects and the document reduce replaces the vector context and citations,
+/// and every later handler (and the orchestrator, after the walk) reads the
+/// updated object.  Same type as
+/// `pipeline_builder::SharedSearchContext`.
+pub type SharedSearchContext = Arc<Mutex<SearchContext>>;
 
 /// What a step contributed to the DAG.
 ///
@@ -76,10 +88,14 @@ pub trait Step: Send + Sync {
     }
 
     /// Build the node(s) and handler(s) this step contributes.
+    ///
+    /// Handlers capture `search_ctx` and may mutate it when they run.  `build`
+    /// itself takes the context and search-context locks only briefly, so the
+    /// caller must not hold either lock while calling it.
     fn build(
         &self,
         ctx: &SharedOrchestratorContext,
-        search_ctx: Option<&SearchContext>,
+        search_ctx: Option<&SharedSearchContext>,
         parent: &AgentNode,
     ) -> StepNodes;
 }
