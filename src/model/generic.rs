@@ -154,6 +154,15 @@ fn status_name(status: DocumentStatus) -> String {
     status.as_str().to_uppercase()
 }
 
+/// The whole response body.  Read in pieces so the 60s timeout bounds each
+/// read (httpx's per-operation timeout) rather than the whole transfer.
+fn read_body(mut response: reqwest::blocking::Response) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut content = Vec::new();
+    response.read_to_end(&mut content)?;
+    Ok(content)
+}
+
 fn http_client() -> anyhow::Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
@@ -310,7 +319,7 @@ impl GenericModel {
             }
 
             let download_path = tmp_dir.join(&filename);
-            let content = response.bytes()?;
+            let content = read_body(response)?;
             fs::write(&download_path, &content)?;
 
             self.logger.info(&format!("Downloaded to: {}", download_path.display()));
@@ -342,7 +351,7 @@ impl GenericModel {
 
             let response = http_client()?.get(url).send()?;
             let response = response.error_for_status()?;
-            let content = response.bytes()?;
+            let content = read_body(response)?;
             fs::write(&download_path, &content)?;
 
             self.logger.info(&format!("Downloaded to: {}", download_path.display()));
@@ -923,4 +932,36 @@ macro_rules! generic_model_type {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_split_matches_urllib() {
+        let parts = url_split("https://example.com/a/b.pdf?x=1#frag").unwrap();
+        assert_eq!(parts.scheme, "https");
+        assert_eq!(parts.netloc, "example.com");
+        assert_eq!(parts.path, "/a/b.pdf");
+
+        // A Windows drive letter parses as a scheme with no netloc.
+        let parts = url_split("C:\\Users\\me\\doc.pdf").unwrap();
+        assert_eq!(parts.scheme, "c");
+        assert_eq!(parts.netloc, "");
+
+        // file:///x has an empty netloc.
+        assert_eq!(url_split("file:///tmp/x.txt").unwrap().netloc, "");
+        assert!(url_split("http://[::1/x").is_err());
+    }
+
+    #[test]
+    fn pathlib_name_helpers() {
+        assert_eq!(pure_name("/a/b.pdf"), "b.pdf");
+        assert_eq!(pure_name("/a/b/"), "b");
+        assert_eq!(pure_name("/"), "");
+        assert_eq!(stem_and_suffix("report.final.pdf"), ("report.final".to_string(), ".pdf".to_string()));
+        assert_eq!(stem_and_suffix(".bashrc"), (".bashrc".to_string(), String::new()));
+        assert_eq!(stem_and_suffix("trailing."), ("trailing.".to_string(), String::new()));
+    }
 }
