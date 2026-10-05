@@ -4386,6 +4386,7 @@ dependencies = [
  "indicatif",
  "libc",
  "llama-cpp-2",
+ "markup5ever_rcdom",
  "md-5",
  "mime_guess",
  "mockall",
