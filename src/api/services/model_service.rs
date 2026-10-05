@@ -447,6 +447,10 @@ pub struct ModelServiceHooks {
     pub generate_completion: Option<Arc<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>>,
     /// Replaces `_get_project(project_id)`.
     pub get_project: Option<Arc<dyn Fn(&str) -> anyhow::Result<Project> + Send + Sync>>,
+    /// Replaces `_ensure_workspace(model_config)` (the API tests'
+    /// `model_service._ensure_workspace.side_effect = ...`).
+    pub ensure_workspace:
+        Option<Arc<dyn Fn(Option<&ModelConfig>) -> anyhow::Result<Arc<RwLock<Workspace>>> + Send + Sync>>,
     /// Replaces `load_model()` (the API tests' `model_service.load_model =
     /// MagicMock(side_effect=...)`).
     pub load_model: Option<Arc<dyn Fn() -> anyhow::Result<Arc<dyn BaseLLM>> + Send + Sync>>,
@@ -1091,6 +1095,9 @@ impl ModelService {
     /// returned directly.  Otherwise the workspace is loaded from disk,
     /// falling back to `Workspace::init` when no workspace exists yet.
     pub fn ensure_workspace(&self, model_config: Option<ModelConfig>) -> anyhow::Result<Arc<RwLock<Workspace>>> {
+        if let Some(hook) = self.hooks().ensure_workspace {
+            return hook(model_config.as_ref());
+        }
         if let Some(workspace) = self.workspace_handle() {
             if pinned_project_id().is_some() {
                 // A child holds the workspace it loaded at spawn, and the
