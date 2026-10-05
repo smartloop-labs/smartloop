@@ -30,6 +30,12 @@ impl LLMExecutor {
         todo!()
     }
 
+    /// The underlying project-bound I/O pool (Python `executor._io_pool`,
+    /// handed to the explorer's parallel collect).
+    pub fn io_pool(&self) -> &ProjectBoundExecutor {
+        &self.io_pool
+    }
+
     /// Submit I/O-bound work (search, MCP calls) to the thread pool.
     pub fn submit_io<F, R>(&self, f: F) -> PoolFuture<R>
     where
