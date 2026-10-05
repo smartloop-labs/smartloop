@@ -1,5 +1,31 @@
 //! Port of `tests/conftest.py` (shared fixtures).
 
+// ===================== process-wide home isolation =====================
+/// Pytest isolated every test through autouse fixtures; Rust has no
+/// equivalent, so a test that forgot to redirect `SLP_HOME` used to read and
+/// write the developer's real `~/.smartloop` (config.json included).  Before
+/// any test in this binary runs, point `HOME` and `SLP_HOME` at a private
+/// temp directory.  Tests that set `SLP_HOME` themselves still do; their
+/// guards restore it to this directory, never to the real home.
+#[ctor::ctor(unsafe)]
+fn isolate_process_home() {
+    let root = tempfile::Builder::new()
+        .prefix("slp-test-home-")
+        .tempdir()
+        .expect("create isolated test home")
+        .keep();
+    let slp_home = root.join(".smartloop");
+    std::fs::create_dir_all(&slp_home).expect("create isolated SLP_HOME");
+    // SAFETY: runs before main, while the process is still single-threaded.
+    unsafe {
+        std::env::set_var("HOME", &root);
+        std::env::set_var("SLP_HOME", &slp_home);
+        std::env::remove_var("SLP_CONFIG_FILE");
+        std::env::remove_var("SNAP_NAME");
+        std::env::remove_var("SNAP_REAL_HOME");
+    }
+}
+
 // ======================= BEGIN unit: core ========================
 /// Test support shared by the core unit's tests: the conftest autouse
 /// `_isolate_credential_store`, which redirects the credential store to a

@@ -149,15 +149,24 @@ fn workspace_env() -> WorkspaceEnv {
 ///
 /// Need to patch the settings in both project_io and workspace modules so that
 /// `Workspace::load()` re-resolves paths against the temp dir.
-struct Patches;
+/// Restores every patch on drop, `SLP_HOME` included: the workspace reads
+/// `SLP_HOME` before the settings' home (as Python's `_home_dir` does), so
+/// the env var has to name the fixture home too, not the process-wide
+/// isolated one.
+struct Patches {
+    saved_slp_home: Option<std::ffi::OsString>,
+}
 
 fn patch_settings(env: &WorkspaceEnv) -> Patches {
+    let saved_slp_home = std::env::var_os("SLP_HOME");
+    // SAFETY: every test in this file is #[serial].
+    unsafe { std::env::set_var("SLP_HOME", &env.home_dir) };
     let mut settings = AppSettings::new();
     settings.slp_home = Some(env.home_dir.clone());
     project_io::set_settings(Some(settings));
     ws_mod::set_settings_home_dir(Some(env.home_dir.clone()));
     Workspace::set_config_file(Some(env.config_file.clone()));
-    Patches
+    Patches { saved_slp_home }
 }
 
 impl Drop for Patches {
@@ -166,6 +175,13 @@ impl Drop for Patches {
         ws_mod::set_settings_home_dir(None);
         Workspace::set_config_file(None);
         Workspace::reset();
+        // SAFETY: every test in this file is #[serial].
+        unsafe {
+            match self.saved_slp_home.take() {
+                Some(home) => std::env::set_var("SLP_HOME", home),
+                None => std::env::remove_var("SLP_HOME"),
+            }
+        }
     }
 }
 

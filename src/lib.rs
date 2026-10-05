@@ -60,3 +60,28 @@ pub fn init_process_env() {
         std::env::set_var("TRANSFORMERS_VERBOSITY", "error");
     }
 }
+
+/// Library unit tests get the same isolation as the integration targets
+/// (see `isolate_process_home` in tests/common/mod.rs): never the real
+/// `~/.smartloop`.
+#[cfg(test)]
+mod test_home_isolation {
+    #[ctor::ctor(unsafe)]
+    fn isolate_process_home() {
+        let root = tempfile::Builder::new()
+            .prefix("slp-test-home-")
+            .tempdir()
+            .expect("create isolated test home")
+            .keep();
+        let slp_home = root.join(".smartloop");
+        std::fs::create_dir_all(&slp_home).expect("create isolated SLP_HOME");
+        // SAFETY: runs before main, while the process is still single-threaded.
+        unsafe {
+            std::env::set_var("HOME", &root);
+            std::env::set_var("SLP_HOME", &slp_home);
+            std::env::remove_var("SLP_CONFIG_FILE");
+            std::env::remove_var("SNAP_NAME");
+            std::env::remove_var("SNAP_REAL_HOME");
+        }
+    }
+}

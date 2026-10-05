@@ -299,8 +299,18 @@ fn test_the_slug_and_tags_come_back_after_a_save_and_reload() {
     let config_file = format!("{home}/config.json");
     Workspace::set_config_file(Some(config_file.clone()));
     smartloop::workspace::workspace::set_settings_home_dir(Some(home.clone()));
+    // The workspace reads SLP_HOME before the settings' home, so it has to
+    // name the temp home as well.  SAFETY: this test is #[serial].
+    let saved_slp_home = std::env::var_os("SLP_HOME");
+    unsafe { std::env::set_var("SLP_HOME", &home) };
     let saved = workspace.save();
     let reloaded = Workspace::load();
+    unsafe {
+        match saved_slp_home {
+            Some(prev) => std::env::set_var("SLP_HOME", prev),
+            None => std::env::remove_var("SLP_HOME"),
+        }
+    }
     Workspace::set_config_file(None);
     smartloop::workspace::workspace::set_settings_home_dir(None);
     saved.expect("the workspace saved");

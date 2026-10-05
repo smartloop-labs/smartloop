@@ -99,6 +99,7 @@ walkdir = "2.5.0"
 zip = "7.2.0"
 
 [dev-dependencies]
+ctor = "1.0.13"
 mockall = "0.15.0"
 pretty_assertions = "1.4.1"
 serial_test = "3.5.0"

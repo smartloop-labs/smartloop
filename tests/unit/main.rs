@@ -45,6 +45,7 @@ mod test_generation_rate;
 mod test_history_search_query;
 mod test_indexer_is_project_work;
 mod test_indexer_waits_for_quiet;
+mod test_home_isolation;
 mod test_inflight;
 mod test_install_system_servers;
 mod test_invoice_pricing_e2e;
