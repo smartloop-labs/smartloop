@@ -11,6 +11,7 @@ pub mod document_parser;
 pub mod docx2_parser;
 pub mod docx_parser;
 pub mod json_parser;
+pub mod markitdown;
 pub mod parser_factory;
 pub mod pdf_parser;
 pub mod text_parser;

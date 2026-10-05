@@ -14,7 +14,7 @@ use markup5ever_rcdom::{Node, NodeData};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::DocumentConverterResult;
+use super::{decode_text, ConvertOptions, DocumentConverter, DocumentConverterResult, StreamInfo};
 
 /// Kind of an arena node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -914,10 +914,10 @@ fn url_unquote(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() + 0 && i + 2 <= bytes.len() - 1 + 0 {
-            let hex = &s[i + 1..i + 3];
-            if let Ok(b) = u8::from_str_radix(hex, 16)
-                && hex.chars().all(|c| c.is_ascii_hexdigit())
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &bytes[i + 1..i + 3];
+            if hex.iter().all(u8::is_ascii_hexdigit)
+                && let Ok(b) = u8::from_str_radix(std::str::from_utf8(hex).unwrap_or(""), 16)
             {
                 out.push(b);
                 i += 3;
@@ -975,6 +975,37 @@ pub fn convert_html(html: &str) -> DocumentConverterResult {
     let title = dom.find(dom.root, "title").and_then(|t| dom.string(t));
 
     DocumentConverterResult { title, text_content: py_strip(&webpage_text).to_string() }
+}
+
+/// Anything with content type text/html (MarkItDown `HtmlConverter`).
+pub struct HtmlConverter;
+
+impl HtmlConverter {
+    /// Non-standard convenience method to convert a string to markdown
+    /// (`HtmlConverter.convert_string`). Given that many converters produce
+    /// HTML as intermediate output, this allows for easy conversion of HTML to
+    /// markdown.
+    pub fn convert_string(html_content: &str) -> DocumentConverterResult {
+        convert_html(html_content)
+    }
+}
+
+impl DocumentConverter for HtmlConverter {
+    fn name(&self) -> &'static str {
+        "HtmlConverter"
+    }
+
+    fn accepts(&self, info: &StreamInfo) -> bool {
+        info.matches(&[".html", ".htm"], &["text/html", "application/xhtml"])
+    }
+
+    fn convert(&self, data: &[u8], info: &StreamInfo, _options: &ConvertOptions) -> anyhow::Result<DocumentConverterResult> {
+        // Parse the stream. BeautifulSoup tries the declared encoding (utf-8
+        // by default) first and falls back to detection when it fails.
+        let charset = info.charset.as_deref().unwrap_or("utf-8");
+        let html = decode_text(data, Some(charset)).or_else(|_| decode_text(data, None))?;
+        Ok(convert_html(&html))
+    }
 }
 
 /// Minimal HTML text escaping (Python `html.escape(s, quote=True)`).

@@ -7,24 +7,30 @@
 //! converter that accepts a guess, in priority order, until one succeeds. The
 //! converters ported here are the ones reachable through `ParserFactory`'s
 //! mime types (PDF, DOCX, PPTX, XLSX, HTML, PNG/JPEG) plus the generic
-//! plain-text / CSV / XLS fallbacks:
+//! plain-text / CSV / ZIP / XLS fallbacks:
 //!
 //! * [`html`] — `HtmlConverter` + `_CustomMarkdownify` (markdownify 1.2).
 //! * [`docx`] — `DocxConverter`: OMML math pre-processing ([`omml`]) and a
-//!   port of `mammoth`'s DOCX → HTML conversion, then `HtmlConverter`.
+//!   port of `mammoth`'s DOCX → HTML conversion ([`mammoth`]), then
+//!   `HtmlConverter`.
 //! * [`pptx`] — `PptxConverter` over a port of the `python-pptx` reader.
 //! * [`xlsx`] — `XlsxConverter` / `XlsConverter`: `pandas.read_excel` +
 //!   `DataFrame.to_html` emulated over `calamine`, then `HtmlConverter`.
-//! * [`pdf`] — `PdfConverter` text extraction (MuPDF stands in for
-//!   pdfminer/pdfplumber).
-//! * image, plain text and CSV converters live in this module.
+//! * [`pdf`] — `PdfConverter` (MuPDF stands in for pdfminer/pdfplumber).
+//! * image, plain text, CSV and ZIP converters live in this module.
+//!
+//! The URL-, feed-, audio-, notebook-, Outlook- and EPUB-specific converters
+//! of MarkItDown never accept the local office/HTML/image files smartloop
+//! routes here and are not ported.
 //!
 //! MarkItDown's content sniffing uses the `magika` ML model; it is replaced
 //! by a deterministic signature sniff ([`sniff_content`]) that yields the same
 //! labels for the formats above.
 
+pub mod dingbats;
 pub mod docx;
 pub mod html;
+pub mod mammoth;
 pub mod omml;
 pub mod ooxml;
 pub mod pdf;
@@ -159,6 +165,7 @@ impl MarkItDown {
         // inserted at the front of the list.
         let registrations: Vec<(Box<dyn DocumentConverter>, f64)> = vec![
             (Box::new(PlainTextConverter), PRIORITY_GENERIC_FILE_FORMAT),
+            (Box::new(ZipConverter), PRIORITY_GENERIC_FILE_FORMAT),
             (Box::new(html::HtmlConverter), PRIORITY_GENERIC_FILE_FORMAT),
             (Box::new(docx::DocxConverter), PRIORITY_SPECIFIC_FILE_FORMAT),
             (Box::new(xlsx::XlsxConverter), PRIORITY_SPECIFIC_FILE_FORMAT),
@@ -199,6 +206,24 @@ impl MarkItDown {
         };
         let guesses = get_stream_info_guesses(&data, &base_guess);
         self.convert_bytes(&data, guesses)
+    }
+
+    /// A MarkItDown carrying the options a converter was called with
+    /// (nested conversions reuse the parent's settings).
+    fn from_options(options: &ConvertOptions) -> Self {
+        Self {
+            llm_client: options.llm_client.clone(),
+            llm_model: options.llm_model.clone(),
+            llm_prompt: options.llm_prompt.clone(),
+            exiftool_path: options.exiftool_path.clone(),
+        }
+    }
+
+    /// Convert in-memory bytes described by `stream_info`
+    /// (`MarkItDown.convert_stream`).
+    pub fn convert_stream(&self, data: &[u8], stream_info: &StreamInfo) -> anyhow::Result<DocumentConverterResult> {
+        let guesses = get_stream_info_guesses(data, stream_info);
+        self.convert_bytes(data, guesses)
     }
 
     /// `MarkItDown._convert`: try every accepting converter for each guess.
@@ -477,6 +502,73 @@ fn decode_cp1252(data: &[u8]) -> String {
         .collect()
 }
 
+// -- ZipConverter ---------------------------------------------------------------------
+
+/// `os.path.splitext(path)[1]` (POSIX): the extension of the last path
+/// component, ignoring leading dots.
+fn py_splitext_ext(path: &str) -> String {
+    let base_start = path.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let base = &path[base_start..];
+    let first_non_dot = base.find(|c| c != '.').unwrap_or(base.len());
+    match base.rfind('.') {
+        Some(dot) if dot > first_non_dot => base[dot..].to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Converts ZIP files to Markdown by converting each contained file with the
+/// parent MarkItDown's converters.
+pub struct ZipConverter;
+
+impl DocumentConverter for ZipConverter {
+    fn name(&self) -> &'static str {
+        "ZipConverter"
+    }
+
+    fn accepts(&self, info: &StreamInfo) -> bool {
+        info.matches(&[".zip"], &["application/zip"])
+    }
+
+    fn convert(&self, data: &[u8], info: &StreamInfo, options: &ConvertOptions) -> anyhow::Result<DocumentConverterResult> {
+        use std::io::Read;
+
+        let file_path = info
+            .url
+            .clone()
+            .or_else(|| info.local_path.clone())
+            .or_else(|| info.filename.clone())
+            .unwrap_or_else(|| "None".to_string());
+        let mut md_content = format!("Content from the zip file `{file_path}`:\n\n");
+        let markitdown = MarkItDown::from_options(options);
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data))?;
+        for index in 0..archive.len() {
+            let (name, bytes) = {
+                let mut entry = archive.by_index(index)?;
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes)?;
+                (entry.name().to_string(), bytes)
+            };
+            let z_file_stream_info = StreamInfo {
+                extension: Some(py_splitext_ext(&name)),
+                filename: Some(name.rsplit('/').next().unwrap_or(&name).to_string()),
+                ..StreamInfo::default()
+            };
+            match markitdown.convert_stream(&bytes, &z_file_stream_info) {
+                Ok(result) => {
+                    md_content.push_str(&format!("## File: {name}\n\n"));
+                    md_content.push_str(&result.text_content);
+                    md_content.push_str("\n\n");
+                }
+                Err(e) if e.is::<UnsupportedFormatException>() || e.is::<FileConversionException>() => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(DocumentConverterResult::markdown(md_content.trim()))
+    }
+}
+
 // -- PlainTextConverter -----------------------------------------------------------
 
 /// Anything with content type text/plain.
@@ -614,7 +706,7 @@ fn py_str_value(value: &Value) -> String {
                 n.as_f64().map(crate::parsers::json_parser::py_float_repr).unwrap_or_else(|| n.to_string())
             }
         }
-        other => other.to_string(),
+        other => crate::parsers::json_parser::py_repr_json(other),
     }
 }
 
@@ -777,6 +869,7 @@ mod tests {
                 "XlsxConverter",
                 "DocxConverter",
                 "HtmlConverter",
+                "ZipConverter",
                 "PlainTextConverter",
             ]
         );

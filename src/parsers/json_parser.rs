@@ -256,7 +256,7 @@ fn py_number_str(n: &serde_json::Number) -> String {
 }
 
 /// Python `repr()` of a JSON container (dict/list of Python objects).
-fn py_repr_json(value: &Value) -> String {
+pub fn py_repr_json(value: &Value) -> String {
     match value {
         Value::Null => "None".to_string(),
         Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),

@@ -115,6 +115,19 @@ impl XmlElement {
         out
     }
 
+    /// Every descendant element, depth-first in document order.
+    pub fn descendants_all(&self) -> Vec<&XmlElement> {
+        let mut out = Vec::new();
+        fn walk<'a>(el: &'a XmlElement, out: &mut Vec<&'a XmlElement>) {
+            for child in el.elements() {
+                out.push(child);
+                walk(child, out);
+            }
+        }
+        walk(self, &mut out);
+        out
+    }
+
     /// First descendant element named `name`.
     pub fn descendant(&self, name: &str) -> Option<&XmlElement> {
         for child in self.elements() {
@@ -179,7 +192,7 @@ pub fn parse_xml(bytes: &[u8]) -> anyhow::Result<XmlElement> {
                     let (attr_ns, attr_local) = reader.resolver().resolve_attribute(key);
                     let attr_name = normalized_name(&attr_ns, attr_local.as_ref(), key.as_ref());
                     let value = attr
-                        .unescape_value()
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map(|v| v.into_owned())
                         .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).into_owned());
                     attrs.push((attr_name, value));
@@ -297,6 +310,11 @@ impl OoxmlPackage {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.as_slice())
         })
+    }
+
+    /// Raw bytes of a zip entry addressed by its exact name.
+    pub fn read_exact(&self, name: &str) -> Option<&[u8]> {
+        self.files.get(name).map(|v| v.as_slice())
     }
 
     /// True when the part exists.
