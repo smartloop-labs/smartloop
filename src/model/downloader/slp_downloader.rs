@@ -30,7 +30,12 @@ impl DownloadProgress {
 
     /// `{"filename", "downloaded", "total", "status"}` as JSON.
     pub fn to_dict(&self) -> serde_json::Value {
-        todo!()
+        serde_json::json!({
+            "filename": self.filename,
+            "downloaded": self.downloaded,
+            "total": self.total,
+            "status": self.status,
+        })
     }
 }
 
@@ -62,18 +67,35 @@ impl AggregateProgress {
     ///
     /// Per-file counts only ever move forward so the bar never dips.
     pub fn call(&self, progress: DownloadProgress) {
-        let _ = (progress, self.total, &self.callback, &self.label, &self.per_file);
-        todo!()
+        let Some(callback) = &self.callback else {
+            return;
+        };
+        let mut downloaded = {
+            let mut per_file = self.per_file.lock();
+            // Per-file counts only ever move forward — ignore any regression
+            // from a resumed/restarted file so the rolled-up bar never dips.
+            let prev = per_file.get(&progress.filename).copied().unwrap_or(0);
+            per_file.insert(progress.filename.clone(), prev.max(progress.downloaded));
+            per_file.values().sum::<u64>()
+        };
+        if self.total > 0 {
+            downloaded = downloaded.min(self.total);
+        }
+        callback(DownloadProgress::new(self.label.clone(), downloaded, self.total, "downloading"));
     }
 
     /// Emit a terminal 100% `completed` event for the whole download.
     pub fn finish(&self) {
-        todo!()
+        let Some(callback) = &self.callback else {
+            return;
+        };
+        callback(DownloadProgress::new(self.label.clone(), self.total, self.total, "completed"));
     }
 
     /// Wrap a shared aggregator as a [`ProgressCallback`].
     pub fn as_callback(self: &Arc<Self>) -> ProgressCallback {
-        todo!()
+        let this = Arc::clone(self);
+        Arc::new(move |progress| this.call(progress))
     }
 }
 

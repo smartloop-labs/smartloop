@@ -1148,3 +1148,8 @@ pub mod mcp {
     }
 }
 // =================================================================== /mcp
+
+// ======================= BEGIN unit: model =======================
+/// Downloader test doubles (scripted HTTP, test logger).
+pub mod model_fakes;
+// ======================== END unit: model ========================
