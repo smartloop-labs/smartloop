@@ -224,3 +224,41 @@ fn opt_text(value: ValueRef<'_>) -> Option<String> {
         ValueRef::Real(f) => Some(f.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(key: &str, s: Option<&str>, i: Option<i64>, f: Option<f64>) -> ChromaMetaRow {
+        ChromaMetaRow { key: key.into(), string_value: s.map(str::to_string), int_value: i, float_value: f }
+    }
+
+    #[test]
+    fn meta_rows_become_a_chunk() {
+        let chunk = meta_rows_to_chunk(
+            &[
+                row("chroma:document", Some("hello"), None, None),
+                row("document_id", Some("d1"), None, None),
+                row("chunk_index", None, Some(3), None),
+                row("page_number", None, Some(2), None),
+                row("empty", Some(""), Some(0), None),
+                row("score", None, None, Some(0.5)),
+            ],
+            "e1",
+        )
+        .unwrap();
+        assert_eq!(chunk["text"], "hello");
+        assert_eq!(chunk["document_id"], "d1");
+        assert_eq!(chunk["document_name"], Value::Null);
+        assert_eq!(chunk["chunk_index"], 3);
+        assert_eq!(chunk["source_content"], "");
+        assert_eq!(chunk["page_number"], 2);
+        assert_eq!(chunk["score"], 0.5);
+        assert!(!chunk.contains_key("empty"));
+    }
+
+    #[test]
+    fn rows_without_document_text_are_skipped() {
+        assert!(meta_rows_to_chunk(&[row("document_id", Some("d1"), None, None)], "e1").is_none());
+    }
+}

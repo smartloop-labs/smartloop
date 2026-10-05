@@ -481,3 +481,33 @@ impl serde_json::ser::Formatter for AsciiPrettyFormatter<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_text_overlaps_like_python() {
+        assert_eq!(chunk_text("short", CHUNK_SIZE, CHUNK_OVERLAP), vec!["short".to_string()]);
+        // size 4, overlap 1: starts at 0, 3, 6, 9.
+        assert_eq!(chunk_text("abcdefghij", 4, 1), vec!["abcd", "defg", "ghij", "j"]);
+    }
+
+    #[test]
+    fn stable_id_is_the_md5_hex_of_the_path() {
+        assert_eq!(stable_id("a"), "0cc175b9c0f1b6a831c399e269772661");
+    }
+
+    #[test]
+    fn manifest_is_written_like_json_dump_indent_2() {
+        let manifest = BTreeMap::from([
+            ("a.md".to_string(), "h1".to_string()),
+            ("\u{e9}.md".to_string(), "h2".to_string()),
+        ]);
+        let out = String::from_utf8(py_pretty_json(&manifest).unwrap()).unwrap();
+        // ensure_ascii: the accented key is escaped (backslash, then u00e9).
+        let backslash = char::from(92u8);
+        let expected = format!("{{\n  \"a.md\": \"h1\",\n  \"{backslash}u00e9.md\": \"h2\"\n}}");
+        assert_eq!(out, expected);
+    }
+}

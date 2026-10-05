@@ -474,10 +474,14 @@ pub fn load_embedder_with(
 /// it never frees the backend out from under its owner.
 pub fn shared_backend() -> anyhow::Result<&'static LlamaBackend> {
     static BACKEND: OnceCell<LlamaBackend> = OnceCell::new();
-    BACKEND.get_or_try_init(|| match LlamaBackend::init() {
-        Ok(backend) => Ok(backend),
-        Err(LlamaCppError::BackendAlreadyInitialized) => Ok(LlamaBackend {}),
-        Err(e) => Err(anyhow::anyhow!("llama.cpp backend init failed: {e}")),
+    BACKEND.get_or_try_init(|| {
+        // `Llama(verbose=False)`: keep llama.cpp's own logging quiet.
+        llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default().with_logs_enabled(false));
+        match LlamaBackend::init() {
+            Ok(backend) => Ok(backend),
+            Err(LlamaCppError::BackendAlreadyInitialized) => Ok(LlamaBackend {}),
+            Err(e) => Err(anyhow::anyhow!("llama.cpp backend init failed: {e}")),
+        }
     })
 }
 
@@ -530,14 +534,10 @@ impl EmbedBackend for LlamaCppEmbedBackend {
         };
         let mut out = Vec::with_capacity(batch.len());
         for text in batch {
-            let tokens = model.vocab().tokenize(text.as_bytes(), true, false);
-            if tokens.len() > self.n_batch {
-                anyhow::bail!(
-                    "Requested tokens ({}) exceed batch size of {}",
-                    tokens.len(),
-                    self.n_batch
-                );
-            }
+            let mut tokens = model.vocab().tokenize(text.as_bytes(), true, false);
+            // llama-cpp-python's `embed(truncate=True)`: clip to n_batch so a
+            // long input can never overrun the micro-batch.
+            tokens.truncate(self.n_batch);
             ctx.clear_kv_cache();
             let mut llama_batch = LlamaBatch::new(self.n_batch.max(1), 1);
             // Every token's output is requested so a model without pooling

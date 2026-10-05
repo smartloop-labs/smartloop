@@ -90,3 +90,23 @@ fn path_stem(filename: &str) -> String {
         _ => name.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_type_date_and_amount_from_the_filename() {
+        let meta = extract_document_metadata("docs/Invoice_2024-01-15_acme.pdf", "");
+        assert_eq!(meta["document_type"], "invoice");
+        assert_eq!(meta["date"], "2024-01-15");
+        assert_eq!(meta["amount"], 2024);
+
+        let meta = extract_document_metadata("receipt-1,250.75.pdf", "");
+        assert_eq!(meta["document_type"], "receipt");
+        assert_eq!(meta["amount"], 1250.75);
+        assert!(!meta.contains_key("date"));
+
+        assert!(extract_document_metadata("notes.txt", "").is_empty());
+    }
+}

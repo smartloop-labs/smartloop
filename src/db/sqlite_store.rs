@@ -1084,7 +1084,8 @@ mod tests {
     #[test]
     fn py_json_dumps_matches_python_defaults() {
         let v: Value = serde_json::json!({"a": 1, "b": "é", "c": 1.5, "d": true, "e": 2.0});
-        assert_eq!(py_json_dumps(&v), r#"{"a": 1, "b": "é", "c": 1.5, "d": true, "e": 2.0}"#);
+        // ensure_ascii=True: non-ASCII is written as a \uXXXX escape.
+        assert_eq!(py_json_dumps(&v), r#"{"a": 1, "b": "\u00e9", "c": 1.5, "d": true, "e": 2.0}"#);
     }
 
     #[test]
@@ -1103,5 +1104,188 @@ mod tests {
         assert!(m.cosine(2, 0) > 0.0);
         assert_eq!(m.cosine(2, 1), 0.0);
         assert!(TfidfMatrix::fit_transform(&["a", "b"]).is_none());
+    }
+
+    /// A store over a fresh `store.db`, bypassing the embedding-model marker
+    /// (which reads the app settings).
+    fn store_in(dir: &Path, collection: &str) -> IndexStore {
+        let project_dir = dir.to_string_lossy().into_owned();
+        let db_path = get_db_path(&project_dir).unwrap();
+        ensure_schema(&db_path).unwrap();
+        IndexStore {
+            project_dir,
+            collection_name: collection.to_string(),
+            base_dir: None,
+            db_path,
+            type_: resolve_type(collection),
+        }
+    }
+
+    fn chunk(doc: &str, index: i64, text: &str, extra: &[(&str, Value)]) -> Chunk {
+        let mut c = Chunk::new();
+        c.insert("text".into(), Value::String(text.into()));
+        c.insert("document_id".into(), Value::String(doc.into()));
+        c.insert("chunk_index".into(), Value::from(index));
+        c.insert("document_name".into(), Value::String(format!("{doc}.pdf")));
+        for (k, v) in extra {
+            c.insert((*k).to_string(), v.clone());
+        }
+        c
+    }
+
+    /// Clears the `encode_texts` override however the test ends.
+    struct HookGuard;
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            crate::db::embeddings::set_encode_texts_hook(None);
+        }
+    }
+
+    #[test]
+    fn legacy_tables_are_migrated_into_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = get_db_path(&dir.path().to_string_lossy()).unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE documents (id TEXT PRIMARY KEY, document_id TEXT, document_name TEXT, \
+                 text TEXT, source_content TEXT, metadata TEXT);
+                 INSERT INTO documents VALUES ('d_0', 'd', 'd.pdf', 'hello', 'src', NULL);
+                 CREATE TABLE feedback_pairs (id TEXT PRIMARY KEY, document_id TEXT, document_name TEXT, \
+                 text TEXT, source_content TEXT, metadata TEXT);",
+            )
+            .unwrap();
+        }
+        ensure_schema(&db_path).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let tables: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(tables, HashSet::from(["indexes".to_string()]));
+        let (type_, ref_, name): (String, String, String) = conn
+            .query_row("SELECT type, ref, name FROM indexes WHERE id = 'd_0'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((type_.as_str(), ref_.as_str(), name.as_str()), ("document", "d", "d.pdf"));
+    }
+
+    #[test]
+    #[serial_test::serial(embeddings)]
+    fn tfidf_fallback_round_trip() {
+        crate::db::embeddings::set_encode_texts_hook(Some(std::sync::Arc::new(|_t, _b, _o| None)));
+        let _guard = HookGuard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path(), "documents");
+        let other = store_in(dir.path(), "workspace_files");
+        store
+            .add_chunks(&[
+                chunk("inv", 0, "Invoice for Adam Hart total 540", &[("document_type", json_str("invoice"))]),
+                chunk("rec", 0, "Recipe for sourdough bread", &[("flag", Value::Bool(true))]),
+            ])
+            .unwrap();
+        other.add_chunks(&[chunk("ws", 0, "Invoice in the workspace", &[])]).unwrap();
+
+        assert_eq!(store.count().unwrap(), 2);
+        assert_eq!(other.count().unwrap(), 1);
+
+        let results = store.query_with_metadata("adam hart invoice", None, 0.8, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].document_id, "inv");
+        assert_eq!(results[0].distance, 0.0);
+        assert!(results[0].embedding.is_none());
+        assert_eq!(results[0].metadata["document_type"], "invoice");
+        assert_eq!(results[0].metadata["document_name"], "inv.pdf");
+
+        // Metadata is stored the way Python's json.dumps wrote it.
+        let conn = Connection::open(store.db_path()).unwrap();
+        let meta: String = conn
+            .query_row("SELECT metadata FROM indexes WHERE id = 'rec_0'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(meta, r#"{"flag": true}"#);
+        let content: String = conn
+            .query_row("SELECT content FROM indexes WHERE id = 'rec_0'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(content, "");
+
+        let mut where_ = Map::new();
+        where_.insert("document_type".into(), serde_json::json!({"$eq": "invoice"}));
+        let filtered = store.query_with_metadata("bread", None, 1.0, Some(&where_)).unwrap();
+        assert_eq!(filtered.iter().map(|r| r.document_id.as_str()).collect::<Vec<_>>(), vec!["inv"]);
+
+        let fetched = store.get_by_document_ids(&["rec".to_string()]).unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].text, "Recipe for sourdough bread");
+
+        store.delete_document("inv").unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(other.count().unwrap(), 1);
+    }
+
+    fn json_str(s: &str) -> Value {
+        Value::String(s.to_string())
+    }
+
+    #[test]
+    #[serial_test::serial(embeddings)]
+    fn embedding_path_ranks_backfills_and_carries_vectors() {
+        const VOCAB: [&str; 3] = ["invoice", "recipe", "bread"];
+        let encoded: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> = Default::default();
+        let recorder = encoded.clone();
+        let encode = move |texts: &[String], _b: Option<&str>, _o: Option<f64>| {
+            recorder.lock().push(texts.to_vec());
+            let flat: Vec<f32> = texts
+                .iter()
+                .flat_map(|t| {
+                    let lower = t.to_lowercase();
+                    VOCAB.iter().map(move |w| lower.matches(w).count() as f32 + 1e-3)
+                })
+                .collect();
+            Some(Array2::from_shape_vec((texts.len(), VOCAB.len()), flat).unwrap())
+        };
+        let _guard = HookGuard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path(), "documents");
+        // Indexed with no embedder: rows land without vectors.
+        crate::db::embeddings::set_encode_texts_hook(Some(std::sync::Arc::new(|_t, _b, _o| None)));
+        store
+            .add_chunks(&[
+                chunk("inv", 0, "Invoice invoice", &[]),
+                chunk("rec", 0, "Recipe for bread", &[]),
+            ])
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let missing: i64 = conn
+            .query_row("SELECT COUNT(*) FROM indexes WHERE embedding IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(missing, 2);
+
+        crate::db::embeddings::set_encode_texts_hook(Some(std::sync::Arc::new(encode)));
+        let results = store.query_with_metadata("bread recipe", Some(1), 0.8, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].document_id, "rec");
+        let blob = results[0].embedding.clone().expect("vector carried out of the store");
+        assert_eq!(blob.len(), VOCAB.len() * 4);
+
+        // The query was encoded, then the two rows lacking vectors (backfill),
+        // which were persisted.
+        assert_eq!(encoded.lock().len(), 2);
+        assert_eq!(encoded.lock()[1], vec!["Invoice invoice".to_string(), "Recipe for bread".to_string()]);
+        let missing: i64 = conn
+            .query_row("SELECT COUNT(*) FROM indexes WHERE embedding IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(missing, 0);
+
+        // A second query needs only the query encoded.
+        store.query_with_metadata("invoice", None, 0.8, None).unwrap();
+        assert_eq!(encoded.lock().len(), 3);
     }
 }

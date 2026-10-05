@@ -128,6 +128,7 @@ fn blocking_after_first(first: String, entered: Event, release: Event) -> Stream
 
 /// One recorded `append_to_session` call.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // the full call is recorded; tests assert on a subset
 struct SessionWrite {
     session_id: String,
     role: String,
