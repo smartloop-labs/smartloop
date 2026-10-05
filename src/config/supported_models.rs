@@ -9,7 +9,6 @@
 
 use once_cell::sync::Lazy;
 
-#[allow(unused_imports)]
 use crate::constants::{canonical_model_name, BOOTSTRAP_MODEL};
 use crate::types::ModelCapability;
 
@@ -56,30 +55,28 @@ impl LazyModelDict {
 
     /// Look up `key` (canonicalized); `None` when unknown.
     pub fn get(&self, key: &str) -> Option<ModelClass> {
-        let _ = key;
-        todo!()
+        let canonical = canonical_model_name(key);
+        self.data.iter().find(|(k, _)| *k == canonical).map(|(_, c)| *c)
     }
 
     /// Whether `key` (canonicalized) names a built-in model.
     pub fn contains(&self, key: &str) -> bool {
-        let _ = key;
-        todo!()
+        self.get(key).is_some()
     }
 
     /// Canonical names in insertion order.
     pub fn keys(&self) -> Vec<&'static str> {
-        todo!()
+        self.data.iter().map(|(k, _)| *k).collect()
     }
 
     /// The model classes in insertion order.
     pub fn values(&self) -> Vec<ModelClass> {
-        todo!()
+        self.data.iter().map(|(_, c)| *c).collect()
     }
 
     /// `(canonical name, class)` pairs in insertion order.
     pub fn items(&self) -> Vec<(&'static str, ModelClass)> {
-        let _ = &self.data;
-        todo!()
+        self.data.clone()
     }
 
     /// Iterate canonical names (Python `__iter__`).
@@ -91,7 +88,23 @@ impl LazyModelDict {
 /// Build the table: sl-mini, gemma3-4b, gemma4-e2b, gemma4-e4b, qwen2-vl-2b,
 /// ministral3-3b, qwen3.5-2b.
 fn load() -> Vec<(&'static str, ModelClass)> {
-    todo!()
+    use crate::model::gemma4_2b::Gemma4_2bModel;
+    use crate::model::gemma4_4b::Gemma4_4bModel;
+    use crate::model::gemma_it::GemmaItModel;
+    use crate::model::gemma_it_text::GemmaItTextModel;
+    use crate::model::ministral_3b::Ministral3bModel;
+    use crate::model::qwen2_vl_2b::Qwen2VL_2bModel;
+    use crate::model::qwen3_5_2b::Qwen3_5_2bModel;
+
+    vec![
+        (BOOTSTRAP_MODEL, GemmaItTextModel::class()),
+        ("gemma3-4b", GemmaItModel::class()),
+        ("gemma4-e2b", Gemma4_2bModel::class()),
+        ("gemma4-e4b", Gemma4_4bModel::class()),
+        ("qwen2-vl-2b", Qwen2VL_2bModel::class()),
+        ("ministral3-3b", Ministral3bModel::class()),
+        ("qwen3.5-2b", Qwen3_5_2bModel::class()),
+    ]
 }
 
 /// The built-in model registry.

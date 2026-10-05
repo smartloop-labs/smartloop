@@ -66,8 +66,38 @@ pub const CURRENT_DATE_FORMAT: &str = "%A, %B %d, %Y";
 /// when the client values are absent or invalid.  The weekday is always
 /// derived from the resolved instant.
 pub fn resolve_current_date(user_date: Option<i64>, tz: Option<&str>) -> String {
-    let _ = (user_date, tz);
-    todo!()
+    use chrono::{DateTime, Utc};
+
+    if let Some(ts) = user_date {
+        if let Some(dt) = DateTime::<Utc>::from_timestamp(ts, 0) {
+            if let Some(tz) = tz.filter(|t| !t.is_empty()) {
+                // An unknown zone keeps the UTC rendering rather than failing.
+                if let Ok(zone) = tz.parse::<chrono_tz::Tz>() {
+                    return dt.with_timezone(&zone).format(CURRENT_DATE_FORMAT).to_string();
+                }
+            }
+            return dt.format(CURRENT_DATE_FORMAT).to_string();
+        }
+    }
+    chrono::Local::now().date_naive().format(CURRENT_DATE_FORMAT).to_string()
+}
+
+/// [`resolve_current_date`] for a loosely-typed client value (Python accepted
+/// anything `int()` could coerce: an int, a float, or a numeric string).
+/// Anything else — `null`, `"garbage"`, `""`, NaN — falls back to the server
+/// date.
+pub fn resolve_current_date_value(user_date: Option<&serde_json::Value>, tz: Option<&str>) -> String {
+    use serde_json::Value;
+
+    let ts = match user_date {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| {
+            n.as_f64().filter(|f| f.is_finite() && f.abs() < 9.2e18).map(|f| f.trunc() as i64)
+        }),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        Some(Value::Bool(b)) => Some(i64::from(*b)),
+        _ => None,
+    };
+    resolve_current_date(ts, tz)
 }
 
 // ---------------------------------------------------------------------------
