@@ -163,7 +163,7 @@ struct Cache {
 
 static CACHE: Lazy<Mutex<Cache>> = Lazy::new(|| Mutex::new(Cache { registry: None, stamp: None }));
 
-/// Replaces [`definitions`] when set (the tests' monkeypatched
+/// Replaces [`definitions`] / [`definitions_shared`] when set (the tests' monkeypatched
 /// `smartloop.mcp.definition_loader.definitions`).
 pub type DefinitionsOverride = Arc<dyn Fn() -> Arc<DefinitionRegistry> + Send + Sync>;
 
@@ -190,7 +190,13 @@ fn stamp(home_dir: Option<&Path>) -> Stamp {
 }
 
 /// The definition registry, reloaded when any file has changed.
-pub fn definitions(home_dir: Option<&Path>) -> Arc<DefinitionRegistry> {
+pub fn definitions(home_dir: Option<&Path>) -> DefinitionRegistry {
+    (*definitions_shared(home_dir)).clone()
+}
+
+/// [`definitions`] without the copy: the cached registry itself, so callers
+/// (and the tests' identity check) can tell a cache hit from a reload.
+pub fn definitions_shared(home_dir: Option<&Path>) -> Arc<DefinitionRegistry> {
     if let Some(f) = OVERRIDE.read().clone() {
         return f();
     }
@@ -218,11 +224,16 @@ pub fn definitions(home_dir: Option<&Path>) -> Arc<DefinitionRegistry> {
 }
 
 /// Drop the cache and read every definition file again.
-pub fn reload_definitions() -> Arc<DefinitionRegistry> {
+pub fn reload_definitions() -> DefinitionRegistry {
+    (*reload_definitions_shared()).clone()
+}
+
+/// [`reload_definitions`], returning the freshly cached registry itself.
+pub fn reload_definitions_shared() -> Arc<DefinitionRegistry> {
     {
         let mut cache = CACHE.lock();
         cache.registry = None;
         cache.stamp = None;
     }
-    definitions(None)
+    definitions_shared(None)
 }

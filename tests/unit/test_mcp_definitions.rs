@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 use serial_test::serial;
 
 use smartloop::mcp::definition_loader::{
-    definitions, load_definitions, parse_definitions, reload_definitions, user_definition_paths,
+    definitions, definitions_shared, load_definitions, parse_definitions, reload_definitions,
+    reload_definitions_shared, user_definition_paths,
 };
 use smartloop::mcp::definitions::{retired_fields, MCPDefinition};
 
@@ -366,9 +367,13 @@ fn test_no_user_files_is_not_an_error() {
 #[test]
 #[serial(mcp_global)]
 fn test_the_registry_is_cached_and_reloadable() {
-    let first = definitions(None);
-    assert!(std::sync::Arc::ptr_eq(&definitions(None), &first));
-    assert!(!std::sync::Arc::ptr_eq(&reload_definitions(), &first));
+    // `definitions() is first`: the shared form is the cached registry itself.
+    let first = definitions_shared(None);
+    assert!(std::sync::Arc::ptr_eq(&definitions_shared(None), &first));
+    assert!(!std::sync::Arc::ptr_eq(&reload_definitions_shared(), &first));
+    // The owned forms read the same registry.
+    assert_eq!(definitions(None), *reload_definitions_shared());
+    assert_eq!(reload_definitions(), *definitions_shared(None));
 }
 
 // ------------------------------------------------------ finding the file for a server

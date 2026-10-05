@@ -501,7 +501,7 @@ fn server_haystack(server: &MCPServer) -> String {
 /// file to delete when a connection is removed, so a re-added server does not
 /// silently inherit an old file.
 pub fn definition_for(server: &MCPServer) -> Option<MCPDefinition> {
-    let found = crate::mcp::definition_loader::definitions(None);
+    let found = crate::mcp::definition_loader::definitions_shared(None);
     if found.is_empty() {
         return None;
     }

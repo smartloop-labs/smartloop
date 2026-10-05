@@ -223,7 +223,12 @@ pub fn load_plans(home_dir: Option<&Path>) -> PlanRegistry {
 }
 
 /// The plan registry, loaded once.
-pub fn plans(home_dir: Option<&Path>) -> Arc<PlanRegistry> {
+pub fn plans(home_dir: Option<&Path>) -> PlanRegistry {
+    (*plans_shared(home_dir)).clone()
+}
+
+/// [`plans`] without the copy: the cached registry itself.
+pub fn plans_shared(home_dir: Option<&Path>) -> Arc<PlanRegistry> {
     let mut cache = CACHE.lock();
     if cache.is_none() {
         let registry = Arc::new(load_plans(home_dir));
@@ -242,9 +247,14 @@ pub fn plans(home_dir: Option<&Path>) -> Arc<PlanRegistry> {
 }
 
 /// Drop the cache and read the plan files again.
-pub fn reload_plans() -> Arc<PlanRegistry> {
+pub fn reload_plans() -> PlanRegistry {
+    (*reload_plans_shared()).clone()
+}
+
+/// [`reload_plans`], returning the freshly cached registry itself.
+pub fn reload_plans_shared() -> Arc<PlanRegistry> {
     *CACHE.lock() = None;
-    plans(None)
+    plans_shared(None)
 }
 
 // ------------------------------------------------------------ plan lookup
@@ -270,7 +280,7 @@ fn server_haystack(server: &MCPServer) -> String {
 /// The catalog slug wins — it is provenance the backend established — and the
 /// declared match terms are the fallback for a hand-added connection.
 pub fn plan_for(server: &MCPServer) -> Option<CallPlan> {
-    let registry = plans(None);
+    let registry = plans_shared(None);
     if registry.is_empty() {
         return None;
     }

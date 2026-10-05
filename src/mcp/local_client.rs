@@ -399,6 +399,9 @@ impl LocalMCPClient {
         let mut line = vec![resolved_command.clone()];
         line.extend(self.args.iter().cloned());
         tracing::info!(target: LOGGER, "[mcp-local] launching {}", line.join(" "));
+        // (Python also prepended the package root to PYTHONPATH for a built-in
+        // `-m smartloop.*` server; the Rust binary carries its own modules, so
+        // there is nothing to put on a search path.)
 
         let mut cmd = Command::new(&resolved_command);
         cmd.args(&self.args)
