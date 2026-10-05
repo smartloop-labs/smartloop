@@ -372,10 +372,18 @@ impl PipelineBuilder {
             ModelRouter::model_label(&*self.agent_llm())
         );
         let matched_skills = matched_skills_from(deps.get(&skill_match_node.node_id));
-        let search_ctx: SearchContext = deps
+        // Python threads the very object the collect step returned through
+        // every later handler, so the caller's `SearchContext` sees the
+        // reduce/judge rewrites.  When the collect result already carries a
+        // live shared context, keep that identity instead of copying it.
+        let collected_shared: Option<SharedSearchContext> = deps
             .get(&collect_node.node_id)
-            .and_then(search_ctx_from)
-            .unwrap_or_default();
+            .and_then(|r| r.payload_as::<SharedSearchContext>())
+            .cloned();
+        let search_ctx: SearchContext = match collected_shared.as_ref() {
+            Some(shared) => shared.lock().clone(),
+            None => deps.get(&collect_node.node_id).and_then(search_ctx_from).unwrap_or_default(),
+        };
         let enrich_ctx: EnrichedContext = ctx.read().enriched.clone().unwrap_or_default();
         let skill_names = matched_skills
             .as_deref()
@@ -418,7 +426,10 @@ impl PipelineBuilder {
         };
         // One search context shared by the doc fan-out (its reduce node writes
         // `vector_context`) and the unified pipeline built on top of it.
-        let shared: SharedSearchContext = Arc::new(Mutex::new(search_ctx));
+        let shared: SharedSearchContext = match collected_shared {
+            Some(shared) => shared,
+            None => Arc::new(Mutex::new(search_ctx)),
+        };
         if applies {
             let contributed = self.doc_fanout.build(ctx, Some(&shared), &parent);
             extend_dag.extend(
