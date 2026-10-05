@@ -9,7 +9,7 @@ repository = "https://github.com/smartloop-ai/smartloop"
 # Internal crate: consumed as a git dependency, never pushed to crates.io.
 publish = false
 build = "build.rs"
-include = ["src/**/*", "build.rs", "proto/**/*", "README.md", "LICENSE"]
+include = ["/src/**/*", "/build.rs", "/proto/**/*", "/README.md", "/LICENSE"]
 
 [lib]
 name = "smartloop"
