@@ -94,6 +94,15 @@ fn run_module(module: &str, args: Vec<String>) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // [llms] The model-load crash probe (`LlmFactory::probe_model_load`)
+    // re-executes this binary as `slp __probe-model <config-json>`.
+    {
+        use smartloop::llms::llm_factory::{LlmFactory, PROBE_SUBCOMMAND};
+        let argv: Vec<String> = std::env::args().collect();
+        if argv.get(1).map(String::as_str) == Some(PROBE_SUBCOMMAND) {
+            std::process::exit(LlmFactory::run_probe(argv.get(2).map(String::as_str).unwrap_or("")));
+        }
+    }
     let _ = run_module as fn(&str, Vec<String>) -> anyhow::Result<()>;
     let _ = cmd_agent as fn(Option<&AgentCommand>, &str, u16) -> anyhow::Result<()>;
     todo!()
