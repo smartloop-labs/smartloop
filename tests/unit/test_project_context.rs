@@ -340,6 +340,7 @@ mod adding_a_document_binds_rather_than_flipping {
 
     use parking_lot::Mutex;
     use smartloop::api::services::model_service::ModelService;
+    use smartloop::api::config::api_settings;
     use smartloop::llms::base_llm::BaseLLM;
     use smartloop::model::downloader::slp_downloader::{SharedLogger, SharedWorkspace};
     use smartloop::model::model_manager::Model;
@@ -457,6 +458,9 @@ mod adding_a_document_binds_rather_than_flipping {
         };
         let made = ModelService::new_bare();
         *made.model.write() = Some(Arc::new(Model::new("m", Arc::clone(&shared), Some(Arc::new(slp)))));
+        // `made._initialize_workspace = lambda: None`: the model is already
+        // the loaded default, so `_ensure_model` has nothing to (re)load.
+        *made.model_name.write() = Some(api_settings().default_model);
         Fixture { service: made, workspace: shared, seen, _home: home, _env: env, _reset: reset }
     }
 
