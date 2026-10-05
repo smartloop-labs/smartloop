@@ -82,6 +82,7 @@ fn callback(session: Option<Value>, query: OAuthCallbackQuery) -> (OAuthCallback
 // ----------------------------------------------------------- the issuer is checked
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_matching_issuer_proceeds() {
     let (resp, exchanged) = callback(Some(session(Some(ISSUER), true)), params(Some("c"), "st", Some(ISSUER), None));
@@ -90,6 +91,7 @@ fn test_a_matching_issuer_proceeds() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_mismatched_issuer_never_spends_the_code() {
     // The whole point: an attacker's code must not reach the honest server.
@@ -102,6 +104,7 @@ fn test_a_mismatched_issuer_never_spends_the_code() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_the_rejection_names_both_issuers() {
     let (resp, _) = callback(
@@ -114,6 +117,7 @@ fn test_the_rejection_names_both_issuers() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_missing_issuer_is_refused_when_the_server_promised_one() {
     let (resp, exchanged) = callback(Some(session(Some(ISSUER), true)), params(Some("c"), "st", None, None));
@@ -122,6 +126,7 @@ fn test_a_missing_issuer_is_refused_when_the_server_promised_one() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_missing_issuer_is_fine_when_none_was_promised() {
     let (resp, exchanged) = callback(Some(session(Some(ISSUER), false)), params(Some("c"), "st", None, None));
@@ -130,6 +135,7 @@ fn test_a_missing_issuer_is_fine_when_none_was_promised() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_metadata_with_no_issuer_at_all_does_not_block_the_flow() {
     // Pre-RFC-9207 servers stay reachable.
@@ -139,6 +145,7 @@ fn test_metadata_with_no_issuer_at_all_does_not_block_the_flow() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_server_that_promises_an_issuer_but_publishes_none_is_refused() {
     let (resp, exchanged) = callback(Some(session(None, true)), params(Some("c"), "st", Some(ISSUER), None));
@@ -149,6 +156,7 @@ fn test_a_server_that_promises_an_issuer_but_publishes_none_is_refused() {
 // ------------------------------------------------------ it runs before everything else
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_an_error_response_is_checked_too() {
     // Otherwise the invalid_scope retry reissues on an attacker's say-so.
@@ -162,6 +170,7 @@ fn test_an_error_response_is_checked_too() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_genuine_error_response_still_retries() {
     let (resp, _) = callback(Some(session(Some(ISSUER), true)), params(None, "st", Some(ISSUER), Some("invalid_scope")));
@@ -169,6 +178,7 @@ fn test_a_genuine_error_response_still_retries() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_an_unknown_state_is_left_to_the_session_check() {
     let (resp, exchanged) = callback(None, params(Some("c"), "st", Some(ISSUER), None));

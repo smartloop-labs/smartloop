@@ -497,7 +497,9 @@ pub mod db {
 /// it is the injected client (`MCPOAuthService(http_client=fake)`).  Tests that
 /// install the override (or touch any other process-wide MCP state: the
 /// router's OAuth sessions and hooks, refresh locks) must be
-/// `#[serial(mcp_global)]`.
+/// `#[serial(mcp_global)]`.  Tests that build a [`mcp::ServiceEnv`] also touch the
+/// process-scope pin and the settings home shared with default-key tests,
+/// so they hold both keys: `#[serial] #[serial(mcp_global)]`.
 pub mod mcp {
     use std::sync::Arc;
 
