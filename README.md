@@ -33,14 +33,64 @@ irm https://smartloop.ai/install.ps1 | iex
 **From source:**
 
 > [!NOTE]
-> Requires the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) (on macOS: `brew install vulkan-headers vulkan-loader molten-vk shaderc`). The build step auto-creates and activates a virtual environment, then compiles the GPU backend — Metal + Vulkan on macOS, Vulkan on Linux/Windows (works with NVIDIA, AMD, and Intel GPUs).
+> Requires a [Rust toolchain](https://rustup.rs/) (1.85+), CMake and a C/C++ compiler with libclang (Xcode command line tools on macOS, `build-essential cmake libclang-dev` on Debian/Ubuntu, Visual Studio Build Tools + LLVM on Windows). llama.cpp is compiled into the binary with the GPU backend for your platform — Metal on macOS, Vulkan on Linux/Windows (works with NVIDIA, AMD, and Intel GPUs), which additionally needs the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home).
 
 ```bash
 git clone https://github.com/smartloop-ai/smartloop.git
 cd smartloop
-make build   # creates and activates .venv, installs dependencies, and configures GPU backend
-make test    # verifies CLI and GPU offload support
+make build   # cargo build --release with the platform's GPU backend (metal / vulkan)
+make test    # verifies the CLI and runs the test suite
 ```
+
+The binary lands at `target/release/slp`. Use `make build CARGO_FEATURES=` for a CPU-only build (no Vulkan SDK needed), or call cargo directly:
+
+```bash
+cargo build --release --features metal    # macOS
+cargo build --release --features vulkan   # Linux / Windows
+cargo install --path . --features metal   # install slp into ~/.cargo/bin
+```
+
+**Development:**
+
+```bash
+make run          # start the agent from source (cargo run --release -- agent start)
+make run-debug    # same, with LOG_LEVEL=DEBUG
+cargo test        # full test suite (CPU build; model/network tests are #[ignore]d)
+make test-unit    # unit tests only (lib + tests/unit)
+make test-api     # HTTP API tests only (tests/api)
+make build-binary # release build staged in dist/slp, as shipped by the installers
+```
+
+### Using as a Rust crate
+
+The `smartloop` library (everything behind `slp`) can be embedded in another Rust project. It is not published to crates.io (`publish = false`); depend on it from git:
+
+```toml
+[dependencies]
+smartloop = { git = "https://github.com/smartloop-ai/smartloop" }
+# Pin a release and pick a GPU backend for llama.cpp:
+# smartloop = { git = "https://github.com/smartloop-ai/smartloop", tag = "v1.2.8", features = ["metal"] }
+```
+
+Available features are `metal`, `vulkan` and `cuda` (forwarded to `llama-cpp-2`); with none, llama.cpp runs on the CPU. For example, to check whether the local agent is up:
+
+```rust
+use smartloop::config::AppSettings;
+use smartloop::server::{get_server_url, is_server_running};
+
+fn main() {
+    let settings = AppSettings::new();
+    let (host, port) = (settings.api_host.as_str(), settings.api_port);
+    println!(
+        "slp {} at {} running: {}",
+        smartloop::VERSION,
+        get_server_url(host, port),
+        is_server_running(host, port)
+    );
+}
+```
+
+Building the crate needs the same toolchain as building from source (CMake, libclang, and the Vulkan SDK when the `vulkan` feature is on).
 
 ### Uninstall
 
@@ -99,11 +149,11 @@ You projects live inside `~/smartloop/<slug>` directory and this is where skills
 
 | Requirement | Description |
 |-------------|-------------|
-| OS | macOS (Apple Silicon), Linux (x86_64), or Windows (x86_64) |
+| OS | macOS (Apple Silicon), Linux (x86_64, arm64), or Windows (x86_64) |
 | Vulkan | GPU driver with Vulkan support (optional — GPU acceleration on Linux/Windows for NVIDIA/AMD/Intel, defaults to CPU) |
 
 > [!NOTE]
-> macOS uses Metal for GPU acceleration automatically (with Vulkan via MoltenVK as an alternative). On Windows and Linux, the pre-built release uses Vulkan, so any current GPU driver (NVIDIA, AMD, or Intel) is sufficient. To build from source with GPU support, install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home).
+> macOS uses Metal for GPU acceleration automatically (Vulkan via MoltenVK is available as an alternative when building with `CARGO_FEATURES="metal vulkan"`). On Windows and Linux, the pre-built release uses Vulkan and ships the Vulkan loader, so any current GPU driver (NVIDIA, AMD, or Intel) is sufficient. To build from source with Vulkan support, install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home).
 
 ### License
 

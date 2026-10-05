@@ -1,6 +1,6 @@
 ---
 name: pr-release
-description: Create a release PR merging dev into main (via a throwaway release/v<version> branch) titled "<version> release" with a website-ready Release Notes section. Defaults to a patch bump of the version in pyproject.toml; pass an explicit version (e.g. /pr-release 1.1.1) to override.
+description: Create a release PR merging dev into main (via a throwaway release/v<version> branch) titled "<version> release" with a website-ready Release Notes section. Defaults to a patch bump of the version in Cargo.toml; pass an explicit version (e.g. /pr-release 1.1.1) to override.
 argument-hint: [version]
 ---
 
@@ -22,8 +22,8 @@ Arguments: `$ARGUMENTS` — an optional explicit semver (e.g. `1.1.1`). If empty
 
 2. **Determine the version**
    - If `$ARGUMENTS` contains a version, use it verbatim (strip any leading `v`). Validate it looks like semver (`X.Y.Z`); if not, ask the user.
-   - Otherwise read `version` from the `[project]` section of `pyproject.toml` and bump the patch component (e.g. `1.0.2` → `1.0.3`).
-   - If the resulting version is not greater than the current `pyproject.toml` version, warn the user but proceed with what they specified.
+   - Otherwise read `version` from the `[package]` section of `Cargo.toml` and bump the patch component (e.g. `1.0.2` → `1.0.3`).
+   - If the resulting version is not greater than the current `Cargo.toml` version, warn the user but proceed with what they specified.
 
 3. **Collect the changes**
    - List commits on dev that main doesn't have: `git log origin/main..origin/dev --oneline --no-merges`.
@@ -56,4 +56,4 @@ Arguments: `$ARGUMENTS` — an optional explicit semver (e.g. `1.1.1`). If empty
 
 6. **Report**
    - Print the PR URL and the version used.
-   - The version is defined in two places: `pyproject.toml` (`[project] version`) and `smartloop/__init__.py` (`__version__`). If either still shows an older version than the release version, remind the user to bump both before tagging.
+   - The version is defined in `Cargo.toml` (`[package] version`, mirrored in the `smartloop` entry of `Cargo.lock`) and pinned by the installers: `install.sh` (`VERSION=`) and `install.ps1` (`$Version`). If any still shows an older version than the release version, remind the user to bump them all before tagging (the `Release` workflow's version bump updates all four).
