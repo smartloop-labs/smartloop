@@ -80,6 +80,15 @@ impl IntoResponse for HTTPException {
 // status_for
 // ---------------------------------------------------------------------------
 
+/// The error as a [`DownloadError`], also when it is the boxed cause a
+/// classified download error keeps (`DownloadError::Connection { cause }`):
+/// thiserror hands that out of `source()` as the `Box<DownloadError>` itself,
+/// which a plain `downcast_ref::<DownloadError>()` does not see through.
+fn as_download_error<'a>(exc: &'a (dyn StdError + 'static)) -> Option<&'a DownloadError> {
+    exc.downcast_ref::<DownloadError>()
+        .or_else(|| exc.downcast_ref::<Box<DownloadError>>().map(|b| b.as_ref()))
+}
+
 /// The `status_code` an error carries on itself (Python's
 /// `getattr(exc, "status_code", None)`), seeing through the transparent
 /// wrappers Rust adds where Python would have raised the inner error as is.
@@ -99,7 +108,7 @@ fn own_status(exc: &(dyn StdError + 'static)) -> Option<u16> {
     if let Some(e) = exc.downcast_ref::<DownloadInProgress>() {
         return Some(e.status_code());
     }
-    if let Some(e) = exc.downcast_ref::<DownloadError>() {
+    if let Some(e) = as_download_error(exc) {
         return match e {
             DownloadError::Cancelled(c) => Some(c.status_code()),
             DownloadError::Source(inner) => own_status(inner.as_ref()),
@@ -117,7 +126,7 @@ fn is_model_access(exc: &(dyn StdError + 'static)) -> bool {
     if let Some(PlatformError::ModelAccess(_)) = exc.downcast_ref::<PlatformError>() {
         return true;
     }
-    if let Some(DownloadError::Source(inner)) = exc.downcast_ref::<DownloadError>() {
+    if let Some(DownloadError::Source(inner)) = as_download_error(exc) {
         return is_model_access(inner.as_ref());
     }
     false
@@ -131,7 +140,7 @@ fn is_connection_error(exc: &(dyn StdError + 'static)) -> bool {
     if exc.downcast_ref::<StaleDownloadURLError>().is_some() {
         return true;
     }
-    if let Some(e) = exc.downcast_ref::<DownloadError>() {
+    if let Some(e) = as_download_error(exc) {
         return match e {
             DownloadError::Connection { .. } | DownloadError::StaleUrl(_) => true,
             DownloadError::Io(io_err) => is_io_connection_error(io_err),
@@ -169,7 +178,7 @@ fn link_is_disk_full(exc: &(dyn StdError + 'static)) -> bool {
             return true;
         }
     }
-    if let Some(e) = exc.downcast_ref::<DownloadError>() {
+    if let Some(e) = as_download_error(exc) {
         let wrapped_full = match e {
             DownloadError::Io(io_err) => is_enospc(io_err),
             DownloadError::Source(inner) => inner.chain().any(link_is_disk_full),
