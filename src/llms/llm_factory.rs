@@ -29,7 +29,7 @@ static LAST_PROBE_STDERR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::
 
 /// True when the linked llama.cpp was built with the CUDA backend.
 #[allow(dead_code)]
-fn llama_cpp_has_cuda_backend() -> bool {
+pub fn llama_cpp_has_cuda_backend() -> bool {
     todo!()
 }
 
