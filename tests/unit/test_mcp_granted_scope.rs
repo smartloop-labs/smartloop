@@ -80,6 +80,7 @@ fn test_it_defaults_to_nothing_for_credentials_written_before_it_existed() {
 // ------------------------------------------------------- a refresh keeps it current
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_narrowed_refresh_is_recorded() {
     // §6 lets a server narrow on refresh; the stored scope must follow.
@@ -95,6 +96,7 @@ fn test_a_narrowed_refresh_is_recorded() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_refresh_that_names_no_scope_leaves_the_grant_alone() {
     // Omitting it means "unchanged", not "nothing".
@@ -151,6 +153,7 @@ fn one_tool() -> MCPConnectResult {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_the_granted_scope_reaches_the_record() {
     let (_, saved) = complete(one_tool(), Some("profile email"));
@@ -159,6 +162,7 @@ fn test_the_granted_scope_reaches_the_record() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_grant_naming_no_scope_persists_nothing() {
     let (_, saved) = complete(one_tool(), None);
@@ -169,6 +173,7 @@ fn test_a_grant_naming_no_scope_persists_nothing() {
 // ------------------------------------------------- the empty tool page stops guessing
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_it_names_what_was_actually_granted() {
     let (resp, _) = complete(MCPConnectResult { success: true, tools: vec![], ..Default::default() }, Some("profile email"));
@@ -177,6 +182,7 @@ fn test_it_names_what_was_actually_granted() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_it_says_so_when_the_grant_named_no_scopes() {
     let (resp, _) = complete(MCPConnectResult { success: true, tools: vec![], ..Default::default() }, None);
@@ -184,6 +190,7 @@ fn test_it_says_so_when_the_grant_named_no_scopes() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_transport_failure_still_reports_the_transport() {
     // A dead endpoint is not a scope problem and must not read as one.

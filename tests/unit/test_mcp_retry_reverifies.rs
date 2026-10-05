@@ -86,6 +86,7 @@ fn mcp_answer(method: &str, tools: &[&str]) -> HttpResponse {
 // --------------------------------------------- a retry drops the catalog it cannot trust
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_the_cached_tools_are_cleared() {
     let env = ServiceEnv::new("p1");
@@ -100,6 +101,7 @@ fn test_the_cached_tools_are_cleared() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_the_pass_is_queued() {
     let env = ServiceEnv::new("p1");
@@ -113,6 +115,7 @@ fn test_the_pass_is_queued() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_provisioning_then_discovers_rather_than_trusting_the_cache() {
     // The two halves together: after a retry, the pass must go to the wire.
@@ -127,6 +130,7 @@ fn test_provisioning_then_discovers_rather_than_trusting_the_cache() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_without_a_retry_a_known_catalog_is_still_not_rediscovered() {
     // The guard earns its keep on the registration path — leave it there.
@@ -141,6 +145,7 @@ fn test_without_a_retry_a_known_catalog_is_still_not_rediscovered() {
 // ------------------------------------------------- discovery renews before giving up
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_an_expired_token_is_renewed_and_discovery_retried() {
     reset_refresh_state();
@@ -197,6 +202,7 @@ fn dead_grant() -> Arc<FakeHttp> {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_retired_grant_keeps_its_own_diagnosis() {
     // Not overwritten by whatever the wire said.
@@ -215,6 +221,7 @@ fn test_a_retired_grant_keeps_its_own_diagnosis() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_the_provisioning_pass_preserves_that_message() {
     reset_refresh_state();

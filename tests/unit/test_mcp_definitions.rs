@@ -365,6 +365,7 @@ fn test_no_user_files_is_not_an_error() {
 // ------------------------------------------------------------------------- cache
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_the_registry_is_cached_and_reloadable() {
     // `definitions() is first`: the shared form is the cached registry itself.
@@ -411,6 +412,7 @@ mod finding_the_file_for_a_server {
     }
 
     #[test]
+    #[serial]
     #[serial(mcp_global)]
     fn test_the_catalog_slug_matches_first() {
         let found = parse_definitions(MINIMAL, "test").unwrap();
@@ -420,6 +422,7 @@ mod finding_the_file_for_a_server {
     }
 
     #[test]
+    #[serial]
     #[serial(mcp_global)]
     fn test_a_declared_match_term_finds_it() {
         let found =
@@ -430,6 +433,7 @@ mod finding_the_file_for_a_server {
     }
 
     #[test]
+    #[serial]
     #[serial(mcp_global)]
     fn test_an_unrelated_server_matches_nothing() {
         let found = parse_definitions(MINIMAL, "test").unwrap();
@@ -481,6 +485,7 @@ mod nothing_rewrites_the_command {
     }
 
     #[test]
+    #[serial]
     #[serial(mcp_global)]
     fn test_a_bare_uvx_package_is_stored_as_written() {
         let config = register("uvx", &["yahoo-finance-mcp"]);
@@ -488,6 +493,7 @@ mod nothing_rewrites_the_command {
     }
 
     #[test]
+    #[serial]
     #[serial(mcp_global)]
     fn test_an_npx_invocation_is_stored_as_written() {
         let config = register("npx", &["-y", "@example/some-mcp"]);
@@ -495,6 +501,7 @@ mod nothing_rewrites_the_command {
     }
 
     #[test]
+    #[serial]
     #[serial(mcp_global)]
     fn test_a_command_line_in_one_string_is_only_split() {
         let config = register("uv tool run --from pkg pkg", &[]);
@@ -502,6 +509,7 @@ mod nothing_rewrites_the_command {
     }
 
     #[test]
+    #[serial]
     #[serial(mcp_global)]
     fn test_a_program_path_needs_no_arguments() {
         let config = register("/opt/bin/my-mcp", &[]);

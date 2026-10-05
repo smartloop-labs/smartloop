@@ -10,6 +10,10 @@
 //! not have, and on the path where it did have one it would have written
 //! nothing.
 
+// Every test here holds both serial keys: the default one (the process-scope
+// globals `pin_project` / `delegate_projects` and env vars shared with the
+// workspace tests) and `mcp_global` (the router's pending OAuth sessions and
+// hooks, shared with the other OAuth tests that also use the state "st").
 use serial_test::serial;
 
 use smartloop::api::routers::mcp_servers as module;
@@ -32,6 +36,7 @@ mod the_redirect_target_is_addressed_to_the_supervisor {
 
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_it_names_the_project() {
         let _reset = ProcessScopeReset::new();
         let url = module::default_callback_url("p1");
@@ -41,6 +46,7 @@ mod the_redirect_target_is_addressed_to_the_supervisor {
     /// A child serves on an ephemeral port that is reaped when idle.
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_it_uses_the_public_port_not_the_childs() {
         let _reset = ProcessScopeReset::new();
         // `AppSettings()` patched to `api_port=38540`.
@@ -53,6 +59,7 @@ mod the_redirect_target_is_addressed_to_the_supervisor {
 
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_the_supervisor_forwards_it_to_the_owning_child() {
         let _reset = ProcessScopeReset::new();
         let _port = EnvGuard::set("SLP_API_PORT", "38540");
@@ -64,6 +71,7 @@ mod the_redirect_target_is_addressed_to_the_supervisor {
     /// Which is why nothing generates it any more.
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_the_unscoped_path_still_stops_at_the_supervisor() {
         let _reset = ProcessScopeReset::new();
         assert_eq!(project_to_proxy(&scope("/v1/mcp/oauth/callback", "GET")), None);
@@ -80,6 +88,7 @@ mod who_may_finish_the_flow {
 
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_the_child_pinned_to_the_project_may() {
         let _reset = ProcessScopeReset::new();
         pin_project(Some("p1"));
@@ -88,6 +97,7 @@ mod who_may_finish_the_flow {
 
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_a_child_pinned_to_another_project_may_not() {
         let _reset = ProcessScopeReset::new();
         pin_project(Some("p2"));
@@ -97,6 +107,7 @@ mod who_may_finish_the_flow {
     /// It writes the workspace record and no project file at all.
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_a_delegating_supervisor_may_not() {
         let _reset = ProcessScopeReset::new();
         delegate_projects(true);
@@ -105,6 +116,7 @@ mod who_may_finish_the_flow {
 
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_a_supervisor_that_claimed_the_project_may() {
         let _reset = ProcessScopeReset::new();
         delegate_projects(true);
@@ -114,6 +126,7 @@ mod who_may_finish_the_flow {
 
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_an_unsupervised_server_may() {
         let _reset = ProcessScopeReset::new();
         assert!(module::can_persist_project(Some("p1")));
@@ -121,6 +134,7 @@ mod who_may_finish_the_flow {
 
     #[test]
     #[serial]
+    #[serial(mcp_global)]
     fn test_a_session_with_no_project_may_not() {
         let _reset = ProcessScopeReset::new();
         assert!(!module::can_persist_project(None));
@@ -209,6 +223,7 @@ mod the_callback_refuses_rather_than_spend_the_code {
 
     #[tokio::test]
     #[serial]
+    #[serial(mcp_global)]
     async fn test_a_delegating_supervisor_refuses_before_exchanging() {
         let _reset = ProcessScopeReset::new();
         let _hooks = HooksReset;
@@ -221,6 +236,7 @@ mod the_callback_refuses_rather_than_spend_the_code {
     /// The redirect named one project; the session belongs to another.
     #[tokio::test]
     #[serial]
+    #[serial(mcp_global)]
     async fn test_a_mismatched_route_refuses_before_exchanging() {
         let _reset = ProcessScopeReset::new();
         let _hooks = HooksReset;

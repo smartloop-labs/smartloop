@@ -119,6 +119,7 @@ fn connect_result() -> MCPConnectResult {
 // ------------------------------------------------- registration carries the slug
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_the_oauth_session_holds_every_curated_field() {
     // The record is written in the callback, long after this request has
@@ -131,6 +132,7 @@ fn test_the_oauth_session_holds_every_curated_field() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_catalog_miss_still_records_what_the_client_asked_for() {
     // `resolve_catalog_entry` never fails — a stale cache, an expired platform
@@ -147,6 +149,7 @@ fn test_a_catalog_miss_still_records_what_the_client_asked_for() {
 // --------------------------------------------------- the callback writes the slug
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_the_record_keeps_the_curated_copy_over_the_handshake() {
     let session = register(true, SLUG);
@@ -205,6 +208,7 @@ fn complete(request: MCPOAuthCallbackRequest, session: Option<Map<String, Value>
 /// the vendor's handshake name — so the same install, completed the other way,
 /// produced a connection with no provenance.
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_posting_the_grant_back_keeps_provenance() {
     let session = register(true, SLUG);
@@ -230,6 +234,7 @@ fn test_posting_the_grant_back_keeps_provenance() {
 }
 
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_a_grant_with_no_session_still_installs() {
     // A session expires after an hour, and a completion arriving without one
@@ -259,6 +264,7 @@ fn test_a_grant_with_no_session_still_installs() {
 /// API and had lost it on disk by the next process start, so the round trip
 /// through config.json is part of the chain too.
 #[test]
+#[serial]
 #[serial(mcp_global)]
 fn test_the_slug_and_tags_come_back_after_a_save_and_reload() {
     let tmp = tempfile::tempdir().unwrap();
