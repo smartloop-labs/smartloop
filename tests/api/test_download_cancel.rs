@@ -36,7 +36,7 @@ use smartloop::utils::log_utils::LoggerLike;
 use smartloop::workspace::Workspace;
 use tower::ServiceExt;
 
-use crate::common::{NoRealDownloads, no_real_downloads};
+use crate::common::model_support::{NoRealDownloads, no_real_downloads};
 
 const MODEL_NAME: &str = "gemma3-4b";
 const MODEL_ID: &str = "google/gemma-3-4b-it";
