@@ -784,9 +784,9 @@ impl ModelService {
         self.model.read().clone().ok_or_else(|| runtime_err("Model not loaded"))
     }
 
-    /// `self._model.save()`.
+    /// `self._model.save()`, honouring the `save_model` seam.
     fn save_model(&self) -> anyhow::Result<()> {
-        self.model_or_err()?.save()
+        self.persist_model()
     }
 
     /// A snapshot of `self._model.workspace.current_project`.
@@ -2232,13 +2232,18 @@ impl ModelService {
         Ok(Self::mcp_server_to_dict(&server))
     }
 
-    /// Launch, hand-shake and list tools on one local server.
+    /// Launch, hand-shake and list tools on one local server (or the
+    /// `local_mcp_discovery` seam standing in for the launch).
     fn run_local_discovery(
+        &self,
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
         cwd: Option<&str>,
     ) -> Result<MCPConnectResult, MCPClientError> {
+        if let Some(discover) = self.hook(|h| h.local_mcp_discovery.clone()) {
+            return discover(command, args, env, cwd);
+        }
         let mut client = LocalMCPClient::new(command, args.to_vec()).with_env(Some(env.clone())).with_cwd(cwd);
         let result = client.enter().and_then(|()| client.connect_and_discover_tools());
         client.exit();
@@ -2266,7 +2271,7 @@ impl ModelService {
         // not silently discarded.
         let mut discovery_error: Option<String> = None;
         let mut result: Option<MCPConnectResult>;
-        match Self::run_local_discovery(&command, &args, &resolved_env, resolved_cwd.as_deref()) {
+        match self.run_local_discovery(&command, &args, &resolved_env, resolved_cwd.as_deref()) {
             Ok(r) => result = Some(r),
             Err(MCPClientError::Launch(exc)) => {
                 let exc_text = exc.0.clone();
@@ -2306,7 +2311,7 @@ impl ModelService {
                 while index < fixes.len() {
                     let fixed_args = fixes[index].clone();
                     index += 1;
-                    match Self::run_local_discovery(&command, &fixed_args, &resolved_env, resolved_cwd.as_deref()) {
+                    match self.run_local_discovery(&command, &fixed_args, &resolved_env, resolved_cwd.as_deref()) {
                         Err(retry_exc) => {
                             result = None;
                             let retry_text = retry_exc.to_string();
@@ -2401,6 +2406,10 @@ impl ModelService {
     /// Falls back to provisioning on a thread when the task isn't registered
     /// (CLI use, tests): the point is that the caller doesn't wait.
     pub fn queue_mcp_provisioning(&self, project: &Project, server: &MCPServer) {
+        if let Some(queue) = self.hook(|h| h.queue_mcp_provisioning.clone()) {
+            queue(project, server);
+            return;
+        }
         if let Some(task) = self.mcp_task() {
             task.enqueue(&project.id, &server.id);
             return;
@@ -2501,7 +2510,7 @@ impl ModelService {
         );
 
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            if server.tools.is_empty() { self.discover_mcp_tools(&mut server) } else { Ok(()) }
+            if server.tools.is_empty() { self.discover_mcp_tools_seam(&mut server) } else { Ok(()) }
         }));
         let failure = match outcome {
             Ok(Ok(())) => None,
@@ -2539,7 +2548,7 @@ impl ModelService {
 
         // Metadata for the UI and the tool router — an LLM call, which is why
         // it is here and not on the registration request.
-        self.enrich_mcp_server(&mut server);
+        self.enrich_mcp_server_seam(&mut server);
 
         server.status = MCPServerStatus::Ready;
         server.last_error = None;
@@ -2554,6 +2563,24 @@ impl ModelService {
             server.tools.len()
         );
         Ok(json!({"status": "ready", "tools": server.tools.len()}))
+    }
+
+    /// `_discover_mcp_tools(server)` as `_provision_mcp_server` calls it,
+    /// honouring the `discover_mcp_tools` seam.
+    fn discover_mcp_tools_seam(&self, server: &mut MCPServer) -> anyhow::Result<()> {
+        match self.hook(|h| h.discover_mcp_tools.clone()) {
+            Some(discover) => discover(server),
+            None => self.discover_mcp_tools(server),
+        }
+    }
+
+    /// `_enrich_mcp_server(server)` as `_provision_mcp_server` calls it,
+    /// honouring the `enrich_mcp_server` seam.
+    fn enrich_mcp_server_seam(&self, server: &mut MCPServer) {
+        match self.hook(|h| h.enrich_mcp_server.clone()) {
+            Some(enrich) => enrich(server),
+            None => self.enrich_mcp_server(server),
+        }
     }
 
     /// The hook a tool caller uses to write a rotated token back.
@@ -2585,7 +2612,10 @@ impl ModelService {
     pub fn probe_mcp_account(&self, server: &mut MCPServer) {
         let probed = catch_unwind(AssertUnwindSafe(|| {
             let caller: Arc<dyn ReadOnlyToolCaller> = Arc::new(PersistingToolCaller(self.transport_tool_caller()));
-            probe_account(&mut *server, Some(caller))
+            match self.hook(|h| h.probe_account.clone()) {
+                Some(probe) => probe(&mut *server, Some(caller)),
+                None => probe_account(&mut *server, Some(caller)),
+            }
         }));
         let (account, credentials_changed) = match probed {
             Ok(outcome) => outcome,
@@ -2626,7 +2656,7 @@ impl ModelService {
                 live.last_error = server.last_error.clone();
             }
         }
-        model.save()
+        self.persist_model()
     }
 
     /// Fill in a server's tools, launching or connecting as needed.  Errors
@@ -2647,7 +2677,11 @@ impl ModelService {
         let caller = self.transport_tool_caller();
         let token = MCPToolCaller::get_access_token(server);
 
+        let remote_discovery = self.hook(|h| h.remote_mcp_discovery.clone());
         let connect = |access_token: Option<&str>| {
+            if let Some(discover) = remote_discovery.as_ref() {
+                return discover(&server_url, access_token);
+            }
             let mut client = MCPClient::new();
             client.enter();
             let result = client.connect_and_discover_tools(&server_url, access_token, "Bearer");
