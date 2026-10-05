@@ -875,6 +875,12 @@ impl SLPArtifactDownloader {
         self
     }
 
+    /// The bootstrap source (`_bootstrap_source`), read by the API's
+    /// orchestrator bootstrap.
+    pub fn bootstrap_source(&self) -> &Arc<dyn BootstrapArtifactSource> {
+        &self.bootstrap_source
+    }
+
     /// Replace the HTTP transport.
     pub fn with_http(mut self, http: Arc<dyn DownloadHttp>) -> Self {
         self.http = http;
