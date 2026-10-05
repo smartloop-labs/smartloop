@@ -3917,13 +3917,8 @@ Search query:"
                 return if size.is_empty() { name } else { format!("{name} ({size})") };
             }
         }
-        if llm.as_any().is::<crate::llms::llama_cpp::LlamaCpp>() {
-            return "LlamaCpp".to_string();
-        }
-        if llm.as_any().is::<RemoteLLM>() {
-            return "RemoteLLM".to_string();
-        }
-        llm.llm_type().to_string()
+        // Python: `type(llm).__name__`.
+        llm.class_name().to_string()
     }
 
     /// Name the model that will actually write the response.
