@@ -124,26 +124,169 @@ fn chunk_literals(src: &str) -> Vec<(usize, String)> {
     found
 }
 
+/// The text between the parenthesis opening at *open* and its match.
+fn parenthesized(src: &str, open: usize) -> &str {
+    let mut depth = 0usize;
+    for (i, b) in src.bytes().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open + 1..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    &src[open + 1..]
+}
+
+/// The top-level, comma-separated arguments of an argument list.
+fn top_level_args(list: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, b) in list.bytes().enumerate() {
+        match b {
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                args.push(list[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = list[start..].trim();
+    if !last.is_empty() {
+        args.push(last.to_string());
+    }
+    args
+}
+
+/// The identifier an expression is rooted at: `&stream_model` and
+/// `stream_model.clone()` are both `stream_model`.
+fn base_ident(expr: &str) -> &str {
+    expr.trim().trim_start_matches('&').split(['.', ' ', '(']).next().unwrap_or_default()
+}
+
+/// Every `ChatCompletionChunk::new(...)` call in *src*, as
+/// `(line, byte offset, model argument)`.  `ChatCompletionChunk::default()`
+/// is reported with no model.
+fn chunk_constructor_calls(src: &str) -> Vec<(usize, usize, Option<String>)> {
+    let mut found = Vec::new();
+    for ctor in ["ChatCompletionChunk::new", "ChatCompletionChunk::default"] {
+        let mut from = 0;
+        while let Some(rel) = src[from..].find(ctor) {
+            let at = from + rel;
+            from = at + ctor.len();
+            let after = &src[from..];
+            let trimmed = after.trim_start();
+            if !trimmed.starts_with('(') {
+                continue;
+            }
+            let open = from + (after.len() - trimmed.len());
+            let model = if ctor.ends_with("::new") {
+                top_level_args(parenthesized(src, open)).into_iter().next()
+            } else {
+                None
+            };
+            found.push((line_of(src, at), at, model));
+        }
+    }
+    found
+}
+
+/// The `fn` enclosing byte offset *pos*: its name and parameter names.
+fn enclosing_fn(src: &str, pos: usize) -> Option<(String, Vec<String>)> {
+    let fn_at = src[..pos].rfind("fn ")?;
+    let rest = &src[fn_at + 3..];
+    let name_len = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    let name = rest[..name_len].to_string();
+    let open = fn_at + 3 + rest.find('(')?;
+    let params = top_level_args(parenthesized(src, open))
+        .into_iter()
+        .map(|p| p.split(':').next().unwrap_or_default().trim().trim_start_matches("mut ").to_string())
+        .collect();
+    Some((name, params))
+}
+
+/// Every call `name(...)` in *src* (not its `fn name(` definition), as
+/// `(line, arguments)`.
+fn calls_to(src: &str, name: &str) -> Vec<(usize, Vec<String>)> {
+    let needle = format!("{name}(");
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(&needle) {
+        let at = from + rel;
+        from = at + needle.len();
+        let preceded_by_ident = src[..at].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if preceded_by_ident || src[..at].trim_end().ends_with("fn") {
+            continue;
+        }
+        let open = at + name.len();
+        found.push((line_of(src, at), top_level_args(parenthesized(src, open))));
+    }
+    found
+}
+
 /// No `ChatCompletionChunk` may echo the raw requested id.
 ///
 /// `stream_model` is resolved once at the top of the stream; a new chunk that
 /// passes `request.model` straight through would leak `slp-orchestra-mini`
 /// back to the client mid-stream.
+///
+/// The Python router builds every chunk inline with `ChatCompletionChunk(...)`.
+/// The Rust router may also build them through a small helper that takes the
+/// model as a parameter (`chunk_frame(model, ...)`); a construction whose model
+/// is such a parameter is followed to every call of the helper, and each of
+/// those must pass `stream_model`.
 #[test]
 fn test_every_sse_chunk_reports_the_display_name() {
     let src = chat_source();
-    let chunks = chunk_literals(&src);
-    assert!(!chunks.is_empty(), "expected ChatCompletionChunk constructions in chat.rs");
+    let literals = chunk_literals(&src);
+    let ctor_calls = chunk_constructor_calls(&src);
+    assert!(
+        !literals.is_empty() || !ctor_calls.is_empty(),
+        "expected ChatCompletionChunk constructions in chat.rs"
+    );
 
-    for (line, body) in chunks {
+    for (line, body) in literals {
         let fields = top_level_fields(&body);
         let model = fields.iter().find(|(name, _)| name == "model");
         let (_, value) = model.unwrap_or_else(|| panic!("chunk at line {line} has no model:"));
-        let base = value.split(['.', ' ']).next().unwrap_or_default().trim_start_matches('&');
         assert_eq!(
-            base, "stream_model",
+            base_ident(value),
+            "stream_model",
             "chunk at line {line} must use stream_model, not the raw request id"
         );
+    }
+
+    for (line, at, model) in ctor_calls {
+        let model = model.unwrap_or_else(|| panic!("chunk at line {line} has no model"));
+        let base = base_ident(&model);
+        if base == "stream_model" {
+            continue;
+        }
+        // The model is a parameter of a chunk-building helper: every call of
+        // the helper has to hand it the display name.
+        let (helper, params) = enclosing_fn(&src, at).unwrap_or_else(|| {
+            panic!("chunk at line {line} must use stream_model, not the raw request id")
+        });
+        let index = params.iter().position(|p| p == base).unwrap_or_else(|| {
+            panic!("chunk at line {line} must use stream_model, not the raw request id (got {model})")
+        });
+        let calls = calls_to(&src, &helper);
+        assert!(!calls.is_empty(), "chunk helper {helper} at line {line} is never called");
+        for (call_line, args) in calls {
+            let arg = args.get(index).map(String::as_str).unwrap_or_default();
+            assert_eq!(
+                base_ident(arg),
+                "stream_model",
+                "chunk built by {helper}() at line {call_line} must use stream_model, not the raw request id"
+            );
+        }
     }
 }
 

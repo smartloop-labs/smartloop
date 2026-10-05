@@ -51,7 +51,7 @@ mod test_pending_session_eviction {
     use super::*;
 
     #[test]
-    #[serial]
+    #[serial(mcp_global)]
     fn test_abandoned_session_expires() {
         let _clean = CleanState::new();
         let now = time_now();
@@ -73,7 +73,7 @@ mod test_pending_session_eviction {
     /// An entry with no `created_at` must not read as infinitely old and
     /// vanish on the very next sweep — it gets stamped and expires one TTL on.
     #[test]
-    #[serial]
+    #[serial(mcp_global)]
     fn test_untimestamped_session_is_stamped_not_dropped() {
         let _clean = CleanState::new();
         let now = time_now();
@@ -97,7 +97,7 @@ mod test_completed_response_eviction {
     use super::*;
 
     #[test]
-    #[serial]
+    #[serial(mcp_global)]
     fn test_cached_response_expires() {
         let _clean = CleanState::new();
         let now = time_now();
@@ -112,7 +112,7 @@ mod test_completed_response_eviction {
     }
 
     #[test]
-    #[serial]
+    #[serial(mcp_global)]
     fn test_cache_is_size_capped_oldest_first() {
         let _clean = CleanState::new();
         let now = time_now();

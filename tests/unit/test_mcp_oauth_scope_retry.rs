@@ -93,7 +93,7 @@ mod test_retry {
     use super::*;
 
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_a_refused_scope_is_reissued_without_one() {
         let (resp, _) = refuse("invalid_scope", Some(session(json!({}))), Some("st")).await;
         assert_eq!(resp.status_code(), 302);
@@ -103,7 +103,7 @@ mod test_retry {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_the_reissue_keeps_everything_else_the_grant_needs() {
         let (resp, _) = refuse("invalid_scope", Some(session(json!({}))), Some("st")).await;
         let params = parse_qs(resp.location().expect("a redirect"));
@@ -116,7 +116,7 @@ mod test_retry {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_the_session_records_what_the_retry_asked_for() {
         let (_, session) = refuse("invalid_scope", Some(session(json!({}))), Some("st")).await;
         let session = session.expect("the session stays pending for the retry");
@@ -126,7 +126,7 @@ mod test_retry {
 
     /// Otherwise a server refusing the empty request bounces the browser forever.
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_a_second_refusal_gives_up() {
         let (first, _) = refuse("invalid_scope", Some(session(json!({}))), Some("st")).await;
         assert_eq!(first.status_code(), 302);
@@ -142,7 +142,7 @@ mod test_when_not_to_retry {
     use super::*;
 
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_another_error_is_reported_not_retried() {
         let (resp, _) = refuse("access_denied", Some(session(json!({}))), Some("st")).await;
         assert_eq!(resp.status_code(), 400);
@@ -151,7 +151,7 @@ mod test_when_not_to_retry {
 
     /// The request already named no scopes; asking again changes nothing.
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_nothing_to_drop_means_nothing_to_retry() {
         let (resp, _) = refuse("invalid_scope", Some(session(json!({"scope": null}))), Some("st")).await;
         assert_eq!(resp.status_code(), 400);
@@ -159,21 +159,21 @@ mod test_when_not_to_retry {
 
     /// A client driving the flow itself owns its own PKCE pair.
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_a_session_without_a_challenge_is_not_rebuilt() {
         let (resp, _) = refuse("invalid_scope", Some(session(json!({"code_challenge": null}))), Some("st")).await;
         assert_eq!(resp.status_code(), 400);
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_an_unknown_state_is_reported() {
         let (resp, _) = refuse("invalid_scope", None, Some("st")).await;
         assert_eq!(resp.status_code(), 400);
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(mcp_global)]
     async fn test_an_error_without_state_is_reported() {
         let (resp, _) = refuse("invalid_scope", Some(session(json!({}))), None).await;
         assert_eq!(resp.status_code(), 400);
