@@ -31,9 +31,8 @@ pub trait ArtifactSource: Send + Sync {
 
 /// An artifact source that can also list the bootstrap catalog.
 pub trait BootstrapArtifactSource: ArtifactSource {
-    /// Fetch (and cache) the bootstrap model list (`list[dict]`).  The
-    /// cached list is shared, so repeated calls hand back the same object.
-    fn list_models(&self) -> anyhow::Result<Arc<Vec<Value>>>;
+    /// Fetch (and cache) the bootstrap model list (`list[dict]`).
+    fn list_models(&self) -> anyhow::Result<Vec<Value>>;
 }
 
 /// The slice of [`SLPPlatformClient`] the artifact sources use; a trait so
@@ -157,7 +156,7 @@ impl ArtifactSource for SLPBootstrapSource {
 }
 
 impl BootstrapArtifactSource for SLPBootstrapSource {
-    fn list_models(&self) -> anyhow::Result<Arc<Vec<Value>>> {
-        SLPBootstrapSource::list_models(self)
+    fn list_models(&self) -> anyhow::Result<Vec<Value>> {
+        Ok(SLPBootstrapSource::list_models(self)?.as_ref().clone())
     }
 }

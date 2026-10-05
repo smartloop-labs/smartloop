@@ -456,8 +456,8 @@ impl ArtifactSource for BootstrapSource {
 }
 
 impl BootstrapArtifactSource for BootstrapSource {
-    fn list_models(&self) -> anyhow::Result<Arc<Vec<Value>>> {
-        Ok(Arc::new(vec![json!({"name": "slp-orchestra-mini"})]))
+    fn list_models(&self) -> anyhow::Result<Vec<Value>> {
+        Ok(vec![json!({"name": "slp-orchestra-mini"})])
     }
 }
 

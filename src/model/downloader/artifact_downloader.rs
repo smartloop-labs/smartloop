@@ -734,7 +734,7 @@ impl ArtifactSource for UnconfiguredSource {
 }
 
 impl BootstrapArtifactSource for UnconfiguredSource {
-    fn list_models(&self) -> anyhow::Result<Arc<Vec<serde_json::Value>>> {
+    fn list_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         anyhow::bail!("no bootstrap source configured")
     }
 }
