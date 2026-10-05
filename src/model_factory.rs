@@ -2,15 +2,20 @@
 //!
 //! Port of `smartloop/model_factory.py`.
 
-#[allow(unused_imports)]
+use std::sync::Arc;
+
+use once_cell::sync::Lazy;
+
 use crate::config::app_settings::AppSettings;
 use crate::config::ModelConfig;
-#[allow(unused_imports)]
 use crate::config::SUPPORTED_MODELS;
-#[allow(unused_imports)]
+use crate::model::downloader::slp_downloader::SharedLogger;
 use crate::model::model_manager::{Model, ModelManager};
-#[allow(unused_imports)]
+use crate::utils::log_utils::ConsoleLogger;
 use crate::workspace::Workspace;
+
+/// Module-level settings (`_settings = AppSettings()`), read once.
+static SETTINGS: Lazy<AppSettings> = Lazy::new(AppSettings::new);
 
 /// Factory for workspace-backed models.
 pub struct ModelFactory;
@@ -19,8 +24,23 @@ impl ModelFactory {
     /// Resolve the model class for `config.model_name` (error
     /// "Unknown model: <name>" when unsupported), ensure the home dir exists,
     /// initialise the workspace and return the registered model.
+    ///
+    /// Logs through a [`ConsoleLogger`], the Python default.
     pub fn get_model(config: &ModelConfig) -> anyhow::Result<Model> {
-        let _ = config;
-        todo!()
+        Self::get_model_with_logger(config, Arc::new(ConsoleLogger::new()))
+    }
+
+    /// [`ModelFactory::get_model`] with an explicit logger (the Python
+    /// `logger` keyword).
+    pub fn get_model_with_logger(config: &ModelConfig, logger: SharedLogger) -> anyhow::Result<Model> {
+        let Some(model_type) = SUPPORTED_MODELS.get(&config.model_name) else {
+            anyhow::bail!("Unknown model: {}", config.model_name);
+        };
+
+        std::fs::create_dir_all(SETTINGS.home_dir())?;
+
+        let workspace = Workspace::init(config);
+
+        ModelManager::get_model(&model_type, workspace, Some(logger), Some(config.clone()))
     }
 }

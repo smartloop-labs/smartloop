@@ -47,5 +47,16 @@ pub use server::{get_server_url, get_status, is_server_running, read_pid_file, s
 /// (`TOKENIZERS_PARALLELISM=false`, `TRANSFORMERS_VERBOSITY=error`).  Call
 /// once at start-up, before any threads are spawned.
 pub fn init_process_env() {
-    todo!()
+    // The Python package also emptied `mimetypes.knownfiles` here so the App
+    // Sandbox's read-denied system MIME tables could not abort start-up;
+    // `mime_guess` uses a compiled-in table, so there is nothing to disable.
+    //
+    // SAFETY: documented as start-up only, before any other thread exists, so
+    // nothing can be reading the environment concurrently.
+    unsafe {
+        // Disable tokenizer parallelism warning
+        std::env::set_var("TOKENIZERS_PARALLELISM", "false");
+        // Suppress transformers warnings
+        std::env::set_var("TRANSFORMERS_VERBOSITY", "error");
+    }
 }
