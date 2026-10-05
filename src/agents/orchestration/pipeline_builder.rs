@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
@@ -78,6 +78,21 @@ pub const REASON_NODE: AgentNodeName = AgentNodeName::Reason;
 /// Shared, mutable search context captured by node handlers (a WEB_SEARCH
 /// step appends its sources to it, the judge clears sources from it).
 pub type SharedSearchContext = Arc<Mutex<SearchContext>>;
+
+/// Test seam replacing [`PipelineBuilder::build_unified_pipeline`]:
+/// `(ctx, matched_skills, search_ctx, enrich_ctx, parent) -> extensions`
+/// (Python tests assign `orch._pipeline._build_unified_pipeline = fake`).
+pub type UnifiedPipelineHook = Arc<
+    dyn Fn(
+            &SharedOrchestratorContext,
+            Option<&[SkillDict]>,
+            &SharedSearchContext,
+            &EnrichedContext,
+            Option<&AgentNode>,
+        ) -> Vec<DagExtension>
+        + Send
+        + Sync,
+>;
 
 /// A URL in a step instruction.
 static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s<>'")\]]+"#).unwrap());
@@ -236,6 +251,9 @@ pub struct PipelineBuilder {
     /// functions.
     #[allow(dead_code)]
     pub(crate) response: Arc<ResponseBuilder>,
+    /// Replaces [`Self::build_unified_pipeline`] in [`Self::handle_route`]
+    /// when set (test seam).
+    unified_pipeline_hook: RwLock<Option<UnifiedPipelineHook>>,
 }
 
 impl PipelineBuilder {
@@ -273,7 +291,15 @@ impl PipelineBuilder {
             steps,
             tool_fanout,
             response,
+            unified_pipeline_hook: RwLock::new(None),
         }
+    }
+
+    /// Replace the unified pipeline the route node builds (Python tests
+    /// assign `orch._pipeline._build_unified_pipeline = fake`).  `None`
+    /// restores the real builder.
+    pub fn set_unified_pipeline_hook(&self, hook: Option<UnifiedPipelineHook>) {
+        *self.unified_pipeline_hook.write() = hook;
     }
 
     /// The decision model, owned by the router.
@@ -438,13 +464,17 @@ impl PipelineBuilder {
             parent = contributed.parent;
         }
 
-        extend_dag.extend(self.build_unified_pipeline(
-            ctx,
-            matched_skills.as_deref(),
-            &shared,
-            &enrich_ctx,
-            Some(&parent),
-        ));
+        let hook = self.unified_pipeline_hook.read().clone();
+        extend_dag.extend(match hook {
+            Some(h) => h(ctx, matched_skills.as_deref(), &shared, &enrich_ctx, Some(&parent)),
+            None => self.build_unified_pipeline(
+                ctx,
+                matched_skills.as_deref(),
+                &shared,
+                &enrich_ctx,
+                Some(&parent),
+            ),
+        });
 
         let data = json!({
             "search_ctx": serde_json::to_value(&*shared.lock()).unwrap_or(Value::Null),
