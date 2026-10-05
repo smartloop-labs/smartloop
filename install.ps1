@@ -309,8 +309,9 @@ function Install-Smartloop {
     $alreadyListed = (Test-Path $installedFile) -and ((Get-Content $installedFile) -contains $Version)
     if (-not $alreadyListed) { Add-Content -Path $installedFile -Value $Version }
 
-    # The PyInstaller distribution is self-contained: slp.exe sits at the top
-    # of the install dir next to its _internal\ payload.
+    # The distribution is self-contained: the single slp.exe sits at the top
+    # of the install dir next to its bundled DLLs (Vulkan loader, MSVC runtime)
+    # and embedding model (embeddings\).
     $slpBin = Join-Path $InstallDir 'slp.exe'
     if (-not (Test-Path $slpBin)) { Die "Executable not found at $slpBin" }
 

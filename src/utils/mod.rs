@@ -10,6 +10,8 @@ pub mod metadata_utils;
 pub mod path_utils;
 pub mod py_compat;
 
+pub mod runtime_env;
+
 pub use chunk_converter::convert_chunks_to_document_chunks;
 pub use device_utils::{get_device_config, is_apple_silicon, DeviceConfig};
 pub use doc_splitter::{is_markdown_table, json_to_table, DocumentSplitter};
@@ -21,3 +23,4 @@ pub use metadata_utils::{
     save_training_metadata,
 };
 pub use path_utils::normalize_path;
+pub use runtime_env::apply_runtime_env;

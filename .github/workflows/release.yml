@@ -31,7 +31,8 @@ jobs:
       - name: Compute next version
         id: next
         run: |
-          CURRENT=$(python3 -c "import re; print(re.search(r'^version = \"([^\"]+)\"', open('pyproject.toml').read(), re.M).group(1))")
+          # The crate version (the [package] table of Cargo.toml) is the source of truth.
+          CURRENT=$(awk -F'"' '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{print $2; exit}' Cargo.toml)
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
           case "${{ inputs.bump }}" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
@@ -46,13 +47,22 @@ jobs:
       - name: Update version files
         run: |
           VERSION="${{ steps.next.outputs.version }}"
-          sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
-          sed -i "s/^__version__ = .*/__version__ = \"${VERSION}\"/" smartloop/__init__.py
+          # Cargo.toml: only the first `version =` line, i.e. the [package] one.
+          sed -i "0,/^version = .*/s//version = \"${VERSION}\"/" Cargo.toml
+          # Cargo.lock: the smartloop package entry (version follows its name).
+          sed -i "/^name = \"smartloop\"$/{n;s/^version = \".*\"/version = \"${VERSION}\"/}" Cargo.lock
           sed -i "s/^VERSION=\".*\"/VERSION=\"${VERSION}\"/" install.sh
+          sed -i "s/^\(\$Version *= *\)'.*'/\1'${VERSION}'/" install.ps1
           echo "Updated to v${VERSION}"
-          grep '^version' pyproject.toml
-          grep '__version__' smartloop/__init__.py
-          head -4 install.sh | tail -1
+          awk -F'"' '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{print "Cargo.toml: " $2; exit}' Cargo.toml
+          grep -A1 '^name = "smartloop"$' Cargo.lock
+          grep '^VERSION=' install.sh
+          grep '^\$Version' install.ps1
+          # Fail the bump rather than open a PR with a half-updated version.
+          grep -q "^version = \"${VERSION}\"" Cargo.toml
+          grep -A1 '^name = "smartloop"$' Cargo.lock | grep -q "^version = \"${VERSION}\"$"
+          grep -q "^VERSION=\"${VERSION}\"" install.sh
+          grep -q "^\$Version *= *'${VERSION}'" install.ps1
 
       - name: Create pull request
         env:
@@ -61,7 +71,7 @@ jobs:
           VERSION="${{ steps.next.outputs.version }}"
           BRANCH="release/v${VERSION}"
           git checkout -b "$BRANCH"
-          git add pyproject.toml smartloop/__init__.py install.sh
+          git add Cargo.toml Cargo.lock install.sh install.ps1
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "Bump version to ${VERSION}"
@@ -87,7 +97,7 @@ jobs:
       - name: Read version
         id: version
         run: |
-          VERSION=$(python3 -c "import re; print(re.search(r'^version = \"([^\"]+)\"', open('pyproject.toml').read(), re.M).group(1))")
+          VERSION=$(awk -F'"' '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{print $2; exit}' Cargo.toml)
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
