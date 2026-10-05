@@ -40,7 +40,7 @@ impl StoreFactory {
         base_dir: Option<&str>,
         store_type: Option<&str>,
     ) -> anyhow::Result<Arc<dyn VectorStore>> {
-        let _ = (project_dir, collection_name, base_dir, store_type, IndexStore::new);
-        todo!()
+        let _ = store_type;
+        Ok(Arc::new(IndexStore::new(project_dir, collection_name, base_dir)?))
     }
 }

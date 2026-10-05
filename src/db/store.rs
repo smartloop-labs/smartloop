@@ -2,6 +2,8 @@
 //! `ChunkResult` search result and the keyword-coverage boost shared by all
 //! dense-embedding stores.
 
+use std::collections::HashSet;
+
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -31,8 +33,27 @@ pub type Chunk = Map<String, Value>;
 /// Subtract the returned value from a cosine distance to boost documents that
 /// match more of the query (clamped to [`MAX_TERM_BOOST`]).
 pub fn keyword_coverage_boost(query_text: &str, name: Option<&str>, content: Option<&str>) -> f64 {
-    let _ = (query_text, name, content);
-    todo!()
+    let query_tokens: HashSet<String> = TERM_RE
+        .find_iter(query_text)
+        .map(|m| m.as_str())
+        .filter(|t| t.chars().count() > 2)
+        .map(|t| t.to_lowercase())
+        .collect();
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let haystack = format!(
+        "{} {}",
+        name.unwrap_or("").replace('_', " "),
+        content.unwrap_or("")
+    )
+    .to_lowercase();
+    let doc_words: HashSet<&str> = TERM_RE.find_iter(&haystack).map(|m| m.as_str()).collect();
+    let matched = query_tokens.iter().filter(|t| doc_words.contains(t.as_str())).count();
+    if matched == 0 {
+        return 0.0;
+    }
+    MAX_TERM_BOOST.min(PER_TERM_BOOST * matched as f64)
 }
 
 /// A single vector search result with text and source metadata.
@@ -121,4 +142,10 @@ pub trait VectorStore: Send + Sync {
 
     /// Remove all chunks for a document.
     fn delete_document(&self, document_id: &str) -> anyhow::Result<()>;
+
+    /// Downcasting hook (Python `isinstance(store, IndexStore)`); `None` for
+    /// implementations that don't support it.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }

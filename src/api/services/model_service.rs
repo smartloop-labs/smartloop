@@ -207,6 +207,15 @@ pub struct ModelServiceHooks {
 /// The process-wide singleton (`ModelService._instance`).
 static INSTANCE: OnceCell<Arc<ModelService>> = OnceCell::new();
 
+impl ModelService {
+    /// The singleton if it has been created (`ModelService._instance`),
+    /// without creating it.  Added by the `db` unit for
+    /// `embeddings::device_idle_seconds`.
+    pub fn existing_instance() -> Option<Arc<ModelService>> {
+        INSTANCE.get().cloned()
+    }
+}
+
 /// Singleton service to manage model lifecycle and inference.
 ///
 /// All state uses interior mutability so the service is shared as
