@@ -173,8 +173,6 @@ mod test_encode_normalizes {
 }
 
 mod test_get_model_wiring {
-    use super::*;
-
     /// `embeddings._get_model` hands the loader the configured repo, file
     /// and bucket.  The singleton's loader is not injectable in the Rust
     /// port, so this pins the settings it forwards — the values the Python

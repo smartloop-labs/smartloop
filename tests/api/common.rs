@@ -5,6 +5,7 @@
 /// behind a real [`PlatformService`], installed as the
 /// `get_platform_service` override for the life of the fixture, plus a
 /// helper that drives the axum app in-process (FastAPI's `TestClient`).
+#[allow(dead_code)]
 pub mod core_support {
     use std::sync::Arc;
 
