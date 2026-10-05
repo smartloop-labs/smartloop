@@ -13,8 +13,8 @@ use smartloop::agents::mcp::mcp_tool_caller::MCPToolCaller;
 use smartloop::api::routers::mcp_servers;
 use smartloop::api::services::model_service::ModelService;
 use smartloop::workspace::workspace::{MCPOAuthCredentials, MCPServer, RemoteMCPServerConfig};
-use wiremock::matchers::any;
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use serial_test::serial;
+use std::sync::{Arc, Mutex};
 
 fn server(token: Option<&str>, oauth_token: Option<&str>) -> MCPServer {
     MCPServer {
@@ -49,30 +49,36 @@ fn test_no_credential_anywhere_is_none() {
 }
 
 /// "/info" belongs on the path — appended raw it lands inside the query.
-#[tokio::test]
-async fn test_info_probe_keeps_the_query_string() {
-    // The probe is not served: whatever it reaches answers with an error.
-    let probe = MockServer::start().await;
-    Mock::given(any())
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&probe)
-        .await;
+///
+/// The route hooks are process-global and are installed by tests in both the
+/// `mcp_global` and the unkeyed `#[serial]` groups, so this holds both locks.
+#[test]
+#[serial]
+#[serial(mcp_global)]
+fn test_info_probe_keeps_the_query_string() {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    // Stands in for `httpx.get`: record the URL, then fail to connect.
+    mcp_servers::set_hooks(mcp_servers::McpRouteHooks {
+        probe_info: Some(Arc::new(move |url: &str| {
+            recorder.lock().unwrap().push(url.to_string());
+            Err(anyhow::anyhow!("probe not served"))
+        })),
+        ..Default::default()
+    });
 
-    let result = mcp_servers::try_register_smartloop_mcp_server(
-        &format!("{}/v1/mcp?token=abc", probe.uri()),
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let result = runtime.block_on(mcp_servers::try_register_smartloop_mcp_server(
+        "http://127.0.0.1:61185/v1/mcp?token=abc",
         ModelService::new_bare(),
         "p",
-    )
-    .await;
+    ));
+    mcp_servers::set_hooks(mcp_servers::McpRouteHooks::default());
 
     // An unreachable probe is "not a Smartloop server", not an error.
     assert!(matches!(result, Ok(None)));
-    let seen: Vec<String> = probe
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|r| r.url.to_string())
-        .collect();
-    assert_eq!(seen, vec![format!("{}/v1/mcp/info?token=abc", probe.uri())]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["http://127.0.0.1:61185/v1/mcp/info?token=abc".to_string()]
+    );
 }
