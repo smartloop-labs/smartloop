@@ -55,6 +55,7 @@ indexmap = { version = "2.14.2", features = ["serde"] }
 indicatif = "0.18.6"
 libc = "0.2.190"
 llama-cpp-2 = { version = "0.1.158", features = ["mtmd"] }
+markup5ever_rcdom = "0.38.0"
 md-5 = "0.11.0"
 mime_guess = "2.0.5"
 minijinja = { version = "2.24", features = ["loop_controls", "json", "preserve_order"] }
