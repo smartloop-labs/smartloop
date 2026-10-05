@@ -5,6 +5,8 @@
 //! are auto-loaded as system skills on every chat request.  The templates are
 //! embedded in the binary.
 
+use std::path::Path;
+
 /// The bundled skill templates as `(file name, contents)`.
 pub const DEFAULT_SKILLS: &[(&str, &str)] = &[(
     "__system_mcp__.md",
@@ -13,6 +15,12 @@ pub const DEFAULT_SKILLS: &[(&str, &str)] = &[(
 
 /// Copy bundled `*.md` skill files into `dest_dir` (skip existing).
 pub fn install_default_skills(dest_dir: &str) -> std::io::Result<()> {
-    let _ = dest_dir;
-    todo!()
+    std::fs::create_dir_all(dest_dir)?;
+    for (name, contents) in DEFAULT_SKILLS {
+        let dst = Path::new(dest_dir).join(name);
+        if !dst.exists() {
+            std::fs::write(&dst, contents)?;
+        }
+    }
+    Ok(())
 }
