@@ -183,6 +183,21 @@ pub struct InferenceState {
 /// methods on the instance.  Each `None` runs the real implementation.
 #[derive(Clone, Default)]
 pub struct ModelServiceHooks {
+    // ---- model_service_b seams (consulted by the methods in `part2`) ----
+    /// Replaces `_pinned_model(capability)` where `part2` calls it.
+    pub pinned_model: Option<Arc<dyn Fn(Option<&str>) -> Option<WorkspaceModel> + Send + Sync>>,
+    /// Replaces `_pinned_llm(capability)` where `part2` calls it.
+    pub pinned_llm: Option<Arc<dyn Fn(Option<&str>) -> Option<Arc<dyn BaseLLM>> + Send + Sync>>,
+    /// Replaces `_get_llm_for_capability(capability)` where `part2` calls it.
+    pub get_llm_for_capability: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn BaseLLM>> + Send + Sync>>,
+    /// Replaces `_get_large_llm()` where `part2` calls it.
+    pub get_large_llm: Option<Arc<dyn Fn() -> Option<Arc<dyn BaseLLM>> + Send + Sync>>,
+    /// Replaces `_llm_for_response(capability)`.
+    pub llm_for_response: Option<Arc<dyn Fn(Option<&str>) -> Option<Arc<dyn BaseLLM>> + Send + Sync>>,
+    /// Replaces `_setup_project_tools(project)` where `create_project` calls it
+    /// (receives the project id).
+    pub setup_project_tools: Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>,
+    // ---- end model_service_b seams ----
     /// Replaces `_free_llm(llm)`.
     pub free_llm: Option<Arc<dyn Fn(&Arc<dyn BaseLLM>) + Send + Sync>>,
     /// Replaces `_cleanup_gpu_cache()`.
@@ -202,6 +217,11 @@ pub struct ModelServiceHooks {
     pub generate_completion: Option<Arc<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>>,
     /// Replaces `_get_project(project_id)`.
     pub get_project: Option<Arc<dyn Fn(&str) -> anyhow::Result<Project> + Send + Sync>>,
+    /// Replaces `load_model()` (the API tests' `model_service.load_model =
+    /// MagicMock(side_effect=...)`).
+    pub load_model: Option<Arc<dyn Fn() -> anyhow::Result<Arc<dyn BaseLLM>> + Send + Sync>>,
+    /// Replaces `add_local_mcp_server(...)`; receives `(command, project_id)`.
+    pub add_local_mcp_server: Option<Arc<dyn Fn(&str, Option<&str>) -> anyhow::Result<Value> + Send + Sync>>,
 }
 
 /// The process-wide singleton (`ModelService._instance`).
