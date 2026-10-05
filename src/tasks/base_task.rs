@@ -6,15 +6,18 @@
 //! tracking. Tasks can use agents to fulfill their work.
 
 use std::any::Any;
-use std::sync::atomic::AtomicU32;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::model::downloader::artifact_downloader::DownloadError;
+use crate::platform::client::{ModelAccessError, PlatformError};
 use crate::utils::log_utils::LoggerLike;
 
 /// Shared logger handle (Python `logging.Logger`).
@@ -88,7 +91,14 @@ impl TaskResult {
 
     /// `{"success": ..., "data": ..., "error": ...}`.
     pub fn to_dict(&self) -> Value {
-        todo!()
+        let mut map = Map::new();
+        map.insert("success".to_string(), Value::Bool(self.success));
+        map.insert("data".to_string(), self.data.clone());
+        map.insert(
+            "error".to_string(),
+            self.error.clone().map(Value::String).unwrap_or(Value::Null),
+        );
+        Value::Object(map)
     }
 }
 
@@ -102,9 +112,49 @@ pub struct PermissionError(pub String);
 
 /// True when `err` (or its cause chain) is a non-retryable error
 /// (`NON_RETRYABLE_ERRORS = (PermissionError,)`).
+///
+/// Python checked the exception and its `__cause__`.  The Rust equivalents of
+/// `PermissionError` are this module's [`PermissionError`], an `io::Error` of
+/// kind `PermissionDenied`, the platform client's permission refusals
+/// (`PlatformError::Permission`, `ModelAccessError`) and a download failure
+/// wrapping any of those.
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
-    let _ = err;
-    todo!()
+    err.chain().any(is_permission_error)
+}
+
+/// True when `err` itself (not its causes) is a `PermissionError` — Python's
+/// `except PermissionError:`.  A download failure wrapping a platform error
+/// counts as that error, since the wrapper exists only on the Rust side.
+pub fn is_permission_exception(err: &anyhow::Error) -> bool {
+    if let Some(DownloadError::Source(inner)) = err.downcast_ref::<DownloadError>() {
+        return is_permission_exception(inner);
+    }
+    is_permission_error(err.as_ref())
+}
+
+fn is_permission_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    if err.downcast_ref::<PermissionError>().is_some() {
+        return true;
+    }
+    if let Some(io) = err.downcast_ref::<std::io::Error>() {
+        return io.kind() == std::io::ErrorKind::PermissionDenied;
+    }
+    if let Some(platform) = err.downcast_ref::<PlatformError>() {
+        return platform.is_permission();
+    }
+    if err.downcast_ref::<ModelAccessError>().is_some() {
+        return true;
+    }
+    if let Some(download) = err.downcast_ref::<DownloadError>() {
+        return match download {
+            DownloadError::Io(io) => io.kind() == std::io::ErrorKind::PermissionDenied,
+            // `#[error(transparent)]` forwards `source()` past the wrapped
+            // error itself, so the wrapped error is inspected explicitly.
+            DownloadError::Source(inner) => is_non_retryable(inner),
+            _ => false,
+        };
+    }
+    false
 }
 
 /// Constructor kwargs shared by every task (`max_retries`, `on_status_change`).
@@ -126,18 +176,26 @@ impl StopEvent {
         Self::default()
     }
     pub fn set(&self) {
-        todo!()
+        let mut flag = self.flag.lock();
+        *flag = true;
+        self.cond.notify_all();
     }
     pub fn clear(&self) {
-        todo!()
+        *self.flag.lock() = false;
     }
     pub fn is_set(&self) -> bool {
-        todo!()
+        *self.flag.lock()
     }
     /// Block up to `timeout`; returns true if the event was set.
     pub fn wait(&self, timeout: Duration) -> bool {
-        let _ = timeout;
-        todo!()
+        let deadline = Instant::now() + timeout;
+        let mut flag = self.flag.lock();
+        while !*flag {
+            if self.cond.wait_until(&mut flag, deadline).timed_out() {
+                break;
+            }
+        }
+        *flag
     }
 }
 
@@ -165,49 +223,54 @@ impl TaskCore {
     pub const RETRY_BACKOFF_BASE: u64 = 2;
 
     pub fn new(name: impl Into<String>, logger: TaskLogger, auto: bool, options: TaskOptions) -> Self {
-        let _ = (name.into(), logger, auto, options);
-        let _ = (
-            &Self::on_status_change,
-            AtomicU32::new(0),
-            Mutex::new(()),
-            Mutex::<Option<JoinHandle<()>>>::new(None),
-            Arc::new((Mutex::new(false), Condvar::new())),
-        );
-        todo!()
+        Self {
+            name: name.into(),
+            logger,
+            auto,
+            max_retries: options.max_retries.unwrap_or(Self::MAX_RETRIES),
+            on_status_change: RwLock::new(options.on_status_change),
+            status: RwLock::new(TaskStatus::Pending),
+            thread: Mutex::new(None),
+            finished: Arc::new((Mutex::new(false), Condvar::new())),
+            lock: Mutex::new(()),
+            retry_count: AtomicU32::new(0),
+            last_error: RwLock::new(None),
+            result: RwLock::new(None),
+            stop_event: Arc::new(StopEvent::new()),
+        }
     }
 
     pub fn status(&self) -> TaskStatus {
-        todo!()
+        *self.status.read()
     }
     pub fn last_error(&self) -> Option<String> {
-        todo!()
+        self.last_error.read().clone()
     }
     pub fn result(&self) -> Option<TaskResult> {
-        todo!()
+        self.result.read().clone()
     }
     pub fn is_running(&self) -> bool {
-        todo!()
+        self.status() == TaskStatus::Running
     }
     pub fn on_status_change(&self) -> Option<StatusCallback> {
-        todo!()
+        self.on_status_change.read().clone()
     }
     /// Replace the per-task status listener (the queue installs its relay here).
     pub fn set_on_status_change(&self, callback: Option<StatusCallback>) {
-        let _ = callback;
-        todo!()
+        *self.on_status_change.write() = callback;
     }
     /// `_set_status`: record and notify (listener panics are swallowed).
     pub fn set_status(&self, status: TaskStatus, message: Option<&str>) {
-        let _ = (status, message);
-        todo!()
+        *self.status.write() = status;
+        if let Some(callback) = self.on_status_change() {
+            let _ = catch_unwind(AssertUnwindSafe(|| callback(&self.name, status, message)));
+        }
     }
     pub fn set_last_error(&self, error: Option<String>) {
-        let _ = error;
-        todo!()
+        *self.last_error.write() = error;
     }
     pub fn set_result(&self, result: Option<TaskResult>) {
-        let _ = result;
-        todo!()
+        *self.result.write() = result;
     }
 }
 
@@ -285,23 +348,165 @@ pub trait BaseTask: Send + Sync + 'static {
     }
 }
 
+/// Marks the worker thread finished when dropped, even if the work panicked.
+struct FinishedGuard(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for FinishedGuard {
+    fn drop(&mut self) {
+        let (flag, cond) = &*self.0;
+        *flag.lock() = true;
+        cond.notify_all();
+    }
+}
+
 /// Implementation of [`BaseTask::submit`]: ignore if running, reset retries,
 /// clear the stop event and start `task-{name}` running [`run_with_retries`].
 pub fn submit_task<T: BaseTask + ?Sized>(task: Arc<T>, kwargs: TaskKwargs) {
-    let _ = (task, kwargs);
-    todo!()
+    let core = task.core();
+    let _guard = core.lock.lock();
+    if core.status() == TaskStatus::Running {
+        core.logger.warning(&format!("[{}] Already running — ignoring submit", core.name));
+        return;
+    }
+    core.retry_count.store(0, Ordering::SeqCst);
+    core.stop_event.clear();
+    start_thread(task.clone(), kwargs);
+}
+
+/// `_start_thread`: spawn the `task-{name}` worker running the retry loop.
+fn start_thread<T: BaseTask + ?Sized>(task: Arc<T>, kwargs: TaskKwargs) {
+    let core = task.core();
+    let finished = core.finished.clone();
+    *finished.0.lock() = false;
+    let worker = task.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("task-{}", core.name))
+        .spawn(move || {
+            let _done = FinishedGuard(finished);
+            run_with_retries(&*worker, &kwargs);
+        });
+    match spawned {
+        Ok(handle) => *core.thread.lock() = Some(handle),
+        Err(exc) => {
+            // The thread never started, so nothing else would flip the flag.
+            *core.finished.0.lock() = true;
+            core.finished.1.notify_all();
+            core.logger.error(&format!("[{}] Could not start task thread: {exc}", core.name));
+        }
+    }
 }
 
 /// Implementation of [`BaseTask::wait`].
 pub fn wait_task(core: &TaskCore, timeout: Option<f64>) -> bool {
-    let _ = (core, timeout);
-    todo!()
+    if core.thread.lock().is_none() {
+        return true;
+    }
+    let (flag, cond) = &*core.finished;
+    let mut done = flag.lock();
+    match timeout {
+        None => {
+            while !*done {
+                cond.wait(&mut done);
+            }
+        }
+        Some(seconds) => {
+            let deadline = Instant::now() + Duration::from_secs_f64(seconds.max(0.0));
+            while !*done {
+                if cond.wait_until(&mut done, deadline).timed_out() {
+                    break;
+                }
+            }
+        }
+    }
+    *done
+}
+
+/// Message of a caught panic payload (`str(exc)` for a panicking body).
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "task panicked".to_string()
+    }
 }
 
 /// Execute with retry + exponential backoff (`_run_with_retries`).
 pub fn run_with_retries<T: BaseTask + ?Sized>(task: &T, kwargs: &TaskKwargs) {
-    let _ = (task, kwargs);
-    todo!()
+    let core = task.core();
+    let name = core.name.as_str();
+    while core.retry_count.load(Ordering::SeqCst) <= core.max_retries {
+        if core.stop_event.is_set() {
+            core.set_status(TaskStatus::Failed, Some("Stopped by user"));
+            return;
+        }
+
+        let attempt = core.retry_count.load(Ordering::SeqCst) + 1;
+        core.set_status(TaskStatus::Running, Some(&format!("Attempt {attempt}")));
+        core.logger.info(&format!(
+            "[{name}] Starting (attempt {attempt}/{})",
+            core.max_retries + 1
+        ));
+
+        // A panic inside `execute` is an exception like any other: it fails
+        // this attempt instead of killing the thread with the status stuck.
+        let outcome = match catch_unwind(AssertUnwindSafe(|| task.execute(kwargs))) {
+            Ok(outcome) => outcome,
+            Err(payload) => Err(anyhow::anyhow!(panic_message(&*payload))),
+        };
+
+        let exc = match outcome {
+            Ok(result) => {
+                let success = result.success;
+                let error = result.error.clone();
+                core.set_result(Some(result));
+                if success {
+                    core.set_status(TaskStatus::Completed, Some("Success"));
+                    core.logger.info(&format!("[{name}] Completed successfully"));
+                    return;
+                }
+                anyhow::anyhow!(error
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or_else(|| "Task returned failure".to_string()))
+            }
+            Err(exc) => exc,
+        };
+
+        let message = exc.to_string();
+        core.set_last_error(Some(message.clone()));
+        core.logger.error(&format!("[{name}] Failed (attempt {attempt}): {message}"));
+        core.logger.debug(&format!("{exc:?}"));
+
+        // Non-retryable errors (e.g. 403 Forbidden) fail immediately
+        if is_non_retryable(&exc) {
+            core.set_result(Some(TaskResult::failure(message.clone())));
+            core.set_status(TaskStatus::Failed, Some(&message));
+            core.logger.error(&format!("[{name}] Non-retryable error — failing immediately"));
+            return;
+        }
+
+        let retry_count = core.retry_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if retry_count > core.max_retries {
+            core.set_result(Some(TaskResult::failure(message.clone())));
+            core.set_status(TaskStatus::Failed, Some(&message));
+            core.logger.error(&format!(
+                "[{name}] Exhausted all {} attempts",
+                core.max_retries + 1
+            ));
+            return;
+        }
+
+        let backoff = TaskCore::RETRY_BACKOFF_BASE.saturating_pow(retry_count);
+        core.set_status(TaskStatus::Retrying, Some(&format!("Retrying in {backoff}s")));
+        core.logger.info(&format!("[{name}] Retrying in {backoff}s..."));
+
+        // Interruptible sleep
+        if core.stop_event.wait(Duration::from_secs(backoff)) {
+            core.set_status(TaskStatus::Failed, Some("Stopped during backoff"));
+            return;
+        }
+    }
 }
 
 /// Unbounded thread-safe FIFO (Python `queue.Queue`).
@@ -321,22 +526,30 @@ impl<T> WorkQueue<T> {
         Self::default()
     }
     pub fn put(&self, item: T) {
-        let _ = (item, &self.items, &self.cond);
-        todo!()
+        self.items.lock().push_back(item);
+        self.cond.notify_one();
     }
     /// Block up to `timeout` for an item; `None` on timeout (`queue.Empty`).
     pub fn get(&self, timeout: Duration) -> Option<T> {
-        let _ = timeout;
-        todo!()
+        let deadline = Instant::now() + timeout;
+        let mut items = self.items.lock();
+        loop {
+            if let Some(item) = items.pop_front() {
+                return Some(item);
+            }
+            if self.cond.wait_until(&mut items, deadline).timed_out() {
+                return items.pop_front();
+            }
+        }
     }
     /// Non-blocking pop (`get_nowait`).
     pub fn get_nowait(&self) -> Option<T> {
-        todo!()
+        self.items.lock().pop_front()
     }
     pub fn qsize(&self) -> usize {
-        todo!()
+        self.items.lock().len()
     }
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.items.lock().is_empty()
     }
 }
