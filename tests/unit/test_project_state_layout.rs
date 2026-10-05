@@ -309,22 +309,22 @@ mod test_document_ingest_destination {
         }
     }
 
-    fn test_model_id() -> String {
+    fn stub_model_id() -> String {
         "test/model".to_string()
     }
-    fn test_model_version() -> i64 {
+    fn stub_model_version() -> i64 {
         0
     }
-    fn test_param_size() -> f64 {
+    fn stub_param_size() -> f64 {
         0.0
     }
-    fn test_capabilities() -> Vec<ModelCapability> {
+    fn stub_capabilities() -> Vec<ModelCapability> {
         vec![ModelCapability::General]
     }
-    fn test_thinking_default() -> bool {
+    fn stub_thinking_default() -> bool {
         false
     }
-    fn test_vision_handler() -> Option<String> {
+    fn stub_vision_handler() -> Option<String> {
         None
     }
 
@@ -346,12 +346,12 @@ mod test_document_ingest_destination {
             Arc::new(RwLock::new(Workspace::new("ws").with_projects(vec![project.clone()])));
         let class = ModelClass {
             class_name: "_Concrete",
-            model_id: test_model_id,
-            model_version: test_model_version,
-            param_size_in_b: test_param_size,
-            default_capabilities: test_capabilities,
-            thinking_default: test_thinking_default,
-            vision_chat_handler: test_vision_handler,
+            model_id: stub_model_id,
+            model_version: stub_model_version,
+            param_size_in_b: stub_param_size,
+            default_capabilities: stub_capabilities,
+            thinking_default: stub_thinking_default,
+            vision_chat_handler: stub_vision_handler,
         };
         let m = GenericModel::new(workspace, Arc::new(NoDownloader), Arc::new(NullLogger), class, ModelType::Text);
         (m, project)
