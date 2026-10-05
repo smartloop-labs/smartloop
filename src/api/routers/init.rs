@@ -1321,3 +1321,31 @@ pub async fn bootstrap_with(request: Option<InitRequest>, model_service: Arc<Mod
 
     sse_response(events)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_frames_use_python_json_dumps_formatting() {
+        let frame = sse_event(&json!({"status": "downloading", "message": "Café ✓ 😀", "n": [1, 2]}), "progress");
+        assert_eq!(
+            frame,
+            "event: progress\ndata: {\"status\": \"downloading\", \"message\": \"Caf\\u00e9 \\u2713 \\ud83d\\ude00\", \"n\": [1, 2]}\n\n"
+        );
+    }
+
+    #[test]
+    fn cancelled_frame_is_its_own_event() {
+        let frame = cancelled_event("gemma3-4b");
+        assert!(frame.starts_with("event: cancelled\ndata: "));
+        assert!(frame.contains("\"status\": \"cancelled\""));
+    }
+
+    #[test]
+    fn percent_formats_like_python_str_float() {
+        assert_eq!(py_float_str(round1(45.0)), "45.0");
+        assert_eq!(py_float_str(round1(12.345)), "12.3");
+        assert_eq!(py_float_str(round1(100.0)), "100.0");
+    }
+}
