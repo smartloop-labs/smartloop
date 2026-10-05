@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn dumps_matches_python() {
-        assert_eq!(python_json_dumps(&json!({"a": [1, "é"], "b": null})), r#"{"a": [1, "é"], "b": null}"#);
+        assert_eq!(python_json_dumps(&json!({"a": [1, "é"], "b": null})), r#"{"a": [1, "\u00e9"], "b": null}"#);
         assert_eq!(python_json_dumps(&json!(1e20)), "1e+20");
     }
 

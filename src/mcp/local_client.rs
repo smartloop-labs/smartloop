@@ -284,8 +284,12 @@ impl LocalMCPClient {
     /// inventing one.
     ///
     /// Built-in `-m smartloop.*` servers run under the current executable
-    /// (honouring `SLP_EXE`); absolute commands are kept; otherwise `PATH` from
-    /// `env`, then the executable's own directory, then the bare name.
+    /// (honouring `SLP_EXE`).  An absolute command is kept as written — except
+    /// inside the macOS App Sandbox, where only the app bundle and the
+    /// container may be exec'd, so a copy of the same program next to the
+    /// `slp` binary or under the framework home is preferred.  Otherwise
+    /// `PATH` from `env` wins, then the anchors (the executable's own
+    /// directory, then the framework home), then the bare name.
     pub fn resolve_command(&self, env: &HashMap<String, String>) -> String {
         // Built-in MCP servers are launched as `<interpreter> -m smartloop.<...>`.
         // The interpreter path is captured at registration time and persisted
@@ -297,6 +301,22 @@ impl LocalMCPClient {
         }
 
         if Path::new(&self.command).is_absolute() {
+            // Outside the sandbox an absolute command wins outright: the app
+            // does not silently redirect a path the user configured.  Inside
+            // it, the user's own install is refused with EPERM however the
+            // path was written, so the copy the app may run is preferred —
+            // and with no such copy the path is kept, so the spawn fails
+            // honestly rather than running *some other* program.
+            if crate::paths::confined_home().is_some() {
+                if let Some(basename) = Path::new(&self.command).file_name() {
+                    for anchor in Self::resolution_anchors() {
+                        let candidate = anchor.join(basename);
+                        if access_check(&candidate) {
+                            return candidate.to_string_lossy().into_owned();
+                        }
+                    }
+                }
+            }
             return self.command.clone();
         }
 
@@ -305,18 +325,37 @@ impl LocalMCPClient {
         }
 
         // Entry-point scripts installed alongside the executable (pipx, a
-        // venv's bin) are not always on the PATH a GUI process inherits.
-        let exe = runtime_executable();
-        let bin_dir = Path::new(&exe)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let search = format!("{bin_dir}{PATH_SEP}{}", env.get("PATH").map(String::as_str).unwrap_or(""));
-        if let Some(found) = which(&self.command, Some(&search)) {
-            return found;
+        // venv's bin) — or a server the app ships next to the `slp` binary —
+        // are not always on the PATH a GUI process inherits; nor is one a
+        // project keeps under the framework home.  A bare name or a relative
+        // path is looked up against those anchors, after PATH: they are the
+        // fallback, not an override.
+        for anchor in Self::resolution_anchors() {
+            let candidate = anchor.join(&self.command);
+            if access_check(&candidate) {
+                return candidate.to_string_lossy().into_owned();
+            }
         }
 
         self.command.clone()
+    }
+
+    /// Where a server the app ships with can live: the directory of the
+    /// running executable (the app bundle when packaged), then the framework
+    /// home (`SLP_HOME`, else `~/.smartloop`).
+    fn resolution_anchors() -> Vec<std::path::PathBuf> {
+        let mut anchors: Vec<std::path::PathBuf> = Vec::new();
+        let exe = runtime_executable();
+        if let Some(dir) = Path::new(&exe).parent().filter(|d| !d.as_os_str().is_empty()) {
+            anchors.push(dir.to_path_buf());
+        }
+        if let Ok(settings) = crate::config::AppSettings::try_new() {
+            let home = std::path::PathBuf::from(settings.home_dir());
+            if !home.as_os_str().is_empty() && !anchors.contains(&home) {
+                anchors.push(home);
+            }
+        }
+        anchors
     }
 
     /// Return an actionable hint for known launcher failures, else `""`.
