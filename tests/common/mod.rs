@@ -815,6 +815,10 @@ pub mod mcp {
             let workspace = Arc::new(parking_lot::RwLock::new(workspace));
             let model_service = ModelService::new_bare();
             *model_service.model.write() = Some(Arc::new(Model::new("m", workspace.clone(), None)));
+            // So the `_ensure_model` / `_initialize_workspace` guards see the
+            // injected model as the loaded default and keep it.
+            *model_service.model_name.write() =
+                Some(smartloop::api::config::api_settings().default_model);
             Self { model_service, workspace, home, http: fake, _http: http }
         }
 
