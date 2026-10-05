@@ -627,7 +627,7 @@ mod hosted_status_cache {
     }
 
     #[test]
-    #[serial(web_search_providers)]
+    #[serial]
     fn test_result_is_cached_across_calls() {
         let _reset = Reset::new();
         let calls = Arc::new(Mutex::new(0));
@@ -640,7 +640,7 @@ mod hosted_status_cache {
     }
 
     #[test]
-    #[serial(web_search_providers)]
+    #[serial]
     fn test_signed_out_short_circuits_without_a_request() {
         let _reset = Reset::new();
         signed_in(false);
@@ -655,7 +655,7 @@ mod hosted_status_cache {
     /// A health check that cannot complete says nothing about whether search
     /// works, and the search itself already skips on a 403.
     #[test]
-    #[serial(web_search_providers)]
+    #[serial]
     fn test_a_failed_check_fails_open() {
         let _reset = Reset::new();
         signed_in(true);
@@ -667,7 +667,7 @@ mod hosted_status_cache {
     /// Only an explicit 401/403 — surfaced by the client as a permission
     /// error — counts as a real "search is off".
     #[test]
-    #[serial(web_search_providers)]
+    #[serial]
     fn test_forbidden_reports_unavailable() {
         let _reset = Reset::new();
         signed_in(true);
@@ -708,7 +708,7 @@ mod hosted_search_provider {
     }
 
     #[test]
-    #[serial(web_search_providers)]
+    #[serial]
     fn test_returns_links() {
         let _reset = Reset::new();
         signed_in(true);
@@ -725,7 +725,7 @@ mod hosted_search_provider {
     }
 
     #[test]
-    #[serial(web_search_providers)]
+    #[serial]
     fn test_count_is_clamped() {
         let _reset = Reset::new();
         signed_in(true);
@@ -742,7 +742,7 @@ mod hosted_search_provider {
     }
 
     #[test]
-    #[serial(web_search_providers)]
+    #[serial]
     fn test_no_credentials_raises() {
         let _reset = Reset::new();
         signed_in(false);
@@ -756,7 +756,7 @@ mod hosted_search_provider {
     }
 
     #[test]
-    #[serial(web_search_providers)]
+    #[serial]
     fn test_permission_error_becomes_search_auth_error() {
         let _reset = Reset::new();
         signed_in(true);
@@ -769,7 +769,7 @@ mod hosted_search_provider {
     /// A 500 or a dropped connection must stay distinguishable from "off" —
     /// the agent skips either way, but only 401/403 means search is disabled.
     #[test]
-    #[serial(web_search_providers)]
+    #[serial]
     fn test_transient_error_is_not_an_auth_error() {
         let _reset = Reset::new();
         signed_in(true);

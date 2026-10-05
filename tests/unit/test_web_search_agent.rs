@@ -156,6 +156,8 @@ mod enablement {
 
     use serial_test::serial;
     use smartloop::config::ModelConfig;
+
+    use crate::shared::workspace_support::EnvGuard;
     use smartloop::search::providers::{self, WebSearchCallError, WebSearchClient};
     use smartloop::workspace::workspace::{Project, Workspace};
 
@@ -185,8 +187,14 @@ mod enablement {
     /// `_hosted_available` fixture): signed in, and the status endpoint says
     /// yes.  Without this the result would depend on the network and on
     /// whoever runs the suite being signed in.  Restores everything on drop.
+    ///
+    /// `SLP_HOME` points at the temp dir too (pytest's `tmp_path` isolation):
+    /// loading the workspace overlays each project's own state file from
+    /// `<home>/<workspace id>/<project id>/`, so a stray `ws/p1` under the
+    /// real home would otherwise override the flag these tests write.
     struct Fixture {
         platform: Platform,
+        _home: EnvGuard,
         _tmp: tempfile::TempDir,
         dir: String,
     }
@@ -207,7 +215,8 @@ mod enablement {
             Workspace::reset();
             let tmp = tempfile::tempdir().unwrap();
             let dir = tmp.path().to_string_lossy().to_string();
-            Self { platform, _tmp: tmp, dir }
+            let home = EnvGuard::set("SLP_HOME", tmp.path());
+            Self { platform, _home: home, _tmp: tmp, dir }
         }
 
         fn write_config(&self, enabled: bool, workspace_enabled: bool) {

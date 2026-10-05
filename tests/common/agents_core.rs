@@ -31,6 +31,10 @@ pub type Responder = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 /// fails.
 pub struct FakeLlm {
     responder: Mutex<Responder>,
+    /// When set, a failing reply makes `invoke` raise (panic) instead of
+    /// returning the wrappers' error string — `MagicMock(side_effect=...)`
+    /// replacing `invoke` itself.
+    raises: AtomicBool,
     calls: Mutex<Vec<String>>,
     max_tokens: AtomicUsize,
     num_tokens: AtomicUsize,
@@ -46,6 +50,7 @@ impl FakeLlm {
         let reply = reply.to_string();
         Arc::new(Self {
             responder: Mutex::new(Arc::new(move |_: &str| Ok(reply.clone()))),
+            raises: AtomicBool::new(false),
             calls: Mutex::new(Vec::new()),
             max_tokens: AtomicUsize::new(4096),
             num_tokens: AtomicUsize::new(100),
@@ -69,17 +74,29 @@ impl FakeLlm {
     pub fn set_reply(&self, reply: &str) {
         let reply = reply.to_string();
         *self.responder.lock() = Arc::new(move |_: &str| Ok(reply.clone()));
+        self.raises.store(false, Ordering::SeqCst);
     }
 
     /// `llm.invoke.side_effect = RuntimeError(message)`.
     pub fn set_failure(&self, message: &str) {
         let message = message.to_string();
         *self.responder.lock() = Arc::new(move |_: &str| Err(message.clone()));
+        self.raises.store(false, Ordering::SeqCst);
+    }
+
+    /// `llm.invoke = MagicMock(side_effect=RuntimeError(message))`: `invoke`
+    /// itself raises (panics) rather than reporting the failure as the
+    /// wrappers' `"Error generating response: ..."` string.
+    pub fn set_raising(&self, message: &str) {
+        let message = message.to_string();
+        *self.responder.lock() = Arc::new(move |_: &str| Err(message.clone()));
+        self.raises.store(true, Ordering::SeqCst);
     }
 
     /// `llm.invoke.side_effect = f`.
     pub fn set_responder(&self, f: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static) {
         *self.responder.lock() = Arc::new(f);
+        self.raises.store(false, Ordering::SeqCst);
     }
 
     /// `get_max_tokens.return_value = n`.
@@ -152,6 +169,7 @@ impl BaseLLM for FakeLlm {
         // A mock's `invoke` returns its value verbatim.
         match self.answer(prompt) {
             Ok(text) => text,
+            Err(e) if self.raises.load(Ordering::SeqCst) => panic!("{e}"),
             Err(e) => format!("Error generating response: {e}"),
         }
     }
