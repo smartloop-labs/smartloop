@@ -96,21 +96,103 @@ mod batch_documents {
 mod route_fanout {
     //! Python replaced `PipelineBuilder._build_unified_pipeline` with a fake
     //! that records the parent it is handed, then inspected the route node's
-    //! `_extend_dag`.  PipelineBuilder (unit orch_build) has no seam to stub
-    //! its downstream pipeline, so these stay ignored until one exists; the
-    //! fan-out structure itself is pinned by `fanout_handlers` below.
+    //! `_extend_dag`; here the fake goes in through the builder's
+    //! unified-pipeline seam.
+
+    use super::*;
+
+    use parking_lot::Mutex;
+    use smartloop::agents::mcp::explorer::EnrichedContext;
+    use smartloop::agents::nodes::{AgentNode, CollectNode, SkillMatchNode};
+
+    use crate::shared::agents_core::class_name;
+
+    /// `{type(n).__name__: n for n, _ in res.data["_extend_dag"]}` plus the
+    /// parent the downstream pipeline was handed.
+    fn route(
+        orch: &SLPOrchestrator,
+        sctx: SearchContext,
+        matched_skills: Option<Value>,
+    ) -> (HashMap<&'static str, AgentNode>, Option<AgentNode>) {
+        let ctx = summarize_ctx(orch);
+
+        let skill_match_node = SkillMatchNode::new(&[]);
+        let collect_node = CollectNode::new(&[&skill_match_node]);
+        let route_node = RouteNode::new(&[&skill_match_node, &collect_node]);
+
+        ctx.write().enriched = Some(EnrichedContext::default());
+
+        let captured: Arc<Mutex<Option<AgentNode>>> = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&captured);
+        orch.pipeline().set_unified_pipeline_hook(Some(Arc::new(move |_c, _ms, _sc, _ec, parent| {
+            *seen.lock() = parent.cloned();
+            Vec::new()
+        })));
+
+        let mut deps = HashMap::new();
+        deps.insert(
+            skill_match_node.node_id.clone(),
+            NodeResult::with_data(
+                skill_match_node.node_id.clone(),
+                json!({"matched_skills": matched_skills.unwrap_or(Value::Null)}),
+            ),
+        );
+        deps.insert(
+            collect_node.node_id.clone(),
+            NodeResult::with_data(
+                collect_node.node_id.clone(),
+                json!({"search_ctx": serde_json::to_value(&sctx).unwrap()}),
+            )
+            .with_payload(sctx),
+        );
+
+        let res = orch.pipeline().handle_route(&ctx, &deps, &route_node, &skill_match_node, &collect_node);
+        let nodes: HashMap<&'static str, AgentNode> =
+            res.extend_dag.iter().map(|e| (class_name(&e.node), e.node.clone())).collect();
+        let parent = captured.lock().clone();
+        (nodes, parent)
+    }
 
     #[test]
-    #[ignore = "needs a stub seam for PipelineBuilder::build_unified_pipeline (unit orch_build)"]
-    fn test_fanout_injected_for_multiple_documents() {}
+    fn test_fanout_injected_for_multiple_documents() {
+        let (orch, _llm) = make_orchestrator();
+        let sctx = SearchContext { vector_context: "raw".to_string(), documents: docs(3, 100), ..Default::default() };
+        let (nodes, captured) = route(&orch, sctx, None);
+
+        let batch_nodes: Vec<&AgentNode> = nodes.values().filter(|n| n.is_llm_decision()).collect();
+        let reduce_nodes: Vec<&AgentNode> = nodes.values().filter(|n| n.is_transform()).collect();
+
+        assert!(!batch_nodes.is_empty());
+        assert!(!reduce_nodes.is_empty());
+        assert!(captured.expect("the downstream parent").is_transform());
+    }
+
+    /// DOC_FANOUT_THRESHOLD = 1: even a single document goes through the
+    /// same map-reduce structure so every retrieved document is processed
+    /// by its own DAG node.  With one doc that's one batch + one reduce.
+    #[test]
+    fn test_single_document_uses_one_batch_node() {
+        let (orch, _llm) = make_orchestrator();
+        let sctx = SearchContext { vector_context: "raw".to_string(), documents: docs(1, 100), ..Default::default() };
+        let (nodes, captured) = route(&orch, sctx, None);
+
+        let batch_nodes: Vec<&AgentNode> = nodes.values().filter(|n| n.is_llm_decision()).collect();
+        let reduce_nodes: Vec<&AgentNode> = nodes.values().filter(|n| n.is_transform()).collect();
+
+        assert_eq!(batch_nodes.len(), 1);
+        assert!(!reduce_nodes.is_empty());
+        assert!(captured.expect("the downstream parent").is_transform());
+    }
 
     #[test]
-    #[ignore = "needs a stub seam for PipelineBuilder::build_unified_pipeline (unit orch_build)"]
-    fn test_single_document_uses_one_batch_node() {}
+    fn test_no_fanout_when_no_documents() {
+        let (orch, _llm) = make_orchestrator();
+        let sctx = SearchContext { vector_context: "raw".to_string(), ..Default::default() };
+        let (nodes, captured) = route(&orch, sctx, None);
 
-    #[test]
-    #[ignore = "needs a stub seam for PipelineBuilder::build_unified_pipeline (unit orch_build)"]
-    fn test_no_fanout_when_no_documents() {}
+        assert!(!nodes.values().any(|n| n.is_transform() && Some(n) != captured.as_ref()));
+        assert_eq!(class_name(&captured.expect("the downstream parent")), "RouteNode");
+    }
 }
 
 // ------------------------------------------------------------------ #

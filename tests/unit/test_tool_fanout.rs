@@ -329,13 +329,15 @@ mod fanout_handler {
         assert_eq!(calls.last().cloned(), Some(json!({"symbol": "AAPL"}).as_object().cloned().unwrap()));
     }
 
+    /// Python stubbed `_extract_fanout_items` to return dict items (the
+    /// extraction parser itself only yields strings); the stub goes in
+    /// through the fan-out's item-extraction seam.
     #[test]
-    #[ignore = "needs dict fan-out items: Python stubbed ToolFanout._extract_fanout_items to return \
-                [{\"symbol\": \"AAPL\", \"exchange\": \"NASDAQ\"}]; the extraction parser only yields strings and \
-                ToolFanout (unit orch_build) has no stub seam for its item extraction"]
     fn test_dict_items_merged_into_arguments() {
-        let (orch, llm) = make_orchestrator();
-        answer_items(&llm, &["{\"symbol\": \"AAPL\", \"exchange\": \"NASDAQ\"}"]);
+        let (orch, _llm) = make_orchestrator();
+        orch.tool_fanout().set_extract_items_hook(Some(Arc::new(|_ctx, _step, _prev, _sctx| {
+            vec![json!({"symbol": "AAPL", "exchange": "NASDAQ"})]
+        })));
         let calls = record_calls(&orch, None);
 
         run(&orch, &[yfinance_server()], &fanout_step(&["symbol", "exchange"]), "AAPL on NASDAQ");
