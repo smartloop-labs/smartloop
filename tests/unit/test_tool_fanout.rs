@@ -188,7 +188,7 @@ mod extract_fanout_items {
     #[test]
     fn test_llm_failure_returns_empty() {
         let (orch, llm) = make_orchestrator();
-        llm.set_failure("boom");
+        llm.set_raising("boom");
 
         assert!(extract(&orch, &symbol_step(), "some context").is_empty());
     }
