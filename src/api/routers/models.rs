@@ -208,8 +208,13 @@ pub fn total_ram_gb() -> Option<f64> {
 /// Approximate RAM for `entry`: ~1GB per billion parameters (Q4 weights plus
 /// context), the same estimate the picker shows.  `None` when unknown.
 pub fn footprint_gb(entry: &ModelEntry) -> Option<f64> {
-    let _ = entry;
-    todo!()
+    // The test seam stands in for `SUPPORTED_MODELS` when installed (see
+    // `set_param_size_override` at the end of this file).
+    let size_b = match param_size_override(&entry.name) {
+        Some(size) => size.unwrap_or(0.0),
+        None => SUPPORTED_MODELS.get(&entry.name).map(|cls| (cls.param_size_in_b)()).unwrap_or(0.0),
+    };
+    if size_b > 0.0 { Some(size_b) } else { None }
 }
 
 /// Set `recommended` on the models to badge for this machine.
@@ -388,3 +393,27 @@ pub async fn update_project_model_with(
     let _ = (project_id, model_name, request, model_service);
     todo!()
 }
+
+// ===== BEGIN api_routes_misc: test seam for tests/unit/test_model_recommendation.rs =====
+
+/// Replacement for the `SUPPORTED_MODELS` parameter-size lookup behind
+/// [`footprint_gb`]: model name → `param_size_in_b()` (`None` = unknown model).
+/// The Python tests patch `models.SUPPORTED_MODELS` with fake classes.
+pub type ParamSizeLookup = Arc<dyn Fn(&str) -> Option<f64> + Send + Sync>;
+
+static PARAM_SIZE_OVERRIDE: once_cell::sync::Lazy<parking_lot::RwLock<Option<ParamSizeLookup>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(None));
+
+/// Install (or with `None`, remove) the parameter-size lookup override.
+pub fn set_param_size_override(lookup: Option<ParamSizeLookup>) {
+    *PARAM_SIZE_OVERRIDE.write() = lookup;
+}
+
+/// The overridden parameter size of *name*: `None` when no override is
+/// installed, `Some(None)` when the override does not know the model.
+pub fn param_size_override(name: &str) -> Option<Option<f64>> {
+    let lookup = PARAM_SIZE_OVERRIDE.read().clone();
+    lookup.map(|lookup| lookup(name))
+}
+
+// ===== END api_routes_misc =====
