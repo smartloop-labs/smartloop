@@ -5,18 +5,17 @@
 //! Fetches the curated MCP server catalog from the Smartloop platform API and
 //! exposes it to local clients (TUI, Electron) for one-click install.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[allow(unused_imports)]
-use crate::platform::{get_platform_service, PlatformError, PlatformService};
+use crate::platform::{get_platform_service, PlatformService};
 
 /// Python logger name (`logging.getLogger(__name__)`).
 pub const LOGGER: &str = "smartloop.api.routers.mcp_catalog";
@@ -69,8 +68,9 @@ pub struct LocalConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Insertion-ordered, like the Python dict it mirrors.
     #[serde(default)]
-    pub env: BTreeMap<String, String>,
+    pub env: IndexMap<String, String>,
 }
 
 /// One curated MCP catalog entry.
@@ -112,23 +112,35 @@ impl MCPCatalogEntry {
     /// Validate a raw platform dict into an entry, applying the
     /// `server_type` default (`_default_server_type`).
     pub fn from_value(value: Value) -> Result<Self, serde_json::Error> {
-        let _ = value;
-        todo!()
+        let entry: MCPCatalogEntry = serde_json::from_value(value)?;
+        Ok(entry.default_server_type())
     }
 
     /// The `model_validator(mode="after")`: fill `server_type` with `"local"`
     /// when a local config is present or the entry is hosted locally, else
     /// `"remote"`.
     pub fn default_server_type(mut self) -> Self {
-        let _ = &mut self;
-        todo!()
+        let missing = self.server_type.as_deref().map(str::is_empty).unwrap_or(true);
+        if missing {
+            let derived = if self.local_config.is_some() || self.hosted_by == "local" {
+                "local"
+            } else {
+                "remote"
+            };
+            self.server_type = Some(derived.to_string());
+        }
+        self
     }
 }
 
 /// Validate raw catalog dicts into entries (`_to_entries`).
-pub fn to_entries(raw: Vec<serde_json::Map<String, Value>>) -> Vec<MCPCatalogEntry> {
-    let _ = raw;
-    todo!()
+///
+/// Fails, like the pydantic constructor, on the first entry that does not
+/// validate.
+pub fn to_entries(
+    raw: Vec<serde_json::Map<String, Value>>,
+) -> Result<Vec<MCPCatalogEntry>, serde_json::Error> {
+    raw.into_iter().map(|e| MCPCatalogEntry::from_value(Value::Object(e))).collect()
 }
 
 /// `GET /v1/mcp-catalog` — list curated MCP server catalog entries.
@@ -137,10 +149,23 @@ pub fn to_entries(raw: Vec<serde_json::Map<String, Value>>) -> Vec<MCPCatalogEnt
 /// Served through the cache-through platform service, so the list survives a
 /// platform outage or an expired token instead of leaving the panel empty.
 /// Permission errors → 401 with the message; connection errors → 502
-/// "Platform API unavailable".  The platform client is blocking, so this runs
-/// on the blocking pool.
+/// "Platform API unavailable".
+///
+/// Blocking on purpose: the platform client is synchronous, and a 401 now
+/// costs a refresh and a retry on top of the original call.  On the runtime
+/// that would stall every in-flight chat stream, so it runs on the blocking
+/// pool (FastAPI ran the sync handler in its threadpool).
 pub async fn list_mcp_catalog() -> Result<Json<Vec<MCPCatalogEntry>>, HTTPException> {
-    todo!()
+    let joined = tokio::task::spawn_blocking(|| {
+        let svc = get_platform_service();
+        list_mcp_catalog_with(&svc)
+    })
+    .await;
+    match joined {
+        Ok(result) => result.map(Json),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => Err(HTTPException::new(500, e.to_string())),
+    }
 }
 
 /// Core of [`list_mcp_catalog`] against an explicit service (the FastAPI
@@ -148,8 +173,23 @@ pub async fn list_mcp_catalog() -> Result<Json<Vec<MCPCatalogEntry>>, HTTPExcept
 pub fn list_mcp_catalog_with(
     svc: &Arc<PlatformService>,
 ) -> Result<Vec<MCPCatalogEntry>, HTTPException> {
-    let _ = svc;
-    todo!()
+    let entries = match svc.list_mcp_catalog(false) {
+        Ok(entries) => entries,
+        Err(e) if e.is_permission() => return Err(HTTPException::new(401, e.message())),
+        Err(e) if e.is_connection() => {
+            return Err(HTTPException::new(502, "Platform API unavailable"));
+        }
+        Err(e) => {
+            // Anything else escaped the Python handler: an unhandled 500.
+            tracing::error!(target: LOGGER, "Error listing MCP catalog: {}", e);
+            return Err(HTTPException::new(500, "Internal Server Error"));
+        }
+    };
+    to_entries(entries).map_err(|e| {
+        // A response-model validation failure is a server error.
+        tracing::error!(target: LOGGER, "Invalid MCP catalog entry: {}", e);
+        HTTPException::new(500, "Internal Server Error")
+    })
 }
 
 /// Look up one curated entry by slug, or `None` if it can't be resolved.
@@ -159,8 +199,28 @@ pub fn list_mcp_catalog_with(
 /// The platform exposes a list endpoint only, so this is fetch-and-find over
 /// the cached list.
 pub fn resolve_catalog_entry(slug: &str) -> Option<MCPCatalogEntry> {
-    let _ = slug;
-    todo!()
+    if slug.is_empty() {
+        return None;
+    }
+    let entries = match get_platform_service().list_mcp_catalog(false) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(target: LOGGER, "Catalog lookup failed for slug '{}': {}", slug, e);
+            return None;
+        }
+    };
+    let entries = match to_entries(entries) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(target: LOGGER, "Catalog lookup failed for slug '{}': {}", slug, e);
+            return None;
+        }
+    };
+    if let Some(entry) = entries.into_iter().find(|entry| entry.slug == slug) {
+        return Some(entry);
+    }
+    tracing::warn!(target: LOGGER, "No catalog entry for slug '{}'", slug);
+    None
 }
 
 /// The router (`APIRouter(prefix="/v1", tags=["mcp-catalog"])`).
