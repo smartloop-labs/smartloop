@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 
 use crate::llms::base_llm::BaseLLM;
 use crate::agents::dag_executor::DAGExecutor;
-use crate::agents::fetch_agent::FetchAgent;
+use crate::agents::fetch_agent::{FetchAgent, UrlFetcher};
 use crate::agents::hybrid_executor::LLMExecutor;
 use crate::agents::mcp::argument_extractor::MCPArgumentExtractor;
 use crate::agents::mcp::dependency_analyzer::MCPDependencyAnalyzer;
@@ -49,7 +49,7 @@ use crate::agents::orchestration::step::Step;
 use crate::agents::orchestration::step_executor::StepExecutor;
 use crate::agents::orchestration::tool_fanout::ToolFanout;
 use crate::agents::planner::{MCPToolContext, Planner};
-use crate::agents::web_search_agent::{ProgressCallback, WebSearchAgent};
+use crate::agents::web_search_agent::{ProgressCallback, WebSearchAgent, WebSearcher};
 use crate::api::services::model_service::ModelService;
 use crate::paths::expand_home;
 use crate::utils::mcp_result_formatter::ResultFormatter;
@@ -275,18 +275,18 @@ impl SLPOrchestrator {
     }
 
     /// The HTTP fetcher.  Owned by [`PipelineBuilder`].
-    pub fn fetch_agent(&self) -> Arc<FetchAgent> {
+    pub fn fetch_agent(&self) -> Arc<dyn UrlFetcher> {
         self.pipeline.get_fetch_agent()
     }
 
     /// Replace the HTTP fetcher (Python `_fetch_agent` setter).
-    pub fn set_fetch_agent(&self, agent: Arc<FetchAgent>) {
+    pub fn set_fetch_agent(&self, agent: Arc<dyn UrlFetcher>) {
         self.pipeline.set_fetch_agent(agent);
     }
 
     /// The web searcher.  Owned by [`PipelineBuilder`].
-    pub fn web_search_agent(&self) -> Arc<WebSearchAgent> {
-        Arc::clone(&self.pipeline.web_search_agent)
+    pub fn web_search_agent(&self) -> Arc<dyn WebSearcher> {
+        self.pipeline.get_web_search_agent()
     }
 
     /// The response model.  Owned by [`ModelRouter`].

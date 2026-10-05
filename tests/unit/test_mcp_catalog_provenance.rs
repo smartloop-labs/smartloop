@@ -191,6 +191,7 @@ fn complete(request: MCPOAuthCallbackRequest, session: Option<Map<String, Value>
         })),
         discover_remote_tools: Some(Arc::new(|_, _, _| Ok(connect_result()))),
         probe_info: None,
+        ..Default::default()
     });
     let result = block_on(complete_mcp_oauth("p1", request, env.model_service.clone()));
     reset_router_state();

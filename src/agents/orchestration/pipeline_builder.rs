@@ -416,15 +416,17 @@ impl PipelineBuilder {
             let c = ctx.read();
             self.doc_fanout.applies_to(&c, Some(&search_ctx))
         };
+        // One search context shared by the doc fan-out (its reduce node writes
+        // `vector_context`) and the unified pipeline built on top of it.
+        let shared: SharedSearchContext = Arc::new(Mutex::new(search_ctx));
         if applies {
-            let contributed = self.doc_fanout.build(ctx, Some(&search_ctx), &parent);
+            let contributed = self.doc_fanout.build(ctx, Some(&shared), &parent);
             extend_dag.extend(
                 contributed.pairs.into_iter().map(|(n, h)| DagExtension::new(n, h)),
             );
             parent = contributed.parent;
         }
 
-        let shared: SharedSearchContext = Arc::new(Mutex::new(search_ctx));
         extend_dag.extend(self.build_unified_pipeline(
             ctx,
             matched_skills.as_deref(),
@@ -1123,7 +1125,7 @@ Assess whether these search results are relevant to the user's request. If relev
         };
 
         let result = self.steps.execute(
-            &c,
+            ctx,
             &exec_step,
             if prev_results.is_empty() { None } else { Some(prev_results.as_slice()) },
             document_context.as_deref(),

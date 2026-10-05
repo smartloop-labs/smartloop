@@ -121,7 +121,8 @@ mod route_fanout {
 fn build(orch: &SLPOrchestrator, sctx: &SearchContext) -> StepNodes {
     let ctx = summarize_ctx(orch);
     let parent = RouteNode::new(&[]);
-    orch.doc_fanout().build(&ctx, Some(sctx), &parent)
+    let shared: SharedSearchContext = Arc::new(parking_lot::Mutex::new(sctx.clone()));
+    orch.doc_fanout().build(&ctx, Some(&shared), &parent)
 }
 
 /// Run every batch handler, then the reduce handler over their results.
@@ -145,7 +146,11 @@ fn content(result: &NodeResult) -> String {
 
 /// The search context the reduce handed downstream.
 fn reduced(result: &NodeResult) -> SearchContext {
-    result.payload_as::<SearchContext>().cloned().expect("the reduced search context")
+    result
+        .payload_as::<SharedSearchContext>()
+        .map(|shared| shared.lock().clone())
+        .or_else(|| result.payload_as::<SearchContext>().cloned())
+        .expect("the reduced search context")
 }
 
 mod fanout_handlers {

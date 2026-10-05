@@ -513,9 +513,14 @@ mod doc_reduce_all_irrelevant {
     /// search context (the result's payload).
     fn reduce(orch: &SLPOrchestrator, search_ctx: SearchContext, batch: NodeResult) -> SearchContext {
         let ctx: octx::SharedOrchestratorContext = SharedCell::wrap(madrid_ctx());
-        let handler = orch.doc_fanout().make_reduce_handler(&ctx, search_ctx, vec!["batch_0".to_string()]);
+        let shared = std::sync::Arc::new(parking_lot::Mutex::new(search_ctx));
+        let handler = orch.doc_fanout().make_reduce_handler(&ctx, shared, vec!["batch_0".to_string()]);
         let result = handler(HashMap::from([("batch_0".to_string(), batch)])).unwrap();
-        result.payload_as::<SearchContext>().cloned().expect("the reduced search context")
+        result
+            .payload_as::<smartloop::agents::orchestration::step::SharedSearchContext>()
+            .map(|shared| shared.lock().clone())
+            .or_else(|| result.payload_as::<SearchContext>().cloned())
+            .expect("the reduced search context")
     }
 
     #[test]

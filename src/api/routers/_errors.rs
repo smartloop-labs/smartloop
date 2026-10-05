@@ -278,6 +278,7 @@ pub fn py_error_kind(err: &anyhow::Error) -> PyErrorKind {
         return match e {
             StorageError::ValueError(_) => PyErrorKind::Value,
             StorageError::RuntimeError(_) => PyErrorKind::Runtime,
+            StorageError::Other(_) => PyErrorKind::Other,
         };
     }
     if let Some(e) = err.downcast_ref::<ProjectIoError>() {

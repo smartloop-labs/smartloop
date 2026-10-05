@@ -863,16 +863,6 @@ impl SLPArtifactDownloader {
         *self.cancel_token.write() = token;
     }
 
-    /// The token a stop request will raise (a handle to the same flag).
-    pub fn cancel_token(&self) -> CancelToken {
-        self.cancel_token.read().clone()
-    }
-
-    /// Replace the token every later check consults.
-    pub fn set_cancel_token(&self, token: CancelToken) {
-        *self.cancel_token.write() = token;
-    }
-
     /// The bootstrap catalog source (`_bootstrap_source`), which
     /// `POST /v1/bootstrap` lists to pick the first-run model.
     pub fn bootstrap_source(&self) -> Arc<dyn BootstrapArtifactSource> {
@@ -889,12 +879,6 @@ impl SLPArtifactDownloader {
     pub fn with_bootstrap_source(mut self, source: Arc<dyn BootstrapArtifactSource>) -> Self {
         self.bootstrap_source = source;
         self
-    }
-
-    /// The bootstrap source (`_bootstrap_source`), read by the API's
-    /// orchestrator bootstrap.
-    pub fn bootstrap_source(&self) -> &Arc<dyn BootstrapArtifactSource> {
-        &self.bootstrap_source
     }
 
     /// Replace the HTTP transport.

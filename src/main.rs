@@ -313,6 +313,9 @@ fn hidden_subcommand_module(name: &str) -> Option<&'static str> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Platform environment fixes (console code page, bundled Vulkan ICD) must
+    // run before anything else, while the process is still single-threaded.
+    smartloop::utils::runtime_env::apply_runtime_env();
     smartloop::init_process_env();
 
     let argv: Vec<String> = std::env::args().collect();

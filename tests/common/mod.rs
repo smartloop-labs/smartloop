@@ -1004,6 +1004,7 @@ pub mod mcp {
             })),
             discover_remote_tools: Some(Arc::new(move |_, _, _| Ok(connect_result.clone()))),
             probe_info: None,
+            ..Default::default()
         });
         let response = block_on(mcp_oauth_callback(query, model_service));
         set_hooks(McpRouteHooks::default());
