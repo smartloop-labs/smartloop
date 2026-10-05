@@ -12,8 +12,14 @@
 
 use serde::{Deserialize, Serialize};
 
-#[allow(unused_imports)]
+use std::time::Instant;
+
+use clap::Parser;
+
 use crate::model_host::client::{InProcessModelClient, ModelClient, RemoteModelClient};
+
+/// Module name the binary is re-executed with (`slp -m smartloop.model_host.bench`).
+pub const MODULE: &str = "smartloop.model_host.bench";
 
 /// Prompt streamed when none is given.
 pub const DEFAULT_PROMPT: &str = "<system>You are a helpful assistant.</system>\n\
@@ -54,35 +60,102 @@ pub struct BenchResult {
 
 /// Stream `prompt` once and time it.
 pub fn time_one_stream(client: &dyn ModelClient, prompt: &str) -> anyhow::Result<Timing> {
-    let _ = (client, prompt);
-    todo!()
+    let started = Instant::now();
+    let mut first: Option<f64> = None;
+    let mut chunks = 0usize;
+    let mut chars = 0usize;
+    for text in client.stream(prompt, None, None, None, None)? {
+        let text = text?;
+        if first.is_none() {
+            first = Some(started.elapsed().as_secs_f64());
+        }
+        chunks += 1;
+        chars += text.chars().count();
+    }
+    let total = started.elapsed().as_secs_f64();
+    Ok(Timing::new(first.unwrap_or(total), total, chunks, chars))
+}
+
+/// `statistics.median`: the middle value, or the mean of the two middle
+/// values for an even count.
+fn median(values: impl IntoIterator<Item = f64>) -> f64 {
+    let mut values: Vec<f64> = values.into_iter().collect();
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) / 2.0
+    }
 }
 
 /// Stream `prompt` `runs` times and summarise (medians).
 ///
 /// One warmup pass first: the first generation after a load pays for the
 /// prompt-cache miss and, for a remote client, for opening the connection.
+/// Including it would flatter or damn the transport for something that
+/// happens once.
 pub fn benchmark(
     client: &dyn ModelClient,
     prompt: &str,
     runs: usize,
     warmup: bool,
 ) -> anyhow::Result<BenchResult> {
-    let _ = (client, prompt, runs, warmup);
-    todo!()
+    if warmup {
+        time_one_stream(client, prompt)?;
+    }
+
+    let timings = (0..runs)
+        .map(|_| time_one_stream(client, prompt))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(BenchResult {
+        client: client.type_name(),
+        runs,
+        first_chunk_s: median(timings.iter().map(|t| t.first_chunk_s)),
+        total_s: median(timings.iter().map(|t| t.total_s)),
+        chars: median(timings.iter().map(|t| t.chars as f64)),
+        chunks: median(timings.iter().map(|t| t.chunks as f64)),
+        chars_per_second: median(timings.iter().map(|t| t.chars_per_second())),
+    })
 }
 
 /// A fixed-width table, and the verdict the decision actually turns on.
 pub fn format_report(results: &[BenchResult]) -> String {
-    let _ = results;
-    todo!()
+    let header = format!(
+        "{:<24}{:>13}{:>10}{:>9}{:>9}{:>11}",
+        "client", "first chunk", "total", "chunks", "chars", "chars/s"
+    );
+    let mut lines = vec![header.clone(), "-".repeat(header.chars().count())];
+    for row in results {
+        lines.push(format!(
+            "{:<24}{:>12.3}s{:>9.3}s{:>9.0}{:>9.0}{:>11.1}",
+            row.client, row.first_chunk_s, row.total_s, row.chunks, row.chars, row.chars_per_second
+        ));
+    }
+
+    if let [base, other] = results {
+        lines.push(String::new());
+        lines.push(format!(
+            "{} vs {}: first chunk {}, throughput {}",
+            other.client,
+            base.client,
+            ratio(other.first_chunk_s, base.first_chunk_s),
+            ratio(base.chars_per_second, other.chars_per_second),
+        ));
+    }
+    lines.join("\n")
 }
 
 /// `1.04x slower` / `0.98x faster` — signed the way a reader expects.
-#[allow(dead_code)]
 fn ratio(numerator: f64, denominator: f64) -> String {
-    let _ = (numerator, denominator);
-    todo!()
+    if denominator == 0.0 {
+        return "n/a".to_string();
+    }
+    let factor = numerator / denominator;
+    format!("{:.2}x {}", factor, if factor >= 1.0 { "slower" } else { "faster" })
 }
 
 /// Command-line arguments of `smartloop.model_host.bench`.
@@ -106,11 +179,27 @@ pub struct BenchArgs {
 
 /// Run the benchmark and print the report.
 pub fn run(args: BenchArgs) -> anyhow::Result<()> {
-    let _ = args;
-    todo!()
+    let mut results: Vec<BenchResult> = Vec::new();
+
+    if !args.skip_in_process {
+        let service = crate::api::services::get_model_service();
+        service.load_model()?;
+        let client = InProcessModelClient::new(service);
+        results.push(benchmark(&client, &args.prompt, args.runs, true)?);
+    }
+
+    if let Some(address) = args.address.as_deref() {
+        let remote = RemoteModelClient::new(address);
+        let measured = benchmark(&remote, &args.prompt, args.runs, true);
+        remote.close();
+        results.push(measured?);
+    }
+
+    println!("{}", format_report(&results));
+    Ok(())
 }
 
 /// Entry point: parse process arguments and [`run`].
 pub fn main() -> anyhow::Result<()> {
-    todo!()
+    run(BenchArgs::parse_from(crate::model_host::entry::module_argv(MODULE)))
 }

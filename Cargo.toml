@@ -50,6 +50,7 @@ htmd = "0.5.5"
 http = "1.5.0"
 http-body-util = "0.1.5"
 hyper = "1.11.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 image = "0.25.9"
 indexmap = { version = "2.14.2", features = ["serde"] }
 indicatif = "0.18.6"

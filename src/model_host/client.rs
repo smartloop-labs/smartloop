@@ -13,20 +13,25 @@
 //! is unset, the default host socket is used.
 
 use std::any::Any;
+use std::future::Future;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use ndarray::Array2;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
+use tonic::{Code, Status};
 
 use crate::api::services::model_service::ModelService;
+use crate::config::AppSettings;
 use crate::llms::base_llm::{CancelEvent, GenerationChunk};
 use crate::model_host::pb;
-#[allow(unused_imports)]
 use crate::workspace::context::pinned_project_id;
 
 /// Logger name used by the Python module.
-#[allow(dead_code)]
 const LOG_TARGET: &str = "smartloop.model_host.client";
 
 /// Set in the process that actually holds the weights.  Without it a host
@@ -302,8 +307,7 @@ pub trait LocalModelService: Send + Sync {
 
 impl LocalModelService for ModelService {
     fn refresh_project_state(&self, project_id: Option<&str>) -> anyhow::Result<bool> {
-        let _ = project_id;
-        todo!()
+        Ok(ModelService::refresh_project_state(self, project_id))
     }
 
     fn generate_completion(
@@ -314,8 +318,7 @@ impl LocalModelService for ModelService {
         max_tokens: Option<usize>,
         thinking: Option<bool>,
     ) -> anyhow::Result<String> {
-        let _ = (prompt, model_name, capability, max_tokens, thinking);
-        todo!()
+        ModelService::generate_completion(self, prompt, model_name, capability, max_tokens, thinking)
     }
 
     fn stream_completion<'a>(
@@ -326,69 +329,63 @@ impl LocalModelService for ModelService {
         capability: Option<&str>,
         thinking: Option<bool>,
     ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<GenerationChunk>> + 'a>> {
-        let _ = (prompt, model_name, cancelled, capability, thinking);
-        todo!()
+        ModelService::stream_completion(self, prompt, model_name, cancelled, capability, thinking)
     }
 
     fn is_loaded(&self) -> bool {
-        todo!()
+        ModelService::is_loaded(self)
     }
 
     fn supports_thinking(&self, capability: Option<&str>) -> bool {
-        let _ = capability;
-        todo!()
+        ModelService::supports_thinking(self, capability)
     }
 
     fn resident_model_name(&self) -> Option<String> {
-        todo!()
+        self.model_name.read().clone()
     }
 
     fn response_model_label(&self, capability: Option<&str>) -> String {
-        let _ = capability;
-        todo!()
+        ModelService::response_model_label(self, capability)
     }
 
     fn count_tokens(&self, text: &str) -> usize {
-        let _ = text;
-        todo!()
+        ModelService::count_tokens(self, text)
     }
 
     fn get_max_context_tokens(&self) -> usize {
-        todo!()
+        ModelService::get_max_context_tokens(self)
     }
 
     fn get_response_max_context_tokens(&self, capability: Option<&str>) -> usize {
-        let _ = capability;
-        todo!()
+        ModelService::get_response_max_context_tokens(self, capability)
     }
 
     fn has_capability_model(&self, capability: &str) -> bool {
-        let _ = capability;
-        todo!()
+        ModelService::has_capability_model(self, capability)
     }
 
     fn idle_seconds(&self) -> f64 {
-        todo!()
+        ModelService::idle_seconds(self)
     }
 
     fn load_model(&self) -> anyhow::Result<()> {
-        todo!()
+        ModelService::load_model(self).map(|_| ())
     }
 
     fn unload_auxiliary_models(&self, include_embedding: bool) {
-        let _ = include_embedding;
-        todo!()
+        ModelService::unload_auxiliary_models(self, include_embedding)
     }
 
     fn unload_embedding_model(&self) {
-        todo!()
+        ModelService::unload_embedding_model(self)
     }
 }
 
 /// The device is owned by this process — call straight through.
 ///
-/// Every method here is the call the caller used to make directly, so
-/// selecting this client changes nothing about how a request is served.
+/// The default. Every method here is the call the caller used to make
+/// directly, so selecting this client changes nothing about how a request is
+/// served.
 pub struct InProcessModelClient {
     service: Arc<dyn LocalModelService>,
 }
@@ -414,12 +411,13 @@ impl ModelClient for InProcessModelClient {
         max_tokens: Option<usize>,
         thinking: Option<bool>,
     ) -> anyhow::Result<String> {
-        let _ = (prompt, model_name, capability, max_tokens, thinking);
-        todo!()
+        self.service
+            .generate_completion(prompt, model_name, capability, max_tokens, thinking)
     }
 
     /// `GenerationChunk` in, plain text out — the wire carries text, so the
-    /// in-process path yields the same thing.
+    /// in-process path yields the same thing rather than making every caller
+    /// handle two shapes.
     fn stream<'a>(
         &'a self,
         prompt: &str,
@@ -428,80 +426,78 @@ impl ModelClient for InProcessModelClient {
         cancelled: Option<CancelEvent>,
         thinking: Option<bool>,
     ) -> anyhow::Result<TextStream<'a>> {
-        let _ = (prompt, model_name, capability, cancelled, thinking);
-        todo!()
+        let chunks = self
+            .service
+            .stream_completion(prompt, model_name, cancelled, capability, thinking)?;
+        Ok(Box::new(chunks.map(|chunk| chunk.map(|c| c.text))))
     }
 
     /// `encode_local`, not `encode_texts`: this process owns the embedder, and
-    /// this is also the host's own serving path — routing would let a host
-    /// serve `EncodeTexts` by sending one.
+    /// this is also the host's own serving path.  Asking the routing entry
+    /// point would let a host serve `EncodeTexts` by sending one — a call it
+    /// can only answer by sending another, one gRPC worker consumed per hop.
     fn encode_texts(
         &self,
         texts: &[String],
         base_dir: Option<&str>,
     ) -> anyhow::Result<Option<Array2<f32>>> {
-        let _ = (texts, base_dir);
-        todo!()
+        Ok(crate::db::embeddings::encode_local(texts, base_dir))
     }
 
     fn is_loaded(&self) -> anyhow::Result<bool> {
-        todo!()
+        Ok(self.service.is_loaded())
     }
 
     fn supports_thinking(&self, capability: Option<&str>) -> anyhow::Result<bool> {
-        let _ = capability;
-        todo!()
+        Ok(self.service.supports_thinking(capability))
     }
 
     fn model_name(&self) -> anyhow::Result<Option<String>> {
-        todo!()
+        Ok(self.service.resident_model_name())
     }
 
     fn model_label(&self, capability: Option<&str>) -> anyhow::Result<String> {
-        let _ = capability;
-        todo!()
+        Ok(self.service.response_model_label(capability))
     }
 
     fn count_tokens(&self, text: &str) -> anyhow::Result<usize> {
-        let _ = text;
-        todo!()
+        Ok(self.service.count_tokens(text))
     }
 
     fn max_context_tokens(&self) -> anyhow::Result<usize> {
-        todo!()
+        Ok(self.service.get_max_context_tokens())
     }
 
     fn response_max_context_tokens(&self, capability: Option<&str>) -> anyhow::Result<usize> {
-        let _ = capability;
-        todo!()
+        Ok(self.service.get_response_max_context_tokens(capability))
     }
 
     fn has_capability_model(&self, capability: &str) -> anyhow::Result<bool> {
-        let _ = capability;
-        todo!()
+        Ok(self.service.has_capability_model(capability))
     }
 
     fn idle_seconds(&self) -> anyhow::Result<f64> {
-        todo!()
+        Ok(self.service.idle_seconds())
     }
 
     fn load_model(&self) -> anyhow::Result<Option<String>> {
-        todo!()
+        self.service.load_model()?;
+        Ok(self.service.resident_model_name())
     }
 
     fn unload_auxiliary_models(&self, include_embedding: bool) -> anyhow::Result<()> {
-        let _ = include_embedding;
-        todo!()
+        self.service.unload_auxiliary_models(include_embedding);
+        Ok(())
     }
 
     fn unload_embedding_model(&self) -> anyhow::Result<()> {
-        todo!()
+        self.service.unload_embedding_model();
+        Ok(())
     }
 
     /// The workspace is right here, so a child's write is one read away.
     fn refresh_project(&self, project_id: Option<&str>) -> anyhow::Result<bool> {
-        let _ = project_id;
-        todo!()
+        self.service.refresh_project_state(project_id)
     }
 
     fn type_name(&self) -> String {
@@ -522,8 +518,53 @@ pub type EncodeHook = Arc<
         + Sync,
 >;
 
+/// Process-wide counterpart of [`RemoteModelClient::set_encode_hook`], used by
+/// every client without an instance hook.  Lets a test stand in for the RPC
+/// of a client it does not construct itself (the embedder's own connection);
+/// the Python tests swapped `embeddings._remote_embedder` for a fake.
+static GLOBAL_ENCODE_HOOK: Lazy<Mutex<Option<EncodeHook>>> = Lazy::new(|| Mutex::new(None));
+
+/// Install (or clear) the process-wide `EncodeTexts` test seam.
+pub fn set_global_encode_hook(hook: Option<EncodeHook>) {
+    *GLOBAL_ENCODE_HOOK.lock() = hook;
+}
+
 /// The live transport: a gRPC client over a lazily-opened channel.
 type GrpcClient = pb::model_host_client::ModelHostClient<tonic::transport::Channel>;
+
+/// The runtime every [`RemoteModelClient`] drives its RPCs on.
+///
+/// The client's interface is synchronous (it is called from worker threads,
+/// exactly as the Python client was), so the async transport runs here and
+/// callers wait on a channel — never on `block_on`, which would refuse to run
+/// on a thread that is already inside a runtime.
+static CLIENT_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("slp-model-host-client")
+        .enable_all()
+        .build()
+        .expect("failed to start the model host client runtime")
+});
+
+/// Run `fut` on [`CLIENT_RUNTIME`] and wait for it from this (sync) thread.
+fn run_on_client_runtime<F>(fut: F) -> Result<F::Output, Status>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = CLIENT_RUNTIME.spawn(fut);
+    futures::executor::block_on(handle)
+        .map_err(|exc| Status::unknown(format!("model host call did not complete: {exc}")))
+}
+
+/// A per-call deadline from seconds; `None` for no deadline.
+fn deadline(seconds: f64) -> Option<Duration> {
+    if seconds.is_nan() || seconds.is_infinite() {
+        return None;
+    }
+    Some(Duration::from_secs_f64(seconds.max(0.0)))
+}
 
 /// The device is owned by a model host — talk to it over gRPC.
 ///
@@ -568,16 +609,95 @@ impl RemoteModelClient {
         *self.encode_hook.lock() = hook;
     }
 
+    // -- transport ----------------------------------------------------------
+
     /// Open the channel if needed and return the stub.
-    #[allow(dead_code)]
     fn connect(&self) -> Result<GrpcClient, ModelHostError> {
-        todo!()
+        let mut stub = self.stub.lock();
+        if let Some(existing) = stub.as_ref() {
+            return Ok(existing.clone());
+        }
+        let (_host, port) = parse_address(&self.address);
+        if port.is_none() && !has_unix_sockets() {
+            return Err(ModelHostError::new(format!(
+                "{} is a unix socket path, which this platform cannot open; the host should \
+                 be listening on host:port",
+                self.address
+            )));
+        }
+        if port == Some(0) {
+            return Err(ModelHostError::new(format!(
+                "model host address {} is not bound: the host is not listening on a real port",
+                py_repr(&self.address)
+            )));
+        }
+        let channel = {
+            // The channel's background worker is spawned onto whichever
+            // runtime is current, so make it ours.
+            let _enter = CLIENT_RUNTIME.enter();
+            open_channel(&self.address)?
+        };
+        let client = GrpcClient::new(channel)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        *stub = Some(client.clone());
+        tracing::info!(target: LOG_TARGET, "[model-host] connected to {}", self.address);
+        Ok(client)
     }
 
     /// Close the channel and forget it, so the next call reconnects.
-    #[allow(dead_code)]
     fn drop_channel(&self) {
-        todo!()
+        // In-flight calls hold their own handle; the channel closes once the
+        // last of them finishes.
+        *self.stub.lock() = None;
+    }
+
+    /// Run one unary RPC and return its message, or a [`ModelHostError`].
+    ///
+    /// `timeout` overrides the client-wide default for a single call, so a
+    /// latency-sensitive path can impose its own deadline (and fall back to
+    /// whatever it does without the host) without reshaping every caller.
+    fn unary<Req, Resp, F, Fut>(
+        &self,
+        request: Req,
+        timeout: Option<f64>,
+        call: F,
+    ) -> Result<Resp, ModelHostError>
+    where
+        Req: Send + 'static,
+        Resp: Send + 'static,
+        F: FnOnce(GrpcClient, tonic::Request<Req>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<tonic::Response<Resp>, Status>> + Send + 'static,
+    {
+        let stub = self.connect()?;
+        let limit = deadline(timeout.unwrap_or(self.timeout));
+        let outcome = run_on_client_runtime(async move {
+            let mut request = tonic::Request::new(request);
+            if let Some(limit) = limit {
+                request.set_timeout(limit);
+            }
+            let fut = call(stub, request);
+            match limit {
+                Some(limit) => match tokio::time::timeout(limit, fut).await {
+                    Ok(result) => result,
+                    Err(_) => Err(Status::deadline_exceeded("Deadline Exceeded")),
+                },
+                None => fut.await,
+            }
+        })
+        .and_then(|result| result);
+        match outcome {
+            Ok(response) => Ok(response.into_inner()),
+            Err(status) => {
+                if status.code() == Code::Unavailable {
+                    // The host is gone (crashed, restarted, or never there).
+                    // A dead channel caches that failure; drop it so the next
+                    // call reconnects instead of re-raising.
+                    self.drop_channel();
+                }
+                Err(rpc_error(&self.address, &status))
+            }
+        }
     }
 
     /// Embed `texts` with an optional per-call deadline (`timeout` seconds)
@@ -589,14 +709,163 @@ impl RemoteModelClient {
         base_dir: Option<&str>,
         timeout: Option<f64>,
     ) -> Result<Option<Array2<f32>>, ModelHostError> {
-        let _ = (texts, base_dir, timeout);
-        todo!()
+        let request = pb::EncodeTextsRequest {
+            texts: texts.to_vec(),
+            base_dir: base_dir.unwrap_or_default().to_string(),
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        let hook = self
+            .encode_hook
+            .lock()
+            .clone()
+            .or_else(|| GLOBAL_ENCODE_HOOK.lock().clone());
+        let reply = match hook {
+            Some(hook) => hook(&request, timeout)?,
+            None => self.unary(request, timeout, |mut stub, request| async move {
+                stub.encode_texts(request).await
+            })?,
+        };
+        decode_embeddings(&reply)
     }
 
     /// The `ProjectRequest` carrying this process's pinned project.
-    #[allow(dead_code)]
     fn project_request(&self) -> pb::ProjectRequest {
-        todo!()
+        pb::ProjectRequest { project_id: pinned_project_id().unwrap_or_default() }
+    }
+}
+
+/// Rebuild the float32 matrix an `EncodeTextsResponse` carries; an empty
+/// shape means the host has no embedder.
+fn decode_embeddings(reply: &pb::EncodeTextsResponse) -> Result<Option<Array2<f32>>, ModelHostError> {
+    if reply.shape.is_empty() {
+        return Ok(None);
+    }
+    let dims: Vec<usize> = reply.shape.iter().map(|d| (*d).max(0) as usize).collect();
+    let (rows, cols) = match dims.as_slice() {
+        [rows, cols] => (*rows, *cols),
+        [cols] => (1, *cols),
+        other => {
+            return Err(ModelHostError::new(format!(
+                "model host returned embeddings of unexpected shape {other:?}"
+            )));
+        }
+    };
+    if reply.data.len() != rows * cols * 4 {
+        return Err(ModelHostError::new(format!(
+            "model host returned {} bytes for embeddings of shape {:?}",
+            reply.data.len(),
+            dims
+        )));
+    }
+    let values: Vec<f32> = reply
+        .data
+        .chunks_exact(4)
+        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    Array2::from_shape_vec((rows, cols), values)
+        .map(Some)
+        .map_err(|exc| ModelHostError::new(format!("model host returned malformed embeddings: {exc}")))
+}
+
+/// Open a lazily-connecting channel to `address`.
+fn open_channel(address: &str) -> Result<tonic::transport::Channel, ModelHostError> {
+    let (host, port) = parse_address(address);
+    match port {
+        None => open_unix_channel(&host),
+        Some(port) => {
+            let authority =
+                if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+            let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{authority}"))
+                .map_err(|exc| {
+                    ModelHostError::new(format!("model host address {address} is not usable: {exc}"))
+                })?;
+            Ok(endpoint.tcp_nodelay(true).connect_lazy())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_unix_channel(path: &str) -> Result<tonic::transport::Channel, ModelHostError> {
+    let path = path.to_string();
+    // The URI is required by the API but never dialled: the connector below
+    // opens the socket file instead.
+    let endpoint = tonic::transport::Endpoint::from_static("http://localhost");
+    Ok(endpoint.connect_with_connector_lazy(tower::service_fn(move |_: http::Uri| {
+        let path = path.clone();
+        async move {
+            let stream = tokio::net::UnixStream::connect(path).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+        }
+    })))
+}
+
+#[cfg(not(unix))]
+fn open_unix_channel(path: &str) -> Result<tonic::transport::Channel, ModelHostError> {
+    Err(ModelHostError::new(format!(
+        "{path} is a unix socket path, which this platform cannot open; the host should be \
+         listening on host:port"
+    )))
+}
+
+/// A streamed generation from the host, as a blocking iterator.
+///
+/// The RPC runs on [`CLIENT_RUNTIME`]; chunks arrive over a channel.  Dropping
+/// the iterator part-way aborts the RPC, which cancels it server-side.
+struct RemoteTextStream<'a> {
+    client: &'a RemoteModelClient,
+    receiver: tokio::sync::mpsc::Receiver<Result<String, Status>>,
+    task: tokio::task::JoinHandle<()>,
+    cancelled: Option<CancelEvent>,
+    done: bool,
+}
+
+impl RemoteTextStream<'_> {
+    fn finish(&mut self) {
+        self.done = true;
+        self.receiver.close();
+        self.task.abort();
+    }
+}
+
+impl Iterator for RemoteTextStream<'_> {
+    type Item = anyhow::Result<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match futures::executor::block_on(self.receiver.recv()) {
+            None => {
+                self.finish();
+                None
+            }
+            Some(Ok(text)) => {
+                if self.cancelled.as_ref().is_some_and(|event| event.load(Ordering::SeqCst)) {
+                    // Advisory, exactly like the old cancel frame: the host
+                    // stops between tokens, and the channel stays usable for
+                    // the next request.
+                    self.finish();
+                    return None;
+                }
+                Some(Ok(text))
+            }
+            Some(Err(status)) => {
+                self.finish();
+                if status.code() == Code::Unavailable {
+                    self.client.drop_channel();
+                }
+                Some(Err(rpc_error(&self.client.address, &status).into()))
+            }
+        }
+    }
+}
+
+impl Drop for RemoteTextStream<'_> {
+    fn drop(&mut self) {
+        // Abandoned mid-way (a caller that broke out of the loop) must cancel
+        // the RPC server-side, or a generation would be computed for nobody.
+        // Harmless once the stream has finished.
+        self.task.abort();
     }
 }
 
@@ -609,8 +878,18 @@ impl ModelClient for RemoteModelClient {
         max_tokens: Option<usize>,
         thinking: Option<bool>,
     ) -> anyhow::Result<String> {
-        let _ = (prompt, model_name, capability, max_tokens, thinking);
-        todo!()
+        let request = pb::GenerateRequest {
+            prompt: prompt.to_string(),
+            model_name: model_name.unwrap_or_default().to_string(),
+            capability: capability.unwrap_or_default().to_string(),
+            max_tokens: max_tokens.map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
+            thinking,
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        let reply = self.unary(request, None, |mut stub, request| async move {
+            stub.generate(request).await
+        })?;
+        Ok(reply.text)
     }
 
     /// Dropping the returned stream part-way cancels the RPC server-side, so
@@ -623,8 +902,41 @@ impl ModelClient for RemoteModelClient {
         cancelled: Option<CancelEvent>,
         thinking: Option<bool>,
     ) -> anyhow::Result<TextStream<'a>> {
-        let _ = (prompt, model_name, capability, cancelled, thinking);
-        todo!()
+        let request = pb::StreamRequest {
+            prompt: prompt.to_string(),
+            model_name: model_name.unwrap_or_default().to_string(),
+            capability: capability.unwrap_or_default().to_string(),
+            thinking,
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        let mut stub = self.connect()?;
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<String, Status>>(16);
+        // No deadline: a long answer is not a hung host.
+        let task = CLIENT_RUNTIME.spawn(async move {
+            match stub.stream(tonic::Request::new(request)).await {
+                Err(status) => {
+                    let _ = sender.send(Err(status)).await;
+                }
+                Ok(response) => {
+                    let mut chunks = response.into_inner();
+                    loop {
+                        match chunks.message().await {
+                            Ok(Some(chunk)) => {
+                                if sender.send(Ok(chunk.text)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(status) => {
+                                let _ = sender.send(Err(status)).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Box::new(RemoteTextStream { client: self, receiver, task, cancelled, done: false }))
     }
 
     fn encode_texts(
@@ -636,61 +948,115 @@ impl ModelClient for RemoteModelClient {
     }
 
     fn is_loaded(&self) -> anyhow::Result<bool> {
-        todo!()
+        let reply = self.unary(self.project_request(), None, |mut stub, request| async move {
+            stub.is_loaded(request).await
+        })?;
+        Ok(reply.value)
     }
 
     fn supports_thinking(&self, capability: Option<&str>) -> anyhow::Result<bool> {
-        let _ = capability;
-        todo!()
+        let request = pb::SupportsThinkingRequest {
+            capability: capability.unwrap_or_default().to_string(),
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        let reply = self.unary(request, None, |mut stub, request| async move {
+            stub.supports_thinking(request).await
+        })?;
+        Ok(reply.value)
     }
 
     fn model_name(&self) -> anyhow::Result<Option<String>> {
-        todo!()
+        let reply = self.unary(self.project_request(), None, |mut stub, request| async move {
+            stub.model_name(request).await
+        })?;
+        Ok(Some(reply.value).filter(|name| !name.is_empty()))
     }
 
     fn model_label(&self, capability: Option<&str>) -> anyhow::Result<String> {
-        let _ = capability;
-        todo!()
+        let request = pb::ModelLabelRequest {
+            capability: capability.unwrap_or_default().to_string(),
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        let reply = self.unary(request, None, |mut stub, request| async move {
+            stub.model_label(request).await
+        })?;
+        Ok(reply.value)
     }
 
     fn count_tokens(&self, text: &str) -> anyhow::Result<usize> {
-        let _ = text;
-        todo!()
+        let request = pb::CountTokensRequest {
+            text: text.to_string(),
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        let reply = self.unary(request, None, |mut stub, request| async move {
+            stub.count_tokens(request).await
+        })?;
+        Ok(reply.value.max(0) as usize)
     }
 
     fn max_context_tokens(&self) -> anyhow::Result<usize> {
-        todo!()
+        let reply = self.unary(self.project_request(), None, |mut stub, request| async move {
+            stub.max_context_tokens(request).await
+        })?;
+        Ok(reply.value.max(0) as usize)
     }
 
     fn response_max_context_tokens(&self, capability: Option<&str>) -> anyhow::Result<usize> {
-        let _ = capability;
-        todo!()
+        let request = pb::ResponseMaxContextRequest {
+            capability: capability.unwrap_or_default().to_string(),
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        let reply = self.unary(request, None, |mut stub, request| async move {
+            stub.response_max_context_tokens(request).await
+        })?;
+        Ok(reply.value.max(0) as usize)
     }
 
     fn has_capability_model(&self, capability: &str) -> anyhow::Result<bool> {
-        let _ = capability;
-        todo!()
+        let request = pb::HasCapabilityRequest {
+            capability: capability.to_string(),
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        let reply = self.unary(request, None, |mut stub, request| async move {
+            stub.has_capability_model(request).await
+        })?;
+        Ok(reply.value)
     }
 
     fn idle_seconds(&self) -> anyhow::Result<f64> {
-        todo!()
+        let reply = self.unary(self.project_request(), None, |mut stub, request| async move {
+            stub.idle_seconds(request).await
+        })?;
+        Ok(reply.value)
     }
 
     fn load_model(&self) -> anyhow::Result<Option<String>> {
-        todo!()
+        let reply = self.unary(self.project_request(), None, |mut stub, request| async move {
+            stub.load_model(request).await
+        })?;
+        Ok(Some(reply.value).filter(|name| !name.is_empty()))
     }
 
     fn unload_auxiliary_models(&self, include_embedding: bool) -> anyhow::Result<()> {
-        let _ = include_embedding;
-        todo!()
+        let request = pb::UnloadAuxiliaryRequest {
+            include_embedding,
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        self.unary(request, None, |mut stub, request| async move {
+            stub.unload_auxiliary_models(request).await
+        })?;
+        Ok(())
     }
 
     fn unload_embedding_model(&self) -> anyhow::Result<()> {
-        todo!()
+        self.unary(self.project_request(), None, |mut stub, request| async move {
+            stub.unload_embedding_model(request).await
+        })?;
+        Ok(())
     }
 
     fn close(&self) {
-        todo!()
+        self.drop_channel();
     }
 
     fn type_name(&self) -> String {
@@ -706,11 +1072,70 @@ impl ModelClient for RemoteModelClient {
     }
 }
 
+/// grpcio's spelling of a status code (`StatusCode.UNAVAILABLE` minus the
+/// prefix).
+fn status_code_name(code: Code) -> &'static str {
+    match code {
+        Code::Ok => "OK",
+        Code::Cancelled => "CANCELLED",
+        Code::Unknown => "UNKNOWN",
+        Code::InvalidArgument => "INVALID_ARGUMENT",
+        Code::DeadlineExceeded => "DEADLINE_EXCEEDED",
+        Code::NotFound => "NOT_FOUND",
+        Code::AlreadyExists => "ALREADY_EXISTS",
+        Code::PermissionDenied => "PERMISSION_DENIED",
+        Code::ResourceExhausted => "RESOURCE_EXHAUSTED",
+        Code::FailedPrecondition => "FAILED_PRECONDITION",
+        Code::Aborted => "ABORTED",
+        Code::OutOfRange => "OUT_OF_RANGE",
+        Code::Unimplemented => "UNIMPLEMENTED",
+        Code::Internal => "INTERNAL",
+        Code::Unavailable => "UNAVAILABLE",
+        Code::DataLoss => "DATA_LOSS",
+        Code::Unauthenticated => "UNAUTHENTICATED",
+    }
+}
+
 /// Describe a failed RPC the way a failing socket used to be described.
-#[allow(dead_code)]
 fn rpc_error(address: &str, status: &tonic::Status) -> ModelHostError {
-    let _ = (address, status);
-    todo!()
+    let code = status.code();
+    let details = if status.message().is_empty() {
+        format!("StatusCode.{}", status_code_name(code))
+    } else {
+        status.message().to_string()
+    };
+    match code {
+        Code::Unavailable => {
+            ModelHostError::new(format!("model host at {address} is unreachable: {details}"))
+        }
+        Code::Cancelled => {
+            ModelHostError::new(format!("model host at {address} cancelled the call: {details}"))
+        }
+        _ => ModelHostError::new(format!("model host at {address} failed: {details}")),
+    }
+}
+
+/// Python's `repr()` of a string, for messages that quoted an address with
+/// `{address!r}`.
+fn py_repr(value: &str) -> String {
+    let quote = if value.contains('\'') && !value.contains('"') { '"' } else { '\'' };
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push(quote);
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
 }
 
 /// Split `address` into `(path, None)` or `(host, Some(port))`.
@@ -719,34 +1144,129 @@ fn rpc_error(address: &str, status: &tonic::Status) -> ModelHostError {
 /// no `AF_UNIX` there — and is also useful for debugging a host that is not on
 /// the same filesystem.
 pub fn parse_address(address: &str) -> (String, Option<u32>) {
-    let _ = address;
-    todo!()
+    if let Some(rest) = address.strip_prefix("unix://") {
+        return (rest.to_string(), None);
+    }
+    if let Some(rest) = address.strip_prefix("unix:") {
+        return (rest.to_string(), None);
+    }
+    if address.contains(std::path::MAIN_SEPARATOR) || address.starts_with('.') {
+        return (address.to_string(), None);
+    }
+    if let Some((host, port)) = address.rsplit_once(':')
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+        && let Ok(port) = port.parse::<u32>()
+    {
+        let host = if host.is_empty() { "127.0.0.1" } else { host };
+        return (host.to_string(), Some(port));
+    }
+    (address.to_string(), None)
 }
 
 /// How gRPC addresses `address`: `unix:`-prefixed or `host:port`.
 pub fn grpc_target(address: &str) -> String {
-    let _ = address;
-    todo!()
+    let (host, port) = parse_address(address);
+    match port {
+        None => format!("unix:{host}"),
+        Some(port) => format!("{host}:{port}"),
+    }
+}
+
+/// `os.path.abspath`: absolute and normalised, without resolving symlinks.
+fn abspath(path: &str) -> String {
+    let path = Path::new(path);
+    let joined: PathBuf = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().into_owned()
 }
 
 /// Where the model host listens when nothing says otherwise.
 ///
-/// Normally `<home>/model-host.sock`.  Without AF_UNIX, or when the home is
-/// too deep for `sun_path`, a short name in the system temp directory keyed by
-/// the home is tried, and loopback (`127.0.0.1:0`) is the last resort.
+/// Normally `<home>/model-host.sock` — a filesystem object, so the OS enforces
+/// who may connect.  Two things take that away:
+///
+/// * **No AF_UNIX at all.**  Windows has none, so there is nothing to bind and
+///   the host listens on loopback TCP instead.
+/// * **A home too deep for `sun_path`.**  It is 104 bytes, and the macOS App
+///   Sandbox puts the home under `~/Library/Containers/<bundle id>/Data`.  A
+///   short name in the system temp directory, keyed by the home so two
+///   workspaces never share one, usually fits; loopback is the last resort.
+///
+/// Loopback binds to 127.0.0.1, so nothing off-machine can reach it — but it
+/// has no file permissions, so any local process may connect where a unix
+/// socket would have said no.  That is the trade Windows makes today.
 pub fn default_socket_path(home_dir: &str) -> String {
-    let _ = home_dir;
-    todo!()
+    if !has_unix_sockets() {
+        tracing::info!(target: LOG_TARGET, "[model-host] no AF_UNIX on this platform; listening on loopback");
+        return "127.0.0.1:0".to_string();
+    }
+
+    let path = Path::new(home_dir).join("model-host.sock").to_string_lossy().into_owned();
+    if path.len() <= MAX_UNIX_SOCKET_PATH {
+        return path;
+    }
+
+    let digest = hex::encode(Sha256::digest(abspath(home_dir).as_bytes()));
+    let short = std::env::temp_dir()
+        .join(format!("slp-model-host-{}.sock", &digest[..12]))
+        .to_string_lossy()
+        .into_owned();
+    if short.len() <= MAX_UNIX_SOCKET_PATH {
+        tracing::info!(
+            target: LOG_TARGET,
+            "[model-host] {} is too long for a unix socket; using {}", path, short
+        );
+        return short;
+    }
+
+    tracing::info!(target: LOG_TARGET, "[model-host] no usable unix socket path; listening on loopback instead");
+    "127.0.0.1:0".to_string()
 }
 
 /// The client this process should use.
 ///
 /// A project child gets a host address from `SLP_MODEL_HOST`; a process that
-/// owns the device, or one that has not started a host yet, stays on the
-/// in-process path.  A port of zero is never a usable model host address.
+/// owns the device, or one that has not started a host yet, must stay on the
+/// in-process path instead of trying to reach a placeholder `127.0.0.1:0`.
+///
+/// A port of zero is not a real bind and must never be treated as a usable
+/// model host address; it indicates the host was not started or was asked to
+/// bind on an ephemeral port that never got published.
 pub fn get_model_client(
     model_service: Option<Arc<dyn LocalModelService>>,
 ) -> Result<Arc<dyn ModelClient>, ModelHostError> {
-    let _ = model_service;
-    todo!()
+    let mut address = std::env::var("SLP_MODEL_HOST").unwrap_or_default().trim().to_string();
+    if address.is_empty() {
+        // No explicit host means there is no model-host process to reach in
+        // this process.  The single-server and local-owner paths remain
+        // in-process; a child without a host address should never silently
+        // fall through to a remote connection against a placeholder port.
+        if let Some(service) = model_service {
+            return Ok(Arc::new(InProcessModelClient::new(service)));
+        }
+        address = default_socket_path(&AppSettings::new().home_dir());
+    }
+
+    if parse_address(&address).1 == Some(0) {
+        return Err(ModelHostError::new(format!(
+            "model host address {} is not bound: a real host port is required before remote \
+             model access",
+            py_repr(&address)
+        )));
+    }
+    Ok(Arc::new(RemoteModelClient::new(address)))
 }
