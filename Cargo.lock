@@ -4381,6 +4381,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-util",
  "image",
  "indexmap",
  "indicatif",
