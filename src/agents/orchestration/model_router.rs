@@ -9,8 +9,6 @@
 //!
 //! This is the leaf of the orchestration graph — it depends on nothing else.
 
-#![allow(unused_imports, unused_variables, dead_code)]
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -62,6 +60,9 @@ pub type CapabilitySkipReasonFn =
 /// Why a capability model was skipped: Python's `(model_name, cause, detail?)`
 /// tuple.  `cause` is one of `memory`, `missing`, `faulted`, `error`; `detail`
 /// carries the figures behind the cause ("needs ~4.9GB, 4.4GB free").
+///
+/// A record whose `cause` is empty stands for Python's malformed (too short)
+/// tuple: it explains nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilitySkipReason {
     pub model_name: String,
@@ -118,8 +119,15 @@ pub const SKIP_REASONS: &[(&str, &str)] = &[
 ];
 
 /// What the user is told a reasoning model was picked for.  `thinking` is an
-/// internal routing tag and names a property of the model rather than the work.
+/// internal routing tag — it is excluded from the capabilities the API reports
+/// and it names a property of the model rather than the work, so "Selected
+/// qwen3.5-2b for thinking" tells the reader nothing about what is happening.
 pub const RESOLUTION_PURPOSE: &str = "tool resolution";
+
+/// True when two handles point at the same model instance (Python `is`).
+fn same_llm(a: &Arc<dyn BaseLLM>, b: &Arc<dyn BaseLLM>) -> bool {
+    std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
+}
 
 /// Resolves the LLM for a node and reports progress to the client.
 ///
@@ -134,7 +142,11 @@ pub struct ModelRouter {
     pub large_llm: Mutex<Option<Arc<dyn BaseLLM>>>,
     large_llm_provider: Option<LargeLlmProvider>,
     capability_llm_provider: Option<CapabilityLlmProvider>,
+    /// Answers "does any selected model declare this capability?" without
+    /// loading anything, so a load is only announced when one can happen.
     capability_available: Option<CapabilityAvailable>,
+    /// Answers "why did the last capability model not load?", so a fallback
+    /// can say what went wrong.
     capability_skip_reason: Option<CapabilitySkipReasonFn>,
     /// Per-request state, reset by [`ModelRouter::begin_request`].
     progress_callback: Mutex<Option<ProgressCallback>>,
@@ -148,123 +160,606 @@ impl ModelRouter {
         agent_llm: Arc<dyn BaseLLM>,
         options: ModelRouterOptions,
     ) -> Self {
-        todo!()
+        Self {
+            orchestrator_llm,
+            agent_llm,
+            large_llm: Mutex::new(options.large_llm),
+            large_llm_provider: options.large_llm_provider,
+            capability_llm_provider: options.capability_llm_provider,
+            capability_available: options.capability_available,
+            capability_skip_reason: options.capability_skip_reason,
+            progress_callback: Mutex::new(None),
+            emitted_model_events: Mutex::new(HashSet::new()),
+        }
     }
 
     /// True when a generic large model can still be loaded on demand.
     pub fn has_large_provider(&self) -> bool {
-        todo!()
+        self.large_llm_provider.is_some()
+    }
+
+    /// The progress sink installed for the current request, if any (Python
+    /// `router._progress_callback`).
+    pub fn progress_callback(&self) -> Option<ProgressCallback> {
+        self.progress_callback.lock().clone()
     }
 
     /// Reset per-request state and install this request's progress sink.
     ///
-    /// The model-selection dedupe set is cleared per request: a capability's
-    /// model is resolved once per DAG node, but the user only needs to be told
-    /// which model was picked once.
+    /// The model-selection dedupe set has to be cleared per request: a
+    /// capability's model is resolved once per DAG node (once per document in
+    /// a fan-out, say), but the user only needs to be told which model was
+    /// picked once.
     pub fn begin_request(&self, progress_callback: Option<ProgressCallback>) {
-        todo!()
+        *self.progress_callback.lock() = progress_callback;
+        self.emitted_model_events.lock().clear();
     }
 
     /// Resolve the model for a node, reporting the choice to the client.
     ///
     /// `capability` routes; `purpose` — when given — is what the user is told
-    /// the model is for.  LARGE falls back to the generic large model, then the
-    /// agent model; SMALL routes best-effort through [`Self::decision_llm`].
+    /// the model is for.  The two are not the same thing.  Synthesis routes on
+    /// the `skills` capability because a skill's answer should be written by a
+    /// skills-capable model, but the user is watching the final answer being
+    /// written, and "Loading model for reasoning…" names an internal routing
+    /// tag rather than the work in progress.
     pub fn llm_for_tier(
         &self,
         tier: ModelTier,
         capability: Option<&str>,
         purpose: Option<&str>,
     ) -> Arc<dyn BaseLLM> {
-        todo!()
+        let capability = capability.filter(|c| !c.is_empty());
+        if tier == ModelTier::Large {
+            if let (Some(cap), Some(provider)) = (capability, self.capability_llm_provider.as_ref()) {
+                // Don't cache the capability LLM here — the provider
+                // (model_service) is the authoritative cache and may evict a
+                // prior step's model to fit this one. Holding our own strong
+                // reference would pin that VRAM and defeat the eager release,
+                // so a subsequent capability (e.g. skills after dp) can't fit.
+                //
+                // Only announce the load when there is something to load.
+                // This event fires *before* the provider is consulted (its
+                // whole point is to precede a slow load), so on a workspace
+                // where no selected model declares the capability it used to
+                // promise a load that never happened — "Loading model for
+                // skills…" on a request with no skills-capable model, then a
+                // fallback to the bootstrap model.
+                if self.capability_model_exists(Some(cap)) {
+                    self.emit_model_loading(Some(cap), purpose);
+                }
+                match provider(cap) {
+                    Ok(Some(llm)) => {
+                        tracing::info!(
+                            target: LOGGER,
+                            "[models] capability '{}' → {}",
+                            cap,
+                            Self::model_label(llm.as_ref())
+                        );
+                        self.emit_model_selected(Some(cap), llm.as_ref(), purpose);
+                        return llm;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: LOGGER,
+                            "[models] capability model load failed ({}): {}",
+                            cap,
+                            e
+                        );
+                    }
+                }
+            }
+            // No capability-specific model available — fall through to the
+            // generic large model so synthesis / analysis still gets the
+            // best available model rather than the small orchestrator.
+            let fallback = {
+                let mut large = self.large_llm.lock();
+                if large.is_none() {
+                    if let Some(provider) = self.large_llm_provider.as_ref() {
+                        *large = match provider() {
+                            Ok(llm) => llm,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: LOGGER,
+                                    "[models] large model load failed: {}",
+                                    e
+                                );
+                                None
+                            }
+                        };
+                    }
+                }
+                large.clone().unwrap_or_else(|| self.agent_llm.clone())
+            };
+            if let Some(cap) = capability {
+                tracing::warn!(
+                    target: LOGGER,
+                    "[models] capability '{}' unresolved — falling back to {}",
+                    cap,
+                    Self::model_label(fallback.as_ref())
+                );
+                self.emit_model_fallback(Some(cap), fallback.as_ref(), purpose);
+            }
+            return fallback;
+        }
+        // A capability tag routes at every tier, not only LARGE.  A SMALL step
+        // is a decision node — picking an MCP tool, extracting its arguments,
+        // judging relevance — so it routes *best-effort*: decision_llm takes the
+        // capability model only when it is already resident or comfortably
+        // fits, and otherwise lands back on agent_llm without forcing a load.
+        //
+        // Dropping the tag here is what kept every MCP tool call on the
+        // bootstrap router: pipeline_builder tags a non-skill TOOL step SMALL
+        // and still sets its capability, and that capability was read by
+        // nothing.  It only surfaced with two or more models selected — a
+        // single selection is pinned into agent_llm upstream, so the default
+        // happened to be the user's model.
+        self.decision_llm(capability, None)
     }
 
-    /// A model that can reason, for a call whose judgement warrants it (MCP
-    /// tool resolution).  Best-effort; a `fallback` that already reasons is
-    /// kept as-is.
+    /// A model that can reason, for a call whose judgement warrants it.
+    ///
+    /// MCP tool resolution is that call: one pass over every discovered tool
+    /// that has to pick the tool *and* fill its required arguments, and a
+    /// reasoning block is the difference between a considered answer and a
+    /// guess.  So if the workspace has a model declaring
+    /// `ModelCapability::Thinking` enabled, that model runs it — rather than
+    /// whichever model the step would otherwise use, which on a multi-model
+    /// selection is the small router model.
+    ///
+    /// Best-effort, like every other decision-node routing: `decision_llm`
+    /// takes the capability model only when it is resident or comfortably
+    /// fits, so this never forces a load onto a memory-tight device.  A
+    /// `fallback` that already reasons is kept as-is — no lookup, no switch.
     pub fn reasoning_llm(&self, fallback: Arc<dyn BaseLLM>) -> Arc<dyn BaseLLM> {
-        todo!()
+        let capability = ModelCapability::Thinking.value();
+        if fallback.supports_thinking() {
+            return fallback;
+        }
+        if !self.capability_model_exists(Some(capability)) {
+            return fallback;
+        }
+        let resolved = self.decision_llm(Some(capability), Some(RESOLUTION_PURPOSE));
+        if resolved.supports_thinking() {
+            tracing::info!(
+                target: LOGGER,
+                "[models] tool resolution → {} (thinking)",
+                Self::model_label(resolved.as_ref())
+            );
+            return resolved;
+        }
+        fallback
     }
 
-    /// True when some selected model declares `capability`.  Unknown (no
-    /// predicate wired in, or the predicate failed) counts as true.
+    /// True when some selected model declares `capability`.
+    ///
+    /// Unknown (no predicate wired in) counts as true, so a caller that does
+    /// not supply one keeps the previous behaviour.
     fn capability_model_exists(&self, capability: Option<&str>) -> bool {
-        todo!()
+        let (Some(capability), Some(available)) =
+            (capability.filter(|c| !c.is_empty()), self.capability_available.as_ref())
+        else {
+            return true;
+        };
+        match available(capability) {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::debug!(
+                    target: LOGGER,
+                    "[models] capability availability check failed for {}: {}",
+                    capability,
+                    e
+                );
+                true
+            }
+        }
     }
 
-    /// Resolve a capability model for a low-value *decision* node.  Never
-    /// forces a generic large-model load; falls straight back to `agent_llm`.
+    /// Resolve a capability model for a low-value *decision* node (skill
+    /// matching, multi-step planning, MCP tool selection).
+    ///
+    /// `purpose` is what the user is told the model is for, in place of the
+    /// capability tag — see [`Self::llm_for_tier`] on why the two differ.
+    ///
+    /// Unlike [`Self::llm_for_tier`], this never forces a generic large-model
+    /// load: it uses the capability model only when it is already resident or
+    /// comfortably fits (the provider's own headroom guard decides), and
+    /// otherwise falls straight back to the small orchestrator model. This
+    /// keeps the better intent judgement "when available" without adding VRAM
+    /// pressure — and risking an OOM — on memory-tight devices.
     pub fn decision_llm(
         &self,
         capability: Option<&str>,
         purpose: Option<&str>,
     ) -> Arc<dyn BaseLLM> {
-        todo!()
+        if let (Some(cap), Some(provider)) =
+            (capability.filter(|c| !c.is_empty()), self.capability_llm_provider.as_ref())
+        {
+            // No local caching — see llm_for_tier: the provider owns the
+            // capability cache and may evict to fit, so pinning a reference
+            // here would prevent that VRAM from being reclaimed for the next
+            // step.
+            match provider(cap) {
+                Ok(Some(llm)) => {
+                    tracing::info!(
+                        target: LOGGER,
+                        "[models] decision capability '{}' → {}",
+                        cap,
+                        Self::model_label(llm.as_ref())
+                    );
+                    // Nothing was switched when the capability resolves to the
+                    // model this request is already running on.  Announcing it
+                    // anyway puts a second "Selected …" beside the first,
+                    // naming one model twice under two labels — which is what
+                    // a single-model workspace saw for every MCP step, since
+                    // the model that reasons is also the one that answers.
+                    if !same_llm(&llm, &self.agent_llm) {
+                        self.emit_model_selected(Some(cap), llm.as_ref(), purpose);
+                    }
+                    return llm;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: LOGGER,
+                        "[models] decision capability load failed ({}): {}",
+                        cap,
+                        e
+                    );
+                }
+            }
+        }
+        self.agent_llm.clone()
     }
 
-    /// Name this model the way the user's model picker names it (explicit
-    /// label, else GGUF `general.name` mapped to the product name plus
-    /// `general.size_label`, else the LLM's type name).
+    /// Name this model the way the user's model picker names it.
+    ///
+    /// The GGUF's `general.name` is the upstream author's label, which for our
+    /// own model is `Slp Orchestra Mini` — a name that appears nowhere in the
+    /// product.  This label goes out on the progress SSE, so it is mapped back
+    /// to the short name (`sl-mini`) before it is shown.
     pub fn model_label(llm: &dyn BaseLLM) -> String {
-        todo!()
+        // A handle to a model owned by another process reports its own label —
+        // there is no local GGUF here to read metadata from, and falling
+        // through would put "RemoteLLM" on the user's progress event.
+        let explicit = llm.model_label();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        if let Some(model) = llm.llama_model() {
+            let meta = model.metadata();
+            let name =
+                display_model_label(meta.get("general.name").map(String::as_str).unwrap_or(""));
+            let size = meta.get("general.size_label").map(String::as_str).unwrap_or("");
+            if !name.is_empty() {
+                return if size.is_empty() { name } else { format!("{name} ({size})") };
+            }
+        }
+        llm.class_name().to_string()
     }
 
-    /// Report an orchestration step to the optional progress callback.  Any
-    /// failure in the callback is swallowed.
+    /// Report an orchestration step to the optional progress callback.
+    ///
+    /// The callback is supplied by the streaming API layer to surface live
+    /// activity as SSE `chat.status` events.  It is invoked from DAG worker
+    /// threads, so it must be thread-safe; any failure here must never break
+    /// orchestration.
     pub fn emit(&self, step: &str, status: &str, message: &str) {
-        todo!()
+        let Some(cb) = self.progress_callback.lock().clone() else {
+            return;
+        };
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(step, status, message)));
+        if outcome.is_err() {
+            tracing::debug!(target: LOGGER, "[progress] callback failed");
+        }
     }
 
     /// Human-readable label for a capability tag.
     fn capability_label(capability: &str) -> String {
-        todo!()
+        let lower = capability.to_lowercase();
+        CAPABILITY_LABELS
+            .iter()
+            .find(|(cap, _)| *cap == lower)
+            .map(|(_, label)| (*label).to_string())
+            .unwrap_or_else(|| capability.to_string())
     }
 
     /// True if this model SSE already fired this request (and record it).
+    ///
+    /// Collapses the per-node emits of a fan-out (one model resolution per
+    /// document) into a single client message.
     fn model_event_seen(&self, key: &str) -> bool {
-        todo!()
+        let mut seen = self.emitted_model_events.lock();
+        if seen.contains(key) {
+            return true;
+        }
+        seen.insert(key.to_string());
+        false
     }
 
     /// True if this model SSE already fired — without recording it.
     fn model_event_fired(&self, key: &str) -> bool {
-        todo!()
+        self.emitted_model_events.lock().contains(key)
     }
 
-    /// `(label, key)` for a model event; `purpose` wins over the capability.
+    /// `(label, key)` for a model event — what to say, and what to dedupe on.
+    /// `purpose` wins over the capability tag on both counts, so two different
+    /// jobs routed through the same capability each get their line.
     fn event_label(capability: Option<&str>, purpose: Option<&str>) -> (String, String) {
-        todo!()
+        if let Some(purpose) = purpose.filter(|p| !p.is_empty()) {
+            return (purpose.to_string(), purpose.to_lowercase());
+        }
+        if let Some(capability) = capability.filter(|c| !c.is_empty()) {
+            return (Self::capability_label(capability), capability.to_lowercase());
+        }
+        (String::new(), String::new())
     }
 
-    /// Surface an immediate "Loading model for …" SSE before a capability
-    /// model load.  Emitted once per capability/request.
+    /// Surface an *immediate* "loading" SSE before the (potentially slow)
+    /// capability model load, so the user gets feedback right away instead of
+    /// only after the model is resident.  Emitted once per capability/request.
     pub fn emit_model_loading(&self, capability: Option<&str>, purpose: Option<&str>) {
-        todo!()
+        let (label, key) = Self::event_label(capability, purpose);
+        if key.is_empty() || self.model_event_seen(&format!("loading:{key}")) {
+            return;
+        }
+        self.emit("model", "processing", &format!("Loading model for {label}…"));
     }
 
-    /// Surface the selected capability model as an SSE ("Selected X for Y"),
-    /// deduped per capability/request and per model.
+    /// Surface the selected capability model as an SSE.
+    ///
+    /// Emitted once per capability/request — a fan-out resolves the model once
+    /// per document — and, where nothing announced a load, once per model.
+    ///
+    /// A "Selected …" line answers the "Loading model for …" line before it,
+    /// so a step that promised a load always reports what it got, even when
+    /// that is a model the user has already seen.  A step that promised
+    /// nothing has only the switch to report, and a model already named this
+    /// turn is not a switch: resolving a tool call after synthesis, on a
+    /// workspace where one model serves both, read as the model being picked
+    /// twice — where the second line told the user nothing the first had not.
+    /// Work moving to a *different* model is still announced, every time.
     pub fn emit_model_selected(
         &self,
         capability: Option<&str>,
         llm: &dyn BaseLLM,
         purpose: Option<&str>,
     ) {
-        todo!()
+        let (label, key) = Self::event_label(capability, purpose);
+        if key.is_empty() || self.model_event_seen(&format!("selected:{key}")) {
+            return;
+        }
+        let name = Self::model_label(llm);
+        // Recorded whichever way this goes: a line that answered a load has
+        // named the model, so a later step that promised nothing has nothing
+        // left to add about it.
+        let first_mention = !self.model_event_seen(&format!("selected-model:{name}"));
+        if !first_mention && !self.model_event_fired(&format!("loading:{key}")) {
+            return;
+        }
+        self.emit("model", "processing", &format!("Selected {name} for {label}"));
     }
 
     /// Trailing clause explaining why no capability model was used, or `""`.
     fn skip_explanation(&self) -> String {
-        todo!()
+        let Some(reporter) = self.capability_skip_reason.as_ref() else {
+            return String::new();
+        };
+        let skip = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reporter())) {
+            Ok(Ok(skip)) => skip,
+            Ok(Err(e)) => {
+                tracing::debug!(target: LOGGER, "[models] skip-reason lookup failed: {}", e);
+                return String::new();
+            }
+            Err(_) => {
+                tracing::debug!(target: LOGGER, "[models] skip-reason lookup failed");
+                return String::new();
+            }
+        };
+        let Some(skip) = skip else {
+            return String::new();
+        };
+        // `detail` is optional and carries the figures behind the cause —
+        // "needs ~4.9GB, 4.4GB free" — which is the part the user can act on.
+        let Some(template) =
+            SKIP_REASONS.iter().find(|(cause, _)| *cause == skip.cause).map(|(_, t)| *t)
+        else {
+            return String::new();
+        };
+        if skip.model_name.is_empty() {
+            return String::new();
+        }
+        let explanation = template.replace("{model}", &display_model_name(&skip.model_name));
+        match skip.detail.as_deref().filter(|d| !d.is_empty()) {
+            Some(detail) => format!("{explanation} ({detail})"),
+            None => explanation,
+        }
     }
 
     /// Name the model that will run the step when the capability could not be
-    /// resolved ("Selected X — reason"), sharing the selection dedupe key.
+    /// resolved, and say why when the reason is known.
+    ///
+    /// Deliberately does not name the capability: no capability model was
+    /// found, so "Selected sl-mini for reasoning" reads as though one had been
+    /// chosen for that work.  Shares the selection dedupe key, so a later real
+    /// resolution for the same capability does not report twice.
     pub fn emit_model_fallback(
         &self,
         capability: Option<&str>,
         llm: &dyn BaseLLM,
         purpose: Option<&str>,
     ) {
-        todo!()
+        let (_label, key) = Self::event_label(capability, purpose);
+        if key.is_empty() || self.model_event_seen(&format!("selected:{key}")) {
+            return;
+        }
+        let explanation = self.skip_explanation();
+        let mut message = format!("Selected {}", Self::model_label(llm));
+        if !explanation.is_empty() {
+            message = format!("{message} — {explanation}");
+        }
+        self.emit("model", "processing", &message);
+    }
+}
+
+/// A scripted LLM double shared by the orchestration-step unit tests.
+#[cfg(test)]
+pub(crate) mod test_llm {
+    use std::any::Any;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use crate::llms::base_llm::{CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
+    use crate::llms::BaseLLM;
+
+    type Reply = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+    /// Replies through a scripted closure and records every prompt.
+    pub(crate) struct ScriptedLlm {
+        pub reply: Mutex<Reply>,
+        pub prompts: Mutex<Vec<String>>,
+        pub max_tokens: usize,
+        pub num_tokens: usize,
+    }
+
+    impl ScriptedLlm {
+        pub(crate) fn new(reply: impl Fn(&str) -> String + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Self {
+                reply: Mutex::new(Arc::new(reply)),
+                prompts: Mutex::new(Vec::new()),
+                max_tokens: 8192,
+                num_tokens: 100,
+            })
+        }
+
+        pub(crate) fn calls(&self) -> usize {
+            self.prompts.lock().len()
+        }
+    }
+
+    impl BaseLLM for ScriptedLlm {
+        fn project_id(&self) -> &str {
+            ""
+        }
+        fn get_num_tokens(&self, _text: &str) -> usize {
+            self.num_tokens
+        }
+        fn apply_chat_template(&self, messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+            messages
+        }
+        fn get_max_tokens(&self) -> usize {
+            self.max_tokens
+        }
+        fn call(&self, prompt: &str, _stop: Option<&[String]>, _o: CallOptions) -> anyhow::Result<String> {
+            Ok(self.invoke(prompt, None, None))
+        }
+        fn stream<'a>(&'a self, prompt: &str, _o: CallOptions) -> GenerationStream<'a> {
+            let text = self.invoke(prompt, None, None);
+            Box::new(std::iter::once(GenerationChunk { text }))
+        }
+        fn invoke(&self, prompt: &str, _max_tokens: Option<usize>, _thinking: Option<bool>) -> String {
+            self.prompts.lock().push(prompt.to_string());
+            let reply = self.reply.lock().clone();
+            reply(prompt)
+        }
+        fn cancelled(&self) -> Option<CancelEvent> {
+            None
+        }
+        fn set_cancelled(&self, _event: Option<CancelEvent>) {}
+        fn llm_type(&self) -> &str {
+            "scripted"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_llm::ScriptedLlm;
+    use super::*;
+
+    fn recorder() -> (ProgressCallback, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        (Arc::new(move |_s: &str, _st: &str, m: &str| sink.lock().push(m.to_string())), seen)
+    }
+
+    #[test]
+    fn capability_model_is_announced_once_per_request() {
+        let agent = ScriptedLlm::new(|_| "x".into());
+        let cap: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "y".into());
+        let cap_for_provider = cap.clone();
+        let router = ModelRouter::new(
+            agent.clone(),
+            agent,
+            ModelRouterOptions {
+                capability_llm_provider: Some(Arc::new(move |_c: &str| Ok(Some(cap_for_provider.clone())))),
+                ..Default::default()
+            },
+        );
+        let (cb, seen) = recorder();
+        router.begin_request(Some(cb));
+        for _ in 0..3 {
+            let got = router.llm_for_tier(ModelTier::Large, Some("dp"), None);
+            assert!(same_llm(&got, &cap));
+        }
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                "Loading model for document processing…".to_string(),
+                "Selected ScriptedLlm for document processing".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn decision_llm_on_the_agent_model_is_not_announced() {
+        let agent: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "x".into());
+        let same = agent.clone();
+        let router = ModelRouter::new(
+            agent.clone(),
+            agent.clone(),
+            ModelRouterOptions {
+                capability_llm_provider: Some(Arc::new(move |_c: &str| Ok(Some(same.clone())))),
+                ..Default::default()
+            },
+        );
+        let (cb, seen) = recorder();
+        router.begin_request(Some(cb));
+        let got = router.llm_for_tier(ModelTier::Small, Some("reasoning"), None);
+        assert!(same_llm(&got, &agent));
+        assert!(seen.lock().is_empty());
+    }
+
+    #[test]
+    fn large_provider_is_used_for_unresolved_capability() {
+        let agent: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "x".into());
+        let large: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "L".into());
+        let large_for_provider = large.clone();
+        let router = ModelRouter::new(
+            agent.clone(),
+            agent,
+            ModelRouterOptions {
+                large_llm_provider: Some(Arc::new(move || Ok(Some(large_for_provider.clone())))),
+                ..Default::default()
+            },
+        );
+        assert!(router.has_large_provider());
+        let got = router.llm_for_tier(ModelTier::Large, None, None);
+        assert!(same_llm(&got, &large));
+        assert!(router.large_llm.lock().is_some());
+    }
+
+    #[test]
+    fn a_panicking_progress_callback_is_swallowed() {
+        let agent = ScriptedLlm::new(|_| "x".into());
+        let router = ModelRouter::new(agent.clone(), agent, ModelRouterOptions::default());
+        router.begin_request(Some(Arc::new(|_: &str, _: &str, _: &str| panic!("boom"))));
+        router.emit("step", "processing", "message");
     }
 }

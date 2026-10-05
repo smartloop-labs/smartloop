@@ -36,4 +36,4 @@ pub mod step_executor;
 pub mod tool_fanout;
 
 pub use context::{MCPExecutionResult, OrchestratorContext, SharedOrchestratorContext};
-pub use step::{NodePair, Step, StepNodes};
+pub use step::{NodePair, SharedSearchContext, Step, StepNodes};

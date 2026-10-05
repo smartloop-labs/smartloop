@@ -126,6 +126,14 @@ pub trait BaseLLM: Send + Sync {
         None
     }
 
+    /// The implementing type's short name (Python `type(llm).__name__`),
+    /// used where a model has no better label to show.
+    fn class_name(&self) -> &'static str {
+        let full = std::any::type_name::<Self>();
+        let base = full.split('<').next().unwrap_or(full);
+        base.rsplit("::").next().unwrap_or(base)
+    }
+
     /// Downcasting hook.
     fn as_any(&self) -> &dyn Any;
 }
