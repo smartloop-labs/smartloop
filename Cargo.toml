@@ -54,9 +54,11 @@ image = "0.25.9"
 indexmap = { version = "2.14.2", features = ["serde"] }
 indicatif = "0.18.6"
 libc = "0.2.190"
-llama-cpp-2 = "0.1.158"
+llama-cpp-2 = { version = "0.1.158", features = ["mtmd"] }
 md-5 = "0.11.0"
 mime_guess = "2.0.5"
+minijinja = { version = "2.24", features = ["loop_controls", "json", "preserve_order"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 mupdf = "0.8.0"
 ndarray = "0.17.2"
 once_cell = "1.21.4"

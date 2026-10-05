@@ -11,10 +11,24 @@ use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-#[allow(unused_imports)]
 use crate::constants::SYSTEM_PROMPT;
+
+/// `<system>…</system>`, `<user>…</user>` and `<assistant>…</assistant>`
+/// (`re.DOTALL`, non-greedy).
+static ROLE_TAG_PATTERNS: Lazy<[(&'static str, Regex); 3]> = Lazy::new(|| {
+    [
+        ("system", Regex::new(r"(?s)<system>(.*?)</system>").expect("valid regex")),
+        ("user", Regex::new(r"(?s)<user>(.*?)</user>").expect("valid regex")),
+        ("assistant", Regex::new(r"(?s)<assistant>(.*?)</assistant>").expect("valid regex")),
+    ]
+});
+
+/// Logger name of the LLM wrappers.
+const LOG_TARGET: &str = "smartloop.llms";
 
 /// `threading.Event` used to cancel an in-flight generation between tokens.
 pub type CancelEvent = Arc<AtomicBool>;
@@ -68,17 +82,58 @@ pub trait BaseLLM: Send + Sync {
 
     /// Format the prompt for the LLM in a standardized way: a system message
     /// (`system_message` or [`SYSTEM_PROMPT`]) followed by the user prompt.
+    ///
+    /// Creates a standard message format that can be used across different
+    /// LLM implementations, similar to llama.cpp's approach.  An empty
+    /// `system_message` falls back to the default, as Python's `or` did.
     fn format_prompt(&self, prompt: &str, system_message: Option<&str>) -> Vec<ChatMessage> {
-        let _ = (prompt, system_message);
-        todo!()
+        let system = match system_message {
+            Some(s) if !s.is_empty() => s,
+            _ => SYSTEM_PROMPT,
+        };
+        // Default implementation returns messages - implementations can override.
+        vec![ChatMessage::new("system", system), ChatMessage::new("user", prompt)]
     }
 
     /// Convert a prompt string to messages using `<system>`/`<user>`/`<assistant>`
     /// tag-based separation, merging consecutive same-role messages; with no tags
     /// the raw prompt becomes `format_prompt("user_question: {prompt}")`.
     fn create_messages_from_prompt(&self, prompt: &str) -> Vec<ChatMessage> {
-        let _ = prompt;
-        todo!()
+        // Find all tags with their content and position, then sort by position.
+        let mut all_matches: Vec<(usize, &'static str, String)> = Vec::new();
+        for (role, pattern) in ROLE_TAG_PATTERNS.iter() {
+            for caps in pattern.captures_iter(prompt) {
+                let whole = caps.get(0).expect("group 0 always matches");
+                let content = caps.get(1).map(|m| m.as_str()).unwrap_or_default().trim().to_string();
+                all_matches.push((whole.start(), role, content));
+            }
+        }
+        all_matches.sort_by_key(|(pos, _, _)| *pos);
+
+        // Create messages from tags; only non-empty content is kept.
+        let messages: Vec<ChatMessage> = all_matches
+            .into_iter()
+            .filter(|(_, _, content)| !content.is_empty())
+            .map(|(_, role, content)| ChatMessage::new(role, content))
+            .collect();
+
+        // If no tags found, process the raw prompt as a user message.
+        if messages.is_empty() {
+            return self.format_prompt(&format!("user_question: {prompt}"), None);
+        }
+
+        // Merge consecutive messages with the same role so the model always
+        // sees alternating user/assistant turns.
+        let mut merged: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+        for msg in messages {
+            match merged.last_mut() {
+                Some(last) if last.role == msg.role => {
+                    last.content = format!("{}\n{}", last.content, msg.content);
+                }
+                _ => merged.push(msg),
+            }
+        }
+        merged
     }
 
     /// Apply the LLM-specific chat template to the standard message format.
@@ -96,9 +151,27 @@ pub trait BaseLLM: Send + Sync {
     /// Invoke the LLM once.  Never fails: an error is returned as
     /// `"Error generating response: ..."`, an empty reply as
     /// `"No response generated"`, and a trailing `<|eot_id|>` is trimmed.
+    ///
+    /// `max_tokens` caps generated tokens — use a small value for short
+    /// classification-style calls (e.g. skill matching) to avoid runaway
+    /// greedy generation when the model fails to emit a stop token.
+    /// `thinking` forces the reasoning block on (`true`) or off (`false`) for
+    /// this call, whatever the user's setting says; `None` leaves it alone.
     fn invoke(&self, prompt: &str, max_tokens: Option<usize>, thinking: Option<bool>) -> String {
-        let _ = (prompt, max_tokens, thinking);
-        todo!()
+        let options = CallOptions { max_tokens, thinking };
+        match self.call(prompt, None, options) {
+            Ok(response) => {
+                let mut cleaned = response.trim();
+                if let Some(stripped) = cleaned.strip_suffix("<|eot_id|>") {
+                    cleaned = stripped.trim();
+                }
+                if cleaned.is_empty() { "No response generated".to_string() } else { cleaned.to_string() }
+            }
+            Err(e) => {
+                tracing::error!(target: LOG_TARGET, "LLM invocation failed: {e}");
+                format!("Error generating response: {e}")
+            }
+        }
     }
 
     /// True when this model's chat template can reason.
