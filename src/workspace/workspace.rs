@@ -377,6 +377,16 @@ where
     Ok(canonical_model_name(&raw))
 }
 
+/// Deserialize `null` as the type's default — the `x or []` the Python
+/// `Workspace.__init__` applies to its list arguments.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Tool definition discovered from an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct MCPToolDefinition {
@@ -1144,11 +1154,12 @@ fn sync_models_into(models: &[WorkspaceModel], project: &mut Project) {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Workspace {
     pub id: String,
-    #[serde(default)]
+    /// `projects or []`: an explicit `null` loads as an empty list.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub projects: Vec<Project>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub models: Vec<WorkspaceModel>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub adapters: Vec<Value>,
     #[serde(default)]
     pub models_dir: String,

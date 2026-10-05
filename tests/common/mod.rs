@@ -158,5 +158,60 @@ pub mod workspace_support {
             smartloop::workspace::context::delegate_projects(false);
         }
     }
+
+    /// The `home` fixture shared by the project-state tests: `SLP_HOME`
+    /// pointed at a fresh temp dir (resolved the way it is live), the legacy
+    /// layout switch and any config-file override cleared, the workspace
+    /// singleton dropped, and the process pin / delegation reset — all undone
+    /// on drop.
+    pub struct TempHome {
+        pub dir: tempfile::TempDir,
+        _env: Vec<EnvGuard>,
+        _reset: ProcessScopeReset,
+    }
+
+    impl TempHome {
+        pub fn new() -> Self {
+            use smartloop::workspace::workspace::{Workspace, set_settings_home_dir};
+
+            let reset = ProcessScopeReset::new();
+            let dir = tempfile::tempdir().expect("temp home");
+            let env = vec![
+                EnvGuard::set("SLP_HOME", dir.path()),
+                EnvGuard::remove("SLP_LEGACY_CONFIG"),
+                EnvGuard::remove("SLP_CONFIG_FILE"),
+            ];
+            Workspace::set_config_file(None);
+            set_settings_home_dir(None);
+            Workspace::reset();
+            Self { dir, _env: env, _reset: reset }
+        }
+
+        /// The home directory.
+        pub fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+
+        /// `str(home / part)`.
+        pub fn join(&self, part: &str) -> String {
+            self.dir.path().join(part).to_string_lossy().into_owned()
+        }
+    }
+
+    impl Default for TempHome {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            use smartloop::workspace::workspace::{Workspace, set_settings_home_dir};
+
+            Workspace::set_config_file(None);
+            set_settings_home_dir(None);
+            Workspace::reset();
+        }
+    }
 }
 // ====================== END unit: workspace ======================

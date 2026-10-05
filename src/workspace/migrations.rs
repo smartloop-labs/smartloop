@@ -118,11 +118,24 @@ fn is_readable_dir(path: &str) -> bool {
     if !Path::new(path).is_dir() {
         return false;
     }
+    access_rx(path)
+}
+
+/// `os.access(path, os.R_OK | os.X_OK)`.
+#[cfg(unix)]
+fn access_rx(path: &str) -> bool {
     let Ok(c_path) = std::ffi::CString::new(path) else {
         return false;
     };
     // SAFETY: `c_path` is a valid NUL-terminated string for the call's duration.
     unsafe { libc::access(c_path.as_ptr(), libc::R_OK | libc::X_OK) == 0 }
+}
+
+/// `os.access(path, os.R_OK | os.X_OK)`: on Windows `os.access` only reports
+/// existence for directories, so an actual listing is the honest check.
+#[cfg(not(unix))]
+fn access_rx(path: &str) -> bool {
+    std::fs::read_dir(path).is_ok()
 }
 
 /// `shutil.copystat`: carry permissions and access/modification times over.
