@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::Method;
 use serde_json::Value;
 
-#[allow(unused_imports)]
 use crate::platform::auth as platform_auth;
 
 /// Python logger name for this module.
@@ -48,6 +48,9 @@ pub const SEARCH_STATUS_TIMEOUT: u64 = 5;
 /// timeout let one 401 turn that into 40s.
 pub const REFRESH_TIMEOUT: u64 = 10;
 
+/// Default timeout of [`SLPPlatformClient::push_token_usage`] (seconds).
+pub const PUSH_TOKEN_USAGE_TIMEOUT: u64 = 10;
+
 /// HTTP header map (same type `credential_store::auth_headers` returns).
 pub type Headers = BTreeMap<String, String>;
 /// A JSON object (Python `dict`).
@@ -59,14 +62,23 @@ pub type RefreshFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Identify this client to the API: `smartloop/<version> (<os>)`.
 ///
-/// The platform records each call in the account's access log; naming
-/// ourselves lets the owner tell their own agent apart from anything else
-/// using their token.  Deliberately not "smartloop-cli": these calls come from
-/// the local API server, background agents and the downloader as much as from
-/// the CLI.  The OS part matches Python's `platform.system().lower()`
-/// (`darwin`, `linux`, `windows`).
+/// The platform records each call in the account's access log, and the HTTP
+/// library's default agent would make every entry look like an anonymous
+/// script.  Naming ourselves lets the owner tell their own agent apart from
+/// anything else using their token.
+///
+/// Deliberately not "smartloop-cli": these calls come from the local API
+/// server, background agents and the downloader as much as from the CLI.
+/// What the log needs from this header is the product and version — *which*
+/// caller it was is already the path on the same log line.  The OS part
+/// matches Python's `platform.system().lower()` (`darwin`, `linux`,
+/// `windows`).
 pub fn user_agent() -> String {
-    todo!()
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    format!("smartloop/{} ({})", crate::VERSION, os)
 }
 
 /// The account's plan does not grant this model (HTTP 403).
@@ -170,21 +182,48 @@ pub fn is_transient(status_code: u16) -> bool {
     status_code == 429 || status_code >= 500
 }
 
+/// The standard reason phrase for *status* (httpx's `reason_phrase`), or `""`
+/// for a status without one.
+fn reason_phrase(status: u16) -> &'static str {
+    reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("")
+}
+
 /// Raise an *error_cls* error for a non-2xx response, tagged with the status.
 ///
-/// *error_cls* names what a refusal means for this endpoint, but a 429 or 5xx
-/// is always a `ConnectionError`.  Callers act on the distinction — the refresh
-/// agent clears both tokens on a `PermissionError`, and the cache-through
-/// service only serves stale data for a `ConnectionError`.  The message comes
-/// from *error_map* when it has the status, else
+/// The status is attached as `status_code` on the error so callers can
+/// classify the failure without re-deriving it from the message.  The API
+/// router turns it back into an HTTP status for its own client, and a message
+/// is a bad channel for that: it is written for a person to read, and it gets
+/// reworded.
+///
+/// *error_cls* names what a refusal means for this endpoint, but it does not
+/// get to claim a transient failure as one: a 429 or 5xx is always a
+/// `ConnectionError`.  Callers act on the distinction — the refresh agent
+/// clears both tokens on a `PermissionError`, and the cache-through service
+/// only serves stale data for a `ConnectionError` — so letting a platform blip
+/// arrive as "your credentials are bad" logs the user out over an outage.  The
+/// message comes from *error_map* when it has the status, else
 /// `"API error ({status}): {reason_phrase}"`.
 pub fn raise_for_status(
     status: u16,
     error_map: &[(u16, String)],
     error_cls: ErrorClass,
 ) -> PlatformResult<()> {
-    let _ = (status, error_map, error_cls);
-    todo!()
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    let error_cls = if is_transient(status) { ErrorClass::Connection } else { error_cls };
+    let message = match error_map.iter().find(|(code, _)| *code == status) {
+        Some((_, message)) => message.clone(),
+        None => format!("API error ({}): {}", status, reason_phrase(status)),
+    };
+    Err(match error_cls {
+        ErrorClass::Connection => PlatformError::Connection { message, status_code: Some(status) },
+        ErrorClass::Permission => PlatformError::Permission { message, status_code: Some(status) },
+    })
 }
 
 /// The platform operations the rest of the app (and tests) depend on.
@@ -246,14 +285,81 @@ fn unsupported(op: &str) -> PlatformError {
     PlatformError::Other(format!("{op} is not supported by this platform client"))
 }
 
+/// A response whose body has been read in full.
+///
+/// httpx reads the body inside `httpx.get(...)`, so a failure while reading it
+/// is a transport error like any other; reading it here keeps it inside the
+/// same `ConnectionError` mapping.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    /// The HTTP status code.
+    pub status: u16,
+    /// The raw response body.
+    pub body: bytes::Bytes,
+}
+
+impl HttpResponse {
+    /// Decode the body as JSON (`resp.json()`).  A body that is not JSON is a
+    /// `ValueError` in Python (`json.JSONDecodeError`), and so is it here.
+    pub fn json(&self) -> PlatformResult<Value> {
+        serde_json::from_slice(&self.body)
+            .map_err(|e| PlatformError::Value(format!("Invalid JSON in response: {e}")))
+    }
+}
+
+/// Python truthiness of a JSON value (`bool(value)`).
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// `ConnectionError(f"Connection error: {e}")` for a transport failure.
+fn connection_error(e: &reqwest::Error) -> PlatformError {
+    PlatformError::connection(format!("Connection error: {e}"))
+}
+
+/// A JSON array of objects (a `list[dict]` response).
+fn object_list(value: Value) -> PlatformResult<Vec<JsonObject>> {
+    match value {
+        Value::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::Object(map) => Ok(map),
+                other => Err(PlatformError::Value(format!(
+                    "Expected a JSON object in the response list, got {other}"
+                ))),
+            })
+            .collect(),
+        other => Err(PlatformError::Value(format!("Expected a JSON list response, got {other}"))),
+    }
+}
+
+/// A JSON object (a `dict` response).
+fn object(value: Value) -> PlatformResult<JsonObject> {
+    match value {
+        Value::Object(map) => Ok(map),
+        other => Err(PlatformError::Value(format!("Expected a JSON object response, got {other}"))),
+    }
+}
+
 /// Thin HTTP client for Smartloop platform API calls.
 ///
 /// * `base_url` — API base URL, e.g. `https://api.smartloop.ai` (trailing `/`
 ///   stripped).
 /// * `auth_headers_fn` — returns auth headers; defaults to
 ///   [`platform_auth::auth_headers`].
-/// * `refresh_fn` — redeems the refresh token once per 401 in [`Self::authed`];
-///   defaults to [`Self::refresh_credentials`].  May legitimately decline.
+/// * `refresh_fn` — redeems the refresh token, returning whether a new access
+///   token was stored.  Called once per 401 by [`Self::authed`]; defaults to
+///   [`Self::refresh_credentials`].  May legitimately decline and do nothing —
+///   a per-project agent child does, because redeeming a single-use token
+///   belongs to the process that owns the credential store.  [`Self::authed`]
+///   handles that without needing to know.
 #[derive(Clone)]
 pub struct SLPPlatformClient {
     base_url: String,
@@ -270,8 +376,7 @@ impl std::fmt::Debug for SLPPlatformClient {
 impl SLPPlatformClient {
     /// Client with the default auth headers and refresh hook.
     pub fn new(base_url: &str) -> Self {
-        let _ = base_url;
-        todo!()
+        Self::with_hooks(base_url, None, None)
     }
 
     /// Client with explicit hooks (`None` selects the default for each).
@@ -280,8 +385,11 @@ impl SLPPlatformClient {
         auth_headers_fn: Option<AuthHeadersFn>,
         refresh_fn: Option<RefreshFn>,
     ) -> Self {
-        let _ = (base_url, auth_headers_fn, refresh_fn);
-        todo!()
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            auth_headers_fn: auth_headers_fn.unwrap_or_else(|| Arc::new(platform_auth::auth_headers)),
+            refresh_fn,
+        }
     }
 
     /// The normalized base URL.
@@ -289,123 +397,465 @@ impl SLPPlatformClient {
         &self.base_url
     }
 
-    /// Redeem the stored refresh token for a new access token, against *this*
-    /// client (via `token_agent::refresh_access_token_now`).
+    /// Redeem the stored refresh token for a new access token.
+    ///
+    /// Redeems against *this* client, so the refresh goes to the host that
+    /// just answered 401 rather than to whatever `AppSettings` names — the two
+    /// are the same in production, and only one of them is true in a test.
+    ///
+    /// No recursion: [`Self::refresh_access_token`] is unauthenticated and
+    /// does not route through [`Self::authed`].
     pub fn refresh_credentials(&self) -> bool {
-        todo!()
+        crate::platform::token_agent::refresh_access_token_now(Some(self))
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
 
-    /// Request headers: always `User-Agent`, with *auth* merged in.
+    /// Request headers.  Every request identifies itself; *auth* is merged in.
+    ///
+    /// The endpoints that take no auth pass nothing rather than flipping a
+    /// flag — they are a minority, and which of them is unauthenticated is
+    /// worth seeing at the call site.
     pub fn headers(&self, auth: Option<&Headers>) -> Headers {
-        let _ = auth;
-        todo!()
+        let mut headers = Headers::new();
+        headers.insert("User-Agent".to_string(), user_agent());
+        if let Some(auth) = auth {
+            for (k, v) in auth {
+                headers.insert(k.clone(), v.clone());
+            }
+        }
+        headers
+    }
+
+    /// Run the refresh hook (the explicit one, or [`Self::refresh_credentials`]).
+    fn run_refresh(&self) -> bool {
+        match &self.refresh_fn {
+            Some(refresh) => refresh(),
+            None => self.refresh_credentials(),
+        }
     }
 
     /// Send an authenticated request, redeeming the refresh token once on a 401.
     ///
-    /// *send* is called with the headers to use.  After a 401 the refresh hook
-    /// runs, auth headers are re-read, and the request is retried only if the
-    /// credentials actually changed; otherwise the original 401 is returned.
-    pub fn authed<F>(&self, send: F) -> reqwest::Result<reqwest::blocking::Response>
+    /// An access token expiring mid-session is the ordinary case, not an
+    /// error: the user has a refresh token on disk and nothing about their
+    /// session has actually ended.
+    ///
+    /// Keyed on the status, not the error, so it stays clear of the
+    /// permission-error hierarchy: a 403 is a verdict about this account's
+    /// plan ([`ModelAccessError`]), and re-minting the same identity cannot
+    /// change it.  Only a 401 says the token itself is stale.
+    ///
+    /// *send* is called with the headers to use rather than being handed a
+    /// prepared request, so the retry re-reads `auth_headers_fn` and picks up
+    /// whatever the refresh left behind.
+    ///
+    /// The retry is keyed on the credentials having actually *changed*, not on
+    /// what the refresh reported.  The refresh can fail and still leave us
+    /// better off (redeeming a dead refresh token clears both OAuth
+    /// credentials, after which `auth_headers` falls back to a working
+    /// developer token), and it can report success without changing what we
+    /// send (in which case resending is a guaranteed second 401).  Comparing
+    /// credentials also means the hook may decline entirely — as it does in a
+    /// per-project agent child — and that a process that never refreshes still
+    /// recovers a token another process rotated during the round trip.
+    pub fn authed<F, R>(&self, send: F) -> Result<R, reqwest::Error>
     where
-        F: Fn(&Headers) -> reqwest::Result<reqwest::blocking::Response>,
+        F: Fn(&Headers) -> Result<R, reqwest::Error>,
+        R: AuthedResponse,
     {
-        let _ = send;
-        todo!()
+        let sent = (self.auth_headers_fn)();
+        let resp = send(&self.headers(Some(&sent)))?;
+        if resp.status_code() != 401 {
+            return Ok(resp);
+        }
+
+        self.run_refresh();
+        let current = (self.auth_headers_fn)();
+        if current == sent {
+            return Ok(resp);
+        }
+        send(&self.headers(Some(&current)))
     }
 
-    fn http(&self, timeout: u64) -> reqwest::blocking::Client {
-        let _ = (timeout, Duration::from_secs(0), self.url(""));
-        todo!()
+    /// A blocking HTTP client with *timeout* seconds of budget.
+    fn http(&self, timeout: u64) -> reqwest::Result<reqwest::blocking::Client> {
+        let budget = Duration::from_secs(timeout);
+        reqwest::blocking::Client::builder()
+            .timeout(budget)
+            .connect_timeout(budget)
+            .build()
+    }
+
+    /// Send one request and read its body.
+    fn send(
+        &self,
+        method: Method,
+        path: &str,
+        headers: &Headers,
+        params: &[(&str, String)],
+        json: Option<&Value>,
+        timeout: u64,
+    ) -> reqwest::Result<HttpResponse> {
+        let url = if params.is_empty() {
+            self.url(path)
+        } else {
+            match url::Url::parse_with_params(&self.url(path), params) {
+                Ok(url) => url.to_string(),
+                // An unparsable base URL: let reqwest report it as a builder
+                // error on the raw string.
+                Err(_) => self.url(path),
+            }
+        };
+        let mut request = self.http(timeout)?.request(method, url);
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        if let Some(body) = json {
+            request = request.json(body);
+        }
+        let response = request.send()?;
+        let status = response.status().as_u16();
+        let body = response.bytes()?;
+        Ok(HttpResponse { status, body })
     }
 
     /// GET /v1/bootstrap/models (no auth). Returns the array of model entries.
     pub fn list_bootstrap_models(&self) -> PlatformResult<Vec<JsonObject>> {
-        let _ = self.http(TIMEOUT);
-        todo!()
+        let resp = self
+            .send(Method::GET, BOOTSTRAP_MODELS, &self.headers(None), &[], None, TIMEOUT)
+            .map_err(|e| connection_error(&e))?;
+
+        raise_for_status(
+            resp.status,
+            &[(404, "Bootstrap endpoint not found on server.".to_string())],
+            ErrorClass::Connection,
+        )?;
+
+        let data = resp.json()?;
+        if !truthy(&data) {
+            return Err(PlatformError::Value("Bootstrap API returned no models".to_string()));
+        }
+        object_list(data)
     }
 
-    /// GET /v1/models (auth optional). Falls back to an anonymous request when
-    /// the credentials are still refused after the refresh attempt.
+    /// GET /v1/models (auth optional). Returns list of model entries.
     pub fn list_models(&self) -> PlatformResult<Vec<JsonObject>> {
-        todo!()
+        let mut resp = self
+            .authed(|h| self.send(Method::GET, MODELS, h, &[], None, TIMEOUT))
+            .map_err(|e| connection_error(&e))?;
+
+        if resp.status == 401 {
+            // Still refused after `authed` tried the refresh token, so the
+            // credentials are genuinely dead.  The catalog is public, so ask
+            // again anonymously rather than showing an empty picker — the
+            // entries come back with `is_accessible` false, which is honest.
+            resp = self
+                .send(Method::GET, MODELS, &self.headers(None), &[], None, TIMEOUT)
+                .map_err(|e| connection_error(&e))?;
+        }
+
+        raise_for_status(resp.status, &[], ErrorClass::Connection)?;
+        object_list(resp.json()?)
     }
 
     /// GET /v1/releases/latest?channel=... (no auth). Returns the
     /// `LatestReleaseResponse` wrapper `{update_available, update_required, release}`.
+    ///
+    /// We poll WITHOUT `current_version` so the cached payload is
+    /// client-agnostic; `update_available`/`update_required` are computed
+    /// locally per request.  Callers use the `release` field (which may be
+    /// `null` when no published release exists for the channel).
     pub fn get_latest_release(&self, channel: &str) -> PlatformResult<Option<JsonObject>> {
-        let _ = channel;
-        todo!()
+        let params = [("channel", channel.to_string())];
+        let resp = self
+            .send(Method::GET, RELEASES_LATEST, &self.headers(None), &params, None, TIMEOUT)
+            .map_err(|e| connection_error(&e))?;
+
+        raise_for_status(resp.status, &[], ErrorClass::Connection)?;
+        match resp.json()? {
+            Value::Null => Ok(None),
+            other => object(other).map(Some),
+        }
     }
 
     /// GET /v1/mcp-catalog (auth required). Curated MCP server catalog entries.
     pub fn list_mcp_catalog(&self) -> PlatformResult<Vec<JsonObject>> {
-        todo!()
+        let resp = self
+            .authed(|h| self.send(Method::GET, MCP_CATALOG, h, &[], None, TIMEOUT))
+            .map_err(|e| {
+                // Only a failure to connect is a `ConnectionError` here (Python
+                // catches `httpx.ConnectError` alone); any other transport
+                // failure surfaces as itself.
+                if e.is_connect() {
+                    connection_error(&e)
+                } else {
+                    PlatformError::Other(e.to_string())
+                }
+            })?;
+
+        raise_for_status(
+            resp.status,
+            &[(401, "Authentication failed. Check your SLP_DEVELOPER_TOKEN.".to_string())],
+            ErrorClass::Permission,
+        )?;
+        object_list(resp.json()?)
     }
 
     /// GET /v1/models/{model_name}/download (auth optional).
     ///
-    /// Returns the `{filename: signed_url}` map in server order.  403 →
-    /// [`ModelAccessError`]; 401/404 → `PermissionError`; 429/5xx →
-    /// `ConnectionError`; empty artifacts → `ValueError`.
+    /// Returns the `{filename: signed_url}` map in server order.
+    ///
+    /// Auth headers are sent when we have them, but their absence is not an
+    /// error: the platform serves free models to anonymous callers and
+    /// answers 403 for anything the caller's plan doesn't grant.  That 403 is
+    /// raised as [`ModelAccessError`] so callers can tell "not on your plan"
+    /// apart from the 401 that means the token itself is bad.
+    ///
+    /// Failures are split by whether retrying could change the answer.
+    /// `ConnectionError` covers the transient ones (429, 5xx): the download
+    /// route is rate-limited per IP and anonymous downloads now reach that
+    /// limit, so a 429 means "wait a moment", not "upgrade your plan".
+    /// `PermissionError` covers the verdicts about this caller and this model
+    /// (401/403/404), which no amount of retrying fixes.  Every one of them
+    /// carries `status_code`.  Empty artifacts → `ValueError`.
     pub fn get_model_artifacts(&self, model_name: &str) -> PlatformResult<Vec<(String, String)>> {
-        let _ = model_name;
-        todo!()
+        let path = MODEL_DOWNLOAD.replacen("{}", model_name, 1);
+        let resp = self
+            .authed(|h| self.send(Method::GET, &path, h, &[], None, TIMEOUT))
+            .map_err(|e| connection_error(&e))?;
+
+        if resp.status == 403 {
+            return Err(ModelAccessError::new(format!(
+                "Model '{model_name}' is not available on your current plan. \
+                 Please upgrade to access this model."
+            ))
+            .into());
+        }
+
+        raise_for_status(
+            resp.status,
+            &[
+                // Reaches an end user in the app, so it says what they can do
+                // about it rather than naming an env var they have never set.
+                (401, "Sign in to download this model.".to_string()),
+                (404, format!("Model '{model_name}' not found on server.")),
+                (429, "Too many download requests. Please wait a moment and try again.".to_string()),
+                (500, format!("Server error while fetching model '{model_name}' artifacts.")),
+            ],
+            ErrorClass::Permission,
+        )?;
+
+        let data = object(resp.json()?)?;
+        let artifacts = data.get("artifacts").cloned().unwrap_or(Value::Object(JsonObject::new()));
+        if !truthy(&artifacts) {
+            return Err(PlatformError::Value(format!(
+                "API returned no artifacts for model '{model_name}'"
+            )));
+        }
+        match artifacts {
+            Value::Object(map) => Ok(map
+                .into_iter()
+                .map(|(name, url)| {
+                    let url = match url {
+                        Value::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (name, url)
+                })
+                .collect()),
+            other => Err(PlatformError::Value(format!(
+                "API returned malformed artifacts for model '{model_name}': {other}"
+            ))),
+        }
     }
 
     /// GET /v1/users/me (auth required). Returns user profile dict.
     pub fn get_current_user(&self) -> PlatformResult<JsonObject> {
-        todo!()
+        let resp = self
+            .authed(|h| self.send(Method::GET, USERS_ME, h, &[], None, TIMEOUT))
+            .map_err(|e| connection_error(&e))?;
+
+        raise_for_status(
+            resp.status,
+            &[(401, "Authentication failed. Token may be expired or invalid.".to_string())],
+            ErrorClass::Permission,
+        )?;
+        object(resp.json()?)
     }
 
     /// PATCH /v1/users/me (auth required). Returns updated user profile dict.
     pub fn update_current_user(&self, payload: &JsonObject) -> PlatformResult<JsonObject> {
-        let _ = payload;
-        todo!()
+        let body = Value::Object(payload.clone());
+        let resp = self
+            .authed(|h| self.send(Method::PATCH, USERS_ME, h, &[], Some(&body), TIMEOUT))
+            .map_err(|e| connection_error(&e))?;
+
+        raise_for_status(
+            resp.status,
+            &[(401, "Authentication failed. Token may be expired or invalid.".to_string())],
+            ErrorClass::Permission,
+        )?;
+        object(resp.json()?)
     }
 
     /// DELETE /v1/users/me (auth required). Permanently deletes the account.
     pub fn delete_current_user(&self) -> PlatformResult<()> {
-        todo!()
+        let auth = (self.auth_headers_fn)();
+        let resp = self
+            .send(Method::DELETE, USERS_ME, &self.headers(Some(&auth)), &[], None, TIMEOUT)
+            .map_err(|e| connection_error(&e))?;
+
+        raise_for_status(
+            resp.status,
+            &[(401, "Authentication failed. Token may be expired or invalid.".to_string())],
+            ErrorClass::Permission,
+        )
     }
 
-    /// POST /v1/auth/jwt/refresh (no auth). Returns `access_token` and
-    /// optionally `refresh_token`; missing `access_token` → `ValueError`.
+    /// POST /v1/auth/jwt/refresh with a refresh token (no auth).
+    ///
+    /// Returns `access_token` and optionally `refresh_token`; a reply without
+    /// `access_token` → `ValueError`.
     pub fn refresh_access_token(&self, refresh_token: &str) -> PlatformResult<JsonObject> {
-        let _ = refresh_token;
-        todo!()
+        let body = serde_json::json!({ "refresh_token": refresh_token });
+        let resp = self
+            .send(Method::POST, JWT_REFRESH, &self.headers(None), &[], Some(&body), REFRESH_TIMEOUT)
+            .map_err(|e| connection_error(&e))?;
+
+        raise_for_status(
+            resp.status,
+            &[(401, "Authentication failed. Refresh token may be expired or revoked.".to_string())],
+            ErrorClass::Permission,
+        )?;
+
+        let data = object(resp.json()?)?;
+        if !data.get("access_token").map(truthy).unwrap_or(false) {
+            return Err(PlatformError::Value("Refresh response missing access_token".to_string()));
+        }
+        Ok(data)
     }
 
     /// POST /v1/models/{name}/upload (auth required). Returns `{url, blob_path, expires_at}`.
     pub fn get_model_upload_url(&self, model_name: &str, filename: &str) -> PlatformResult<JsonObject> {
-        let _ = (model_name, filename);
-        todo!()
+        let path = MODEL_UPLOAD.replacen("{}", model_name, 1);
+        let body = serde_json::json!({ "filename": filename });
+        let resp = self
+            .authed(|h| self.send(Method::POST, &path, h, &[], Some(&body), TIMEOUT))
+            .map_err(|e| connection_error(&e))?;
+
+        raise_for_status(
+            resp.status,
+            &[
+                (401, "Authentication failed. Check your SLP_DEVELOPER_TOKEN.".to_string()),
+                (404, "Model upload endpoint not found on server.".to_string()),
+            ],
+            ErrorClass::Permission,
+        )?;
+        object(resp.json()?)
     }
 
     /// POST /v1/usage/tokens (auth required). Fire-and-forget telemetry;
-    /// failures are logged, never raised.  Deliberately not through
-    /// [`Self::authed`] so a telemetry 401 can never log the user out.
+    /// failures are logged, never raised.
     pub fn push_token_usage(&self, record: &JsonObject, timeout: u64) {
-        let _ = (record, timeout);
-        todo!()
+        // Deliberately not through `authed`.  A 401 here would redeem the
+        // refresh token, and a refresh endpoint answering 401 clears both
+        // credentials — so a fire-and-forget telemetry POST, whose every
+        // failure is swallowed below, could log the user out with no visible
+        // cause.  Usage records are flushed in batches, so it would do it once
+        // per queued record.
+        let auth = (self.auth_headers_fn)();
+        let body = Value::Object(record.clone());
+        let result = self
+            .send(Method::POST, USAGE_TOKENS, &self.headers(Some(&auth)), &[], Some(&body), timeout)
+            .map_err(|e| connection_error(&e))
+            .and_then(|resp| raise_for_status(resp.status, &[], ErrorClass::Connection));
+        if let Err(e) = result {
+            tracing::error!(target: "smartloop.platform.client", "Failed to push token usage: {}", e);
+        }
     }
 
-    /// GET /v1/websearch?q=..&count=.. (auth required). Returns result URLs.
-    /// 401/403/429 → `PermissionError`; other failures → `ConnectionError`.
+    /// GET /v1/websearch?q=..&count=.. (auth required). Returns the result URLs.
+    ///
+    /// The endpoint resolves the account's registered search provider
+    /// server-side, so this side never sees a provider name or an API key.
+    /// A 401/403 means search is unavailable for the account, and a 429 means
+    /// its monthly allowance is spent; both raise `PermissionError`, because
+    /// both mean "stop searching" rather than "try again".  Every other
+    /// failure is a `ConnectionError`, which callers must be free to treat as
+    /// transient.
     pub fn web_search(&self, query: &str, count: u32, timeout: u64) -> PlatformResult<Vec<String>> {
-        let _ = (query, count, timeout);
-        todo!()
+        let params = [("q", query.to_string()), ("count", count.to_string())];
+        let resp = self
+            .authed(|h| self.send(Method::GET, WEBSEARCH, h, &params, None, timeout))
+            .map_err(|e| connection_error(&e))?;
+
+        if matches!(resp.status, 401 | 403 | 429) {
+            return Err(PlatformError::permission(format!(
+                "Web search endpoint rejected the token (HTTP {})",
+                resp.status
+            )));
+        }
+        raise_for_status(resp.status, &[], ErrorClass::Connection)?;
+
+        match resp.json()? {
+            Value::Array(items) => Ok(items
+                .into_iter()
+                .filter_map(|item| match item {
+                    Value::String(s) if !s.trim().is_empty() => Some(s),
+                    _ => None,
+                })
+                .collect()),
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// GET /v1/websearch/status (auth required). Whether search would serve.
-    /// 401/403 → `PermissionError`; anything else → `ConnectionError`.
+    ///
+    /// Answers for the whole account: signed in, and with searches left in the
+    /// month's allowance.  Raises `PermissionError` on 401/403 and
+    /// `ConnectionError` on anything else, keeping "search is off"
+    /// distinguishable from "the check did not complete" — see
+    /// `search::providers::hosted_search_available`, which fails open on the
+    /// latter.
     pub fn web_search_status(&self, timeout: u64) -> PlatformResult<bool> {
-        let _ = timeout;
-        todo!()
+        let resp = self
+            .authed(|h| self.send(Method::GET, WEBSEARCH_STATUS, h, &[], None, timeout))
+            .map_err(|e| connection_error(&e))?;
+
+        if matches!(resp.status, 401 | 403) {
+            return Err(PlatformError::permission(format!(
+                "Web search status rejected the token (HTTP {})",
+                resp.status
+            )));
+        }
+        raise_for_status(resp.status, &[], ErrorClass::Connection)?;
+        match resp.json()? {
+            Value::Object(map) => Ok(map.get("enabled").map(truthy).unwrap_or(false)),
+            other => Err(PlatformError::Other(format!(
+                "Unexpected web search status response: {other}"
+            ))),
+        }
+    }
+}
+
+/// A response [`SLPPlatformClient::authed`] can inspect for a 401.
+pub trait AuthedResponse {
+    /// The HTTP status code.
+    fn status_code(&self) -> u16;
+}
+
+impl AuthedResponse for HttpResponse {
+    fn status_code(&self) -> u16 {
+        self.status
+    }
+}
+
+impl AuthedResponse for reqwest::blocking::Response {
+    fn status_code(&self) -> u16 {
+        self.status().as_u16()
     }
 }
 
