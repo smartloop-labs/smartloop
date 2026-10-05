@@ -184,12 +184,16 @@ pub type RemoveHook = Arc<dyn Fn(&str, bool) -> (bool, Option<String>) + Send + 
 pub type IsDownloadingHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// Replacement for the directory removal (tests patch `shutil.rmtree`).
 pub type RmtreeHook = Arc<dyn Fn(&str) -> std::io::Result<()> + Send + Sync>;
+/// Replacement for [`discard_partial_download`] (tests patch
+/// `storage_service.discard_partial_download`); receives the model id.
+pub type DiscardHook = Arc<dyn Fn(&str) -> Result<Row, StorageError> + Send + Sync>;
 
 /// Module-level settings (Python `_settings`); tests override it.
 static SETTINGS: Lazy<RwLock<Option<AppSettings>>> = Lazy::new(|| RwLock::new(None));
 static REMOVE_HOOK: Lazy<RwLock<Option<RemoveHook>>> = Lazy::new(|| RwLock::new(None));
 static IS_DOWNLOADING_HOOK: Lazy<RwLock<Option<IsDownloadingHook>>> = Lazy::new(|| RwLock::new(None));
 static RMTREE_HOOK: Lazy<RwLock<Option<RmtreeHook>>> = Lazy::new(|| RwLock::new(None));
+static DISCARD_HOOK: Lazy<RwLock<Option<DiscardHook>>> = Lazy::new(|| RwLock::new(None));
 
 /// Override the module settings (tests patch `storage_service._settings`).
 /// `None` restores `AppSettings::new()`.
@@ -210,6 +214,12 @@ pub fn set_is_downloading_hook(hook: Option<IsDownloadingHook>) {
 /// Override recursive directory removal; `None` restores `remove_dir_all`.
 pub fn set_rmtree_hook(hook: Option<RmtreeHook>) {
     *RMTREE_HOOK.write() = hook;
+}
+
+/// Override [`discard_partial_download`] as a whole; `None` restores the real
+/// one.
+pub fn set_discard_hook(hook: Option<DiscardHook>) {
+    *DISCARD_HOOK.write() = hook;
 }
 
 
@@ -1506,6 +1516,11 @@ pub fn discard_partial_download(
     model_service: Option<&dyn StorageModelService>,
     model_id: &str,
 ) -> Result<Row, StorageError> {
+    let hook = DISCARD_HOOK.read().clone();
+    if let Some(hook) = hook {
+        return hook(model_id);
+    }
+
     let shared = load_workspace(model_service)?;
     let models_dir = shared.read().models_dir.clone();
     if models_dir.is_empty() {

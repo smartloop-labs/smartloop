@@ -463,12 +463,25 @@ mod test_the_init_stream_answers_a_cancel {
     /// already collects; the cancel itself still succeeded.
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    #[ignore = "needs a seam to make storage_service::discard_partial_download fail (the Python test \
-                patches it with side_effect=OSError); the api units own it"]
     async fn test_a_failed_discard_does_not_become_an_error_frame() {
+        use smartloop::api::services::storage_service::{self, StorageError};
+
+        /// Restores the real `discard_partial_download` even if the test fails.
+        struct DiscardPatch;
+        impl Drop for DiscardPatch {
+            fn drop(&mut self) {
+                storage_service::set_discard_hook(None);
+            }
+        }
+
         let fx = Fixture::new(true);
         fx.cancelled_download();
 
+        // `patch(_DISCARD, side_effect=OSError("busy"))`
+        let _patch = DiscardPatch;
+        storage_service::set_discard_hook(Some(Arc::new(|_model_id: &str| {
+            Err(StorageError::Other("busy".to_string()))
+        })));
         let (_status, text) = fx.init().await;
 
         let events = event_names(&text);
