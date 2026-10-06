@@ -317,6 +317,12 @@ fn main() -> anyhow::Result<()> {
     // run before anything else, while the process is still single-threaded.
     smartloop::utils::runtime_env::apply_runtime_env();
     smartloop::init_process_env();
+    // main.py: `logging.getLogger("httpx"/"httpcore").setLevel(WARNING)`.  The
+    // Rust HTTP/gRPC stack logs through these crates instead; at DEBUG they
+    // would bury the orchestration trace under connection-pool chatter.
+    for name in ["reqwest", "hyper", "hyper_util", "h2", "rustls", "tonic", "tower", "want", "mio"] {
+        smartloop::utils::logging_setup::get_logger(name).set_level("WARNING");
+    }
 
     let argv: Vec<String> = std::env::args().collect();
 

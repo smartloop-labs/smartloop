@@ -483,3 +483,14 @@ fn test_shutdown_clears_the_listener_reference() {
         assert!(current_listener().is_none());
     });
 }
+
+/// `make run`/`run-debug` build with `--release`; only the binary the release
+/// pipeline ships (`SLP_PACKAGED_BUILD=1`) counts as frozen, so a run from
+/// the checkout keeps its console trace whatever the cargo profile.
+#[test]
+fn test_a_checkout_build_is_not_frozen() {
+    if option_env!("SLP_PACKAGED_BUILD").is_some_and(|v| !v.is_empty() && v != "0") {
+        return;
+    }
+    assert!(!smartloop::utils::logging_setup::is_packaged_build());
+}

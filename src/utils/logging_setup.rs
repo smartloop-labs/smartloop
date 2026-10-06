@@ -1081,6 +1081,14 @@ impl ListenerOptions {
     }
 }
 
+/// True for the binary the release pipeline ships (`make build-binary` sets
+/// `SLP_PACKAGED_BUILD=1` at compile time) — Python's `sys.frozen`.  Not tied
+/// to the cargo profile: `make run`/`run-debug` build with `--release` too,
+/// and must still log to the terminal like a from-source Python run.
+pub fn is_packaged_build() -> bool {
+    matches!(option_env!("SLP_PACKAGED_BUILD"), Some(v) if !v.is_empty() && v != "0")
+}
+
 /// Start the listener that owns the real handlers.
 ///
 /// Writes to a rotating file handler at `<home_dir>/server.log`, or at
@@ -1091,9 +1099,10 @@ impl ListenerOptions {
 /// hard part.  Separate files make that question disappear.
 ///
 /// Adds a stdout handler when running interactively (TTY and not a frozen
-/// build), unless `force_console` overrides the auto-detection.  A release
-/// binary is the counterpart of the Python app's frozen (PyInstaller) build;
-/// a debug build is the counterpart of running from source.
+/// build), unless `force_console` overrides the auto-detection.  "Frozen" is
+/// the shipped binary ([`is_packaged_build`]), the counterpart of the Python
+/// app's PyInstaller build; anything run from the checkout — `make run-debug`
+/// included, which builds with `--release` — is "running from source".
 pub fn start_listener(queue: &LogQueue, opts: ListenerOptions) -> std::io::Result<Arc<QueueListener>> {
     let log_path = match &opts.log_path {
         Some(p) if !p.is_empty() => PathBuf::from(p),
@@ -1113,7 +1122,7 @@ pub fn start_listener(queue: &LogQueue, opts: ListenerOptions) -> std::io::Resul
 
     let mut handlers: Vec<Arc<dyn Handler>> = vec![Arc::new(file_handler)];
 
-    let frozen = !cfg!(debug_assertions);
+    let frozen = is_packaged_build();
     let console = match opts.force_console {
         None => std::io::stdout().is_terminal() && !frozen,
         Some(force) => force,

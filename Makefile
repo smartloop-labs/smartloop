@@ -262,7 +262,7 @@ test-cov:
 
 build-binary:
 	@echo "Building slp v$(SLP_VERSION) with cargo (features: $(or $(CARGO_FEATURES),none))..."
-	$(CARGO_BUILD) --locked
+	SLP_PACKAGED_BUILD=1 $(CARGO_BUILD) --locked
 	@rm -rf $(DIST_DIR)
 	@mkdir -p $(DIST_DIR)
 	cp $(RELEASE_BIN) $(DIST_BIN)
