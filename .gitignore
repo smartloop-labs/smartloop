@@ -174,3 +174,6 @@ dist-wheels/
 wheelhouse/
 .model-cache/
 slp
+
+# Rust
+/target

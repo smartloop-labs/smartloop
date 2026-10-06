@@ -356,8 +356,9 @@ install_smartloop() {
         echo "$VERSION" >> "$installed_file"
     fi
 
-    # The PyInstaller distribution is self-contained: the `slp` executable sits
-    # at the top of the install dir next to its _internal/ payload.
+    # The distribution is self-contained: the single `slp` executable sits at
+    # the top of the install dir, next to its bundled runtime libraries (lib/)
+    # and embedding model (embeddings/).
     local slp_bin="${INSTALL_DIR}/slp"
     [ "$OS" = "windows" ] && slp_bin="${INSTALL_DIR}/slp.exe"
 
@@ -395,7 +396,7 @@ install_smartloop() {
         port="$(cat "$port_file")"
     fi
 
-    # First start loads heavy deps (torch/CUDA), so allow plenty of time.
+    # First start initialises the GPU backend and workspace, so allow plenty of time.
     local max_attempts=90
     local attempts=0
     while [ $attempts -lt $max_attempts ]; do

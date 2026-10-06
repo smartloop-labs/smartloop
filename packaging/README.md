@@ -1,8 +1,8 @@
 # Packaging: keeping `~/.smartloop` the home in every build
 
 The framework home is `~/.smartloop` everywhere — App Store, Snap Store,
-Developer ID, `pip install` — so the desktop app and the `slp` CLI operate on
-one workspace instead of two. `smartloop/paths.py` resolves it: both store
+Developer ID, `cargo install` — so the desktop app and the `slp` CLI operate on
+one workspace instead of two. `src/paths.rs` resolves it: both store
 sandboxes rewrite `$HOME` to a private directory, so the home is read from the
 passwd record (which they do not rewrite) or from `SNAP_REAL_HOME`, never from
 `$HOME`.
@@ -12,7 +12,7 @@ grant, below. Without the grant the app still starts — it keeps running out of
 the sandboxed location, logs the denial, and the workspaces stay separate.
 
 An install made by an older build already has its state inside the sandbox.
-`adopt_confined_home` (`smartloop/workspace/migrations.py`) moves it out at
+`adopt_confined_home` (`src/workspace/migrations.rs`) moves it out at
 startup, before anything reads the home. It declines when `SLP_HOME` is set or
 when a workspace already exists at `~/.smartloop`.
 
@@ -33,7 +33,7 @@ with `SLP_HOME` pointed at the container. Every home lookup checks `SLP_HOME`
 first, so that one variable pins the whole framework.
 
 ```js
-spawn(pythonBin, args, {
+spawn(slpBin, args, {
   env: { ...process.env, SLP_HOME: path.join(app.getPath('userData'), 'slp') },
 });
 ```
