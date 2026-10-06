@@ -6,8 +6,9 @@ rust-version = "1.85"
 description = "AI Agent harness for extracting information and creating new content"
 license-file = "LICENSE"
 repository = "https://github.com/smartloop-ai/smartloop"
-# Internal crate: consumed as a git dependency, never pushed to crates.io.
-publish = false
+# Published only to the sparse registry at dl.smartloop.ai/crates/ (the
+# publish job in build.yml), never to crates.io.
+publish = ["smartloop"]
 build = "build.rs"
 include = ["/src/**/*", "/build.rs", "/proto/**/*", "/README.md", "/LICENSE"]
 

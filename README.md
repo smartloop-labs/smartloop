@@ -63,13 +63,20 @@ make build-binary # release build staged in dist/slp, as shipped by the installe
 
 ### Using as a Rust crate
 
-The `smartloop` library (everything behind `slp`) can be embedded in another Rust project. It is not published to crates.io (`publish = false`); depend on it from git:
+The `smartloop` library (everything behind `slp`) can be embedded in another Rust project. It is not on crates.io; each release is published to the Cargo registry at `dl.smartloop.ai/crates/`. Register it in your project's `.cargo/config.toml`:
+
+```toml
+[registries.smartloop]
+index = "sparse+https://dl.smartloop.ai/crates/"
+```
+
+then depend on it from that registry:
 
 ```toml
 [dependencies]
-smartloop = { git = "https://github.com/smartloop-ai/smartloop" }
-# Pin a release and pick a GPU backend for llama.cpp:
-# smartloop = { git = "https://github.com/smartloop-ai/smartloop", tag = "v1.2.8", features = ["metal"] }
+smartloop = { version = "1.2.8", registry = "smartloop" }
+# Pick a GPU backend for llama.cpp:
+# smartloop = { version = "1.2.8", registry = "smartloop", features = ["metal"] }
 ```
 
 Available features are `metal`, `vulkan` and `cuda` (forwarded to `llama-cpp-2`); with none, llama.cpp runs on the CPU. For example, to check whether the local agent is up:

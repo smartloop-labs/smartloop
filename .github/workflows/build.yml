@@ -357,6 +357,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || '' }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
@@ -418,6 +423,44 @@ jobs:
           done
           echo "Uploaded to $DEST"
           aws s3 ls "$DEST/"
+
+      # The library is published to a static sparse Cargo registry under
+      # crates/ in the same bucket (dl.smartloop.ai/crates/), never to
+      # crates.io: config.json, the index file and the .crate archives.
+      # --no-verify because the test job already built this commit.
+      - name: Publish the crate to the registry on R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          CARGO_REGISTRIES_SMARTLOOP_INDEX: sparse+https://dl.smartloop.ai/crates/
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          REGISTRY="s3://$R2_BUCKET/crates"
+          cargo package --no-verify --locked
+          CRATE="target/package/smartloop-${VERSION}.crate"
+          [ -f "$CRATE" ] || { echo "::error::$CRATE not built; does Cargo.toml's version match $TAG?"; exit 1; }
+
+          # Start from the published index so earlier versions stay listed.
+          INDEX="sm/ar/smartloop"
+          mkdir -p "registry/$(dirname "$INDEX")"
+          if aws s3 ls "$REGISTRY/$INDEX"; then
+            aws s3 cp "$REGISTRY/$INDEX" "registry/$INDEX" --no-progress
+          fi
+          [ "$(python3 packaging/crate_index.py "$CRATE" registry)" = "$INDEX" ]
+          echo '{"dl": "https://dl.smartloop.ai/crates/dl/{crate}/{version}/{crate}-{version}.crate"}' > registry/config.json
+
+          # The archive before the index line that points at it.
+          aws s3 cp "$CRATE" "$REGISTRY/dl/smartloop/${VERSION}/smartloop-${VERSION}.crate" \
+            --cache-control "public, max-age=3600" --no-progress
+          for f in "$INDEX" config.json; do
+            aws s3 cp "registry/$f" "$REGISTRY/$f" --cache-control "no-cache" --no-progress
+          done
+          echo "Published smartloop $VERSION to https://dl.smartloop.ai/crates/"
 
       - name: Create GitHub Release
         env:
