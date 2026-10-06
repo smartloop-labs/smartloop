@@ -811,6 +811,32 @@ impl ModelService {
         Ok(workspace.project_mut(project_id).map(f))
     }
 
+    /// Apply `f` to the live project and persist it as one step.
+    ///
+    /// A chat request opens with `workspace.reload()`, which brings every
+    /// record back to what is on disk.  Mutating under one lock and saving
+    /// under another left a gap for that reload to land in: the mutation was
+    /// reverted in memory and the save that followed wrote the reverted state
+    /// out, so the change was lost on disk too.  Holding the write lock across
+    /// the save closes the gap.  (A `save_model` seam cannot run under the
+    /// lock — it may read the workspace — so it keeps the two-step form.)
+    fn with_project_mut_saved<R>(
+        &self,
+        project_id: &str,
+        f: impl FnOnce(&mut Project) -> R,
+    ) -> anyhow::Result<Option<R>> {
+        if self.hook(|h| h.save_model.clone()).is_some() {
+            let result = self.with_project_mut(project_id, f)?;
+            self.save_model()?;
+            return Ok(result);
+        }
+        let model = self.model_or_err()?;
+        let mut workspace = model.workspace.write();
+        let result = workspace.project_mut(project_id).map(f);
+        workspace.save()?;
+        Ok(result)
+    }
+
     /// Find a project by id, or the current one, raising `missing` when there
     /// is none.  `initialize_first` mirrors call sites that resolve the
     /// workspace even when an id is given.
@@ -2096,9 +2122,8 @@ impl ModelService {
             status: MCPServerStatus::Pending,
             ..MCPServer::default()
         };
-        self.with_project_mut(&project.id, |p| p.mcp_servers.push(server.clone()))?
+        self.with_project_mut_saved(&project.id, |p| p.mcp_servers.push(server.clone()))?
             .ok_or_else(|| value_err(format!("Project not found: {}", project.id)))?;
-        self.save_model()?;
         self.queue_mcp_provisioning(&project, &server);
 
         Ok(Self::mcp_server_to_dict(&server))
@@ -2224,9 +2249,8 @@ impl ModelService {
             status: MCPServerStatus::Pending,
             ..MCPServer::default()
         };
-        self.with_project_mut(&project.id, |p| p.mcp_servers.push(server.clone()))?
+        self.with_project_mut_saved(&project.id, |p| p.mcp_servers.push(server.clone()))?
             .ok_or_else(|| value_err(format!("Project not found: {}", project.id)))?;
-        self.save_model()?;
         self.queue_mcp_provisioning(&project, &server);
 
         Ok(Self::mcp_server_to_dict(&server))
@@ -2463,12 +2487,12 @@ impl ModelService {
     /// Write a provisioning pass's result back onto the live record (unless
     /// the server was deleted meanwhile) and save.
     fn store_provisioned(&self, project_id: &str, server: &MCPServer) -> anyhow::Result<()> {
-        self.with_project_mut(project_id, |p| {
+        self.with_project_mut_saved(project_id, |p| {
             if let Some(live) = p.mcp_servers.iter_mut().find(|s| s.id == server.id) {
                 merge_provisioned(live, server);
             }
         })?;
-        self.save_model()
+        Ok(())
     }
 
     /// Discover and enrich one registered server; returns
@@ -2509,8 +2533,9 @@ impl ModelService {
             server.tools.len()
         );
 
+        let discovered = server.tools.is_empty();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            if server.tools.is_empty() { self.discover_mcp_tools_seam(&mut server) } else { Ok(()) }
+            if discovered { self.discover_mcp_tools_seam(&mut server) } else { Ok(()) }
         }));
         let failure = match outcome {
             Ok(Ok(())) => None,
@@ -2544,6 +2569,22 @@ impl ModelService {
                 }
             }
             return Ok(json!({"status": "failed", "error": server.last_error}));
+        }
+
+        // The tools are the catalog a chat resolves against, and they are
+        // known now.  Publish them before the enrichment below: that is one or
+        // two LLM calls on a model host the user's own chat competes for, and
+        // a prompt sent in the meantime would otherwise reload the workspace,
+        // find the connection with no tools, and leave it out of the turn.
+        // The status stays `pending` until the pass is finished.
+        if discovered && !server.tools.is_empty() {
+            self.store_provisioned(project_id, &server)?;
+            tracing::info!(
+                target: LOG,
+                "[mcp-provision] '{}' — {} tool(s) available, enriching metadata",
+                server.name,
+                server.tools.len()
+            );
         }
 
         // Metadata for the UI and the tool router — an LLM call, which is why

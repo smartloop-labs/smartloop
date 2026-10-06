@@ -59,6 +59,7 @@ mod test_mcp_401_detail_redaction;
 mod test_mcp_account_probe;
 mod test_mcp_auth_expired;
 mod test_mcp_background_provisioning;
+mod test_mcp_tools_visible_during_provisioning;
 mod test_mcp_call_plans;
 mod test_mcp_capability_routing;
 mod test_mcp_catalog_cache;
