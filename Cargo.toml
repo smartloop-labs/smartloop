@@ -43,7 +43,9 @@ comfy-table = "8.0.0"
 console = "0.16.6"
 dirs = "7.0.0"
 fancy-regex = "0.19.2"
-fernet = "0.2.2"
+# rustcrypto instead of the default openssl backend: no OpenSSL to link
+# (Homebrew dylibs on macOS, an SDK on Windows).
+fernet = { version = "0.2.2", default-features = false, features = ["rustcrypto"] }
 futures = "0.3.34"
 glob = "0.3.4"
 hex = "0.4.3"

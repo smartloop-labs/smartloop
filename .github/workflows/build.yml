@@ -106,10 +106,12 @@ jobs:
           sudo apt-get install -y libvulkan-dev glslc spirv-headers spirv-tools
 
       # cmake builds llama.cpp; libclang drives bindgen for the -sys crates.
+      # mupdf's system-fonts feature (font-kit) needs fontconfig, which the
+      # ubuntu-24.04-arm image doesn't ship.
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake clang libclang-dev
+          sudo apt-get install -y cmake clang libclang-dev pkg-config libfontconfig1-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
