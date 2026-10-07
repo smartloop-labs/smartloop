@@ -1958,8 +1958,9 @@ impl ModelService {
     /// unload is guarded on its own so one failure still returns the other
     /// models' VRAM.
     pub fn unload_auxiliary_models(&self, include_embedding: bool) {
-        // Capability models are not released here.  One that loaded passed
-        // the fit guard and stays resident across responses, so the next
+        // Capability models are not released here but once idle (see
+        // `release_capability_models_when_idle`).  One that loaded passed the
+        // fit guard and stays resident across a conversation, so the next
         // message reuses it instead of reloading the GGUF — and instead of
         // re-routing from scratch, which on a memory-tight device swapped
         // two selected models in and out on every step.  A step that needs
@@ -1977,6 +1978,69 @@ impl ModelService {
                 tracing::warn!(target: LOG, "[models] {name} unload failed: {}", panic_message(&panic));
             }
         }
+        self.release_capability_models_when_idle();
+    }
+
+    /// Unload the capability models once nothing has run for
+    /// `SLP_MODEL_KEEP_ALIVE` — the way Ollama's `keep_alive` works.
+    ///
+    /// Called as each response completes.  `0` releases them now; a negative
+    /// keep-alive never does.  Otherwise a timer waits out the idle period;
+    /// any later response completing starts a fresh one, so only the timer
+    /// from the most recent response acts.  Unloading drops the cached
+    /// handles only: a generation still holding one keeps that model alive
+    /// until it finishes, so a timer can never pull a model out from under a
+    /// running step.
+    pub fn release_capability_models_when_idle(&self) {
+        let keep_alive = AppSettings::new().model_keep_alive;
+        if keep_alive < 0 {
+            return;
+        }
+        if keep_alive == 0 {
+            self.release_idle_capability_models(0.0);
+            return;
+        }
+        let epoch = self.idle_unload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let Some(service) = self.weak_self.upgrade() else {
+            return;
+        };
+        let service = Arc::downgrade(&service);
+        let keep_alive = keep_alive as f64;
+        let spawned = std::thread::Builder::new().name("idle-unload".into()).spawn(move || {
+            let mut wait = keep_alive;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs_f64(wait.max(1.0)));
+                let Some(service) = service.upgrade() else {
+                    return;
+                };
+                if service.idle_unload_epoch.load(Ordering::SeqCst) != epoch {
+                    return;
+                }
+                if service.release_idle_capability_models(keep_alive) {
+                    return;
+                }
+                // Something ran in the meantime: wait out the rest of the
+                // idle period from when it finished.
+                wait = keep_alive - service.idle_seconds().min(keep_alive);
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!(target: LOG, "[models] could not start the idle-unload timer: {e}");
+        }
+    }
+
+    /// Unload the capability models when nothing has run for `keep_alive`
+    /// seconds; true when the idle period has passed (whether or not anything
+    /// was loaded).
+    pub fn release_idle_capability_models(&self, keep_alive: f64) -> bool {
+        let idle = self.idle_seconds();
+        if idle < keep_alive || (keep_alive > 0.0 && idle == 0.0) {
+            return false;
+        }
+        if self.evict_capability_models(None) {
+            tracing::info!(target: LOG, "[models] Unloaded capability models after {:.0}s idle", idle.min(keep_alive));
+        }
+        true
     }
 
     /// Free VRAM held by a specific model, e.g. when it's deselected.

@@ -151,6 +151,7 @@ mod test_tool_call_progress;
 mod test_tool_fanout;
 mod test_vector_search_grouped;
 mod test_vision_evicted_for_capability;
+mod test_vision_evicts_capability_models;
 mod test_web_search_agent;
 mod test_web_search_context_framing;
 mod test_web_search_gate;

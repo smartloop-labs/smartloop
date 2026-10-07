@@ -573,6 +573,9 @@ pub struct ModelService {
     pub inference_lock: InferenceSemaphore,
     /// `_inference_state_lock` + `_inference_active` + `_last_inference_at`.
     pub inference_state: Mutex<InferenceState>,
+    /// Bumped each time a response completes; an idle-unload timer only acts
+    /// while the epoch it was started under is still current.
+    pub idle_unload_epoch: AtomicUsize,
     /// `_sessions`: session_id -> chat history (in-memory cache).
     pub sessions: Mutex<HashMap<String, Vec<MessageInput>>>,
     /// `_conversation_store`.
@@ -635,6 +638,7 @@ impl ModelService {
             llm_executor: Mutex::new(None),
             inference_lock: InferenceSemaphore::new(n_parallel),
             inference_state: Mutex::new(InferenceState::default()),
+            idle_unload_epoch: AtomicUsize::new(0),
             sessions: Mutex::new(HashMap::new()),
             conversation_store: RwLock::new(conversation_store),
             task_queue: RwLock::new(task_queue),
@@ -1552,14 +1556,30 @@ impl ModelService {
                 );
                 continue;
             }
+            // Capability models stay resident across responses, so on a tight
+            // device they can hold the memory the vision copy needs for good —
+            // waiting for "the next document" would never free it.  Release
+            // them and re-check, as a text step does; they reload on the next
+            // step that asks for them.  The vision copy is its own instance
+            // (with the mmproj), so a resident text copy of the same model
+            // cannot stand in for it.
             if !self.large_model_fits(&gguf_path, cap, &ws_model.model_name, Some(0.0)) {
-                tracing::warn!(
+                if !(self.evict_capability_models_hooked(None)
+                    && self.large_model_fits(&gguf_path, cap, &ws_model.model_name, Some(0.0)))
+                {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "[vision] {} skipped — won't fit in available memory right now (will retry on the next document)",
+                        ws_model.model_name
+                    );
+                    transient_failure = true;
+                    continue;
+                }
+                tracing::info!(
                     target: LOG_TARGET,
-                    "[vision] {} skipped — won't fit in available memory right now (will retry on the next document)",
+                    "[vision] Freed capability models to fit {}",
                     ws_model.model_name
                 );
-                transient_failure = true;
-                continue;
             }
             let clip_on_cpu = self.clip_on_cpu(&gguf_path, cap);
             // Announce the chosen model before the (heavy) load so callers can

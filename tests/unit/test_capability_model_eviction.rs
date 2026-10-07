@@ -132,13 +132,102 @@ fn test_no_default_model_name_does_not_crash() {
 /// The end-of-response unload leaves capability models resident, so the next
 /// message reuses them rather than reloading — and re-routing — from scratch.
 #[test]
+#[serial_test::serial]
 fn test_end_of_response_unload_keeps_capability_models() {
     let (svc, freed) = svc();
     let qwen = FakeLLM::named("cap_llm_qwen");
     svc.set_cap_llm("qwen3.5-2b", Some(CachedLlm::Loaded(qwen.clone())));
 
-    svc.unload_auxiliary_models(false);
+    with_keep_alive("5m", || svc.unload_auxiliary_models(false));
 
     assert!(freed.lock().iter().all(|llm| !same(llm, &qwen)));
     assert!(same(&slot(&svc, "qwen3.5-2b").expect("kept"), &qwen));
+}
+
+/// Run `f` with `SLP_MODEL_KEEP_ALIVE` set to `value`.
+fn with_keep_alive<R>(value: &str, f: impl FnOnce() -> R) -> R {
+    let previous = std::env::var("SLP_MODEL_KEEP_ALIVE").ok();
+    // SAFETY: serialized with every other env-touching test.
+    unsafe { std::env::set_var("SLP_MODEL_KEEP_ALIVE", value) };
+    let out = f();
+    // SAFETY: as above.
+    unsafe {
+        match previous {
+            Some(v) => std::env::set_var("SLP_MODEL_KEEP_ALIVE", v),
+            None => std::env::remove_var("SLP_MODEL_KEEP_ALIVE"),
+        }
+    }
+    out
+}
+
+/// A keep-alive of 0 unloads capability models as the response completes.
+#[test]
+#[serial_test::serial]
+fn test_zero_keep_alive_unloads_when_the_response_completes() {
+    let (svc, freed) = svc();
+    let qwen = FakeLLM::named("cap_llm_qwen");
+    svc.set_cap_llm("qwen3.5-2b", Some(CachedLlm::Loaded(qwen.clone())));
+
+    with_keep_alive("0", || svc.unload_auxiliary_models(false));
+
+    assert!(freed.lock().iter().any(|llm| same(llm, &qwen)));
+    assert!(slot(&svc, "qwen3.5-2b").is_none());
+}
+
+/// A negative keep-alive never unloads them.
+#[test]
+#[serial_test::serial]
+fn test_negative_keep_alive_keeps_them_loaded() {
+    let (svc, _freed) = svc();
+    let qwen = FakeLLM::named("cap_llm_qwen");
+    svc.set_cap_llm("qwen3.5-2b", Some(CachedLlm::Loaded(qwen.clone())));
+
+    with_keep_alive("-1", || svc.unload_auxiliary_models(false));
+
+    assert!(same(&slot(&svc, "qwen3.5-2b").expect("kept"), &qwen));
+}
+
+/// Before the idle period has passed nothing is unloaded; after it, the
+/// capability models go.
+#[test]
+fn test_idle_unload_waits_out_the_keep_alive() {
+    let (svc, freed) = svc();
+    let qwen = FakeLLM::named("cap_llm_qwen");
+    svc.set_cap_llm("qwen3.5-2b", Some(CachedLlm::Loaded(qwen.clone())));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+
+    svc.inference_state.lock().last_inference_at = now - 60.0;
+    assert!(!svc.release_idle_capability_models(300.0));
+    assert!(same(&slot(&svc, "qwen3.5-2b").expect("kept"), &qwen));
+
+    svc.inference_state.lock().last_inference_at = now - 301.0;
+    assert!(svc.release_idle_capability_models(300.0));
+    assert!(freed.lock().iter().any(|llm| same(llm, &qwen)));
+    assert!(slot(&svc, "qwen3.5-2b").is_none());
+}
+
+/// A generation in progress is never idle.
+#[test]
+fn test_idle_unload_never_fires_while_a_generation_runs() {
+    let (svc, _freed) = svc();
+    let qwen = FakeLLM::named("cap_llm_qwen");
+    svc.set_cap_llm("qwen3.5-2b", Some(CachedLlm::Loaded(qwen.clone())));
+    svc.inference_state.lock().active = 1;
+    svc.inference_state.lock().last_inference_at = 1.0;
+
+    assert!(!svc.release_idle_capability_models(300.0));
+    assert!(same(&slot(&svc, "qwen3.5-2b").expect("kept"), &qwen));
+}
+
+#[test]
+fn test_keep_alive_durations_parse() {
+    use smartloop::config::app_settings::parse_duration_secs;
+    assert_eq!(parse_duration_secs("300"), Some(300));
+    assert_eq!(parse_duration_secs("30s"), Some(30));
+    assert_eq!(parse_duration_secs("5m"), Some(300));
+    assert_eq!(parse_duration_secs(" 1H "), Some(3600));
+    assert_eq!(parse_duration_secs("0"), Some(0));
+    assert_eq!(parse_duration_secs("-1"), Some(-1));
+    assert_eq!(parse_duration_secs("soon"), None);
+    assert_eq!(parse_duration_secs(""), None);
 }
