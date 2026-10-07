@@ -620,8 +620,7 @@ pub fn footprint_gb(entry: &ModelEntry) -> Option<f64> {
 ///
 /// Every capable model at Low memory pressure.  Any capable model can do its
 /// capability's work, and a light one loads sooner, answers faster and leaves
-/// room for the rest — which is how a step is routed, too (the smallest
-/// capable model that fits).  With nothing at Low, the lightest model per
+/// room for the rest.  With nothing at Low, the lightest model per
 /// capability that fits, so a small machine still gets a recommendation.
 ///
 /// Reasoning weighs more than the rest: it is the model that resolves tool

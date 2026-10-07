@@ -699,7 +699,7 @@ impl SkillProcessor {
         );
 
         // Synthesis writes the final skill answer, so use a model declaring
-        // the reasoning capability (the lightest that fits — see
+        // the reasoning capability (the largest that fits — see
         // ModelService._get_llm_for_capability), not the small orchestrator.
         // Falls back to the large/agent model when no capable model fits.
         //
