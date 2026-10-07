@@ -1949,8 +1949,8 @@ impl ModelService {
         }
     }
 
-    /// Release every on-demand auxiliary model, keeping only the resident
-    /// orchestrator.
+    /// Release the on-demand auxiliary models (vision, large, embedding),
+    /// keeping the orchestrator and the capability models resident.
     ///
     /// Called at the end of each response cycle.  The embedding model goes
     /// with them by default; `include_embedding=false` is for the caller that
@@ -1958,15 +1958,16 @@ impl ModelService {
     /// unload is guarded on its own so one failure still returns the other
     /// models' VRAM.
     pub fn unload_auxiliary_models(&self, include_embedding: bool) {
+        // Capability models are not released here.  One that loaded passed
+        // the fit guard and stays resident across responses, so the next
+        // message reuses it instead of reloading the GGUF — and instead of
+        // re-routing from scratch, which on a memory-tight device swapped
+        // two selected models in and out on every step.  A step that needs
+        // a model that does not fit still evicts them (see
+        // `get_llm_for_capability`), and deselecting a model unloads it.
         let mut unloads: Vec<(&str, Box<dyn Fn() + '_>)> = vec![
             ("vision", Box::new(|| self.unload_vision_model())),
             ("large", Box::new(|| self.unload_large_model())),
-            (
-                "capability",
-                Box::new(|| {
-                    self.evict_capability_models(None);
-                }),
-            ),
         ];
         if include_embedding {
             unloads.push(("embedding", Box::new(|| self.unload_embedding_model())));
