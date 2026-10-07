@@ -80,6 +80,11 @@ pub struct AppSettings {
     pub llm_large_n_ctx_cap: i64,
     /// `SLP_LLM_LARGE_FIT_RESERVE_GB` — VRAM kept free when fit-checking the large model.
     pub llm_large_fit_reserve_gb: f64,
+    /// `SLP_MODEL_KEEP_ALIVE` — how long capability models stay loaded once
+    /// nothing is running, in seconds (`"30s"`, `"5m"` and `"1h"` are accepted
+    /// too).  `0` unloads them as soon as a response completes; a negative
+    /// value keeps them loaded until they are deselected or evicted for room.
+    pub model_keep_alive: i64,
     /// `SLP_DOC_EXTRACT_MAX_CHARS` — hard cap on fan-out extraction chars; 0 = derive.
     pub doc_extract_max_chars: i64,
     /// `SLP_EMBEDDING_DEVICE` — `"auto"` (GPU offload) or `"cpu"`.
@@ -156,6 +161,7 @@ impl AppSettings {
             llm_main_n_ctx_cap: 4096,
             llm_large_n_ctx_cap: 0,
             llm_large_fit_reserve_gb: 1.0,
+            model_keep_alive: 300,
             doc_extract_max_chars: 0,
             embedding_device: "auto".to_string(),
             embedding_gguf_repo: "gpustack/bge-m3-GGUF".to_string(),
@@ -224,6 +230,7 @@ impl AppSettings {
             llm_main_n_ctx_cap: r.int("slp_llm_main_n_ctx_cap", d.llm_main_n_ctx_cap)?,
             llm_large_n_ctx_cap: r.int("slp_llm_large_n_ctx_cap", d.llm_large_n_ctx_cap)?,
             llm_large_fit_reserve_gb: r.float("slp_llm_large_fit_reserve_gb", d.llm_large_fit_reserve_gb)?,
+            model_keep_alive: r.duration_secs("slp_model_keep_alive", d.model_keep_alive)?,
             doc_extract_max_chars: r.int("slp_doc_extract_max_chars", d.doc_extract_max_chars)?,
             embedding_device: r.string("slp_embedding_device", d.embedding_device)?,
             embedding_gguf_repo: r.string("slp_embedding_gguf_repo", d.embedding_gguf_repo)?,
@@ -400,6 +407,15 @@ impl SourceReader<'_> {
         }
     }
 
+    fn duration_secs(&self, alias: &str, default: i64) -> Result<i64, SettingsValidationError> {
+        match self.source.get(alias) {
+            None => Ok(default),
+            Some(raw) => parse_duration_secs(raw).ok_or_else(|| {
+                self.error(alias, "Input should be a duration in seconds, or a number with s, m or h", raw)
+            }),
+        }
+    }
+
     fn port(&self, alias: &str, default: u16) -> Result<u16, SettingsValidationError> {
         match self.source.get(alias) {
             None => Ok(default),
@@ -433,6 +449,20 @@ pub fn parse_bool(raw: &str) -> Option<bool> {
 
 /// Pydantic's lax string → int coercion (surrounding whitespace allowed,
 /// `_` digit separators allowed, an integral float like `"8.0"` accepted).
+/// A duration in whole seconds: a plain integer, or one suffixed with `s`,
+/// `m` or `h` (`"90"`, `"30s"`, `"5m"`, `"1h"`).  The sign is kept, so `"-1"`
+/// still reads as "forever" wherever a negative value means that.
+pub fn parse_duration_secs(raw: &str) -> Option<i64> {
+    let s = py_strip(raw).to_ascii_lowercase();
+    let (number, unit) = match s.chars().last()? {
+        's' => (&s[..s.len() - 1], 1),
+        'm' => (&s[..s.len() - 1], 60),
+        'h' => (&s[..s.len() - 1], 3600),
+        _ => (s.as_str(), 1),
+    };
+    parse_int(number)?.checked_mul(unit)
+}
+
 pub fn parse_int(raw: &str) -> Option<i64> {
     let s = py_strip(raw);
     if s.is_empty() {
