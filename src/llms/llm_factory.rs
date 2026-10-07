@@ -641,10 +641,7 @@ impl LlmFactory {
         if device_config.device.value() == "mps" {
             // Apple Silicon — unified memory shared between CPU and GPU.
             // Metal handles GPU offloading via n_gpu_layers=-1 (already set).
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            let total_mem_gb = sys.total_memory() as f64 / 1024f64.powi(3);
-            let available_mem_gb = sys.available_memory() as f64 / 1024f64.powi(3);
+            let (available_mem_gb, total_mem_gb) = crate::utils::device_utils::available_memory_gb();
 
             // Use available memory minus model size and a 2GB OS/app overhead.
             let available_for_kv = available_mem_gb - model_size_gb - 2.0;

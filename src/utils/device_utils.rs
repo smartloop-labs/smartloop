@@ -188,6 +188,49 @@ pub fn max_auto_context_tokens() -> u32 {
     8192
 }
 
+/// `(available, total)` system memory in GiB.
+///
+/// On macOS, `sysinfo` reports only the *free* pages, but macOS keeps idle
+/// RAM busy as inactive and file-backed cache and hands it back on demand.  So
+/// a 24GB machine with half its memory reclaimable read as 0.4–2GB free, which
+/// rejected every capability model and squeezed each one to the minimum
+/// context.  The kernel's own measure — `kern.memorystatus_level`, the
+/// free percentage `memory_pressure` prints — counts that reclaimable memory,
+/// so it is used whenever it says more than the free pages do.
+pub fn available_memory_gb() -> (f64, f64) {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let gib = 1024f64.powi(3);
+    let total_gb = sys.total_memory() as f64 / gib;
+    let free_gb = sys.available_memory() as f64 / gib;
+    let reclaimable_gb = memorystatus_level().map(|pct| total_gb * pct / 100.0).unwrap_or(0.0);
+    (free_gb.max(reclaimable_gb), total_gb)
+}
+
+/// The kernel's free-memory percentage (`kern.memorystatus_level`), macOS only.
+#[cfg(target_os = "macos")]
+fn memorystatus_level() -> Option<f64> {
+    let mut level: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated, `level` is a c_int-sized buffer and
+    // `size` holds its length; no new value is written.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_level".as_ptr(),
+            (&mut level as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && (0..=100).contains(&level)).then_some(level as f64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn memorystatus_level() -> Option<f64> {
+    None
+}
+
 /// True on Apple Silicon with a llama.cpp Metal (GPU offload) backend.
 pub fn is_mps() -> bool {
     cfg!(target_os = "macos") && llama_gpu_offload()

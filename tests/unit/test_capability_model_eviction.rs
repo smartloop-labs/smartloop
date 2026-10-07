@@ -128,3 +128,17 @@ fn test_no_default_model_name_does_not_crash() {
     assert_eq!(freed.len(), 1);
     assert!(same(&freed[0], &some_slot));
 }
+
+/// The end-of-response unload leaves capability models resident, so the next
+/// message reuses them rather than reloading — and re-routing — from scratch.
+#[test]
+fn test_end_of_response_unload_keeps_capability_models() {
+    let (svc, freed) = svc();
+    let qwen = FakeLLM::named("cap_llm_qwen");
+    svc.set_cap_llm("qwen3.5-2b", Some(CachedLlm::Loaded(qwen.clone())));
+
+    svc.unload_auxiliary_models(false);
+
+    assert!(freed.lock().iter().all(|llm| !same(llm, &qwen)));
+    assert!(same(&slot(&svc, "qwen3.5-2b").expect("kept"), &qwen));
+}

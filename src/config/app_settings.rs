@@ -71,7 +71,10 @@ pub struct AppSettings {
     pub llm_n_batch: i64,
     /// `SLP_LLM_N_THREADS` — llama.cpp n_threads; 0 = choose from the device.
     pub llm_n_threads: i64,
-    /// `SLP_LLM_MAIN_N_CTX_CAP` — max context for the main model; 0 = no cap.
+    /// `SLP_LLM_MAIN_N_CTX_CAP` — max context for the main (routing) model;
+    /// 0 = no cap.  Defaults to 4096: the router only makes short routing
+    /// decisions, and an auto-sized window would claim memory the capability
+    /// models need.
     pub llm_main_n_ctx_cap: i64,
     /// `SLP_LLM_LARGE_N_CTX_CAP` — max context for the large agent model; 0 = no cap.
     pub llm_large_n_ctx_cap: i64,
@@ -150,7 +153,7 @@ impl AppSettings {
             n_parallel: 1,
             llm_n_batch: 0,
             llm_n_threads: 0,
-            llm_main_n_ctx_cap: 0,
+            llm_main_n_ctx_cap: 4096,
             llm_large_n_ctx_cap: 0,
             llm_large_fit_reserve_gb: 1.0,
             doc_extract_max_chars: 0,

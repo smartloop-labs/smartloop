@@ -2015,7 +2015,7 @@ impl Producer {
             self.put(QueueItem::End);
         }
         // Frees the on-demand auxiliary models (vision + large agent), leaving
-        // only the orchestrator resident between chats.
+        // the orchestrator and the capability models resident between chats.
         //
         // The embedding model stays when there are sources to verify: this
         // runs the moment generation ends, which is the moment before

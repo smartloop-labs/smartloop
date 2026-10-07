@@ -80,9 +80,9 @@ impl ModelLoader {
 
         // Cap the main model's auto-sized context so its KV cache doesn't
         // claim the whole device and leave nothing for the on-demand
-        // large/vision models (avoids llama.cpp OOM crashes).  A cap of 0
-        // (default) means no cap — the main model keeps its full auto-sized
-        // window.
+        // large/vision models (avoids llama.cpp OOM crashes).  Defaults to
+        // 4096 — the main model is the router; a cap of 0 means no cap, and
+        // the model keeps its full auto-sized window.
         let mut main_max_n_ctx = None;
         if let Ok(settings) = AppSettings::try_new() {
             if settings.llm_main_n_ctx_cap > 0 {

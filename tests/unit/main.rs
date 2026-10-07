@@ -5,6 +5,7 @@
 mod shared;
 
 mod test_add_local_mcp_server_mcp2_pin;
+mod test_available_memory;
 mod test_adopt_confined_home;
 mod test_agent_registry;
 mod test_analyze_node;

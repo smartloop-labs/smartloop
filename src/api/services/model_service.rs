@@ -2152,10 +2152,7 @@ impl ModelService {
             return hook();
         }
         if crate::utils::device_utils::is_mps() {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            let gib = 1024f64.powi(3);
-            return Some((sys.available_memory() as f64 / gib, sys.total_memory() as f64 / gib));
+            return Some(crate::utils::device_utils::available_memory_gb());
         }
         None
     }
