@@ -1645,31 +1645,6 @@ impl ModelService {
         keyed.into_iter().map(|(_, m)| m).collect()
     }
 
-    /// Sort candidates smallest-first for a routed step; size ties go to
-    /// broader capability coverage, then the newer version.
-    ///
-    /// Every candidate already declares the capability, so the smallest one
-    /// can do the step — and it loads sooner, decodes faster and leaves the
-    /// most room for whatever runs next.  `ranked_candidates` with
-    /// `descending=false` would reverse those tie-breaks too and prefer the
-    /// narrower, older model.
-    pub fn lightest_first<M: RankedModel, S: AsRef<str>>(candidates: Vec<M>, ref_caps: &[S]) -> Vec<M> {
-        let mut keyed: Vec<((f64, usize, i64), M)> = candidates
-            .into_iter()
-            .map(|m| {
-                let (size, version) = m.model_rank();
-                ((size, cap_overlap(ref_caps, &m.model_capabilities()), version), m)
-            })
-            .collect();
-        keyed.sort_by(|(a, _), (b, _)| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.1.cmp(&a.1))
-                .then(b.2.cmp(&a.2))
-        });
-        keyed.into_iter().map(|(_, m)| m).collect()
-    }
-
     /// The models the user has chosen — enabled *and* downloaded, excluding
     /// the bootstrap/orchestrator model.
     ///
@@ -2060,7 +2035,7 @@ impl ModelService {
     ///
     /// When the user has selected exactly one model, that model is returned
     /// for every capability it can serve.  Otherwise walks the capability's
-    /// models smallest-first and returns the first that is already resident
+    /// models largest-first and returns the first that is already resident
     /// or fits in memory — evicting prior-step capability models to make room
     /// when needed.  Returns `None` only when no capable model fits.
     pub fn get_llm_for_capability(&self, capability: &str) -> Option<Arc<dyn BaseLLM>> {
@@ -2109,8 +2084,11 @@ impl ModelService {
         }
 
         // Candidate selection is project-scoped (per-project model settings
-        // override the workspace defaults); walked lightest-first.
-        let ranked = Self::lightest_first(self.ranked_models_for(capability), &[capability]);
+        // override the workspace defaults).  Walked largest-first: when two
+        // selected models both declare the capability, the bigger one does
+        // the step, and a smaller one runs it only when the bigger cannot be
+        // loaded.  Size ties go to broader coverage, then the newer version.
+        let ranked = Self::ranked_candidates(self.ranked_models_for(capability), &[capability], true);
         if ranked.is_empty() {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -2120,7 +2098,7 @@ impl ModelService {
         }
 
         for ws_model in &ranked {
-            // Move up to the next capable model when this one has no GGUF,
+            // Move down to the next capable model when this one has no GGUF,
             // faulted, or doesn't fit — rather than the tiny default.
             let llm = self.load_workspace_llm(
                 ws_model,

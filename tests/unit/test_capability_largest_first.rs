@@ -1,10 +1,9 @@
-//! Port of `tests/unit/test_capability_lightest_first.py`.
+//! A routed step runs on the largest selected model that declares its
+//! capability.
 //!
-//! A routed step runs on the lightest model that declares its capability.
-//!
-//! Every candidate can do the step, so the smallest is enough — and it loads
-//! sooner, decodes faster and leaves the most room for the next step.  A
-//! larger capable model is used only when the smaller ones cannot be loaded.
+//! When two selected models can both do the step, the bigger one gives the
+//! better answer.  A smaller capable model is used only when the larger ones
+//! cannot be loaded (no GGUF, faulted, or it does not fit).
 //!
 //! The Python test faked `_rank` on mocks.  A workspace model's rank comes
 //! from its model class, so the walk uses real built-in models whose sizes
@@ -79,30 +78,41 @@ fn walk(
 }
 
 #[test]
-fn test_the_smallest_capable_model_is_used() {
-    let small = FakeLLM::named("small_llm");
+fn test_the_largest_capable_model_is_used() {
+    let big = FakeLLM::named("big_llm");
     let mut loads = HashMap::new();
-    loads.insert(BIG, FakeLLM::named("big"));
+    loads.insert(BIG, big.clone());
     loads.insert(MID, FakeLLM::named("mid"));
-    loads.insert(SMALL, small.clone());
-    let (tried, llm) = walk(vec![ws_model(BIG), ws_model(MID), ws_model(SMALL)], loads);
-    assert_eq!(tried, vec![SMALL.to_string()]);
-    assert!(same(&llm.expect("a model"), &small));
+    loads.insert(SMALL, FakeLLM::named("small"));
+    let (tried, llm) = walk(vec![ws_model(SMALL), ws_model(MID), ws_model(BIG)], loads);
+    assert_eq!(tried, vec![BIG.to_string()]);
+    assert!(same(&llm.expect("a model"), &big));
 }
 
 #[test]
-fn test_a_larger_one_is_used_when_the_smaller_cannot_load() {
+fn test_a_smaller_one_is_used_when_the_larger_cannot_load() {
     let mid = FakeLLM::named("mid_llm");
     let mut loads = HashMap::new();
     loads.insert(MID, mid.clone());
-    let (tried, llm) = walk(vec![ws_model(BIG), ws_model(MID), ws_model(SMALL)], loads);
-    assert_eq!(tried, vec![SMALL.to_string(), MID.to_string()]);
+    let (tried, llm) = walk(vec![ws_model(SMALL), ws_model(MID), ws_model(BIG)], loads);
+    assert_eq!(tried, vec![BIG.to_string(), MID.to_string()]);
     assert!(same(&llm.expect("a model"), &mid));
 }
 
 #[test]
+fn test_ministral_3b_outranks_qwen3_5_2b() {
+    let ministral = FakeLLM::named("ministral");
+    let mut loads = HashMap::new();
+    loads.insert("ministral3-3b", ministral.clone());
+    loads.insert("qwen3.5-2b", FakeLLM::named("qwen"));
+    let (tried, llm) = walk(vec![ws_model("qwen3.5-2b"), ws_model("ministral3-3b")], loads);
+    assert_eq!(tried, vec!["ministral3-3b".to_string()]);
+    assert!(same(&llm.expect("a model"), &ministral));
+}
+
+#[test]
 fn test_size_ties_go_to_broader_coverage_then_the_newer_version() {
-    let ordered = ModelService::lightest_first(
+    let ordered = ModelService::ranked_candidates(
         vec![
             candidate("old", 4.0, 1, &["reasoning"]),
             candidate("narrow-new", 4.0, 3, &["reasoning"]),
@@ -110,6 +120,7 @@ fn test_size_ties_go_to_broader_coverage_then_the_newer_version() {
             candidate("new", 4.0, 2, &["reasoning"]),
         ],
         &["reasoning", "general"],
+        true,
     );
     let names: Vec<&str> = ordered.iter().map(|m| m.name).collect();
     assert_eq!(names, vec!["broad", "narrow-new", "new", "old"]);

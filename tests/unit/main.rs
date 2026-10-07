@@ -16,7 +16,7 @@ mod test_auth_writes_are_workspace_work;
 mod test_bootstrap_is_workspace_work;
 mod test_bound_port_in_settings;
 mod test_capability_event_honesty;
-mod test_capability_lightest_first;
+mod test_capability_largest_first;
 mod test_capability_model_eviction;
 mod test_capability_model_reuses_resident;
 mod test_capability_skip_reason;
