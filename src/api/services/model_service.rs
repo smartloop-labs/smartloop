@@ -470,9 +470,10 @@ pub struct ModelServiceHooks {
     pub pinned_model: Option<Arc<dyn Fn(Option<&str>) -> Option<WorkspaceModel> + Send + Sync>>,
     /// Replaces `_pinned_llm(capability)`.
     pub pinned_llm: Option<Arc<dyn Fn(Option<&str>) -> Option<Arc<dyn BaseLLM>> + Send + Sync>>,
-    /// Replaces `_load_workspace_llm(ws_model, reason, reserve_gb)`.
+    /// Replaces `_load_workspace_llm(ws_model, reason, reserve_gb)`; the last
+    /// argument says whether the load may evict prior-step models to fit.
     pub load_workspace_llm: Option<
-        Arc<dyn Fn(&WorkspaceModel, &str, Option<f64>) -> Option<Arc<dyn BaseLLM>> + Send + Sync>,
+        Arc<dyn Fn(&WorkspaceModel, &str, Option<f64>, bool) -> Option<Arc<dyn BaseLLM>> + Send + Sync>,
     >,
     /// Replaces `_get_llm_for_capability(capability)`.
     pub get_llm_for_capability: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn BaseLLM>> + Send + Sync>>,
@@ -1786,8 +1787,25 @@ impl ModelService {
         reason: &str,
         reserve_gb: Option<f64>,
     ) -> Option<Arc<dyn BaseLLM>> {
+        self.load_workspace_llm_with(ws_model, reason, reserve_gb, true)
+    }
+
+    /// [`Self::load_workspace_llm`], with `evict` saying whether a model
+    /// that does not fit may release prior steps' capability models (and the
+    /// on-demand large model) and retry.
+    ///
+    /// Without eviction the call only returns a model that is already
+    /// resident or fits as things stand, so it never costs a model that is
+    /// already serving.
+    pub fn load_workspace_llm_with(
+        &self,
+        ws_model: &WorkspaceModel,
+        reason: &str,
+        reserve_gb: Option<f64>,
+        evict: bool,
+    ) -> Option<Arc<dyn BaseLLM>> {
         if let Some(hook) = self.hooks().load_workspace_llm {
-            return hook(ws_model, reason, reserve_gb);
+            return hook(ws_model, reason, reserve_gb, evict);
         }
         let Some(workspace) = self.workspace_handle() else {
             tracing::warn!(
@@ -1863,7 +1881,8 @@ impl ModelService {
         // on-demand large model) and retry — that frees enough VRAM to run
         // this model on a memory-tight device.
         if !self.large_model_fits(&gguf_path, cap, &ws_model.model_name, reserve_gb) {
-            if !(self.evict_capability_models_hooked(Some(&ws_model.model_name))
+            if !(evict
+                && self.evict_capability_models_hooked(Some(&ws_model.model_name))
                 && self.large_model_fits(&gguf_path, cap, &ws_model.model_name, reserve_gb))
             {
                 tracing::warn!(
@@ -2097,16 +2116,22 @@ impl ModelService {
             return None;
         }
 
-        for ws_model in &ranked {
-            // Move down to the next capable model when this one has no GGUF,
-            // faulted, or doesn't fit — rather than the tiny default.
-            let llm = self.load_workspace_llm(
-                ws_model,
-                &format!("capability '{}'", Self::cap_name(capability)),
-                reserve_gb,
-            );
-            if llm.is_some() {
-                return llm;
+        // Two passes.  The first takes the largest model that is already
+        // resident or fits as things stand, without evicting anything: a
+        // bigger model that does not fit must not cost the smaller capable
+        // model already serving — evicting it and then finding the bigger one
+        // still does not fit leaves the step on the tiny default.  Only when
+        // nothing is resident or fits does the second pass evict prior-step
+        // models to make room.
+        let reason = format!("capability '{}'", Self::cap_name(capability));
+        for evict in [false, true] {
+            for ws_model in &ranked {
+                // Move down to the next capable model when this one has no
+                // GGUF, faulted, or doesn't fit — rather than the tiny default.
+                let llm = self.load_workspace_llm_with(ws_model, &reason, reserve_gb, evict);
+                if llm.is_some() {
+                    return llm;
+                }
             }
         }
 

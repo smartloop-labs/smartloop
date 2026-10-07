@@ -52,23 +52,37 @@ impl RankedModel for Candidate {
     }
 }
 
-/// The candidates tried, in order, and what was returned.
+/// How a fake candidate loads: as things stand (resident, or fits), or only
+/// once prior-step models are evicted.
+#[derive(Clone, Copy, PartialEq)]
+enum Fit {
+    AsIs,
+    AfterEviction,
+}
+
+/// The candidates tried, in order (with whether eviction was allowed), and
+/// what was returned.
 fn walk(
     ranked: Vec<WorkspaceModel>,
-    loads: HashMap<&'static str, Arc<dyn BaseLLM>>,
-) -> (Vec<String>, Option<Arc<dyn BaseLLM>>) {
-    let tried: Arc<Mutex<Vec<String>>> = Arc::default();
+    loads: HashMap<&'static str, (Arc<dyn BaseLLM>, Fit)>,
+) -> (Vec<(String, bool)>, Option<Arc<dyn BaseLLM>>) {
+    let tried: Arc<Mutex<Vec<(String, bool)>>> = Arc::default();
     let svc = bare_service();
     attach_workspace(&svc, Workspace::new("ws"));
 
     let tried_in_hook = tried.clone();
-    let loads: HashMap<String, Arc<dyn BaseLLM>> = loads.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let loads: HashMap<String, (Arc<dyn BaseLLM>, Fit)> =
+        loads.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     svc.set_hooks(ModelServiceHooks {
         pinned_model: Some(Arc::new(|_| None)),
         ranked_models_for: Some(Arc::new(move |_| ranked.clone())),
-        load_workspace_llm: Some(Arc::new(move |ws_model: &WorkspaceModel, _reason: &str, _reserve| {
-            tried_in_hook.lock().push(ws_model.model_name.clone());
-            loads.get(&ws_model.model_name).cloned()
+        load_workspace_llm: Some(Arc::new(move |ws_model: &WorkspaceModel, _reason: &str, _reserve, evict| {
+            tried_in_hook.lock().push((ws_model.model_name.clone(), evict));
+            match loads.get(&ws_model.model_name) {
+                Some((llm, Fit::AsIs)) => Some(llm.clone()),
+                Some((llm, Fit::AfterEviction)) if evict => Some(llm.clone()),
+                _ => None,
+            }
         })),
         ..Default::default()
     });
@@ -77,15 +91,19 @@ fn walk(
     (tried, llm)
 }
 
+fn attempt(name: &str, evict: bool) -> (String, bool) {
+    (name.to_string(), evict)
+}
+
 #[test]
 fn test_the_largest_capable_model_is_used() {
     let big = FakeLLM::named("big_llm");
     let mut loads = HashMap::new();
-    loads.insert(BIG, big.clone());
-    loads.insert(MID, FakeLLM::named("mid"));
-    loads.insert(SMALL, FakeLLM::named("small"));
+    loads.insert(BIG, (big.clone(), Fit::AsIs));
+    loads.insert(MID, (FakeLLM::named("mid"), Fit::AsIs));
+    loads.insert(SMALL, (FakeLLM::named("small"), Fit::AsIs));
     let (tried, llm) = walk(vec![ws_model(SMALL), ws_model(MID), ws_model(BIG)], loads);
-    assert_eq!(tried, vec![BIG.to_string()]);
+    assert_eq!(tried, vec![attempt(BIG, false)]);
     assert!(same(&llm.expect("a model"), &big));
 }
 
@@ -93,9 +111,9 @@ fn test_the_largest_capable_model_is_used() {
 fn test_a_smaller_one_is_used_when_the_larger_cannot_load() {
     let mid = FakeLLM::named("mid_llm");
     let mut loads = HashMap::new();
-    loads.insert(MID, mid.clone());
+    loads.insert(MID, (mid.clone(), Fit::AsIs));
     let (tried, llm) = walk(vec![ws_model(SMALL), ws_model(MID), ws_model(BIG)], loads);
-    assert_eq!(tried, vec![BIG.to_string(), MID.to_string()]);
+    assert_eq!(tried, vec![attempt(BIG, false), attempt(MID, false)]);
     assert!(same(&llm.expect("a model"), &mid));
 }
 
@@ -103,10 +121,38 @@ fn test_a_smaller_one_is_used_when_the_larger_cannot_load() {
 fn test_ministral_3b_outranks_qwen3_5_2b() {
     let ministral = FakeLLM::named("ministral");
     let mut loads = HashMap::new();
-    loads.insert("ministral3-3b", ministral.clone());
-    loads.insert("qwen3.5-2b", FakeLLM::named("qwen"));
+    loads.insert("ministral3-3b", (ministral.clone(), Fit::AsIs));
+    loads.insert("qwen3.5-2b", (FakeLLM::named("qwen"), Fit::AsIs));
     let (tried, llm) = walk(vec![ws_model("qwen3.5-2b"), ws_model("ministral3-3b")], loads);
-    assert_eq!(tried, vec!["ministral3-3b".to_string()]);
+    assert_eq!(tried, vec![attempt("ministral3-3b", false)]);
+    assert!(same(&llm.expect("a model"), &ministral));
+}
+
+/// The regression: Qwen 3.5 2B was resident, Ministral 3B did not fit, and
+/// evicting Qwen to try Ministral left the step on the bootstrap model.  A
+/// bigger model that does not fit as things stand must not cost the
+/// resident one.
+#[test]
+fn test_a_resident_smaller_model_is_kept_over_a_bigger_one_that_does_not_fit() {
+    let qwen = FakeLLM::named("qwen");
+    let mut loads = HashMap::new();
+    loads.insert("ministral3-3b", (FakeLLM::named("ministral"), Fit::AfterEviction));
+    loads.insert("qwen3.5-2b", (qwen.clone(), Fit::AsIs));
+    let (tried, llm) = walk(vec![ws_model("qwen3.5-2b"), ws_model("ministral3-3b")], loads);
+    assert_eq!(tried, vec![attempt("ministral3-3b", false), attempt("qwen3.5-2b", false)]);
+    assert!(same(&llm.expect("a model"), &qwen));
+}
+
+#[test]
+fn test_eviction_is_tried_only_when_nothing_fits_as_things_stand() {
+    let ministral = FakeLLM::named("ministral");
+    let mut loads = HashMap::new();
+    loads.insert("ministral3-3b", (ministral.clone(), Fit::AfterEviction));
+    let (tried, llm) = walk(vec![ws_model("qwen3.5-2b"), ws_model("ministral3-3b")], loads);
+    assert_eq!(
+        tried,
+        vec![attempt("ministral3-3b", false), attempt("qwen3.5-2b", false), attempt("ministral3-3b", true)]
+    );
     assert!(same(&llm.expect("a model"), &ministral));
 }
 
