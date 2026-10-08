@@ -484,7 +484,8 @@ impl MCPServerType {
 #[serde(rename_all = "snake_case")]
 pub enum MCPAuthType {
     Oauth,
-    TokenUrl,
+    /// A credential supplied by the user rather than granted (a PAT pasted
+    /// into the connect form), sent as a bearer token and never refreshable.
     Token,
     #[default]
     None,
@@ -495,7 +496,6 @@ impl MCPAuthType {
     pub fn as_str(&self) -> &'static str {
         match self {
             MCPAuthType::Oauth => "oauth",
-            MCPAuthType::TokenUrl => "token_url",
             MCPAuthType::Token => "token",
             MCPAuthType::None => "none",
         }

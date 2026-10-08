@@ -2185,7 +2185,6 @@ impl ModelService {
 
         let mcp_auth = match auth_type {
             "oauth" => MCPAuthType::Oauth,
-            "token_url" => MCPAuthType::TokenUrl,
             "token" => MCPAuthType::Token,
             _ => MCPAuthType::None,
         };
