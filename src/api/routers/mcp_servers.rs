@@ -1674,6 +1674,32 @@ fn oauth_discover(
     })
 }
 
+/// Labels of the required `credential_fields` on *curated* that *request*
+/// leaves empty.  A token carried in the server URL's query satisfies a
+/// "token" field.
+fn missing_credentials(
+    request: &MCPRegisterRequest,
+    curated: Option<&MCPCatalogEntry>,
+    has_token: bool,
+) -> Vec<String> {
+    let Some(rc) = curated.and_then(|c| c.remote_config.as_ref()) else {
+        return Vec::new();
+    };
+    let supplied = serde_json::to_value(request).unwrap_or(Value::Null);
+    rc.credential_fields
+        .iter()
+        .filter(|f| f.required)
+        .filter(|f| {
+            let given = supplied.get(&f.key).is_some_and(|v| match v {
+                Value::String(s) => !s.is_empty(),
+                v => !v.is_null(),
+            });
+            !(given || (f.key == "token" && has_token))
+        })
+        .map(|f| f.label.clone())
+        .collect()
+}
+
 /// Register a remote MCP server.  Tries direct connection first, falls back
 /// to OAuth (stashing a pending session and returning `auth_type="oauth"`).
 ///
@@ -1728,6 +1754,16 @@ pub async fn register_remote_mcp_server(
         server_url.clone()
     };
 
+    // A curated entry that needs a pasted credential can't fall back to OAuth,
+    // so name the missing credential up front.
+    let missing = missing_credentials(request, curated, token.is_some());
+    if !missing.is_empty() {
+        return Err(HTTPException::new(
+            400,
+            format!("This connection needs {} to be supplied.", missing.join(" and ")),
+        ));
+    }
+
     let registry = registry_for(&model_service);
 
     // Try direct connection (no auth or token).
@@ -1781,8 +1817,10 @@ pub async fn register_remote_mcp_server(
                         .and_then(|r| build_server_response(&r))
                     {
                         Ok(server) => {
+                            // Report what was stored so the client can tell a
+                            // token connection from an open one.
                             return Ok(MCPRegisterResponse {
-                                auth_type: "none".to_string(),
+                                auth_type: if token.is_some() { "token" } else { "none" }.to_string(),
                                 server: Some(server),
                                 ..Default::default()
                             });

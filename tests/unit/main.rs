@@ -72,6 +72,7 @@ mod test_mcp_catalog_cache;
 mod test_mcp_catalog_provenance;
 mod test_mcp_collect_gather;
 mod test_mcp_credential_persistence;
+mod test_mcp_credential_prompt;
 mod test_mcp_dead_grant;
 mod test_mcp_definition_install;
 mod test_mcp_definitions;

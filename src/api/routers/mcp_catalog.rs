@@ -46,10 +46,38 @@ impl IntoResponse for HTTPException {
     }
 }
 
+/// One value the client collects before registering the server.
+///
+/// Used by entries that connect with a pasted credential (e.g. a GitHub PAT)
+/// instead of OAuth.  The client renders a form from these fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct CredentialField {
+    /// The `MCPRegisterRequest` field to send the value as, e.g. "token".
+    pub key: String,
+    pub label: String,
+    /// What to paste and, for a token, which scopes it needs.
+    #[serde(default)]
+    pub help: Option<String>,
+    /// Where to create the credential, e.g. GitHub's token settings page.
+    #[serde(default)]
+    pub help_url: Option<String>,
+    /// Mask on entry and never echo back.
+    #[serde(default = "default_true")]
+    pub secret: bool,
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Connection settings for a remotely hosted catalog server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct RemoteConfig {
     pub server_url: String,
+    /// "oauth", "token" or "none".  A "token" entry is one the client must
+    /// prompt for; it carries `credential_fields` describing what to ask.
     #[serde(default)]
     pub auth_type: Option<String>,
     #[serde(default)]
@@ -60,6 +88,8 @@ pub struct RemoteConfig {
     pub token_endpoint: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
+    #[serde(default)]
+    pub credential_fields: Vec<CredentialField>,
 }
 
 /// Launch settings for a catalog server run locally over stdio.
