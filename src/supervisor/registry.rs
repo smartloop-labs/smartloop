@@ -74,8 +74,10 @@ pub(crate) fn with_process<R>(
 /// Whether the OS says something holds `pid`, asked without signalling it.
 ///
 /// Only used when sysinfo cannot see the process: on POSIX, `kill(pid, 0)`
-/// is a pure question, and `EPERM` means the process is there, just not ours
-/// (psutil's `AccessDenied`).
+/// is a pure question.  Success means the process is there and ours; `EPERM`
+/// means it is there, just not ours (psutil's `AccessDenied`).  Success is
+/// the common answer inside the macOS App Sandbox, where sysinfo is denied
+/// even our own children and our parent.
 #[cfg(unix)]
 fn exists_but_hidden(pid: i64) -> bool {
     if pid <= 0 || pid > i64::from(i32::MAX) {
@@ -83,7 +85,32 @@ fn exists_but_hidden(pid: i64) -> bool {
     }
     // SAFETY: signal 0 performs only the existence and permission checks.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if rc == 0 {
+        // A zombie answers signal 0 too, and sysinfo on macOS does not list
+        // zombies, so ask whether it is a child of ours that has exited.
+        return !is_unreaped_child(pid);
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether `pid` is a child of ours that has exited but not been waited on.
+///
+/// `WNOWAIT` leaves it unreaped for whoever owns its `Child`; anything that
+/// is not our child answers `ECHILD`, which is not a zombie of ours.
+#[cfg(unix)]
+fn is_unreaped_child(pid: i64) -> bool {
+    // SAFETY: an all-zero siginfo_t is valid, and waitid only writes into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // SAFETY: waitid succeeded, so si_pid is set (0 when it has not exited).
+    rc == 0 && unsafe { info.si_pid() } != 0
 }
 
 #[cfg(not(unix))]
@@ -512,4 +539,21 @@ pub fn read_project_agent(project_dir: &str) -> Option<(i64, u16)> {
     let pid = parse_py_int(&read(AGENT_PID_FILE)?)?;
     let port = u16::try_from(parse_py_int(&read(AGENT_PORT_FILE)?)?).ok()?;
     Some((pid, port))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::exists_but_hidden;
+
+    /// The fallback for a process sysinfo cannot see (the macOS App Sandbox
+    /// hides even our own children): signal 0 succeeding means it is there.
+    #[test]
+    fn a_process_we_may_signal_exists() {
+        assert!(exists_but_hidden(i64::from(std::process::id())));
+    }
+
+    #[test]
+    fn a_pid_nothing_holds_does_not() {
+        assert!(!exists_but_hidden(4194305));
+    }
 }
