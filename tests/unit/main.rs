@@ -28,6 +28,7 @@ mod test_context_precedence;
 mod test_credential_store;
 mod test_current_date_grounding;
 mod test_dag_executor_llm_serialization;
+mod test_deselected_model_not_reused;
 mod test_direct_name_match;
 mod test_discrepancy_skill_e2e;
 mod test_doc_splitter;

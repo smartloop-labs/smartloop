@@ -1402,8 +1402,19 @@ impl ModelService {
         if self.pinned_model(None).is_some() {
             return self.pinned_llm(None);
         }
-        if let Some(llm) = self.large_llm.read().clone() {
-            return Some(llm);
+        let cached = self.large_llm.read().clone();
+        if let Some(llm) = cached {
+            let name = self.large_model_name.read().clone().unwrap_or_default();
+            if self.still_selected(&name) {
+                return Some(llm);
+            }
+            tracing::info!(
+                target: LOG_TARGET,
+                "[large-model] {name} is no longer selected for this project — releasing it"
+            );
+            // Clears the slot and the attempted latch, so detection below
+            // picks again from what is selected now.
+            self.unload_model_by_name_unlocked(&name);
         }
         if self.large_model_attempted.load(Ordering::SeqCst) {
             return None;
@@ -1493,12 +1504,21 @@ impl ModelService {
         if !app.vision_enabled {
             return None;
         }
-        if let Some(llm) = self.vision_llm.read().clone() {
+        let cached = self.vision_llm.read().clone();
+        if let Some(llm) = cached {
             let name = self.vision_model_name.read().clone().filter(|n| !n.is_empty());
-            if let (Some(cb), Some(name)) = (on_model_selected, name) {
-                cb(&name);
+            if name.as_deref().is_none_or(|n| self.still_selected(n)) {
+                if let (Some(cb), Some(name)) = (on_model_selected, name) {
+                    cb(&name);
+                }
+                return Some(llm);
             }
-            return Some(llm);
+            let name = name.unwrap_or_default();
+            tracing::info!(
+                target: LOG_TARGET,
+                "[vision] {name} is no longer selected for this project — releasing it"
+            );
+            self.unload_model_by_name_unlocked(&name);
         }
         let workspace = self.workspace_handle()?;
 
@@ -1690,6 +1710,24 @@ impl ModelService {
             })
             .cloned()
             .collect()
+    }
+
+    /// True while `model_name` is enabled and downloaded for the bound
+    /// project; true for an empty name or when there is no workspace.
+    ///
+    /// The large and vision slots are process-wide, but selection is per
+    /// project and is written by that project's child.  Deselecting there
+    /// cannot release what this process (the model host) holds, so a cached
+    /// model is checked against the selection each time it is reused.
+    fn still_selected(&self, model_name: &str) -> bool {
+        if model_name.is_empty() {
+            return true;
+        }
+        let Some(workspace) = self.workspace_handle() else {
+            return true;
+        };
+        let ws = workspace.read();
+        ws.effective_model_enabled(model_name, ws.current_project()) && ws.effective_model_downloaded(model_name)
     }
 
     /// The sole selected model, or `None` when it cannot serve the step.
