@@ -1,6 +1,7 @@
 //! Registering remote MCP servers that connect with a pasted credential.
 //!
-//! Covers catalog `credential_fields` and the auth type register reports.
+//! Covers catalog `credential_fields`, the auth type register reports, and
+//! how a supplied token that fails to connect is handled.
 //! The handshake, the `/info` probe and the model service's MCP registry are
 //! stood in for through the router's hooks; the registry records what
 //! register asked it to store.
@@ -18,9 +19,9 @@ use smartloop::api::routers::mcp_servers::{
     McpServerRegistry,
 };
 use smartloop::api::services::model_service::ModelService;
-use smartloop::mcp::client::MCPConnectResult;
+use smartloop::mcp::client::{HttpResponse, HttpTransportOverride, MCPConnectResult};
 
-use crate::shared::mcp::{block_on, reset_router_state, tool};
+use crate::shared::mcp::{block_on, reset_router_state, tool, FakeHttp};
 
 const PAT: &str = "ghp_pasted_by_the_user";
 const GITHUB_URL: &str = "https://api.githubcopilot.com/mcp/";
@@ -204,4 +205,58 @@ fn test_a_token_in_the_url_counts_as_supplied() {
 
     assert_eq!(resp.expect("registered").auth_type, "token");
     assert_eq!(registry.added.lock()[0].token.as_deref(), Some(PAT));
+}
+
+// ------------------------------------------------------- a refused token stops there
+
+fn refused(auth_expired: bool) -> MCPConnectResult {
+    MCPConnectResult {
+        success: false,
+        error: Some("Authorization failed".into()),
+        auth_expired,
+        ..Default::default()
+    }
+}
+
+/// Register against a handshake that fails with *connect*.  Returns the error
+/// and whether OAuth discovery went on to fetch any metadata.
+fn register_failing(request: MCPRegisterRequest, connect: MCPConnectResult) -> (HTTPException, bool) {
+    let http = FakeHttp::new(|_, _, _| Ok(HttpResponse::new(404, "")));
+    let _transport = HttpTransportOverride::install(http.clone());
+    let (resp, registry) = register(request, None, connect);
+    assert!(registry.added.lock().is_empty());
+    let oauth_ran = http.calls.lock().iter().any(|c| c.url.contains("/.well-known/"));
+    (resp.expect_err("refused"), oauth_ran)
+}
+
+#[test]
+#[serial]
+#[serial(mcp_global)]
+fn test_a_rejected_token_says_so() {
+    let (err, oauth_ran) = register_failing(remote(GITHUB_URL, Some(PAT)), refused(true));
+
+    assert_eq!(err.status_code, 401);
+    assert!(err.detail.contains("access token was rejected"), "{}", err.detail);
+    assert!(!oauth_ran);
+}
+
+#[test]
+#[serial]
+#[serial(mcp_global)]
+fn test_any_other_failure_with_a_token_skips_oauth_too() {
+    let (err, oauth_ran) = register_failing(remote(GITHUB_URL, Some(PAT)), refused(false));
+
+    assert_eq!(err.status_code, 502);
+    assert!(err.detail.contains("Authorization failed"), "{}", err.detail);
+    assert!(!oauth_ran);
+}
+
+#[test]
+#[serial]
+#[serial(mcp_global)]
+fn test_without_a_token_a_401_still_starts_oauth() {
+    // DCR servers (Atlassian, Trello) must keep reaching registration.
+    let (_, oauth_ran) = register_failing(remote("https://mcp.atlassian.com/v1/mcp", None), refused(true));
+
+    assert!(oauth_ran);
 }

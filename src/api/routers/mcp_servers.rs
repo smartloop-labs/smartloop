@@ -1849,6 +1849,26 @@ pub async fn register_remote_mcp_server(
         );
     }
 
+    // A supplied token that fails to connect is reported as such; falling back
+    // to OAuth would surface an unrelated DCR error instead.
+    if token.is_some() {
+        if connect_result.as_ref().is_some_and(|r| r.auth_expired) {
+            return Err(HTTPException::new(
+                401,
+                format!(
+                    "The access token was rejected by {}. \
+                     Check it is correct and has not expired or been revoked.",
+                    parsed.netloc
+                ),
+            ));
+        }
+        let detail = match connect_result.as_ref().and_then(|r| r.error.as_deref()) {
+            Some(reason) => format!("Could not connect to {} with the access token: {reason}", parsed.netloc),
+            None => format!("Could not connect to {} with the access token.", parsed.netloc),
+        };
+        return Err(HTTPException::new(502, detail));
+    }
+
     // Fall back to OAuth.
     let callback_url = non_empty(request.callback_url.as_deref())
         .unwrap_or_else(|| default_callback_url(project_id));
