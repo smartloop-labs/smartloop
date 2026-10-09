@@ -99,4 +99,42 @@ mod test_model_kind {
         assert_eq!(value["type"], "remote");
         assert!(value.get("kind").is_none());
     }
+
+    #[test]
+    fn test_workspace_and_project_entries_carry_the_remote_fields() {
+        use smartloop::api::routers::models::{ProjectModelEntry, WorkspaceModelEntry};
+
+        let workspace = WorkspaceModelEntry {
+            model_name: "kimi-k2".into(),
+            model_id: String::new(),
+            downloaded: true,
+            is_active: false,
+            enabled: true,
+            capabilities: vec!["general".into()],
+            thinking: None,
+            kind: ModelKind::Remote,
+            url: Some("https://api.smartloop.ai".into()),
+            context_length: Some(131072),
+        };
+        let value = serde_json::to_value(&workspace).unwrap();
+        assert_eq!(value["type"], "remote");
+        assert_eq!(value["url"], "https://api.smartloop.ai");
+        assert_eq!(value["context_length"], 131072);
+
+        let project = ProjectModelEntry {
+            model_name: "kimi-k2".into(),
+            model_id: String::new(),
+            downloaded: true,
+            is_active: false,
+            enabled: true,
+            capabilities: vec![],
+            settings: Default::default(),
+            kind: ModelKind::Remote,
+            url: Some("https://api.smartloop.ai".into()),
+            context_length: None,
+        };
+        let value = serde_json::to_value(&project).unwrap();
+        assert_eq!(value["type"], "remote");
+        assert_eq!(value["context_length"], serde_json::Value::Null);
+    }
 }

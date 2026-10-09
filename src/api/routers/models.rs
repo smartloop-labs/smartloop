@@ -791,6 +791,12 @@ pub struct WorkspaceModelEntry {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub thinking: Option<bool>,
+    #[serde(rename = "type", default)]
+    pub kind: ModelKind,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u32>,
 }
 
 /// `sorted(models, key=lambda m: m._rank, reverse=True)`: best model first
@@ -845,6 +851,9 @@ pub async fn list_workspace_models_with(
                 enabled: m.enabled,
                 capabilities: display_capabilities(&m.effective_capabilities()),
                 thinking: ws.effective_model_thinking(&m.model_name, None),
+                kind: m.kind,
+                url: m.url.clone(),
+                context_length: m.context_length,
             })
             .collect())
     };
@@ -1032,6 +1041,12 @@ pub struct ProjectModelEntry {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub settings: Map<String, Value>,
+    #[serde(rename = "type", default)]
+    pub kind: ModelKind,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u32>,
 }
 
 /// Body of `PATCH /v1/projects/{project_id}/models/{model_name}`.
@@ -1111,6 +1126,9 @@ pub async fn list_project_models_with(
                     .project_model(project, &m.model_name)
                     .map(|pm| pm.settings.clone())
                     .unwrap_or_default(),
+                kind: m.kind,
+                url: m.url.clone(),
+                context_length: m.context_length,
             })
             .collect())
     };
