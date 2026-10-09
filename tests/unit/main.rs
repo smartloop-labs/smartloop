@@ -98,6 +98,7 @@ mod test_mcp_tool_resolution;
 mod test_model_access_level;
 mod test_remote_workspace_model;
 mod test_cloud_llm;
+mod test_cloud_model_routing;
 mod test_model_display_name;
 mod test_model_host;
 mod test_model_label_naming;
