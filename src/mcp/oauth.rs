@@ -69,6 +69,32 @@ pub struct TokenResponse {
     pub scope: Option<String>,
 }
 
+/// RFC 8628 §3.2 device authorization response.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct DeviceAuthorization {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
+    pub expires_in: i64,
+    /// Seconds to wait between polls.
+    pub interval: i64,
+}
+
+/// The outcome of one device-token poll (RFC 8628 §3.5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DevicePoll {
+    Pending,
+    /// Poll less often; `interval` is the server's new minimum, when it sent one.
+    SlowDown { interval: Option<i64> },
+    Granted(TokenResponse),
+    Expired,
+    Denied,
+}
+
+/// RFC 8628 §3.2 default when the server names no interval.
+pub const DEFAULT_DEVICE_POLL_INTERVAL_S: i64 = 5;
+
 // ------------------------------------------------------------------ errors
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -287,6 +313,51 @@ fn opt_i64(data: &Map<String, Value>, key: &str) -> Option<i64> {
         Value::String(s) => s.trim().parse::<i64>().ok(),
         _ => None,
     }
+}
+
+/// Read an RFC 6749 §5.1 success body.
+fn token_response(data: &Map<String, Value>) -> Result<TokenResponse, MCPOAuthError> {
+    let Some(access_token) = data.get("access_token") else {
+        return Err(TokenExchangeError::new("Invalid token response - missing 'access_token'", None, None).into());
+    };
+    Ok(TokenResponse {
+        access_token: py_str(Some(access_token)),
+        token_type: match data.get("token_type") {
+            None => "Bearer".to_string(),
+            Some(v) => py_str(Some(v)),
+        },
+        expires_in: opt_i64(data, "expires_in"),
+        refresh_token: opt_string(data, "refresh_token"),
+        scope: opt_string(data, "scope"),
+    })
+}
+
+/// Read one RFC 8628 §3.5 device-token poll response.
+///
+/// The error codes are read whatever the status, since some providers
+/// (GitHub) answer a pending grant with HTTP 200.
+pub fn device_poll_response(status: u16, body: &str) -> Result<DevicePoll, MCPOAuthError> {
+    let data = match serde_json::from_str::<Value>(body) {
+        Ok(Value::Object(data)) => data,
+        _ => return Err(token_error(status, body, "Device authorization failed").into()),
+    };
+    match data.get("error").and_then(Value::as_str) {
+        Some("authorization_pending") => Ok(DevicePoll::Pending),
+        Some("slow_down") => Ok(DevicePoll::SlowDown { interval: opt_i64(&data, "interval") }),
+        Some("expired_token") => Ok(DevicePoll::Expired),
+        Some("access_denied") => Ok(DevicePoll::Denied),
+        Some(_) => Err(token_error(status, body, "Device authorization failed").into()),
+        None if (200..300).contains(&status) => token_response(&data).map(DevicePoll::Granted),
+        None => Err(token_error(status, body, "Device authorization failed").into()),
+    }
+}
+
+/// Form-post headers that ask for JSON back; GitHub answers form-encoded without `Accept`.
+fn json_form_headers() -> Vec<(String, String)> {
+    vec![
+        ("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+    ]
 }
 
 // ------------------------------------------------------------------ service
@@ -620,19 +691,7 @@ impl MCPOAuthService {
             Ok(_) => return Err(MCPOAuthError::Other("Invalid token response - not an object".to_string())),
             Err(e) => return Err(MCPOAuthError::Other(e.to_string())),
         };
-        let Some(access_token) = data.get("access_token") else {
-            return Err(TokenExchangeError::new("Invalid token response - missing 'access_token'", None, None).into());
-        };
-        Ok(TokenResponse {
-            access_token: py_str(Some(access_token)),
-            token_type: match data.get("token_type") {
-                None => "Bearer".to_string(),
-                Some(v) => py_str(Some(v)),
-            },
-            expires_in: opt_i64(&data, "expires_in"),
-            refresh_token: opt_string(&data, "refresh_token"),
-            scope: opt_string(&data, "scope"),
-        })
+        token_response(&data)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -660,6 +719,62 @@ impl MCPOAuthService {
             token_data.push(("resource".to_string(), resource.to_string()));
         }
         self.token_request(token_endpoint, token_data, "Token exchange failed")
+    }
+
+    /// RFC 8628 §3.1: ask for a device code and the code the user enters.
+    pub fn request_device_code(
+        &self,
+        device_authorization_endpoint: &str,
+        client_id: &str,
+        scope: Option<&str>,
+    ) -> Result<DeviceAuthorization, MCPOAuthError> {
+        let mut form = vec![("client_id".to_string(), client_id.to_string())];
+        if let Some(scope) = scope.filter(|s| !s.is_empty()) {
+            form.push(("scope".to_string(), scope.to_string()));
+        }
+        let response = self
+            .http()?
+            .post(device_authorization_endpoint, &HttpBody::Form(form), &json_form_headers())
+            .map_err(|e| MCPOAuthError::Other(format!("Failed to connect to {device_authorization_endpoint}: {e}")))?;
+        if !response.is_success() {
+            return Err(token_error(response.status, &response.body, "Device authorization failed").into());
+        }
+        let data = match serde_json::from_str::<Value>(&response.body) {
+            Ok(Value::Object(data)) => data,
+            _ => return Err(MCPOAuthError::Other("Invalid device authorization response - not a JSON object".to_string())),
+        };
+        let required = |key: &str| {
+            opt_string(&data, key).filter(|v| !v.is_empty()).ok_or_else(|| {
+                MCPOAuthError::Other(format!("Invalid device authorization response - missing '{key}'"))
+            })
+        };
+        Ok(DeviceAuthorization {
+            device_code: required("device_code")?,
+            user_code: required("user_code")?,
+            verification_uri: required("verification_uri")?,
+            verification_uri_complete: opt_string(&data, "verification_uri_complete"),
+            expires_in: opt_i64(&data, "expires_in").unwrap_or(900),
+            interval: opt_i64(&data, "interval").unwrap_or(DEFAULT_DEVICE_POLL_INTERVAL_S),
+        })
+    }
+
+    /// RFC 8628 §3.4: poll once for the token behind *device_code*.
+    pub fn poll_device_token(
+        &self,
+        token_endpoint: &str,
+        client_id: &str,
+        device_code: &str,
+    ) -> Result<DevicePoll, MCPOAuthError> {
+        let form = vec![
+            ("grant_type".to_string(), "urn:ietf:params:oauth:grant-type:device_code".to_string()),
+            ("device_code".to_string(), device_code.to_string()),
+            ("client_id".to_string(), client_id.to_string()),
+        ];
+        let response = self
+            .http()?
+            .post(token_endpoint, &HttpBody::Form(form), &json_form_headers())
+            .map_err(|e| TokenExchangeError::new(format!("Failed to connect to {token_endpoint}: {e}"), None, None))?;
+        device_poll_response(response.status, &response.body)
     }
 
     pub fn refresh_access_token(
@@ -702,6 +817,34 @@ mod tests {
     #[test]
     fn quote_plus_matches_python() {
         assert_eq!(quote_plus("https://a.b/c d~*"), "https%3A%2F%2Fa.b%2Fc+d~%2A");
+    }
+
+    #[test]
+    fn device_poll_reads_errors_sent_with_200() {
+        assert_eq!(device_poll_response(200, r#"{"error":"authorization_pending"}"#).unwrap(), DevicePoll::Pending);
+        assert_eq!(
+            device_poll_response(200, r#"{"error":"slow_down","interval":10}"#).unwrap(),
+            DevicePoll::SlowDown { interval: Some(10) }
+        );
+        assert_eq!(device_poll_response(400, r#"{"error":"expired_token"}"#).unwrap(), DevicePoll::Expired);
+        assert_eq!(device_poll_response(400, r#"{"error":"access_denied"}"#).unwrap(), DevicePoll::Denied);
+    }
+
+    #[test]
+    fn device_poll_grants_a_token() {
+        let poll = device_poll_response(200, r#"{"access_token":"gho_x","token_type":"bearer","scope":"repo"}"#).unwrap();
+        let DevicePoll::Granted(token) = poll else { panic!("expected a grant, got {poll:?}") };
+        assert_eq!(token.access_token, "gho_x");
+        assert_eq!(token.refresh_token, None);
+    }
+
+    #[test]
+    fn device_poll_surfaces_other_errors() {
+        let err = device_poll_response(200, r#"{"error":"incorrect_client_credentials","error_description":"bad id"}"#)
+            .unwrap_err();
+        assert_eq!(err.as_token_exchange().unwrap().error_code.as_deref(), Some("incorrect_client_credentials"));
+        assert!(err.to_string().contains("bad id"));
+        assert!(device_poll_response(502, "Bad Gateway").is_err());
     }
 
     #[test]
