@@ -229,7 +229,7 @@ fn test_a_pasted_token_that_stopped_working_is_reported() {
     assert_eq!(caller.refresh_access_token(&mut server, None), None);
 
     assert_eq!(server.status, MCPServerStatus::Failed);
-    assert!(server.last_error.as_deref().unwrap_or("").contains("Enter a new token"));
+    assert!(server.last_error.as_deref().unwrap_or("").contains("Reconnect to sign in again"));
 }
 
 /// Nothing to re-enter: it needs re-authorizing, not a new paste.

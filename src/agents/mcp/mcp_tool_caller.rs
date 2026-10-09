@@ -641,7 +641,7 @@ impl MCPToolCaller {
         }
         self.fail(
             server,
-            "The access token for this connection was rejected. Enter a new token to reconnect.",
+            "The access token for this connection was rejected. Reconnect to sign in again.",
         )
     }
 
