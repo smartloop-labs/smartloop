@@ -1,6 +1,7 @@
 //! Port of `smartloop/llms/__init__.py`.
 
 pub mod base_llm;
+pub mod cloud_llm;
 pub mod llama;
 pub mod llama_cpp;
 pub mod llm_factory;
