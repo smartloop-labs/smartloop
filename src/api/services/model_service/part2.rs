@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::agents::agent::SharedLLM;
 use crate::agents::hybrid_executor::LLMExecutor;
 use crate::agents::mcp::argument_extractor::MCPArgumentExtractor;
-use crate::agents::mcp::mcp_tool_caller::{LiveCredentialsFn, MCPToolCaller, PersistFn};
+use crate::agents::mcp::mcp_tool_caller::{LiveCredentialsFn, MCPToolCaller, PersistFn, ServerChange};
 use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
@@ -2726,8 +2726,11 @@ impl ModelService {
     /// The hook a tool caller uses to write a rotated token back.
     fn persist_hook(&self) -> PersistFn {
         let weak = self.weak_self.clone();
-        Arc::new(move |server: &MCPServer| match weak.upgrade() {
-            Some(service) => service.persist_mcp_server(server),
+        Arc::new(move |server: &MCPServer, change: ServerChange| match weak.upgrade() {
+            Some(service) => match change {
+                ServerChange::Credentials => service.persist_mcp_credentials(server),
+                ServerChange::Status => service.persist_mcp_status(server),
+            },
             None => Ok(()),
         })
     }
@@ -2754,9 +2757,9 @@ impl ModelService {
     ///
     /// One read-only call on the provisioning pass; best-effort.  It is also
     /// the call most likely to renew an expired token, so its caller carries
-    /// the persistence hook and a reported rotation is saved here as well —
-    /// a rotation nothing writes would be discarded by the next reload,
-    /// leaving a refresh token the provider has already retired.
+    /// the persistence hook, which saves a rotation as it happens — a rotation
+    /// nothing writes would be discarded by the next reload, leaving a refresh
+    /// token the provider has already retired.
     pub fn probe_mcp_account(&self, server: &mut MCPServer) {
         let probed = catch_unwind(AssertUnwindSafe(|| {
             let caller: Arc<dyn ReadOnlyToolCaller> = Arc::new(PersistingToolCaller(self.transport_tool_caller()));
@@ -2765,7 +2768,9 @@ impl ModelService {
                 None => probe_account(&mut *server, Some(caller)),
             }
         }));
-        let (account, credentials_changed) = match probed {
+        // A rotation the probe made has already been written by the caller's
+        // persist hook, so only the account is left to save here.
+        let (account, _credentials_changed) = match probed {
             Ok(outcome) => outcome,
             Err(panic) => {
                 tracing::debug!(target: LOG, "[mcp-account] probe failed for '{}': {}", server.name, panic_message(&panic));
@@ -2773,15 +2778,9 @@ impl ModelService {
             }
         };
 
-        let mut changed = credentials_changed;
         if truthy(&account) && account != server.account {
             server.account = account;
-            changed = true;
-        }
-        if changed {
-            // The hook has already written a rotation; this covers a caller
-            // built without one.
-            if let Err(e) = self.persist_mcp_server(server) {
+            if let Err(e) = self.persist_mcp_account(server) {
                 tracing::warn!(target: LOG, "[mcp-account] could not save '{}': {e}", server.name);
             }
         }
@@ -2799,21 +2798,38 @@ impl ModelService {
             .and_then(|s| s.oauth_credentials.clone())
     }
 
-    /// Save `server`'s state onto the workspace this service holds now.
+    /// Save `server`'s OAuth credentials onto the workspace.
+    pub fn persist_mcp_credentials(&self, server: &MCPServer) -> anyhow::Result<()> {
+        self.update_live_mcp_server(&server.id, |live| live.oauth_credentials = server.oauth_credentials.clone())
+    }
+
+    /// Save `server`'s status and last error onto the workspace.
+    pub fn persist_mcp_status(&self, server: &MCPServer) -> anyhow::Result<()> {
+        self.update_live_mcp_server(&server.id, |live| {
+            live.status = server.status;
+            live.last_error = server.last_error.clone();
+        })
+    }
+
+    /// Save `server`'s linked account onto the workspace.
+    pub fn persist_mcp_account(&self, server: &MCPServer) -> anyhow::Result<()> {
+        self.update_live_mcp_server(&server.id, |live| live.account = server.account.clone())
+    }
+
+    /// Apply `update` to server `server_id` on the workspace this service
+    /// holds now, then save.
     ///
     /// Re-finds the server by id so the write lands on the instance that will
     /// be serialized; a server deleted while the pass ran is left gone rather
-    /// than resurrected.
-    pub fn persist_mcp_server(&self, server: &MCPServer) -> anyhow::Result<()> {
+    /// than resurrected.  Each caller writes only the fields it changed: the
+    /// server it holds is a copy, stale everywhere else.
+    fn update_live_mcp_server(&self, server_id: &str, update: impl FnOnce(&mut MCPServer)) -> anyhow::Result<()> {
         let model = self.model_or_err()?;
         {
             let mut workspace = model.workspace.write();
-            let live = workspace.projects.iter_mut().flat_map(|p| p.mcp_servers.iter_mut()).find(|s| s.id == server.id);
+            let live = workspace.projects.iter_mut().flat_map(|p| p.mcp_servers.iter_mut()).find(|s| s.id == server_id);
             if let Some(live) = live {
-                live.oauth_credentials = server.oauth_credentials.clone();
-                live.account = server.account.clone();
-                live.status = server.status;
-                live.last_error = server.last_error.clone();
+                update(live);
             }
         }
         self.persist_model()

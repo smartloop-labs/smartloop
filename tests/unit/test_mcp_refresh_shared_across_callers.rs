@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 use serial_test::serial;
 
-use smartloop::agents::mcp::mcp_tool_caller::{reset_refresh_state, MCPToolCaller};
+use smartloop::agents::mcp::mcp_tool_caller::{reset_refresh_state, MCPToolCaller, ServerChange};
 use smartloop::mcp::client::{HttpBody, HttpResponse, HttpTransportOverride};
 use smartloop::workspace::workspace::MCPServerStatus;
 use smartloop::workspace::MCPServer;
@@ -211,11 +211,15 @@ fn test_a_reconnection_is_not_held_back() {
 fn workspace_backed_caller(live: &Arc<Mutex<MCPServer>>) -> MCPToolCaller {
     let caller = tool_caller();
     let sink = live.clone();
-    caller.set_persist(Some(Arc::new(move |server: &MCPServer| {
+    caller.set_persist(Some(Arc::new(move |server: &MCPServer, change: ServerChange| {
         let mut live = sink.lock();
-        live.oauth_credentials = server.oauth_credentials.clone();
-        live.status = server.status;
-        live.last_error = server.last_error.clone();
+        match change {
+            ServerChange::Credentials => live.oauth_credentials = server.oauth_credentials.clone(),
+            ServerChange::Status => {
+                live.status = server.status;
+                live.last_error = server.last_error.clone();
+            }
+        }
         Ok(())
     })));
     let source = live.clone();

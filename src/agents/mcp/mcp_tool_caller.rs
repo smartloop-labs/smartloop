@@ -68,10 +68,23 @@ pub fn reset_refresh_state() {
     REFRESH_FAILURES.lock().clear();
 }
 
+/// Which part of a server a write-back carries.
+///
+/// The server handed to the persist hook is the caller's copy, current only in
+/// the part that changed; writing the rest would put stale fields back over
+/// whatever another caller saved meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerChange {
+    /// `oauth_credentials`, after a refresh.
+    Credentials,
+    /// `status` and `last_error`, after a connection fails.
+    Status,
+}
+
 /// Writes refreshed credentials / a failed status back to the workspace.
 /// (Python: `Callable[[], None]`; Rust passes the changed server since it is
 /// not shared by reference with the workspace.)
-pub type PersistFn = Arc<dyn Fn(&MCPServer) -> anyhow::Result<()> + Send + Sync>;
+pub type PersistFn = Arc<dyn Fn(&MCPServer, ServerChange) -> anyhow::Result<()> + Send + Sync>;
 
 /// Reads a server's credentials as the workspace holds them now, by server id
 /// (`None` when the workspace does not have it).
@@ -566,7 +579,7 @@ impl MCPToolCaller {
             }
         }
 
-        self.write_back(server, "Refreshed");
+        self.write_back(server, ServerChange::Credentials, "Refreshed");
         tracing::info!(
             target: LOGGER,
             "Refreshed access token for server '{}'",
@@ -591,12 +604,12 @@ impl MCPToolCaller {
     /// The state in memory is good, so whatever this change was made for
     /// should still go ahead; it is the *next* process that pays for a failed
     /// write.
-    fn write_back(&self, server: &MCPServer, what: &str) {
+    fn write_back(&self, server: &MCPServer, change: ServerChange, what: &str) {
         let persist = self.persist.lock().clone();
         let Some(persist) = persist else {
             return;
         };
-        if let Err(e) = persist(server) {
+        if let Err(e) = persist(server, change) {
             tracing::warn!(
                 target: LOGGER,
                 "{} '{}' but could not persist the change: {}",
@@ -657,7 +670,7 @@ impl MCPToolCaller {
             server.name,
             message
         );
-        self.write_back(server, "Failed");
+        self.write_back(server, ServerChange::Status, "Failed");
         true
     }
 

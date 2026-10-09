@@ -27,7 +27,7 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use smartloop::agents::mcp::argument_extractor::MCPArgumentExtractor;
-use smartloop::agents::mcp::mcp_tool_caller::{reset_refresh_state, MCPToolCaller, PersistFn};
+use smartloop::agents::mcp::mcp_tool_caller::{reset_refresh_state, MCPToolCaller, PersistFn, ServerChange};
 use smartloop::agents::mcp::result_mapper::MCPResultMapper;
 use smartloop::agents::orchestration::step_executor::StepExecutor;
 use smartloop::workspace::workspace::{
@@ -78,12 +78,12 @@ fn caller(persist: Option<PersistFn>) -> MCPToolCaller {
     )
 }
 
-/// A persist hook that counts its calls (`saves.append(1)`).
-fn counting_persist() -> (PersistFn, Arc<Mutex<Vec<i32>>>) {
+/// A persist hook that records what each call wrote (`saves.append(1)`).
+fn counting_persist() -> (PersistFn, Arc<Mutex<Vec<ServerChange>>>) {
     let saves = Arc::new(Mutex::new(Vec::new()));
     let sink = saves.clone();
-    let persist: PersistFn = Arc::new(move |_server: &MCPServer| {
-        sink.lock().push(1);
+    let persist: PersistFn = Arc::new(move |_server: &MCPServer, change: ServerChange| {
+        sink.lock().push(change);
         Ok(())
     });
     (persist, saves)
@@ -142,7 +142,7 @@ fn a_retired_grant_fails_it(code: &str) {
 
     assert_eq!(server.status, MCPServerStatus::Failed);
     assert!(server.last_error.as_deref().unwrap_or("").contains("Reconnect"));
-    assert_eq!(*saves.lock(), vec![1]);
+    assert_eq!(*saves.lock(), vec![ServerChange::Status]);
 }
 
 #[test]
@@ -210,7 +210,7 @@ fn test_the_same_failure_twice_is_written_once() {
     caller.refresh_access_token(&mut server, None);
     caller.refresh_access_token(&mut server, None);
 
-    assert_eq!(*saves.lock(), vec![1]);
+    assert_eq!(*saves.lock(), vec![ServerChange::Status]);
 }
 
 // ---------------------------------------------------------------------------
