@@ -23,7 +23,7 @@ use crate::constants::canonical_model_name;
 use crate::model::downloader::artifact_downloader::DownloadError;
 use crate::model::downloader::cancellation::{DownloadCancelled, DownloadInProgress};
 use crate::platform::{get_platform_service, ModelAccessError, PlatformError, PlatformService};
-use crate::types::ModelCapability;
+use crate::types::{ModelCapability, ModelKind};
 use crate::workspace::workspace::{Project, SharedWorkspace, Workspace, WorkspaceError};
 
 /// Python logger name (`logging.getLogger(__name__)`).
@@ -365,7 +365,7 @@ pub async fn unload_model_with(model_service: Arc<ModelService>) -> Value {
     })
 }
 
-/// Mirrors the cloud catalog's access levels exactly (FREE/PRO/INTERNAL).
+/// Mirrors the cloud catalog's access levels exactly (FREE/FREE_LOGIN/PRO/INTERNAL).
 ///
 /// These values are proxied straight through from the platform API, so the
 /// members have to match `ModelAccessLevel` there or a valid row fails
@@ -376,6 +376,9 @@ pub async fn unload_model_with(model_service: Arc<ModelService>) -> Value {
 pub enum AccessLevel {
     #[serde(rename = "free")]
     Free,
+    /// Free, but only to a signed-in account.
+    #[serde(rename = "free_login")]
+    FreeLogin,
     #[serde(rename = "pro")]
     Paid,
     /// Not on any plan: staff/preview builds the catalog publishes alongside
@@ -385,10 +388,11 @@ pub enum AccessLevel {
 }
 
 impl AccessLevel {
-    /// The wire value (`"free"`, `"pro"`, `"internal"`).
+    /// The wire value (`"free"`, `"free_login"`, `"pro"`, `"internal"`).
     pub fn value(&self) -> &'static str {
         match self {
             AccessLevel::Free => "free",
+            AccessLevel::FreeLogin => "free_login",
             AccessLevel::Paid => "pro",
             AccessLevel::Internal => "internal",
         }
@@ -398,6 +402,7 @@ impl AccessLevel {
     pub fn from_value(value: &str) -> Option<Self> {
         match value {
             "free" => Some(AccessLevel::Free),
+            "free_login" => Some(AccessLevel::FreeLogin),
             "pro" => Some(AccessLevel::Paid),
             "internal" => Some(AccessLevel::Internal),
             _ => None,
@@ -447,6 +452,8 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct ModelEntry {
     pub name: String,
+    /// Empty for a remote model, which has no weights to name.
+    #[serde(deserialize_with = "null_as_empty")]
     pub model_id: String,
     #[serde(default)]
     pub size: Option<String>,
@@ -473,6 +480,18 @@ pub struct ModelEntry {
     /// known, rather than re-derived by every client (see [`mark_recommended`]).
     #[serde(default)]
     pub recommended: bool,
+    #[serde(rename = "type", default)]
+    pub kind: ModelKind,
+    /// Base URL a remote model's chat requests go to.  Filled with the
+    /// platform API base when the catalog sends none.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u32>,
+}
+
+fn null_as_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn default_true() -> bool {
@@ -530,7 +549,8 @@ pub async fn list_models(Query(query): Query<ListModelsQuery>) -> Result<Json<Ve
 ///
 /// Unparseable catalog rows are skipped with a warning; names are
 /// canonicalized; the bootstrap model is omitted; workspace state fills
-/// `enabled`/`capabilities`/`thinking`.  Sorted free-tier first, then by
+/// `enabled`/`capabilities`/`thinking`.  Sorted free, then free-with-login,
+/// then the rest, then by
 /// parameter size (both descending), then [`mark_recommended`] is applied.
 ///
 /// Only `enabled` resolves against `project_id`; download state is
@@ -596,19 +616,32 @@ pub fn list_models_with(
                     let caps: Vec<&str> =
                         (model_cls.default_capabilities)().iter().map(|c| c.value()).collect();
                     entry.capabilities = display_capabilities(&caps);
+                } else {
+                    // A model this build has no class for (every remote one)
+                    // keeps the catalog's list, minus names it can't route.
+                    entry.capabilities.retain(|c| ModelCapability::from_value(c).is_some());
+                    entry.capabilities = display_capabilities(&entry.capabilities);
                 }
             }
+        }
+        if entry.url.as_deref().is_none_or(str::is_empty) {
+            entry.url = Some(settings.slp_api_base.clone());
         }
         result.push(entry);
     }
     drop(ws_guard);
 
-    let sort_key = |entry: &ModelEntry| -> (bool, f64) {
+    let sort_key = |entry: &ModelEntry| -> (u8, f64) {
         let size = SUPPORTED_MODELS
             .get(&entry.name)
             .map(|cls| (cls.param_size_in_b)())
             .unwrap_or(0.0);
-        (entry.access_level == Some(AccessLevel::Free), size)
+        let tier = match entry.access_level {
+            Some(AccessLevel::Free) => 2,
+            Some(AccessLevel::FreeLogin) => 1,
+            _ => 0,
+        };
+        (tier, size)
     };
     // ``sorted(..., reverse=True)``: descending, stable for equal keys.
     result.sort_by(|a, b| {

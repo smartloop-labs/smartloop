@@ -51,3 +51,52 @@ fn test_an_absent_level_stays_absent() {
     let parsed: ModelEntry = serde_json::from_value(json!({"name": "x", "model_id": "y"})).unwrap();
     assert_eq!(parsed.access_level, None);
 }
+
+#[test]
+fn test_free_login_is_a_known_tier() {
+    assert_eq!(entry("free_login").access_level, Some(AccessLevel::FreeLogin));
+}
+
+mod test_model_kind {
+    use serde_json::json;
+    use smartloop::api::routers::models::ModelEntry;
+    use smartloop::types::ModelKind;
+
+    fn kind(row: serde_json::Value) -> ModelEntry {
+        serde_json::from_value(row).expect("a catalog row must validate")
+    }
+
+    #[test]
+    fn test_a_remote_row_carries_its_url_and_context() {
+        let parsed = kind(json!({
+            "name": "kimi-k2", "model_id": null, "type": "remote",
+            "url": "https://api.smartloop.ai", "context_length": 131072,
+        }));
+        assert_eq!(parsed.kind, ModelKind::Remote);
+        assert_eq!(parsed.model_id, "");
+        assert_eq!(parsed.url.as_deref(), Some("https://api.smartloop.ai"));
+        assert_eq!(parsed.context_length, Some(131072));
+    }
+
+    #[test]
+    fn test_a_row_without_a_type_is_local() {
+        let parsed = kind(json!({"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it"}));
+        assert_eq!(parsed.kind, ModelKind::Local);
+        assert_eq!(parsed.url, None);
+    }
+
+    #[test]
+    fn test_an_unknown_type_degrades_to_local() {
+        let parsed = kind(json!({"name": "x", "model_id": "y", "type": "hybrid"}));
+        assert_eq!(parsed.kind, ModelKind::Local);
+    }
+
+    #[test]
+    fn test_the_type_serializes_under_its_wire_name() {
+        let mut entry = ModelEntry::new("kimi-k2", "");
+        entry.kind = ModelKind::Remote;
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["type"], "remote");
+        assert!(value.get("kind").is_none());
+    }
+}
