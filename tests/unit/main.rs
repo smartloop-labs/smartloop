@@ -96,6 +96,7 @@ mod test_mcp_sandbox_discovery;
 mod test_mcp_static_token_auth;
 mod test_mcp_tool_resolution;
 mod test_model_access_level;
+mod test_remote_workspace_model;
 mod test_model_display_name;
 mod test_model_host;
 mod test_model_label_naming;

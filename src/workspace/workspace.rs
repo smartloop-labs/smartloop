@@ -34,7 +34,7 @@ use crate::config::{AppSettings, ModelConfig, SUPPORTED_MODELS};
 use crate::constants::canonical_model_name;
 use crate::llms::llm_factory::LlmFactory;
 use crate::paths::{expand_home, real_home};
-use crate::types::ModelCapability;
+use crate::types::{ModelCapability, ModelKind};
 use crate::workspace::context::{
     active_project_id, owned_project_id, pinned_project_id, projects_delegated,
 };
@@ -682,6 +682,13 @@ pub struct WorkspaceModel {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub config: Option<ModelConfig>,
+    /// Remote models run behind `url` and have no weights on disk.
+    #[serde(rename = "type", default, skip_serializing_if = "ModelKind::is_local")]
+    pub kind: ModelKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
     /// Runtime-only; never persisted (`Field(exclude=True)`).
     #[serde(skip)]
     pub models_dir: String,
@@ -698,15 +705,30 @@ impl Default for WorkspaceModel {
             thinking: None,
             capabilities: Vec::new(),
             config: None,
+            kind: ModelKind::Local,
+            url: None,
+            context_length: None,
             models_dir: String::new(),
         }
     }
 }
 
 impl WorkspaceModel {
-    /// `<models_dir>/<model_id>`, or `""` when `models_dir` is unset.
+    /// Whether this model runs behind the platform API rather than on device.
+    pub fn is_remote(&self) -> bool {
+        self.kind == ModelKind::Remote
+    }
+
+    /// Whether there is no on-disk location to name: `models_dir` unset, or a
+    /// remote model (whose empty `model_id` would otherwise resolve to the
+    /// whole models directory).
+    fn has_no_weights_path(&self) -> bool {
+        self.models_dir.is_empty() || self.is_remote() || self.model_id.is_empty()
+    }
+
+    /// `<models_dir>/<model_id>`, or `""` when there are no weights to locate.
     pub fn model_dir(&self) -> String {
-        if self.models_dir.is_empty() {
+        if self.has_no_weights_path() {
             return String::new();
         }
         join(&self.models_dir, &self.model_id)
@@ -714,7 +736,7 @@ impl WorkspaceModel {
 
     /// `<models_dir>/<model_id>/<basename(model_id)>.gguf`, or `""`.
     pub fn model_path(&self) -> String {
-        if self.models_dir.is_empty() {
+        if self.has_no_weights_path() {
             return String::new();
         }
         join(
@@ -725,7 +747,7 @@ impl WorkspaceModel {
 
     /// Directory where the built GGUF is written for this model.
     pub fn bin_dir(&self) -> String {
-        if self.models_dir.is_empty() {
+        if self.has_no_weights_path() {
             return String::new();
         }
         join(&self.model_dir(), "bin")
@@ -733,7 +755,7 @@ impl WorkspaceModel {
 
     /// GGUF file path under the model's bin directory.
     pub fn gguf_path(&self) -> String {
-        if self.models_dir.is_empty() {
+        if self.has_no_weights_path() {
             return String::new();
         }
         join(&self.bin_dir(), &format!("{}.gguf", path_name(&self.model_id)))
@@ -773,9 +795,13 @@ impl WorkspaceModel {
     ///
     /// The stored `capabilities` field is ignored so class defaults stay
     /// authoritative and updates to any model's capabilities take effect
-    /// immediately.  Models without a `SUPPORTED_MODELS` entry fall back to
-    /// metadata-inferred capabilities.
+    /// immediately.  A remote model has no class, so its stored list (from
+    /// the catalog) is used.  Other models without a `SUPPORTED_MODELS` entry
+    /// fall back to metadata-inferred capabilities.
     pub fn effective_capabilities(&self) -> Vec<String> {
+        if self.is_remote() {
+            return self.capabilities.clone();
+        }
         match SUPPORTED_MODELS.get(&self.model_name) {
             Some(model_cls) => (model_cls.default_capabilities)()
                 .into_iter()
@@ -1656,6 +1682,42 @@ impl Workspace {
         entry
     }
 
+    /// Register a remote model, or refresh the catalog details of one already
+    /// registered.  It is never the active (bootstrap) model and is
+    /// `downloaded` from the start, since there is nothing to fetch.
+    pub fn add_remote_model(
+        &mut self,
+        model_name: &str,
+        url: &str,
+        capabilities: Vec<String>,
+        context_length: Option<u32>,
+        enabled: bool,
+    ) -> WorkspaceModel {
+        let model_name = canonical_model_name(model_name);
+        if let Some(existing) = self.get_model_mut(Some(&model_name)) {
+            existing.kind = ModelKind::Remote;
+            existing.url = Some(url.to_string());
+            existing.capabilities = capabilities;
+            existing.context_length = context_length;
+            existing.downloaded = true;
+            existing.is_active = false;
+            return existing.clone();
+        }
+        let entry = WorkspaceModel {
+            model_name,
+            downloaded: true,
+            enabled,
+            capabilities,
+            kind: ModelKind::Remote,
+            url: Some(url.to_string()),
+            context_length,
+            models_dir: self.models_dir.clone(),
+            ..Default::default()
+        };
+        self.models.push(entry.clone());
+        entry
+    }
+
     /// Sort `candidates` best-first by [`WorkspaceModel::rank`] (stable, so
     /// equal ranks keep registration order) and stamp their `models_dir`.
     fn rank_candidates(&self, mut candidates: Vec<WorkspaceModel>) -> Vec<WorkspaceModel> {
@@ -1688,6 +1750,9 @@ impl Workspace {
     }
 
     /// Enabled, downloaded models declaring `capability`, best-first.
+    ///
+    /// Remote models never appear: they have no parameter size, and in this
+    /// version answer only when pinned.
     ///
     /// Callers walk this list down to a smaller same-capability model when
     /// the largest doesn't fit in memory, rather than dropping straight to the
