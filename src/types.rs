@@ -50,6 +50,10 @@ impl ModelKind {
             ModelKind::Remote => "remote",
         }
     }
+
+    pub fn is_local(&self) -> bool {
+        *self == ModelKind::Local
+    }
 }
 
 impl<'de> Deserialize<'de> for ModelKind {
