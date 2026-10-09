@@ -196,6 +196,8 @@ mod test_list_project_models {
         assert_eq!(data["qwen2-vl-2b"]["enabled"], false);
         assert_eq!(data["qwen2-vl-2b"]["downloaded"], true);
         assert_eq!(data["qwen2-vl-2b"]["is_active"], true);
+        assert_eq!(data["gemma3-4b"]["type"], "local");
+        assert_eq!(data["gemma3-4b"]["url"], Value::Null);
     }
 
     #[tokio::test(flavor = "multi_thread")]
