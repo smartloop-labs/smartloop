@@ -636,8 +636,11 @@ impl Iterator for CompletionStream<'_> {
             return None;
         }
         if self.phase == StreamPhase::NotStarted {
-            // Lock around inference - llama-cpp is not thread-safe.
-            self.slot = Some(self.service.inference_slot());
+            // Lock around inference - llama-cpp is not thread-safe.  A cloud
+            // model holds no context, so it doesn't queue behind local ones.
+            if !ModelService::is_cloud_llm(self.llm.as_ref()) {
+                self.slot = Some(self.service.inference_slot());
+            }
             // Propagate cancellation event so the LLM can stop mid-inference.
             self.llm.set_cancelled(self.cancelled.clone());
             self.rx = Some(spawn_llm_stream(
@@ -669,7 +672,12 @@ impl Iterator for CompletionStream<'_> {
                     return None;
                 }
                 StreamMsg::Failed(ex) => {
-                    let fallback = if self.phase == StreamPhase::Primary {
+                    // A cloud model's failure is a message for the user (sign
+                    // in, plan, busy), not a GPU fault: no eviction, and no
+                    // quiet answer from a different model.
+                    let fallback = if self.phase == StreamPhase::Primary
+                        && !ModelService::is_cloud_llm(self.llm.as_ref())
+                    {
                         self.service.default_fallback_llm(&self.llm)
                     } else {
                         None
@@ -1053,6 +1061,10 @@ impl ModelService {
             .llm_for_response(capability)
             .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
 
+        if ModelService::is_cloud_llm(llm.as_ref()) {
+            // `invoke` would turn a refusal into answer text; keep it an error.
+            return llm.call(prompt, None, CallOptions { max_tokens, thinking }).map(|text| text.trim().to_string());
+        }
         let _slot = self.inference_slot();
         match catch_unwind(AssertUnwindSafe(|| llm.invoke(prompt, max_tokens, thinking))) {
             Ok(text) => Ok(text),
@@ -3472,7 +3484,9 @@ impl ModelService {
         // With exactly one model selected, it runs the routing and decision
         // nodes too.  Asked without a capability, so a vision-only selection
         // declines these text-only nodes and they stay on the default model.
-        let pinned_llm = self.pinned_llm_seam(None);
+        // A cloud model is pinned for the answer only: these nodes make many
+        // small calls, and stay on device.
+        let pinned_llm = self.pinned_llm_seam(None).filter(|llm| !Self::is_cloud_llm(llm.as_ref()));
         if let Some(pinned) = pinned_llm.as_ref() {
             tracing::info!(
                 target: LOG,

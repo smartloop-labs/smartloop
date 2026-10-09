@@ -42,6 +42,7 @@ use crate::db::store_factory::StoreFactory;
 use crate::db::workspace_indexer::{WORKSPACE_COLLECTION, WorkspaceIndexer};
 use crate::feedback_store::{ConversationTurn, FeedbackEntry, FeedbackStore, Rating};
 use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationStream};
+use crate::llms::cloud_llm::CloudLLM;
 use crate::llms::llm_factory::{LlamaInstanceOptions, LlmFactory};
 use crate::llms::thinking::strip_thinking;
 use crate::mcp::client::{MCPClientError, MCPConnectResult};
@@ -1783,6 +1784,11 @@ impl ModelService {
             return hook(capability);
         }
         let ws_model = self.pinned_model(capability)?;
+        if ws_model.is_remote() {
+            // Answered over HTTP from whichever process asks; there is
+            // nothing for the model host to hold.
+            return Some(self.cloud_llm(&ws_model));
+        }
         if self.remote_device().is_some() {
             // The pin says *which* model; putting it in memory is the host's
             // business.  Loading the GGUF here would be a second copy of the
@@ -1864,6 +1870,11 @@ impl ModelService {
     ) -> Option<Arc<dyn BaseLLM>> {
         if let Some(hook) = self.hooks().load_workspace_llm {
             return hook(ws_model, reason, reserve_gb, evict);
+        }
+        if ws_model.is_remote() {
+            // No weights, so no cache slot, fit guard or eviction.
+            *self.capability_skip.lock() = None;
+            return Some(self.cloud_llm(ws_model));
         }
         let Some(workspace) = self.workspace_handle() else {
             tracing::warn!(
@@ -1981,6 +1992,27 @@ impl ModelService {
                 None
             }
         }
+    }
+
+    /// A [`CloudLLM`] for a remote workspace model.  Built per call: it holds
+    /// no weights, and a fresh instance keeps one request's cancellation
+    /// event off another's.
+    pub fn cloud_llm(&self, ws_model: &WorkspaceModel) -> Arc<dyn BaseLLM> {
+        let project_id = self
+            .workspace_handle()
+            .and_then(|ws| ws.read().current_project().map(|p| p.id.clone()))
+            .unwrap_or_default();
+        let url = ws_model
+            .url
+            .clone()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| AppSettings::new().slp_api_base);
+        Arc::new(CloudLLM::new(&project_id, &ws_model.model_name, &url, ws_model.context_length))
+    }
+
+    /// Whether `llm` answers over HTTP rather than from local weights.
+    pub fn is_cloud_llm(llm: &dyn BaseLLM) -> bool {
+        llm.as_any().is::<CloudLLM>()
     }
 
     /// Whether `model_name` should reason, per the picker's setting.
