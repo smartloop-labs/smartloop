@@ -916,9 +916,11 @@ pub mod mcp {
     /// Reset the router's process-wide OAuth state and test hooks.
     pub fn reset_router_state() {
         use smartloop::api::routers::mcp_servers::{
-            set_hooks, McpRouteHooks, COMPLETED_OAUTH_RESPONSES, PENDING_OAUTH_SESSIONS,
+            set_hooks, McpRouteHooks, COMPLETED_OAUTH_RESPONSES, PENDING_DEVICE_SESSIONS,
+            PENDING_OAUTH_SESSIONS,
         };
         PENDING_OAUTH_SESSIONS.lock().clear();
+        PENDING_DEVICE_SESSIONS.lock().clear();
         COMPLETED_OAUTH_RESPONSES.lock().clear();
         set_hooks(McpRouteHooks::default());
     }

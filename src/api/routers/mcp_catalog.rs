@@ -72,6 +72,22 @@ fn default_true() -> bool {
     true
 }
 
+/// An RFC 8628 device authorization grant the client can sign in with.
+///
+/// For providers without dynamic client registration (GitHub) that publish a
+/// public client registered for us.  The token it yields is stored and sent
+/// like a pasted one, so an entry with both this and `credential_fields`
+/// offers the device sign-in with pasting as the fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct DeviceFlowConfig {
+    /// Public client id; device flow needs no secret.
+    pub client_id: String,
+    pub device_authorization_endpoint: String,
+    pub token_endpoint: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
 /// Connection settings for a remotely hosted catalog server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct RemoteConfig {
@@ -90,6 +106,8 @@ pub struct RemoteConfig {
     pub token: Option<String>,
     #[serde(default)]
     pub credential_fields: Vec<CredentialField>,
+    #[serde(default)]
+    pub device_flow: Option<DeviceFlowConfig>,
 }
 
 /// Launch settings for a catalog server run locally over stdio.

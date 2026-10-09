@@ -24,7 +24,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::api::model::mcp::{
-    DeleteMCPServerResponse, MCPDefinitionRequest, MCPOAuthCallbackRequest, MCPRegisterRequest,
+    DeleteMCPServerResponse, MCPDefinitionRequest, MCPDevicePollRequest, MCPDevicePollResponse,
+    MCPDeviceStartRequest, MCPDeviceStartResponse, MCPOAuthCallbackRequest, MCPRegisterRequest,
     MCPRegisterResponse, MCPServerResponse,
 };
 pub use crate::api::routers::mcp_catalog::HTTPException;
@@ -39,8 +40,8 @@ use crate::mcp::client::{
 use crate::mcp::definition_loader::{parse_definitions, reload_definitions, USER_DEFINITIONS_DIR};
 use crate::mcp::definitions::MCPDefinitionError;
 use crate::mcp::oauth::{
-    ClientRegistrationResponse, MCPOAuthError, MCPOAuthService, OAuthMetadata,
-    ProtectedResourceMetadata, TokenResponse,
+    ClientRegistrationResponse, DeviceAuthorization, DevicePoll, MCPOAuthError, MCPOAuthService,
+    OAuthMetadata, ProtectedResourceMetadata, TokenResponse,
 };
 use crate::workspace::context::{owned_project_id, pinned_project_id, projects_delegated};
 
@@ -72,6 +73,27 @@ pub static PENDING_OAUTH_SESSIONS: Lazy<Mutex<HashMap<String, OAuthSession>>> =
 /// first): `(expires_at, response)`.
 pub static COMPLETED_OAUTH_RESPONSES: Lazy<Mutex<IndexMap<String, (f64, HtmlPage)>>> =
     Lazy::new(|| Mutex::new(IndexMap::new()));
+
+/// A device sign-in waiting on the user to enter its code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingDeviceSession {
+    pub project_id: String,
+    pub catalog_slug: String,
+    /// The entry's URL at start, for registering if the catalog misses later.
+    pub server_url: String,
+    pub client_id: String,
+    pub token_endpoint: String,
+    pub device_code: String,
+    /// Seconds between polls; grows on `slow_down`.
+    pub interval: i64,
+    /// Polls before this answer "pending" without asking the provider.
+    pub next_poll_at: f64,
+    pub expires_at: f64,
+}
+
+/// Pending device sign-ins, keyed by the session id handed to the client.
+pub static PENDING_DEVICE_SESSIONS: Lazy<Mutex<HashMap<String, PendingDeviceSession>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Single-worker gate standing in for the `ThreadPoolExecutor(max_workers=1)`.
 ///
@@ -212,6 +234,22 @@ pub trait OAuthFlow: Send {
         params: &TokenExchangeParams,
     ) -> Result<TokenResponse, MCPOAuthError>;
 
+    /// RFC 8628 device authorization request.
+    fn request_device_code(
+        &mut self,
+        device_authorization_endpoint: &str,
+        client_id: &str,
+        scope: Option<&str>,
+    ) -> Result<DeviceAuthorization, MCPOAuthError>;
+
+    /// One RFC 8628 device-token poll.
+    fn poll_device_token(
+        &mut self,
+        token_endpoint: &str,
+        client_id: &str,
+        device_code: &str,
+    ) -> Result<DevicePoll, MCPOAuthError>;
+
     /// Build the authorization redirect URL.
     fn build_authorization_url(&mut self, params: &AuthorizationUrlParams) -> String {
         MCPOAuthService::new(None).build_authorization_url(
@@ -308,6 +346,24 @@ impl OAuthFlow for ServiceOAuthFlow {
             params.client_secret.as_deref(),
             params.resource.as_deref(),
         )
+    }
+
+    fn request_device_code(
+        &mut self,
+        device_authorization_endpoint: &str,
+        client_id: &str,
+        scope: Option<&str>,
+    ) -> Result<DeviceAuthorization, MCPOAuthError> {
+        self.entered().request_device_code(device_authorization_endpoint, client_id, scope)
+    }
+
+    fn poll_device_token(
+        &mut self,
+        token_endpoint: &str,
+        client_id: &str,
+        device_code: &str,
+    ) -> Result<DevicePoll, MCPOAuthError> {
+        self.entered().poll_device_token(token_endpoint, client_id, device_code)
     }
 
     fn build_authorization_url(&mut self, params: &AuthorizationUrlParams) -> String {
@@ -872,6 +928,12 @@ const REGISTER_REQUEST_FIELDS: &[FieldSpec] = &[
 const DEFINITION_REQUEST_FIELDS: &[FieldSpec] =
     &[("toml", FieldKind::Str, true), ("filename", FieldKind::OptStr, false)];
 
+/// `MCPDeviceStartRequest`'s fields.
+const DEVICE_START_REQUEST_FIELDS: &[FieldSpec] = &[("catalog_slug", FieldKind::Str, true)];
+
+/// `MCPDevicePollRequest`'s fields.
+const DEVICE_POLL_REQUEST_FIELDS: &[FieldSpec] = &[("session_id", FieldKind::Str, true)];
+
 /// `MCPOAuthCallbackRequest`'s fields.
 const OAUTH_CALLBACK_REQUEST_FIELDS: &[FieldSpec] = &[
     ("server_url", FieldKind::Str, true),
@@ -1041,7 +1103,7 @@ fn parse_body<T: serde::de::DeserializeOwned>(
 
 // ------------------------------------------------------------------ state
 
-/// Drop expired pending OAuth sessions and cached callback responses.
+/// Drop expired pending OAuth and device sessions and cached callback responses.
 ///
 /// Piggybacked on request handling rather than run as a background task: the
 /// maps only grow when a registration happens, so sweeping on the same events
@@ -1073,6 +1135,7 @@ pub fn purge_oauth_state(now: Option<f64>) {
             sessions.remove(&state);
         }
     }
+    PENDING_DEVICE_SESSIONS.lock().retain(|_, session| now <= session.expires_at);
     let mut responses = COMPLETED_OAUTH_RESPONSES.lock();
     responses.retain(|_, (expires_at, _)| now <= *expires_at);
     while responses.len() > OAUTH_RESPONSE_MAX {
@@ -2835,6 +2898,181 @@ async fn complete_mcp_oauth_handler(
     }
 }
 
+// ------------------------------------------------------------------ device sign-in
+
+/// Start an RFC 8628 device sign-in for a catalog entry that has `device_flow`.
+///
+/// The provider's device code stays in [`PENDING_DEVICE_SESSIONS`]; the client
+/// gets the code to show the user and a session id to poll with.
+pub async fn start_device_sign_in(
+    project_id: &str,
+    request: MCPDeviceStartRequest,
+) -> Result<MCPDeviceStartResponse, HTTPException> {
+    let slug = request.catalog_slug.clone();
+    let remote = blocking(move || lookup_catalog_entry(&slug)).await.and_then(|e| e.remote_config);
+    let Some((server_url, flow)) = remote.and_then(|rc| Some((rc.server_url, rc.device_flow?))) else {
+        return Err(HTTPException::new(
+            400,
+            format!("'{}' does not offer a device sign-in", request.catalog_slug),
+        ));
+    };
+
+    let started = {
+        let flow = flow.clone();
+        let scope = flow.scopes.join(" ");
+        blocking(move || {
+            open_oauth_service().request_device_code(
+                &flow.device_authorization_endpoint,
+                &flow.client_id,
+                Some(&scope),
+            )
+        })
+        .await
+    };
+    let auth = started.map_err(|e| {
+        tracing::warn!(target: LOGGER, "Device sign-in for {} did not start: {}", request.catalog_slug, e);
+        HTTPException::new(502, format!("Could not start the sign-in: {e}"))
+    })?;
+
+    let now = now_ts();
+    purge_oauth_state(Some(now));
+    let session_id = MCPOAuthService::generate_state();
+    PENDING_DEVICE_SESSIONS.lock().insert(
+        session_id.clone(),
+        PendingDeviceSession {
+            project_id: project_id.to_string(),
+            catalog_slug: request.catalog_slug.clone(),
+            server_url,
+            client_id: flow.client_id,
+            token_endpoint: flow.token_endpoint,
+            device_code: auth.device_code,
+            interval: auth.interval,
+            next_poll_at: now,
+            expires_at: now + auth.expires_in as f64,
+        },
+    );
+    tracing::info!(target: LOGGER, "Device sign-in started for {}", request.catalog_slug);
+
+    Ok(MCPDeviceStartResponse {
+        session_id,
+        user_code: auth.user_code,
+        verification_uri: auth.verification_uri,
+        verification_uri_complete: auth.verification_uri_complete,
+        interval: auth.interval,
+        expires_in: auth.expires_in,
+    })
+}
+
+/// Poll a device sign-in once.  On a grant the token registers the server
+/// exactly as a pasted one would.
+///
+/// Polls arriving faster than the provider's interval answer "pending"
+/// without reaching it, so a hasty client cannot earn a `slow_down`.
+pub async fn poll_device_sign_in(
+    project_id: &str,
+    request: MCPDevicePollRequest,
+    model_service: Arc<ModelService>,
+) -> Result<MCPDevicePollResponse, HTTPException> {
+    let pending = |interval: i64| MCPDevicePollResponse {
+        status: "pending".to_string(),
+        interval: Some(interval),
+        server: None,
+    };
+    let finished = |status: &str| MCPDevicePollResponse { status: status.to_string(), ..Default::default() };
+
+    let now = now_ts();
+    purge_oauth_state(Some(now));
+    let session = {
+        let mut sessions = PENDING_DEVICE_SESSIONS.lock();
+        match sessions.get_mut(&request.session_id).filter(|s| s.project_id == project_id) {
+            None => {
+                return Err(HTTPException::new(404, "No sign-in is waiting under that session. Start again."));
+            }
+            Some(session) if now < session.next_poll_at => return Ok(pending(session.interval)),
+            Some(session) => {
+                // Reserved before the request goes out, so a concurrent poll
+                // waits rather than doubling up.
+                session.next_poll_at = now + session.interval as f64;
+                session.clone()
+            }
+        }
+    };
+    let end_session = || PENDING_DEVICE_SESSIONS.lock().remove(&request.session_id);
+
+    let polled = {
+        let s = session.clone();
+        blocking(move || open_oauth_service().poll_device_token(&s.token_endpoint, &s.client_id, &s.device_code))
+            .await
+    };
+    let token = match polled {
+        Ok(DevicePoll::Pending) => return Ok(pending(session.interval)),
+        Ok(DevicePoll::SlowDown { interval }) => {
+            // RFC 8628 §3.5: without a new interval from the server, add 5s.
+            let interval = interval.filter(|i| *i > session.interval).unwrap_or(session.interval + 5);
+            if let Some(s) = PENDING_DEVICE_SESSIONS.lock().get_mut(&request.session_id) {
+                s.interval = interval;
+                s.next_poll_at = now + interval as f64;
+            }
+            return Ok(pending(interval));
+        }
+        Ok(DevicePoll::Denied) => {
+            end_session();
+            return Ok(finished("denied"));
+        }
+        Ok(DevicePoll::Expired) => {
+            end_session();
+            return Ok(finished("expired"));
+        }
+        Err(e) => {
+            end_session();
+            tracing::warn!(target: LOGGER, "Device sign-in for {} failed: {}", session.catalog_slug, e);
+            return Err(HTTPException::new(502, format!("The sign-in failed: {e}")));
+        }
+        Ok(DevicePoll::Granted(token)) => token,
+    };
+    end_session();
+    tracing::info!(target: LOGGER, "Device sign-in granted for {}", session.catalog_slug);
+
+    let register = MCPRegisterRequest {
+        catalog_slug: Some(session.catalog_slug),
+        server_url: Some(session.server_url),
+        token: Some(token.access_token),
+        ..Default::default()
+    };
+    let registered = register_mcp_server(project_id, register, model_service).await?;
+    Ok(MCPDevicePollResponse { status: "connected".to_string(), interval: None, server: registered.server })
+}
+
+async fn start_device_sign_in_handler(
+    AxumPath(project_id): AxumPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request: MCPDeviceStartRequest = match parse_body(&headers, &body, DEVICE_START_REQUEST_FIELDS) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match start_device_sign_in(&project_id, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn poll_device_sign_in_handler(
+    AxumPath(project_id): AxumPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request: MCPDevicePollRequest = match parse_body(&headers, &body, DEVICE_POLL_REQUEST_FIELDS) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match poll_device_sign_in(&project_id, request, get_model_service()).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 /// `GET`/`DELETE` on a literal segment that shadows `{server_id}`.
 ///
 /// FastAPI tries routes in order and only answers 405 when no route matches
@@ -2876,6 +3114,8 @@ pub fn router() -> Router {
             get(mcp_oauth_callback_for_project_handler).post(complete_mcp_oauth_handler),
         )
         .route("/v1/mcp/oauth/callback", get(mcp_oauth_callback_handler))
+        .route("/v1/projects/{project_id}/mcp/device/start", post(start_device_sign_in_handler))
+        .route("/v1/projects/{project_id}/mcp/device/poll", post(poll_device_sign_in_handler))
 }
 
 #[cfg(test)]

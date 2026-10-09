@@ -231,6 +231,45 @@ pub struct MCPOAuthCallbackRequest {
     pub callback_url: Option<String>,
 }
 
+/// Start an RFC 8628 device sign-in for a catalog entry with `device_flow`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MCPDeviceStartRequest {
+    pub catalog_slug: String,
+}
+
+/// The code to show the user and where they enter it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MCPDeviceStartResponse {
+    /// Passed back on each poll; the device code itself stays server-side.
+    pub session_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    /// Seconds between polls.
+    pub interval: i64,
+    pub expires_in: i64,
+}
+
+/// Poll a device sign-in started by `MCPDeviceStartRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MCPDevicePollRequest {
+    pub session_id: String,
+}
+
+/// Where a device sign-in stands.
+///
+/// `status` is "pending" (poll again after `interval`), "denied" or
+/// "expired" (start over), or "connected" with the registered `server`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MCPDevicePollResponse {
+    pub status: String,
+    #[serde(default)]
+    pub interval: Option<i64>,
+    #[serde(default)]
+    pub server: Option<MCPServerResponse>,
+}
+
 /// Request to call a tool on an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct MCPToolCallRequest {
