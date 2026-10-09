@@ -146,3 +146,20 @@ async fn test_a_non_streamed_cloud_failure_is_an_error_not_answer_text() {
 
     assert_eq!(outcome.unwrap_err().to_string(), "kimi-k2 is busy right now. Try again shortly.");
 }
+
+/// The platform records a remote answer's tokens; pushing our own estimate
+/// too would count them twice.
+#[test]
+fn test_a_remote_answer_is_not_reported_as_local_usage() {
+    use smartloop::api::routers::chat::ChatService;
+
+    let remote = svc_with_remote_pin();
+    assert!(remote.answers_remotely());
+
+    let local = bare_service();
+    let mut ws = Workspace::new("ws");
+    ws.add_model("gemma3-4b", "google/gemma-3-4b-it", None, true);
+    ws.get_model_mut(Some("gemma3-4b")).unwrap().downloaded = true;
+    attach_workspace(&local, ws);
+    assert!(!local.answers_remotely());
+}
