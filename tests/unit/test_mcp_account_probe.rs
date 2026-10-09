@@ -491,3 +491,18 @@ fn test_the_ordinary_case_writes_through_untouched() {
     assert_eq!(live_servers(&svc)[0], held);
     assert_eq!(saves.load(Ordering::SeqCst), 1);
 }
+
+/// A refresh reads the credentials the workspace holds now, not a held copy's.
+#[test]
+#[serial]
+fn test_live_credentials_are_read_from_the_workspace() {
+    let (mut held, live) = pair();
+    let (svc, _saves, _config) = svc_holding(vec![live]);
+    held.oauth_credentials =
+        Some(MCPOAuthCredentials { refresh_token: Some("rotated-rt".to_string()), ..Default::default() });
+    svc.persist_mcp_server(&held).expect("persist");
+
+    let creds = svc.live_mcp_credentials("s1").expect("live credentials");
+    assert_eq!(creds.refresh_token.as_deref(), Some("rotated-rt"));
+    assert_eq!(svc.live_mcp_credentials("gone"), None);
+}

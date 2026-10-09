@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::agents::agent::SharedLLM;
 use crate::agents::hybrid_executor::LLMExecutor;
 use crate::agents::mcp::argument_extractor::MCPArgumentExtractor;
-use crate::agents::mcp::mcp_tool_caller::{MCPToolCaller, PersistFn};
+use crate::agents::mcp::mcp_tool_caller::{LiveCredentialsFn, MCPToolCaller, PersistFn};
 use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
@@ -2732,14 +2732,22 @@ impl ModelService {
         })
     }
 
+    /// The hook a tool caller uses to read a server's current credentials.
+    fn live_credentials_hook(&self) -> LiveCredentialsFn {
+        let weak = self.weak_self.clone();
+        Arc::new(move |server_id: &str| weak.upgrade().and_then(|service| service.live_mcp_credentials(server_id)))
+    }
+
     /// `MCPToolCaller(None, None, persist=...)`.
     fn transport_tool_caller(&self) -> MCPToolCaller {
         let llm: Arc<dyn BaseLLM> = Arc::new(TransportOnlyLLM::new());
-        MCPToolCaller::new(
+        let caller = MCPToolCaller::new(
             Arc::new(MCPArgumentExtractor::new(llm)),
             Arc::new(parking_lot::Mutex::new(MCPResultMapper::new())),
             Some(self.persist_hook()),
-        )
+        );
+        caller.set_live_credentials(Some(self.live_credentials_hook()));
+        caller
     }
 
     /// Record which account `server` is linked as, when it can say.
@@ -2777,6 +2785,18 @@ impl ModelService {
                 tracing::warn!(target: LOG, "[mcp-account] could not save '{}': {e}", server.name);
             }
         }
+    }
+
+    /// The OAuth credentials the workspace holds now for server `server_id`.
+    pub fn live_mcp_credentials(&self, server_id: &str) -> Option<MCPOAuthCredentials> {
+        let model = self.model_or_err().ok()?;
+        let workspace = model.workspace.read();
+        workspace
+            .projects
+            .iter()
+            .flat_map(|p| p.mcp_servers.iter())
+            .find(|s| s.id == server_id)
+            .and_then(|s| s.oauth_credentials.clone())
     }
 
     /// Save `server`'s state onto the workspace this service holds now.
@@ -3556,6 +3576,7 @@ impl ModelService {
             // server; this is what writes it back.  The orchestrator has no
             // workspace of its own — the service owns it.
             orchestrator.tool_caller.set_persist(Some(self.persist_hook()));
+            orchestrator.tool_caller.set_live_credentials(Some(self.live_credentials_hook()));
 
             // What the selected models declare, and whether any is selected
             // at all: text work needs no declaration, so a selection may
