@@ -11,6 +11,7 @@
 //! message back to the chat instead of falling back to a local model.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -32,6 +33,33 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Whole-request budget, streamed body included: long enough for a long
 /// answer, short enough that a hung upstream frees the chat.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+thread_local! {
+    static LOCAL_ONLY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Restores the previous [`local_only`] setting when dropped.
+#[must_use = "the setting is restored when the guard is dropped"]
+pub struct LocalOnlyScope(bool);
+
+impl Drop for LocalOnlyScope {
+    fn drop(&mut self) {
+        LOCAL_ONLY.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Mark model resolution on this thread as orchestration (`on`) or not, until
+/// the guard drops.  Orchestration runs on device: while set, a pinned remote
+/// model is ignored and selection falls back to local models.  The final
+/// answer is resolved outside any such scope.
+pub fn local_only_scope(on: bool) -> LocalOnlyScope {
+    LocalOnlyScope(LOCAL_ONLY.with(|cell| cell.replace(on)))
+}
+
+/// Whether this thread is resolving a model for orchestration.
+pub fn local_only() -> bool {
+    LOCAL_ONLY.with(Cell::get)
+}
 
 /// Whether our platform credentials may be sent to `url`: only to the
 /// configured platform API host or a `smartloop.ai` host.  The catalog names

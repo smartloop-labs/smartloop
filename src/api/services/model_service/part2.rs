@@ -32,6 +32,8 @@ use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
 use crate::agents::orchestrator::{ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions};
 use crate::llms::base_llm::{BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
+use crate::llms::cloud_llm::local_only_scope;
+use crate::model_host::remote_llm::RemoteLLM;
 use crate::llms::llama::ChatCompletionRequest;
 use crate::mcp::account::probe_account;
 use crate::mcp::client::{
@@ -227,6 +229,15 @@ fn same_llm(a: &Arc<dyn BaseLLM>, b: &Arc<dyn BaseLLM>) -> bool {
 /// `a is b` where `b` may be `None`.
 fn is_llm(a: &Arc<dyn BaseLLM>, b: Option<&Arc<dyn BaseLLM>>) -> bool {
     b.is_some_and(|b| same_llm(a, b))
+}
+
+/// `llm`, resolving on device only when it is a model-host handle; a model
+/// loaded in this process is returned as is.
+fn local_only_handle(llm: Arc<dyn BaseLLM>) -> Arc<dyn BaseLLM> {
+    match llm.as_any().downcast_ref::<RemoteLLM>() {
+        Some(remote) if !remote.is_local_only() => Arc::new(remote.local_only_copy()),
+        _ => llm,
+    }
 }
 
 /// `_cap_name(capability)` for an optional capability (`None` → `"None"`).
@@ -3484,9 +3495,12 @@ impl ModelService {
         // With exactly one model selected, it runs the routing and decision
         // nodes too.  Asked without a capability, so a vision-only selection
         // declines these text-only nodes and they stay on the default model.
-        // A cloud model is pinned for the answer only: these nodes make many
-        // small calls, and stay on device.
-        let pinned_llm = self.pinned_llm_seam(None).filter(|llm| !Self::is_cloud_llm(llm.as_ref()));
+        // Orchestration runs on device: a remote pin is for the answer only, so
+        // every model this request resolves is resolved local-only.
+        let pinned_llm = {
+            let _scope = local_only_scope(true);
+            self.pinned_llm_seam(None)
+        };
         if let Some(pinned) = pinned_llm.as_ref() {
             tracing::info!(
                 target: LOG,
@@ -3497,7 +3511,10 @@ impl ModelService {
 
         let run = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<OrchestrateOutcome> {
             let service = self.arc();
-            let decision_llm = self.decision_llm.read().clone();
+            // In a project child these are handles to the model host, which
+            // resolves them per call; mark them local-only so it does too.
+            let main_llm = local_only_handle(main_llm.clone());
+            let decision_llm = self.decision_llm.read().clone().map(local_only_handle);
             let orchestrator_llm: Arc<dyn BaseLLM> = pinned_llm.clone().unwrap_or_else(|| main_llm.clone());
             let agent_llm: Arc<dyn BaseLLM> =
                 pinned_llm.clone().or_else(|| decision_llm.clone()).unwrap_or_else(|| main_llm.clone());
@@ -3510,11 +3527,17 @@ impl ModelService {
             options.large_llm = None;
             options.large_llm_provider = Some(provider0({
                 let service = service.clone();
-                move || ProviderOutput::from_value(service.large_llm_seam())
+                move || {
+                    let _scope = local_only_scope(true);
+                    ProviderOutput::from_value(service.large_llm_seam())
+                }
             }));
             options.capability_llm_provider = Some(provider1({
                 let service = service.clone();
-                move |capability: &str| ProviderOutput::from_value(service.llm_for_capability_seam(capability))
+                move |capability: &str| {
+                    let _scope = local_only_scope(true);
+                    ProviderOutput::from_value(service.llm_for_capability_seam(capability))
+                }
             }));
             options.capability_available = Some(provider1({
                 let service = service.clone();

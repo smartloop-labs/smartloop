@@ -1747,6 +1747,10 @@ impl ModelService {
             return None;
         }
         let ws_model = selected.remove(0);
+        if ws_model.is_remote() && crate::llms::cloud_llm::local_only() {
+            // Orchestration stays on device; the remote pin is for the answer.
+            return None;
+        }
 
         let caps: HashSet<String> = ws_model
             .effective_capabilities()

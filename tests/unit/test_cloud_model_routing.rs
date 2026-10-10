@@ -163,3 +163,21 @@ fn test_a_remote_answer_is_not_reported_as_local_usage() {
     attach_workspace(&local, ws);
     assert!(!local.answers_remotely());
 }
+
+/// Orchestration resolves inside a local-only scope, where a remote pin is
+/// ignored and the resident model answers; outside it the pin still holds.
+#[test]
+fn test_a_remote_pin_is_ignored_while_orchestrating() {
+    use smartloop::llms::cloud_llm::local_only_scope;
+
+    let svc = svc_with_remote_pin();
+    {
+        let _scope = local_only_scope(true);
+        assert!(svc.pinned_model(None).is_none());
+        assert!(svc.pinned_llm(None).is_none());
+        let llm = svc.llm_for_response(None).expect("the resident model");
+        assert!(!ModelService::is_cloud_llm(llm.as_ref()));
+    }
+    let llm = svc.llm_for_response(None).expect("the pinned model");
+    assert!(ModelService::is_cloud_llm(llm.as_ref()));
+}
