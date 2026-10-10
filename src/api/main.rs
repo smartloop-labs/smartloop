@@ -742,6 +742,37 @@ fn indexing_health(model_service: &ModelService, result: &mut Map<String, Value>
     Some(())
 }
 
+/// How long the supervisor waits on a project agent's `/health` before
+/// reporting without its indexing section.  Short: the desktop app polls
+/// `/health` every few seconds, and a slow child must not stall that.
+const DELEGATED_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Under the supervisor the indexer runs in each project's agent, so this
+/// process has no indexer task and [`indexing_health`] adds nothing.  Clients
+/// that poll the bare `/health` (the desktop app does) then never see a
+/// document turn indexed.  Fill the gap from the current project's agent.
+///
+/// Only an agent that is already running is asked — `running`, not `ensure`:
+/// a health poll must not cold-start a project, and asking the child directly
+/// rather than through routing leaves its idle clock alone, so the poll does
+/// not keep an idle agent resident either.
+///
+/// Async, and called from the handler rather than [`health_status`]: that
+/// runs on a blocking thread inside the runtime, where `reqwest::blocking`
+/// panics as it tears its own runtime down.
+async fn delegated_indexing_health() -> Option<Value> {
+    let pool = get_pool()?;
+    // From disk, not the singleton: this process does not own the workspace
+    // under the supervisor, and an import here resets the singleton, so it is
+    // empty or behind exactly when a new project has documents to index.
+    let project_id = Workspace::load()?.current_project()?.id.clone();
+    let record = pool.running(&project_id)?;
+    let client = reqwest::Client::builder().timeout(DELEGATED_HEALTH_TIMEOUT).build().ok()?;
+    let response = client.get(format!("{}/health", record.base_url())).send().await.ok()?;
+    let mut child: Map<String, Value> = response.json().await.ok()?;
+    child.remove("indexing")
+}
+
 /// Memory pressure: the estimated total footprint of every enabled model the
 /// orchestrator could load against device memory.
 fn memory_percent(model_service: &ModelService) -> Option<i64> {
@@ -820,11 +851,17 @@ pub fn health_status() -> Map<String, Value> {
 
 /// `GET /health` — model, indexing and memory-pressure status.
 pub async fn health_check() -> Json<Map<String, Value>> {
-    match tokio::task::spawn_blocking(health_status).await {
-        Ok(result) => Json(result),
+    let mut result = match tokio::task::spawn_blocking(health_status).await {
+        Ok(result) => result,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         Err(e) => panic!("health check task failed: {e}"),
+    };
+    if !result.contains_key("indexing")
+        && let Some(indexing) = delegated_indexing_health().await
+    {
+        result.insert("indexing".into(), indexing);
     }
+    Json(result)
 }
 
 /// `GET /agents` — what is actually running: the supervisor, the model host,
