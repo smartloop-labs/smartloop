@@ -503,6 +503,37 @@ mod test_web_search_status {
 
     #[test]
     #[serial]
+    fn test_detail_returns_the_whole_body() {
+        let _c = autouse();
+        let server = StubServer::start();
+        let body = json!({
+            "enabled": true,
+            "provider": "serper",
+            "reason": null,
+            "quota": {"limit": 5, "used": 2, "remaining": 3, "period": "2026-10",
+                      "resets_at": "2026-11-01T00:00:00Z", "plan": "free"}
+        });
+        server.route("/v1/websearch/status", 200, body.clone());
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let detail = client.web_search_status_detail(SEARCH_STATUS_TIMEOUT).unwrap();
+        assert_eq!(serde_json::Value::Object(detail), body);
+    }
+
+    #[test]
+    #[serial]
+    fn test_detail_auth_failure_raises_permission_error() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route("/v1/websearch/status", 401, json!({"detail": "nope"}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.web_search_status_detail(SEARCH_STATUS_TIMEOUT).unwrap_err();
+        assert_permission(&err, "401");
+    }
+
+    #[test]
+    #[serial]
     fn test_server_error_raises_connection_error() {
         let _c = autouse();
         let server = StubServer::start();

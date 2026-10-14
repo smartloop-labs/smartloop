@@ -8,6 +8,10 @@
 //! which the hosted `GET /v1/websearch/status` answers and the orchestrator
 //! checks before searching. There is deliberately no second local switch — it
 //! would only duplicate what the endpoint already knows.
+//!
+//! `GET /v1/websearch/status` passes that hosted answer through, so the
+//! desktop app (which hands its tokens to this service and keeps none) can
+//! show the account's monthly search allowance.
 
 use axum::extract::Path;
 use axum::routing::get;
@@ -16,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::services::get_model_service;
+use crate::platform::client::{JsonObject, SEARCH_STATUS_TIMEOUT};
+use crate::platform::get_platform_service;
 
 use super::_errors::{py_error_kind, run_blocking, unhandled_error, HTTPException, PyErrorKind, ValidatedJson};
 
@@ -37,10 +43,12 @@ pub struct WebSearchConfigResponse {
 
 /// Routes under `/v1` (tag `web-search`).
 pub fn router() -> Router {
-    Router::new().route(
-        "/v1/projects/{project_id}/websearch",
-        get(get_web_search_config).patch(set_web_search_enabled),
-    )
+    Router::new()
+        .route(
+            "/v1/projects/{project_id}/websearch",
+            get(get_web_search_config).patch(set_web_search_enabled),
+        )
+        .route("/v1/websearch/status", get(get_web_search_status))
 }
 
 /// Turn the service's answer into the response model, or its failure into
@@ -99,4 +107,31 @@ pub async fn set_web_search_enabled(
     let result =
         run_blocking(move || model_service.set_web_search_enabled(&project_id, request.enabled)).await?;
     respond(result, "Error updating web search config")
+}
+
+/// The hosted `GET /v1/websearch/status` body, as the platform returned it.
+///
+/// Sync on purpose, like `get_me` in the users router: a 401 costs a token
+/// refresh and a retry, which must not stall the async runtime.  Signed out or
+/// a rejected token is 401; the platform unreachable is 502.
+pub fn web_search_status() -> Result<JsonObject, HTTPException> {
+    get_platform_service()
+        .client()
+        .web_search_status_detail(SEARCH_STATUS_TIMEOUT)
+        .map_err(|e| {
+            if e.is_permission() {
+                HTTPException::new(401, "Not authenticated")
+            } else if e.is_connection() {
+                HTTPException::new(502, "Platform API unavailable")
+            } else {
+                tracing::error!(target: LOGGER, "Unhandled platform error: {}", e);
+                unhandled_error()
+            }
+        })
+}
+
+/// `GET /v1/websearch/status` — the account's web search state and monthly
+/// allowance (`quota.limit`, `used`, `remaining`, `resets_at`, `plan`).
+pub async fn get_web_search_status() -> Result<Json<JsonObject>, HTTPException> {
+    run_blocking(web_search_status).await?.map(Json)
 }
