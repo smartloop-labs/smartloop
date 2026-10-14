@@ -886,7 +886,8 @@ impl ModelClient for RemoteModelClient {
             thinking,
             project_id: pinned_project_id().unwrap_or_default(),
         };
-        let reply = self.unary(request, None, |mut stub, request| async move {
+        // No deadline: a slow answer is not a hung host (as with `stream`).
+        let reply = self.unary(request, Some(f64::INFINITY), |mut stub, request| async move {
             stub.generate(request).await
         })?;
         Ok(reply.text)
