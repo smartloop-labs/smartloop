@@ -132,6 +132,14 @@ pub fn web_search_status() -> Result<JsonObject, HTTPException> {
 
 /// `GET /v1/websearch/status` — the account's web search state and monthly
 /// allowance (`quota.limit`, `used`, `remaining`, `resets_at`, `plan`).
+#[utoipa::path(
+    get,
+    path = "/v1/websearch/status",
+    tag = "auth",
+    summary = "Get the account's web search status and monthly allowance",
+    description = "Relays the hosted status: `enabled`, `reason`, and `quota` (`limit`, `used`, `remaining`, `period`, `resets_at`, `plan`). `limit` is null for unmetered accounts.",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 401, description = "Not signed in"), (status = 502, description = "Platform API unavailable"), (status = 500, description = "Server error"))
+)]
 pub async fn get_web_search_status() -> Result<Json<JsonObject>, HTTPException> {
     run_blocking(web_search_status).await?.map(Json)
 }
