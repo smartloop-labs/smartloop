@@ -62,6 +62,10 @@ impl AuthPlatformService for RefusingService {
     fn list_models(&self, _force: bool) -> PlatformResult<Vec<JsonObject>> {
         Ok(Vec::new())
     }
+
+    fn list_mcp_catalog(&self, _force: bool) -> PlatformResult<Vec<JsonObject>> {
+        Ok(Vec::new())
+    }
 }
 
 fn refusing_service(status: u16) -> Arc<dyn AuthPlatformService> {

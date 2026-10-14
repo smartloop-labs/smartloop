@@ -43,6 +43,10 @@ impl AuthPlatformService for FakePlatform {
     fn list_models(&self, _force: bool) -> PlatformResult<Vec<JsonObject>> {
         Ok(Vec::new())
     }
+
+    fn list_mcp_catalog(&self, _force: bool) -> PlatformResult<Vec<JsonObject>> {
+        Ok(Vec::new())
+    }
 }
 
 /// The autouse fixtures of the Python module: an isolated credential store,
@@ -510,5 +514,48 @@ mod test_signing_in_clears_the_search_gate {
         delete(&client(), "/v1/auth/token").await;
 
         assert!(status_cache_is_empty());
+    }
+}
+
+mod test_auth_changes_refresh_the_mcp_catalog {
+    //! The cloud lists INTERNAL catalog entries to superusers only, so a cached
+    //! catalog must not outlive the account that fetched it.
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records the `force` flag of every `list_mcp_catalog` call.
+    struct RecordingPlatform {
+        catalog_calls: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl AuthPlatformService for RecordingPlatform {
+        fn get_current_user(&self, _force: bool) -> PlatformResult<JsonObject> {
+            Ok(JsonObject::new())
+        }
+
+        fn list_models(&self, _force: bool) -> PlatformResult<Vec<JsonObject>> {
+            Ok(Vec::new())
+        }
+
+        fn list_mcp_catalog(&self, force: bool) -> PlatformResult<Vec<JsonObject>> {
+            self.catalog_calls.lock().unwrap().push(force);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_sign_in_and_out_force_a_catalog_refetch() {
+        let _fx = AuthFixture::new();
+        let catalog_calls = Arc::new(Mutex::new(Vec::new()));
+        auth::set_platform_service_override(Some(Arc::new(RecordingPlatform {
+            catalog_calls: catalog_calls.clone(),
+        })));
+
+        post_json(&client(), "/v1/auth/callback", &json!({"access_token": "jwt-superuser"})).await;
+        assert_eq!(*catalog_calls.lock().unwrap(), vec![true]);
+
+        delete(&client(), "/v1/auth/token").await;
+        assert_eq!(*catalog_calls.lock().unwrap(), vec![true, true]);
     }
 }

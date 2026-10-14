@@ -130,7 +130,7 @@ pub struct OAuthCallbackQuery {
 
 // -- platform seam --------------------------------------------------------------
 
-/// The two platform-service calls this router makes.
+/// The platform-service calls this router makes.
 ///
 /// The router resolves the service through its own module-level
 /// [`get_platform_service`] (not through a request dependency), exactly as the
@@ -141,6 +141,8 @@ pub trait AuthPlatformService: Send + Sync {
     fn get_current_user(&self, force: bool) -> PlatformResult<JsonObject>;
     /// `PlatformService.list_models(force=...)`.
     fn list_models(&self, force: bool) -> PlatformResult<Vec<JsonObject>>;
+    /// `PlatformService.list_mcp_catalog(force=...)`.
+    fn list_mcp_catalog(&self, force: bool) -> PlatformResult<Vec<JsonObject>>;
 }
 
 impl AuthPlatformService for PlatformService {
@@ -150,6 +152,10 @@ impl AuthPlatformService for PlatformService {
 
     fn list_models(&self, force: bool) -> PlatformResult<Vec<JsonObject>> {
         PlatformService::list_models(self, force)
+    }
+
+    fn list_mcp_catalog(&self, force: bool) -> PlatformResult<Vec<JsonObject>> {
+        PlatformService::list_mcp_catalog(self, force)
     }
 }
 
@@ -210,19 +216,22 @@ pub fn router() -> Router {
         .route("/v1/auth/callback", post(oauth_callback_handler).get(oauth_callback_get_handler))
 }
 
-/// Force-refresh the cached model catalog (and optionally the user) on an
-/// auth change.
+/// Force-refresh the cached model and MCP catalogs (and optionally the user)
+/// on an auth change.
 ///
-/// The catalog always refreshes so each model's `is_accessible` — which the
-/// cloud computes on the fly per-user — reflects the current auth state instead
-/// of a stale entry.  On logout pass `refresh_user = false`: the cached user
-/// profile is intentionally left in place (stale is fine; already-downloaded
+/// Both catalogs always refresh because the cloud shapes them per-user: each
+/// model's `is_accessible`, and which MCP entries are listed at all (INTERNAL
+/// entries go to superusers only).  Without this, switching accounts would
+/// serve the previous account's catalog until the cache TTL ran out.
+///
+/// On logout pass `refresh_user = false`: the cached user profile is
+/// intentionally left in place (stale is fine; already-downloaded
 /// models stay usable), and we avoid a pointless 401 round-trip.
 ///
-/// Best-effort and independent: a failed user fetch doesn't block the catalog
-/// refresh.  A single login delivers the token redundantly (POST + Safari GET
-/// fallback, plus retries), so we dedupe on the credential value — only a
-/// genuine change triggers a refetch.
+/// Best-effort and independent: a failed fetch doesn't block the others.  A
+/// single login delivers the token redundantly (POST + Safari GET fallback,
+/// plus retries), so we dedupe on the credential value — only a genuine
+/// change triggers a refetch.
 pub fn refresh_platform_cache(refresh_user: bool) {
     let token = credential_store::get_access_token().or_else(credential_store::get_token);
     if token.is_some() && *LAST_REFRESHED_TOKEN.lock() == token {
@@ -243,6 +252,9 @@ pub fn refresh_platform_cache(refresh_user: bool) {
     }
     if let Err(e) = svc.list_models(true) {
         tracing::warn!(target: LOGGER, "Failed to refresh cached model catalog: {}", e);
+    }
+    if let Err(e) = svc.list_mcp_catalog(true) {
+        tracing::warn!(target: LOGGER, "Failed to refresh cached MCP catalog: {}", e);
     }
     *LAST_REFRESHED_TOKEN.lock() = token;
 }
@@ -410,9 +422,9 @@ pub fn clear_token(type_: ClearScope) -> AuthStatusResponse {
         tracing::info!(target: LOGGER, "Access/refresh tokens cleared via /v1/auth/token");
     }
 
-    // Refresh the catalog (now anonymous) so model is_accessible reflects the
-    // logout.  Keep the cached user profile as-is — stale is acceptable and
-    // already-downloaded models remain usable.
+    // Refresh the catalogs (now anonymous) so model is_accessible and the
+    // listed MCP entries reflect the logout.  Keep the cached user profile
+    // as-is — stale is acceptable and already-downloaded models remain usable.
     refresh_platform_cache(false);
     auth_status()
 }
