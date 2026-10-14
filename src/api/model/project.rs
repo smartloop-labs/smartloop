@@ -9,7 +9,7 @@ use crate::api::model::mcp::MCPServerResponse;
 
 /// Request model for creating a skill.  Only `content` is required;
 /// name and description are auto-generated from content when omitted.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct SkillRequest {
     /// Skill content.
     pub content: String,
@@ -23,14 +23,14 @@ pub struct SkillRequest {
 
 /// Request model for updating an existing skill.
 /// Content should include YAML frontmatter with name and description.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct UpdateSkillRequest {
     /// Full skill content with YAML frontmatter.
     pub content: String,
 }
 
 /// Response model for project skills.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct SkillResponse {
     /// Skill ID.
     pub id: String,
@@ -44,7 +44,7 @@ pub struct SkillResponse {
 }
 
 /// Request to create a new project.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct CreateProjectRequest {
     /// Project name.
     pub name: String,
@@ -67,7 +67,7 @@ pub struct CreateProjectRequest {
 }
 
 /// Request to update an existing project.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct UpdateProjectRequest {
     /// New project name.
     #[serde(default)]
@@ -88,7 +88,7 @@ fn default_true() -> bool {
 }
 
 /// Single project info.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct ProjectResponse {
     pub id: String,
     #[serde(default)]
@@ -134,13 +134,13 @@ impl Default for ProjectResponse {
 }
 
 /// List of projects.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct ProjectListResponse {
     pub projects: Vec<ProjectResponse>,
 }
 
 /// Response after deleting a project.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct DeleteProjectResponse {
     pub id: String,
     pub deleted: bool,

@@ -30,7 +30,7 @@ use super::_errors::{py_error_kind, run_blocking, HTTPException, PyErrorKind, Va
 pub const LOGGER: &str = "smartloop.api.routers.storage";
 
 /// Categories to reclaim.  Nothing is deleted unless asked for explicitly.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct CleanupRequest {
     /// Delete downloaded models that aren't in use.
     #[serde(default)]
@@ -261,6 +261,14 @@ pub fn router() -> Router {
 }
 
 /// `GET /v1/storage/usage` — disk usage under the SLP home directory, by category.
+#[utoipa::path(
+    get,
+    path = "/v1/storage/usage",
+    tag = "system",
+    summary = "Get disk usage",
+    description = "Disk usage under the Smartloop home directory, by category.",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn get_storage_usage() -> Result<Json<Value>, HTTPException> {
     let svc = model_service();
     let result = run_blocking(move || compute_usage(svc.as_ref())).await?;
@@ -274,6 +282,15 @@ pub async fn get_storage_usage() -> Result<Json<Value>, HTTPException> {
 ///
 /// Returns what was removed, what failed, and a fresh usage report, so the
 /// caller doesn't need a follow-up request to refresh its view.
+#[utoipa::path(
+    post,
+    path = "/v1/storage/cleanup",
+    tag = "system",
+    request_body = CleanupRequest,
+    summary = "Reclaim disk space",
+    description = "",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn cleanup_storage(
     ValidatedJson(request): ValidatedJson<CleanupRequest>,
 ) -> Result<Json<Value>, HTTPException> {

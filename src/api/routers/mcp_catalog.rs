@@ -47,7 +47,7 @@ impl IntoResponse for HTTPException {
 }
 
 /// Connection settings for a remotely hosted catalog server.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct RemoteConfig {
     pub server_url: String,
     #[serde(default)]
@@ -63,7 +63,7 @@ pub struct RemoteConfig {
 }
 
 /// Launch settings for a catalog server run locally over stdio.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct LocalConfig {
     pub command: String,
     #[serde(default)]
@@ -78,7 +78,7 @@ pub struct LocalConfig {
 /// The platform catalog does not store `server_type`; [`MCPCatalogEntry::from_value`]
 /// (the `model_validator`) derives it so clients still get a populated
 /// `"local"`/`"remote"` value.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct MCPCatalogEntry {
     pub slug: String,
     pub display_name: String,
@@ -155,6 +155,14 @@ pub fn to_entries(
 /// costs a refresh and a retry on top of the original call.  On the runtime
 /// that would stall every in-flight chat stream, so it runs on the blocking
 /// pool (FastAPI ran the sync handler in its threadpool).
+#[utoipa::path(
+    get,
+    path = "/v1/mcp-catalog",
+    tag = "mcp",
+    summary = "List the curated MCP catalog",
+    description = "",
+    responses((status = 200, description = "OK", body = Vec<MCPCatalogEntry>), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn list_mcp_catalog() -> Result<Json<Vec<MCPCatalogEntry>>, HTTPException> {
     let joined = tokio::task::spawn_blocking(|| {
         let svc = get_platform_service();

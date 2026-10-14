@@ -35,7 +35,7 @@ pub const LOGGER: &str = "smartloop.api.routers.auth";
 // -- request / response models ------------------------------------------------
 
 /// Kind of token stored via `POST /v1/auth/token`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenType {
     #[default]
@@ -44,7 +44,7 @@ pub enum TokenType {
 }
 
 /// Which credentials `DELETE /v1/auth/token` clears.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ClearScope {
     #[default]
@@ -54,7 +54,7 @@ pub enum ClearScope {
 }
 
 /// Body of `POST /v1/auth/token`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct TokenSetRequest {
     /// The token value to store (min length 1).
     pub token: String,
@@ -80,7 +80,7 @@ impl TokenSetRequest {
 }
 
 /// The logged-in user's identity.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct UserInfo {
     pub email: String,
     #[serde(default)]
@@ -88,7 +88,7 @@ pub struct UserInfo {
 }
 
 /// Credential state, without token values.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct AuthStatusResponse {
     pub authenticated: bool,
     /// `"developer_token"`, `"access_token"` or null.
@@ -101,7 +101,8 @@ pub struct AuthStatusResponse {
 }
 
 /// Query of `DELETE /v1/auth/token`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ClearTokenQuery {
     /// Which credentials to clear: all, developer_token, or access_token.
     #[serde(default, rename = "type")]
@@ -109,7 +110,7 @@ pub struct ClearTokenQuery {
 }
 
 /// Body of `POST /v1/auth/callback`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct OAuthCallbackRequest {
     /// JWT access token from the OAuth flow.
     pub access_token: String,
@@ -119,7 +120,8 @@ pub struct OAuthCallbackRequest {
 }
 
 /// Query of `GET /v1/auth/callback` (Safari fallback).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct OAuthCallbackQuery {
     pub access_token: String,
     #[serde(default)]
@@ -470,11 +472,28 @@ pub fn oauth_callback_get(access_token: &str, refresh_token: Option<&str>) -> St
 }
 
 /// `GET /v1/auth/status`.
+#[utoipa::path(
+    get,
+    path = "/v1/auth/status",
+    tag = "auth",
+    summary = "Get sign-in status",
+    description = "",
+    responses((status = 200, description = "OK", body = AuthStatusResponse))
+)]
 async fn auth_status_handler() -> Result<Json<AuthStatusResponse>, HTTPException> {
     run_blocking(auth_status).await.map(Json)
 }
 
 /// `POST /v1/auth/token`.
+#[utoipa::path(
+    post,
+    path = "/v1/auth/token",
+    tag = "auth",
+    request_body = TokenSetRequest,
+    summary = "Store a token",
+    description = "",
+    responses((status = 200, description = "OK", body = AuthStatusResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 async fn set_token_handler(
     ValidatedJson(request): ValidatedJson<TokenSetRequest>,
 ) -> Result<Json<AuthStatusResponse>, HTTPException> {
@@ -483,6 +502,15 @@ async fn set_token_handler(
 }
 
 /// `DELETE /v1/auth/token`.
+#[utoipa::path(
+    delete,
+    path = "/v1/auth/token",
+    tag = "auth",
+    params(ClearTokenQuery),
+    summary = "Sign out",
+    description = "Clears all credentials, or only the developer or access token.",
+    responses((status = 200, description = "OK", body = AuthStatusResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 async fn clear_token_handler(
     ValidatedQuery(query): ValidatedQuery<ClearTokenQuery>,
 ) -> Result<Json<AuthStatusResponse>, HTTPException> {
@@ -490,6 +518,15 @@ async fn clear_token_handler(
 }
 
 /// `POST /v1/auth/callback`.
+#[utoipa::path(
+    post,
+    path = "/v1/auth/callback",
+    tag = "auth",
+    request_body = OAuthCallbackRequest,
+    summary = "Complete OAuth sign-in",
+    description = "",
+    responses((status = 200, description = "OK", body = AuthStatusResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 async fn oauth_callback_handler(
     ValidatedJson(request): ValidatedJson<OAuthCallbackRequest>,
 ) -> Result<Json<AuthStatusResponse>, HTTPException> {
@@ -498,6 +535,15 @@ async fn oauth_callback_handler(
 
 /// `GET /v1/auth/callback` — 307 redirect to the webapp success page
 /// (FastAPI's `RedirectResponse` default status).
+#[utoipa::path(
+    get,
+    path = "/v1/auth/callback",
+    tag = "auth",
+    params(OAuthCallbackQuery),
+    summary = "OAuth redirect target",
+    description = "Stores the token and redirects to the sign-in success page.",
+    responses((status = 307, description = "Redirect to the sign-in success page"), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 async fn oauth_callback_get_handler(
     ValidatedQuery(query): ValidatedQuery<OAuthCallbackQuery>,
 ) -> Result<Response, HTTPException> {

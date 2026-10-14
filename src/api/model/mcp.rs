@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 /// A tool exposed by an MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct MCPToolResponse {
     pub name: String,
     #[serde(default)]
@@ -33,7 +33,7 @@ fn default_empty_args() -> Option<Vec<String>> {
 }
 
 /// A registered MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct MCPServerResponse {
     pub id: String,
     pub name: String,
@@ -100,13 +100,13 @@ impl Default for MCPServerResponse {
 }
 
 /// List of MCP servers.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct MCPServerListResponse {
     pub servers: Vec<MCPServerResponse>,
 }
 
 /// Response after deleting an MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct DeleteMCPServerResponse {
     pub id: String,
     pub deleted: bool,
@@ -114,7 +114,7 @@ pub struct DeleteMCPServerResponse {
 }
 
 /// Request to register an MCP server (local stdio or remote HTTP).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct MCPRegisterRequest {
     /// "local" or "remote".
     #[serde(default = "default_remote")]
@@ -173,7 +173,7 @@ impl Default for MCPRegisterRequest {
 ///
 /// `toml` is the file's text; `filename` names the copy kept under
 /// `~/.smartloop/mcp.d/`, so the connection survives as a file.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct MCPDefinitionRequest {
     pub toml: String,
     #[serde(default)]
@@ -184,7 +184,7 @@ pub struct MCPDefinitionRequest {
 ///
 /// If `auth_type` is 'oauth', `auth_url` and oauth session fields are returned.
 /// Otherwise, the server is registered directly and server fields are populated.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct MCPRegisterResponse {
     /// 'none', 'token', 'oauth'.
     pub auth_type: String,
@@ -214,7 +214,7 @@ pub struct MCPRegisterResponse {
 }
 
 /// OAuth callback payload completing a remote MCP registration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct MCPOAuthCallbackRequest {
     pub server_url: String,
     pub code: String,
@@ -232,7 +232,7 @@ pub struct MCPOAuthCallbackRequest {
 }
 
 /// Request to call a tool on an MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct MCPToolCallRequest {
     pub tool_name: String,
     /// Values are str/int/float/bool/list/dict.
@@ -241,7 +241,7 @@ pub struct MCPToolCallRequest {
 }
 
 /// Result of an MCP tool call.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct MCPToolCallResponse {
     pub success: bool,
     #[serde(default)]

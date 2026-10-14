@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The role of a chat message author (`Literal["system", "user", "assistant"]`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
@@ -26,7 +26,7 @@ impl Role {
 }
 
 /// A single message in a chat conversation.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct ChatMessage {
     /// The role of the message author.
     pub role: Role,
@@ -42,7 +42,7 @@ pub struct ChatMessage {
 ///
 /// Sent so date/time-aware answers are grounded in the *user's* wall clock and
 /// locale instead of the server's — see `resolve_current_date`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct AdditionalMessageParams {
     /// IANA timezone, e.g. 'America/New_York'.
     #[serde(default)]
@@ -66,7 +66,7 @@ fn default_penalty() -> Option<f64> {
 }
 
 /// OpenAI-compatible chat completion request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct ChatCompletionRequest {
     /// ID of the model to use.
     pub model: String,
@@ -202,7 +202,7 @@ fn float_range(
 }
 
 /// Delta content for streaming responses.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct DeltaContent {
     #[serde(default)]
     pub role: Option<String>,
@@ -211,7 +211,7 @@ pub struct DeltaContent {
 }
 
 /// A single choice in a streaming chunk response.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct ChunkChoice {
     #[serde(default)]
     pub index: i64,
@@ -241,7 +241,7 @@ fn status_object() -> String {
 }
 
 /// OpenAI-compatible streaming chunk response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct ChatCompletionChunk {
     #[serde(default = "new_completion_id")]
     pub id: String,
@@ -268,7 +268,7 @@ impl Default for ChatCompletionChunk {
 }
 
 /// Lifecycle of a [`ChatStatusChunk`] step.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatStatus {
     #[default]
@@ -282,7 +282,7 @@ pub enum ChatStatus {
 /// Interleaved in the same SSE stream as [`ChatCompletionChunk`] content
 /// deltas. Clients distinguish it by `object == "chat.status"` and render
 /// `message` as live progress (e.g. "Searching documents", "Running fetch").
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct ChatStatusChunk {
     /// Always `"chat.status"`.
     #[serde(default = "status_object")]
@@ -309,7 +309,7 @@ fn default_finish_reason() -> String {
 }
 
 /// A single choice in a non-streaming response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct Choice {
     #[serde(default)]
     pub index: i64,
@@ -325,7 +325,7 @@ impl Default for Choice {
 }
 
 /// Token usage information.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct Usage {
     #[serde(default)]
     pub prompt_tokens: i64,
@@ -336,7 +336,7 @@ pub struct Usage {
 }
 
 /// Reference to a source document used in the response.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct Citation {
     pub document_id: String,
     #[serde(default)]
@@ -344,7 +344,7 @@ pub struct Citation {
 }
 
 /// OpenAI-compatible non-streaming response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct ChatCompletionResponse {
     #[serde(default = "new_completion_id")]
     pub id: String,
@@ -388,7 +388,7 @@ impl Default for ChatCompletionResponse {
 // --- Document models ---
 
 /// Request to add a document source.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct AddDocumentRequest {
     /// File path or URL for the document source.
     pub source: String,
@@ -406,7 +406,7 @@ fn default_pending() -> String {
 }
 
 /// Single document info.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct DocumentResponse {
     #[serde(default)]
     pub id: Option<String>,
@@ -427,13 +427,13 @@ impl Default for DocumentResponse {
 }
 
 /// List of documents.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct DocumentListResponse {
     pub documents: Vec<DocumentResponse>,
 }
 
 /// Response after deleting a document.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct DeleteDocumentResponse {
     pub id: String,
     pub deleted: bool,
@@ -443,7 +443,7 @@ pub struct DeleteDocumentResponse {
 // --- Asset models ---
 
 /// Response after uploading an asset.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct AssetUploadResponse {
     pub asset_id: String,
     pub filename: String,
@@ -456,7 +456,7 @@ pub struct AssetUploadResponse {
 }
 
 /// Metadata and content for a stored asset.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct AssetResponse {
     pub asset_id: String,
     pub filename: String,
@@ -469,7 +469,7 @@ pub struct AssetResponse {
 }
 
 /// Response after deleting an asset.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct DeleteAssetResponse {
     pub asset_id: String,
     pub deleted: bool,
@@ -479,7 +479,7 @@ pub struct DeleteAssetResponse {
 // --- Feedback models ---
 
 /// Thumbs up or down (`Literal["up", "down"]`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Rating {
     #[default]
@@ -498,7 +498,7 @@ impl Rating {
 }
 
 /// Feedback on an assistant response.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct FeedbackRequest {
     /// Session ID of the conversation.
     pub session_id: String,
@@ -512,7 +512,7 @@ pub struct FeedbackRequest {
 }
 
 /// Result of recording feedback.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct FeedbackResponse {
     pub feedback_id: String,
     pub session_id: String,

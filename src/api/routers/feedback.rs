@@ -18,7 +18,8 @@ use super::_errors::{
 pub const LOGGER: &str = "smartloop.api.routers.feedback";
 
 /// Query for `GET /v1/feedback`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GetFeedbackQuery {
     /// Session ID to load feedback for.
     pub session_id: String,
@@ -28,7 +29,8 @@ pub struct GetFeedbackQuery {
 }
 
 /// Query for `DELETE /v1/feedback`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DeleteFeedbackQuery {
     /// Session ID to delete feedback for.
     pub session_id: String,
@@ -57,6 +59,15 @@ fn project_arg(project_id: Option<&str>) -> String {
 /// `GET /v1/feedback` — return a map of message_id -> rating for a session.
 ///
 /// A `ValueError` (model or project not loaded yet) returns `{}`.
+#[utoipa::path(
+    get,
+    path = "/v1/feedback",
+    tag = "feedback",
+    params(GetFeedbackQuery),
+    summary = "Get feedback for a session",
+    description = "A map of message ID to rating.",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn get_feedback(
     ValidatedQuery(query): ValidatedQuery<GetFeedbackQuery>,
 ) -> Result<Json<Map<String, Value>>, HTTPException> {
@@ -80,6 +91,15 @@ pub async fn get_feedback(
 }
 
 /// `POST /v1/feedback` — record a rating; `ValueError` answers 400.
+#[utoipa::path(
+    post,
+    path = "/v1/feedback",
+    tag = "feedback",
+    request_body = FeedbackRequest,
+    summary = "Rate an answer",
+    description = "",
+    responses((status = 200, description = "OK", body = FeedbackResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn submit_feedback(
     ValidatedJson(request): ValidatedJson<FeedbackRequest>,
 ) -> Result<Json<FeedbackResponse>, HTTPException> {
@@ -108,6 +128,15 @@ pub async fn submit_feedback(
 }
 
 /// `DELETE /v1/feedback` — delete feedback ratings for a message ID.
+#[utoipa::path(
+    delete,
+    path = "/v1/feedback",
+    tag = "feedback",
+    params(DeleteFeedbackQuery),
+    summary = "Delete feedback for a message",
+    description = "",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn delete_feedback(
     ValidatedQuery(query): ValidatedQuery<DeleteFeedbackQuery>,
 ) -> Result<Json<Value>, HTTPException> {

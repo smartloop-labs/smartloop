@@ -2483,11 +2483,11 @@ fn stream_chunks_inner(
                 tokio::task::spawn_blocking(bind(move || orchestrate_svc.orchestrate(args)));
 
             let orch_timeout = AppSettings::new().orchestrate_timeout_s;
-            let deadline = if orch_timeout > 0.0 {
-                Some(Instant::now() + Duration::from_secs_f64(orch_timeout))
-            } else {
-                None
-            };
+            // An idle budget, not a total one: every progress event (a step
+            // starting or finishing) restarts it, so a slow but advancing
+            // orchestration is never cut off.
+            let budget = (orch_timeout > 0.0).then(|| Duration::from_secs_f64(orch_timeout));
+            let mut deadline = budget.map(|b| Instant::now() + b);
 
             let mut timed_out = false;
             while !orchestrate_task.is_finished() {
@@ -2496,7 +2496,10 @@ fn stream_chunks_inner(
                     break;
                 }
                 match tokio::time::timeout(Duration::from_millis(100), status_rx.recv()).await {
-                    Ok(Some(event)) => yield event,
+                    Ok(Some(event)) => {
+                        deadline = budget.map(|b| Instant::now() + b);
+                        yield event
+                    }
                     Ok(None) => tokio::time::sleep(Duration::from_millis(1)).await,
                     Err(_) => continue,
                 }
@@ -2511,7 +2514,7 @@ fn stream_chunks_inner(
                 cancelled.store(true, Ordering::SeqCst);
                 tracing::error!(
                     target: LOG_TARGET,
-                    "[orchestrate] exceeded {:.0}s budget — cancelling and returning a timeout to the client",
+                    "[orchestrate] no progress for {:.0}s — cancelling and returning a timeout to the client",
                     orch_timeout
                 );
                 // Drain any progress events already queued before giving up.
@@ -2521,7 +2524,7 @@ fn stream_chunks_inner(
                 yield status_event(
                     "tools",
                     "error",
-                    &format!("Orchestration timed out after {orch_timeout:.0}s"),
+                    &format!("Orchestration made no progress for {orch_timeout:.0}s"),
                 );
                 yield chunk_frame(
                     &stream_model,
@@ -3070,6 +3073,15 @@ pub fn parse_chat_request(body: &[u8]) -> Result<ChatCompletionRequest, Response
 
 /// `POST /v1/chat/completions` — create a chat completion (OpenAI-compatible).
 /// Supports both streaming and non-streaming modes.
+#[utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    tag = "chat",
+    request_body = crate::api::model::chat::ChatCompletionRequest,
+    summary = "Create a chat completion",
+    description = "OpenAI-compatible. Set `stream: true` to receive Server-Sent Events: `chat.completion.chunk` frames, `chat.status` progress frames, then `data: [DONE]`. A slow generation is never cut off.",
+    responses((status = 200, description = "A completion, or with `stream: true` an SSE stream of chunks ending in `data: [DONE]`", content((crate::api::model::chat::ChatCompletionResponse = "application/json"), (crate::api::model::chat::ChatCompletionChunk = "text/event-stream"))), (status = 400, description = "Invalid request"), (status = 500, description = "Server error"))
+)]
 pub async fn create_chat_completion(body: Bytes) -> Response {
     let request = match parse_chat_request(&body) {
         Ok(request) => request,

@@ -23,7 +23,7 @@ use super::_errors::{
 pub const LOGGER: &str = "smartloop.api.routers.releases";
 
 /// One downloadable artifact of a release.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct ReleaseArtifact {
     pub platform: String,
     pub arch: String,
@@ -34,7 +34,7 @@ pub struct ReleaseArtifact {
 }
 
 /// A published release.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct ReleaseInfo {
     pub version: String,
     pub name: String,
@@ -50,7 +50,7 @@ pub struct ReleaseInfo {
 }
 
 /// Response of `GET /v1/releases/latest`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct LatestReleaseResponse {
     #[serde(default)]
     pub update_available: Option<bool>,
@@ -63,7 +63,8 @@ pub struct LatestReleaseResponse {
 }
 
 /// Query of `GET /v1/releases/latest`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct LatestReleaseQuery {
     #[serde(default)]
     pub current_version: Option<String>,
@@ -89,6 +90,15 @@ pub fn router() -> Router {
 /// Pass `force=true` (used by an explicit "check for updates" action) to bypass
 /// the local cache TTL and re-poll the cloud immediately.  400 for an unknown
 /// channel, 502 when the platform is unavailable.
+#[utoipa::path(
+    get,
+    path = "/v1/releases/latest",
+    tag = "system",
+    params(LatestReleaseQuery),
+    summary = "Get the latest release",
+    description = "",
+    responses((status = 200, description = "OK", body = LatestReleaseResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn latest_release(
     ValidatedQuery(query): ValidatedQuery<LatestReleaseQuery>,
 ) -> Result<Json<LatestReleaseResponse>, HTTPException> {

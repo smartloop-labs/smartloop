@@ -46,7 +46,7 @@ pub const LOG_TARGET: &str = "smartloop.api.routers.init";
 pub const SSE_KEEPALIVE: &str = ": keepalive\n\n";
 
 /// Request body for workspace initialization.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct InitRequest {
     /// Model to initialize.
     #[serde(default)]
@@ -994,6 +994,15 @@ async fn ensure_tasks(model_service: &Arc<dyn InitModelService>, workspace: &Sha
 /// Downloads the GGUF via the Smartloop artifact endpoints and returns a
 /// streaming SSE response with real-time download progress.  The body is
 /// validated the way FastAPI validates `InitRequest` (422 in its shape).
+#[utoipa::path(
+    post,
+    path = "/v1/init",
+    tag = "setup",
+    request_body = InitRequest,
+    summary = "Initialise the workspace",
+    description = "Downloads and loads the model, streaming progress as Server-Sent Events.",
+    responses((status = 200, description = "Download/load progress as an SSE stream", content_type = "text/event-stream"), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn init(body: Bytes) -> Result<Response, HTTPException> {
     let request: InitRequest = parse_json_body(&body, None)?;
     init_with(request, get_model_service()).await
@@ -1276,6 +1285,15 @@ pub async fn init_with_seams(
 /// No authentication required; the body is optional (an empty or `null` body
 /// is `None`).  Intended for first-run scenarios (Electron installer, brew
 /// install) where the user has no login token.  Streams SSE progress.
+#[utoipa::path(
+    post,
+    path = "/v1/bootstrap",
+    tag = "setup",
+    request_body(content = Option<InitRequest>, description = "Optional; an empty body bootstraps the default model"),
+    summary = "Bootstrap a default project",
+    description = "Downloads a model and creates a default project.",
+    responses((status = 200, description = "Bootstrap result", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn bootstrap(body: Bytes) -> Result<Response, HTTPException> {
     let is_blank = body.iter().all(|b| b.is_ascii_whitespace());
     let request = if is_blank || serde_json::from_slice::<Value>(&body).is_ok_and(|v| v.is_null()) {

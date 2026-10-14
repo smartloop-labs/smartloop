@@ -107,9 +107,9 @@ pub struct AppSettings {
     pub thinking_enabled: Option<bool>,
     /// `SLP_DECISION_MODEL` — small model for decision nodes.
     pub decision_model: Option<String>,
-    /// `SLP_ORCHESTRATE_TIMEOUT_S` — 0 disables.
+    /// `SLP_ORCHESTRATE_TIMEOUT_S` — 0 (the default) disables.
     pub orchestrate_timeout_s: f64,
-    /// `SLP_STREAM_STALL_TIMEOUT_S` — 0 disables.
+    /// `SLP_STREAM_STALL_TIMEOUT_S` — 0 (the default) disables.
     pub stream_stall_timeout_s: f64,
     /// `SLP_AGENT_IDLE_TTL_S` — 0 = never stop idle agents.
     pub agent_idle_ttl_s: f64,
@@ -173,8 +173,8 @@ impl AppSettings {
             vision_clip_device: "auto".to_string(),
             thinking_enabled: None,
             decision_model: None,
-            orchestrate_timeout_s: 180.0,
-            stream_stall_timeout_s: 300.0,
+            orchestrate_timeout_s: 0.0,
+            stream_stall_timeout_s: 0.0,
             agent_idle_ttl_s: 900.0,
             agent_memory_limit_mb: 0,
         }

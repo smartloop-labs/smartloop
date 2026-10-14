@@ -279,6 +279,10 @@ pub trait PlatformApi: Send + Sync {
         let _ = timeout;
         Err(unsupported("web_search_status"))
     }
+    fn web_search_status_detail(&self, timeout: u64) -> PlatformResult<JsonObject> {
+        let _ = timeout;
+        Err(unsupported("web_search_status_detail"))
+    }
 }
 
 fn unsupported(op: &str) -> PlatformError {
@@ -821,6 +825,14 @@ impl SLPPlatformClient {
     /// `search::providers::hosted_search_available`, which fails open on the
     /// latter.
     pub fn web_search_status(&self, timeout: u64) -> PlatformResult<bool> {
+        let status = self.web_search_status_detail(timeout)?;
+        Ok(status.get("enabled").map(truthy).unwrap_or(false))
+    }
+
+    /// GET /v1/websearch/status (auth required), the whole body: `enabled`,
+    /// `reason`, and the account's monthly `quota` (limit, used, remaining,
+    /// resets_at, plan).  Same errors as [`Self::web_search_status`].
+    pub fn web_search_status_detail(&self, timeout: u64) -> PlatformResult<JsonObject> {
         let resp = self
             .authed(|h| self.send(Method::GET, WEBSEARCH_STATUS, h, &[], None, timeout))
             .map_err(|e| connection_error(&e))?;
@@ -833,7 +845,7 @@ impl SLPPlatformClient {
         }
         raise_for_status(resp.status, &[], ErrorClass::Connection)?;
         match resp.json()? {
-            Value::Object(map) => Ok(map.get("enabled").map(truthy).unwrap_or(false)),
+            Value::Object(map) => Ok(map),
             other => Err(PlatformError::Other(format!(
                 "Unexpected web search status response: {other}"
             ))),
@@ -898,5 +910,8 @@ impl PlatformApi for SLPPlatformClient {
     }
     fn web_search_status(&self, timeout: u64) -> PlatformResult<bool> {
         SLPPlatformClient::web_search_status(self, timeout)
+    }
+    fn web_search_status_detail(&self, timeout: u64) -> PlatformResult<JsonObject> {
+        SLPPlatformClient::web_search_status_detail(self, timeout)
     }
 }

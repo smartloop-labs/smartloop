@@ -45,6 +45,15 @@ fn asset_error(err: anyhow::Error, value_status: u16, what: &str) -> HTTPExcepti
 /// Other file types are stored as-is.  Returns an `asset_id` that can be
 /// referenced in `message.attachments` of a chat completion request.
 /// A `ValueError` (too large) answers 413.
+#[utoipa::path(
+    post,
+    path = "/v1/assets",
+    tag = "assets",
+    request_body(content = inline(crate::api::openapi::FileUpload), content_type = "multipart/form-data"),
+    summary = "Upload an asset",
+    description = "Uploads a chat attachment and converts it to Markdown where possible.",
+    responses((status = 200, description = "OK", body = AssetUploadResponse), (status = 413, description = "File too large"), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn upload_asset(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<AssetUploadResponse>, HTTPException> {
@@ -69,6 +78,15 @@ pub async fn upload_asset(
 }
 
 /// `GET /v1/assets/{asset_id}` — retrieve asset metadata and content (markdown) by ID.
+#[utoipa::path(
+    get,
+    path = "/v1/assets/{asset_id}",
+    tag = "assets",
+    params(("asset_id" = String, Path, description = "Asset ID")),
+    summary = "Get an asset",
+    description = "",
+    responses((status = 200, description = "OK", body = AssetResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn get_asset(Path(asset_id): Path<String>) -> Result<Json<AssetResponse>, HTTPException> {
     let model_service = get_model_service();
     let result = run_on(&EXECUTOR, move || model_service.get_asset(&asset_id)).await?;
@@ -79,6 +97,15 @@ pub async fn get_asset(Path(asset_id): Path<String>) -> Result<Json<AssetRespons
 }
 
 /// `DELETE /v1/assets/{asset_id}` — delete an asset by ID.
+#[utoipa::path(
+    delete,
+    path = "/v1/assets/{asset_id}",
+    tag = "assets",
+    params(("asset_id" = String, Path, description = "Asset ID")),
+    summary = "Delete an asset",
+    description = "",
+    responses((status = 200, description = "OK", body = DeleteAssetResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn delete_asset(
     Path(asset_id): Path<String>,
 ) -> Result<Json<DeleteAssetResponse>, HTTPException> {
