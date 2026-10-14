@@ -137,6 +137,15 @@ pub fn resolve_model_id(model_name: &str, model_service: &ModelService) -> anyho
 ///
 /// Validates `wait_ms` (422 in FastAPI's validation shape when negative or
 /// not an integer) and delegates to [`cancel_download`].
+#[utoipa::path(
+    delete,
+    path = "/v1/downloads/{model_name}",
+    tag = "models",
+    params(("model_name" = String, Path, description = "Model name"), ("wait_ms" = Option<i64>, Query, description = "Milliseconds to wait for the download to stop")),
+    summary = "Cancel a model download",
+    description = "",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn cancel_download_handler(
     Path(model_name): Path<String>,
     RawQuery(query): RawQuery,

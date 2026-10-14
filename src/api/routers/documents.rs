@@ -170,6 +170,15 @@ where
 
 /// `GET /v1/projects/{project_id}/documents` — list documents for a project
 /// (404 on `ValueError`, 503 on `RuntimeError`).
+#[utoipa::path(
+    get,
+    path = "/v1/projects/{project_id}/documents",
+    tag = "documents",
+    params(("project_id" = String, Path, description = "Project ID")),
+    summary = "List documents",
+    description = "",
+    responses((status = 200, description = "OK", body = DocumentListResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn list_documents_for_project(
     Path(project_id): Path<String>,
 ) -> Result<Json<DocumentListResponse>, HTTPException> {
@@ -218,6 +227,16 @@ fn queued_ids(result: &Value) -> Result<Vec<String>, String> {
 ///
 /// Returns a text/event-stream response with the same events as POST /documents:
 /// `queued`, `progress`…, then `done` (or `timeout`).
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/documents",
+    tag = "documents",
+    params(("project_id" = String, Path, description = "Project ID")),
+    request_body = AddDocumentRequest,
+    summary = "Add a document source",
+    description = "Indexes a file, directory or URL and streams progress as Server-Sent Events.",
+    responses((status = 200, description = "Indexing progress as an SSE stream", content_type = "text/event-stream"), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn add_document_to_project(
     Path(project_id): Path<String>,
     ValidatedJson(request): ValidatedJson<AddDocumentRequest>,
@@ -265,6 +284,16 @@ pub async fn add_document_to_project(
 /// automatically within a few seconds.  Returns immediately with
 /// `status=accepted`; poll `GET /v1/projects/{project_id}/documents` to track
 /// indexing progress.
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/documents/upload",
+    tag = "documents",
+    params(("project_id" = String, Path, description = "Project ID")),
+    request_body(content = inline(crate::api::openapi::DocumentUpload), content_type = "multipart/form-data"),
+    summary = "Upload a document",
+    description = "",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn upload_document_file(
     Path(project_id): Path<String>,
     multipart: Result<Multipart, MultipartRejection>,
@@ -297,6 +326,15 @@ pub async fn upload_document_file(
 }
 
 /// `DELETE /v1/projects/{project_id}/documents/{document_id}` — delete a document.
+#[utoipa::path(
+    delete,
+    path = "/v1/projects/{project_id}/documents/{document_id}",
+    tag = "documents",
+    params(("project_id" = String, Path, description = "Project ID"), ("document_id" = String, Path, description = "Document ID")),
+    summary = "Delete a document",
+    description = "",
+    responses((status = 200, description = "OK", body = DeleteDocumentResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn delete_document_from_project(
     Path((project_id, document_id)): Path<(String, String)>,
 ) -> Result<Json<DeleteDocumentResponse>, HTTPException> {

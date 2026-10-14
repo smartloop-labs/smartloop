@@ -258,7 +258,7 @@ pub fn display_capabilities<S: AsRef<str>>(caps: &[S]) -> Vec<String> {
 }
 
 /// Body of `POST /v1/models/load` (optional; defaults to no project).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct ModelLoadRequest {
     #[serde(default)]
     pub project_id: Option<String>,
@@ -269,6 +269,15 @@ pub struct ModelLoadRequest {
 ///
 /// Errors: `PermissionError` → `status_for`, `EnvironmentError`/
 /// `ConnectionError` → 502, `ValueError` → 422, else 500.
+#[utoipa::path(
+    post,
+    path = "/v1/models/load",
+    tag = "models",
+    request_body = ModelLoadRequest,
+    summary = "Load the model into memory",
+    description = "",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn load_model(body: Bytes) -> Result<Json<Value>, HTTPException> {
     let request: ModelLoadRequest = parse_json_body(&body, Some(ModelLoadRequest::default()))?;
     load_model_with(request, get_model_service()).await.map(Json)
@@ -330,6 +339,14 @@ pub async fn load_model_with(
 }
 
 /// `POST /v1/models/unload` — unload the model from memory to free resources.
+#[utoipa::path(
+    post,
+    path = "/v1/models/unload",
+    tag = "models",
+    summary = "Unload the model from memory",
+    description = "",
+    responses((status = 200, description = "OK", body = serde_json::Value))
+)]
 pub async fn unload_model() -> Json<Value> {
     Json(unload_model_with(get_model_service()).await)
 }
@@ -355,7 +372,7 @@ pub async fn unload_model_with(model_service: Arc<ModelService>) -> Value {
 /// validation on arrival.  `premium` is deliberately not a member: it never
 /// existed on the platform's enum.  `internal` only ever appears when
 /// superuser credentials fetched the catalog.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, utoipa::ToSchema)]
 pub enum AccessLevel {
     #[serde(rename = "free")]
     Free,
@@ -427,7 +444,7 @@ where
 }
 
 /// One row of `GET /v1/models`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct ModelEntry {
     pub name: String,
     pub model_id: String,
@@ -470,7 +487,8 @@ impl ModelEntry {
 }
 
 /// Query string of `GET /v1/models`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListModelsQuery {
     /// Resolve enabled state against this project; defaults to workspace
     /// (app-default) state.
@@ -486,6 +504,15 @@ pub struct ListModelsQuery {
 /// Sync on purpose in Python: the platform client is synchronous, and a 401
 /// costs a refresh and a retry on top of the original call.  On the event
 /// loop that stalls every in-flight chat stream.
+#[utoipa::path(
+    get,
+    path = "/v1/models",
+    tag = "models",
+    params(ListModelsQuery),
+    summary = "List available models",
+    description = "The cloud model catalog, enriched with local download and enabled state.",
+    responses((status = 200, description = "OK", body = Vec<ModelEntry>), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn list_models(Query(query): Query<ListModelsQuery>) -> Result<Json<Vec<ModelEntry>>, HTTPException> {
     let model_service = get_model_service();
     let svc = get_platform_service();
@@ -720,7 +747,7 @@ pub fn mark_recommended(entries: &mut [ModelEntry], total_gb: Option<f64>) {
 }
 
 /// One row of `GET /v1/models/workspace`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct WorkspaceModelEntry {
     pub model_name: String,
     pub model_id: String,
@@ -746,6 +773,14 @@ fn sort_by_rank_desc<T>(items: &mut [T], rank: impl Fn(&T) -> (f64, i64)) {
 
 /// `GET /v1/models/workspace` — list models registered in the local
 /// workspace (bootstrap model excluded, best model first).
+#[utoipa::path(
+    get,
+    path = "/v1/models/workspace",
+    tag = "models",
+    summary = "List workspace models",
+    description = "Models registered in the local workspace.",
+    responses((status = 200, description = "OK", body = Vec<WorkspaceModelEntry>), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn list_workspace_models() -> Result<Json<Vec<WorkspaceModelEntry>>, HTTPException> {
     let model_service = get_model_service();
     list_workspace_models_with(&model_service).await.map(Json)
@@ -787,7 +822,7 @@ pub async fn list_workspace_models_with(
 }
 
 /// Body of `PATCH /v1/models/workspace/{model_name}`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct UpdateWorkspaceModelRequest {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -824,6 +859,16 @@ impl WorkspaceModelHost for ModelService {
 }
 
 /// `PATCH /v1/models/workspace/{model_name}` — axum handler.
+#[utoipa::path(
+    patch,
+    path = "/v1/models/workspace/{model_name}",
+    tag = "models",
+    params(("model_name" = String, Path, description = "Model name")),
+    request_body = UpdateWorkspaceModelRequest,
+    summary = "Update a workspace model",
+    description = "Enable/disable a model, toggle thinking, or set its capabilities.",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn update_workspace_model_handler(
     Path(model_name): Path<String>,
     body: Bytes,
@@ -943,7 +988,7 @@ pub async fn update_workspace_model<H: WorkspaceModelHost + ?Sized>(
 // ---------------------------------------------------------------------------
 
 /// One row of `GET /v1/projects/{project_id}/models`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct ProjectModelEntry {
     pub model_name: String,
     pub model_id: String,
@@ -957,7 +1002,7 @@ pub struct ProjectModelEntry {
 }
 
 /// Body of `PATCH /v1/projects/{project_id}/models/{model_name}`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct UpdateProjectModelRequest {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -986,6 +1031,15 @@ pub fn resolve_project(
 
 /// `GET /v1/projects/{project_id}/models` — list models registered for a
 /// project, with per-project state.
+#[utoipa::path(
+    get,
+    path = "/v1/projects/{project_id}/models",
+    tag = "models",
+    params(("project_id" = String, Path, description = "Project ID")),
+    summary = "List project models",
+    description = "",
+    responses((status = 200, description = "OK", body = Vec<ProjectModelEntry>), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn list_project_models(
     Path(project_id): Path<String>,
 ) -> Result<Json<Vec<ProjectModelEntry>>, HTTPException> {
@@ -1034,6 +1088,16 @@ pub async fn list_project_models_with(
 }
 
 /// `PATCH /v1/projects/{project_id}/models/{model_name}` — axum handler.
+#[utoipa::path(
+    patch,
+    path = "/v1/projects/{project_id}/models/{model_name}",
+    tag = "models",
+    params(("project_id" = String, Path, description = "Project ID"), ("model_name" = String, Path, description = "Model name")),
+    request_body = UpdateProjectModelRequest,
+    summary = "Update a project model",
+    description = "Enable/disable, make active, or change per-project settings.",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn update_project_model(
     Path((project_id, model_name)): Path<(String, String)>,
     body: Bytes,

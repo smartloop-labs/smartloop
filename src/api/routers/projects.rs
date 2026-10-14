@@ -59,6 +59,15 @@ fn project_error(err: anyhow::Error, value_status: u16, what: &str) -> HTTPExcep
 }
 
 /// `POST /v1/projects` — create a new project (400 on `ValueError`, 503 on `RuntimeError`).
+#[utoipa::path(
+    post,
+    path = "/v1/projects",
+    tag = "projects",
+    request_body = CreateProjectRequest,
+    summary = "Create a project",
+    description = "",
+    responses((status = 200, description = "OK", body = ProjectResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn create_project(
     ValidatedJson(request): ValidatedJson<CreateProjectRequest>,
 ) -> Result<Json<ProjectResponse>, HTTPException> {
@@ -81,6 +90,14 @@ pub async fn create_project(
 }
 
 /// `GET /v1/projects` — list all projects.
+#[utoipa::path(
+    get,
+    path = "/v1/projects",
+    tag = "projects",
+    summary = "List projects",
+    description = "",
+    responses((status = 200, description = "OK", body = ProjectListResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn list_projects() -> Result<Json<ProjectListResponse>, HTTPException> {
     let model_service = get_model_service();
     let result = run_blocking(move || model_service.list_projects()).await?;
@@ -102,6 +119,16 @@ pub async fn list_projects() -> Result<Json<ProjectListResponse>, HTTPException>
 }
 
 /// `PATCH /v1/projects/{project_id}` — update a project (404 on `ValueError`).
+#[utoipa::path(
+    patch,
+    path = "/v1/projects/{project_id}",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project ID")),
+    request_body = UpdateProjectRequest,
+    summary = "Update a project",
+    description = "",
+    responses((status = 200, description = "OK", body = ProjectResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn update_project(
     Path(project_id): Path<String>,
     ValidatedJson(request): ValidatedJson<UpdateProjectRequest>,
@@ -131,6 +158,15 @@ pub async fn update_project(
 /// `crate::supervisor::routing`).  So the agent has to be stopped from here
 /// too — and before the record goes, because the pool finds the child's port
 /// files through the workspace entry it is about to lose.
+#[utoipa::path(
+    delete,
+    path = "/v1/projects/{project_id}",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project ID")),
+    summary = "Delete a project",
+    description = "",
+    responses((status = 200, description = "OK", body = DeleteProjectResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn delete_project(
     Path(project_id): Path<String>,
 ) -> Result<Json<DeleteProjectResponse>, HTTPException> {

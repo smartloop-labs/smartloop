@@ -8,6 +8,7 @@ pub mod main;
 pub mod mcp;
 pub mod middleware;
 pub mod model;
+pub mod openapi;
 pub mod project_agent;
 pub mod routers;
 pub mod services;

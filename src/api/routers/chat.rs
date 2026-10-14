@@ -3073,6 +3073,15 @@ pub fn parse_chat_request(body: &[u8]) -> Result<ChatCompletionRequest, Response
 
 /// `POST /v1/chat/completions` — create a chat completion (OpenAI-compatible).
 /// Supports both streaming and non-streaming modes.
+#[utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    tag = "chat",
+    request_body = crate::api::model::chat::ChatCompletionRequest,
+    summary = "Create a chat completion",
+    description = "OpenAI-compatible. Set `stream: true` to receive Server-Sent Events: `chat.completion.chunk` frames, `chat.status` progress frames, then `data: [DONE]`. A slow generation is never cut off.",
+    responses((status = 200, description = "A completion, or with `stream: true` an SSE stream of chunks ending in `data: [DONE]`", content((crate::api::model::chat::ChatCompletionResponse = "application/json"), (crate::api::model::chat::ChatCompletionChunk = "text/event-stream"))), (status = 400, description = "Invalid request"), (status = 500, description = "Server error"))
+)]
 pub async fn create_chat_completion(body: Bytes) -> Response {
     let request = match parse_chat_request(&body) {
         Ok(request) => request,

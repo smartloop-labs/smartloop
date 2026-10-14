@@ -20,7 +20,7 @@ use super::_errors::{run_blocking, unhandled_error, HTTPException, ValidatedJson
 pub const LOGGER: &str = "smartloop.api.routers.users";
 
 /// User profile returned by the platform API.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct UserRead {
     pub email: String,
     #[serde(default)]
@@ -68,7 +68,7 @@ impl Default for UserRead {
 }
 
 /// Mutable user profile fields (serialized with `exclude_none`).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct UserUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_temperature: Option<f64>,
@@ -182,11 +182,28 @@ pub fn update_me(body: UserUpdate) -> Result<UserRead, HTTPException> {
 }
 
 /// `GET /v1/users/me`.
+#[utoipa::path(
+    get,
+    path = "/v1/users/me",
+    tag = "auth",
+    summary = "Get the current user",
+    description = "",
+    responses((status = 200, description = "OK", body = UserRead), (status = 401, description = "Not signed in"), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 async fn get_me_handler() -> Result<Json<UserRead>, HTTPException> {
     run_blocking(get_me).await?.map(Json)
 }
 
 /// `PATCH /v1/users/me`.
+#[utoipa::path(
+    patch,
+    path = "/v1/users/me",
+    tag = "auth",
+    request_body = UserUpdate,
+    summary = "Update the current user's preferences",
+    description = "",
+    responses((status = 200, description = "OK", body = UserRead), (status = 401, description = "Not signed in"), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 async fn update_me_handler(
     ValidatedJson(body): ValidatedJson<UserUpdate>,
 ) -> Result<Json<UserRead>, HTTPException> {

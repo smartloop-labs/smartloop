@@ -23,13 +23,13 @@ use super::_errors::{py_error_kind, run_blocking, unhandled_error, HTTPException
 pub const LOGGER: &str = "smartloop.api.routers.web_search";
 
 /// Body of `PATCH /v1/projects/{id}/websearch`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct WebSearchEnabledRequest {
     pub enabled: bool,
 }
 
 /// Web search state of a project.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct WebSearchConfigResponse {
     pub project_id: String,
     pub enabled: bool,
@@ -63,6 +63,15 @@ fn respond(result: anyhow::Result<Value>, what: &str) -> Result<Json<WebSearchCo
 }
 
 /// `GET /v1/projects/{project_id}/websearch` — whether web search is enabled.
+#[utoipa::path(
+    get,
+    path = "/v1/projects/{project_id}/websearch",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project ID")),
+    summary = "Get the web search setting",
+    description = "",
+    responses((status = 200, description = "OK", body = WebSearchConfigResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn get_web_search_config(
     Path(project_id): Path<String>,
 ) -> Result<Json<WebSearchConfigResponse>, HTTPException> {
@@ -72,6 +81,16 @@ pub async fn get_web_search_config(
 }
 
 /// `PATCH /v1/projects/{project_id}/websearch` — enable/disable web search (Pro feature).
+#[utoipa::path(
+    patch,
+    path = "/v1/projects/{project_id}/websearch",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project ID")),
+    request_body = WebSearchEnabledRequest,
+    summary = "Enable or disable web search",
+    description = "Requires a Pro plan.",
+    responses((status = 200, description = "OK", body = WebSearchConfigResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn set_web_search_enabled(
     Path(project_id): Path<String>,
     ValidatedJson(request): ValidatedJson<WebSearchEnabledRequest>,

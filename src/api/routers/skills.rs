@@ -35,6 +35,15 @@ fn skill_error(err: anyhow::Error, what: &str) -> HTTPException {
 }
 
 /// `GET /v1/projects/{project_id}/skills` — `{"skills": [SkillResponse...]}`.
+#[utoipa::path(
+    get,
+    path = "/v1/projects/{project_id}/skills",
+    tag = "skills",
+    params(("project_id" = String, Path, description = "Project ID")),
+    summary = "List skills",
+    description = "Returns `{\"skills\": [SkillResponse, ...]}`.",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn list_skills(Path(project_id): Path<String>) -> Result<Json<Value>, HTTPException> {
     let model_service = get_model_service();
     let result = run_blocking(move || model_service.list_skills(&project_id)).await?;
@@ -51,6 +60,16 @@ pub async fn list_skills(Path(project_id): Path<String>) -> Result<Json<Value>, 
 }
 
 /// `POST /v1/projects/{project_id}/skills` — add a skill to a project.
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/skills",
+    tag = "skills",
+    params(("project_id" = String, Path, description = "Project ID")),
+    request_body = SkillRequest,
+    summary = "Add a skill",
+    description = "",
+    responses((status = 200, description = "OK", body = SkillResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn add_skill(
     Path(project_id): Path<String>,
     ValidatedJson(request): ValidatedJson<SkillRequest>,
@@ -72,6 +91,15 @@ pub async fn add_skill(
 }
 
 /// `GET /v1/projects/{project_id}/skills/{skill_id}` — get a single skill by ID.
+#[utoipa::path(
+    get,
+    path = "/v1/projects/{project_id}/skills/{skill_id}",
+    tag = "skills",
+    params(("project_id" = String, Path, description = "Project ID"), ("skill_id" = String, Path, description = "Skill ID")),
+    summary = "Get a skill",
+    description = "",
+    responses((status = 200, description = "OK", body = SkillResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn get_skill(
     Path((project_id, skill_id)): Path<(String, String)>,
 ) -> Result<Json<SkillResponse>, HTTPException> {
@@ -84,6 +112,16 @@ pub async fn get_skill(
 }
 
 /// `PATCH /v1/projects/{project_id}/skills/{skill_id}` — update a skill's content.
+#[utoipa::path(
+    patch,
+    path = "/v1/projects/{project_id}/skills/{skill_id}",
+    tag = "skills",
+    params(("project_id" = String, Path, description = "Project ID"), ("skill_id" = String, Path, description = "Skill ID")),
+    request_body = UpdateSkillRequest,
+    summary = "Update a skill",
+    description = "",
+    responses((status = 200, description = "OK", body = SkillResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn update_skill(
     Path((project_id, skill_id)): Path<(String, String)>,
     ValidatedJson(request): ValidatedJson<UpdateSkillRequest>,
@@ -98,6 +136,15 @@ pub async fn update_skill(
 }
 
 /// `DELETE /v1/projects/{project_id}/skills/{skill_id}` — delete a skill by ID.
+#[utoipa::path(
+    delete,
+    path = "/v1/projects/{project_id}/skills/{skill_id}",
+    tag = "skills",
+    params(("project_id" = String, Path, description = "Project ID"), ("skill_id" = String, Path, description = "Skill ID")),
+    summary = "Delete a skill",
+    description = "",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn delete_skill(
     Path((project_id, skill_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, HTTPException> {

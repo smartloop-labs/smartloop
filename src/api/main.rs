@@ -56,8 +56,8 @@ pub const ACCESS_LOGGER: &str = "uvicorn.access";
 /// Logger uvicorn wrote its lifecycle lines to.
 pub const SERVER_LOGGER: &str = "uvicorn.error";
 
-/// App title / description / version (the FastAPI metadata; the OpenAPI
-/// schema and docs UIs are disabled, as in the Python app).
+/// App title / description / version (the FastAPI metadata).  The OpenAPI
+/// document and Swagger UI live in [`crate::api::openapi`].
 pub const APP_TITLE: &str = "Smartloop";
 pub const APP_DESCRIPTION: &str = "Smartloop local LLM inference framework - OpenAI-compatible API server";
 
@@ -642,6 +642,7 @@ pub fn app() -> Router {
         .merge(routers::web_search_router())
         .merge(routers::storage_router())
         .merge(routers::downloads_router())
+        .merge(crate::api::openapi::router())
         .route("/health", get(health_check))
         .route("/agents", get(agents))
         .route("/", get(root))
@@ -850,6 +851,14 @@ pub fn health_status() -> Map<String, Value> {
 }
 
 /// `GET /health` — model, indexing and memory-pressure status.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "system",
+    summary = "Health check",
+    description = "Model, indexing and memory-pressure status.",
+    responses((status = 200, description = "OK", body = serde_json::Value))
+)]
 pub async fn health_check() -> Json<Map<String, Value>> {
     let mut result = match tokio::task::spawn_blocking(health_status).await {
         Ok(result) => result,
@@ -870,6 +879,14 @@ pub async fn health_check() -> Json<Map<String, Value>> {
 /// `slp agent status` used to describe one process, because there was one.
 /// With a process per project the interesting questions are which projects
 /// are resident, on which ports, and what each is costing in RSS.
+#[utoipa::path(
+    get,
+    path = "/agents",
+    tag = "system",
+    summary = "List running agents",
+    description = "The supervisor, the model host and each project agent.",
+    responses((status = 200, description = "Supervisor status and running project agents", body = serde_json::Value))
+)]
 pub async fn agents() -> Json<Value> {
     let Some(supervisor) = get_supervisor() else {
         return Json(json!({"supervised": false, "agents": []}));
@@ -895,6 +912,14 @@ async fn method_not_allowed() -> Response {
 }
 
 /// `GET /` — root endpoint.
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "system",
+    summary = "Root",
+    description = "",
+    responses((status = 200, description = "OK", body = serde_json::Value))
+)]
 pub async fn root() -> Json<Value> {
     Json(json!({
         "message": "Smartloop agent is healthy and running",

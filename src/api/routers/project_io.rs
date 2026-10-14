@@ -50,6 +50,15 @@ impl Drop for RemoveOnDrop {
 /// `POST /v1/projects/{project_id}/export` — export a project as a downloadable
 /// zip archive (`application/zip`, `Content-Disposition: attachment`).  The
 /// temporary zip is deleted once streamed.  404 when missing, 400 on `ValueError`.
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/export",
+    tag = "projects",
+    params(("project_id" = String, Path, description = "Project ID")),
+    summary = "Export a project as a zip archive",
+    description = "",
+    responses((status = 200, description = "Project zip archive", content_type = "application/zip", body = Vec<u8>), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn export_project_endpoint(Path(project_id): Path<String>) -> Result<Response, HTTPException> {
     let result = run_blocking(move || export_project(&project_id)).await?;
     let zip_path = match result {
@@ -118,6 +127,15 @@ pub async fn export_project_endpoint(Path(project_id): Path<String>) -> Result<R
 /// collection actions) — and the workspace it imports into has to be the one
 /// this process serves from, or the project exists on disk and nowhere in the
 /// process that just created it.
+#[utoipa::path(
+    post,
+    path = "/v1/projects/import",
+    tag = "projects",
+    request_body(content = inline(crate::api::openapi::FileUpload), content_type = "multipart/form-data"),
+    summary = "Import a project from a zip archive",
+    description = "",
+    responses((status = 200, description = "OK", body = ProjectResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn import_project_endpoint(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Json<ProjectResponse>, HTTPException> {

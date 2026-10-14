@@ -548,7 +548,8 @@ fn lookup_catalog_entry(slug: &str) -> Option<MCPCatalogEntry> {
 }
 
 /// Query string of the GET OAuth callbacks.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct OAuthCallbackQuery {
     #[serde(default)]
     pub code: Option<String>,
@@ -1908,6 +1909,15 @@ fn route_error(context: &str, e: anyhow::Error) -> HTTPException {
 /// `GET /v1/projects/{project_id}/mcp` — `{"servers": [...]}` with each
 /// server's `indexing` block, so a client can show "still connecting" without
 /// a request per server.
+#[utoipa::path(
+    get,
+    path = "/v1/projects/{project_id}/mcp",
+    tag = "mcp",
+    params(("project_id" = String, Path, description = "Project ID")),
+    summary = "List MCP servers",
+    description = "Each server includes its provisioning and indexing status.",
+    responses((status = 200, description = "OK", body = crate::api::model::mcp::MCPServerListResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn list_mcp_servers_for_project(
     AxumPath(project_id): AxumPath<String>,
 ) -> Result<Json<Value>, HTTPException> {
@@ -1924,6 +1934,15 @@ pub async fn list_mcp_servers_for_project(
 /// the catalog a step is resolved against — and `by_server` breaks it down,
 /// so a connection that discovered nothing is visible here rather than only in
 /// the logs.
+#[utoipa::path(
+    get,
+    path = "/v1/projects/{project_id}/mcp/tools/count",
+    tag = "mcp",
+    params(("project_id" = String, Path, description = "Project ID")),
+    summary = "Count MCP tools",
+    description = "Diagnostic: total tools across servers, with a per-server breakdown.",
+    responses((status = 200, description = "OK", body = serde_json::Value), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn count_mcp_tools_for_project(
     AxumPath(project_id): AxumPath<String>,
 ) -> Result<Json<Value>, HTTPException> {
@@ -1941,6 +1960,15 @@ pub async fn count_mcp_tools_for_project(
 /// the MCP task.  `indexing.state` is what a client polls — `provisioning` →
 /// `ready`, or `failed` with `indexing.error` — and `indexing.in_progress` is
 /// the single flag to drive a spinner off.
+#[utoipa::path(
+    get,
+    path = "/v1/projects/{project_id}/mcp/{server_id}",
+    tag = "mcp",
+    params(("project_id" = String, Path, description = "Project ID"), ("server_id" = String, Path, description = "MCP server ID")),
+    summary = "Get an MCP server",
+    description = "",
+    responses((status = 200, description = "OK", body = crate::api::model::mcp::MCPServerResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn get_mcp_server(
     AxumPath((project_id, server_id)): AxumPath<(String, String)>,
 ) -> Result<Json<Value>, HTTPException> {
@@ -1956,6 +1984,15 @@ pub async fn get_mcp_server(
 ///
 /// Returns the server with `status="pending"`; the pass itself runs on the
 /// MCP task.
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/mcp/{server_id}/refresh",
+    tag = "mcp",
+    params(("project_id" = String, Path, description = "Project ID"), ("server_id" = String, Path, description = "MCP server ID")),
+    summary = "Re-provision an MCP server",
+    description = "",
+    responses((status = 200, description = "OK", body = crate::api::model::mcp::MCPServerResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn refresh_mcp_server(
     AxumPath((project_id, server_id)): AxumPath<(String, String)>,
 ) -> Result<Json<MCPServerResponse>, HTTPException> {
@@ -1973,6 +2010,15 @@ pub async fn refresh_mcp_server(
 }
 
 /// `DELETE /v1/projects/{project_id}/mcp/{server_id}`.
+#[utoipa::path(
+    delete,
+    path = "/v1/projects/{project_id}/mcp/{server_id}",
+    tag = "mcp",
+    params(("project_id" = String, Path, description = "Project ID"), ("server_id" = String, Path, description = "MCP server ID")),
+    summary = "Remove an MCP server",
+    description = "",
+    responses((status = 200, description = "OK", body = crate::api::model::mcp::DeleteMCPServerResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn delete_mcp_server_from_project(
     AxumPath((project_id, server_id)): AxumPath<(String, String)>,
 ) -> Result<Json<DeleteMCPServerResponse>, HTTPException> {
@@ -2018,6 +2064,16 @@ pub async fn register_mcp_server(
 }
 
 /// Axum handler for `POST /v1/projects/{project_id}/mcp/register`.
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/mcp/register",
+    tag = "mcp",
+    params(("project_id" = String, Path, description = "Project ID")),
+    request_body = crate::api::model::mcp::MCPRegisterRequest,
+    summary = "Register an MCP server",
+    description = "Local (stdio) or remote (HTTP). A remote server that needs OAuth answers with an `auth_url` to complete sign-in.",
+    responses((status = 200, description = "OK", body = crate::api::model::mcp::MCPRegisterResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn register_mcp_server_handler(
     AxumPath(project_id): AxumPath<String>,
     headers: HeaderMap,
@@ -2152,6 +2208,16 @@ where
 }
 
 /// Axum handler for `POST /v1/projects/{project_id}/mcp/definition`.
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/mcp/definition",
+    tag = "mcp",
+    params(("project_id" = String, Path, description = "Project ID")),
+    request_body = crate::api::model::mcp::MCPDefinitionRequest,
+    summary = "Register an MCP server from a TOML definition",
+    description = "",
+    responses((status = 200, description = "OK", body = crate::api::model::mcp::MCPRegisterResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 pub async fn register_mcp_from_definition_handler(
     AxumPath(project_id): AxumPath<String>,
     headers: HeaderMap,
@@ -2197,6 +2263,15 @@ pub async fn mcp_oauth_callback(
     complete_oauth_redirect(query, model_service, None).await
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/projects/{project_id}/mcp/oauth/callback",
+    tag = "mcp",
+    params(("project_id" = String, Path, description = "Project ID"), OAuthCallbackQuery),
+    summary = "MCP OAuth redirect target (project)",
+    description = "Browser redirect target of an MCP server's OAuth flow.",
+    responses((status = 200, description = "OAuth completion page", content_type = "text/html"), (status = 302, description = "Redirect back to the requesting app"))
+)]
 async fn mcp_oauth_callback_for_project_handler(
     AxumPath(project_id): AxumPath<String>,
     Query(query): Query<OAuthCallbackQuery>,
@@ -2204,6 +2279,15 @@ async fn mcp_oauth_callback_for_project_handler(
     mcp_oauth_callback_for_project(&project_id, query, get_model_service()).await
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/mcp/oauth/callback",
+    tag = "mcp",
+    params(OAuthCallbackQuery),
+    summary = "MCP OAuth redirect target",
+    description = "Browser redirect target of an MCP server's OAuth flow.",
+    responses((status = 200, description = "OAuth completion page", content_type = "text/html"), (status = 302, description = "Redirect back to the requesting app"))
+)]
 async fn mcp_oauth_callback_handler(Query(query): Query<OAuthCallbackQuery>) -> OAuthCallbackResponse {
     mcp_oauth_callback(query, get_model_service()).await
 }
@@ -2668,6 +2752,16 @@ pub async fn complete_mcp_oauth(
     })
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/mcp/oauth/callback",
+    tag = "mcp",
+    params(("project_id" = String, Path, description = "Project ID")),
+    request_body = crate::api::model::mcp::MCPOAuthCallbackRequest,
+    summary = "Complete MCP OAuth sign-in",
+    description = "",
+    responses((status = 200, description = "OK", body = crate::api::model::mcp::MCPServerResponse), (status = 400, description = "Invalid request"), (status = 404, description = "Not found"), (status = 500, description = "Server error"))
+)]
 async fn complete_mcp_oauth_handler(
     AxumPath(project_id): AxumPath<String>,
     headers: HeaderMap,
