@@ -135,6 +135,12 @@ pub struct ChatCompletionRequest {
     pub repeat_penalty: f32,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
+    /// DRY ("don't repeat yourself") strength; 0.0 = off.  Unlike
+    /// `repeat_penalty`, which sees only the last 64 tokens, DRY penalizes
+    /// extending any sequence the output has already produced, so it reaches
+    /// loops whose cycle is longer than that window.
+    #[serde(default)]
+    pub dry_multiplier: f32,
     pub stop: Vec<String>,
     pub seed: Option<u32>,
     pub stream: bool,
@@ -152,6 +158,7 @@ impl Default for ChatCompletionRequest {
             repeat_penalty: 1.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            dry_multiplier: 0.0,
             stop: Vec::new(),
             seed: None,
             stream: false,
@@ -403,6 +410,45 @@ const NO_TOKEN: LlamaToken = -1;
 
 /// `Llama.last_n_tokens_size` default.
 const LAST_N_TOKENS_SIZE: i32 = 64;
+
+/// DRY growth per token a repeat runs past `DRY_ALLOWED_LENGTH`.
+const DRY_BASE: f32 = 1.75;
+
+/// Repeats up to this many tokens go unpenalized.  Above the usual 2, so an
+/// extract can name the same party or clause twice without being pushed to
+/// misspell it the second time.
+const DRY_ALLOWED_LENGTH: i32 = 4;
+
+/// Tokens a repeat cannot span: a new line or field starts a new match, so
+/// list items and table rows that share a shape are not penalized.
+const DRY_SEQ_BREAKERS: [&str; 4] = ["\n", ":", "\"", "*"];
+
+/// Longest cycle the repetition guard looks for, in tokens — a few sentences.
+const REPEAT_MAX_PERIOD: usize = 256;
+
+/// Shortest repeated run that ends a generation.  A run counts only once its
+/// cycle has come round three times, and never below this, so a short
+/// legitimate repeat (a table divider, a list of similar lines) is left alone.
+const REPEAT_MIN_RUN: usize = 128;
+
+/// Length of the run of tokens at the end of `tokens` that only repeats an
+/// earlier cycle, when the model has fallen into a loop: the last `p` tokens
+/// have come round at least three times in a row, over `REPEAT_MIN_RUN`
+/// tokens or more.  Dropping that many tokens leaves one copy of the cycle.
+///
+/// A small model that loops never emits end-of-generation, so without this it
+/// runs until `max_tokens` — the rest of the context window when uncapped.
+fn repetition_run(tokens: &[LlamaToken]) -> Option<usize> {
+    let n = tokens.len();
+    for p in 1..=REPEAT_MAX_PERIOD.min(n / 3) {
+        // Positions at the end that match the token one cycle back.
+        let run = (p..n).rev().take_while(|&i| tokens[i] == tokens[i - p]).count();
+        if run >= (2 * p).max(REPEAT_MIN_RUN) {
+            return Some(run);
+        }
+    }
+    None
+}
 
 /// Decode bytes as UTF-8, dropping invalid sequences (`errors="ignore"`).
 pub fn decode_utf8_ignore(bytes: &[u8]) -> String {
@@ -755,6 +801,19 @@ impl Llama {
             request.frequency_penalty,
             request.presence_penalty,
         )];
+        if request.dry_multiplier > 0.0 {
+            // -1: the whole context, which only ever holds generated tokens —
+            // the sampler accepts what it samples, not the prompt, so copying
+            // from a source document is never penalized.
+            chain.push(LlamaSampler::dry(
+                &self.model,
+                request.dry_multiplier,
+                DRY_BASE,
+                DRY_ALLOWED_LENGTH,
+                -1,
+                DRY_SEQ_BREAKERS,
+            ));
+        }
         let temp = request.temperature;
         if temp < 0.0 {
             chain.push(LlamaSampler::dist(seed));
@@ -1049,6 +1108,23 @@ impl CompletionRun<'_> {
             self.text = self.detok(&self.completion_tokens);
             self.finish_reason = "length";
             return Ok(false);
+        }
+
+        // Checked every 16 tokens: a loop is caught a few tokens late, at a
+        // sixteenth of the cost.
+        if self.completion_tokens.len() % 16 == 0 {
+            if let Some(run) = repetition_run(&self.completion_tokens) {
+                // Streamed text already sent cannot be taken back.
+                let keep = (self.completion_tokens.len() - run).max(self.returned_tokens);
+                tracing::warn!(
+                    target: "smartloop.llms.llama",
+                    "Generation stopped: output repeating ({run} tokens looped after {keep})"
+                );
+                self.completion_tokens.truncate(keep);
+                self.text = self.detok(&self.completion_tokens);
+                self.finish_reason = "length";
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -2179,6 +2255,29 @@ pub fn make_vision_chat_handler(name: &str, clip_model_path: &str, use_gpu: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repetition_run_catches_a_loop_and_keeps_one_copy() {
+        let cycle: Vec<LlamaToken> = (100..140).collect();
+        let mut tokens: Vec<LlamaToken> = (0..50).collect();
+        for _ in 0..5 {
+            tokens.extend(&cycle);
+        }
+        let run = repetition_run(&tokens).expect("loop detected");
+        assert_eq!(&tokens[..tokens.len() - run], &[(0..50).collect::<Vec<_>>(), cycle].concat()[..]);
+    }
+
+    #[test]
+    fn repetition_run_ignores_short_or_varied_repeats() {
+        // Three copies of a short cycle: under REPEAT_MIN_RUN.
+        let short: Vec<LlamaToken> = (0..3).flat_map(|_| 1..20).collect();
+        assert_eq!(repetition_run(&short), None);
+        // Table-like rows: a shared shape, different values.
+        let rows: Vec<LlamaToken> = (0..40).flat_map(|r| [7, 8, 1000 + r, 8, 2000 + r, 8, 9]).collect();
+        assert_eq!(repetition_run(&rows), None);
+        // One token over and over.
+        assert_eq!(repetition_run(&[5; 200]), Some(199));
+    }
 
     #[test]
     fn decode_ignore_drops_invalid_bytes() {
