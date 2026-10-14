@@ -41,6 +41,24 @@ pub const CHARS_PER_TOKEN: f64 = 2.0;
 /// Tokens reserved for prompt scaffolding + output when sizing extraction.
 pub const OUTPUT_RESERVE_TOKENS: usize = 1024;
 
+/// Ceiling on one extract's generated tokens.  Uncapped, the budget is the
+/// rest of the context window — ~64k tokens on a large window, twenty minutes
+/// of a small model repeating itself while the whole turn waits on it.  A
+/// concise extract runs ~1k tokens.
+pub const EXTRACT_MAX_TOKENS: usize = 2048;
+
+/// Floor on the extract budget, so a short document still has room for
+/// its facts (and a NONE costs nothing either way).
+pub const EXTRACT_MIN_TOKENS: usize = 256;
+
+/// The output budget for extracting from `document_chars` of source: half the
+/// source's tokens — an extract is never longer than what it extracts from —
+/// within [`EXTRACT_MIN_TOKENS`, `EXTRACT_MAX_TOKENS`].
+pub fn extract_max_tokens(document_chars: usize) -> usize {
+    let source_tokens = (document_chars as f64 / CHARS_PER_TOKEN) as usize;
+    (source_tokens / 2).clamp(EXTRACT_MIN_TOKENS, EXTRACT_MAX_TOKENS)
+}
+
 /// Default extraction input cap when the model's window is unknown.
 pub const DEFAULT_MAX_CHARS: usize = 16000;
 
@@ -234,6 +252,8 @@ impl DocumentFanoutStep {
             Some(instruction) => format!("Guidance:\n{instruction}\n\n"),
             None => String::new(),
         };
+        let documents = char_prefix(&combined, max_chars);
+        let max_tokens = extract_max_tokens(documents.chars().count());
         let prompt = format!(
             "<system>\n\
              You extract the information relevant to the user's request from \
@@ -247,13 +267,13 @@ impl DocumentFanoutStep {
              {guidance}\
              Documents:\n{}\n\
              </user>",
-            char_prefix(&combined, max_chars)
+            documents
         );
 
         let mut extract = String::new();
         let mut llm_failed = false;
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dp_llm.invoke(&prompt, None, None)
+            dp_llm.invoke(&prompt, Some(max_tokens), None)
         })) {
             Ok(reply) => extract = reply.trim().to_string(),
             Err(panic) => {
@@ -562,6 +582,14 @@ mod tests {
 
     fn reduce_result(content: &str, names: &[&str]) -> NodeResult {
         NodeResult::with_data("batch_0", json!({"doc_names": names, "content": content}))
+    }
+
+    #[test]
+    fn extract_budget_scales_with_the_document() {
+        assert_eq!(extract_max_tokens(0), EXTRACT_MIN_TOKENS);
+        // 3000 chars ≈ 1500 tokens of source → 750 tokens out.
+        assert_eq!(extract_max_tokens(3000), 750);
+        assert_eq!(extract_max_tokens(1_000_000), EXTRACT_MAX_TOKENS);
     }
 
     #[test]

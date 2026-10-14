@@ -27,6 +27,10 @@ use crate::llms::llama::decode_utf8_ignore;
 /// logger it was handed).
 const LOG_TARGET: &str = "smartloop.llms.llama_cpp";
 
+/// DRY strength for every generation — the commonly recommended 0.8.  The
+/// 64-token `repeat_penalty` cannot see a loop with a longer cycle; DRY can.
+const DRY_MULTIPLIER: f32 = 0.8;
+
 /// Output budget below which a reasoning model is told not to think.  Decision
 /// calls cap output hard (8-256 tokens for a yes/no or a short label); a
 /// `<think>` block would consume the whole budget and return a truncated
@@ -367,6 +371,7 @@ impl LlamaCpp {
                 repeat_penalty: 1.2,
                 frequency_penalty: 0.1,
                 presence_penalty: 0.1,
+                dry_multiplier: DRY_MULTIPLIER,
                 stream: true,
                 ..ChatCompletionRequest::default()
             })?
@@ -584,6 +589,7 @@ impl BaseLLM for LlamaCpp {
                 repeat_penalty: 1.1,
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
+                dry_multiplier: DRY_MULTIPLIER,
                 stream: true,
                 ..ChatCompletionRequest::default()
             })
