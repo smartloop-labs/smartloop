@@ -3546,6 +3546,7 @@ impl ModelService {
             }));
             options.model_path = self.model_gguf_path.read().clone();
             options.project_id = self.get_project_id();
+            options.answers_remotely = self.pinned_model_seam(None).is_some_and(|m| m.is_remote());
             options.executor = Some(self.get_llm_executor());
             let orchestrator = SLPOrchestrator::new(orchestrator_llm, options);
 

@@ -115,6 +115,9 @@ pub struct SLPOrchestratorOptions {
     pub capability_skip_reason: Option<CapabilitySkipReasonFn>,
     pub model_path: Option<String>,
     pub project_id: Option<String>,
+    /// The final answer comes from a pinned remote model, which writes it
+    /// from the gathered context; no step drafts it first.
+    pub answers_remotely: bool,
     /// Shared, long-lived I/O executor; a per-instance one is created when
     /// absent (e.g. in tests).
     pub executor: Option<Arc<LLMExecutor>>,
@@ -225,7 +228,8 @@ impl SLPOrchestrator {
             Arc::clone(&explorer),
             Arc::clone(&mcp_agent),
             Arc::clone(&response),
-        ));
+        )
+        .with_remote_answer(options.answers_remotely));
         let tool_fanout = Arc::new(ToolFanout::new(
             Arc::clone(&models),
             Arc::clone(&steps),

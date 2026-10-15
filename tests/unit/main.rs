@@ -126,6 +126,7 @@ mod test_project_state_split;
 mod test_project_store_caches;
 mod test_project_tools_are_claimed;
 mod test_prompt_question_placement;
+mod test_remote_answer_skips_draft;
 mod test_remote_llm;
 mod test_resolution_model_loads_like_vision;
 mod test_response_model_events;
