@@ -3496,8 +3496,8 @@ impl ModelService {
         // With exactly one model selected, it runs the routing and decision
         // nodes too.  Asked without a capability, so a vision-only selection
         // declines these text-only nodes and they stay on the default model.
-        // Orchestration runs on device: a remote pin is for the answer only, so
-        // every model this request resolves is resolved local-only.
+        // Orchestration runs on device: a remote pin writes what the user
+        // reads, so the routing and decision models resolve local-only.
         let pinned_llm = {
             let _scope = local_only_scope(true);
             self.pinned_llm_seam(None)
@@ -3526,19 +3526,15 @@ impl ModelService {
             let mut options = SLPOrchestratorOptions::default();
             options.agent_llm = Some(ProviderOutput::from_value(agent_llm));
             options.large_llm = None;
+            // Not local-only: these write step output the user reads.  The
+            // router resolves its decision nodes inside a local-only scope.
             options.large_llm_provider = Some(provider0({
                 let service = service.clone();
-                move || {
-                    let _scope = local_only_scope(true);
-                    ProviderOutput::from_value(service.large_llm_seam())
-                }
+                move || ProviderOutput::from_value(service.large_llm_seam())
             }));
             options.capability_llm_provider = Some(provider1({
                 let service = service.clone();
-                move |capability: &str| {
-                    let _scope = local_only_scope(true);
-                    ProviderOutput::from_value(service.llm_for_capability_seam(capability))
-                }
+                move |capability: &str| ProviderOutput::from_value(service.llm_for_capability_seam(capability))
             }));
             options.capability_available = Some(provider1({
                 let service = service.clone();
