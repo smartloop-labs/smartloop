@@ -119,6 +119,18 @@ pub const SKIP_REASONS: &[(&str, &str)] = &[
     ("error", "{model} could not be loaded"),
 ];
 
+/// The `chat.status` step that carries a skipped model's reason on its own,
+/// e.g. "Not enough memory for gemma4-e2b (needs ~4.9GB, 4.4GB free)".
+pub const SKIP_STEP: &str = "model_skip";
+
+fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// What the user is told a reasoning model was picked for.  `thinking` is an
 /// internal routing tag — it is excluded from the capabilities the API reports
 /// and it names a property of the model rather than the work, so "Selected
@@ -686,6 +698,10 @@ impl ModelRouter {
         let explanation = self.skip_explanation();
         let mut message = format!("Selected {}", Self::model_label(llm));
         if !explanation.is_empty() {
+            // Its own step as well, so a client can raise it as an alert
+            // without parsing the "Selected …" line.  `processing`, not
+            // `error`: the turn still answers, on the fallback model.
+            self.emit(SKIP_STEP, "processing", &capitalize_first(&explanation));
             message = format!("{message} — {explanation}");
         }
         self.emit("model", "processing", &message);

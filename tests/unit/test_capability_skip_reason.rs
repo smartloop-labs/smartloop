@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use smartloop::agents::orchestration::model_router::{
-    CapabilitySkipReason, CapabilitySkipReasonFn, ModelRouter, ModelRouterOptions,
+    CapabilitySkipReason, CapabilitySkipReasonFn, ModelRouter, ModelRouterOptions, SKIP_STEP,
 };
 use smartloop::agents::planner::ModelTier;
 use smartloop::llms::BaseLLM;
@@ -46,6 +46,11 @@ fn router(skip: Option<CapabilitySkipReason>) -> (ModelRouter, ProgressRecorder)
 
 fn last_message(progress: &ProgressRecorder) -> String {
     progress.messages().last().cloned().expect("at least one progress event")
+}
+
+/// `(status, message)` of every `model_skip` event.
+fn skip_events(progress: &ProgressRecorder) -> Vec<(String, String)> {
+    progress.calls.lock().iter().filter(|(step, _, _)| step == SKIP_STEP).map(|(_, s, m)| (s.clone(), m.clone())).collect()
 }
 
 fn resolve_reasoning(router: &ModelRouter) {
@@ -341,5 +346,48 @@ mod the_shortfall_is_measured_where_it_happens {
     fn test_no_measurement_yields_no_detail() {
         let svc = service((4.4, 24.0));
         assert_eq!(svc.fit_shortfall_detail(), None);
+    }
+}
+
+/// The reason also goes out as its own `model_skip` step, so a client can
+/// alert on it without reading the "Selected …" line.
+mod the_skip_is_its_own_event {
+    use super::*;
+
+    #[test]
+    fn test_a_memory_skip_is_reported_with_its_figures() {
+        let (router, progress) = router(Some(CapabilitySkipReason::with_detail(
+            "gemma4-e2b",
+            "memory",
+            "needs ~4.9GB, 4.4GB free",
+        )));
+
+        resolve_reasoning(&router);
+
+        assert_eq!(
+            skip_events(&progress),
+            vec![("processing".to_string(), "Not enough memory for gemma4-e2b (needs ~4.9GB, 4.4GB free)".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_it_comes_before_the_selection_line() {
+        let (router, progress) = router(Some(CapabilitySkipReason::new("gemma4-e2b", "missing")));
+
+        resolve_reasoning(&router);
+
+        let calls = progress.calls.lock().clone();
+        let skip = calls.iter().position(|(step, _, _)| step == SKIP_STEP).expect("a model_skip event");
+        let selected = calls.iter().position(|(_, _, m)| m.starts_with("Selected ")).expect("a selection line");
+        assert!(skip < selected, "{calls:?}");
+    }
+
+    #[test]
+    fn test_no_reason_means_no_skip_event() {
+        let (router, progress) = router(None);
+
+        resolve_reasoning(&router);
+
+        assert!(skip_events(&progress).is_empty());
     }
 }
