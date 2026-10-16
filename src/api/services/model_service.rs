@@ -2184,6 +2184,15 @@ impl ModelService {
 
     /// `(model_name, llm)` for every resident model that can reason.
     fn loaded_thinking_models(&self) -> Vec<(String, Arc<dyn BaseLLM>)> {
+        self.resident_models()
+            .into_iter()
+            .filter(|(name, _)| LlmFactory::supports_thinking(Some(name)))
+            .collect()
+    }
+
+    /// `(model_name, llm)` for every resident model: the orchestrator, the
+    /// large model and each loaded capability model.
+    pub fn resident_models(&self) -> Vec<(String, Arc<dyn BaseLLM>)> {
         let mut pairs: Vec<(String, Arc<dyn BaseLLM>)> = Vec::new();
         let main_name = self.model_name.read().clone().filter(|n| !n.is_empty());
         if let (Some(name), Some(llm)) = (main_name, self.llm.read().clone()) {
@@ -2199,9 +2208,6 @@ impl ModelService {
             }
         }
         pairs
-            .into_iter()
-            .filter(|(name, _)| LlmFactory::supports_thinking(Some(name)))
-            .collect()
     }
 
     /// The capability's value, for logs and messages.
@@ -2405,6 +2411,19 @@ impl ModelService {
         None
     }
 
+    /// A model's estimated footprint in GiB: weights + KV cache at `cap` +
+    /// per-process overhead.  The reserve is not included.
+    pub fn fit_footprint_gb(model_gb: f64, cap: i64) -> f64 {
+        // 0 = no cap — the factory auto-sizes the model's context from live
+        // available memory, so the KV cache fits by construction.  Only the
+        // bare weights + overhead footprint can veto here; estimate no KV
+        // cache.  (Estimating it at the device bound instead over-counts and
+        // rejects every capable model on a tight box.)
+        let est_ctx = if cap > 0 { cap } else { 0 };
+        let kv_gb = 0.5 * (est_ctx as f64 / 4096.0);
+        model_gb + kv_gb + 0.7
+    }
+
     /// True if a large model's capped footprint fits in free memory.
     ///
     /// Estimates the model's footprint (weights + KV cache @ `cap` +
@@ -2423,14 +2442,7 @@ impl ModelService {
             Err(_) => return true,
         };
         let reserve_gb = reserve_gb.unwrap_or_else(|| AppSettings::new().llm_large_fit_reserve_gb);
-        // 0 = no cap — the factory auto-sizes the model's context from live
-        // available memory, so the KV cache fits by construction.  Only the
-        // bare weights + overhead footprint can veto here; estimate no KV
-        // cache.  (Estimating it at the device bound instead over-counts and
-        // rejects every capable model on a tight box.)
-        let est_ctx = if cap > 0 { cap } else { 0 };
-        let kv_gb = 0.5 * (est_ctx as f64 / 4096.0);
-        let footprint_gb = model_gb + kv_gb + 0.7;
+        let footprint_gb = Self::fit_footprint_gb(model_gb, cap);
         if footprint_gb + reserve_gb > free_gb {
             // Only suggest the cap when there is a cap to lower.  Uncapped,
             // the KV cache is already estimated at zero and the window
