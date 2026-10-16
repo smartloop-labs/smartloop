@@ -95,6 +95,7 @@ pub struct DocumentUpload {
         crate::api::routers::users::update_me_handler,
         crate::api::routers::payments::verify_apple_handler,
         crate::api::routers::payments::checkout_handler,
+        crate::api::routers::payments::refresh_handler,
         crate::api::routers::feedback::get_feedback,
         crate::api::routers::feedback::submit_feedback,
         crate::api::routers::feedback::delete_feedback,

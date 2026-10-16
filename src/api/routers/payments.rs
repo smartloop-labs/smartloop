@@ -8,15 +8,18 @@
 //! Endpoints:
 //!     POST /v1/payments/apple/verify – link an App Store transaction to the account
 //!     POST /v1/payments/checkout     – start a Stripe Checkout session
+//!     POST /v1/payments/refresh      – re-read the plan from the cloud (poll after checkout)
 
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::platform::client::JsonObject;
 use crate::platform::{get_platform_service, PlatformError, PlatformService};
 use crate::search::providers;
 
+use super::users::{user_read, UserRead};
 use super::_errors::{run_blocking, unhandled_error, HTTPException, ValidatedJson};
 
 /// Logger name used by this router.
@@ -50,6 +53,7 @@ pub fn router() -> Router {
     Router::new()
         .route("/v1/payments/apple/verify", post(verify_apple_handler))
         .route("/v1/payments/checkout", post(checkout_handler))
+        .route("/v1/payments/refresh", post(refresh_handler))
 }
 
 /// Map a payment failure to the status the desktop app acts on.
@@ -166,4 +170,73 @@ pub fn checkout() -> Result<JsonObject, HTTPException> {
 )]
 pub async fn checkout_handler() -> Result<Json<JsonObject>, HTTPException> {
     run_blocking(checkout).await?.map(Json)
+}
+
+/// `is_paid` of a user payload; absent or null counts as not paid, as
+/// [`user_read`] defaults it.
+fn is_paid(user: &JsonObject) -> bool {
+    matches!(user.get("is_paid"), Some(Value::Bool(true)))
+}
+
+/// Re-read the user's plan from the cloud and return the fresh profile.
+///
+/// The desktop polls this after sending the user to Stripe Checkout, so
+/// unlike [`refresh_entitlements`] it is not best-effort and it never serves
+/// the cache: the profile comes from the cloud or the call fails (401 not
+/// signed in / token rejected, 502 unreachable — as `GET /v1/users/me`).
+/// The cache is written with what came back.
+///
+/// Kept cheap for polling: the model catalog and the hosted search status
+/// are only refreshed when `is_paid` differs from the cached profile (or
+/// there was none to compare with).
+pub fn refresh() -> Result<UserRead, HTTPException> {
+    let svc = get_platform_service();
+    let cached_paid = svc.db().and_then(|db| db.get_user().ok().flatten()).map(|u| is_paid(&u));
+
+    let user = svc.client().get_current_user().map_err(|e| {
+        if e.is_permission() {
+            HTTPException::new(401, "Not authenticated")
+        } else if e.is_connection() {
+            HTTPException::new(502, "Platform API unavailable")
+        } else {
+            tracing::error!(target: LOGGER, "Unhandled platform error: {}", e);
+            unhandled_error()
+        }
+    })?;
+    let profile = user_read(&user).map_err(|e| {
+        tracing::error!(target: LOGGER, "Invalid user payload from the platform API: {}", e);
+        unhandled_error()
+    })?;
+
+    if let Some(db) = svc.db() {
+        if let Err(e) = db.save_user(&user) {
+            tracing::warn!(target: LOGGER, "Failed to cache refreshed user: {:#}", e);
+        }
+    }
+
+    if cached_paid != Some(is_paid(&user)) {
+        providers::reset_status_cache();
+        if let Err(e) = svc.list_models(true) {
+            tracing::warn!(target: LOGGER, "Failed to refresh cached model catalog after plan change: {}", e);
+        }
+    }
+    Ok(profile)
+}
+
+/// `POST /v1/payments/refresh`.
+#[utoipa::path(
+    post,
+    path = "/v1/payments/refresh",
+    tag = "auth",
+    summary = "Re-read the account's plan from the platform",
+    description = "Fetches the user profile from the platform (never the cache), stores it, and returns it in the `GET /v1/users/me` shape. When `is_paid` changed, the model catalog and web search status are refreshed too. Poll after Stripe Checkout to see the upgrade land.",
+    responses(
+        (status = 200, description = "OK", body = UserRead),
+        (status = 401, description = "Not signed in"),
+        (status = 502, description = "Platform API unavailable"),
+        (status = 500, description = "Server error")
+    )
+)]
+pub async fn refresh_handler() -> Result<Json<UserRead>, HTTPException> {
+    run_blocking(refresh).await?.map(Json)
 }

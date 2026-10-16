@@ -229,3 +229,108 @@ mod test_checkout {
         check(PlatformError::connection("Connection error: refused"), 502, "Platform API unavailable").await;
     }
 }
+
+mod test_refresh {
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+    use serial_test::serial;
+    use smartloop::platform::{PlatformError, WorkspaceDB};
+
+    use crate::common::core_support::{obj, platform_service, platform_service_with_db, post, PlatformFixture};
+
+    const PATH: &str = "/v1/payments/refresh";
+
+    fn user(is_paid: bool) -> Value {
+        json!({"email": "chris@example.com", "name": "Chris", "is_paid": is_paid})
+    }
+
+    /// A cache-backed fixture whose cached profile says `cached_paid`, fresh
+    /// enough that `GET /v1/users/me` would serve it without asking.
+    fn with_cached_user(cached_paid: bool) -> (tempfile::TempDir, PlatformFixture) {
+        let dir = tempfile::tempdir().expect("temp dir for the workspace DB");
+        let db = WorkspaceDB::new(dir.path().join("workspace.db")).expect("workspace DB");
+        db.save_user(&obj(user(cached_paid))).expect("seed the user cache");
+        (dir, platform_service_with_db(Some(Arc::new(db))))
+    }
+
+    /// The point of the route: the cache is fresh and says unpaid, the cloud
+    /// says paid, and the cloud wins — then the cache agrees.
+    #[tokio::test]
+    #[serial]
+    async fn test_returns_the_cloud_profile_not_the_cache() {
+        let (_dir, fixture) = with_cached_user(false);
+        fixture.set_current_user(Ok(obj(user(true))));
+        fixture.set_list_models(Ok(vec![]));
+        let resp = post(PATH, json!({})).await;
+
+        assert_eq!(resp.status_code(), 200);
+        let data = resp.json();
+        assert_eq!(data["email"], "chris@example.com");
+        assert_eq!(data["is_paid"], true);
+        assert_eq!(data["default_temperature"], 0.3);
+        assert_eq!(fixture.calls_to("get_current_user").len(), 1);
+        let cached = fixture.service.db().unwrap().get_user().unwrap().unwrap();
+        assert_eq!(cached["is_paid"], true);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_plan_change_refreshes_the_catalog() {
+        let (_dir, fixture) = with_cached_user(false);
+        fixture.set_current_user(Ok(obj(user(true))));
+        fixture.set_list_models(Ok(vec![]));
+        post(PATH, json!({})).await;
+
+        assert_eq!(fixture.calls_to("list_models").len(), 1);
+    }
+
+    /// Polled every few seconds: an unchanged plan costs one call, not two.
+    #[tokio::test]
+    #[serial]
+    async fn test_an_unchanged_plan_skips_the_catalog() {
+        let (_dir, fixture) = with_cached_user(false);
+        fixture.set_current_user(Ok(obj(user(false))));
+        let resp = post(PATH, json!({})).await;
+
+        assert_eq!(resp.status_code(), 200);
+        assert_eq!(resp.json()["is_paid"], false);
+        assert!(fixture.calls_to("list_models").is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_failed_catalog_refresh_still_returns_the_profile() {
+        let (_dir, fixture) = with_cached_user(false);
+        fixture.set_current_user(Ok(obj(user(true))));
+        fixture.set_list_models(Err(PlatformError::connection("Connection refused")));
+        let resp = post(PATH, json!({})).await;
+
+        assert_eq!(resp.status_code(), 200);
+        assert_eq!(resp.json()["is_paid"], true);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_401_when_not_signed_in() {
+        let platform_service = platform_service();
+        platform_service.set_current_user(Err(PlatformError::permission("Not authenticated")));
+        let resp = post(PATH, json!({})).await;
+
+        assert_eq!(resp.status_code(), 401);
+        assert_eq!(resp.json()["detail"], "Not authenticated");
+    }
+
+    /// Never the stale cache: an offline poll must not report the old plan as
+    /// if it were the answer.
+    #[tokio::test]
+    #[serial]
+    async fn test_502_when_unreachable_even_with_a_cache() {
+        let (_dir, fixture) = with_cached_user(false);
+        fixture.set_current_user(Err(PlatformError::connection("Connection refused")));
+        let resp = post(PATH, json!({})).await;
+
+        assert_eq!(resp.status_code(), 502);
+        assert_eq!(resp.json()["detail"], "Platform API unavailable");
+    }
+}
