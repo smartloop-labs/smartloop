@@ -897,7 +897,7 @@ impl SLPPlatformClient {
         object(resp.json()?)
     }
 
-    /// POST /v1/payments/create-checkout-session (auth required, no body).
+    /// POST /v1/payments/create-checkout-session (auth required, body `{}`).
     ///
     /// Starts a Stripe Checkout for the Pro upgrade on builds that are not
     /// distributed through the Mac App Store.  Returns `{checkout_url}`.
@@ -906,8 +906,12 @@ impl SLPPlatformClient {
     /// (Stripe disabled on the platform) or 400 (a Stripe error) is a
     /// `PermissionError` carrying the platform's `detail` and status.
     pub fn create_checkout_session(&self) -> PlatformResult<JsonObject> {
+        // An empty JSON object rather than no body: Google's load balancer in
+        // front of the platform answers a bodiless POST with 411 Length
+        // Required, which surfaced in the app as "API error (411)".
+        let body = serde_json::json!({});
         let resp = self
-            .authed(|h| self.send(Method::POST, CHECKOUT_SESSION, h, &[], None, TIMEOUT))
+            .authed(|h| self.send(Method::POST, CHECKOUT_SESSION, h, &[], Some(&body), TIMEOUT))
             .map_err(|e| connection_error(&e))?;
 
         raise_relaying_detail(&resp)?;

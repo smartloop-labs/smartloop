@@ -1162,6 +1162,9 @@ mod test_create_checkout_session {
         let sent = &server.requests()[0];
         assert_eq!(sent.method, "POST");
         assert_eq!(sent.header("Authorization"), Some("Bearer jwt"));
+        // Google's load balancer answers a bodiless POST with 411.
+        assert_eq!(sent.json(), json!({}));
+        assert_eq!(sent.header("Content-Length"), Some("2"));
     }
 
     #[test]
