@@ -42,6 +42,8 @@ pub mod core_support {
         list_models: Scripted<Vec<JsonObject>>,
         list_mcp_catalog: Scripted<Vec<JsonObject>>,
         latest_release: Scripted<Option<JsonObject>>,
+        verify_apple_transaction: Scripted<JsonObject>,
+        checkout_session: Scripted<JsonObject>,
     }
 
     fn answer<T: Clone>(slot: &Scripted<T>, method: &str) -> PlatformResult<T> {
@@ -74,6 +76,12 @@ pub mod core_support {
         pub fn set_latest_release(&self, result: PlatformResult<Option<JsonObject>>) {
             *self.latest_release.lock() = Some(result);
         }
+        pub fn set_verify_apple_transaction(&self, result: PlatformResult<JsonObject>) {
+            *self.verify_apple_transaction.lock() = Some(result);
+        }
+        pub fn set_checkout_session(&self, result: PlatformResult<JsonObject>) {
+            *self.checkout_session.lock() = Some(result);
+        }
 
         /// Every recorded call to `method`, oldest first.
         pub fn calls_to(&self, method: &str) -> Vec<Call> {
@@ -105,6 +113,14 @@ pub mod core_support {
         fn update_current_user(&self, payload: &JsonObject) -> PlatformResult<JsonObject> {
             self.record("update_current_user", vec![Value::Object(payload.clone())]);
             answer(&self.update_current_user, "update_current_user")
+        }
+        fn verify_apple_transaction(&self, transaction_id: &str) -> PlatformResult<JsonObject> {
+            self.record("verify_apple_transaction", vec![Value::from(transaction_id)]);
+            answer(&self.verify_apple_transaction, "verify_apple_transaction")
+        }
+        fn create_checkout_session(&self) -> PlatformResult<JsonObject> {
+            self.record("create_checkout_session", vec![]);
+            answer(&self.checkout_session, "create_checkout_session")
         }
     }
 
@@ -190,6 +206,11 @@ pub mod core_support {
     /// `client.get(uri)`.
     pub async fn get(uri: &str) -> TestResponse {
         send(Method::GET, uri, None).await
+    }
+
+    /// `client.post(uri, json=body)`.
+    pub async fn post(uri: &str, body: Value) -> TestResponse {
+        send(Method::POST, uri, Some(body)).await
     }
 
     /// `client.patch(uri, json=body)`.

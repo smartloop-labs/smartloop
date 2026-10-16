@@ -32,6 +32,8 @@ pub const RELEASES_LATEST: &str = "/v1/releases/latest";
 pub const MCP_CATALOG: &str = "/v1/mcp-catalog";
 pub const WEBSEARCH: &str = "/v1/websearch";
 pub const WEBSEARCH_STATUS: &str = "/v1/websearch/status";
+pub const APPLE_VERIFY: &str = "/v1/payments/apple/verify";
+pub const CHECKOUT_SESSION: &str = "/v1/payments/create-checkout-session";
 
 /// Control-plane request timeout (seconds).
 pub const TIMEOUT: u64 = 30;
@@ -283,6 +285,13 @@ pub trait PlatformApi: Send + Sync {
         let _ = timeout;
         Err(unsupported("web_search_status_detail"))
     }
+    fn verify_apple_transaction(&self, transaction_id: &str) -> PlatformResult<JsonObject> {
+        let _ = transaction_id;
+        Err(unsupported("verify_apple_transaction"))
+    }
+    fn create_checkout_session(&self) -> PlatformResult<JsonObject> {
+        Err(unsupported("create_checkout_session"))
+    }
 }
 
 fn unsupported(op: &str) -> PlatformError {
@@ -349,6 +358,20 @@ fn object(value: Value) -> PlatformResult<JsonObject> {
     match value {
         Value::Object(map) => Ok(map),
         other => Err(PlatformError::Value(format!("Expected a JSON object response, got {other}"))),
+    }
+}
+
+/// The `detail` string of a FastAPI error body, when it has one.
+///
+/// A refusal whose reason is written for the user (an Apple transaction that
+/// is already linked to another account, say) has to reach them as written,
+/// so the endpoints that relay one read it back rather than substituting a
+/// message of their own.  A non-string `detail` (a validation error list) or
+/// a body that is not JSON yields `None`.
+pub fn error_detail(body: &[u8]) -> Option<String> {
+    match serde_json::from_slice::<Value>(body).ok()?.get("detail")? {
+        Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -851,6 +874,63 @@ impl SLPPlatformClient {
             ))),
         }
     }
+
+    /// POST /v1/payments/apple/verify (auth required).
+    ///
+    /// Hands a Mac App Store transaction id to the platform, which checks it
+    /// with Apple and links the subscription to this account.  Returns
+    /// `{is_paid, subscription_status, current_period_end}`.
+    ///
+    /// Every refusal carries `status_code`, and — except a 401, which always
+    /// means "sign in" — the platform's own `detail` as its message: a 400
+    /// (invalid transaction) or 409 (linked to another account) is a
+    /// `PermissionError`, a verdict retrying will not change; a 503 (Apple IAP
+    /// not configured) or any other 5xx/429 is a `ConnectionError`, as
+    /// [`raise_for_status`] classifies every transient status.
+    pub fn verify_apple_transaction(&self, transaction_id: &str) -> PlatformResult<JsonObject> {
+        let body = serde_json::json!({ "transaction_id": transaction_id });
+        let resp = self
+            .authed(|h| self.send(Method::POST, APPLE_VERIFY, h, &[], Some(&body), TIMEOUT))
+            .map_err(|e| connection_error(&e))?;
+
+        raise_relaying_detail(&resp)?;
+        object(resp.json()?)
+    }
+
+    /// POST /v1/payments/create-checkout-session (auth required, body `{}`).
+    ///
+    /// Starts a Stripe Checkout for the Pro upgrade on builds that are not
+    /// distributed through the Mac App Store.  Returns `{checkout_url}`.
+    ///
+    /// Errors as [`Self::verify_apple_transaction`]: 401 is "sign in"; a 404
+    /// (Stripe disabled on the platform) or 400 (a Stripe error) is a
+    /// `PermissionError` carrying the platform's `detail` and status.
+    pub fn create_checkout_session(&self) -> PlatformResult<JsonObject> {
+        // An empty JSON object rather than no body: Google's load balancer in
+        // front of the platform answers a bodiless POST with 411 Length
+        // Required, which surfaced in the app as "API error (411)".
+        let body = serde_json::json!({});
+        let resp = self
+            .authed(|h| self.send(Method::POST, CHECKOUT_SESSION, h, &[], Some(&body), TIMEOUT))
+            .map_err(|e| connection_error(&e))?;
+
+        raise_relaying_detail(&resp)?;
+        object(resp.json()?)
+    }
+}
+
+/// [`raise_for_status`] for the payment endpoints, whose refusals are written
+/// for the user: a 401 says "sign in", any other non-2xx carries the
+/// platform's `detail` (when it sent one) as its message.  Refusals are
+/// `PermissionError`; transient statuses stay `ConnectionError`.
+fn raise_relaying_detail(resp: &HttpResponse) -> PlatformResult<()> {
+    let mut error_map = vec![(401, "Authentication failed. Token may be expired or invalid.".to_string())];
+    if resp.status != 401 {
+        if let Some(detail) = error_detail(&resp.body) {
+            error_map.push((resp.status, detail));
+        }
+    }
+    raise_for_status(resp.status, &error_map, ErrorClass::Permission)
 }
 
 /// A response [`SLPPlatformClient::authed`] can inspect for a 401.
@@ -913,5 +993,11 @@ impl PlatformApi for SLPPlatformClient {
     }
     fn web_search_status_detail(&self, timeout: u64) -> PlatformResult<JsonObject> {
         SLPPlatformClient::web_search_status_detail(self, timeout)
+    }
+    fn verify_apple_transaction(&self, transaction_id: &str) -> PlatformResult<JsonObject> {
+        SLPPlatformClient::verify_apple_transaction(self, transaction_id)
+    }
+    fn create_checkout_session(&self) -> PlatformResult<JsonObject> {
+        SLPPlatformClient::create_checkout_session(self)
     }
 }

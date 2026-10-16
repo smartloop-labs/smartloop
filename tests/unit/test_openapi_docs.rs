@@ -28,7 +28,7 @@ async fn serves_the_openapi_document() {
         assert!(paths.contains_key(path), "{path} missing from the OpenAPI document");
     }
     let operations: usize = paths.values().map(|item| item.as_object().unwrap().len()).sum();
-    assert_eq!(operations, 59, "every route's handler should be listed in ApiDoc");
+    assert_eq!(operations, 62, "every route's handler should be listed in ApiDoc");
 }
 
 #[tokio::test]
