@@ -1751,8 +1751,8 @@ impl Workspace {
 
     /// Enabled, downloaded models declaring `capability`, best-first.
     ///
-    /// Remote models rank after every local one: they have no parameter
-    /// size, so they answer only when no local model can.
+    /// Remote models are included; callers that route place them after
+    /// every local model (see `ModelService::get_llm_for_capability`).
     ///
     /// Callers walk this list down to a smaller same-capability model when
     /// the largest doesn't fit in memory, rather than dropping straight to the

@@ -2207,8 +2207,22 @@ impl ModelService {
         // selected models both declare the capability, the bigger one does
         // the step, and a smaller one runs it only when the bigger cannot be
         // loaded.  Size ties go to broader coverage, then the newer version.
-        // Remote models have no size, so they come last, ordered by coverage.
-        let ranked = Self::ranked_candidates(self.ranked_models_for(capability), &[capability], true);
+        //
+        // Then by tier, keeping that order within each: local models, which
+        // run here when they fit; remote ones, which always resolve; and the
+        // bootstrap model last, since any other selected model does the step
+        // better.
+        let mut ranked = Self::ranked_candidates(self.ranked_models_for(capability), &[capability], true);
+        let bootstrap = canonical_model_name(&api_settings().default_model);
+        ranked.sort_by_key(|m| {
+            if canonical_model_name(&m.model_name) == bootstrap {
+                2
+            } else if m.is_remote() {
+                1
+            } else {
+                0
+            }
+        });
         if ranked.is_empty() {
             tracing::warn!(
                 target: LOG_TARGET,
