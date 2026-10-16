@@ -37,6 +37,7 @@ use crate::supervisor::routing::{with_project_routing, AgentPool, PoolProvider};
 use crate::supervisor::service::{
     get_pool, get_supervisor, start_supervisor, stop_supervisor, supervision_enabled, Supervisor,
 };
+use crate::utils::device_utils;
 use crate::utils::log_utils::print_logo;
 use crate::utils::logging_setup::{
     get_logger, make_log_queue, setup_root_logging, shutdown_logging, start_listener, ListenerOptions,
@@ -774,46 +775,158 @@ async fn delegated_indexing_health() -> Option<Value> {
     child.remove("indexing")
 }
 
-/// Memory pressure: the estimated total footprint of every enabled model the
-/// orchestrator could load against device memory.
-fn memory_percent(model_service: &ModelService) -> Option<i64> {
-    let _ = model_service;
-    let mut total_model_bytes: u64 = 0;
-    if let Some(shared) = Workspace::get_instance() {
-        let workspace = shared.read();
-        let project = workspace.current_project();
-        for m in &workspace.models {
-            if !(workspace.effective_model_enabled(&m.model_name, project)
-                && workspace.effective_model_downloaded(&m.model_name))
-            {
-                continue;
-            }
-            let model_dir = workspace.model_dir_for(&m.model_id);
-            let (gguf, mmproj) = ModelService::find_model_ggufs(&model_dir);
-            for file in [gguf, mmproj].into_iter().flatten() {
-                if let Ok(meta) = std::fs::metadata(&file) {
-                    total_model_bytes += meta.len();
-                }
-            }
+/// The GGUF files this process has loaded, as `{name, path, bytes}`.
+///
+/// llama.cpp mmaps weights, so on macOS they sit outside each process's
+/// footprint and are shared between processes that load the same file.
+/// [`complete_memory_health`] counts each path once.
+fn resident_model_files(model_service: &ModelService) -> Vec<Value> {
+    model_service
+        .resident_models()
+        .into_iter()
+        .filter_map(|(name, llm)| {
+            let path = llm.as_any().downcast_ref::<LlamaCpp>()?.model.model_path();
+            let bytes = std::fs::metadata(&path).ok()?.len();
+            Some(json!({"name": name, "path": path, "bytes": bytes}))
+        })
+        .collect()
+}
+
+/// The loaded models each running project agent reports, read from its own
+/// `/health`.  `running`, not `ensure`: a poll must not start an agent.
+async fn agent_model_files() -> Vec<Value> {
+    let Some(pool) = get_pool() else {
+        return Vec::new();
+    };
+    let Ok(client) = reqwest::Client::builder().timeout(DELEGATED_HEALTH_TIMEOUT).build() else {
+        return Vec::new();
+    };
+    let requests = pool.registry.live().into_iter().map(|record| {
+        let client = client.clone();
+        async move {
+            let child: Value = client.get(format!("{}/health", record.base_url())).send().await.ok()?.json().await.ok()?;
+            child.pointer("/memory/models")?.as_array().cloned()
         }
-    }
+    });
+    futures::future::join_all(requests).await.into_iter().flatten().flatten().collect()
+}
 
-    let mut system = sysinfo::System::new();
-    let pid = sysinfo::Pid::from_u32(std::process::id());
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    let mem_rss = system.process(pid)?.memory();
-    let overhead = mem_rss.saturating_sub(total_model_bytes);
-    let estimated_total = total_model_bytes + overhead;
+/// Whether each model selected for the current project can load right now,
+/// judged the way the loader judges it ([`ModelService::large_model_fits`]):
+///
+/// - `loaded`  — already resident.
+/// - `fits`    — fits in available memory as things stand.
+/// - `evicts`  — fits only once other capability models are unloaded, which
+///               the loader does before giving up.
+/// - `no_room` — won't fit even then; the turn falls back to the orchestrator.
+///               `shortfall_bytes` is how much more must be freed for it to
+///               load, and `exceeds_total` is set when it needs more than the
+///               machine has at all.
+///
+/// Off Apple Silicon the loader doesn't gate on memory, so nothing is
+/// reported as short there.  Read from disk, not the singleton: under the
+/// supervisor this process does not own the workspace.
+fn selected_model_fits(resident: &[Value], orchestrator: Option<&str>) -> Vec<Value> {
+    let Some(workspace) = Workspace::load() else {
+        return Vec::new();
+    };
+    let project = workspace.current_project();
+    let gib = 1024f64.powi(3);
+    let resident_path = |path: &str| resident.iter().any(|m| m.get("path").and_then(Value::as_str) == Some(path));
+    // What the loader can free: resident capability models, not the orchestrator.
+    let evictable_bytes: u64 = resident
+        .iter()
+        .filter(|m| m.get("name").and_then(Value::as_str) != orchestrator)
+        .filter_map(|m| m.get("bytes").and_then(Value::as_u64))
+        .sum();
+    let device = get_model_service().device_free_total_gb();
+    let free_gb = device.map(|(free, _)| free);
+    let total_gb = device.map(|(_, total)| total);
+    let evictable_gb = evictable_bytes as f64 / gib;
+    let settings = AppSettings::new();
 
-    // VRAM is not probed (the Vulkan backend manages discrete-GPU memory);
-    // report against system/unified RAM, which is correct for Apple Silicon
-    // and CPU and a reasonable proxy otherwise.
-    system.refresh_memory();
-    let mem_total = system.total_memory();
-    if mem_total == 0 {
-        return None;
+    workspace
+        .models
+        .iter()
+        .filter(|m| {
+            workspace.effective_model_enabled(&m.model_name, project) && workspace.effective_model_downloaded(&m.model_name)
+        })
+        .filter_map(|m| {
+            let (gguf, _mmproj) = ModelService::find_model_ggufs(&workspace.model_dir_for(&m.model_id));
+            let path = gguf?;
+            let bytes = std::fs::metadata(&path).ok()?.len();
+            let needed_gb = ModelService::fit_footprint_gb(bytes as f64 / gib, settings.llm_large_n_ctx_cap)
+                + settings.llm_large_fit_reserve_gb;
+            let status = match free_gb {
+                _ if resident_path(&path) => "loaded",
+                None => "fits",
+                Some(free) if needed_gb <= free => "fits",
+                Some(free) if needed_gb <= free + evictable_gb => "evicts",
+                Some(_) => "no_room",
+            };
+            let mut entry = json!({
+                "name": m.model_name,
+                "bytes": bytes,
+                "needed_bytes": (needed_gb * gib) as u64,
+                "status": status,
+            });
+            if let (true, Some(free), Some(total)) = (status == "no_room", free_gb, total_gb) {
+                entry["shortfall_bytes"] = json!(((needed_gb - free - evictable_gb).max(0.0) * gib) as u64);
+                entry["exceeds_total"] = json!(needed_gb > total);
+            }
+            Some(entry)
+        })
+        .collect()
+}
+
+/// Fill `memory` with what Smartloop is actually using: every process from
+/// this one down plus each loaded model file once, against system RAM.
+///
+/// Under the supervisor, `/health` is answered here, so the tree covers the
+/// project agents and the model host; their loaded models come from
+/// [`agent_model_files`].  `memory_percent` is `used / total`.
+async fn complete_memory_health(result: &mut Map<String, Value>) {
+    let mut models: Vec<Value> =
+        result.get("memory").and_then(|m| m.get("models")).and_then(Value::as_array).cloned().unwrap_or_default();
+    models.extend(agent_model_files().await);
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|m| m.get("path").and_then(Value::as_str).is_some_and(|p| seen.insert(p.to_string())));
+    let model_bytes: u64 = models.iter().filter_map(|m| m.get("bytes").and_then(Value::as_u64)).sum();
+
+    let resident = models.clone();
+    let orchestrator = result.get("model_name").and_then(Value::as_str).map(str::to_string);
+    let sample = tokio::task::spawn_blocking(move || {
+        let (process_bytes, processes) = device_utils::process_tree_memory(std::process::id());
+        let (available_gb, total_gb) = device_utils::available_memory_gb();
+        let selected = selected_model_fits(&resident, orchestrator.as_deref());
+        (process_bytes, processes, available_gb, total_gb, selected)
+    })
+    .await;
+    let Ok((process_bytes, processes, available_gb, total_gb, selected)) = sample else {
+        return;
+    };
+    let gib = 1024f64.powi(3);
+    let total_bytes = (total_gb * gib) as u64;
+    if total_bytes == 0 {
+        return;
     }
-    Some((estimated_total as f64 / mem_total as f64 * 100.0) as i64)
+    let used_bytes =
+        if device_utils::PROCESS_MEMORY_INCLUDES_MAPPED_FILES { process_bytes } else { process_bytes + model_bytes };
+
+    result.insert(
+        "memory".into(),
+        json!({
+            "used_bytes": used_bytes,
+            "total_bytes": total_bytes,
+            "available_bytes": (available_gb * gib) as u64,
+            "process_bytes": process_bytes,
+            "model_bytes": model_bytes,
+            "processes": processes,
+            "models": models,
+            "selected": selected,
+        }),
+    );
+    result.insert("memory_percent".into(), json!((used_bytes as f64 / total_bytes as f64 * 100.0).round() as i64));
 }
 
 /// The synchronous body of [`health_check`].
@@ -840,23 +953,22 @@ pub fn health_status() -> Map<String, Value> {
     // Indexer status + indexed documents
     let _ = best_effort(|| indexing_health(&model_service, &mut result));
 
-    // Memory pressure: estimate total footprint of all enabled models that
-    // the orchestrator could load vs device memory.  This tells the desktop
-    // app whether the full model set fits before anything is actually loaded.
-    if let Ok(Some(percent)) = best_effort(|| memory_percent(&model_service)) {
-        result.insert("memory_percent".into(), json!(percent));
+    // This process's loaded models; the totals are filled in by
+    // complete_memory_health, which can reach the project agents.
+    if let Ok(models) = best_effort(|| resident_model_files(&model_service)) {
+        result.insert("memory".into(), json!({"models": models}));
     }
 
     result
 }
 
-/// `GET /health` — model, indexing and memory-pressure status.
+/// `GET /health` — model, indexing and memory-usage status.
 #[utoipa::path(
     get,
     path = "/health",
     tag = "system",
     summary = "Health check",
-    description = "Model, indexing and memory-pressure status.",
+    description = "Model, indexing and memory-usage status.",
     responses((status = 200, description = "OK", body = serde_json::Value))
 )]
 pub async fn health_check() -> Json<Map<String, Value>> {
@@ -870,6 +982,7 @@ pub async fn health_check() -> Json<Map<String, Value>> {
     {
         result.insert("indexing".into(), indexing);
     }
+    complete_memory_health(&mut result).await;
     Json(result)
 }
 
