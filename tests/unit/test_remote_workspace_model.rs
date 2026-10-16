@@ -1,5 +1,5 @@
 //! A remote model in the workspace registry: no weights on disk, catalog
-//! capabilities, never the active model, never auto-routed.
+//! capabilities, never the active model, ranked after every local model.
 
 use smartloop::types::ModelKind;
 use smartloop::workspace::workspace::{Workspace, WorkspaceModel};
@@ -63,11 +63,24 @@ fn test_remote_capabilities_come_from_the_catalog() {
     assert_eq!(model.effective_capabilities(), caps(&["general"]));
 }
 
+fn ranked_names(ws: &Workspace, capability: &str) -> Vec<String> {
+    ws.ranked_models_for(capability, None).into_iter().map(|m| m.model_name).collect()
+}
+
 #[test]
-fn test_remote_models_are_not_auto_routed() {
+fn test_remote_models_rank_after_local_ones() {
     let mut ws = workspace();
     ws.add_remote_model("kimi-k2", "https://api.smartloop.ai", caps(&["general", "coding"]), None, true);
-    assert!(ws.ranked_models_for("coding", None).is_empty());
+    ws.add_model("gemma4-e4b", "gemma4-e4b", None, true);
+    ws.get_model_mut(Some("gemma4-e4b")).unwrap().downloaded = true;
+    assert_eq!(ranked_names(&ws, "general"), vec!["gemma4-e4b", "kimi-k2"]);
+}
+
+#[test]
+fn test_a_capability_only_remote_models_declare_ranks_them() {
+    let mut ws = workspace();
+    ws.add_remote_model("kimi-k2", "https://api.smartloop.ai", caps(&["general", "coding"]), None, true);
+    assert_eq!(ranked_names(&ws, "coding"), vec!["kimi-k2"]);
 }
 
 #[test]

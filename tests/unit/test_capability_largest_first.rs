@@ -18,6 +18,8 @@ use parking_lot::Mutex;
 
 use smartloop::api::services::model_service::{ModelService, ModelServiceHooks, RankedModel};
 use smartloop::llms::base_llm::BaseLLM;
+use smartloop::llms::cloud_llm::local_only_scope;
+use smartloop::types::ModelKind;
 use smartloop::workspace::{Workspace, WorkspaceModel};
 
 use crate::shared::model_service_a::{FakeLLM, attach_workspace, bare_service, same};
@@ -170,4 +172,37 @@ fn test_size_ties_go_to_broader_coverage_then_the_newer_version() {
     );
     let names: Vec<&str> = ordered.iter().map(|m| m.name).collect();
     assert_eq!(names, vec!["broad", "narrow-new", "new", "old"]);
+}
+
+fn remote_model(name: &str) -> WorkspaceModel {
+    WorkspaceModel { model_name: name.to_string(), kind: ModelKind::Remote, ..Default::default() }
+}
+
+/// A local model that fits only once earlier steps' models are evicted loses
+/// to a remote one: the remote model answers before anything is evicted.
+#[test]
+fn test_a_remote_model_answers_before_a_local_one_is_evicted_for() {
+    let kimi = FakeLLM::named("kimi");
+    let mut loads = HashMap::new();
+    loads.insert(BIG, (FakeLLM::named("big"), Fit::AfterEviction));
+    loads.insert("kimi-k2", (kimi.clone(), Fit::AsIs));
+    let (tried, llm) = walk(vec![ws_model(BIG), remote_model("kimi-k2")], loads);
+    assert_eq!(tried, vec![attempt(BIG, false), attempt("kimi-k2", false)]);
+    assert!(same(&llm.expect("a model"), &kimi));
+}
+
+/// Decisions resolve local-only: the remote model is not a candidate, so the
+/// local one is loaded, evicting if it must.
+#[test]
+fn test_a_local_only_resolution_skips_remote_models() {
+    let big = FakeLLM::named("big");
+    let mut loads = HashMap::new();
+    loads.insert(BIG, (big.clone(), Fit::AfterEviction));
+    loads.insert("kimi-k2", (FakeLLM::named("kimi"), Fit::AsIs));
+    let (tried, llm) = {
+        let _scope = local_only_scope(true);
+        walk(vec![ws_model(BIG), remote_model("kimi-k2")], loads)
+    };
+    assert_eq!(tried, vec![attempt(BIG, false), attempt(BIG, true)]);
+    assert!(same(&llm.expect("a model"), &big));
 }

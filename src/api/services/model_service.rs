@@ -2111,16 +2111,22 @@ impl ModelService {
     }
 
     /// `workspace.ranked_models_for(capability, current_project)` through the
-    /// test seam.
+    /// test seam, without remote models inside a local-only scope.
     fn ranked_models_for(&self, capability: &str) -> Vec<WorkspaceModel> {
-        if let Some(hook) = self.hooks().ranked_models_for {
-            return hook(capability);
-        }
-        let Some(workspace) = self.workspace_handle() else {
-            return Vec::new();
+        let mut ranked = match self.hooks().ranked_models_for {
+            Some(hook) => hook(capability),
+            None => {
+                let Some(workspace) = self.workspace_handle() else {
+                    return Vec::new();
+                };
+                let ws = workspace.read();
+                ws.ranked_models_for(capability, ws.current_project())
+            }
         };
-        let ws = workspace.read();
-        ws.ranked_models_for(capability, ws.current_project())
+        if crate::llms::cloud_llm::local_only() {
+            ranked.retain(|m| !m.is_remote());
+        }
+        ranked
     }
 
     /// True when some selected model declares `capability` (loads nothing).
@@ -2201,6 +2207,7 @@ impl ModelService {
         // selected models both declare the capability, the bigger one does
         // the step, and a smaller one runs it only when the bigger cannot be
         // loaded.  Size ties go to broader coverage, then the newer version.
+        // Remote models have no size, so they come last, ordered by coverage.
         let ranked = Self::ranked_candidates(self.ranked_models_for(capability), &[capability], true);
         if ranked.is_empty() {
             tracing::warn!(
@@ -2216,7 +2223,8 @@ impl ModelService {
         // model already serving — evicting it and then finding the bigger one
         // still does not fit leaves the step on the tiny default.  Only when
         // nothing is resident or fits does the second pass evict prior-step
-        // models to make room.
+        // models to make room.  A remote model always resolves, so with one
+        // selected the first pass ends on it and nothing is evicted.
         let reason = format!("capability '{}'", Self::cap_name(capability));
         for evict in [false, true] {
             for ws_model in &ranked {
