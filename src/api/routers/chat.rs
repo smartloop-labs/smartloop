@@ -179,7 +179,7 @@ pub trait ChatService: Send + Sync {
     fn workspace_project_ids(&self) -> Option<Vec<String>>;
     /// `model_service._model.workspace.current_project.project_dir`.
     fn current_project_dir(&self) -> Option<String>;
-    /// Whether the answer comes from a pinned remote model, whose usage the
+    /// Whether the answer comes from a remote model, whose usage the
     /// platform records itself.
     fn answers_remotely(&self) -> bool {
         false
@@ -208,7 +208,7 @@ pub trait ChatService: Send + Sync {
 
 impl ChatService for ModelService {
     fn answers_remotely(&self) -> bool {
-        self.pinned_model(None).is_some_and(|m| m.is_remote())
+        ModelService::answers_remotely(self)
     }
 
     fn is_loaded(&self) -> bool {
