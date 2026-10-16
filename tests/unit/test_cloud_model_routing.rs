@@ -151,8 +151,6 @@ async fn test_a_non_streamed_cloud_failure_is_an_error_not_answer_text() {
 /// too would count them twice.
 #[test]
 fn test_a_remote_answer_is_not_reported_as_local_usage() {
-    use smartloop::api::routers::chat::ChatService;
-
     let remote = svc_with_remote_pin();
     assert!(remote.answers_remotely());
 
@@ -162,6 +160,29 @@ fn test_a_remote_answer_is_not_reported_as_local_usage() {
     ws.get_model_mut(Some("gemma3-4b")).unwrap().downloaded = true;
     attach_workspace(&local, ws);
     assert!(!local.answers_remotely());
+}
+
+/// With local and remote models both selected, the answer is remote only
+/// when the model that writes it is.
+#[test]
+fn test_a_mixed_selection_answers_remotely_only_on_the_remote_model() {
+    let mixed = |answer: Arc<dyn BaseLLM>| {
+        let svc = bare_service();
+        let mut ws = Workspace::new("ws");
+        ws.add_model("gemma4-e4b", "gemma4-e4b", None, true);
+        ws.get_model_mut(Some("gemma4-e4b")).unwrap().downloaded = true;
+        ws.add_remote_model("kimi-k2", "https://api.smartloop.ai", vec!["general".into()], None, true);
+        attach_workspace(&svc, ws);
+        svc.set_hooks(ModelServiceHooks {
+            llm_for_response: Some(Arc::new(move |_| Some(answer.clone()))),
+            ..Default::default()
+        });
+        svc
+    };
+
+    assert!(!mixed(FakeLLM::named("gemma")).answers_remotely());
+    let cloud: Arc<dyn BaseLLM> = Arc::new(CloudLLM::new("p1", "kimi-k2", "https://api.smartloop.ai", None));
+    assert!(mixed(cloud).answers_remotely());
 }
 
 /// Orchestration resolves inside a local-only scope, where a remote pin is

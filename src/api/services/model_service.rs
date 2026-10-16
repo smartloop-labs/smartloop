@@ -4044,6 +4044,25 @@ Search query:"
         }
     }
 
+    /// Whether the final answer comes from a remote model.
+    ///
+    /// Resolved the way the answer is (`general`), so a selection mixing
+    /// local and remote models says remote only when no local model can
+    /// answer.  No remote selection, no resolution.
+    pub fn answers_remotely(&self) -> bool {
+        let remote: Vec<String> = self
+            .selected_models()
+            .into_iter()
+            .filter(|m| m.is_remote())
+            .map(|m| m.model_name)
+            .collect();
+        if remote.is_empty() {
+            return false;
+        }
+        let label = self.response_model_label(Some(ModelCapability::General.value()));
+        remote.contains(&label)
+    }
+
     /// Reports response-model selection, the same way the orchestrator does.
     ///
     /// The response model is resolved after orchestration finishes, by the
