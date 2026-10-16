@@ -206,3 +206,18 @@ fn test_a_local_only_resolution_skips_remote_models() {
     assert_eq!(tried, vec![attempt(BIG, false), attempt(BIG, true)]);
     assert!(same(&llm.expect("a model"), &big));
 }
+
+/// The bootstrap model is the last resort: a remote model that declares the
+/// capability does the step even though the bootstrap model fits.
+#[test]
+fn test_the_bootstrap_model_ranks_after_remote_models() {
+    let bootstrap = smartloop::api::config::api_settings().default_model;
+    let kimi = FakeLLM::named("kimi");
+    let mut loads = HashMap::new();
+    loads.insert("kimi-k2", (kimi.clone(), Fit::AsIs));
+    let mut ranked = vec![ws_model(&bootstrap), remote_model("kimi-k2")];
+    ranked[0].model_name = bootstrap.clone();
+    let (tried, llm) = walk(ranked, loads);
+    assert_eq!(tried, vec![attempt("kimi-k2", false)]);
+    assert!(same(&llm.expect("a model"), &kimi));
+}
