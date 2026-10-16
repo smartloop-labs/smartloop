@@ -231,6 +231,57 @@ fn memorystatus_level() -> Option<f64> {
     None
 }
 
+/// Memory held by `root` and every process below it (project agents, the
+/// model host, MCP servers), as `(bytes, process_count)`.
+///
+/// Per process this is [`process_memory_bytes`]: on macOS that leaves out
+/// memory-mapped model weights, which the caller counts once per file.
+pub fn process_tree_memory(root: u32) -> (u64, usize) {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
+    let mut tree = vec![sysinfo::Pid::from_u32(root)];
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i];
+        tree.extend(sys.processes().iter().filter(|(_, p)| p.parent() == Some(parent)).map(|(pid, _)| *pid));
+        i += 1;
+    }
+    let bytes = tree
+        .iter()
+        .filter_map(|pid| process_memory_bytes(pid.as_u32()).or_else(|| sys.process(*pid).map(|p| p.memory())))
+        .sum();
+    (bytes, tree.len())
+}
+
+/// Whether [`process_memory_bytes`] already includes memory-mapped files.
+/// Where it does, counting model weights on top would count them twice.
+pub const PROCESS_MEMORY_INCLUDES_MAPPED_FILES: bool = !cfg!(target_os = "macos");
+
+/// A process's memory as the OS accounts it to that process.
+///
+/// macOS: `phys_footprint`, Activity Monitor's "Memory" column — private
+/// memory including GPU (Metal) allocations, without clean mapped files.
+/// RSS would count the mmapped GGUF once per agent that has it loaded, though
+/// the pages are shared.  Elsewhere: `None`, so the caller falls back to RSS.
+#[cfg(target_os = "macos")]
+pub fn process_memory_bytes(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+    // SAFETY: `info` is a rusage_info_v2-sized buffer and RUSAGE_INFO_V2 asks
+    // for exactly that layout.
+    let rc = unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V2, info.as_mut_ptr().cast()) };
+    // SAFETY: rc == 0 means the kernel filled the struct.
+    (rc == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_memory_bytes(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// True on Apple Silicon with a llama.cpp Metal (GPU offload) backend.
 pub fn is_mps() -> bool {
     cfg!(target_os = "macos") && llama_gpu_offload()
