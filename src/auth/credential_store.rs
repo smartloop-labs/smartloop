@@ -87,13 +87,28 @@ pub fn creds_path() -> PathBuf {
     slp_home().join(".credentials")
 }
 
-/// Create the directory if needed and lock permissions to owner-only (700).
+/// Create the directory if needed, locking a newly created one to owner-only
+/// (700).
+///
+/// A directory that already exists is left as it is.  `SLP_HOME` is not always
+/// ours to chmod: under snap it is `$SNAP_USER_COMMON` itself, which snapd owns
+/// and AppArmor refuses to chmod even though it lets us write inside it.
+/// Insisting on the chmod failed every write of the key and the credentials, so
+/// a sign-in landed its tokens and kept none of them.  The files themselves are
+/// opened 0600 (see [`open_private`]), which is what keeps them private.
 fn ensure_dir(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        // Best effort for the same reason: owner-only is the goal, not a
+        // precondition for storing anything.
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(target: "smartloop.auth.credential_store", "Could not restrict {}: {e}", path.display());
+        }
     }
     Ok(())
 }

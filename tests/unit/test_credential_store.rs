@@ -208,6 +208,39 @@ mod test_file_backend_persistence {
         let key_stat = std::fs::metadata(g.path().join(".key")).unwrap();
         assert_eq!(key_stat.permissions().mode() & 0o777, 0o600);
     }
+
+    /// A home that already exists belongs to whoever made it — under snap that
+    /// is snapd, and AppArmor denies the chmod.  Saving must not depend on it.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_an_existing_home_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let g = isolate_credential_store();
+        std::fs::set_permissions(g.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        credential_store::set_access_token("jwt-abc");
+        assert_eq!(credential_store::get_access_token().as_deref(), Some("jwt-abc"));
+        let home_stat = std::fs::metadata(g.path()).unwrap();
+        assert_eq!(home_stat.permissions().mode() & 0o777, 0o755);
+        let creds_stat = std::fs::metadata(g.path().join(".credentials")).unwrap();
+        assert_eq!(creds_stat.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_a_home_it_creates_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let g = isolate_credential_store();
+        let home = g.path().join("fresh");
+        credential_store::set_slp_home_override(Some(home.clone()));
+        credential_store::set_token("sk-test");
+        let home_stat = std::fs::metadata(&home).unwrap();
+        assert_eq!(home_stat.permissions().mode() & 0o777, 0o700);
+        credential_store::set_slp_home_override(Some(g.path().to_path_buf()));
+    }
 }
 
 /// `SLP_DEVELOPER_TOKEN` is step 3 of the documented resolution order.
