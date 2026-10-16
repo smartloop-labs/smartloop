@@ -13,6 +13,7 @@ mod test_init_promotes_a_downloaded_model;
 mod test_mcp_catalog;
 mod test_models;
 mod test_models_load_errors;
+mod test_payments;
 mod test_project_models;
 mod test_releases;
 mod test_storage;

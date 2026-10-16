@@ -1043,3 +1043,162 @@ mod test_a_project_agent_does_not_redeem {
         assert_eq!(credential_store::get_refresh_token().as_deref(), Some("rt"));
     }
 }
+
+/// The platform's `detail` is what the desktop shows the user, so each refusal
+/// keeps it — and its status — rather than being reworded here.
+mod test_verify_apple_transaction {
+    use super::*;
+
+    const PATH: &str = "/v1/payments/apple/verify";
+
+    #[test]
+    #[serial]
+    fn test_posts_the_transaction_and_returns_the_answer() {
+        let _c = autouse();
+        let server = StubServer::start();
+        let body = json!({"is_paid": true, "subscription_status": "active", "current_period_end": null});
+        server.route(PATH, 200, body.clone());
+
+        let client = client_with_auth(server.base_url(), &[("Authorization", "Bearer jwt")]);
+        let result = client.verify_apple_transaction("2000000123").unwrap();
+
+        assert_eq!(result, obj(body));
+        let sent = &server.requests()[0];
+        assert_eq!(sent.method, "POST");
+        assert_eq!(sent.json(), json!({"transaction_id": "2000000123"}));
+        assert_eq!(sent.header("Authorization"), Some("Bearer jwt"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_401_raises_permission_error() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(PATH, 401, json!({"detail": "Unauthorized"}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.verify_apple_transaction("tx").unwrap_err();
+        assert_permission(&err, "expired or invalid");
+        assert_eq!(err.status_code(), Some(401));
+    }
+
+    fn check_refusal_keeps_detail(status: u16, detail: &str) {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(PATH, status, json!({"detail": detail}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.verify_apple_transaction("tx").unwrap_err();
+        assert_permission(&err, detail);
+        assert_eq!(err.message(), detail);
+        assert_eq!(err.status_code(), Some(status));
+    }
+
+    #[test]
+    #[serial]
+    fn test_400_invalid_transaction_keeps_detail() {
+        check_refusal_keeps_detail(400, "Invalid transaction");
+    }
+
+    #[test]
+    #[serial]
+    fn test_409_already_linked_keeps_detail() {
+        check_refusal_keeps_detail(409, "Transaction is already linked to another account");
+    }
+
+    /// Not configured is the platform's state, not a verdict about this
+    /// caller, so it stays transient — with its detail.
+    #[test]
+    #[serial]
+    fn test_503_is_a_connection_error_with_detail() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(PATH, 503, json!({"detail": "Apple IAP is not configured"}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.verify_apple_transaction("tx").unwrap_err();
+        assert_connection(&err, "Apple IAP is not configured");
+        assert_eq!(err.status_code(), Some(503));
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_refusal_without_detail_falls_back_to_the_reason_phrase() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(PATH, 409, json!({"detail": [{"msg": "not a string"}]}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.verify_apple_transaction("tx").unwrap_err();
+        assert_permission(&err, "API error (409): Conflict");
+    }
+
+    #[test]
+    #[serial]
+    fn test_unreachable_raises_connection_error() {
+        let _c = autouse();
+        let client = client_with_auth(UNREACHABLE, &[]);
+        let err = client.verify_apple_transaction("tx").unwrap_err();
+        assert_connection(&err, "Connection error");
+        assert_eq!(err.status_code(), None);
+    }
+}
+
+mod test_create_checkout_session {
+    use super::*;
+
+    const PATH: &str = "/v1/payments/create-checkout-session";
+
+    #[test]
+    #[serial]
+    fn test_posts_and_returns_the_checkout_url() {
+        let _c = autouse();
+        let server = StubServer::start();
+        let body = json!({"checkout_url": "https://checkout.stripe.com/c/pay/cs_test"});
+        server.route(PATH, 200, body.clone());
+
+        let client = client_with_auth(server.base_url(), &[("Authorization", "Bearer jwt")]);
+        assert_eq!(client.create_checkout_session().unwrap(), obj(body));
+        let sent = &server.requests()[0];
+        assert_eq!(sent.method, "POST");
+        assert_eq!(sent.header("Authorization"), Some("Bearer jwt"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_404_stripe_disabled_is_a_permission_error_with_status() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(PATH, 404, json!({"detail": "Not Found"}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.create_checkout_session().unwrap_err();
+        assert_permission(&err, "Not Found");
+        assert_eq!(err.status_code(), Some(404));
+    }
+
+    #[test]
+    #[serial]
+    fn test_400_stripe_error_keeps_detail() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(PATH, 400, json!({"detail": "Stripe error: No such price"}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.create_checkout_session().unwrap_err();
+        assert_eq!(err.message(), "Stripe error: No such price");
+        assert_eq!(err.status_code(), Some(400));
+    }
+
+    #[test]
+    #[serial]
+    fn test_401_raises_permission_error() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(PATH, 401, json!({"detail": "Unauthorized"}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.create_checkout_session().unwrap_err();
+        assert_permission(&err, "expired or invalid");
+    }
+}

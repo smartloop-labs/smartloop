@@ -636,6 +636,7 @@ pub fn app() -> Router {
         .merge(routers::init_router())
         .merge(routers::skills_router())
         .merge(routers::users_router())
+        .merge(routers::payments_router())
         .merge(routers::feedback_router())
         .merge(routers::project_io_router())
         .merge(routers::releases_router())
