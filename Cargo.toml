@@ -1,6 +1,6 @@
 [package]
 name = "smartloop"
-version = "1.2.13"
+version = "1.2.14"
 edition = "2024"
 rust-version = "1.85"
 description = "AI Agent harness for extracting information and creating new content"
