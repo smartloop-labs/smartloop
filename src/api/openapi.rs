@@ -93,6 +93,7 @@ pub struct DocumentUpload {
         crate::api::routers::auth::oauth_callback_get_handler,
         crate::api::routers::users::get_me_handler,
         crate::api::routers::users::update_me_handler,
+        crate::api::routers::users::delete_me_handler,
         crate::api::routers::payments::verify_apple_handler,
         crate::api::routers::payments::checkout_handler,
         crate::api::routers::payments::refresh_handler,
