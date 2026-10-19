@@ -5,7 +5,9 @@
 //! Endpoints:
 //!     GET  /v1/users/me – fetch authenticated user's full profile
 //!     PATCH /v1/users/me – update mutable profile fields (default_temperature, default_memory)
+//!     DELETE /v1/users/me – permanently delete the account and sign out
 
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,7 @@ use crate::platform::client::JsonObject;
 use crate::platform::{get_platform_service, PlatformError};
 
 use super::_errors::{run_blocking, unhandled_error, HTTPException, ValidatedJson};
+use super::auth::{clear_token, ClearScope};
 
 /// Logger name used by this router.
 pub const LOGGER: &str = "smartloop.api.routers.users";
@@ -78,7 +81,10 @@ pub struct UserUpdate {
 
 /// Routes under `/v1/users` (tag `users`).
 pub fn router() -> Router {
-    Router::new().route("/v1/users/me", get(get_me_handler).patch(update_me_handler))
+    Router::new().route(
+        "/v1/users/me",
+        get(get_me_handler).patch(update_me_handler).delete(delete_me_handler),
+    )
 }
 
 /// `data.get(key, default)` validated as `Optional[T]`: an absent key takes
@@ -181,6 +187,25 @@ pub fn update_me(body: UserUpdate) -> Result<UserRead, HTTPException> {
     user_read_or_500(&data)
 }
 
+/// Permanently delete the signed-in account via the platform API, then drop
+/// the credentials that authorised it.
+///
+/// Sync on purpose, for the same reason as [`get_me`].  Clearing the stored
+/// tokens is what signs the app out: they belong to an account that no longer
+/// exists, so keeping them would leave every later platform call failing 401
+/// until the person noticed.  The cloud call comes first — a network failure
+/// must not sign someone out of an account that is still there.
+///
+/// Required by App Review guideline 5.1.1(v): an app that offers account
+/// creation has to offer account deletion in-app.
+pub fn delete_me() -> Result<(), HTTPException> {
+    let svc = get_platform_service();
+    svc.delete_current_user().map_err(|e| platform_failure(&e))?;
+    tracing::info!(target: LOGGER, "Account deleted on the platform; clearing stored credentials");
+    clear_token(ClearScope::All);
+    Ok(())
+}
+
 /// `GET /v1/users/me`.
 #[utoipa::path(
     get,
@@ -208,4 +233,18 @@ async fn update_me_handler(
     ValidatedJson(body): ValidatedJson<UserUpdate>,
 ) -> Result<Json<UserRead>, HTTPException> {
     run_blocking(move || update_me(body)).await?.map(Json)
+}
+
+/// `DELETE /v1/users/me`.
+#[utoipa::path(
+    delete,
+    path = "/v1/users/me",
+    tag = "auth",
+    summary = "Delete the current user's account",
+    description = "Permanently deletes the signed-in account on the platform, then clears the stored credentials so the app is signed out.",
+    responses((status = 204, description = "Deleted"), (status = 401, description = "Not signed in"), (status = 500, description = "Server error"))
+)]
+async fn delete_me_handler() -> Result<StatusCode, HTTPException> {
+    run_blocking(delete_me).await??;
+    Ok(StatusCode::NO_CONTENT)
 }

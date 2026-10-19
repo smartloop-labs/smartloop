@@ -166,6 +166,15 @@ impl PlatformService {
         Ok(data)
     }
 
+    /// Permanently delete the signed-in account on the cloud.
+    ///
+    /// The cached profile is left alone, as logout leaves it: the credentials
+    /// that authorised the call are cleared by the caller, and nothing reads
+    /// a profile while signed out.
+    pub fn delete_current_user(&self) -> PlatformResult<()> {
+        self.client.delete_current_user()
+    }
+
     /// Return the model catalog (cached or fresh).
     pub fn list_models(&self, force: bool) -> PlatformResult<Vec<JsonObject>> {
         let Some(db) = &self.db else {

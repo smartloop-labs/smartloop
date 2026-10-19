@@ -119,3 +119,56 @@ mod test_update_me {
         assert_eq!(resp.status_code(), 401);
     }
 }
+
+mod test_delete_me {
+    use axum::http::Method;
+    use serial_test::serial;
+    use smartloop::auth::credential_store;
+    use smartloop::platform::PlatformError;
+
+    use crate::common::core_support::{platform_service, send};
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deletes_and_signs_out() {
+        let platform_service = platform_service();
+        platform_service.set_delete_current_user(Ok(()));
+        // Signing out re-reads the catalog anonymously.
+        platform_service.set_list_models(Ok(vec![]));
+        credential_store::set_tokens("access-token", Some("refresh-token"));
+        credential_store::set_token("developer-token");
+
+        let resp = send(Method::DELETE, "/v1/users/me", None).await;
+
+        assert_eq!(resp.status_code(), 204);
+        assert_eq!(platform_service.calls_to("delete_current_user").len(), 1);
+        // Every credential belonged to the deleted account.
+        assert_eq!(credential_store::get_access_token(), None);
+        assert_eq!(credential_store::get_refresh_token(), None);
+        assert_eq!(credential_store::get_token(), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_keeps_credentials_when_platform_fails() {
+        let platform_service = platform_service();
+        platform_service.set_delete_current_user(Err(PlatformError::connection("Connection error")));
+        credential_store::set_tokens("access-token", None);
+
+        let resp = send(Method::DELETE, "/v1/users/me", None).await;
+
+        assert_eq!(resp.status_code(), 502);
+        // The account still exists, so the session must too.
+        assert_eq!(credential_store::get_access_token().as_deref(), Some("access-token"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_401_when_not_authenticated() {
+        let platform_service = platform_service();
+        platform_service.set_delete_current_user(Err(PlatformError::permission("Not authenticated")));
+        let resp = send(Method::DELETE, "/v1/users/me", None).await;
+
+        assert_eq!(resp.status_code(), 401);
+    }
+}

@@ -39,6 +39,7 @@ pub mod core_support {
         pub calls: Mutex<Vec<Call>>,
         current_user: Scripted<JsonObject>,
         update_current_user: Scripted<JsonObject>,
+        delete_current_user: Scripted<()>,
         list_models: Scripted<Vec<JsonObject>>,
         list_mcp_catalog: Scripted<Vec<JsonObject>>,
         latest_release: Scripted<Option<JsonObject>>,
@@ -66,6 +67,9 @@ pub mod core_support {
         }
         pub fn set_update_current_user(&self, result: PlatformResult<JsonObject>) {
             *self.update_current_user.lock() = Some(result);
+        }
+        pub fn set_delete_current_user(&self, result: PlatformResult<()>) {
+            *self.delete_current_user.lock() = Some(result);
         }
         pub fn set_list_models(&self, result: PlatformResult<Vec<JsonObject>>) {
             *self.list_models.lock() = Some(result);
@@ -113,6 +117,10 @@ pub mod core_support {
         fn update_current_user(&self, payload: &JsonObject) -> PlatformResult<JsonObject> {
             self.record("update_current_user", vec![Value::Object(payload.clone())]);
             answer(&self.update_current_user, "update_current_user")
+        }
+        fn delete_current_user(&self) -> PlatformResult<()> {
+            self.record("delete_current_user", vec![]);
+            answer(&self.delete_current_user, "delete_current_user")
         }
         fn verify_apple_transaction(&self, transaction_id: &str) -> PlatformResult<JsonObject> {
             self.record("verify_apple_transaction", vec![Value::from(transaction_id)]);
