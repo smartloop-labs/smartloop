@@ -82,7 +82,9 @@ pub fn describe_failure(status: u16, body: &str, model: &str) -> String {
         401 => format!("Sign in to use {model}."),
         403 => format!("{model} isn't available on your current plan."),
         404 => format!("{model} is no longer available."),
-        429 => format!("{model} is busy right now. Try again shortly."),
+        // A spent allowance says when it resets; a busy upstream or our own
+        // rate limit has no detail worth more than the generic message.
+        429 => detail.unwrap_or_else(|| format!("{model} is busy right now. Try again shortly.")),
         400 => detail.unwrap_or_else(|| format!("{model} could not answer this request.")),
         _ => format!("{model} did not answer (HTTP {status})."),
     }
