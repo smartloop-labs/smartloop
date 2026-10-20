@@ -251,6 +251,18 @@ fn test_credentials_allowed_only_on_platform_hosts() {
 fn test_failure_messages() {
     assert_eq!(describe_failure(401, "", "kimi-k2"), "Sign in to use kimi-k2.");
     assert_eq!(describe_failure(429, "", "kimi-k2"), "kimi-k2 is busy right now. Try again shortly.");
+    assert_eq!(
+        describe_failure(429, r#"{"error": "Rate limit exceeded: 60 per 1 minute"}"#, "kimi-k2"),
+        "kimi-k2 is busy right now. Try again shortly."
+    );
+    assert_eq!(
+        describe_failure(
+            429,
+            r#"{"detail": "Cloud model usage limit reached on the paid plan. It resets on 2026-11-01."}"#,
+            "kimi-k2"
+        ),
+        "Cloud model usage limit reached on the paid plan. It resets on 2026-11-01."
+    );
     assert_eq!(describe_failure(400, r#"{"detail": "context length exceeded"}"#, "kimi-k2"), "context length exceeded");
     assert_eq!(describe_failure(502, "", "kimi-k2"), "kimi-k2 did not answer (HTTP 502).");
 }
