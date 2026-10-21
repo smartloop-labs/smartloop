@@ -198,9 +198,14 @@ pub trait BaseLLM: Send + Sync {
     /// A model that can generate several sequences at once (the in-process
     /// llama.cpp model, or the model host serving one) runs them together; by
     /// default they run one after another, so the replies are the same either
-    /// way.
-    fn invoke_batch(&self, prompts: &[BatchPrompt]) -> Vec<String> {
-        prompts.iter().map(|p| self.invoke(&p.prompt, p.max_tokens, p.thinking)).collect()
+    /// way.  Once `cancelled` is set, generation stops: prompts not yet
+    /// answered come back empty.
+    fn invoke_batch(&self, prompts: &[BatchPrompt], cancelled: Option<CancelEvent>) -> Vec<String> {
+        let is_cancelled = || cancelled.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
+        prompts
+            .iter()
+            .map(|p| if is_cancelled() { String::new() } else { self.invoke(&p.prompt, p.max_tokens, p.thinking) })
+            .collect()
     }
 
     /// True when this model's chat template can reason.

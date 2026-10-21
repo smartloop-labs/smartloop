@@ -201,8 +201,8 @@ impl BaseLLM for RemoteLLM {
     /// One RPC for the whole batch; the host generates the prompts together.
     /// Replies are cleaned as [`Self::invoke`] cleans one, and a failed call
     /// answers every prompt with the error, as `invoke` would.
-    fn invoke_batch(&self, prompts: &[BatchPrompt]) -> Vec<String> {
-        match self.client.generate_batch(prompts, None, self.capability.as_deref()) {
+    fn invoke_batch(&self, prompts: &[BatchPrompt], cancelled: Option<CancelEvent>) -> Vec<String> {
+        match self.client.generate_batch(prompts, None, self.capability.as_deref(), cancelled) {
             Ok(texts) => texts.iter().map(|text| clean_reply(text)).collect(),
             Err(exc) => {
                 tracing::error!(target: LOG_TARGET, "Remote LLM batch invocation failed: {exc}");

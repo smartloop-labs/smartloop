@@ -559,6 +559,45 @@ fn test_invoke_batch_defaults_to_one_at_a_time_in_order() {
     let llm = llm_8k("unused");
     llm.set_responder(|p| Ok(format!("echo:{}", p.chars().last().unwrap_or(' '))));
     let prompts: Vec<BatchPrompt> = ["a", "b", "c"].iter().map(|p| BatchPrompt::new(*p, None)).collect();
-    assert_eq!(llm.shared().invoke_batch(&prompts), vec!["echo:a", "echo:b", "echo:c"]);
+    assert_eq!(llm.shared().invoke_batch(&prompts, None), vec!["echo:a", "echo:b", "echo:c"]);
     assert_eq!(llm.call_count(), 3);
+}
+
+/// A cancelled batch stops asking the model: prompts after the cancel come
+/// back empty.
+#[test]
+fn test_invoke_batch_stops_once_cancelled() {
+    use smartloop::llms::base_llm::{BaseLLM, BatchPrompt};
+    use std::sync::atomic::AtomicBool;
+    let llm = llm_8k("unused");
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = cancelled.clone();
+    llm.set_responder(move |p| {
+        flag.store(true, Ordering::SeqCst);
+        Ok(format!("echo:{}", p.chars().last().unwrap_or(' ')))
+    });
+    let prompts: Vec<BatchPrompt> = ["a", "b", "c"].iter().map(|p| BatchPrompt::new(*p, None)).collect();
+    assert_eq!(llm.shared().invoke_batch(&prompts, Some(cancelled)), vec!["echo:a", "", ""]);
+    assert_eq!(llm.call_count(), 1);
+}
+
+/// Once the request is cancelled, a fan-out node skips its documents instead
+/// of extracting them for nobody.
+#[test]
+fn test_fanout_node_skips_work_after_cancel() {
+    use std::sync::atomic::AtomicBool;
+    let (orch, llm) = make_orchestrator();
+    llm.set_reply("EXTRACT");
+    let c = summarize_ctx(&orch);
+    c.write().cancelled = Some(Arc::new(AtomicBool::new(true)));
+    let sctx = SearchContext { documents: docs(3, 100), ..Default::default() };
+    let shared: SharedSearchContext = Arc::new(parking_lot::Mutex::new(sctx));
+    let built = orch.doc_fanout().build(&c, Some(&shared), &smartloop::agents::nodes::AgentNode::default());
+    for (node, handler) in &built.pairs {
+        if node.is_llm_decision() {
+            let result = handler(HashMap::new()).unwrap();
+            assert_eq!(result.data["extracts"], json!([]));
+        }
+    }
+    assert_eq!(llm.call_count(), 0);
 }

@@ -32,7 +32,7 @@ use crate::model_host::client::{
     default_socket_path, has_unix_sockets, mark_device_owner, parse_address,
     InProcessModelClient, LocalModelService, ModelClient, ModelHostError,
 };
-use crate::llms::base_llm::BatchPrompt;
+use crate::llms::base_llm::{BatchPrompt, CancelEvent};
 use crate::model_host::pb;
 use crate::model_host::pb::model_host_server::{ModelHost as ModelHostService, ModelHostServer};
 use crate::workspace::context::use_project;
@@ -455,6 +455,17 @@ impl ModelHostService for ModelHostServicer {
     ) -> Result<Response<pb::GenerateBatchResponse>, Status> {
         let request = request.into_inner();
         let project_id = request.project_id.clone();
+        // tonic drops this handler's future when the client cancels the call;
+        // the guard then raises the event the batch checks between steps, so
+        // the device stops generating for nobody.
+        struct CancelOnDrop(CancelEvent);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let cancelled: CancelEvent = Arc::new(AtomicBool::new(false));
+        let _guard = CancelOnDrop(cancelled.clone());
         let result = self
             .blocking(project_id, move |client| {
                 let prompts: Vec<BatchPrompt> = request
@@ -466,7 +477,12 @@ impl ModelHostService for ModelHostServicer {
                         thinking: p.thinking,
                     })
                     .collect();
-                client.generate_batch(&prompts, non_empty(&request.model_name), non_empty(&request.capability))
+                client.generate_batch(
+                    &prompts,
+                    non_empty(&request.model_name),
+                    non_empty(&request.capability),
+                    Some(cancelled),
+                )
             })
             .await?;
         match result {

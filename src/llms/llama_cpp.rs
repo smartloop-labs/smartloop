@@ -589,9 +589,13 @@ impl BaseLLM for LlamaCpp {
     /// Every prompt is rendered exactly as [`BaseLLM::invoke`] would render it
     /// (fitted to the window, same template, sampling and thinking flags),
     /// then generated together; see [`Llama::generate_batch`].
-    fn invoke_batch(&self, prompts: &[BatchPrompt]) -> Vec<String> {
+    fn invoke_batch(&self, prompts: &[BatchPrompt], cancelled: Option<CancelEvent>) -> Vec<String> {
+        let request_cancelled = || cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst));
         let Some(llama) = self.model.as_llama() else {
-            return prompts.iter().map(|p| self.invoke(&p.prompt, p.max_tokens, p.thinking)).collect();
+            return prompts
+                .iter()
+                .map(|p| if request_cancelled() { String::new() } else { self.invoke(&p.prompt, p.max_tokens, p.thinking) })
+                .collect();
         };
         let _guard = self.context_lock().lock();
         let mut items = Vec::with_capacity(prompts.len());
@@ -611,12 +615,15 @@ impl BaseLLM for LlamaCpp {
                 // cannot be batched.
                 None => {
                     drop(_guard);
-                    return prompts.iter().map(|p| self.invoke(&p.prompt, p.max_tokens, p.thinking)).collect();
+                    return prompts
+                        .iter()
+                        .map(|p| if request_cancelled() { String::new() } else { self.invoke(&p.prompt, p.max_tokens, p.thinking) })
+                        .collect();
                 }
             }
         }
         llama
-            .generate_batch(items, &|| self.is_cancelled())
+            .generate_batch(items, &|| request_cancelled() || self.is_cancelled())
             .into_iter()
             .map(|result| match result {
                 Ok(text) => clean_reply(&Self::finish_text(&text)),
