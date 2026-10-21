@@ -76,7 +76,12 @@ pub struct AppSettings {
     /// decisions, and an auto-sized window would claim memory the capability
     /// models need.
     pub llm_main_n_ctx_cap: i64,
-    /// `SLP_LLM_LARGE_N_CTX_CAP` — max context for the large agent model; 0 = no cap.
+    /// `SLP_LLM_LARGE_N_CTX_CAP` — max context for the large agent model and
+    /// the capability models; 0 = no cap.  Defaults to 16384: each of these
+    /// auto-sizes from the memory free when it loads, as if it were alone, so
+    /// two loaded back to back each claimed a 65536 window (~6GB of KV apiece)
+    /// and a document fan-out over a large project got the process killed.
+    /// Fan-out extraction needs at most ~5k prompt tokens plus 2048 output.
     pub llm_large_n_ctx_cap: i64,
     /// `SLP_LLM_LARGE_FIT_RESERVE_GB` — VRAM kept free when fit-checking the large model.
     pub llm_large_fit_reserve_gb: f64,
@@ -159,7 +164,7 @@ impl AppSettings {
             llm_n_batch: 0,
             llm_n_threads: 0,
             llm_main_n_ctx_cap: 4096,
-            llm_large_n_ctx_cap: 0,
+            llm_large_n_ctx_cap: 16384,
             llm_large_fit_reserve_gb: 1.0,
             model_keep_alive: 300,
             doc_extract_max_chars: 0,
