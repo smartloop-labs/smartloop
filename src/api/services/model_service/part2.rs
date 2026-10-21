@@ -31,8 +31,6 @@ use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
 use crate::agents::orchestrator::{ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions};
-use crate::db::migrate_chroma::migrate_chroma_to_index_store;
-use crate::db::store_factory::{StoreType, resolve_default_store_type};
 use crate::llms::base_llm::{CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::llms::llama::ChatCompletionRequest;
 use crate::mcp::account::probe_account;
@@ -1274,8 +1272,7 @@ impl ModelService {
         Ok(task)
     }
 
-    /// Set up all background tasks for the workspace (Chroma migration,
-    /// indexer, MCP) and start the auto tasks.  Called during API server
+    /// Set up all background tasks for the workspace (indexer, MCP) and start the auto tasks.  Called during API server
     /// startup.
     pub fn setup_tasks(&self, workspace: Option<SharedWorkspace>) -> anyhow::Result<()> {
         let workspace: SharedWorkspace = match workspace {
@@ -1286,19 +1283,6 @@ impl ModelService {
             },
         };
         let queue = self.task_queue.read().clone();
-
-        // Migrate legacy ChromaDB data into the SQLite IndexStore — but ONLY
-        // when sqlite is the active backend: the migration reads (and then
-        // archives) chroma.sqlite3.
-        if resolve_default_store_type() == StoreType::SQLite {
-            let projects = workspace.read().projects.clone();
-            for project in projects {
-                if migrate_chroma_to_index_store(&project.project_dir) {
-                    let label = project.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| project.id.clone());
-                    tracing::info!(target: LOG, "Migrated ChromaDB data for project '{label}'");
-                }
-            }
-        }
 
         // Document conversion uses MarkItDown-style converters (no model
         // pre-download).  OCR / image understanding is handled on demand by

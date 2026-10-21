@@ -54,9 +54,8 @@ impl Drop for Harness {
     }
 }
 
-/// Run the real `setup_tasks` on an empty workspace (no projects: the
-/// ChromaDB migration loop has nothing to walk, which keeps this about task
-/// registration).
+/// Run the real `setup_tasks` on an empty workspace (no projects, which keeps
+/// this about task registration).
 fn run_setup_tasks() -> Harness {
     let config = ScratchConfig::new();
     let svc = bare_service();
