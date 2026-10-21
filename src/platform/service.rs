@@ -13,6 +13,7 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use serde_json::Value;
 
+use crate::model::spec::MODEL_SPECS;
 use crate::platform::client::{JsonObject, PlatformApi, PlatformError, PlatformResult};
 #[allow(unused_imports)]
 use crate::platform::client::SLPPlatformClient;
@@ -176,18 +177,23 @@ impl PlatformService {
     }
 
     /// Return the model catalog (cached or fresh).
+    ///
+    /// Whatever comes back is laid over [`MODEL_SPECS`], so per-model
+    /// metadata follows the catalog.
     pub fn list_models(&self, force: bool) -> PlatformResult<Vec<JsonObject>> {
-        let Some(db) = &self.db else {
-            return self.client.list_models();
-        };
-        fetch_or_cache(
-            MODELS_TTL,
-            || db.list_models().map(Some),
-            || db.models_fetched_at(),
-            || self.client.list_models(),
-            |models| db.save_models(models),
-            force,
-        )
+        let models = match &self.db {
+            None => self.client.list_models(),
+            Some(db) => fetch_or_cache(
+                MODELS_TTL,
+                || db.list_models().map(Some),
+                || db.models_fetched_at(),
+                || self.client.list_models(),
+                |models| db.save_models(models),
+                force,
+            ),
+        }?;
+        MODEL_SPECS.hydrate(&models);
+        Ok(models)
     }
 
     /// Return the curated MCP server catalog (cached or fresh).
