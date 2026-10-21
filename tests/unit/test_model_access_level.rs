@@ -115,11 +115,13 @@ mod test_model_kind {
             kind: ModelKind::Remote,
             url: Some("https://api.smartloop.ai".into()),
             context_length: Some(131072),
+            param_size_b: Some(1000.0),
         };
         let value = serde_json::to_value(&workspace).unwrap();
         assert_eq!(value["type"], "remote");
         assert_eq!(value["url"], "https://api.smartloop.ai");
         assert_eq!(value["context_length"], 131072);
+        assert_eq!(value["param_size_b"], 1000.0);
 
         let project = ProjectModelEntry {
             model_name: "kimi-k2".into(),
@@ -132,6 +134,7 @@ mod test_model_kind {
             kind: ModelKind::Remote,
             url: Some("https://api.smartloop.ai".into()),
             context_length: None,
+            param_size_b: None,
         };
         let value = serde_json::to_value(&project).unwrap();
         assert_eq!(value["type"], "remote");

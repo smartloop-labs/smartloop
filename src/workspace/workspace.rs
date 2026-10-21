@@ -683,13 +683,10 @@ pub struct WorkspaceModel {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub config: Option<ModelConfig>,
-    /// Remote models run behind `url` and have no weights on disk.
+    /// Remote models run behind their spec's `url` and have no weights on
+    /// disk.
     #[serde(rename = "type", default, skip_serializing_if = "ModelKind::is_local")]
     pub kind: ModelKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_length: Option<u32>,
     /// Runtime-only; never persisted (`Field(exclude=True)`).
     #[serde(skip)]
     pub models_dir: String,
@@ -707,8 +704,6 @@ impl Default for WorkspaceModel {
             capabilities: Vec::new(),
             config: None,
             kind: ModelKind::Local,
-            url: None,
-            context_length: None,
             models_dir: String::new(),
         }
     }
@@ -767,6 +762,21 @@ impl WorkspaceModel {
         MODEL_SPECS.get(&self.model_name)
     }
 
+    /// Base URL a remote model's chat requests go to: its spec's, else the
+    /// platform API.  `None` for a local model.
+    pub fn url(&self) -> Option<String> {
+        if !self.is_remote() {
+            return None;
+        }
+        let url = self.spec().and_then(|spec| spec.url.clone()).filter(|u| !u.is_empty());
+        Some(url.unwrap_or_else(|| AppSettings::new().slp_api_base))
+    }
+
+    /// The context window the spec declares, if any.
+    pub fn context_length(&self) -> Option<u32> {
+        self.spec().and_then(|spec| spec.context_length)
+    }
+
     /// Parameter count in billions of the weights this machine runs, taken
     /// from the spec (the authoritative source).  0 for a model without a
     /// spec or a size, and for a remote model, which local selection
@@ -799,15 +809,13 @@ impl WorkspaceModel {
     ///
     /// The stored `capabilities` field is ignored so the spec stays
     /// authoritative and catalog updates to any model's capabilities take
-    /// effect immediately.  A remote model uses its stored list (from the
-    /// catalog).  Other models without a spec fall back to metadata-inferred
-    /// capabilities.
+    /// effect immediately.  A local model without a spec falls back to
+    /// metadata-inferred capabilities; a remote one, which nothing can be
+    /// inferred about, declares none.
     pub fn effective_capabilities(&self) -> Vec<String> {
-        if self.is_remote() {
-            return self.capabilities.clone();
-        }
         match self.spec() {
             Some(spec) => spec.capability_values(),
+            None if self.is_remote() => Vec::new(),
             None => self.infer_capabilities(),
         }
     }
@@ -1670,23 +1678,14 @@ impl Workspace {
         entry
     }
 
-    /// Register a remote model, or refresh the catalog details of one already
-    /// registered.  It is never the active (bootstrap) model and is
-    /// `downloaded` from the start, since there is nothing to fetch.
-    pub fn add_remote_model(
-        &mut self,
-        model_name: &str,
-        url: &str,
-        capabilities: Vec<String>,
-        context_length: Option<u32>,
-        enabled: bool,
-    ) -> WorkspaceModel {
+    /// Register a remote model, or mark one already registered as remote.
+    /// It is never the active (bootstrap) model and is `downloaded` from the
+    /// start, since there is nothing to fetch.  Its endpoint, capabilities and
+    /// size come from its spec.
+    pub fn add_remote_model(&mut self, model_name: &str, enabled: bool) -> WorkspaceModel {
         let model_name = canonical_model_name(model_name);
         if let Some(existing) = self.get_model_mut(Some(&model_name)) {
             existing.kind = ModelKind::Remote;
-            existing.url = Some(url.to_string());
-            existing.capabilities = capabilities;
-            existing.context_length = context_length;
             existing.downloaded = true;
             existing.is_active = false;
             return existing.clone();
@@ -1695,10 +1694,7 @@ impl Workspace {
             model_name,
             downloaded: true,
             enabled,
-            capabilities,
             kind: ModelKind::Remote,
-            url: Some(url.to_string()),
-            context_length,
             models_dir: self.models_dir.clone(),
             ..Default::default()
         };

@@ -488,6 +488,9 @@ pub struct ModelEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub context_length: Option<u32>,
+    /// Parameter count in billions, local or remote; `None` when unknown.
+    #[serde(default)]
+    pub param_size_b: Option<f64>,
 }
 
 fn null_as_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -625,6 +628,9 @@ pub fn list_models_with(
         if entry.url.as_deref().is_none_or(str::is_empty) {
             entry.url = Some(settings.slp_api_base.clone());
         }
+        if let Some(size) = declared_param_size_b(&entry.name) {
+            entry.param_size_b = Some(size);
+        }
         result.push(entry);
     }
     drop(ws_guard);
@@ -669,6 +675,11 @@ pub fn footprint_gb(entry: &ModelEntry) -> Option<f64> {
         None => local_param_size_b(&entry.name),
     };
     if size_b > 0.0 { Some(size_b) } else { None }
+}
+
+/// Parameter count the spec of `name` declares, local or remote.
+fn declared_param_size_b(name: &str) -> Option<f64> {
+    MODEL_SPECS.get(name).map(|spec| spec.param_size_b).filter(|size| *size > 0.0)
 }
 
 /// Parameter count of the local model `name`, 0 when unknown.  A remote
@@ -798,6 +809,9 @@ pub struct WorkspaceModelEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub context_length: Option<u32>,
+    /// Parameter count in billions, local or remote; `None` when unknown.
+    #[serde(default)]
+    pub param_size_b: Option<f64>,
 }
 
 /// `sorted(models, key=lambda m: m._rank, reverse=True)`: best model first
@@ -853,8 +867,9 @@ pub async fn list_workspace_models_with(
                 capabilities: display_capabilities(&m.effective_capabilities()),
                 thinking: ws.effective_model_thinking(&m.model_name, None),
                 kind: m.kind,
-                url: m.url.clone(),
-                context_length: m.context_length,
+                url: m.url(),
+                context_length: m.context_length(),
+                param_size_b: declared_param_size_b(&m.model_name),
             })
             .collect())
     };
@@ -1048,6 +1063,9 @@ pub struct ProjectModelEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub context_length: Option<u32>,
+    /// Parameter count in billions, local or remote; `None` when unknown.
+    #[serde(default)]
+    pub param_size_b: Option<f64>,
 }
 
 /// Body of `PATCH /v1/projects/{project_id}/models/{model_name}`.
@@ -1128,8 +1146,9 @@ pub async fn list_project_models_with(
                     .map(|pm| pm.settings.clone())
                     .unwrap_or_default(),
                 kind: m.kind,
-                url: m.url.clone(),
-                context_length: m.context_length,
+                url: m.url(),
+                context_length: m.context_length(),
+                param_size_b: declared_param_size_b(&m.model_name),
             })
             .collect())
     };

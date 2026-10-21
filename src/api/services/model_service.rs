@@ -2004,12 +2004,8 @@ impl ModelService {
             .workspace_handle()
             .and_then(|ws| ws.read().current_project().map(|p| p.id.clone()))
             .unwrap_or_default();
-        let url = ws_model
-            .url
-            .clone()
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| AppSettings::new().slp_api_base);
-        Arc::new(CloudLLM::new(&project_id, &ws_model.model_name, &url, ws_model.context_length))
+        let url = ws_model.url().unwrap_or_else(|| AppSettings::new().slp_api_base);
+        Arc::new(CloudLLM::new(&project_id, &ws_model.model_name, &url, ws_model.context_length()))
     }
 
     /// Whether `llm` answers over HTTP rather than from local weights.

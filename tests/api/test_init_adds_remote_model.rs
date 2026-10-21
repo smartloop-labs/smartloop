@@ -84,9 +84,9 @@ async fn test_a_remote_model_is_registered_without_a_download() {
     assert!(model.is_remote());
     assert!(model.downloaded);
     assert!(!model.is_active);
-    assert_eq!(model.url.as_deref(), Some("https://edge.smartloop.ai"));
-    assert_eq!(model.capabilities, vec!["general".to_string(), "coding".to_string()]);
-    assert_eq!(model.context_length, Some(131072));
+    assert_eq!(model.url().as_deref(), Some("https://edge.smartloop.ai"));
+    assert_eq!(model.effective_capabilities(), vec!["general".to_string(), "coding".to_string()]);
+    assert_eq!(model.context_length(), Some(131072));
     // Project-scoped: left for the follow-up PATCH, and never promoted.
     assert!(!model.enabled);
 }

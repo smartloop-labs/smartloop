@@ -193,6 +193,41 @@ mod test_list_models {
 
     #[tokio::test]
     #[serial]
+    async fn test_models_report_their_parameter_size() {
+        let client = TestClient::new();
+        client.platform().set_list_models(json!([
+            {"name": "remote-sized", "model_id": null, "type": "remote",
+             "is_accessible": true, "capabilities": ["general"], "param_size_b": 355.0},
+            {"name": "gemma4-e2b", "model_id": "google/gemma-4-e2b-it", "is_accessible": true},
+        ]));
+        let resp = client.get("/v1/models").await;
+
+        let body = resp.json();
+        let by_name = |name: &str| body.as_array().unwrap().iter().find(|m| m["name"] == name).unwrap().clone();
+        assert_eq!(by_name("remote-sized")["param_size_b"], 355.0);
+        // A catalog without the field still reports the built-in size.
+        assert_eq!(by_name("gemma4-e2b")["param_size_b"], 2.0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_catalog_only_local_model_is_listed_with_its_spec() {
+        let client = TestClient::new();
+        client.platform().set_list_models(json!([
+            {"name": "catalog-only-8b", "model_id": "org/catalog-only-8b", "type": "local",
+             "is_accessible": true, "capabilities": ["general", "dp", "vision"],
+             "param_size_b": 8.0, "model_version": 4, "vision_chat_handler": "Gemma4ChatHandler"},
+        ]));
+        let resp = client.get("/v1/models").await;
+
+        let entry = &resp.json()[0];
+        assert_eq!(entry["name"], "catalog-only-8b");
+        assert_eq!(entry["capabilities"], json!(["general", "dp", "vision"]));
+        assert_eq!(entry["param_size_b"], 8.0);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_a_missing_url_falls_back_to_the_platform() {
         let client = TestClient::new();
         client.platform().set_list_models(json!([
