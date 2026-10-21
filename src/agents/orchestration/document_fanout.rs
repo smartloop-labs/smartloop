@@ -1,12 +1,14 @@
 //! Port of `smartloop/agents/orchestration/document_fanout.py`.
 //!
-//! Document map-reduce: one DAG node per retrieved document.
+//! Document map-reduce: every retrieved document extracted on its own.
 //!
-//! EVERY retrieved document gets its own node, so the answer covers them all
-//! and nothing is dropped for volume.  Processing each document independently
-//! is also what makes per-document relevance possible: a document the query
-//! doesn't ask about is filtered out by its own `NONE` extraction instead of
-//! leaking into a co-batched document's result.
+//! EVERY retrieved document gets its own extraction, so the answer covers
+//! them all and nothing is dropped for volume.  Processing each document
+//! independently is also what makes per-document relevance possible: a
+//! document the query doesn't ask about is filtered out by its own `NONE`
+//! extraction instead of leaking into another document's result.  Documents
+//! are grouped into DAG nodes only so a node can hand its documents' prompts
+//! to the model together, which generates them side by side.
 //!
 //! The reduce step merges the surviving extracts and narrows the citation list
 //! to exactly the documents that contributed.
@@ -24,6 +26,7 @@ use crate::agents::orchestration::replies::{is_none_extract, is_placeholder_outp
 use crate::agents::orchestration::step::{NodePair, SharedSearchContext, Step, StepNodes};
 use crate::agents::planner::ModelTier;
 use crate::config::app_settings::AppSettings;
+use crate::llms::base_llm::BatchPrompt;
 use crate::types::ModelCapability;
 
 /// Python logger name of this module.
@@ -58,6 +61,12 @@ pub fn extract_max_tokens(document_chars: usize) -> usize {
     let source_tokens = (document_chars as f64 / CHARS_PER_TOKEN) as usize;
     (source_tokens / 2).clamp(EXTRACT_MIN_TOKENS, EXTRACT_MAX_TOKENS)
 }
+
+/// Most documents one fan-out node extracts.  The model generates a node's
+/// prompts together, as many at once as the device has slots for, refilling a
+/// slot as each document finishes; a larger group keeps the slots full
+/// between nodes.
+pub const BATCH_GROUP_SIZE: usize = 32;
 
 /// Default extraction input cap when the model's window is unknown.
 pub const DEFAULT_MAX_CHARS: usize = 16000;
@@ -109,19 +118,18 @@ impl DocumentFanoutStep {
         Self { models }
     }
 
-    /// Map each document to its own batch (one document per fan-out node).
+    /// Group the documents for the fan-out nodes, in relevance order, at
+    /// most [`BATCH_GROUP_SIZE`] to a group.
     ///
-    /// EVERY retrieved document gets its own node so the answer covers them
-    /// all — nothing is dropped regardless of count.  Processing each document
-    /// independently also means a document the query doesn't ask about (e.g.
-    /// another person's invoice) is filtered out by its own `NONE` extraction
-    /// instead of leaking into a co-batched document's result.
-    ///
-    /// The number processed concurrently is bounded by the LLM worker pool
-    /// (and the DAG thread pool); any overflow simply waits in the pool's
-    /// queue and is processed as workers free up.
+    /// EVERY retrieved document is still extracted on its own — its own
+    /// prompt, its own `NONE` verdict — so nothing is dropped regardless of
+    /// count, and a document the query doesn't ask about (e.g. another
+    /// person's invoice) is filtered out by its own extraction instead of
+    /// leaking into a neighbour's.  Grouping only lets one node hand its
+    /// documents' prompts to the model together, which generates them side by
+    /// side ([`crate::llms::base_llm::BaseLLM::invoke_batch`]).
     pub fn batch_documents(&self, documents: &[Map<String, Value>]) -> Vec<Vec<Map<String, Value>>> {
-        documents.iter().map(|doc| vec![doc.clone()]).collect()
+        documents.chunks(BATCH_GROUP_SIZE).map(<[_]>::to_vec).collect()
     }
 
     /// See [`crate::utils::doc_splitter::json_to_table`].
@@ -157,6 +165,12 @@ impl DocumentFanoutStep {
     }
 
     /// Body of a batch handler (see [`Self::make_batch_handler`]).
+    ///
+    /// Each document of the group is extracted independently: structured
+    /// data deterministically, everything else by the DP model, all of the
+    /// group's prompts in one batched call.  The result carries one entry per
+    /// surviving document under `extracts`; a single document's extract is
+    /// also its `doc_names`/`content`.
     fn run_batch(
         &self,
         ctx: &SharedOrchestratorContext,
@@ -164,26 +178,14 @@ impl DocumentFanoutStep {
         batch: &[Map<String, Value>],
         skill_instruction: Option<&str>,
     ) -> NodeResult {
-        let doc_names: Vec<String> = batch.iter().map(|d| doc_field(d, "document_name")).collect();
-        let named: Vec<&str> =
-            doc_names.iter().map(String::as_str).filter(|n| !n.is_empty()).collect();
-        let reading = if named.is_empty() {
-            "Reading document".to_string()
-        } else {
-            format!("Reading document: {}", named.join(", "))
+        let named: Vec<String> =
+            batch.iter().map(|d| doc_field(d, "document_name")).filter(|n| !n.is_empty()).collect();
+        let reading = match named.len() {
+            0 => "Reading document".to_string(),
+            1..=3 => format!("Reading document: {}", named.join(", ")),
+            n => format!("Reading {n} documents: {}, …", named[..3].join(", ")),
         };
         self.models.emit("read", "processing", &reading);
-        let combined = batch
-            .iter()
-            .map(|d| {
-                format!(
-                    "=== Document: {} ===\n{}",
-                    doc_field(d, "document_name"),
-                    doc_field(d, "content")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
 
         // Structured data documents are used deterministically — no LLM
         // context window, so large files can't overflow the extractor, and
@@ -192,33 +194,60 @@ impl DocumentFanoutStep {
         //     → converted to a table on the fly;
         //   * content already normalized to a markdown table at index time
         //     → used directly.
-        // Both skip loading the DP model entirely.
-        let mut table_parts: Vec<String> = Vec::new();
-        for d in batch {
+        // Neither needs the DP model.
+        let mut extracts: Vec<Option<String>> = vec![None; batch.len()];
+        let mut needs_llm: Vec<usize> = Vec::new();
+        for (i, d) in batch.iter().enumerate() {
             let doc_name = doc_field(d, "document_name");
             let content = doc_field(d, "content");
             let mut table = Self::json_to_table(&content);
             if table.is_none() && Self::is_markdown_table(&content) {
                 table = Some(content.clone());
             }
-            if let Some(t) = table {
-                table_parts.push(if doc_name.is_empty() { t } else { format!("{doc_name}\n{t}") });
+            match table {
+                Some(t) => {
+                    let table = if doc_name.is_empty() { t } else { format!("{doc_name}\n{t}") };
+                    tracing::info!(
+                        target: LOGGER,
+                        "[doc-batch] {}: json→table conversion → {} chars",
+                        node_id,
+                        table.chars().count()
+                    );
+                    extracts[i] = Some(table);
+                }
+                None => needs_llm.push(i),
             }
         }
-        if !table_parts.is_empty() {
-            let table = table_parts.join("\n\n---\n\n");
-            tracing::info!(
-                target: LOGGER,
-                "[doc-batch] {}: json→table conversion → {} chars",
-                node_id,
-                table.chars().count()
-            );
-            return NodeResult::with_data(
-                node_id,
-                json!({"doc_names": doc_names, "content": table}),
-            );
+
+        if !needs_llm.is_empty() {
+            self.extract_with_llm(ctx, node_id, batch, &needs_llm, skill_instruction, &mut extracts);
         }
 
+        let mut entries: Vec<Value> = Vec::new();
+        for (d, extract) in batch.iter().zip(extracts) {
+            if let Some(content) = extract.filter(|c| !c.is_empty()) {
+                entries.push(json!({"doc_names": [doc_field(d, "document_name")], "content": content}));
+            }
+        }
+        let doc_names: Vec<String> = batch.iter().map(|d| doc_field(d, "document_name")).collect();
+        let content = match entries.as_slice() {
+            [only] => only["content"].as_str().unwrap_or_default().to_string(),
+            _ => String::new(),
+        };
+        NodeResult::with_data(node_id, json!({"doc_names": doc_names, "content": content, "extracts": entries}))
+    }
+
+    /// Extract `indices` of `batch` with the DP model, one prompt per
+    /// document, generated together; each result lands in `extracts`.
+    fn extract_with_llm(
+        &self,
+        ctx: &SharedOrchestratorContext,
+        node_id: &str,
+        batch: &[Map<String, Value>],
+        indices: &[usize],
+        skill_instruction: Option<&str>,
+        extracts: &mut [Option<String>],
+    ) {
         // Size the extraction input to the EXTRACTION model's actual context
         // window — not the router's.  The router's max_tokens can exceed the
         // DP model's window (e.g. 8192 vs 6080), so sizing from it overflows
@@ -227,9 +256,10 @@ impl DocumentFanoutStep {
         let dp_llm = self.models.llm_for_tier(ModelTier::Large, Some(ModelCapability::Dp.value()), None);
         tracing::info!(
             target: LOGGER,
-            "[doc-batch] {} → {}",
+            "[doc-batch] {} → {} ({} document(s))",
             node_id,
-            ModelRouter::model_label(dp_llm.as_ref())
+            ModelRouter::model_label(dp_llm.as_ref()),
+            indices.len()
         );
         let ctx_tokens = dp_llm.get_max_tokens();
         if ctx_tokens > 0 {
@@ -252,79 +282,99 @@ impl DocumentFanoutStep {
             Some(instruction) => format!("Guidance:\n{instruction}\n\n"),
             None => String::new(),
         };
-        let documents = char_prefix(&combined, max_chars);
-        let max_tokens = extract_max_tokens(documents.chars().count());
-        let prompt = format!(
-            "<system>\n\
-             You extract the information relevant to the user's request from \
-             the document(s) below. Preserve concrete facts, numbers, names, \
-             dates, and identifiers exactly as written. Be faithful to the \
-             source — do not invent or infer beyond it. Return a concise \
-             factual extract; if nothing is relevant, reply with NONE.\n\
-             </system>\n\
-             <user>\n\
-             User request: {user_message}\n\n\
-             {guidance}\
-             Documents:\n{}\n\
-             </user>",
-            documents
-        );
+        let sources: Vec<String> = indices
+            .iter()
+            .map(|&i| {
+                let d = &batch[i];
+                format!("=== Document: {} ===\n{}", doc_field(d, "document_name"), doc_field(d, "content"))
+            })
+            .collect();
+        let prompts: Vec<BatchPrompt> = sources
+            .iter()
+            .map(|source| {
+                let documents = char_prefix(source, max_chars);
+                let max_tokens = extract_max_tokens(documents.chars().count());
+                let prompt = format!(
+                    "<system>\n\
+                     You extract the information relevant to the user's request from \
+                     the document(s) below. Preserve concrete facts, numbers, names, \
+                     dates, and identifiers exactly as written. Be faithful to the \
+                     source — do not invent or infer beyond it. Return a concise \
+                     factual extract; if nothing is relevant, reply with NONE.\n\
+                     </system>\n\
+                     <user>\n\
+                     User request: {user_message}\n\n\
+                     {guidance}\
+                     Documents:\n{}\n\
+                     </user>",
+                    documents
+                );
+                BatchPrompt::new(prompt, Some(max_tokens))
+            })
+            .collect();
 
-        let mut extract = String::new();
-        let mut llm_failed = false;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            dp_llm.invoke(&prompt, Some(max_tokens), None)
-        })) {
-            Ok(reply) => extract = reply.trim().to_string(),
-            Err(panic) => {
-                llm_failed = true;
-                let reason = panic
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_default();
-                tracing::warn!(target: LOGGER, "[doc-batch] {} extraction failed: {}", node_id, reason);
+        let replies: Vec<Option<String>> =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dp_llm.invoke_batch(&prompts))) {
+                Ok(replies) if replies.len() == prompts.len() => {
+                    replies.into_iter().map(|r| Some(r.trim().to_string())).collect()
+                }
+                Ok(replies) => {
+                    tracing::warn!(
+                        target: LOGGER,
+                        "[doc-batch] {} extraction failed: {} replies for {} prompts",
+                        node_id,
+                        replies.len(),
+                        prompts.len()
+                    );
+                    vec![None; prompts.len()]
+                }
+                Err(panic) => {
+                    let reason = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    tracing::warn!(target: LOGGER, "[doc-batch] {} extraction failed: {}", node_id, reason);
+                    vec![None; prompts.len()]
+                }
+            };
+
+        for ((&i, source), reply) in indices.iter().zip(&sources).zip(replies) {
+            let name = doc_field(&batch[i], "document_name");
+            let llm_failed = reply.is_none();
+            let mut extract = reply.unwrap_or_default();
+            if is_none_extract(&extract) {
+                // The LLM judged this document irrelevant to the request (it
+                // was told to reply NONE).  Respect that and drop it so an
+                // entity-specific query ("items Adam Hart purchased") doesn't
+                // pull in other people's documents.
+                tracing::info!(target: LOGGER, "[doc-batch] {}: not relevant → dropped ({})", node_id, name);
+                extract = String::new();
+            } else if extract.is_empty() || llm_failed || is_placeholder_output(&extract) {
+                // No usable extract: the model errored, returned empty, or
+                // produced only a placeholder (e.g. llama.cpp's empty-response
+                // fallback "No response generated" — which also happens when
+                // the extraction prompt overflows the model's context window
+                // and generation silently fails).  Fall back to a raw excerpt
+                // so a degenerate model never replaces the document with
+                // placeholder text.
+                tracing::info!(
+                    target: LOGGER,
+                    "[doc-batch] {}: extract unusable → falling back to raw excerpt ({} chars)",
+                    node_id,
+                    extract.chars().count()
+                );
+                extract = char_prefix(source, RAW_EXCERPT_CHARS).to_string();
             }
-        }
-
-        if is_none_extract(&extract) {
-            // The LLM judged this document irrelevant to the request (it was
-            // told to reply NONE).  Respect that and drop the batch so an
-            // entity-specific query ("items Adam Hart purchased") doesn't pull
-            // in other people's documents.
             tracing::info!(
                 target: LOGGER,
-                "[doc-batch] {}: not relevant → dropped ({})",
+                "[doc-batch] {}: 1 doc(s) ({}) → {} chars",
                 node_id,
-                named.join(", ")
-            );
-            extract = String::new();
-        } else if extract.is_empty() || llm_failed || is_placeholder_output(&extract) {
-            // No usable extract: the model errored, returned empty, or
-            // produced only a placeholder (e.g. llama.cpp's empty-response
-            // fallback "No response generated" — which also happens when the
-            // extraction prompt overflows the model's context window and
-            // generation silently fails).  Fall back to a raw excerpt so a
-            // degenerate model never replaces the document with placeholder
-            // text.
-            tracing::info!(
-                target: LOGGER,
-                "[doc-batch] {}: extract unusable → falling back to raw excerpt ({} chars)",
-                node_id,
+                name,
                 extract.chars().count()
             );
-            extract = char_prefix(&combined, RAW_EXCERPT_CHARS).to_string();
+            extracts[i] = Some(extract);
         }
-
-        tracing::info!(
-            target: LOGGER,
-            "[doc-batch] {}: {} doc(s) ({}) → {} chars",
-            node_id,
-            batch.len(),
-            named.join(", "),
-            extract.chars().count()
-        );
-        NodeResult::with_data(node_id, json!({"doc_names": doc_names, "content": extract}))
     }
 
     /// Create the reduce handler that merges batch extracts into one document,
@@ -372,28 +422,36 @@ impl DocumentFanoutStep {
             let Some(data) = dep_result.data.as_object() else {
                 continue;
             };
-            let content = data.get("content").and_then(Value::as_str).unwrap_or("");
-            if content.is_empty() {
-                continue;
+            // A grouped node carries one entry per surviving document; a
+            // node result without `extracts` is a single extract.
+            let entries: Vec<&Map<String, Value>> = match data.get("extracts").and_then(Value::as_array) {
+                Some(list) => list.iter().filter_map(Value::as_object).collect(),
+                None => vec![data],
+            };
+            for entry in entries {
+                let content = entry.get("content").and_then(Value::as_str).unwrap_or("");
+                if content.is_empty() {
+                    continue;
+                }
+                let names: Vec<String> = entry
+                    .get("doc_names")
+                    .and_then(Value::as_array)
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .filter(|n| !n.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                surviving_names.extend(names.iter().cloned());
+                for n in &names {
+                    extract_by_name.insert(n.clone(), content.to_string());
+                }
+                let header = if names.is_empty() { "Unknown source".to_string() } else { names.join(", ") };
+                parts.push(format!("=== Source: {header} ===\n{content}"));
             }
-            let names: Vec<String> = data
-                .get("doc_names")
-                .and_then(Value::as_array)
-                .map(|names| {
-                    names
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .filter(|n| !n.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            surviving_names.extend(names.iter().cloned());
-            for n in &names {
-                extract_by_name.insert(n.clone(), content.to_string());
-            }
-            let header = if names.is_empty() { "Unknown source".to_string() } else { names.join(", ") };
-            parts.push(format!("=== Source: {header} ===\n{content}"));
         }
 
         let merged = parts.join("\n\n---\n\n");
@@ -593,10 +651,11 @@ mod tests {
     }
 
     #[test]
-    fn each_document_gets_its_own_batch() {
-        let batches = step(|_| "OK".into()).batch_documents(&docs(5));
-        assert_eq!(batches.len(), 5);
-        assert!(batches.iter().all(|b| b.len() == 1));
+    fn documents_are_grouped_in_order() {
+        let documents = docs(BATCH_GROUP_SIZE + 3);
+        let batches = step(|_| "OK".into()).batch_documents(&documents);
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), vec![BATCH_GROUP_SIZE, 3]);
+        assert_eq!(batches.concat(), documents);
     }
 
     #[test]
@@ -619,7 +678,8 @@ mod tests {
         assert!(fanout.applies_to(&ctx.read(), Some(&sc.lock())));
         let built = fanout.build(&ctx, Some(&sc), &parent);
         assert!(built.parent.is_transform());
-        assert_eq!(built.pairs.len(), 3);
+        // One group node for both documents, plus the reduce.
+        assert_eq!(built.pairs.len(), 2);
 
         let mut results = HashMap::new();
         let mut reduce = None;

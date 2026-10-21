@@ -23,6 +23,10 @@ service ModelHost {
   // Complete a prompt, yielding text as it is produced.
   rpc Stream(StreamRequest) returns (stream StreamChunk);
 
+  // Complete several independent prompts together, batched on the device,
+  // and return every response in prompt order.
+  rpc GenerateBatch(GenerateBatchRequest) returns (GenerateBatchResponse);
+
   // Embed texts, or signal that the embedder is unavailable (empty shape).
   rpc EncodeTexts(EncodeTextsRequest) returns (EncodeTextsResponse);
 
@@ -61,6 +65,23 @@ message GenerateRequest {
 
 message GenerateResponse {
   string text = 1;
+}
+
+message BatchPrompt {
+  string prompt = 1;
+  optional int32 max_tokens = 2;
+  optional bool thinking = 3;
+}
+
+message GenerateBatchRequest {
+  repeated BatchPrompt prompts = 1;
+  string model_name = 2;
+  string capability = 3;
+  string project_id = 4;
+}
+
+message GenerateBatchResponse {
+  repeated string texts = 1;
 }
 
 message StreamRequest {

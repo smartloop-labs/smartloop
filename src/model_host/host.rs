@@ -32,6 +32,7 @@ use crate::model_host::client::{
     default_socket_path, has_unix_sockets, mark_device_owner, parse_address,
     InProcessModelClient, LocalModelService, ModelClient, ModelHostError,
 };
+use crate::llms::base_llm::BatchPrompt;
 use crate::model_host::pb;
 use crate::model_host::pb::model_host_server::{ModelHost as ModelHostService, ModelHostServer};
 use crate::workspace::context::use_project;
@@ -445,6 +446,32 @@ impl ModelHostService for ModelHostServicer {
         match result {
             Ok(text) => Ok(Response::new(pb::GenerateResponse { text })),
             Err(exc) => Err(abort("generate", &exc)),
+        }
+    }
+
+    async fn generate_batch(
+        &self,
+        request: Request<pb::GenerateBatchRequest>,
+    ) -> Result<Response<pb::GenerateBatchResponse>, Status> {
+        let request = request.into_inner();
+        let project_id = request.project_id.clone();
+        let result = self
+            .blocking(project_id, move |client| {
+                let prompts: Vec<BatchPrompt> = request
+                    .prompts
+                    .iter()
+                    .map(|p| BatchPrompt {
+                        prompt: p.prompt.clone(),
+                        max_tokens: p.max_tokens.map(|n| n.max(0) as usize),
+                        thinking: p.thinking,
+                    })
+                    .collect();
+                client.generate_batch(&prompts, non_empty(&request.model_name), non_empty(&request.capability))
+            })
+            .await?;
+        match result {
+            Ok(texts) => Ok(Response::new(pb::GenerateBatchResponse { texts })),
+            Err(exc) => Err(abort("generate_batch", &exc)),
         }
     }
 

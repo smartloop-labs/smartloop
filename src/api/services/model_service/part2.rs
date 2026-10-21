@@ -31,7 +31,7 @@ use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
 use crate::agents::orchestrator::{ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions};
-use crate::llms::base_llm::{CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
+use crate::llms::base_llm::{BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::llms::llama::ChatCompletionRequest;
 use crate::mcp::account::probe_account;
 use crate::mcp::client::{
@@ -1069,6 +1069,42 @@ impl ModelService {
                 );
                 self.evict_response_llm(&llm);
                 catch_unwind(AssertUnwindSafe(|| fallback.invoke(prompt, None, None)))
+                    .map_err(|panic| anyhow::anyhow!(panic_message(&panic)))
+            }
+        }
+    }
+
+    /// [`Self::generate_completion`] for several independent prompts,
+    /// generated together on the device (see `BaseLLM::invoke_batch`).
+    ///
+    /// Holds one inference slot for the whole batch: the batch is one job on
+    /// the device, however many sequences it carries.
+    pub fn generate_batch_completion(
+        &self,
+        prompts: &[BatchPrompt],
+        model_name: Option<&str>,
+        capability: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let _ = model_name;
+        let llm = self
+            .llm_for_response(capability)
+            .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
+
+        let _slot = self.inference_slot();
+        match catch_unwind(AssertUnwindSafe(|| llm.invoke_batch(prompts))) {
+            Ok(texts) => Ok(texts),
+            Err(panic) => {
+                let ex = panic_message(&panic);
+                // Same GPU-OOM fallback as generate_completion.
+                let Some(fallback) = self.default_fallback_llm(&llm) else {
+                    return Err(anyhow::anyhow!(ex));
+                };
+                tracing::warn!(
+                    target: LOG,
+                    "[response] Response model failed during batch generation ({ex}) — falling back to the default model"
+                );
+                self.evict_response_llm(&llm);
+                catch_unwind(AssertUnwindSafe(|| fallback.invoke_batch(prompts)))
                     .map_err(|panic| anyhow::anyhow!(panic_message(&panic)))
             }
         }

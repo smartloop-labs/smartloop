@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use smartloop::agents::mcp::explorer::SearchContext;
 use smartloop::agents::nodes::{NodeResult, RouteNode};
 use smartloop::agents::orchestration::context as octx;
-use smartloop::agents::orchestration::document_fanout::DocumentFanoutStep;
+use smartloop::agents::orchestration::document_fanout::{DocumentFanoutStep, BATCH_GROUP_SIZE};
 use smartloop::agents::orchestration::step::{Step, StepNodes};
 use smartloop::agents::orchestrator::{
     CapabilityLlmProvider, ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions, SharedCell, SharedSearchContext,
@@ -68,12 +68,14 @@ fn summarize_ctx(orch: &SLPOrchestrator) -> octx::SharedOrchestratorContext {
 mod batch_documents {
     use super::*;
 
+    /// Documents are grouped so a node can hand the model their prompts
+    /// together; each is still extracted on its own (see `fanout_handlers`).
     #[test]
-    fn test_each_document_gets_its_own_batch() {
+    fn test_documents_are_grouped_up_to_the_group_size() {
         let (orch, _llm) = make_orchestrator();
         let batches = orch.doc_fanout().batch_documents(&docs(5, 50));
-        assert_eq!(batches.len(), 5);
-        assert!(batches.iter().all(|b| b.len() == 1));
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 5);
     }
 
     #[test]
@@ -81,9 +83,9 @@ mod batch_documents {
         let (orch, _llm) = make_orchestrator();
         let docs = docs(50, 100);
         let batches = orch.doc_fanout().batch_documents(&docs);
-        assert_eq!(batches.len(), 50);
-        assert!(batches.iter().all(|b| b.len() == 1));
-        let names: Vec<&Value> = batches.iter().map(|b| &b[0]["document_name"]).collect();
+        assert_eq!(batches.len(), 50usize.div_ceil(BATCH_GROUP_SIZE));
+        assert!(batches.iter().all(|b| b.len() <= BATCH_GROUP_SIZE));
+        let names: Vec<&Value> = batches.iter().flatten().map(|d| &d["document_name"]).collect();
         let expected: Vec<&Value> = docs.iter().map(|d| &d["document_name"]).collect();
         assert_eq!(names, expected);
     }
@@ -251,6 +253,14 @@ fn content(result: &NodeResult) -> String {
     result.data["content"].as_str().unwrap_or("").to_string()
 }
 
+/// Each surviving document's extract in a group node's result.
+fn extracts(result: &NodeResult) -> Vec<String> {
+    match result.data["extracts"].as_array() {
+        Some(list) => list.iter().map(|e| e["content"].as_str().unwrap_or("").to_string()).collect(),
+        None => vec![content(result)].into_iter().filter(|c| !c.is_empty()).collect(),
+    }
+}
+
 /// The search context the reduce handed downstream.
 fn reduced(result: &NodeResult) -> SearchContext {
     result
@@ -278,10 +288,12 @@ mod fanout_handlers {
         assert!(built.parent.is_transform());
 
         let (results, reduce_result) = run_fanout(&built);
-        assert!(results.values().all(|r| content(r).starts_with("EXTRACT::")));
+        let all: Vec<String> = results.values().flat_map(extracts).collect();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|e| e.starts_with("EXTRACT::")));
 
         let merged = content(&reduce_result);
-        assert_eq!(merged.matches("EXTRACT::").count(), results.len());
+        assert_eq!(merged.matches("EXTRACT::").count(), all.len());
         let after = reduced(&reduce_result);
         assert_eq!(after.vector_context, merged);
         assert_ne!(after.vector_context, "ORIGINAL RAW CONCAT");
@@ -347,10 +359,16 @@ mod fanout_handlers {
         // The opt-out flag is gone: an AgentNode carries no such field, so the
         // executor's lock always applies to these nodes.
 
+        let mut n = 0;
         for (_, handler) in &batch {
-            assert_eq!(content(&handler(HashMap::new()).unwrap()), "DP EXTRACT");
+            for extract in extracts(&handler(HashMap::new()).unwrap()) {
+                assert_eq!(extract, "DP EXTRACT");
+                n += 1;
+            }
         }
-        assert_eq!(dp_llm.call_count(), batch.len());
+        // One extraction per document, whatever the grouping.
+        assert_eq!(n, 3);
+        assert_eq!(dp_llm.call_count(), 3);
     }
 
     fn first_batch(orch: &SLPOrchestrator, sctx: &SearchContext) -> NodeResult {
@@ -365,8 +383,8 @@ mod fanout_handlers {
         llm.set_reply("NONE");
 
         let result = first_batch(&orch, &SearchContext { documents: docs(2, 100), ..Default::default() });
+        assert!(extracts(&result).is_empty());
         assert_eq!(content(&result), "");
-        assert!(!content(&result).contains("body"));
     }
 
     #[test]
@@ -375,7 +393,9 @@ mod fanout_handlers {
         llm.set_failure("boom");
 
         let result = first_batch(&orch, &SearchContext { documents: docs(2, 100), ..Default::default() });
-        assert!(content(&result).contains("body"));
+        let all = extracts(&result);
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|e| e.contains("body")));
     }
 
     /// llama.cpp's empty-output fallback string must never be surfaced as
@@ -387,8 +407,9 @@ mod fanout_handlers {
         llm.set_reply("No response generated");
 
         let result = first_batch(&orch, &SearchContext { documents: docs(2, 100), ..Default::default() });
-        assert!(!content(&result).contains("No response generated"));
-        assert!(content(&result).contains("body 0"));
+        let all = extracts(&result);
+        assert!(all.iter().all(|e| !e.contains("No response generated")));
+        assert!(all[0].contains("body 0"));
     }
 
     #[test]
@@ -528,4 +549,16 @@ mod fanout_integration {
         assert!(sctx.with_ref(|s| s.vector_context.contains("Extracted fact from document.")));
         assert!(result.handled);
     }
+}
+
+/// A model without batched generation answers `invoke_batch` one prompt at a
+/// time, in prompt order.
+#[test]
+fn test_invoke_batch_defaults_to_one_at_a_time_in_order() {
+    use smartloop::llms::base_llm::{BaseLLM, BatchPrompt};
+    let llm = llm_8k("unused");
+    llm.set_responder(|p| Ok(format!("echo:{}", p.chars().last().unwrap_or(' '))));
+    let prompts: Vec<BatchPrompt> = ["a", "b", "c"].iter().map(|p| BatchPrompt::new(*p, None)).collect();
+    assert_eq!(llm.shared().invoke_batch(&prompts), vec!["echo:a", "echo:b", "echo:c"]);
+    assert_eq!(llm.call_count(), 3);
 }

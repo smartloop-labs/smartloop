@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use parking_lot::Mutex;
 
 use crate::llms::base_llm::{
-    BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream,
+    BaseLLM, BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream, clean_reply,
 };
 use crate::model_host::client::ModelClient;
 
@@ -194,6 +194,19 @@ impl BaseLLM for RemoteLLM {
             Err(exc) => {
                 tracing::error!(target: LOG_TARGET, "Remote LLM invocation failed: {exc}");
                 format!("Error generating response: {exc}")
+            }
+        }
+    }
+
+    /// One RPC for the whole batch; the host generates the prompts together.
+    /// Replies are cleaned as [`Self::invoke`] cleans one, and a failed call
+    /// answers every prompt with the error, as `invoke` would.
+    fn invoke_batch(&self, prompts: &[BatchPrompt]) -> Vec<String> {
+        match self.client.generate_batch(prompts, None, self.capability.as_deref()) {
+            Ok(texts) => texts.iter().map(|text| clean_reply(text)).collect(),
+            Err(exc) => {
+                tracing::error!(target: LOG_TARGET, "Remote LLM batch invocation failed: {exc}");
+                vec![format!("Error generating response: {exc}"); prompts.len()]
             }
         }
     }

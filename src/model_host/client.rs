@@ -27,7 +27,7 @@ use tonic::{Code, Status};
 
 use crate::api::services::model_service::ModelService;
 use crate::config::AppSettings;
-use crate::llms::base_llm::{CancelEvent, GenerationChunk};
+use crate::llms::base_llm::{BatchPrompt, CancelEvent, GenerationChunk};
 use crate::model_host::pb;
 use crate::workspace::context::pinned_project_id;
 
@@ -127,6 +127,22 @@ pub trait ModelClient: Send + Sync {
         max_tokens: Option<usize>,
         thinking: Option<bool>,
     ) -> anyhow::Result<String>;
+
+    /// Complete several independent prompts, responses in prompt order.
+    ///
+    /// The host generates them together on the device; this default runs
+    /// them one after another, with the same responses.
+    fn generate_batch(
+        &self,
+        prompts: &[BatchPrompt],
+        model_name: Option<&str>,
+        capability: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        prompts
+            .iter()
+            .map(|p| self.generate(&p.prompt, model_name, capability, p.max_tokens, p.thinking))
+            .collect()
+    }
 
     /// Complete `prompt`, yielding text as it is produced.
     ///
@@ -265,6 +281,19 @@ pub trait LocalModelService: Send + Sync {
         thinking: Option<bool>,
     ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<GenerationChunk>> + 'a>>;
 
+    /// `ModelService.generate_batch_completion`; one at a time by default.
+    fn generate_batch_completion(
+        &self,
+        prompts: &[BatchPrompt],
+        model_name: Option<&str>,
+        capability: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        prompts
+            .iter()
+            .map(|p| self.generate_completion(&p.prompt, model_name, capability, p.max_tokens, p.thinking))
+            .collect()
+    }
+
     /// `ModelService.is_loaded`.
     fn is_loaded(&self) -> bool;
 
@@ -319,6 +348,15 @@ impl LocalModelService for ModelService {
         thinking: Option<bool>,
     ) -> anyhow::Result<String> {
         ModelService::generate_completion(self, prompt, model_name, capability, max_tokens, thinking)
+    }
+
+    fn generate_batch_completion(
+        &self,
+        prompts: &[BatchPrompt],
+        model_name: Option<&str>,
+        capability: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        ModelService::generate_batch_completion(self, prompts, model_name, capability)
     }
 
     fn stream_completion<'a>(
@@ -413,6 +451,15 @@ impl ModelClient for InProcessModelClient {
     ) -> anyhow::Result<String> {
         self.service
             .generate_completion(prompt, model_name, capability, max_tokens, thinking)
+    }
+
+    fn generate_batch(
+        &self,
+        prompts: &[BatchPrompt],
+        model_name: Option<&str>,
+        capability: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.service.generate_batch_completion(prompts, model_name, capability)
     }
 
     /// `GenerationChunk` in, plain text out — the wire carries text, so the
@@ -891,6 +938,35 @@ impl ModelClient for RemoteModelClient {
             stub.generate(request).await
         })?;
         Ok(reply.text)
+    }
+
+    fn generate_batch(
+        &self,
+        prompts: &[BatchPrompt],
+        model_name: Option<&str>,
+        capability: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let request = pb::GenerateBatchRequest {
+            prompts: prompts
+                .iter()
+                .map(|p| pb::BatchPrompt {
+                    prompt: p.prompt.clone(),
+                    max_tokens: p.max_tokens.map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
+                    thinking: p.thinking,
+                })
+                .collect(),
+            model_name: model_name.unwrap_or_default().to_string(),
+            capability: capability.unwrap_or_default().to_string(),
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        // No deadline, as with `generate`: a batch of extractions takes minutes.
+        let reply = self.unary(request, Some(f64::INFINITY), |mut stub, request| async move {
+            stub.generate_batch(request).await
+        })?;
+        if reply.texts.len() != prompts.len() {
+            anyhow::bail!("model host answered {} of {} prompts", reply.texts.len(), prompts.len());
+        }
+        Ok(reply.texts)
     }
 
     /// Dropping the returned stream part-way cancels the RPC server-side, so

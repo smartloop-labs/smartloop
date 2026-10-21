@@ -62,6 +62,31 @@ pub struct CallOptions {
     pub thinking: Option<bool>,
 }
 
+/// One prompt of [`BaseLLM::invoke_batch`], with its own per-call options.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct BatchPrompt {
+    pub prompt: String,
+    pub max_tokens: Option<usize>,
+    pub thinking: Option<bool>,
+}
+
+impl BatchPrompt {
+    /// A prompt with default options.
+    pub fn new(prompt: impl Into<String>, max_tokens: Option<usize>) -> Self {
+        Self { prompt: prompt.into(), max_tokens, thinking: None }
+    }
+}
+
+/// Clean an invoke reply: trim, drop a trailing `<|eot_id|>`, and report an
+/// empty reply as `"No response generated"`.
+pub fn clean_reply(response: &str) -> String {
+    let mut cleaned = response.trim();
+    if let Some(stripped) = cleaned.strip_suffix("<|eot_id|>") {
+        cleaned = stripped.trim();
+    }
+    if cleaned.is_empty() { "No response generated".to_string() } else { cleaned.to_string() }
+}
+
 /// A stream of generated chunks.  Not `Send`: the local implementation holds
 /// the per-context lock for the lifetime of the stream, so it must be drained
 /// on the thread that started it.
@@ -160,18 +185,22 @@ pub trait BaseLLM: Send + Sync {
     fn invoke(&self, prompt: &str, max_tokens: Option<usize>, thinking: Option<bool>) -> String {
         let options = CallOptions { max_tokens, thinking };
         match self.call(prompt, None, options) {
-            Ok(response) => {
-                let mut cleaned = response.trim();
-                if let Some(stripped) = cleaned.strip_suffix("<|eot_id|>") {
-                    cleaned = stripped.trim();
-                }
-                if cleaned.is_empty() { "No response generated".to_string() } else { cleaned.to_string() }
-            }
+            Ok(response) => clean_reply(&response),
             Err(e) => {
                 tracing::error!(target: LOG_TARGET, "LLM invocation failed: {e}");
                 format!("Error generating response: {e}")
             }
         }
+    }
+
+    /// [`Self::invoke`] for several independent prompts, replies in order.
+    ///
+    /// A model that can generate several sequences at once (the in-process
+    /// llama.cpp model, or the model host serving one) runs them together; by
+    /// default they run one after another, so the replies are the same either
+    /// way.
+    fn invoke_batch(&self, prompts: &[BatchPrompt]) -> Vec<String> {
+        prompts.iter().map(|p| self.invoke(&p.prompt, p.max_tokens, p.thinking)).collect()
     }
 
     /// True when this model's chat template can reason.

@@ -30,6 +30,8 @@
 //! `response_format`, tool-choice grammars, suffix/infill, draft models and
 //! the prompt state cache.
 
+pub mod batch;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::num::NonZeroU32;
@@ -509,6 +511,9 @@ pub struct Llama {
     state: LlamaState,
     metadata: HashMap<String, String>,
     engine: Mutex<Engine>,
+    /// Slots past which a batch step stops speeding up on this device;
+    /// benchmarked on the first batch (see [`batch`]).
+    batch_knee: Mutex<Option<usize>>,
     n_ctx: usize,
     n_batch: usize,
     model: Box<NativeModel>,
@@ -581,6 +586,7 @@ impl Llama {
                 seed: LLAMA_DEFAULT_SEED,
                 _lora: lora,
             }),
+            batch_knee: Mutex::new(None),
             n_ctx,
             n_batch,
             model,
@@ -723,6 +729,9 @@ impl Llama {
         request: &ChatCompletionRequest,
         stop: Vec<String>,
     ) -> anyhow::Result<ChatCompletionOutput<'_>> {
+        if batch::try_capture(&prompt_tokens, request, &stop) {
+            return Ok(ChatCompletionOutput::Response(Value::Null));
+        }
         let engine = self.engine();
         self.create_completion_locked(engine, prompt_tokens, request, stop)
     }
