@@ -27,33 +27,79 @@ pub static TERM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\w+").expect("valid 
 /// `source_content` plus any extra scalar metadata keys.
 pub type Chunk = Map<String, Value>;
 
-/// Return the distance reduction for a document based on how many distinct
-/// query keywords appear in its name + content.
-///
-/// Subtract the returned value from a cosine distance to boost documents that
-/// match more of the query (clamped to [`MAX_TERM_BOOST`]).
-pub fn keyword_coverage_boost(query_text: &str, name: Option<&str>, content: Option<&str>) -> f64 {
-    let query_tokens: HashSet<String> = TERM_RE
+/// Below this many documents there is too little evidence to call a term
+/// common, so every query term counts toward the boost.
+pub const MIN_DOCS_FOR_TERM_FREQUENCY: usize = 4;
+/// A query term found in more than this share of the documents searched
+/// ("the", "how", or a topic every document shares) does not discriminate
+/// between them and earns no boost.
+pub const MAX_TERM_DOC_SHARE: f64 = 0.5;
+
+/// Distinct query terms (lowercased, longer than two characters).
+fn query_terms(query_text: &str) -> HashSet<String> {
+    TERM_RE
         .find_iter(query_text)
         .map(|m| m.as_str())
         .filter(|t| t.chars().count() > 2)
         .map(|t| t.to_lowercase())
-        .collect();
-    if query_tokens.is_empty() {
+        .collect()
+}
+
+/// Lowercased words of a document's name + content.
+fn document_words(name: Option<&str>, content: Option<&str>) -> HashSet<String> {
+    let haystack = format!("{} {}", name.unwrap_or("").replace('_', " "), content.unwrap_or("")).to_lowercase();
+    TERM_RE.find_iter(&haystack).map(|m| m.as_str().to_string()).collect()
+}
+
+/// The query terms that tell the given documents apart: those found in at
+/// most [`MAX_TERM_DOC_SHARE`] of them.  With fewer than
+/// [`MIN_DOCS_FOR_TERM_FREQUENCY`] documents every query term is kept.
+///
+/// Without this, filler words a long question is full of ("how", "can",
+/// "the", "with") matched nearly every document, each collected the full
+/// boost, and a 402-document search returned 213 of them at distance 0.000.
+pub fn discriminative_terms<'a>(
+    query_text: &str,
+    documents: impl IntoIterator<Item = (Option<&'a str>, Option<&'a str>)>,
+) -> HashSet<String> {
+    let terms = query_terms(query_text);
+    let docs: Vec<HashSet<String>> = documents.into_iter().map(|(n, c)| document_words(n, c)).collect();
+    if docs.len() < MIN_DOCS_FOR_TERM_FREQUENCY {
+        return terms;
+    }
+    let max_docs = (docs.len() as f64 * MAX_TERM_DOC_SHARE).floor() as usize;
+    terms
+        .into_iter()
+        .filter(|t| docs.iter().filter(|words| words.contains(t)).count() <= max_docs)
+        .collect()
+}
+
+/// The boost for a document containing some of `terms` (see
+/// [`keyword_coverage_boost`]).
+pub fn terms_coverage_boost(terms: &HashSet<String>, name: Option<&str>, content: Option<&str>) -> f64 {
+    if terms.is_empty() {
         return 0.0;
     }
-    let haystack = format!(
-        "{} {}",
-        name.unwrap_or("").replace('_', " "),
-        content.unwrap_or("")
-    )
-    .to_lowercase();
-    let doc_words: HashSet<&str> = TERM_RE.find_iter(&haystack).map(|m| m.as_str()).collect();
-    let matched = query_tokens.iter().filter(|t| doc_words.contains(t.as_str())).count();
-    if matched == 0 {
-        return 0.0;
-    }
+    let words = document_words(name, content);
+    let matched = terms.iter().filter(|t| words.contains(t.as_str())).count();
     MAX_TERM_BOOST.min(PER_TERM_BOOST * matched as f64)
+}
+
+/// Return the distance reduction for a document based on how many distinct
+/// query keywords appear in its name + content.
+///
+/// Apply it with [`apply_coverage_boost`].  Clamped to [`MAX_TERM_BOOST`].
+pub fn keyword_coverage_boost(query_text: &str, name: Option<&str>, content: Option<&str>) -> f64 {
+    terms_coverage_boost(&query_terms(query_text), name, content)
+}
+
+/// Shrink a cosine distance by a coverage boost.
+///
+/// Proportional rather than subtracted: subtracting clamped every boosted
+/// document at 0.0, erasing the ranking among them and defeating the
+/// relevance cutoff downstream.
+pub fn apply_coverage_boost(distance: f64, boost: f64) -> f64 {
+    distance * (1.0 - boost)
 }
 
 /// A single vector search result with text and source metadata.
