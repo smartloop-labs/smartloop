@@ -175,6 +175,19 @@ fn test_a_replaced_model_id_stops_resolving() {
 }
 
 #[test]
+fn test_a_later_row_replaces_what_an_earlier_one_said() {
+    let mut registry = ModelRegistry::seeded();
+    registry.hydrate([row(json!({"name": "remote-x", "type": "remote", "url": "https://old.example"}))]);
+    registry.hydrate([row(json!({"name": "remote-x", "type": "remote"}))]);
+    assert_eq!(registry.get("remote-x").unwrap().url, None);
+
+    // A seeded model falls back to its seed, not to the earlier row.
+    registry.hydrate([row(json!({"name": "gemma4-e2b", "param_size_b": 9.0}))]);
+    registry.hydrate([row(json!({"name": "gemma4-e2b"}))]);
+    assert_eq!(registry.get("gemma4-e2b").unwrap().param_size_b, 2.0);
+}
+
+#[test]
 fn test_models_the_catalog_omits_are_kept() {
     let mut registry = ModelRegistry::seeded();
     let before = registry.len();

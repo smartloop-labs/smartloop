@@ -9,7 +9,8 @@
 //! [`MODEL_SPECS`] starts from [`seed_specs`] (what this build knows offline)
 //! and is overlaid with catalog rows: once from the workspace's cached
 //! catalog on first use, then on every catalog fetch.  A row only overrides
-//! the fields it declares, so an older catalog leaves the seed values intact.
+//! the seed fields it declares, so an older catalog leaves the seed values
+//! intact, and each fetch replaces what the previous one said.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -261,14 +262,18 @@ pub fn seed_specs() -> Vec<ModelSpec> {
 #[derive(Debug, Clone, Default)]
 pub struct ModelRegistry {
     specs: Vec<Arc<ModelSpec>>,
+    /// What catalog rows are laid over.
+    seeds: Vec<Arc<ModelSpec>>,
 }
 
 impl ModelRegistry {
-    pub fn new(specs: Vec<ModelSpec>) -> Self {
+    /// A registry seeded with `seeds`.
+    pub fn new(seeds: Vec<ModelSpec>) -> Self {
         let mut registry = Self::default();
-        for spec in specs {
+        for spec in seeds {
             registry.insert(spec);
         }
+        registry.seeds = registry.specs.clone();
         registry
     }
 
@@ -313,17 +318,19 @@ impl ModelRegistry {
         }
     }
 
-    /// Lay catalog `rows` over the known specs.  Models the catalog omits
-    /// are kept: an anonymous catalog hides some, and the seeds must survive
-    /// it.  Returns how many models were new.
+    /// Lay each catalog row over its model's seed, replacing whatever an
+    /// earlier row said.  Models the catalog omits are kept: an anonymous
+    /// catalog hides some, and the seeds must survive it.  Returns how many
+    /// models were new.
     pub fn hydrate(&mut self, rows: impl IntoIterator<Item = CatalogModel>) -> usize {
         let mut added = 0;
         for row in rows {
-            let base = self.get(&row.name);
-            if base.is_none() {
+            let name = canonical_model_name(&row.name);
+            if self.get(&name).is_none() {
                 added += 1;
             }
-            self.insert(ModelSpec::merged(base.as_deref(), row));
+            let seed = self.seeds.iter().find(|s| s.name == name).cloned();
+            self.insert(ModelSpec::merged(seed.as_deref(), row));
         }
         added
     }
