@@ -83,6 +83,9 @@ pub enum Attention {
     Linear,
     /// Linear-time layers mixed with full-attention ones.
     Hybrid,
+    /// Each token attends a selected subset of the context (DeepSeek
+    /// Sparse Attention, MiniMax Sparse Attention).
+    Sparse,
 }
 
 impl Attention {
@@ -93,6 +96,7 @@ impl Attention {
             "sliding_window" => Some(Attention::SlidingWindow),
             "linear" => Some(Attention::Linear),
             "hybrid" => Some(Attention::Hybrid),
+            "sparse" => Some(Attention::Sparse),
             _ => None,
         }
     }

@@ -169,6 +169,20 @@ fn test_a_mixture_of_experts_model_ranks_on_active_params() {
 }
 
 #[test]
+fn test_every_attention_type_parses() {
+    for (value, attention) in [
+        ("full", Attention::Full),
+        ("sliding_window", Attention::SlidingWindow),
+        ("linear", Attention::Linear),
+        ("hybrid", Attention::Hybrid),
+        ("sparse", Attention::Sparse),
+    ] {
+        assert_eq!(Attention::from_value(value), Some(attention), "{value}");
+        assert_eq!(serde_json::to_value(attention).unwrap(), json!(value));
+    }
+}
+
+#[test]
 fn test_an_unknown_attention_type_is_ignored() {
     let mut registry = ModelRegistry::default();
     registry.hydrate([row(json!({"name": "x", "attention": "quantum"}))]);
