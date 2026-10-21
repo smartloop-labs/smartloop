@@ -2217,6 +2217,15 @@ impl Producer {
 /// cleanup deliberately does NOT happen here — see
 /// [`Producer::run_sync_stream`]: this runs on interrupt too, while the
 /// producer thread may still be inside llama.cpp.
+/// Raises a request's cancellation signal when dropped.
+struct CancelOnDrop(CancelEvent);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 struct StreamFinally {
     svc: Arc<dyn ChatService>,
     cancelled: CancelEvent,
@@ -2443,6 +2452,13 @@ fn stream_chunks_inner(
         // orchestration so a client disconnect during the planning phase
         // interrupts those LLM calls too — not just the final response stream.
         let cancelled: CancelEvent = Arc::new(AtomicBool::new(false));
+        // A client that disconnects drops this stream wherever it is
+        // suspended.  `StreamFinally` raises the signal once the answer
+        // streams, but orchestration runs before it exists: without this a
+        // disconnect mid-fan-out left a worker thread extracting documents
+        // for nobody for the better part of an hour.  Raising it on normal
+        // completion too is harmless — everything has finished by then.
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
 
         // Orchestrator handles vector search, MCP tools, and explore in one step
         let mut orchestrator_context: Option<String> = None;

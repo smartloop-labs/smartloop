@@ -300,6 +300,13 @@ impl Llama {
         let mut steps = 0usize;
 
         loop {
+            if cancelled() {
+                for slot in active.drain(..) {
+                    texts[slot.item] = Some(decode_utf8_ignore(&self.detokenize_ext(&slot.completion, false)));
+                }
+                tracing::info!(target: "smartloop.llms.llama", "[batch] cancelled");
+                break;
+            }
             // Admit waiting items into free slots: prefill each prompt and
             // sample its first token.
             while let Some(&seq) = free.last() {
@@ -349,12 +356,6 @@ impl Llama {
                 }
             }
             if active.is_empty() {
-                break;
-            }
-            if cancelled() {
-                for slot in active.drain(..) {
-                    texts[slot.item] = Some(decode_utf8_ignore(&self.detokenize_ext(&slot.completion, false)));
-                }
                 break;
             }
 

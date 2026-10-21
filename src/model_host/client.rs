@@ -137,10 +137,17 @@ pub trait ModelClient: Send + Sync {
         prompts: &[BatchPrompt],
         model_name: Option<&str>,
         capability: Option<&str>,
+        cancelled: Option<CancelEvent>,
     ) -> anyhow::Result<Vec<String>> {
+        let is_cancelled = || cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst));
         prompts
             .iter()
-            .map(|p| self.generate(&p.prompt, model_name, capability, p.max_tokens, p.thinking))
+            .map(|p| {
+                if is_cancelled() {
+                    return Ok(String::new());
+                }
+                self.generate(&p.prompt, model_name, capability, p.max_tokens, p.thinking)
+            })
             .collect()
     }
 
@@ -287,10 +294,17 @@ pub trait LocalModelService: Send + Sync {
         prompts: &[BatchPrompt],
         model_name: Option<&str>,
         capability: Option<&str>,
+        cancelled: Option<CancelEvent>,
     ) -> anyhow::Result<Vec<String>> {
+        let is_cancelled = || cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst));
         prompts
             .iter()
-            .map(|p| self.generate_completion(&p.prompt, model_name, capability, p.max_tokens, p.thinking))
+            .map(|p| {
+                if is_cancelled() {
+                    return Ok(String::new());
+                }
+                self.generate_completion(&p.prompt, model_name, capability, p.max_tokens, p.thinking)
+            })
             .collect()
     }
 
@@ -355,8 +369,9 @@ impl LocalModelService for ModelService {
         prompts: &[BatchPrompt],
         model_name: Option<&str>,
         capability: Option<&str>,
+        cancelled: Option<CancelEvent>,
     ) -> anyhow::Result<Vec<String>> {
-        ModelService::generate_batch_completion(self, prompts, model_name, capability)
+        ModelService::generate_batch_completion(self, prompts, model_name, capability, cancelled)
     }
 
     fn stream_completion<'a>(
@@ -458,8 +473,9 @@ impl ModelClient for InProcessModelClient {
         prompts: &[BatchPrompt],
         model_name: Option<&str>,
         capability: Option<&str>,
+        cancelled: Option<CancelEvent>,
     ) -> anyhow::Result<Vec<String>> {
-        self.service.generate_batch_completion(prompts, model_name, capability)
+        self.service.generate_batch_completion(prompts, model_name, capability, cancelled)
     }
 
     /// `GenerationChunk` in, plain text out — the wire carries text, so the
@@ -945,6 +961,7 @@ impl ModelClient for RemoteModelClient {
         prompts: &[BatchPrompt],
         model_name: Option<&str>,
         capability: Option<&str>,
+        cancelled: Option<CancelEvent>,
     ) -> anyhow::Result<Vec<String>> {
         let request = pb::GenerateBatchRequest {
             prompts: prompts
@@ -959,9 +976,23 @@ impl ModelClient for RemoteModelClient {
             capability: capability.unwrap_or_default().to_string(),
             project_id: pinned_project_id().unwrap_or_default(),
         };
-        // No deadline, as with `generate`: a batch of extractions takes minutes.
-        let reply = self.unary(request, Some(f64::INFINITY), |mut stub, request| async move {
-            stub.generate_batch(request).await
+        // No deadline, as with `generate`: a batch of extractions takes
+        // minutes.  Cancelling drops the call, which the host sees as the
+        // request going away and stops generating (see the host's handler).
+        let reply = self.unary(request, Some(f64::INFINITY), move |mut stub, request| async move {
+            let call = stub.generate_batch(request);
+            let Some(cancelled) = cancelled else {
+                return call.await;
+            };
+            let watch = async move {
+                while !cancelled.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            };
+            tokio::select! {
+                reply = call => reply,
+                () = watch => Err(Status::cancelled("generation cancelled by the client")),
+            }
         })?;
         if reply.texts.len() != prompts.len() {
             anyhow::bail!("model host answered {} of {} prompts", reply.texts.len(), prompts.len());

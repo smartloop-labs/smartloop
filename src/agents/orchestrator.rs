@@ -20,7 +20,7 @@ use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Map, Value};
 
-use crate::llms::base_llm::BaseLLM;
+use crate::llms::base_llm::{BaseLLM, CancelEvent};
 use crate::agents::dag_executor::DAGExecutor;
 use crate::agents::fetch_agent::{FetchAgent, UrlFetcher};
 use crate::agents::hybrid_executor::LLMExecutor;
@@ -136,6 +136,9 @@ pub struct ExecuteOptions {
     pub requested_skill: Option<String>,
     /// The client's wall-clock date ("Month DD, YYYY").
     pub current_date: Option<String>,
+    /// Set when the client goes away; long steps (the document fan-out)
+    /// stop at their next check.
+    pub cancelled: Option<CancelEvent>,
 }
 
 /// Coordinates plan → run → reason for one user message.
@@ -472,6 +475,7 @@ impl SLPOrchestrator {
         ctx.mcp_tool_contexts = mcp_tool_contexts;
         ctx.enriched = Some(enriched);
         ctx.available_capabilities = options.available_capabilities.clone().unwrap_or_default();
+        ctx.cancelled = options.cancelled.clone();
         Ok(SharedCell::wrap(ctx))
     }
 

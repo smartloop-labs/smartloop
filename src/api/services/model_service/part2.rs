@@ -1084,6 +1084,7 @@ impl ModelService {
         prompts: &[BatchPrompt],
         model_name: Option<&str>,
         capability: Option<&str>,
+        cancelled: Option<CancelEvent>,
     ) -> anyhow::Result<Vec<String>> {
         let _ = model_name;
         let llm = self
@@ -1091,7 +1092,7 @@ impl ModelService {
             .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
 
         let _slot = self.inference_slot();
-        match catch_unwind(AssertUnwindSafe(|| llm.invoke_batch(prompts))) {
+        match catch_unwind(AssertUnwindSafe(|| llm.invoke_batch(prompts, cancelled.clone()))) {
             Ok(texts) => Ok(texts),
             Err(panic) => {
                 let ex = panic_message(&panic);
@@ -1104,7 +1105,7 @@ impl ModelService {
                     "[response] Response model failed during batch generation ({ex}) — falling back to the default model"
                 );
                 self.evict_response_llm(&llm);
-                catch_unwind(AssertUnwindSafe(|| fallback.invoke_batch(prompts)))
+                catch_unwind(AssertUnwindSafe(|| fallback.invoke_batch(prompts, cancelled)))
                     .map_err(|panic| anyhow::anyhow!(panic_message(&panic)))
             }
         }
@@ -3600,6 +3601,7 @@ impl ModelService {
                         progress_callback: progress_callback.clone(),
                         requested_skill: requested_skill.map(str::to_string),
                         current_date: current_date.map(str::to_string),
+                        cancelled: cancelled.clone(),
                     },
                 )
             };

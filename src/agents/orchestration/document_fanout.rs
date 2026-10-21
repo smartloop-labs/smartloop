@@ -178,6 +178,12 @@ impl DocumentFanoutStep {
         batch: &[Map<String, Value>],
         skill_instruction: Option<&str>,
     ) -> NodeResult {
+        // The client went away: the answer this would feed has nobody to
+        // read it, so don't spend minutes of the device on it.
+        if ctx.read().is_cancelled() {
+            tracing::info!(target: LOGGER, "[doc-batch] {}: request cancelled → skipped {} doc(s)", node_id, batch.len());
+            return NodeResult::with_data(node_id, json!({"doc_names": [], "content": "", "extracts": []}));
+        }
         let named: Vec<String> =
             batch.iter().map(|d| doc_field(d, "document_name")).filter(|n| !n.is_empty()).collect();
         let reading = match named.len() {
@@ -277,7 +283,10 @@ impl DocumentFanoutStep {
             }
         }
 
-        let user_message = ctx.read().user_message.clone();
+        let (user_message, cancelled) = {
+            let c = ctx.read();
+            (c.user_message.clone(), c.cancelled.clone())
+        };
         let guidance = match skill_instruction.filter(|s| !s.is_empty()) {
             Some(instruction) => format!("Guidance:\n{instruction}\n\n"),
             None => String::new(),
@@ -314,7 +323,7 @@ impl DocumentFanoutStep {
             .collect();
 
         let replies: Vec<Option<String>> =
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dp_llm.invoke_batch(&prompts))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dp_llm.invoke_batch(&prompts, cancelled.clone()))) {
                 Ok(replies) if replies.len() == prompts.len() => {
                     replies.into_iter().map(|r| Some(r.trim().to_string())).collect()
                 }
@@ -339,6 +348,10 @@ impl DocumentFanoutStep {
                 }
             };
 
+        if cancelled.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            tracing::info!(target: LOGGER, "[doc-batch] {}: request cancelled during extraction", node_id);
+            return;
+        }
         for ((&i, source), reply) in indices.iter().zip(&sources).zip(replies) {
             let name = doc_field(&batch[i], "document_name");
             let llm_failed = reply.is_none();

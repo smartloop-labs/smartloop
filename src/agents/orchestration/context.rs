@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::agents::mcp::explorer::EnrichedContext;
 use crate::agents::planner::MCPToolContext;
 use crate::api::services::model_service::ModelService;
+use crate::llms::base_llm::CancelEvent;
 use crate::workspace::workspace::MCPServer;
 
 /// Shared parameters passed to DAG handler methods (Python
@@ -68,6 +69,15 @@ pub struct OrchestratorContext {
     pub skill_report: Option<String>,
     /// Citations from the documents the explore step actually drew on.
     pub explore_citations: Option<Vec<Value>>,
+    /// The request's cancellation signal, set when the client goes away.
+    pub cancelled: Option<CancelEvent>,
+}
+
+impl OrchestratorContext {
+    /// True once the client has gone away.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+    }
 }
 
 impl OrchestratorContext {
