@@ -23,7 +23,7 @@ use crate::model::downloader::artifact_downloader::DownloadError;
 use crate::model::downloader::cancellation::{DownloadCancelled, DownloadInProgress};
 use crate::model::spec::MODEL_SPECS;
 use crate::platform::{get_platform_service, ModelAccessError, PlatformError, PlatformService};
-use crate::types::{ModelCapability, ModelKind};
+use crate::types::{Attention, ModelCapability, ModelKind};
 use crate::workspace::workspace::{Project, SharedWorkspace, Workspace, WorkspaceError};
 
 /// Python logger name (`logging.getLogger(__name__)`).
@@ -494,6 +494,18 @@ pub struct ModelEntry {
     /// Whether `param_size_b` is an estimate, for the picker to mark.
     #[serde(default)]
     pub param_size_estimated: bool,
+    /// Parameters active per token for a mixture-of-experts model; `None`
+    /// for a dense one.
+    #[serde(default)]
+    pub active_param_size_b: Option<f64>,
+    #[serde(default, deserialize_with = "tolerate_unknown_attention")]
+    pub attention: Option<Attention>,
+}
+
+/// An attention type this build doesn't know reads as undeclared rather
+/// than failing the whole catalog row.
+fn tolerate_unknown_attention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Attention>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.as_deref().and_then(Attention::from_value))
 }
 
 fn null_as_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -634,6 +646,10 @@ pub fn list_models_with(
         if let Some(size) = declared_param_size_b(&entry.name) {
             entry.param_size_b = Some(size);
             entry.param_size_estimated = param_size_estimated(&entry.name);
+        }
+        if let Some(spec) = MODEL_SPECS.get(&entry.name) {
+            entry.active_param_size_b = spec.active_param_size_b;
+            entry.attention = spec.attention;
         }
         result.push(entry);
     }
@@ -824,6 +840,12 @@ pub struct WorkspaceModelEntry {
     /// Whether `param_size_b` is an estimate, for the picker to mark.
     #[serde(default)]
     pub param_size_estimated: bool,
+    /// Parameters active per token for a mixture-of-experts model; `None`
+    /// for a dense one.
+    #[serde(default)]
+    pub active_param_size_b: Option<f64>,
+    #[serde(default)]
+    pub attention: Option<Attention>,
 }
 
 /// `sorted(models, key=lambda m: m._rank, reverse=True)`: best model first
@@ -883,6 +905,8 @@ pub async fn list_workspace_models_with(
                 context_length: m.context_length(),
                 param_size_b: declared_param_size_b(&m.model_name),
                 param_size_estimated: param_size_estimated(&m.model_name),
+                active_param_size_b: m.spec().and_then(|spec| spec.active_param_size_b),
+                attention: m.spec().and_then(|spec| spec.attention),
             })
             .collect())
     };
@@ -1082,6 +1106,12 @@ pub struct ProjectModelEntry {
     /// Whether `param_size_b` is an estimate, for the picker to mark.
     #[serde(default)]
     pub param_size_estimated: bool,
+    /// Parameters active per token for a mixture-of-experts model; `None`
+    /// for a dense one.
+    #[serde(default)]
+    pub active_param_size_b: Option<f64>,
+    #[serde(default)]
+    pub attention: Option<Attention>,
 }
 
 /// Body of `PATCH /v1/projects/{project_id}/models/{model_name}`.
@@ -1166,6 +1196,8 @@ pub async fn list_project_models_with(
                 context_length: m.context_length(),
                 param_size_b: declared_param_size_b(&m.model_name),
                 param_size_estimated: param_size_estimated(&m.model_name),
+                active_param_size_b: m.spec().and_then(|spec| spec.active_param_size_b),
+                attention: m.spec().and_then(|spec| spec.attention),
             })
             .collect())
     };

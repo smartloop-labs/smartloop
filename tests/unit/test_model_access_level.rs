@@ -117,6 +117,8 @@ mod test_model_kind {
             context_length: Some(131072),
             param_size_b: Some(1000.0),
             param_size_estimated: true,
+            active_param_size_b: Some(32.0),
+            attention: None,
         };
         let value = serde_json::to_value(&workspace).unwrap();
         assert_eq!(value["type"], "remote");
@@ -124,6 +126,7 @@ mod test_model_kind {
         assert_eq!(value["context_length"], 131072);
         assert_eq!(value["param_size_b"], 1000.0);
         assert_eq!(value["param_size_estimated"], true);
+        assert_eq!(value["active_param_size_b"], 32.0);
 
         let project = ProjectModelEntry {
             model_name: "kimi-k2".into(),
@@ -138,6 +141,8 @@ mod test_model_kind {
             context_length: None,
             param_size_b: None,
             param_size_estimated: false,
+            active_param_size_b: None,
+            attention: None,
         };
         let value = serde_json::to_value(&project).unwrap();
         assert_eq!(value["type"], "remote");

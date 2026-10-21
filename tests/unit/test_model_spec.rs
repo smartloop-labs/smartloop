@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use smartloop::model::spec::{seed_specs, CatalogModel, ModelRegistry, ModelSpec};
 use smartloop::platform::client::JsonObject;
-use smartloop::types::{ModelCapability, ModelKind, ModelType};
+use smartloop::types::{Attention, ModelCapability, ModelKind, ModelType};
 
 use ModelCapability::{Coding, Dp, General, Reasoning, Thinking, Vision};
 
@@ -149,6 +149,30 @@ fn test_a_remote_model_carries_size_and_endpoint() {
     assert_eq!(spec.capabilities, vec![General, Coding]);
     // No weights, so nothing resolves by an empty id.
     assert!(registry.get_by_id("").is_none());
+}
+
+#[test]
+fn test_a_mixture_of_experts_model_ranks_on_active_params() {
+    let mut registry = ModelRegistry::default();
+    registry.hydrate([row(json!({
+        "name": "moe", "type": "remote", "param_size_b": 428.0, "active_param_size_b": 23.0,
+        "attention": "hybrid",
+    }))]);
+    let spec = registry.get("moe").unwrap();
+    assert_eq!(spec.param_size_b, 428.0);
+    assert_eq!(spec.active_param_size_b, Some(23.0));
+    assert_eq!(spec.ranking_size_b(), 23.0);
+    assert_eq!(spec.attention, Some(Attention::Hybrid));
+
+    // A dense model ranks on its parameter count.
+    assert_eq!(ModelRegistry::seeded().get("gemma4-e4b").unwrap().ranking_size_b(), 4.0);
+}
+
+#[test]
+fn test_an_unknown_attention_type_is_ignored() {
+    let mut registry = ModelRegistry::default();
+    registry.hydrate([row(json!({"name": "x", "attention": "quantum"}))]);
+    assert_eq!(registry.get("x").unwrap().attention, None);
 }
 
 #[test]

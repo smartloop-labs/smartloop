@@ -198,7 +198,7 @@ mod test_list_models {
         client.platform().set_list_models(json!([
             {"name": "remote-sized", "model_id": null, "type": "remote",
              "is_accessible": true, "capabilities": ["general"], "param_size_b": 355.0,
-             "param_size_estimated": true},
+             "param_size_estimated": true, "active_param_size_b": 32.0, "attention": "quantum"},
             {"name": "gemma4-e2b", "model_id": "google/gemma-4-e2b-it", "is_accessible": true},
         ]));
         let resp = client.get("/v1/models").await;
@@ -207,6 +207,9 @@ mod test_list_models {
         let by_name = |name: &str| body.as_array().unwrap().iter().find(|m| m["name"] == name).unwrap().clone();
         assert_eq!(by_name("remote-sized")["param_size_b"], 355.0);
         assert_eq!(by_name("remote-sized")["param_size_estimated"], true);
+        assert_eq!(by_name("remote-sized")["active_param_size_b"], 32.0);
+        // An attention type this build doesn't know doesn't drop the row.
+        assert_eq!(by_name("remote-sized")["attention"], Value::Null);
         // A catalog without the fields still reports the built-in size, as
         // an exact one.
         assert_eq!(by_name("gemma4-e2b")["param_size_b"], 2.0);

@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::constants::{canonical_model_name, BOOTSTRAP_MODEL};
 use crate::model::slp_model::DEFAULT_CAPABILITIES;
 use crate::platform::client::JsonObject;
-use crate::types::{ModelCapability, ModelKind, ModelType};
+use crate::types::{Attention, ModelCapability, ModelKind, ModelType};
 
 /// What this build knows about one model.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +41,10 @@ pub struct ModelSpec {
     /// Whether `param_size_b` is an estimate (a closed remote model's,
     /// say).  It ranks the same; only display differs.
     pub param_size_estimated: bool,
+    /// Parameters active per token for a mixture-of-experts model; `None`
+    /// for a dense one, where it equals `param_size_b`.
+    pub active_param_size_b: Option<f64>,
+    pub attention: Option<Attention>,
     /// Capabilities the model declares — never empty.
     pub capabilities: Vec<ModelCapability>,
     /// Whether reasoning starts ON for a model that supports it.
@@ -63,6 +67,8 @@ impl ModelSpec {
             model_version: 0,
             param_size_b: 0.0,
             param_size_estimated: false,
+            active_param_size_b: None,
+            attention: None,
             capabilities: DEFAULT_CAPABILITIES.to_vec(),
             thinking_default: false,
             vision_chat_handler: None,
@@ -73,6 +79,13 @@ impl ModelSpec {
 
     pub fn is_remote(&self) -> bool {
         self.kind == ModelKind::Remote
+    }
+
+    /// The size models are compared on: active parameters for a
+    /// mixture-of-experts model (what sets its speed and per-token ability),
+    /// otherwise the parameter count.
+    pub fn ranking_size_b(&self) -> f64 {
+        self.active_param_size_b.unwrap_or(self.param_size_b)
     }
 
     /// Whether the model declares `capability`.
@@ -118,6 +131,15 @@ impl ModelSpec {
         }
         if let Some(estimated) = row.param_size_estimated {
             spec.param_size_estimated = estimated;
+        }
+        if let Some(active) = row.active_param_size_b {
+            spec.active_param_size_b = Some(active);
+        }
+        if let Some(attention) = row.attention.filter(|a| !a.is_empty()) {
+            match Attention::from_value(&attention) {
+                Some(attention) => spec.attention = Some(attention),
+                None => tracing::warn!("[models] {} declares unknown attention '{attention}' — ignoring it", spec.name),
+            }
         }
         let capabilities = row.capabilities.unwrap_or_default();
         let known: Vec<ModelCapability> = capabilities
@@ -165,6 +187,12 @@ pub struct CatalogModel {
     pub param_size_b: Option<f64>,
     #[serde(default)]
     pub param_size_estimated: Option<bool>,
+    #[serde(default)]
+    pub active_param_size_b: Option<f64>,
+    /// Kept as text so an attention type this build doesn't know is
+    /// ignored rather than failing the row.
+    #[serde(default)]
+    pub attention: Option<String>,
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
     #[serde(default)]
