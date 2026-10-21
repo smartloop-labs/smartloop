@@ -28,13 +28,13 @@ use crate::api::routers::models::{
 };
 use crate::api::services::storage_service::{self, StorageModelService};
 use crate::api::services::{get_model_service, ModelService};
-use crate::config::SUPPORTED_MODELS;
 use crate::constants::{canonical_model_name, display_model_name};
 use crate::model::downloader::artifact_downloader::DownloadError;
 use crate::model::downloader::artifact_source::ArtifactMap;
 use crate::model::downloader::cancellation::{self, CancelToken};
 use crate::model::downloader::slp_downloader::{ProgressCallback, SharedLogger};
 use crate::model::downloader::{DownloadProgress, SLPArtifactDownloader};
+use crate::model::spec::MODEL_SPECS;
 use crate::config::app_settings::AppSettings;
 use crate::platform::auth::has_credentials;
 use crate::platform::get_platform_service;
@@ -996,12 +996,12 @@ async fn ensure_tasks(model_service: &Arc<dyn InitModelService>, workspace: &Sha
 
 /// The catalog entry for `target` when it names a remote model.
 ///
-/// A model this build has a class for is local and skips the lookup.  When
+/// A model with a local spec skips the lookup.  When
 /// the catalog can't be read, a remote model already in the workspace is
 /// re-added from what was stored; anything else falls through to the local
 /// path, which reports an unknown model.
 async fn remote_target(workspace: &SharedWorkspace, target: &str) -> Result<Option<ModelEntry>, HTTPException> {
-    if SUPPORTED_MODELS.get(target).is_some() {
+    if MODEL_SPECS.get(target).is_some_and(|spec| !spec.is_remote()) {
         return Ok(None);
     }
     let registered = workspace.read().get_model(Some(target));
@@ -1166,7 +1166,7 @@ pub async fn init_with_seams(
     let ws_model = match existing {
         Some(ws_model) => ws_model,
         None => {
-            let Some(model_cls) = SUPPORTED_MODELS.get(&target) else {
+            let Some(spec) = MODEL_SPECS.get(&target).filter(|spec| !spec.is_remote()) else {
                 return Err(HTTPException::new(400, format!("Unknown model: {target}")));
             };
             // Register a project-scoped download disabled: the caller's
@@ -1176,7 +1176,7 @@ pub async fn init_with_seams(
             // workspace-wide.
             workspace
                 .write()
-                .add_model(&target, &(model_cls.model_id)(), None, request.project_id.is_none())
+                .add_model(&target, &spec.model_id, None, request.project_id.is_none())
         }
     };
 

@@ -18,7 +18,7 @@ use md5::{Digest, Md5};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 
-use crate::config::{AppSettings, SUPPORTED_MODELS};
+use crate::config::AppSettings;
 use crate::constants::{canonical_model_name, display_model_name, platform_model_name};
 use crate::model::downloader::artifact_source::{
     ArtifactMap, ArtifactSource, BootstrapArtifactSource, SLPBootstrapSource, SLPModelSource, available_names,
@@ -30,6 +30,7 @@ use crate::model::downloader::slp_downloader::{
     AggregateProgress, DownloadProgress, DownloadStubCall, ProgressCallback, SLPDownloader, SharedLogger,
     SharedWorkspace, download_stubs,
 };
+use crate::model::spec::MODEL_SPECS;
 use crate::platform::{ModelAccessError, PlatformError, SLPPlatformClient};
 
 /// `os.cpu_count() or 4`.
@@ -1547,11 +1548,11 @@ impl SLPArtifactDownloader {
     /// Lookup the HuggingFace model_id from a short model name.
     ///
     /// E.g. `"sl-mini"` → `"smartloop-ai/slp-orchestra-mini"`.  Legacy short
-    /// names resolve too (`SUPPORTED_MODELS` canonicalizes its keys).  Falls
-    /// back to `model_name` if no mapping is found.
+    /// names resolve too (spec lookups canonicalize).  Falls back to
+    /// `model_name` if no local model has that name.
     pub fn resolve_model_id(model_name: &str) -> String {
-        match SUPPORTED_MODELS.get(model_name) {
-            Some(model_type) => (model_type.model_id)(),
+        match MODEL_SPECS.get(model_name).filter(|spec| !spec.model_id.is_empty()) {
+            Some(spec) => spec.model_id.clone(),
             None => model_name.to_string(),
         }
     }
@@ -1564,12 +1565,10 @@ impl SLPArtifactDownloader {
     /// the API must pass it through [`platform_model_name`] first.  Falls back
     /// to `model_id` if no mapping is found.
     pub fn resolve_model_name(model_id: &str) -> String {
-        for (name, model_type) in SUPPORTED_MODELS.items() {
-            if (model_type.model_id)() == model_id {
-                return name.to_string();
-            }
+        match MODEL_SPECS.get_by_id(model_id) {
+            Some(spec) => spec.name.clone(),
+            None => model_id.to_string(),
         }
-        model_id.to_string()
     }
 
     /// Ask the platform for this model's signed GGUF URLs.

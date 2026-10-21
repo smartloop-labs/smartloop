@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::config::app_settings::AppSettings;
-use crate::config::supported_models::SUPPORTED_MODELS;
+use crate::model::spec::MODEL_SPECS;
 use crate::llms::llama::{self, ChatHandler, ChatHandlerRequest, Llama, LlamaModel, LlamaParams};
 use crate::llms::llama_cpp::LlamaCpp;
 use crate::types::ModelCapability;
@@ -469,16 +469,13 @@ impl LlmFactory {
     /// That capability is the single source of truth for "this model's chat
     /// template reads `enable_thinking`" — it is what the model picker shows
     /// and what gates the per-request `thinking` flag.  False for a model
-    /// outside `SUPPORTED_MODELS` (user-added): binding the flag onto a
-    /// template that ignores it does nothing.
+    /// without a spec (user-added): binding the flag onto a template that
+    /// ignores it does nothing.
     pub fn supports_thinking(model_name: Option<&str>) -> bool {
         let Some(model_name) = model_name.filter(|n| !n.is_empty()) else {
             return false;
         };
-        match SUPPORTED_MODELS.get(model_name) {
-            Some(model_cls) => (model_cls.default_capabilities)().contains(&ModelCapability::Thinking),
-            None => false,
-        }
+        MODEL_SPECS.get(model_name).is_some_and(|spec| spec.supports(ModelCapability::Thinking))
     }
 
     /// `(n_batch, n_threads)` for this load.
@@ -510,7 +507,7 @@ impl LlmFactory {
 
     /// True when the loaded GGUF's own chat template reads `enable_thinking`.
     ///
-    /// `supports_thinking` answers from `SUPPORTED_MODELS`, which knows nothing
+    /// `supports_thinking` answers from the model specs, which know nothing
     /// about a model the user built or merged themselves — and a merge of a
     /// reasoning base keeps its template.  The template is the ground truth.
     pub fn template_reads_thinking(llm: &dyn LlamaModel) -> bool {
@@ -524,7 +521,7 @@ impl LlmFactory {
     /// `None` means the model does not support reasoning, so nothing is bound.
     /// Otherwise the answer is, most specific first: the caller's `override_`
     /// (the request's `thinking` field), then `slp_thinking_enabled`, then the
-    /// model class's `thinking_default()`.
+    /// spec's `thinking_default`.
     pub fn thinking_for(model_name: Option<&str>, override_: Option<bool>) -> Option<bool> {
         if !Self::supports_thinking(model_name) {
             return None;
@@ -535,10 +532,7 @@ impl LlmFactory {
         if let Some(setting) = AppSettings::new().thinking_enabled {
             return Some(setting);
         }
-        let default = model_name
-            .and_then(|name| SUPPORTED_MODELS.get(name))
-            .map(|model_cls| (model_cls.thinking_default)())
-            .unwrap_or(false);
+        let default = model_name.and_then(|name| MODEL_SPECS.get(name)).is_some_and(|spec| spec.thinking_default);
         Some(default)
     }
 
@@ -845,7 +839,7 @@ impl LlmFactory {
 
         if thinking.is_none() {
             // The registry could not answer — a user-built or merged model is
-            // not in SUPPORTED_MODELS, so nothing declares THINKING for it.
+            // without a spec, so nothing declares THINKING for it.
             // The GGUF itself can: its chat template either reads
             // `enable_thinking` or it doesn't.  Bind it off by default, which
             // keeps the visible answer as it is and still leaves the flag

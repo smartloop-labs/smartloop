@@ -18,10 +18,10 @@ use crate::api::routers::_errors::{status_for, HTTPException};
 use crate::api::services::model_service::ModelServiceError;
 use crate::api::services::{get_model_service, ModelService};
 use crate::config::app_settings::AppSettings;
-use crate::config::SUPPORTED_MODELS;
 use crate::constants::canonical_model_name;
 use crate::model::downloader::artifact_downloader::DownloadError;
 use crate::model::downloader::cancellation::{DownloadCancelled, DownloadInProgress};
+use crate::model::spec::MODEL_SPECS;
 use crate::platform::{get_platform_service, ModelAccessError, PlatformError, PlatformService};
 use crate::types::{ModelCapability, ModelKind};
 use crate::workspace::workspace::{Project, SharedWorkspace, Workspace, WorkspaceError};
@@ -612,13 +612,11 @@ pub fn list_models_with(
                 entry.thinking = ws.effective_model_thinking(&entry.name, project);
             }
             _ => {
-                if let Some(model_cls) = SUPPORTED_MODELS.get(&entry.name) {
-                    let caps: Vec<&str> =
-                        (model_cls.default_capabilities)().iter().map(|c| c.value()).collect();
-                    entry.capabilities = display_capabilities(&caps);
+                if let Some(spec) = MODEL_SPECS.get(&entry.name) {
+                    entry.capabilities = display_capabilities(&spec.capability_values());
                 } else {
-                    // A model this build has no class for (every remote one)
-                    // keeps the catalog's list, minus names it can't route.
+                    // A row the specs haven't seen keeps the catalog's list,
+                    // minus names it can't route.
                     entry.capabilities.retain(|c| ModelCapability::from_value(c).is_some());
                     entry.capabilities = display_capabilities(&entry.capabilities);
                 }
@@ -632,10 +630,7 @@ pub fn list_models_with(
     drop(ws_guard);
 
     let sort_key = |entry: &ModelEntry| -> (u8, f64) {
-        let size = SUPPORTED_MODELS
-            .get(&entry.name)
-            .map(|cls| (cls.param_size_in_b)())
-            .unwrap_or(0.0);
+        let size = local_param_size_b(&entry.name);
         let tier = match entry.access_level {
             Some(AccessLevel::Free) => 2,
             Some(AccessLevel::FreeLogin) => 1,
@@ -667,13 +662,19 @@ pub fn total_ram_gb() -> Option<f64> {
 /// Approximate RAM for `entry`: ~1GB per billion parameters (Q4 weights plus
 /// context), the same estimate the picker shows.  `None` when unknown.
 pub fn footprint_gb(entry: &ModelEntry) -> Option<f64> {
-    // The test seam stands in for `SUPPORTED_MODELS` when installed (see
+    // The test seam stands in for the model specs when installed (see
     // `set_param_size_override` at the end of this file).
     let size_b = match param_size_override(&entry.name) {
         Some(size) => size.unwrap_or(0.0),
-        None => SUPPORTED_MODELS.get(&entry.name).map(|cls| (cls.param_size_in_b)()).unwrap_or(0.0),
+        None => local_param_size_b(&entry.name),
     };
     if size_b > 0.0 { Some(size_b) } else { None }
+}
+
+/// Parameter count of the local model `name`, 0 when unknown.  A remote
+/// model counts as 0: it takes no memory here and sorts after local ones.
+fn local_param_size_b(name: &str) -> f64 {
+    MODEL_SPECS.get(name).filter(|spec| !spec.is_remote()).map(|spec| spec.param_size_b).unwrap_or(0.0)
 }
 
 /// Set `recommended` on the models to badge for this machine.
@@ -1287,9 +1288,8 @@ pub async fn update_project_model_with(
 
 // ===== BEGIN api_routes_misc: test seam for tests/unit/test_model_recommendation.rs =====
 
-/// Replacement for the `SUPPORTED_MODELS` parameter-size lookup behind
-/// [`footprint_gb`]: model name → `param_size_in_b()` (`None` = unknown model).
-/// The Python tests patch `models.SUPPORTED_MODELS` with fake classes.
+/// Replacement for the model-spec parameter-size lookup behind
+/// [`footprint_gb`]: model name → parameter count (`None` = unknown model).
 pub type ParamSizeLookup = Arc<dyn Fn(&str) -> Option<f64> + Send + Sync>;
 
 static PARAM_SIZE_OVERRIDE: once_cell::sync::Lazy<parking_lot::RwLock<Option<ParamSizeLookup>>> =

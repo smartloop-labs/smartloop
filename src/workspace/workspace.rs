@@ -30,9 +30,10 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::config::{AppSettings, ModelConfig, SUPPORTED_MODELS};
+use crate::config::{AppSettings, ModelConfig};
 use crate::constants::canonical_model_name;
 use crate::llms::llm_factory::LlmFactory;
+use crate::model::spec::{ModelSpec, MODEL_SPECS};
 use crate::paths::{expand_home, real_home};
 use crate::types::{ModelCapability, ModelKind};
 use crate::workspace::context::{
@@ -761,25 +762,28 @@ impl WorkspaceModel {
         join(&self.bin_dir(), &format!("{}.gguf", path_name(&self.model_id)))
     }
 
-    /// Parameter count in billions, taken from the model class (the
-    /// authoritative source).  0 for models without a `SUPPORTED_MODELS`
-    /// entry or an explicit size.
-    pub fn param_size_b(&self) -> f64 {
-        match SUPPORTED_MODELS.get(&self.model_name) {
-            Some(model_cls) => (model_cls.param_size_in_b)(),
-            None => 0.0,
-        }
+    /// This model's spec, if one is known.
+    pub fn spec(&self) -> Option<Arc<ModelSpec>> {
+        MODEL_SPECS.get(&self.model_name)
     }
 
-    /// Model family version declared by the model class (0 if unknown).
+    /// Parameter count in billions of the weights this machine runs, taken
+    /// from the spec (the authoritative source).  0 for a model without a
+    /// spec or a size, and for a remote model, which local selection
+    /// never loads (its own size is on [`WorkspaceModel::spec`]).
+    pub fn param_size_b(&self) -> f64 {
+        if self.is_remote() {
+            return 0.0;
+        }
+        self.spec().map(|spec| spec.param_size_b).unwrap_or(0.0)
+    }
+
+    /// Model family version declared by the spec (0 if unknown).
     ///
     /// Selection prefers a higher version over a lower one only between two
     /// models of the same size (see [`WorkspaceModel::rank`]).
     pub fn model_version(&self) -> i64 {
-        match SUPPORTED_MODELS.get(&self.model_name) {
-            Some(model_cls) => (model_cls.model_version)(),
-            None => 0,
-        }
+        self.spec().map(|spec| spec.model_version).unwrap_or(0)
     }
 
     /// Selection rank: larger size wins first, then newer model version.
@@ -791,22 +795,19 @@ impl WorkspaceModel {
         (self.param_size_b(), self.model_version())
     }
 
-    /// Capabilities declared by the model class — read-only.
+    /// Capabilities declared by the model's spec — read-only.
     ///
-    /// The stored `capabilities` field is ignored so class defaults stay
-    /// authoritative and updates to any model's capabilities take effect
-    /// immediately.  A remote model has no class, so its stored list (from
-    /// the catalog) is used.  Other models without a `SUPPORTED_MODELS` entry
-    /// fall back to metadata-inferred capabilities.
+    /// The stored `capabilities` field is ignored so the spec stays
+    /// authoritative and catalog updates to any model's capabilities take
+    /// effect immediately.  A remote model uses its stored list (from the
+    /// catalog).  Other models without a spec fall back to metadata-inferred
+    /// capabilities.
     pub fn effective_capabilities(&self) -> Vec<String> {
         if self.is_remote() {
             return self.capabilities.clone();
         }
-        match SUPPORTED_MODELS.get(&self.model_name) {
-            Some(model_cls) => (model_cls.default_capabilities)()
-                .into_iter()
-                .map(|c| c.value().to_string())
-                .collect(),
+        match self.spec() {
+            Some(spec) => spec.capability_values(),
             None => self.infer_capabilities(),
         }
     }
@@ -1598,22 +1599,9 @@ impl Workspace {
             Some(name) => name.to_string(),
             None => AppSettings::new().default_model,
         };
+        // Canonical names, so a legacy name matches its current one.
         let target = canonical_model_name(&model_name);
-        let target_cls = SUPPORTED_MODELS.get(&target);
-
-        self.models.iter().position(|m| {
-            // Compare by class where both sides are known models, so two names
-            // for the same model still match; otherwise fall back to the name,
-            // which keeps unknown (user-added) models from colliding with each
-            // other on a shared `None` class.
-            if canonical_model_name(&m.model_name) == target {
-                return true;
-            }
-            match target_cls {
-                Some(target_cls) => SUPPORTED_MODELS.get(&m.model_name) == Some(target_cls),
-                None => false,
-            }
-        })
+        self.models.iter().position(|m| canonical_model_name(&m.model_name) == target)
     }
 
     /// Look up a registered model by its short name (alias-aware); `None`
