@@ -103,14 +103,38 @@ fn test_a_remote_model_without_a_spec_declares_nothing() {
 }
 
 #[test]
-fn test_a_remote_size_is_reported_but_not_ranked() {
-    remote_spec("remote-sized", json!({"capabilities": ["general"], "param_size_b": 355.0}));
+fn test_a_remote_model_ranks_on_its_active_params() {
+    remote_spec(
+        "remote-sized",
+        json!({"capabilities": ["general"], "param_size_b": 428.0, "active_param_size_b": 23.0}),
+    );
     let mut ws = workspace();
     let added = ws.add_remote_model("remote-sized", true);
 
-    assert_eq!(added.spec().unwrap().param_size_b, 355.0);
-    // Local selection never loads it, so it takes no size there.
-    assert_eq!(added.param_size_b(), 0.0);
+    assert_eq!(added.param_size_b(), 428.0);
+    assert_eq!(added.rank(), (23.0, 0));
+}
+
+#[test]
+fn test_remote_models_rank_among_themselves_by_active_params() {
+    remote_spec("remote-light", json!({"capabilities": ["general"], "param_size_b": 900.0, "active_param_size_b": 23.0}));
+    remote_spec("remote-heavy", json!({"capabilities": ["general"], "param_size_b": 753.0, "active_param_size_b": 40.0}));
+    let mut ws = workspace();
+    ws.add_remote_model("remote-light", true);
+    ws.add_remote_model("remote-heavy", true);
+    assert_eq!(ranked_names(&ws, "general"), vec!["remote-heavy", "remote-light"]);
+}
+
+#[test]
+fn test_a_remote_model_is_never_the_largest_downloaded_one() {
+    remote_spec("remote-giant", json!({"capabilities": ["general"], "param_size_b": 753.0}));
+    let mut ws = workspace();
+    ws.add_remote_model("remote-giant", true);
+    assert!(ws.largest_downloaded_model(None).is_none());
+
+    ws.add_model("gemma4-e2b", "gemma4-e2b", None, true);
+    ws.get_model_mut(Some("gemma4-e2b")).unwrap().downloaded = true;
+    assert_eq!(ws.largest_downloaded_model(None).unwrap().model_name, "gemma4-e2b");
 }
 
 fn ranked_names(ws: &Workspace, capability: &str) -> Vec<String> {

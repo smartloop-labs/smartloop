@@ -2412,6 +2412,7 @@ impl ModelService {
                     ws.effective_model_enabled(&m.model_name, project)
                         && ws.effective_model_downloaded(&m.model_name)
                         && Some(m.model_name.as_str()) != router_name.as_deref()
+                        && !m.is_remote()
                         && m.effective_capabilities().iter().any(|c| text_caps.contains(&c.as_str()))
                 })
                 .cloned()

@@ -777,14 +777,9 @@ impl WorkspaceModel {
         self.spec().and_then(|spec| spec.context_length)
     }
 
-    /// Parameter count in billions of the weights this machine runs, taken
-    /// from the spec (the authoritative source).  0 for a model without a
-    /// spec or a size, and for a remote model, which local selection
-    /// never loads (its own size is on [`WorkspaceModel::spec`]).
+    /// Parameter count in billions, taken from the spec (the authoritative
+    /// source).  0 for a model without a spec or a size.
     pub fn param_size_b(&self) -> f64 {
-        if self.is_remote() {
-            return 0.0;
-        }
         self.spec().map(|spec| spec.param_size_b).unwrap_or(0.0)
     }
 
@@ -800,9 +795,12 @@ impl WorkspaceModel {
     ///
     /// Size is the primary key so the most capable (largest) model is always
     /// preferred; the model version only breaks a tie between two models of
-    /// the same parameter count.
+    /// the same size.  A mixture-of-experts model is sized by its active
+    /// parameters.  Remote models rank among themselves this way; every
+    /// selection list still puts them after the local ones.
     pub fn rank(&self) -> (f64, i64) {
-        (self.param_size_b(), self.model_version())
+        let size = self.spec().map(|spec| spec.ranking_size_b()).unwrap_or(0.0);
+        (size, self.model_version())
     }
 
     /// Capabilities declared by the model's spec — read-only.
@@ -1702,11 +1700,14 @@ impl Workspace {
         entry
     }
 
-    /// Sort `candidates` best-first by [`WorkspaceModel::rank`] (stable, so
-    /// equal ranks keep registration order) and stamp their `models_dir`.
+    /// Sort `candidates` local first, then best-first by
+    /// [`WorkspaceModel::rank`] (stable, so equal ranks keep registration
+    /// order), and stamp their `models_dir`.
     fn rank_candidates(&self, mut candidates: Vec<WorkspaceModel>) -> Vec<WorkspaceModel> {
         candidates.sort_by(|a, b| {
-            b.rank().partial_cmp(&a.rank()).unwrap_or(std::cmp::Ordering::Equal)
+            a.is_remote()
+                .cmp(&b.is_remote())
+                .then(b.rank().partial_cmp(&a.rank()).unwrap_or(std::cmp::Ordering::Equal))
         });
         for m in &mut candidates {
             m.models_dir = self.models_dir.clone();
@@ -1726,6 +1727,7 @@ impl Workspace {
             .filter(|m| {
                 self.effective_model_enabled(&m.model_name, project)
                     && self.effective_model_downloaded(&m.model_name)
+                    && !m.is_remote()
                     && m.param_size_b() > 0.0
             })
             .cloned()
@@ -1735,8 +1737,8 @@ impl Workspace {
 
     /// Enabled, downloaded models declaring `capability`, best-first.
     ///
-    /// Remote models are included; callers that route place them after
-    /// every local model (see `ModelService::get_llm_for_capability`).
+    /// Remote models are included, after every local model and ranked among
+    /// themselves by active size (see `ModelService::get_llm_for_capability`).
     ///
     /// Callers walk this list down to a smaller same-capability model when
     /// the largest doesn't fit in memory, rather than dropping straight to the

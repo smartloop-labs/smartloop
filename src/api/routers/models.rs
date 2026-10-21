@@ -890,6 +890,8 @@ pub async fn list_workspace_models_with(
             .filter(|m| canonical_model_name(&m.model_name) != bootstrap_model)
             .collect();
         sort_by_rank_desc(&mut models, |m| m.rank());
+        // Remote models list after the local ones, as they route.
+        models.sort_by_key(|m| m.is_remote());
         Ok(models
             .into_iter()
             .map(|m| WorkspaceModelEntry {
@@ -1178,6 +1180,8 @@ pub async fn list_project_models_with(
         let mut models: Vec<_> =
             ws.models.iter().filter(|m| !ws.is_bootstrap_model(&m.model_name)).collect();
         sort_by_rank_desc(&mut models, |m| m.rank());
+        // Remote models list after the local ones, as they route.
+        models.sort_by_key(|m| m.is_remote());
         Ok(models
             .into_iter()
             .map(|m| ProjectModelEntry {
