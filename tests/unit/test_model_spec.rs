@@ -47,6 +47,7 @@ fn test_seeds_pin_every_built_in_model() {
         assert_eq!(spec.param_size_b, size, "{name}");
         assert_eq!(spec.capabilities, caps, "{name}");
         assert!(!spec.thinking_default, "{name}");
+        assert!(!spec.param_size_estimated, "{name}");
         assert_eq!(spec.vision_chat_handler.as_deref(), handler, "{name}");
     }
 }
@@ -134,6 +135,7 @@ fn test_a_remote_model_carries_size_and_endpoint() {
         "capabilities": ["general", "coding"],
         "context_length": 1048576,
         "param_size_b": 355.0,
+        "param_size_estimated": true,
         "model_version": 5,
     }))]);
 
@@ -143,6 +145,7 @@ fn test_a_remote_model_carries_size_and_endpoint() {
     assert_eq!(spec.url.as_deref(), Some("https://api.smartloop.ai"));
     assert_eq!(spec.context_length, Some(1048576));
     assert_eq!(spec.param_size_b, 355.0);
+    assert!(spec.param_size_estimated);
     assert_eq!(spec.capabilities, vec![General, Coding]);
     // No weights, so nothing resolves by an empty id.
     assert!(registry.get_by_id("").is_none());

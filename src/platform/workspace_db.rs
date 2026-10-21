@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     capabilities   TEXT,            -- JSON array of capability names
     context_length INTEGER,
     param_size_b        REAL,
+    param_size_estimated INTEGER,
     model_version       INTEGER,
     thinking_default    INTEGER,
     vision_chat_handler TEXT,
@@ -238,15 +239,16 @@ pub fn python_json_dumps(value: &Value) -> String {
     String::from_utf8(out).expect("JSON output is UTF-8")
 }
 
-/// Drop a `model_catalog` table from before its newest column (the model
-/// spec fields; before that, remote models and their name key).  It only
+/// Drop a `model_catalog` table from before its newest column (the
+/// estimated-size flag; before that, the other model spec fields, and
+/// remote models and their name key).  It only
 /// caches the cloud catalog, so the next fetch refills it.
 fn drop_outdated_model_catalog(conn: &Connection) -> anyhow::Result<()> {
     let columns: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('model_catalog')")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
-    if !columns.is_empty() && !columns.iter().any(|c| c == "vision_chat_handler") {
+    if !columns.is_empty() && !columns.iter().any(|c| c == "param_size_estimated") {
         conn.execute_batch("DROP TABLE model_catalog")?;
     }
     Ok(())
@@ -360,7 +362,8 @@ impl WorkspaceDB {
         let mut stmt = conn.prepare(
             "SELECT model_id, name, size, description, access_level, is_accessible, sha256, \
                     type, url, capabilities, context_length, \
-                    param_size_b, model_version, thinking_default, vision_chat_handler \
+                    param_size_b, model_version, thinking_default, vision_chat_handler, \
+                    param_size_estimated \
              FROM model_catalog",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -388,6 +391,11 @@ impl WorkspaceDB {
             };
             m.insert("thinking_default".into(), thinking_default);
             m.insert("vision_chat_handler".into(), sql_to_json(r.get(14)?));
+            let param_size_estimated = match r.get::<_, SqlValue>(15)? {
+                SqlValue::Null => Value::Null,
+                flag => Value::Bool(sql_truthy(&flag)),
+            };
+            m.insert("param_size_estimated".into(), param_size_estimated);
             Ok(m)
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -423,6 +431,7 @@ impl WorkspaceDB {
                         optional(m, "model_version")?,
                         optional(m, "thinking_default")?,
                         optional(m, "vision_chat_handler")?,
+                        optional(m, "param_size_estimated")?,
                     ),
                 ))
             })
@@ -436,14 +445,15 @@ impl WorkspaceDB {
                 "INSERT INTO model_catalog
                        (model_id, name, size, description, access_level, is_accessible, sha256,
                         type, url, capabilities, context_length,
-                        param_size_b, model_version, thinking_default, vision_chat_handler, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        param_size_b, model_version, thinking_default, vision_chat_handler,
+                        param_size_estimated, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ",
             )?;
             for (
                 (model_id, name, size, description, access_level, is_accessible, sha256),
                 (kind, url, capabilities, context_length),
-                (param_size_b, model_version, thinking_default, vision_chat_handler),
+                (param_size_b, model_version, thinking_default, vision_chat_handler, param_size_estimated),
             ) in rows
             {
                 stmt.execute(params![
@@ -462,6 +472,7 @@ impl WorkspaceDB {
                     model_version,
                     thinking_default,
                     vision_chat_handler,
+                    param_size_estimated,
                     fetched_at
                 ])?;
             }

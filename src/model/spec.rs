@@ -38,6 +38,9 @@ pub struct ModelSpec {
     pub model_version: i64,
     /// Parameter count in billions; 0 when unknown.
     pub param_size_b: f64,
+    /// Whether `param_size_b` is an estimate (a closed remote model's,
+    /// say).  It ranks the same; only display differs.
+    pub param_size_estimated: bool,
     /// Capabilities the model declares — never empty.
     pub capabilities: Vec<ModelCapability>,
     /// Whether reasoning starts ON for a model that supports it.
@@ -59,6 +62,7 @@ impl ModelSpec {
             kind: ModelKind::Local,
             model_version: 0,
             param_size_b: 0.0,
+            param_size_estimated: false,
             capabilities: DEFAULT_CAPABILITIES.to_vec(),
             thinking_default: false,
             vision_chat_handler: None,
@@ -112,6 +116,9 @@ impl ModelSpec {
         if let Some(size) = row.param_size_b {
             spec.param_size_b = size;
         }
+        if let Some(estimated) = row.param_size_estimated {
+            spec.param_size_estimated = estimated;
+        }
         let capabilities = row.capabilities.unwrap_or_default();
         let known: Vec<ModelCapability> = capabilities
             .iter()
@@ -156,6 +163,8 @@ pub struct CatalogModel {
     pub model_version: Option<i64>,
     #[serde(default)]
     pub param_size_b: Option<f64>,
+    #[serde(default)]
+    pub param_size_estimated: Option<bool>,
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
     #[serde(default)]

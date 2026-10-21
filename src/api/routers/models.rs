@@ -491,6 +491,9 @@ pub struct ModelEntry {
     /// Parameter count in billions, local or remote; `None` when unknown.
     #[serde(default)]
     pub param_size_b: Option<f64>,
+    /// Whether `param_size_b` is an estimate, for the picker to mark.
+    #[serde(default)]
+    pub param_size_estimated: bool,
 }
 
 fn null_as_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -630,6 +633,7 @@ pub fn list_models_with(
         }
         if let Some(size) = declared_param_size_b(&entry.name) {
             entry.param_size_b = Some(size);
+            entry.param_size_estimated = param_size_estimated(&entry.name);
         }
         result.push(entry);
     }
@@ -680,6 +684,11 @@ pub fn footprint_gb(entry: &ModelEntry) -> Option<f64> {
 /// Parameter count the spec of `name` declares, local or remote.
 fn declared_param_size_b(name: &str) -> Option<f64> {
     MODEL_SPECS.get(name).map(|spec| spec.param_size_b).filter(|size| *size > 0.0)
+}
+
+/// Whether the size the spec of `name` declares is an estimate.
+fn param_size_estimated(name: &str) -> bool {
+    MODEL_SPECS.get(name).is_some_and(|spec| spec.param_size_estimated)
 }
 
 /// Parameter count of the local model `name`, 0 when unknown.  A remote
@@ -812,6 +821,9 @@ pub struct WorkspaceModelEntry {
     /// Parameter count in billions, local or remote; `None` when unknown.
     #[serde(default)]
     pub param_size_b: Option<f64>,
+    /// Whether `param_size_b` is an estimate, for the picker to mark.
+    #[serde(default)]
+    pub param_size_estimated: bool,
 }
 
 /// `sorted(models, key=lambda m: m._rank, reverse=True)`: best model first
@@ -870,6 +882,7 @@ pub async fn list_workspace_models_with(
                 url: m.url(),
                 context_length: m.context_length(),
                 param_size_b: declared_param_size_b(&m.model_name),
+                param_size_estimated: param_size_estimated(&m.model_name),
             })
             .collect())
     };
@@ -1066,6 +1079,9 @@ pub struct ProjectModelEntry {
     /// Parameter count in billions, local or remote; `None` when unknown.
     #[serde(default)]
     pub param_size_b: Option<f64>,
+    /// Whether `param_size_b` is an estimate, for the picker to mark.
+    #[serde(default)]
+    pub param_size_estimated: bool,
 }
 
 /// Body of `PATCH /v1/projects/{project_id}/models/{model_name}`.
@@ -1149,6 +1165,7 @@ pub async fn list_project_models_with(
                 url: m.url(),
                 context_length: m.context_length(),
                 param_size_b: declared_param_size_b(&m.model_name),
+                param_size_estimated: param_size_estimated(&m.model_name),
             })
             .collect())
     };

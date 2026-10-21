@@ -197,7 +197,8 @@ mod test_list_models {
         let client = TestClient::new();
         client.platform().set_list_models(json!([
             {"name": "remote-sized", "model_id": null, "type": "remote",
-             "is_accessible": true, "capabilities": ["general"], "param_size_b": 355.0},
+             "is_accessible": true, "capabilities": ["general"], "param_size_b": 355.0,
+             "param_size_estimated": true},
             {"name": "gemma4-e2b", "model_id": "google/gemma-4-e2b-it", "is_accessible": true},
         ]));
         let resp = client.get("/v1/models").await;
@@ -205,8 +206,11 @@ mod test_list_models {
         let body = resp.json();
         let by_name = |name: &str| body.as_array().unwrap().iter().find(|m| m["name"] == name).unwrap().clone();
         assert_eq!(by_name("remote-sized")["param_size_b"], 355.0);
-        // A catalog without the field still reports the built-in size.
+        assert_eq!(by_name("remote-sized")["param_size_estimated"], true);
+        // A catalog without the fields still reports the built-in size, as
+        // an exact one.
         assert_eq!(by_name("gemma4-e2b")["param_size_b"], 2.0);
+        assert_eq!(by_name("gemma4-e2b")["param_size_estimated"], false);
     }
 
     #[tokio::test]
