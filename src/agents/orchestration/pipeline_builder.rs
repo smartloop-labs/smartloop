@@ -476,11 +476,12 @@ impl PipelineBuilder {
             ),
         });
 
-        let data = json!({
-            "search_ctx": serde_json::to_value(&*shared.lock()).unwrap_or(Value::Null),
-            "enrich_ctx": serde_json::to_value(&enrich_ctx).unwrap_or(Value::Null),
-        });
-        let mut result = NodeResult::with_data(node.node_id.clone(), data).with_payload(shared);
+        // The context travels only as the shared payload, never as JSON in
+        // `data`: the executor deep-clones a node's result into every
+        // dependant, and the fan-out makes one per retrieved document.  With
+        // 213 documents a ~150MB serialized context (full texts plus each
+        // citation's chunk vectors as byte arrays) became ~32GB of copies.
+        let mut result = NodeResult::with_data(node.node_id.clone(), json!({})).with_payload(shared);
         result.extend_dag = extend_dag;
         result
     }

@@ -114,6 +114,18 @@ mod route_fanout {
         sctx: SearchContext,
         matched_skills: Option<Value>,
     ) -> (HashMap<&'static str, AgentNode>, Option<AgentNode>) {
+        let (res, parent) = route_result(orch, sctx, matched_skills);
+        let nodes: HashMap<&'static str, AgentNode> =
+            res.extend_dag.iter().map(|e| (class_name(&e.node), e.node.clone())).collect();
+        (nodes, parent)
+    }
+
+    /// The route node's own result plus the parent the pipeline was handed.
+    fn route_result(
+        orch: &SLPOrchestrator,
+        sctx: SearchContext,
+        matched_skills: Option<Value>,
+    ) -> (NodeResult, Option<AgentNode>) {
         let ctx = summarize_ctx(orch);
 
         let skill_match_node = SkillMatchNode::new(&[]);
@@ -147,10 +159,23 @@ mod route_fanout {
         );
 
         let res = orch.pipeline().handle_route(&ctx, &deps, &route_node, &skill_match_node, &collect_node);
-        let nodes: HashMap<&'static str, AgentNode> =
-            res.extend_dag.iter().map(|e| (class_name(&e.node), e.node.clone())).collect();
         let parent = captured.lock().clone();
-        (nodes, parent)
+        (res, parent)
+    }
+
+    /// The executor deep-clones a result into every dependant, one per
+    /// retrieved document under the fan-out.  Serialized into `data`, a
+    /// 213-document context became ~32GB of copies; it must ride only as
+    /// the shared payload.
+    #[test]
+    fn test_route_result_does_not_copy_the_search_context() {
+        let (orch, _llm) = make_orchestrator();
+        let sctx = SearchContext { vector_context: "raw".to_string(), documents: docs(3, 100), ..Default::default() };
+        let (res, _) = route_result(&orch, sctx, None);
+
+        assert!(res.data.get("search_ctx").is_none());
+        let shared = res.payload_as::<SharedSearchContext>().expect("the shared context");
+        assert_eq!(shared.lock().documents.len(), 3);
     }
 
     #[test]
