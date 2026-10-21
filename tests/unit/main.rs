@@ -46,6 +46,8 @@ mod test_fit_guard_logging;
 mod test_generation_rate;
 mod test_history_search_query;
 mod test_indexer_is_project_work;
+mod test_indexer_resumes_unfinished;
+mod test_large_n_ctx_cap_default;
 mod test_indexer_waits_for_quiet;
 mod test_home_isolation;
 mod test_inflight;

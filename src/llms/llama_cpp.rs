@@ -14,7 +14,10 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::constants::OPENING_TOKENS;
-use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
+use crate::llms::base_llm::{
+    BaseLLM, BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream, clean_reply,
+};
+use crate::llms::llama::batch::capture_prompt;
 use crate::llms::thinking::{ThinkingFilter, strip_thinking};
 
 pub use crate::llms::llama::{
@@ -351,6 +354,29 @@ impl LlamaCpp {
         Ok(text)
     }
 
+    /// The completion request every generation sends: `messages` with room
+    /// for `max_tokens` of output.
+    fn completion_request(&self, messages: &[ChatMessage], max_tokens: usize, stream: bool) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            messages: messages_to_values(messages),
+            max_tokens: Some(max_tokens),
+            temperature: self.temperature,
+            repeat_penalty: 1.2,
+            frequency_penalty: 0.1,
+            presence_penalty: 0.1,
+            dry_multiplier: DRY_MULTIPLIER,
+            stream,
+            ..ChatCompletionRequest::default()
+        }
+    }
+
+    /// Model output as every caller takes it: the `<think>` block and tabs
+    /// removed, trimmed.
+    fn finish_text(text: &str) -> String {
+        let text = strip_thinking(text);
+        TABS.replace_all(text.trim(), "").into_owned()
+    }
+
     fn generate(&self, prompt: &str, prompt_tokens: usize, start_time: f64, options: CallOptions) -> anyhow::Result<String> {
         let messages = self.create_messages_from_prompt(prompt);
         let available_tokens = match options.max_tokens {
@@ -364,17 +390,7 @@ impl LlamaCpp {
         let stream = {
             let _override = self.thinking_override(Some(Self::requested_thinking(&options)));
             let _budget = self.thinking_for_budget(Some(available_tokens));
-            self.model.create_chat_completion(ChatCompletionRequest {
-                messages: messages_to_values(&messages),
-                max_tokens: Some(available_tokens),
-                temperature: self.temperature,
-                repeat_penalty: 1.2,
-                frequency_penalty: 0.1,
-                presence_penalty: 0.1,
-                dry_multiplier: DRY_MULTIPLIER,
-                stream: true,
-                ..ChatCompletionRequest::default()
-            })?
+            self.model.create_chat_completion(self.completion_request(&messages, available_tokens, true))?
         };
 
         let mut parts: Vec<String> = Vec::new();
@@ -414,8 +430,7 @@ impl LlamaCpp {
         // from here on treats this string as one (JSON planning, skill
         // matching, the chat reply), so drop it.  A no-op for models that
         // don't think.
-        let text = strip_thinking(&parts.concat());
-        Ok(TABS.replace_all(text.trim(), "").into_owned())
+        Ok(Self::finish_text(&parts.concat()))
     }
 }
 
@@ -569,6 +584,48 @@ impl BaseLLM for LlamaCpp {
     fn call(&self, prompt: &str, _stop: Option<&[String]>, options: CallOptions) -> anyhow::Result<String> {
         let _guard = self.context_lock().lock();
         self.call_locked(prompt, options)
+    }
+
+    /// Every prompt is rendered exactly as [`BaseLLM::invoke`] would render it
+    /// (fitted to the window, same template, sampling and thinking flags),
+    /// then generated together; see [`Llama::generate_batch`].
+    fn invoke_batch(&self, prompts: &[BatchPrompt]) -> Vec<String> {
+        let Some(llama) = self.model.as_llama() else {
+            return prompts.iter().map(|p| self.invoke(&p.prompt, p.max_tokens, p.thinking)).collect();
+        };
+        let _guard = self.context_lock().lock();
+        let mut items = Vec::with_capacity(prompts.len());
+        for p in prompts {
+            let prompt = self.fit_prompt(&p.prompt);
+            let messages = self.create_messages_from_prompt(&prompt);
+            let max_tokens = p.max_tokens.unwrap_or_else(|| self.get_available_tokens(&prompt));
+            let options = CallOptions { max_tokens: p.max_tokens, thinking: p.thinking };
+            let (_, item) = capture_prompt(|| {
+                let _override = self.thinking_override(Some(Self::requested_thinking(&options)));
+                let _budget = self.thinking_for_budget(Some(max_tokens));
+                self.model.create_chat_completion(self.completion_request(&messages, max_tokens, false))
+            });
+            match item {
+                Some(item) => items.push(item),
+                // A handler that never reached a text completion (multimodal)
+                // cannot be batched.
+                None => {
+                    drop(_guard);
+                    return prompts.iter().map(|p| self.invoke(&p.prompt, p.max_tokens, p.thinking)).collect();
+                }
+            }
+        }
+        llama
+            .generate_batch(items, &|| self.is_cancelled())
+            .into_iter()
+            .map(|result| match result {
+                Ok(text) => clean_reply(&Self::finish_text(&text)),
+                Err(e) => {
+                    tracing::error!(target: LOG_TARGET, "Generation failed: {e}");
+                    format!("Error generating response: {e}")
+                }
+            })
+            .collect()
     }
 
     fn stream<'a>(&'a self, prompt: &str, options: CallOptions) -> GenerationStream<'a> {

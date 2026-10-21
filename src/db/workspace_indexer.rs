@@ -55,7 +55,12 @@ pub const MANIFEST_FILENAME: &str = ".workspace_manifest.json";
 /// Directories holding the framework's own state, skipped when they sit at
 /// the root of the scan.  The scan root *is* `project_dir` (see the indexer
 /// task), so the vector store's own files are always inside it.
-pub const SKIP_ROOT_DIRS: &[&str] = &["db"];
+///
+/// `documents` holds the uploaded documents, which the document indexer
+/// already indexes.  Scanning it too indexed every `.md`/`.txt` upload a
+/// second time as workspace rows, so a 374-document project kept writing
+/// chunks long after indexing finished and searches returned each twice.
+pub const SKIP_ROOT_DIRS: &[&str] = &["db", "documents"];
 
 /// Files holding the framework's own state, skipped at the root of the scan
 /// for the same reason as [`SKIP_ROOT_DIRS`] — and for the reason hidden

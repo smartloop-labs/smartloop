@@ -210,6 +210,12 @@ mod test_the_idle_reading_comes_from_the_right_process {
         ) -> Result<Response<pb::GenerateResponse>, Status> {
             unimplemented()
         }
+        async fn generate_batch(
+            &self,
+            _: Request<pb::GenerateBatchRequest>,
+        ) -> Result<Response<pb::GenerateBatchResponse>, Status> {
+            unimplemented()
+        }
         type StreamStream = futures::stream::Empty<Result<pb::StreamChunk, Status>>;
         async fn stream(&self, _: Request<pb::StreamRequest>) -> Result<Response<Self::StreamStream>, Status> {
             unimplemented()

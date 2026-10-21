@@ -267,6 +267,35 @@ impl IndexerTask {
         self.queue.qsize()
     }
 
+    /// Queue the project's documents a previous run registered but never
+    /// finished: `pending`, `converting` or `indexing` when the loop starts.
+    ///
+    /// The queue lives in memory and the folder scan only enqueues files it
+    /// has not seen, so without this a restart mid-index leaves every
+    /// unfinished document in its status forever.  Returns the count.
+    pub fn requeue_unfinished(&self) -> usize {
+        let Some(project) = self.project() else {
+            return 0;
+        };
+        let unfinished: Vec<Document> = self
+            .project_documents(&project)
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d.status,
+                    DocumentStatus::Pending | DocumentStatus::Converting | DocumentStatus::Indexing
+                )
+            })
+            .collect();
+        if !unfinished.is_empty() {
+            self.core.logger.info(&format!(
+                "[Indexer] Resuming {} unfinished document(s)",
+                unfinished.len()
+            ));
+        }
+        self.enqueue(&unfinished)
+    }
+
     // ---------------------------------------------------------------
     // Event loop
     // ---------------------------------------------------------------
@@ -310,6 +339,7 @@ impl IndexerTask {
 
     fn event_loop(self: Arc<Self>) {
         self.core.set_status(TaskStatus::Pending, Some("Waiting for documents"));
+        self.requeue_unfinished();
 
         while !self.core.stop_event.is_set() {
             let tick = catch_unwind(AssertUnwindSafe(|| self.tick()));

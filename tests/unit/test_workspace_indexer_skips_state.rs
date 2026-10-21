@@ -107,6 +107,38 @@ mod test_state_files_are_not_content {
 
     #[test]
     #[serial(embeddings)]
+    fn test_the_uploaded_documents_directory_is_skipped() {
+        // The document indexer owns these; scanning them too indexed every
+        // upload a second time and kept writing chunks after indexing was done.
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("documents")).unwrap();
+        write(td.path().join("documents").join("article.md"), "uploaded content");
+        write(td.path().join("notes.md"), "real content");
+        let (idx, _store) = indexer(td.path());
+        idx.index(td.path().to_str().unwrap());
+        assert_eq!(keys(&idx), set(&["notes.md"]));
+    }
+
+    #[test]
+    #[serial(embeddings)]
+    fn test_already_indexed_uploads_are_removed_from_the_store() {
+        // Existing installs carry them as workspace rows; the first pass after
+        // the fix has to drop those duplicates.
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("documents")).unwrap();
+        write(td.path().join("documents").join("article.md"), "uploaded content");
+        let (idx, store) = indexer(td.path());
+        idx.set_manifest(BTreeMap::from([(rel(&["documents", "article.md"]), "old-hash".to_string())]));
+
+        let stats = idx.index(td.path().to_str().unwrap());
+
+        assert_eq!(stats.removed, 1);
+        assert!(idx.manifest().is_empty());
+        assert_eq!(store.delete_count(), 1);
+    }
+
+    #[test]
+    #[serial(embeddings)]
     fn test_a_db_directory_deeper_in_the_tree_is_still_indexed() {
         // Only the scan root's `db` is ours; a project with its own db/ of
         // source files keeps it.

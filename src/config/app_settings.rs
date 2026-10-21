@@ -76,10 +76,22 @@ pub struct AppSettings {
     /// decisions, and an auto-sized window would claim memory the capability
     /// models need.
     pub llm_main_n_ctx_cap: i64,
-    /// `SLP_LLM_LARGE_N_CTX_CAP` — max context for the large agent model; 0 = no cap.
+    /// `SLP_LLM_LARGE_N_CTX_CAP` — max context for the large agent model and
+    /// the capability models; 0 = no cap.  Defaults to 16384: each of these
+    /// auto-sizes from the memory free when it loads, as if it were alone, so
+    /// two loaded back to back each claimed a 65536 window (~6GB of KV apiece)
+    /// and a document fan-out over a large project got the process killed.
+    /// Fan-out extraction needs at most ~5k prompt tokens plus 2048 output.
     pub llm_large_n_ctx_cap: i64,
     /// `SLP_LLM_LARGE_FIT_RESERVE_GB` — VRAM kept free when fit-checking the large model.
     pub llm_large_fit_reserve_gb: f64,
+    /// `SLP_LLM_BATCH_SLOTS` — most prompts a batched generation runs at once;
+    /// 0 = size automatically (free memory and a throughput benchmark), 1 =
+    /// never batch.
+    pub llm_batch_slots: i64,
+    /// `SLP_LLM_BATCH_RESERVE_GB` — memory left free when sizing batch slots,
+    /// for macOS, other apps and allocation spikes.
+    pub llm_batch_reserve_gb: f64,
     /// `SLP_MODEL_KEEP_ALIVE` — how long capability models stay loaded once
     /// nothing is running, in seconds (`"30s"`, `"5m"` and `"1h"` are accepted
     /// too).  `0` unloads them as soon as a response completes; a negative
@@ -159,8 +171,10 @@ impl AppSettings {
             llm_n_batch: 0,
             llm_n_threads: 0,
             llm_main_n_ctx_cap: 4096,
-            llm_large_n_ctx_cap: 0,
+            llm_large_n_ctx_cap: 16384,
             llm_large_fit_reserve_gb: 1.0,
+            llm_batch_slots: 0,
+            llm_batch_reserve_gb: 3.0,
             model_keep_alive: 300,
             doc_extract_max_chars: 0,
             embedding_device: "auto".to_string(),
@@ -230,6 +244,8 @@ impl AppSettings {
             llm_main_n_ctx_cap: r.int("slp_llm_main_n_ctx_cap", d.llm_main_n_ctx_cap)?,
             llm_large_n_ctx_cap: r.int("slp_llm_large_n_ctx_cap", d.llm_large_n_ctx_cap)?,
             llm_large_fit_reserve_gb: r.float("slp_llm_large_fit_reserve_gb", d.llm_large_fit_reserve_gb)?,
+            llm_batch_slots: r.int("slp_llm_batch_slots", d.llm_batch_slots)?,
+            llm_batch_reserve_gb: r.float("slp_llm_batch_reserve_gb", d.llm_batch_reserve_gb)?,
             model_keep_alive: r.duration_secs("slp_model_keep_alive", d.model_keep_alive)?,
             doc_extract_max_chars: r.int("slp_doc_extract_max_chars", d.doc_extract_max_chars)?,
             embedding_device: r.string("slp_embedding_device", d.embedding_device)?,

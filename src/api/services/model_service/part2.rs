@@ -31,9 +31,7 @@ use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
 use crate::agents::orchestrator::{ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions};
-use crate::db::migrate_chroma::migrate_chroma_to_index_store;
-use crate::db::store_factory::{StoreType, resolve_default_store_type};
-use crate::llms::base_llm::{CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
+use crate::llms::base_llm::{BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::llms::llama::ChatCompletionRequest;
 use crate::mcp::account::probe_account;
 use crate::mcp::client::{
@@ -1076,6 +1074,42 @@ impl ModelService {
         }
     }
 
+    /// [`Self::generate_completion`] for several independent prompts,
+    /// generated together on the device (see `BaseLLM::invoke_batch`).
+    ///
+    /// Holds one inference slot for the whole batch: the batch is one job on
+    /// the device, however many sequences it carries.
+    pub fn generate_batch_completion(
+        &self,
+        prompts: &[BatchPrompt],
+        model_name: Option<&str>,
+        capability: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let _ = model_name;
+        let llm = self
+            .llm_for_response(capability)
+            .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
+
+        let _slot = self.inference_slot();
+        match catch_unwind(AssertUnwindSafe(|| llm.invoke_batch(prompts))) {
+            Ok(texts) => Ok(texts),
+            Err(panic) => {
+                let ex = panic_message(&panic);
+                // Same GPU-OOM fallback as generate_completion.
+                let Some(fallback) = self.default_fallback_llm(&llm) else {
+                    return Err(anyhow::anyhow!(ex));
+                };
+                tracing::warn!(
+                    target: LOG,
+                    "[response] Response model failed during batch generation ({ex}) — falling back to the default model"
+                );
+                self.evict_response_llm(&llm);
+                catch_unwind(AssertUnwindSafe(|| fallback.invoke_batch(prompts)))
+                    .map_err(|panic| anyhow::anyhow!(panic_message(&panic)))
+            }
+        }
+    }
+
     // --------------------------------------------------------------- documents
 
     /// Add a document source (file path or URL) to a project (by ID or
@@ -1274,8 +1308,7 @@ impl ModelService {
         Ok(task)
     }
 
-    /// Set up all background tasks for the workspace (Chroma migration,
-    /// indexer, MCP) and start the auto tasks.  Called during API server
+    /// Set up all background tasks for the workspace (indexer, MCP) and start the auto tasks.  Called during API server
     /// startup.
     pub fn setup_tasks(&self, workspace: Option<SharedWorkspace>) -> anyhow::Result<()> {
         let workspace: SharedWorkspace = match workspace {
@@ -1286,19 +1319,6 @@ impl ModelService {
             },
         };
         let queue = self.task_queue.read().clone();
-
-        // Migrate legacy ChromaDB data into the SQLite IndexStore — but ONLY
-        // when sqlite is the active backend: the migration reads (and then
-        // archives) chroma.sqlite3.
-        if resolve_default_store_type() == StoreType::SQLite {
-            let projects = workspace.read().projects.clone();
-            for project in projects {
-                if migrate_chroma_to_index_store(&project.project_dir) {
-                    let label = project.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| project.id.clone());
-                    tracing::info!(target: LOG, "Migrated ChromaDB data for project '{label}'");
-                }
-            }
-        }
 
         // Document conversion uses MarkItDown-style converters (no model
         // pre-download).  OCR / image understanding is handled on demand by

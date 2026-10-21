@@ -23,7 +23,7 @@ use crate::db::embeddings::{
     active_embedding_identity, blob_to_embedding, embedding_to_blob, encode_texts,
     try_cosine_distances,
 };
-use crate::db::store::{keyword_coverage_boost, Chunk, ChunkResult, VectorStore};
+use crate::db::store::{apply_coverage_boost, discriminative_terms, terms_coverage_boost, Chunk, ChunkResult, VectorStore};
 
 /// Logger name of the Python module.
 const LOG_TARGET: &str = "smartloop.db.sqlite_store";
@@ -639,12 +639,24 @@ impl IndexStore {
         // contain so the document the user actually named ("Adam Hart") ranks
         // above embedding look-alikes ("Aaron Hawkins").  See
         // store::keyword_coverage_boost.
+        // Only terms that tell the documents apart count; see
+        // store::discriminative_terms.
         if !query_text.is_empty() {
+            fn row_content(row: &IndexRow) -> &str {
+                row.content.as_deref().filter(|c| !c.is_empty()).unwrap_or(&row.text)
+            }
+            let mut seen: HashSet<&str> = HashSet::new();
+            let terms = discriminative_terms(
+                query_text,
+                emb_rows
+                    .iter()
+                    .filter(|row| seen.insert(row.ref_.as_str()))
+                    .map(|row| (row.name.as_deref(), Some(row_content(row)))),
+            );
             for (i, row) in emb_rows.iter().enumerate() {
-                let content = row.content.as_deref().filter(|c| !c.is_empty()).unwrap_or(&row.text);
-                let boost = keyword_coverage_boost(query_text, row.name.as_deref(), Some(content));
+                let boost = terms_coverage_boost(&terms, row.name.as_deref(), Some(row_content(row)));
                 if boost != 0.0 {
-                    distances[i] = (f64::from(distances[i]) - boost).max(0.0) as f32;
+                    distances[i] = apply_coverage_boost(f64::from(distances[i]), boost) as f32;
                 }
             }
         }

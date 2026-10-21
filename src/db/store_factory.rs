@@ -18,8 +18,7 @@ impl StoreType {
 
 /// Return the active backend.
 ///
-/// SQLite is the only backend; kept as a function so existing call sites
-/// (e.g. the legacy chroma→sqlite migration guard) stay valid.
+/// SQLite is the only backend; kept as a function so callers can still ask.
 pub fn resolve_default_store_type() -> &'static str {
     StoreType::SQLITE
 }
