@@ -11,6 +11,7 @@ pub mod model_manager;
 pub mod qwen2_vl_2b;
 pub mod qwen3_5_2b;
 pub mod slp_model;
+pub mod spec;
 pub mod workers;
 
 pub use gemma4_2b::Gemma4_2bModel;
