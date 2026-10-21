@@ -6,7 +6,7 @@
 //! cannot be loaded (no GGUF, faulted, or it does not fit).
 //!
 //! The Python test faked `_rank` on mocks.  A workspace model's rank comes
-//! from its model class, so the walk uses real built-in models whose sizes
+//! from its model spec, so the walk uses real built-in models whose sizes
 //! give the same big/mid/small spread (gemma4-e4b 4B, ministral3-3b 3B,
 //! gemma4-e2b 2B); the tie-break test ranks plain candidates through the
 //! [`RankedModel`] seam the sort is written against.

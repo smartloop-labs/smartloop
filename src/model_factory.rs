@@ -8,9 +8,9 @@ use once_cell::sync::Lazy;
 
 use crate::config::app_settings::AppSettings;
 use crate::config::ModelConfig;
-use crate::config::SUPPORTED_MODELS;
 use crate::model::downloader::slp_downloader::SharedLogger;
 use crate::model::model_manager::{Model, ModelManager};
+use crate::model::spec::MODEL_SPECS;
 use crate::utils::log_utils::ConsoleLogger;
 use crate::workspace::Workspace;
 
@@ -21,8 +21,8 @@ static SETTINGS: Lazy<AppSettings> = Lazy::new(AppSettings::new);
 pub struct ModelFactory;
 
 impl ModelFactory {
-    /// Resolve the model class for `config.model_name` (error
-    /// "Unknown model: <name>" when unsupported), ensure the home dir exists,
+    /// Resolve the spec for `config.model_name` (error "Unknown model:
+    /// <name>" when there is none), ensure the home dir exists,
     /// initialise the workspace and return the registered model.
     ///
     /// Logs through a [`ConsoleLogger`], the Python default.
@@ -33,7 +33,7 @@ impl ModelFactory {
     /// [`ModelFactory::get_model`] with an explicit logger (the Python
     /// `logger` keyword).
     pub fn get_model_with_logger(config: &ModelConfig, logger: SharedLogger) -> anyhow::Result<Model> {
-        let Some(model_type) = SUPPORTED_MODELS.get(&config.model_name) else {
+        let Some(spec) = MODEL_SPECS.get(&config.model_name) else {
             anyhow::bail!("Unknown model: {}", config.model_name);
         };
 
@@ -41,6 +41,6 @@ impl ModelFactory {
 
         let workspace = Workspace::init(config);
 
-        ModelManager::get_model(&model_type, workspace, Some(logger), Some(config.clone()))
+        ModelManager::get_model(&spec, workspace, Some(logger), Some(config.clone()))
     }
 }

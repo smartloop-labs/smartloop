@@ -940,7 +940,7 @@ pub async fn update_workspace_model_handler(
 /// unexpected a 500.
 ///
 /// `capabilities` in the request body is accepted for backward compatibility
-/// but ignored — capabilities are read-only from the model class.
+/// but ignored — capabilities are read-only from the model spec.
 pub async fn update_workspace_model<H: WorkspaceModelHost + ?Sized>(
     model_name: &str,
     request: UpdateWorkspaceModelRequest,
@@ -1100,7 +1100,7 @@ pub async fn list_project_models(
 ///
 /// Entries are seeded from the workspace (app-default) registry; a project's
 /// own settings override those defaults.  Capabilities are read-only from the
-/// model class, and so is `downloaded` — weights are shared workspace-wide.
+/// model spec, and so is `downloaded` — weights are shared workspace-wide.
 pub async fn list_project_models_with(
     project_id: &str,
     model_service: &ModelService,

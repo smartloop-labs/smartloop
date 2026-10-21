@@ -245,7 +245,7 @@ pub struct LlamaInstanceOptions {
     pub mmproj_path: Option<String>,
     /// Keep the CLIP/mmproj encoder on CPU.
     pub clip_on_cpu: bool,
-    /// Vision chat-handler name declared by the model class (authoritative).
+    /// Vision chat-handler name declared by the model spec (authoritative).
     pub vision_handler: Option<String>,
     /// Turn the `<think>` block on/off; `None` keeps the template default.
     pub thinking: Option<bool>,
@@ -275,8 +275,8 @@ impl LlmFactory {
     /// that knows its image-token / prompt format.  Using the WRONG handler
     /// (or none) for a model crashes the native clip code, so an arch without
     /// an entry here is treated as unsupported (text-only / skipped) rather
-    /// than guessed.  `gemma3`/`gemma4` are absent because their model classes
-    /// declare the handler explicitly via `vision_chat_handler()`, which is
+    /// than guessed.  `gemma3`/`gemma4` are absent because their model specs
+    /// declare the handler explicitly via `vision_chat_handler`, which is
     /// authoritative and bypasses this arch-sniffing fallback.
     pub const VISION_HANDLER_BY_ARCH: &'static [(&'static [&'static str], &'static str)] = &[
         (&["qwen2vl", "qwen2.5vl", "qwen2_5vl", "qwen3vl", "qwenvl"], "Qwen25VLChatHandler"),
@@ -377,8 +377,8 @@ impl LlmFactory {
 
     /// True when this build can run this model's vision input.
     ///
-    /// `handler_name` is the handler the model class declares
-    /// (`vision_chat_handler()`); when given it is authoritative and the
+    /// `handler_name` is the handler the model spec declares
+    /// (`vision_chat_handler`); when given it is authoritative and the
     /// GGUF-arch guess is skipped.
     pub fn vision_handler_supported(model_path: &str, handler_name: Option<&str>) -> bool {
         let name = match handler_name.filter(|n| !n.is_empty()) {
@@ -407,7 +407,7 @@ impl LlmFactory {
     /// Build the multimodal chat handler for this model, or `None` (load
     /// text-only) when no supported handler exists or it fails to initialize.
     ///
-    /// `handler_name` is the handler declared by the model class and is
+    /// `handler_name` is the handler declared by the model spec and is
     /// authoritative when provided; otherwise the handler is inferred from the
     /// GGUF architecture.  `clip_on_cpu` forces the CLIP/mmproj encoder onto
     /// CPU; the caller sets it only when GPU VRAM is too tight to run the
@@ -590,7 +590,7 @@ impl LlmFactory {
     /// * `mmproj_path` — CLIP/mmproj GGUF.  When set, the model is loaded as a
     ///   multimodal (vision) instance with a vision chat handler; the
     ///   subprocess probe is skipped and the load is forced in-process.
-    /// * `vision_handler` — chat-handler name declared by the model class;
+    /// * `vision_handler` — chat-handler name declared by the model spec;
     ///   authoritative when set, otherwise inferred from the GGUF architecture.
     /// * `thinking` — turn the model's `<think>` block on/off; `None` keeps the
     ///   chat template's own default.  The block itself is stripped from

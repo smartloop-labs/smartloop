@@ -172,9 +172,8 @@ mod test_list_models {
     #[serial]
     async fn test_a_remote_model_keeps_the_catalogs_capabilities() {
         let client = TestClient::new();
-        // No model class exists for a remote model, so its capabilities come
-        // from the catalog, minus ones this build can't route and the
-        // internal-only "thinking".
+        // A remote model's capabilities come from the catalog, minus ones
+        // this build can't route and the internal-only "thinking".
         client.platform().set_list_models(json!([
             {"name": "kimi-k2", "model_id": null, "type": "remote",
              "access_level": "free_login", "is_accessible": true,

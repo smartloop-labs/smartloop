@@ -12,7 +12,7 @@ use serial_test::serial;
 
 use smartloop::api::routers::models::{self as router, mark_recommended, ModelEntry};
 
-/// Parameter sizes (billions) of the fake model classes.
+/// Parameter sizes (billions) of the fake models.
 fn sizes() -> HashMap<String, f64> {
     [("tiny", 1.0), ("small", 2.0), ("mid", 4.0), ("big", 8.0), ("huge", 30.0)]
         .into_iter()
@@ -31,10 +31,10 @@ fn capable(name: &str, caps: &[&str]) -> ModelEntry {
     entry(name, caps, true)
 }
 
-/// Run `mark_recommended` with `SUPPORTED_MODELS` patched to *sizes*, and
+/// Run `mark_recommended` with model sizes patched to *sizes*, and
 /// return the names it badged.
 fn recommended_with(entries: &mut [ModelEntry], total_gb: Option<f64>, sizes: HashMap<String, f64>) -> BTreeSet<String> {
-    /// `patch.object(router, "SUPPORTED_MODELS", fake)`, undone on drop.
+    /// The size override, undone on drop.
     struct Patched;
     impl Drop for Patched {
         fn drop(&mut self) {

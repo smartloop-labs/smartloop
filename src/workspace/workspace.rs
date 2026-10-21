@@ -630,7 +630,7 @@ pub struct ProjectModel {
     #[serde(default)]
     pub is_active: bool,
     /// Reason before answering.  `None` = follow the workspace default (and
-    /// below that the model class's).  Only meaningful for a model declaring
+    /// below that the model spec's).  Only meaningful for a model declaring
     /// `ModelCapability::Thinking`; see [`Workspace::effective_model_thinking`].
     #[serde(default)]
     pub thinking: Option<bool>,
@@ -675,7 +675,7 @@ pub struct WorkspaceModel {
     pub is_active: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Reason before answering; `None` = the model class's own default.  Set
+    /// Reason before answering; `None` = the model spec's own default.  Set
     /// from the model picker for models whose capabilities include "thinking".
     #[serde(default)]
     pub thinking: Option<bool>,
@@ -1365,7 +1365,7 @@ impl Workspace {
     /// Whether `model_name` should reason before answering.
     ///
     /// Resolution: project override → workspace (app-default) entry →
-    /// `slp_thinking_enabled` → the model class's `thinking_default()` (via
+    /// `slp_thinking_enabled` → the model spec's `thinking_default` (via
     /// `LlmFactory::thinking_for`).
     ///
     /// Returns `None` for a model that does not declare thinking, which means

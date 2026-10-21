@@ -2,15 +2,14 @@
 //!
 //! A reasoning model's <think> block never reaches a caller.
 //!
-//! Qwen3.5 thinks before it answers (`Qwen3_5_2bModel::thinking_default`), and
+//! Qwen3.5 can think before it answers (its spec declares THINKING), and
 //! everything downstream of the LLM wrapper treats the generated text as the
 //! answer — the planner parses it as JSON, the chat endpoint streams it to the
 //! user.  So the monologue is filtered out of both the blocking reply and the
 //! token stream, including when its tags arrive split across stream chunks.
 
 use smartloop::llms::thinking::{ThinkingFilter, strip_thinking};
-use smartloop::model::qwen2_vl_2b::Qwen2VL_2bModel;
-use smartloop::model::qwen3_5_2b::Qwen3_5_2bModel;
+use smartloop::model::spec::MODEL_SPECS;
 
 /// Run chunks through the streaming filter, as `LlamaCpp::stream` does.
 fn stream(chunks: &[&str]) -> String {
@@ -98,6 +97,7 @@ fn test_gemma4_channel_split_across_stream_chunks() {
 fn test_reasoning_is_opt_in_for_every_model() {
     // Support is declared by ModelCapability::Thinking; the default is off, so
     // reasoning costs nothing until switched on in the model picker.
-    assert!(!Qwen3_5_2bModel::thinking_default());
-    assert!(!Qwen2VL_2bModel::thinking_default());
+    for spec in MODEL_SPECS.specs() {
+        assert!(!spec.thinking_default, "{}", spec.name);
+    }
 }
