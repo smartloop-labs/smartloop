@@ -213,6 +213,58 @@ mod test_model_persistence {
 
     #[test]
     #[serial]
+    fn test_spec_fields_round_trip() {
+        let (_tmp, db) = db();
+        let mut rows = models();
+        rows[0].extend(obj(json!({
+            "param_size_b": 1.5,
+            "model_version": 3,
+            "thinking_default": true,
+            "vision_chat_handler": "MTMDChatHandler",
+        })));
+        db.save_models(&rows).unwrap();
+
+        let result = db.list_models().unwrap();
+        let declared = result.iter().find(|m| m["name"] == json!("gemma3-1b")).unwrap();
+        assert_eq!(declared["param_size_b"], json!(1.5));
+        assert_eq!(declared["model_version"], json!(3));
+        assert_eq!(declared["thinking_default"], json!(true));
+        assert_eq!(declared["vision_chat_handler"], json!("MTMDChatHandler"));
+        // Undeclared stays null rather than reading as false or 0.
+        let bare = result.iter().find(|m| m["name"] == json!("gemma3-4b")).unwrap();
+        for key in ["param_size_b", "model_version", "thinking_default", "vision_chat_handler"] {
+            assert_eq!(bare[key], Value::Null, "{key}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_catalog_cached_before_spec_fields_is_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE model_catalog (
+                     name TEXT PRIMARY KEY, model_id TEXT, size TEXT,
+                     description TEXT, access_level TEXT,
+                     is_accessible INTEGER NOT NULL DEFAULT 0, sha256 TEXT,
+                     type TEXT, url TEXT, capabilities TEXT, context_length INTEGER,
+                     fetched_at REAL NOT NULL);
+                 INSERT INTO model_catalog (model_id, name, fetched_at)
+                     VALUES ('google/gemma-3-1b-it', 'gemma3-1b', 1.0);",
+            )
+            .unwrap();
+        }
+
+        let db = WorkspaceDB::new(&path).unwrap();
+        assert!(db.list_models().unwrap().is_empty());
+        db.save_models(&models()).unwrap();
+        assert_eq!(db.list_models().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[serial]
     fn test_a_catalog_cached_before_remote_models_is_discarded() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("workspace.db");

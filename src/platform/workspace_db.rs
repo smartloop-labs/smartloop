@@ -18,7 +18,7 @@ use crate::platform::client::JsonObject;
 use crate::platform::service::now;
 
 /// Schema.  `model_catalog` is a pure cache; [`drop_outdated_model_catalog`]
-/// discards one written before it was keyed by name.
+/// discards one written before its current columns.
 pub const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS workspace (
     id         TEXT PRIMARY KEY,
@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     url            TEXT,
     capabilities   TEXT,            -- JSON array of capability names
     context_length INTEGER,
+    param_size_b        REAL,
+    model_version       INTEGER,
+    thinking_default    INTEGER,
+    vision_chat_handler TEXT,
     fetched_at     REAL NOT NULL
 );
 
@@ -234,15 +238,15 @@ pub fn python_json_dumps(value: &Value) -> String {
     String::from_utf8(out).expect("JSON output is UTF-8")
 }
 
-/// Drop a `model_catalog` table from before remote models (keyed by
-/// `model_id`, which a remote model lacks).  It only caches the cloud
-/// catalog, so the next fetch refills it.
+/// Drop a `model_catalog` table from before its newest column (the model
+/// spec fields; before that, remote models and their name key).  It only
+/// caches the cloud catalog, so the next fetch refills it.
 fn drop_outdated_model_catalog(conn: &Connection) -> anyhow::Result<()> {
     let columns: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('model_catalog')")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
-    if !columns.is_empty() && !columns.iter().any(|c| c == "type") {
+    if !columns.is_empty() && !columns.iter().any(|c| c == "vision_chat_handler") {
         conn.execute_batch("DROP TABLE model_catalog")?;
     }
     Ok(())
@@ -355,7 +359,8 @@ impl WorkspaceDB {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT model_id, name, size, description, access_level, is_accessible, sha256, \
-                    type, url, capabilities, context_length \
+                    type, url, capabilities, context_length, \
+                    param_size_b, model_version, thinking_default, vision_chat_handler \
              FROM model_catalog",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -375,6 +380,14 @@ impl WorkspaceDB {
                 }
             }
             m.insert("context_length".into(), sql_to_json(r.get(10)?));
+            m.insert("param_size_b".into(), sql_to_json(r.get(11)?));
+            m.insert("model_version".into(), sql_to_json(r.get(12)?));
+            let thinking_default = match r.get::<_, SqlValue>(13)? {
+                SqlValue::Null => Value::Null,
+                flag => Value::Bool(sql_truthy(&flag)),
+            };
+            m.insert("thinking_default".into(), thinking_default);
+            m.insert("vision_chat_handler".into(), sql_to_json(r.get(14)?));
             Ok(m)
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -405,6 +418,12 @@ impl WorkspaceDB {
                         optional(m, "sha256")?,
                     ),
                     (optional(m, "type")?, optional(m, "url")?, capabilities, optional(m, "context_length")?),
+                    (
+                        optional(m, "param_size_b")?,
+                        optional(m, "model_version")?,
+                        optional(m, "thinking_default")?,
+                        optional(m, "vision_chat_handler")?,
+                    ),
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -416,13 +435,15 @@ impl WorkspaceDB {
             let mut stmt = tx.prepare(
                 "INSERT INTO model_catalog
                        (model_id, name, size, description, access_level, is_accessible, sha256,
-                        type, url, capabilities, context_length, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        type, url, capabilities, context_length,
+                        param_size_b, model_version, thinking_default, vision_chat_handler, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ",
             )?;
             for (
                 (model_id, name, size, description, access_level, is_accessible, sha256),
                 (kind, url, capabilities, context_length),
+                (param_size_b, model_version, thinking_default, vision_chat_handler),
             ) in rows
             {
                 stmt.execute(params![
@@ -437,6 +458,10 @@ impl WorkspaceDB {
                     url,
                     capabilities,
                     context_length,
+                    param_size_b,
+                    model_version,
+                    thinking_default,
+                    vision_chat_handler,
                     fetched_at
                 ])?;
             }
