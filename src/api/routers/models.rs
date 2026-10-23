@@ -902,7 +902,7 @@ pub async fn list_workspace_models_with(
                 enabled: m.enabled,
                 capabilities: display_capabilities(&m.effective_capabilities()),
                 thinking: ws.effective_model_thinking(&m.model_name, None),
-                kind: m.kind,
+                kind: m.kind(),
                 url: m.url(),
                 context_length: m.context_length(),
                 param_size_b: declared_param_size_b(&m.model_name),

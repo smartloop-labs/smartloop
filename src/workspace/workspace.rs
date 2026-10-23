@@ -88,6 +88,10 @@ static INSTANCE: Lazy<Mutex<Option<SharedWorkspace>>> = Lazy::new(|| Mutex::new(
 /// provisioning) each persist from their own thread.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Models whose stored kind has already been reported as disagreeing with
+/// their spec, so the error is logged once per model rather than per lookup.
+static KIND_MISMATCH_REPORTED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
 /// Override the import-time settings home (Python tests patch
 /// `workspace._settings`).  `None` restores `AppSettings::new().home_dir`.
 pub fn set_settings_home_dir(home_dir: Option<String>) {
@@ -710,9 +714,30 @@ impl Default for WorkspaceModel {
 }
 
 impl WorkspaceModel {
+    /// Where this model runs: its spec's kind, else the stored one.
+    ///
+    /// The spec is authoritative.  The stored `type` is only a fallback for a
+    /// model the catalog has not described yet: a build that predates remote
+    /// models drops the key on its next save.
+    pub fn kind(&self) -> ModelKind {
+        let Some(spec) = self.spec() else {
+            return self.kind;
+        };
+        if spec.kind != self.kind && KIND_MISMATCH_REPORTED.lock().insert(self.model_name.clone()) {
+            tracing::error!(
+                target: LOG_TARGET,
+                "[workspace] {} is registered as {} but its spec says {} — using the spec",
+                self.model_name,
+                self.kind.value(),
+                spec.kind.value()
+            );
+        }
+        spec.kind
+    }
+
     /// Whether this model runs behind the platform API rather than on device.
     pub fn is_remote(&self) -> bool {
-        self.kind == ModelKind::Remote
+        self.kind() == ModelKind::Remote
     }
 
     /// Whether there is no on-disk location to name: `models_dir` unset, or a

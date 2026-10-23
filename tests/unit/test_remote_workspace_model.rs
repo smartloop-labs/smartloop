@@ -171,5 +171,30 @@ fn test_a_local_model_persists_without_remote_fields() {
     // The endpoint lives in the spec, so nothing else is stored.
     assert!(value.get("url").is_none());
     let back: WorkspaceModel = serde_json::from_value(value).unwrap();
-    assert!(back.is_remote());
+    assert_eq!(back.kind, ModelKind::Remote);
+}
+
+#[test]
+fn test_the_spec_decides_a_model_is_remote_when_the_stored_type_is_lost() {
+    remote_spec("remote-untyped", json!({"capabilities": ["general", "dp"]}));
+    // A save by a build that predates remote models drops `type`.
+    let stored: WorkspaceModel = serde_json::from_value(json!({
+        "model_name": "remote-untyped",
+        "model_id": "",
+        "downloaded": true,
+        "capabilities": ["general", "coding"],
+    }))
+    .unwrap();
+
+    assert_eq!(stored.kind, ModelKind::Local);
+    assert_eq!(stored.kind(), ModelKind::Remote);
+    assert!(stored.is_remote());
+    assert_eq!(stored.model_dir(), "");
+}
+
+#[test]
+fn test_the_stored_type_stands_when_no_spec_is_known() {
+    let mut ws = workspace();
+    let added = ws.add_remote_model("remote-unhydrated", true);
+    assert!(added.is_remote());
 }
