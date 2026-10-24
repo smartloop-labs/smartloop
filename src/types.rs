@@ -70,6 +70,38 @@ impl<'de> Deserialize<'de> for ModelKind {
     }
 }
 
+/// How a model's attention cost grows with context length (the catalog's
+/// `attention`).  Reported only; nothing routes on it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Attention {
+    /// Every layer attends the whole context: quadratic.
+    Full,
+    /// Most layers attend a local window, with global layers interleaved.
+    SlidingWindow,
+    /// Linear-time attention throughout.
+    Linear,
+    /// Linear-time layers mixed with full-attention ones.
+    Hybrid,
+    /// Each token attends a selected subset of the context (DeepSeek
+    /// Sparse Attention, MiniMax Sparse Attention).
+    Sparse,
+}
+
+impl Attention {
+    /// Resolve a wire value; `None` when unknown.
+    pub fn from_value(value: &str) -> Option<Self> {
+        match value {
+            "full" => Some(Attention::Full),
+            "sliding_window" => Some(Attention::SlidingWindow),
+            "linear" => Some(Attention::Linear),
+            "hybrid" => Some(Attention::Hybrid),
+            "sparse" => Some(Attention::Sparse),
+            _ => None,
+        }
+    }
+}
+
 /// What a model can be routed to (or, for `Thinking`, how it answers).
 ///
 /// Deserialization accepts the legacy spelling `"skills"` (any case, padded)

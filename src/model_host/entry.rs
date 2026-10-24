@@ -57,6 +57,9 @@ pub(crate) fn module_argv(module: &str) -> Vec<String> {
 /// `logging.basicConfig(level=..., format="%(asctime)s %(levelname)s
 /// %(name)s: %(message)s")`.  A no-op when a subscriber is already installed.
 pub(crate) fn init_logging(level: &str) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let filter = match level.trim().to_ascii_uppercase().as_str() {
         "DEBUG" | "NOTSET" => tracing::level_filters::LevelFilter::DEBUG,
         "WARNING" | "WARN" => tracing::level_filters::LevelFilter::WARN,
@@ -64,10 +67,16 @@ pub(crate) fn init_logging(level: &str) {
         "TRACE" => tracing::level_filters::LevelFilter::TRACE,
         _ => tracing::level_filters::LevelFilter::INFO,
     };
+    // Dependencies never log below INFO; only smartloop follows `level`.
+    let targets = tracing_subscriber::filter::Targets::new()
+        .with_default(filter.min(tracing::level_filters::LevelFilter::INFO))
+        .with_target("smartloop", filter);
     let _ = tracing_subscriber::fmt()
         .with_max_level(filter)
         .with_writer(std::io::stderr)
         .event_format(BasicFormat)
+        .finish()
+        .with(targets)
         .try_init();
 }
 

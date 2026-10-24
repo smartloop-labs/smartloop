@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use serial_test::serial;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -12,14 +12,28 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use smartloop::api::services::model_service::{ModelService, ModelServiceHooks};
 use smartloop::llms::base_llm::BaseLLM;
 use smartloop::llms::cloud_llm::CloudLLM;
+use smartloop::model::spec::MODEL_SPECS;
 use smartloop::workspace::{Workspace, WorkspaceModel};
 
 use crate::shared::model_service_a::{FakeLLM, attach_workspace, bare_service, same};
 use crate::shared::workspace_support::EnvGuard;
 
+/// Register `kimi-k2`'s spec (the registry is process-wide, so every test
+/// here publishes the same row) and return it as a workspace model.
 fn remote(name: &str) -> WorkspaceModel {
+    publish_kimi();
     let mut ws = Workspace::new("ws");
-    ws.add_remote_model(name, "https://api.smartloop.ai", vec!["general".into(), "coding".into()], Some(65536), true)
+    ws.add_remote_model(name, true)
+}
+
+fn publish_kimi() {
+    let Value::Object(row) = json!({
+        "name": "kimi-k2", "type": "remote", "url": "https://api.smartloop.ai",
+        "capabilities": ["general", "coding"], "context_length": 65536,
+    }) else {
+        unreachable!()
+    };
+    MODEL_SPECS.hydrate(&[row]);
 }
 
 /// A service with a resident default model and a workspace whose only
@@ -29,7 +43,8 @@ fn svc_with_remote_pin() -> Arc<ModelService> {
     *svc.llm.write() = Some(FakeLLM::named("resident_orchestrator"));
     *svc.model_name.write() = Some("sl-mini".to_string());
     let mut ws = Workspace::new("ws");
-    ws.add_remote_model("kimi-k2", "https://api.smartloop.ai", vec!["general".into()], None, true);
+    publish_kimi();
+    ws.add_remote_model("kimi-k2", true);
     attach_workspace(&svc, ws);
     svc
 }
@@ -171,7 +186,8 @@ fn test_a_mixed_selection_answers_remotely_only_on_the_remote_model() {
         let mut ws = Workspace::new("ws");
         ws.add_model("gemma4-e4b", "gemma4-e4b", None, true);
         ws.get_model_mut(Some("gemma4-e4b")).unwrap().downloaded = true;
-        ws.add_remote_model("kimi-k2", "https://api.smartloop.ai", vec!["general".into()], None, true);
+        publish_kimi();
+        ws.add_remote_model("kimi-k2", true);
         attach_workspace(&svc, ws);
         svc.set_hooks(ModelServiceHooks {
             llm_for_response: Some(Arc::new(move |_| Some(answer.clone()))),

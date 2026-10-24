@@ -33,7 +33,6 @@ use crate::agents::planner::{FETCH_SERVER_ID, SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOO
 use crate::api::config::api_settings;
 use crate::config::app_settings::AppSettings;
 use crate::config::model_config::ModelConfig;
-use crate::config::SUPPORTED_MODELS;
 use crate::constants::{canonical_model_name, display_model_label};
 use crate::conversation_store::{ConversationStore, MessageInput};
 use crate::db::feedback_indexer::FeedbackIndexer;
@@ -49,6 +48,7 @@ use crate::mcp::client::{MCPClientError, MCPConnectResult};
 use crate::mcp::read_only_calls::ReadOnlyToolCaller;
 use crate::model::model_manager::Model;
 use crate::model::slp_model::TrainProgressCallback;
+use crate::model::spec::MODEL_SPECS;
 use crate::model_factory::ModelFactory;
 use crate::model_host::client::{LocalModelService, ModelClient, ModelHostError, get_model_client};
 use crate::model_host::remote_llm::RemoteLLM;
@@ -1072,14 +1072,14 @@ impl ModelService {
         {
             let mut ws = workspace.write();
             if ws.get_model(Some(&default)).is_none() {
-                let Some(model_type) = SUPPORTED_MODELS.get(&default) else {
+                let Some(spec) = MODEL_SPECS.get(&default) else {
                     return Err(ModelServiceError::value(format!(
                         "Default model {default} not found in workspace"
                     )));
                 };
                 ws.add_model(
                     &default,
-                    &(model_type.model_id)(),
+                    &spec.model_id,
                     Some(Self::default_model_config(&default)),
                     true,
                 );
@@ -1562,11 +1562,9 @@ impl ModelService {
                 );
                 continue;
             };
-            // The handler the model class declares alongside its VISION
+            // The handler the model's spec declares alongside its VISION
             // capability (falls back to GGUF-arch sniffing when absent).
-            let vision_handler = SUPPORTED_MODELS
-                .get(&ws_model.model_name)
-                .and_then(|cls| (cls.vision_chat_handler)());
+            let vision_handler = MODEL_SPECS.get(&ws_model.model_name).and_then(|spec| spec.vision_chat_handler.clone());
             if !LlmFactory::vision_handler_supported(&gguf_path, vision_handler.as_deref()) {
                 tracing::warn!(
                     target: LOG_TARGET,
@@ -2006,12 +2004,11 @@ impl ModelService {
             .workspace_handle()
             .and_then(|ws| ws.read().current_project().map(|p| p.id.clone()))
             .unwrap_or_default();
-        let url = ws_model
-            .url
-            .clone()
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| AppSettings::new().slp_api_base);
-        Arc::new(CloudLLM::new(&project_id, &ws_model.model_name, &url, ws_model.context_length))
+        let url = ws_model.url().unwrap_or_else(|| AppSettings::new().slp_api_base);
+        Arc::new(
+            CloudLLM::new(&project_id, &ws_model.model_name, &url, ws_model.context_length())
+                .with_reasoning_budget(ws_model.reasoning_budget_tokens()),
+        )
     }
 
     /// Whether `llm` answers over HTTP rather than from local weights.
@@ -2418,6 +2415,7 @@ impl ModelService {
                     ws.effective_model_enabled(&m.model_name, project)
                         && ws.effective_model_downloaded(&m.model_name)
                         && Some(m.model_name.as_str()) != router_name.as_deref()
+                        && !m.is_remote()
                         && m.effective_capabilities().iter().any(|c| text_caps.contains(&c.as_str()))
                 })
                 .cloned()

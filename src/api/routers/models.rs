@@ -18,12 +18,12 @@ use crate::api::routers::_errors::{status_for, HTTPException};
 use crate::api::services::model_service::ModelServiceError;
 use crate::api::services::{get_model_service, ModelService};
 use crate::config::app_settings::AppSettings;
-use crate::config::SUPPORTED_MODELS;
 use crate::constants::canonical_model_name;
 use crate::model::downloader::artifact_downloader::DownloadError;
 use crate::model::downloader::cancellation::{DownloadCancelled, DownloadInProgress};
+use crate::model::spec::MODEL_SPECS;
 use crate::platform::{get_platform_service, ModelAccessError, PlatformError, PlatformService};
-use crate::types::{ModelCapability, ModelKind};
+use crate::types::{Attention, ModelCapability, ModelKind};
 use crate::workspace::workspace::{Project, SharedWorkspace, Workspace, WorkspaceError};
 
 /// Python logger name (`logging.getLogger(__name__)`).
@@ -488,6 +488,24 @@ pub struct ModelEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub context_length: Option<u32>,
+    /// Parameter count in billions, local or remote; `None` when unknown.
+    #[serde(default)]
+    pub param_size_b: Option<f64>,
+    /// Whether `param_size_b` is an estimate, for the picker to mark.
+    #[serde(default)]
+    pub param_size_estimated: bool,
+    /// Parameters active per token for a mixture-of-experts model; `None`
+    /// for a dense one.
+    #[serde(default)]
+    pub active_param_size_b: Option<f64>,
+    #[serde(default, deserialize_with = "tolerate_unknown_attention")]
+    pub attention: Option<Attention>,
+}
+
+/// An attention type this build doesn't know reads as undeclared rather
+/// than failing the whole catalog row.
+fn tolerate_unknown_attention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Attention>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.as_deref().and_then(Attention::from_value))
 }
 
 fn null_as_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -612,13 +630,11 @@ pub fn list_models_with(
                 entry.thinking = ws.effective_model_thinking(&entry.name, project);
             }
             _ => {
-                if let Some(model_cls) = SUPPORTED_MODELS.get(&entry.name) {
-                    let caps: Vec<&str> =
-                        (model_cls.default_capabilities)().iter().map(|c| c.value()).collect();
-                    entry.capabilities = display_capabilities(&caps);
+                if let Some(spec) = MODEL_SPECS.get(&entry.name) {
+                    entry.capabilities = display_capabilities(&spec.capability_values());
                 } else {
-                    // A model this build has no class for (every remote one)
-                    // keeps the catalog's list, minus names it can't route.
+                    // A row the specs haven't seen keeps the catalog's list,
+                    // minus names it can't route.
                     entry.capabilities.retain(|c| ModelCapability::from_value(c).is_some());
                     entry.capabilities = display_capabilities(&entry.capabilities);
                 }
@@ -627,15 +643,20 @@ pub fn list_models_with(
         if entry.url.as_deref().is_none_or(str::is_empty) {
             entry.url = Some(settings.slp_api_base.clone());
         }
+        if let Some(size) = declared_param_size_b(&entry.name) {
+            entry.param_size_b = Some(size);
+            entry.param_size_estimated = param_size_estimated(&entry.name);
+        }
+        if let Some(spec) = MODEL_SPECS.get(&entry.name) {
+            entry.active_param_size_b = spec.active_param_size_b;
+            entry.attention = spec.attention;
+        }
         result.push(entry);
     }
     drop(ws_guard);
 
     let sort_key = |entry: &ModelEntry| -> (u8, f64) {
-        let size = SUPPORTED_MODELS
-            .get(&entry.name)
-            .map(|cls| (cls.param_size_in_b)())
-            .unwrap_or(0.0);
+        let size = local_param_size_b(&entry.name);
         let tier = match entry.access_level {
             Some(AccessLevel::Free) => 2,
             Some(AccessLevel::FreeLogin) => 1,
@@ -667,13 +688,29 @@ pub fn total_ram_gb() -> Option<f64> {
 /// Approximate RAM for `entry`: ~1GB per billion parameters (Q4 weights plus
 /// context), the same estimate the picker shows.  `None` when unknown.
 pub fn footprint_gb(entry: &ModelEntry) -> Option<f64> {
-    // The test seam stands in for `SUPPORTED_MODELS` when installed (see
+    // The test seam stands in for the model specs when installed (see
     // `set_param_size_override` at the end of this file).
     let size_b = match param_size_override(&entry.name) {
         Some(size) => size.unwrap_or(0.0),
-        None => SUPPORTED_MODELS.get(&entry.name).map(|cls| (cls.param_size_in_b)()).unwrap_or(0.0),
+        None => local_param_size_b(&entry.name),
     };
     if size_b > 0.0 { Some(size_b) } else { None }
+}
+
+/// Parameter count the spec of `name` declares, local or remote.
+fn declared_param_size_b(name: &str) -> Option<f64> {
+    MODEL_SPECS.get(name).map(|spec| spec.param_size_b).filter(|size| *size > 0.0)
+}
+
+/// Whether the size the spec of `name` declares is an estimate.
+fn param_size_estimated(name: &str) -> bool {
+    MODEL_SPECS.get(name).is_some_and(|spec| spec.param_size_estimated)
+}
+
+/// Parameter count of the local model `name`, 0 when unknown.  A remote
+/// model counts as 0: it takes no memory here and sorts after local ones.
+fn local_param_size_b(name: &str) -> f64 {
+    MODEL_SPECS.get(name).filter(|spec| !spec.is_remote()).map(|spec| spec.param_size_b).unwrap_or(0.0)
 }
 
 /// Set `recommended` on the models to badge for this machine.
@@ -797,6 +834,18 @@ pub struct WorkspaceModelEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub context_length: Option<u32>,
+    /// Parameter count in billions, local or remote; `None` when unknown.
+    #[serde(default)]
+    pub param_size_b: Option<f64>,
+    /// Whether `param_size_b` is an estimate, for the picker to mark.
+    #[serde(default)]
+    pub param_size_estimated: bool,
+    /// Parameters active per token for a mixture-of-experts model; `None`
+    /// for a dense one.
+    #[serde(default)]
+    pub active_param_size_b: Option<f64>,
+    #[serde(default)]
+    pub attention: Option<Attention>,
 }
 
 /// `sorted(models, key=lambda m: m._rank, reverse=True)`: best model first
@@ -841,6 +890,8 @@ pub async fn list_workspace_models_with(
             .filter(|m| canonical_model_name(&m.model_name) != bootstrap_model)
             .collect();
         sort_by_rank_desc(&mut models, |m| m.rank());
+        // Remote models list after the local ones, as they route.
+        models.sort_by_key(|m| m.is_remote());
         Ok(models
             .into_iter()
             .map(|m| WorkspaceModelEntry {
@@ -851,9 +902,13 @@ pub async fn list_workspace_models_with(
                 enabled: m.enabled,
                 capabilities: display_capabilities(&m.effective_capabilities()),
                 thinking: ws.effective_model_thinking(&m.model_name, None),
-                kind: m.kind,
-                url: m.url.clone(),
-                context_length: m.context_length,
+                kind: m.kind(),
+                url: m.url(),
+                context_length: m.context_length(),
+                param_size_b: declared_param_size_b(&m.model_name),
+                param_size_estimated: param_size_estimated(&m.model_name),
+                active_param_size_b: m.spec().and_then(|spec| spec.active_param_size_b),
+                attention: m.spec().and_then(|spec| spec.attention),
             })
             .collect())
     };
@@ -939,7 +994,7 @@ pub async fn update_workspace_model_handler(
 /// unexpected a 500.
 ///
 /// `capabilities` in the request body is accepted for backward compatibility
-/// but ignored — capabilities are read-only from the model class.
+/// but ignored — capabilities are read-only from the model spec.
 pub async fn update_workspace_model<H: WorkspaceModelHost + ?Sized>(
     model_name: &str,
     request: UpdateWorkspaceModelRequest,
@@ -1047,6 +1102,18 @@ pub struct ProjectModelEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub context_length: Option<u32>,
+    /// Parameter count in billions, local or remote; `None` when unknown.
+    #[serde(default)]
+    pub param_size_b: Option<f64>,
+    /// Whether `param_size_b` is an estimate, for the picker to mark.
+    #[serde(default)]
+    pub param_size_estimated: bool,
+    /// Parameters active per token for a mixture-of-experts model; `None`
+    /// for a dense one.
+    #[serde(default)]
+    pub active_param_size_b: Option<f64>,
+    #[serde(default)]
+    pub attention: Option<Attention>,
 }
 
 /// Body of `PATCH /v1/projects/{project_id}/models/{model_name}`.
@@ -1099,7 +1166,7 @@ pub async fn list_project_models(
 ///
 /// Entries are seeded from the workspace (app-default) registry; a project's
 /// own settings override those defaults.  Capabilities are read-only from the
-/// model class, and so is `downloaded` — weights are shared workspace-wide.
+/// model spec, and so is `downloaded` — weights are shared workspace-wide.
 pub async fn list_project_models_with(
     project_id: &str,
     model_service: &ModelService,
@@ -1113,6 +1180,8 @@ pub async fn list_project_models_with(
         let mut models: Vec<_> =
             ws.models.iter().filter(|m| !ws.is_bootstrap_model(&m.model_name)).collect();
         sort_by_rank_desc(&mut models, |m| m.rank());
+        // Remote models list after the local ones, as they route.
+        models.sort_by_key(|m| m.is_remote());
         Ok(models
             .into_iter()
             .map(|m| ProjectModelEntry {
@@ -1127,8 +1196,12 @@ pub async fn list_project_models_with(
                     .map(|pm| pm.settings.clone())
                     .unwrap_or_default(),
                 kind: m.kind,
-                url: m.url.clone(),
-                context_length: m.context_length,
+                url: m.url(),
+                context_length: m.context_length(),
+                param_size_b: declared_param_size_b(&m.model_name),
+                param_size_estimated: param_size_estimated(&m.model_name),
+                active_param_size_b: m.spec().and_then(|spec| spec.active_param_size_b),
+                attention: m.spec().and_then(|spec| spec.attention),
             })
             .collect())
     };
@@ -1287,9 +1360,8 @@ pub async fn update_project_model_with(
 
 // ===== BEGIN api_routes_misc: test seam for tests/unit/test_model_recommendation.rs =====
 
-/// Replacement for the `SUPPORTED_MODELS` parameter-size lookup behind
-/// [`footprint_gb`]: model name → `param_size_in_b()` (`None` = unknown model).
-/// The Python tests patch `models.SUPPORTED_MODELS` with fake classes.
+/// Replacement for the model-spec parameter-size lookup behind
+/// [`footprint_gb`]: model name → parameter count (`None` = unknown model).
 pub type ParamSizeLookup = Arc<dyn Fn(&str) -> Option<f64> + Send + Sync>;
 
 static PARAM_SIZE_OVERRIDE: once_cell::sync::Lazy<parking_lot::RwLock<Option<ParamSizeLookup>>> =
