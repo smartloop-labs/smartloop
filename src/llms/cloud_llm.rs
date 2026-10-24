@@ -28,6 +28,11 @@ const LOG_TARGET: &str = "smartloop.llms.cloud";
 /// Context window assumed when the catalog gives none.
 pub const DEFAULT_CONTEXT_LENGTH: usize = 32_768;
 
+/// Reasoning allowance added to a capped request when the catalog gives
+/// none.  Reasoning models count their thinking against `max_tokens`, and
+/// the ones measured spent 50-350 tokens before answering a short prompt.
+pub const DEFAULT_REASONING_BUDGET_TOKENS: usize = 1024;
+
 const CHAT_PATH: &str = "/v1/chat/completions";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Whole-request budget, streamed body included: long enough for a long
@@ -95,6 +100,7 @@ pub struct CloudLLM {
     project_id: String,
     model_name: String,
     context_length: usize,
+    reasoning_budget_tokens: usize,
     client: SLPPlatformClient,
     send_credentials: bool,
     cancelled: RwLock<Option<CancelEvent>>,
@@ -124,10 +130,19 @@ impl CloudLLM {
             project_id: project_id.to_string(),
             model_name: model_name.to_string(),
             context_length: context_length.map(|n| n as usize).filter(|n| *n > 0).unwrap_or(DEFAULT_CONTEXT_LENGTH),
+            reasoning_budget_tokens: DEFAULT_REASONING_BUDGET_TOKENS,
             client: SLPPlatformClient::with_hooks(url, auth_headers_fn, refresh_fn),
             send_credentials,
             cancelled: RwLock::new(None),
         }
+    }
+
+    /// Use the catalog's reasoning budget; `None` keeps the default.
+    pub fn with_reasoning_budget(mut self, budget: Option<u32>) -> Self {
+        if let Some(budget) = budget {
+            self.reasoning_budget_tokens = budget as usize;
+        }
+        self
     }
 
     pub fn model_name(&self) -> &str {
@@ -145,8 +160,11 @@ impl CloudLLM {
             "stream": stream,
             "project_id": self.project_id,
         });
+        // A caller's cap sizes the answer; the model's reasoning comes on
+        // top, or a short cap is spent thinking and the answer comes back
+        // empty.
         if let Some(max_tokens) = options.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
+            body["max_tokens"] = json!(max_tokens + self.reasoning_budget_tokens);
         }
         body
     }

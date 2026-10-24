@@ -802,6 +802,11 @@ impl WorkspaceModel {
         self.spec().and_then(|spec| spec.context_length)
     }
 
+    /// The reasoning budget the spec declares, if any.
+    pub fn reasoning_budget_tokens(&self) -> Option<u32> {
+        self.spec().and_then(|spec| spec.reasoning_budget_tokens)
+    }
+
     /// Parameter count in billions, taken from the spec (the authoritative
     /// source).  0 for a model without a spec or a size.
     pub fn param_size_b(&self) -> f64 {

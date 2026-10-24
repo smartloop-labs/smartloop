@@ -198,3 +198,11 @@ fn test_the_stored_type_stands_when_no_spec_is_known() {
     let added = ws.add_remote_model("remote-unhydrated", true);
     assert!(added.is_remote());
 }
+
+#[test]
+fn test_the_reasoning_budget_comes_from_the_spec() {
+    remote_spec("remote-thinker", json!({"capabilities": ["general"], "reasoning_budget_tokens": 2048}));
+    let mut ws = workspace();
+    assert_eq!(ws.add_remote_model("remote-thinker", true).reasoning_budget_tokens(), Some(2048));
+    assert_eq!(ws.add_remote_model("remote-no-budget", true).reasoning_budget_tokens(), None);
+}

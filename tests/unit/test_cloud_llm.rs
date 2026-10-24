@@ -10,7 +10,9 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use smartloop::llms::base_llm::{BaseLLM, CallOptions};
-use smartloop::llms::cloud_llm::{credentials_allowed, describe_failure, CloudLLM, DEFAULT_CONTEXT_LENGTH};
+use smartloop::llms::cloud_llm::{
+    credentials_allowed, describe_failure, CloudLLM, DEFAULT_CONTEXT_LENGTH, DEFAULT_REASONING_BUDGET_TOKENS,
+};
 use smartloop::platform::client::{AuthHeadersFn, Headers};
 
 use crate::shared::workspace_support::EnvGuard;
@@ -113,7 +115,51 @@ async fn test_call_returns_the_whole_answer() {
     assert_eq!(answer, "Hello!");
     let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
     assert_eq!(sent["stream"], false);
-    assert_eq!(sent["max_tokens"], 64);
+    // The cap sizes the answer; the reasoning budget comes on top.
+    assert_eq!(sent["max_tokens"], 64 + DEFAULT_REASONING_BUDGET_TOKENS);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_the_catalog_reasoning_budget_replaces_the_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        })))
+        .mount(&server)
+        .await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+    let llm = Arc::new(llm.with_reasoning_budget(Some(4096)));
+
+    tokio::task::spawn_blocking(move || llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), thinking: None }))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
+    assert_eq!(sent["max_tokens"], 256 + 4096);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_an_uncapped_request_stays_uncapped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        })))
+        .mount(&server)
+        .await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+    let llm = Arc::new(llm);
+
+    tokio::task::spawn_blocking(move || llm.call(PROMPT, None, CallOptions::default())).await.unwrap().unwrap();
+
+    let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
+    assert!(sent.get("max_tokens").is_none());
 }
 
 #[tokio::test]
