@@ -153,20 +153,35 @@ impl CloudLLM {
         self.client.base_url()
     }
 
-    fn body(&self, messages: &[ChatMessage], stream: bool, options: CallOptions) -> Value {
+    /// The `max_tokens` to send for a caller's cap.  The cap sizes the
+    /// answer; the model's reasoning comes on top, or a short cap is spent
+    /// thinking and the answer comes back empty.
+    fn request_max_tokens(&self, options: CallOptions) -> Option<usize> {
+        options.max_tokens.map(|cap| cap + self.reasoning_budget_tokens)
+    }
+
+    fn body(&self, messages: &[ChatMessage], stream: bool, max_tokens: Option<usize>) -> Value {
         let mut body = json!({
             "model": self.model_name,
             "messages": messages,
             "stream": stream,
             "project_id": self.project_id,
         });
-        // A caller's cap sizes the answer; the model's reasoning comes on
-        // top, or a short cap is spent thinking and the answer comes back
-        // empty.
-        if let Some(max_tokens) = options.max_tokens {
-            body["max_tokens"] = json!(max_tokens + self.reasoning_budget_tokens);
+        if let Some(max_tokens) = max_tokens {
+            body["max_tokens"] = json!(max_tokens);
         }
         body
+    }
+
+    /// One non-streaming completion: the answer and why it stopped.
+    fn complete(&self, messages: &[ChatMessage], max_tokens: Option<usize>) -> anyhow::Result<(String, Option<String>)> {
+        let response = self.post(&self.body(messages, false, max_tokens)).map_err(anyhow::Error::msg)?;
+        let data: Value = response
+            .json()
+            .map_err(|e| anyhow::anyhow!("{} sent an unreadable answer: {e}", self.model_name))?;
+        let content = data.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or_default();
+        let finish = data.pointer("/choices/0/finish_reason").and_then(Value::as_str);
+        Ok((content.to_string(), finish.map(str::to_string)))
     }
 
     /// POST the chat request, redeeming the refresh token once on a 401.
@@ -239,22 +254,46 @@ impl BaseLLM for CloudLLM {
         self.context_length
     }
 
+    /// A capped answer that runs out of tokens is retried once with twice
+    /// the room.  If it is still cut off it comes back empty: callers treat
+    /// an empty reply as unusable, where a truncated one would pass as
+    /// complete.
     fn call(&self, prompt: &str, _stop: Option<&[String]>, options: CallOptions) -> anyhow::Result<String> {
         let messages = self.create_messages_from_prompt(prompt);
-        let response = self.post(&self.body(&messages, false, options)).map_err(anyhow::Error::msg)?;
-        let data: Value = response
-            .json()
-            .map_err(|e| anyhow::anyhow!("{} sent an unreadable answer: {e}", self.model_name))?;
-        Ok(data
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string())
+        let Some(max_tokens) = self.request_max_tokens(options) else {
+            let (content, finish) = self.complete(&messages, None)?;
+            if finish.as_deref() == Some("length") {
+                tracing::warn!(target: LOG_TARGET, "[cloud] {} ran out of context mid-answer", self.model_name);
+            }
+            return Ok(content);
+        };
+        let (content, finish) = self.complete(&messages, Some(max_tokens))?;
+        if finish.as_deref() != Some("length") {
+            return Ok(content);
+        }
+        tracing::warn!(
+            target: LOG_TARGET,
+            "[cloud] {} hit max_tokens={max_tokens} ({} chars answered) — retrying with {}",
+            self.model_name,
+            content.chars().count(),
+            max_tokens * 2
+        );
+        let (content, finish) = self.complete(&messages, Some(max_tokens * 2))?;
+        if finish.as_deref() != Some("length") {
+            return Ok(content);
+        }
+        tracing::warn!(
+            target: LOG_TARGET,
+            "[cloud] {} hit max_tokens={} again — discarding the truncated answer",
+            self.model_name,
+            max_tokens * 2
+        );
+        Ok(String::new())
     }
 
     fn stream<'a>(&'a self, prompt: &str, options: CallOptions) -> GenerationStream<'a> {
         let messages = self.create_messages_from_prompt(prompt);
-        let response = match self.post(&self.body(&messages, true, options)) {
+        let response = match self.post(&self.body(&messages, true, self.request_max_tokens(options))) {
             Ok(response) => response,
             Err(message) => std::panic::panic_any(message),
         };
@@ -275,6 +314,11 @@ impl BaseLLM for CloudLLM {
                 return None;
             }
             let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+            // Text already streamed can't be taken back, so a cut-off stream
+            // is only reported.
+            if chunk.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length") {
+                tracing::warn!(target: LOG_TARGET, "[cloud] {} stream was cut off at its token limit", self.model_name);
+            }
             match chunk_text(&chunk) {
                 Ok(Some(text)) => return Some(GenerationChunk { text }),
                 Ok(None) => continue,

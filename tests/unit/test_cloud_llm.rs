@@ -312,3 +312,66 @@ fn test_failure_messages() {
     assert_eq!(describe_failure(400, r#"{"detail": "context length exceeded"}"#, "kimi-k2"), "context length exceeded");
     assert_eq!(describe_failure(502, "", "kimi-k2"), "kimi-k2 did not answer (HTTP 502).");
 }
+
+fn answer(content: &str, finish: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}],
+    }))
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_truncated_answer_is_retried_with_twice_the_room() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(answer("Partial", "length")).up_to_n_times(1).mount(&server).await;
+    Mock::given(method("POST")).respond_with(answer("The whole answer.", "stop")).mount(&server).await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+    let llm = Arc::new(llm);
+
+    let reply = tokio::task::spawn_blocking(move || {
+        llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), thinking: None })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(reply, "The whole answer.");
+    let sent = server.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 2);
+    let first = 256 + DEFAULT_REASONING_BUDGET_TOKENS;
+    assert_eq!(sent[0].body_json::<Value>().unwrap()["max_tokens"], first);
+    assert_eq!(sent[1].body_json::<Value>().unwrap()["max_tokens"], first * 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_an_answer_still_truncated_comes_back_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(answer("Cut off mid-", "length")).mount(&server).await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+    let llm = Arc::new(llm);
+
+    let reply = tokio::task::spawn_blocking(move || {
+        llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), thinking: None })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(reply, "");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_an_uncapped_answer_is_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(answer("Long answer", "length")).mount(&server).await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+    let llm = Arc::new(llm);
+
+    let reply = tokio::task::spawn_blocking(move || llm.call(PROMPT, None, CallOptions::default())).await.unwrap().unwrap();
+
+    assert_eq!(reply, "Long answer");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
