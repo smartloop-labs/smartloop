@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::config::app_settings::AppSettings;
-use crate::config::supported_models::SUPPORTED_MODELS;
+use crate::model::spec::MODEL_SPECS;
 use crate::llms::llama::{self, ChatHandler, ChatHandlerRequest, Llama, LlamaModel, LlamaParams};
 use crate::llms::llama_cpp::LlamaCpp;
 use crate::types::ModelCapability;
@@ -245,7 +245,7 @@ pub struct LlamaInstanceOptions {
     pub mmproj_path: Option<String>,
     /// Keep the CLIP/mmproj encoder on CPU.
     pub clip_on_cpu: bool,
-    /// Vision chat-handler name declared by the model class (authoritative).
+    /// Vision chat-handler name declared by the model spec (authoritative).
     pub vision_handler: Option<String>,
     /// Turn the `<think>` block on/off; `None` keeps the template default.
     pub thinking: Option<bool>,
@@ -275,8 +275,8 @@ impl LlmFactory {
     /// that knows its image-token / prompt format.  Using the WRONG handler
     /// (or none) for a model crashes the native clip code, so an arch without
     /// an entry here is treated as unsupported (text-only / skipped) rather
-    /// than guessed.  `gemma3`/`gemma4` are absent because their model classes
-    /// declare the handler explicitly via `vision_chat_handler()`, which is
+    /// than guessed.  `gemma3`/`gemma4` are absent because their model specs
+    /// declare the handler explicitly via `vision_chat_handler`, which is
     /// authoritative and bypasses this arch-sniffing fallback.
     pub const VISION_HANDLER_BY_ARCH: &'static [(&'static [&'static str], &'static str)] = &[
         (&["qwen2vl", "qwen2.5vl", "qwen2_5vl", "qwen3vl", "qwenvl"], "Qwen25VLChatHandler"),
@@ -377,8 +377,8 @@ impl LlmFactory {
 
     /// True when this build can run this model's vision input.
     ///
-    /// `handler_name` is the handler the model class declares
-    /// (`vision_chat_handler()`); when given it is authoritative and the
+    /// `handler_name` is the handler the model spec declares
+    /// (`vision_chat_handler`); when given it is authoritative and the
     /// GGUF-arch guess is skipped.
     pub fn vision_handler_supported(model_path: &str, handler_name: Option<&str>) -> bool {
         let name = match handler_name.filter(|n| !n.is_empty()) {
@@ -407,7 +407,7 @@ impl LlmFactory {
     /// Build the multimodal chat handler for this model, or `None` (load
     /// text-only) when no supported handler exists or it fails to initialize.
     ///
-    /// `handler_name` is the handler declared by the model class and is
+    /// `handler_name` is the handler declared by the model spec and is
     /// authoritative when provided; otherwise the handler is inferred from the
     /// GGUF architecture.  `clip_on_cpu` forces the CLIP/mmproj encoder onto
     /// CPU; the caller sets it only when GPU VRAM is too tight to run the
@@ -469,16 +469,13 @@ impl LlmFactory {
     /// That capability is the single source of truth for "this model's chat
     /// template reads `enable_thinking`" — it is what the model picker shows
     /// and what gates the per-request `thinking` flag.  False for a model
-    /// outside `SUPPORTED_MODELS` (user-added): binding the flag onto a
-    /// template that ignores it does nothing.
+    /// without a spec (user-added): binding the flag onto a template that
+    /// ignores it does nothing.
     pub fn supports_thinking(model_name: Option<&str>) -> bool {
         let Some(model_name) = model_name.filter(|n| !n.is_empty()) else {
             return false;
         };
-        match SUPPORTED_MODELS.get(model_name) {
-            Some(model_cls) => (model_cls.default_capabilities)().contains(&ModelCapability::Thinking),
-            None => false,
-        }
+        MODEL_SPECS.get(model_name).is_some_and(|spec| spec.supports(ModelCapability::Thinking))
     }
 
     /// `(n_batch, n_threads)` for this load.
@@ -510,7 +507,7 @@ impl LlmFactory {
 
     /// True when the loaded GGUF's own chat template reads `enable_thinking`.
     ///
-    /// `supports_thinking` answers from `SUPPORTED_MODELS`, which knows nothing
+    /// `supports_thinking` answers from the model specs, which know nothing
     /// about a model the user built or merged themselves — and a merge of a
     /// reasoning base keeps its template.  The template is the ground truth.
     pub fn template_reads_thinking(llm: &dyn LlamaModel) -> bool {
@@ -524,7 +521,7 @@ impl LlmFactory {
     /// `None` means the model does not support reasoning, so nothing is bound.
     /// Otherwise the answer is, most specific first: the caller's `override_`
     /// (the request's `thinking` field), then `slp_thinking_enabled`, then the
-    /// model class's `thinking_default()`.
+    /// spec's `thinking_default`.
     pub fn thinking_for(model_name: Option<&str>, override_: Option<bool>) -> Option<bool> {
         if !Self::supports_thinking(model_name) {
             return None;
@@ -535,10 +532,7 @@ impl LlmFactory {
         if let Some(setting) = AppSettings::new().thinking_enabled {
             return Some(setting);
         }
-        let default = model_name
-            .and_then(|name| SUPPORTED_MODELS.get(name))
-            .map(|model_cls| (model_cls.thinking_default)())
-            .unwrap_or(false);
+        let default = model_name.and_then(|name| MODEL_SPECS.get(name)).is_some_and(|spec| spec.thinking_default);
         Some(default)
     }
 
@@ -596,7 +590,7 @@ impl LlmFactory {
     /// * `mmproj_path` — CLIP/mmproj GGUF.  When set, the model is loaded as a
     ///   multimodal (vision) instance with a vision chat handler; the
     ///   subprocess probe is skipped and the load is forced in-process.
-    /// * `vision_handler` — chat-handler name declared by the model class;
+    /// * `vision_handler` — chat-handler name declared by the model spec;
     ///   authoritative when set, otherwise inferred from the GGUF architecture.
     /// * `thinking` — turn the model's `<think>` block on/off; `None` keeps the
     ///   chat template's own default.  The block itself is stripped from
@@ -845,7 +839,7 @@ impl LlmFactory {
 
         if thinking.is_none() {
             // The registry could not answer — a user-built or merged model is
-            // not in SUPPORTED_MODELS, so nothing declares THINKING for it.
+            // without a spec, so nothing declares THINKING for it.
             // The GGUF itself can: its chat template either reads
             // `enable_thinking` or it doesn't.  Bind it off by default, which
             // keeps the visible answer as it is and still leaves the flag

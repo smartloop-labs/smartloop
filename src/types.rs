@@ -30,6 +30,78 @@ impl ModelType {
     }
 }
 
+/// Where a model runs: weights on this machine, or behind the platform API.
+///
+/// The catalog's `type` field.  An absent or unknown value is `Local`, which
+/// is what every model was before remote ones existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    #[default]
+    Local,
+    Remote,
+}
+
+impl ModelKind {
+    /// The wire value (`"local"` / `"remote"`).
+    pub fn value(&self) -> &'static str {
+        match self {
+            ModelKind::Local => "local",
+            ModelKind::Remote => "remote",
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        *self == ModelKind::Local
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelKind {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value: Option<String> = Option::deserialize(d)?;
+        Ok(match value.as_deref() {
+            Some("remote") => ModelKind::Remote,
+            Some("local") | None => ModelKind::Local,
+            Some(other) => {
+                tracing::warn!("[models] unknown model type '{other}' — treating as local");
+                ModelKind::Local
+            }
+        })
+    }
+}
+
+/// How a model's attention cost grows with context length (the catalog's
+/// `attention`).  Reported only; nothing routes on it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Attention {
+    /// Every layer attends the whole context: quadratic.
+    Full,
+    /// Most layers attend a local window, with global layers interleaved.
+    SlidingWindow,
+    /// Linear-time attention throughout.
+    Linear,
+    /// Linear-time layers mixed with full-attention ones.
+    Hybrid,
+    /// Each token attends a selected subset of the context (DeepSeek
+    /// Sparse Attention, MiniMax Sparse Attention).
+    Sparse,
+}
+
+impl Attention {
+    /// Resolve a wire value; `None` when unknown.
+    pub fn from_value(value: &str) -> Option<Self> {
+        match value {
+            "full" => Some(Attention::Full),
+            "sliding_window" => Some(Attention::SlidingWindow),
+            "linear" => Some(Attention::Linear),
+            "hybrid" => Some(Attention::Hybrid),
+            "sparse" => Some(Attention::Sparse),
+            _ => None,
+        }
+    }
+}
+
 /// What a model can be routed to (or, for `Thinking`, how it answers).
 ///
 /// Deserialization accepts the legacy spelling `"skills"` (any case, padded)

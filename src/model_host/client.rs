@@ -948,6 +948,7 @@ impl ModelClient for RemoteModelClient {
             max_tokens: max_tokens.map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
             thinking,
             project_id: pinned_project_id().unwrap_or_default(),
+            local_only: crate::llms::cloud_llm::local_only(),
         };
         // No deadline: a slow answer is not a hung host (as with `stream`).
         let reply = self.unary(request, Some(f64::INFINITY), |mut stub, request| async move {
@@ -1016,6 +1017,7 @@ impl ModelClient for RemoteModelClient {
             capability: capability.unwrap_or_default().to_string(),
             thinking,
             project_id: pinned_project_id().unwrap_or_default(),
+            local_only: crate::llms::cloud_llm::local_only(),
         };
         let mut stub = self.connect()?;
         let (sender, receiver) = tokio::sync::mpsc::channel::<Result<String, Status>>(16);
@@ -1066,6 +1068,7 @@ impl ModelClient for RemoteModelClient {
         let request = pb::SupportsThinkingRequest {
             capability: capability.unwrap_or_default().to_string(),
             project_id: pinned_project_id().unwrap_or_default(),
+            local_only: crate::llms::cloud_llm::local_only(),
         };
         let reply = self.unary(request, None, |mut stub, request| async move {
             stub.supports_thinking(request).await
@@ -1084,6 +1087,7 @@ impl ModelClient for RemoteModelClient {
         let request = pb::ModelLabelRequest {
             capability: capability.unwrap_or_default().to_string(),
             project_id: pinned_project_id().unwrap_or_default(),
+            local_only: crate::llms::cloud_llm::local_only(),
         };
         let reply = self.unary(request, None, |mut stub, request| async move {
             stub.model_label(request).await
@@ -1113,6 +1117,7 @@ impl ModelClient for RemoteModelClient {
         let request = pb::ResponseMaxContextRequest {
             capability: capability.unwrap_or_default().to_string(),
             project_id: pinned_project_id().unwrap_or_default(),
+            local_only: crate::llms::cloud_llm::local_only(),
         };
         let reply = self.unary(request, None, |mut stub, request| async move {
             stub.response_max_context_tokens(request).await

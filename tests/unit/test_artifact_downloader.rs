@@ -144,7 +144,7 @@ mod test_resolve_model_name {
         // resolve_model_id and resolve_model_name should be inverses
         let model_id = SLPArtifactDownloader::resolve_model_id("sl-mini");
         if model_id != "sl-mini" {
-            // only if the model is in SUPPORTED_MODELS
+            // only if the model has a spec
             let name = SLPArtifactDownloader::resolve_model_name(&model_id);
             assert_eq!(name, "sl-mini");
         }

@@ -10,7 +10,7 @@
 
 use serial_test::serial;
 
-use smartloop::config::SUPPORTED_MODELS;
+use smartloop::model::spec::MODEL_SPECS;
 use smartloop::constants::{
     BOOTSTRAP_MODEL, canonical_model_name, display_model_name, platform_model_name,
 };
@@ -70,40 +70,37 @@ mod platform_model_name_tests {
     }
 }
 
-mod supported_models {
+mod model_specs {
     use super::*;
 
     #[test]
     fn test_new_name_resolves() {
-        assert!(SUPPORTED_MODELS.get("sl-mini").is_some());
+        assert!(MODEL_SPECS.get("sl-mini").is_some());
     }
 
     #[test]
-    fn test_legacy_name_resolves_to_the_same_class() {
-        assert_eq!(SUPPORTED_MODELS.get(LEGACY), SUPPORTED_MODELS.get("sl-mini"));
-        assert!(SUPPORTED_MODELS.get(LEGACY).is_some());
+    fn test_legacy_name_resolves_to_the_same_spec() {
+        assert_eq!(MODEL_SPECS.get(LEGACY), MODEL_SPECS.get("sl-mini"));
+        assert!(MODEL_SPECS.get(LEGACY).is_some());
     }
 
     #[test]
     fn test_legacy_name_is_a_member() {
-        assert!(SUPPORTED_MODELS.contains(LEGACY));
-        assert_eq!(SUPPORTED_MODELS.get(LEGACY).unwrap(), SUPPORTED_MODELS.get("sl-mini").unwrap());
+        assert!(MODEL_SPECS.contains(LEGACY));
     }
 
     #[test]
     fn test_alias_is_not_listed_as_a_separate_model() {
         // Iteration must not show the same model twice.
-        assert!(!SUPPORTED_MODELS.keys().contains(&LEGACY));
-        assert!(SUPPORTED_MODELS.keys().contains(&"sl-mini"));
+        let keys = MODEL_SPECS.keys();
+        assert!(!keys.iter().any(|k| k == LEGACY));
+        assert!(keys.iter().any(|k| k == "sl-mini"));
     }
 
     #[test]
     fn test_model_id_is_unchanged_by_the_rename() {
         // The model_id names the on-disk directory and the upstream bucket path.
-        assert_eq!(
-            (SUPPORTED_MODELS.get("sl-mini").unwrap().model_id)(),
-            "smartloop-ai/slp-orchestra-mini"
-        );
+        assert_eq!(MODEL_SPECS.get("sl-mini").unwrap().model_id, "smartloop-ai/slp-orchestra-mini");
     }
 }
 

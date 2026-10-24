@@ -13,12 +13,12 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 
-use smartloop::config::supported_models::SUPPORTED_MODELS;
 use smartloop::llms::llama_cpp::{
     ChatCompletionOutput, ChatCompletionRequest, ChatHandler, ChatHandlerRequest, LlamaCpp, LlamaModel, LlamaState,
     LlamaToken, THINKING_MIN_BUDGET,
 };
 use smartloop::llms::llm_factory::LlmFactory;
+use smartloop::model::spec::MODEL_SPECS;
 use smartloop::types::ModelCapability;
 use smartloop::workspace::workspace::WorkspaceModel;
 
@@ -215,17 +215,15 @@ fn test_unknown_workspace_model_is_left_alone() {
 
 #[test]
 fn test_the_bootstrap_model_answers_the_capability_question() {
-    // Its class declares nothing of its own, which broke every model load with
-    // "type object 'GemmaItTextModel' has no attribute 'default_capabilities'".
-    // SLPModel now supplies the floor, and the answer is still no.
+    // It declares only the [General] floor, and the answer is no.
     assert!(!LlmFactory::supports_thinking(Some("sl-mini")));
     assert_eq!(LlmFactory::thinking_for(Some("sl-mini"), None), None);
 }
 
 #[test]
 fn test_capabilities_are_never_empty_and_sl_mini_is_unchanged() {
-    for (name, model_cls) in SUPPORTED_MODELS.items() {
-        assert!(!(model_cls.default_capabilities)().is_empty(), "{name}");
+    for spec in MODEL_SPECS.specs() {
+        assert!(!spec.capabilities.is_empty(), "{}", spec.name);
     }
 
     // The base default has to match what capability inference already gave a
@@ -240,10 +238,10 @@ fn test_capabilities_are_never_empty_and_sl_mini_is_unchanged() {
 
 #[test]
 fn test_every_supported_model_resolves() {
-    // Guards against a model class that answers the capability question but
-    // not the default one (or vice versa) breaking loads for that model.
-    for name in SUPPORTED_MODELS.keys() {
-        let resolved = LlmFactory::thinking_for(Some(name), None);
+    // Guards against a spec that answers the capability question but not the
+    // default one (or vice versa) breaking loads for that model.
+    for name in MODEL_SPECS.keys() {
+        let resolved = LlmFactory::thinking_for(Some(&name), None);
         assert!(matches!(resolved, Some(true) | Some(false) | None), "{name}");
     }
 }

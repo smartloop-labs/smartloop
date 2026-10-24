@@ -1,10 +1,9 @@
 //! Port of `smartloop/model/generic.py`.
 //!
-//! [`GenericModel`] is the shared implementation behind every concrete model:
-//! weight download, document ingestion (files, directories, URLs, Google
-//! Drive links), skills, status, train/build and the cached LLM instance.  The
-//! per-model facts (id, family version, capabilities, ...) come from the
-//! concrete model's [`ModelClass`].
+//! [`GenericModel`] is the one model implementation: weight download,
+//! document ingestion (files, directories, URLs, Google Drive links), skills,
+//! status, train/build and the cached LLM instance.  The per-model facts (id,
+//! family version, capabilities, ...) come from its [`ModelSpec`].
 
 use std::collections::HashSet;
 use std::fs;
@@ -21,7 +20,8 @@ use regex::Regex;
 use crate::llms::base_llm::BaseLLM;
 use crate::loader::ModelLoader;
 use crate::model::downloader::slp_downloader::{SLPDownloader, SharedLogger, SharedWorkspace};
-use crate::model::slp_model::{DocumentProgressCallback, DocumentSource, ModelClass, SLPModel, TrainProgressCallback};
+use crate::model::slp_model::{DocumentProgressCallback, DocumentSource, SLPModel, TrainProgressCallback};
+use crate::model::spec::ModelSpec;
 use crate::paths::expand_home;
 use crate::trainer::{Builder, Trainer, TrainerNotInstalled};
 use crate::types::{ModelCapability, ModelType};
@@ -175,24 +175,21 @@ pub struct GenericModel {
     pub workspace: SharedWorkspace,
     pub logger: SharedLogger,
     pub downloader: Arc<dyn SLPDownloader>,
-    /// The concrete model's static facts (the Python subclass's static methods).
-    pub class: ModelClass,
-    /// The concrete model's modality (the Python `model_type` property).
-    pub model_type: ModelType,
+    /// Everything that sets this model apart from any other.
+    pub spec: Arc<ModelSpec>,
     /// Cache for the loaded model.
     instance_cache: Mutex<Option<Arc<dyn BaseLLM>>>,
 }
 
 impl GenericModel {
-    /// Build a generic model for `class` with modality `model_type`.
+    /// Build the model `spec` describes.
     pub fn new(
         workspace: SharedWorkspace,
         downloader: Arc<dyn SLPDownloader>,
         logger: SharedLogger,
-        class: ModelClass,
-        model_type: ModelType,
+        spec: Arc<ModelSpec>,
     ) -> Self {
-        Self { workspace, logger, downloader, class, model_type, instance_cache: Mutex::new(None) }
+        Self { workspace, logger, downloader, spec, instance_cache: Mutex::new(None) }
     }
 
     /// MD5 hex digest of a file's contents.
@@ -749,31 +746,31 @@ impl SLPModel for GenericModel {
     }
 
     fn model_type(&self) -> ModelType {
-        self.model_type
+        self.spec.model_type()
     }
 
     fn model_id(&self) -> String {
-        (self.class.model_id)()
+        self.spec.model_id.clone()
     }
 
     fn model_version(&self) -> i64 {
-        (self.class.model_version)()
+        self.spec.model_version
     }
 
     fn param_size_in_b(&self) -> f64 {
-        (self.class.param_size_in_b)()
+        self.spec.param_size_b
     }
 
     fn default_capabilities(&self) -> Vec<ModelCapability> {
-        (self.class.default_capabilities)()
+        self.spec.capabilities.clone()
     }
 
     fn thinking_default(&self) -> bool {
-        (self.class.thinking_default)()
+        self.spec.thinking_default
     }
 
     fn vision_chat_handler(&self) -> Option<String> {
-        (self.class.vision_chat_handler)()
+        self.spec.vision_chat_handler.clone()
     }
 
     fn get_instance(&self) -> anyhow::Result<Arc<dyn BaseLLM>> {
@@ -794,144 +791,6 @@ impl SLPModel for GenericModel {
         *cache = Some(Arc::clone(&instance));
         Ok(instance)
     }
-}
-
-/// Define a concrete model type wrapping [`GenericModel`]: a newtype with
-/// inherent static accessors mirroring the Python static methods (these are
-/// what the config registry's [`ModelClass`] points at), `Deref` to the
-/// generic model, and an [`SLPModel`] impl.
-#[macro_export]
-macro_rules! generic_model_type {
-    (
-        $(#[$meta:meta])*
-        $name:ident {
-            model_id: $model_id:expr,
-            model_type: $model_type:expr,
-            model_version: $version:expr,
-            param_size_in_b: $size:expr,
-            default_capabilities: $caps:expr,
-            thinking_default: $thinking:expr,
-            vision_chat_handler: $handler:expr $(,)?
-        }
-    ) => {
-        $(#[$meta])*
-        pub struct $name(pub $crate::model::generic::GenericModel);
-
-        #[allow(non_camel_case_types)]
-        impl $name {
-            /// Construct the model (`Model(workspace, downloader, logger)`).
-            pub fn new(
-                workspace: $crate::model::downloader::slp_downloader::SharedWorkspace,
-                downloader: ::std::sync::Arc<dyn $crate::model::downloader::slp_downloader::SLPDownloader>,
-                logger: $crate::model::downloader::slp_downloader::SharedLogger,
-            ) -> Self {
-                Self($crate::model::generic::GenericModel::new(workspace, downloader, logger, Self::class(), $model_type))
-            }
-
-            /// This model's class descriptor.
-            pub fn class() -> $crate::model::slp_model::ModelClass {
-                $crate::model::slp_model::ModelClass {
-                    class_name: stringify!($name),
-                    model_id: Self::model_id,
-                    model_version: Self::model_version,
-                    param_size_in_b: Self::param_size_in_b,
-                    default_capabilities: Self::default_capabilities,
-                    thinking_default: Self::thinking_default,
-                    vision_chat_handler: Self::vision_chat_handler,
-                }
-            }
-
-            /// The HuggingFace-style model id.
-            pub fn model_id() -> String {
-                ($model_id).to_string()
-            }
-            /// Model family version.
-            pub fn model_version() -> i64 {
-                $version
-            }
-            /// Parameter count in billions.
-            pub fn param_size_in_b() -> f64 {
-                $size
-            }
-            /// Declared capabilities.
-            pub fn default_capabilities() -> Vec<$crate::types::ModelCapability> {
-                $caps
-            }
-            /// Whether reasoning defaults on.
-            pub fn thinking_default() -> bool {
-                $thinking
-            }
-            /// Vision chat-handler name.
-            pub fn vision_chat_handler() -> Option<String> {
-                let handler: Option<&str> = $handler;
-                handler.map(str::to_string)
-            }
-        }
-
-        impl ::std::ops::Deref for $name {
-            type Target = $crate::model::generic::GenericModel;
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        impl $crate::model::slp_model::SLPModel for $name {
-            fn workspace(&self) -> &$crate::model::downloader::slp_downloader::SharedWorkspace {
-                $crate::model::slp_model::SLPModel::workspace(&self.0)
-            }
-            fn logger(&self) -> &$crate::model::downloader::slp_downloader::SharedLogger {
-                $crate::model::slp_model::SLPModel::logger(&self.0)
-            }
-            fn init(&self) -> ::anyhow::Result<()> {
-                $crate::model::slp_model::SLPModel::init(&self.0)
-            }
-            fn add_document(
-                &self,
-                source: $crate::model::slp_model::DocumentSource,
-                progress_callback: Option<$crate::model::slp_model::DocumentProgressCallback>,
-                cwd: Option<&str>,
-                generate_filename: bool,
-            ) -> ::anyhow::Result<Vec<$crate::workspace::types::Document>> {
-                $crate::model::slp_model::SLPModel::add_document(&self.0, source, progress_callback, cwd, generate_filename)
-            }
-            fn add_skill(&self, name: &str, content: &str) -> ::anyhow::Result<()> {
-                $crate::model::slp_model::SLPModel::add_skill(&self.0, name, content)
-            }
-            fn status(&self) -> ::anyhow::Result<()> {
-                $crate::model::slp_model::SLPModel::status(&self.0)
-            }
-            fn build(&self, progress_callback: Option<$crate::model::slp_model::TrainProgressCallback>) -> ::anyhow::Result<()> {
-                $crate::model::slp_model::SLPModel::build(&self.0, progress_callback)
-            }
-            fn train(&self, progress_callback: Option<$crate::model::slp_model::TrainProgressCallback>) -> ::anyhow::Result<()> {
-                $crate::model::slp_model::SLPModel::train(&self.0, progress_callback)
-            }
-            fn model_type(&self) -> $crate::types::ModelType {
-                $crate::model::slp_model::SLPModel::model_type(&self.0)
-            }
-            fn model_id(&self) -> String {
-                $crate::model::slp_model::SLPModel::model_id(&self.0)
-            }
-            fn model_version(&self) -> i64 {
-                $crate::model::slp_model::SLPModel::model_version(&self.0)
-            }
-            fn param_size_in_b(&self) -> f64 {
-                $crate::model::slp_model::SLPModel::param_size_in_b(&self.0)
-            }
-            fn default_capabilities(&self) -> Vec<$crate::types::ModelCapability> {
-                $crate::model::slp_model::SLPModel::default_capabilities(&self.0)
-            }
-            fn thinking_default(&self) -> bool {
-                $crate::model::slp_model::SLPModel::thinking_default(&self.0)
-            }
-            fn vision_chat_handler(&self) -> Option<String> {
-                $crate::model::slp_model::SLPModel::vision_chat_handler(&self.0)
-            }
-            fn get_instance(&self) -> ::anyhow::Result<::std::sync::Arc<dyn $crate::llms::base_llm::BaseLLM>> {
-                $crate::model::slp_model::SLPModel::get_instance(&self.0)
-            }
-        }
-    };
 }
 
 #[cfg(test)]

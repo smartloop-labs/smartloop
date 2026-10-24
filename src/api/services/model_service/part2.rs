@@ -32,6 +32,8 @@ use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
 use crate::agents::orchestrator::{ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions};
 use crate::llms::base_llm::{BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
+use crate::llms::cloud_llm::local_only_scope;
+use crate::model_host::remote_llm::RemoteLLM;
 use crate::llms::llama::ChatCompletionRequest;
 use crate::mcp::account::probe_account;
 use crate::mcp::client::{
@@ -227,6 +229,15 @@ fn same_llm(a: &Arc<dyn BaseLLM>, b: &Arc<dyn BaseLLM>) -> bool {
 /// `a is b` where `b` may be `None`.
 fn is_llm(a: &Arc<dyn BaseLLM>, b: Option<&Arc<dyn BaseLLM>>) -> bool {
     b.is_some_and(|b| same_llm(a, b))
+}
+
+/// `llm`, resolving on device only when it is a model-host handle; a model
+/// loaded in this process is returned as is.
+fn local_only_handle(llm: Arc<dyn BaseLLM>) -> Arc<dyn BaseLLM> {
+    match llm.as_any().downcast_ref::<RemoteLLM>() {
+        Some(remote) if !remote.is_local_only() => Arc::new(remote.local_only_copy()),
+        _ => llm,
+    }
 }
 
 /// `_cap_name(capability)` for an optional capability (`None` → `"None"`).
@@ -636,8 +647,11 @@ impl Iterator for CompletionStream<'_> {
             return None;
         }
         if self.phase == StreamPhase::NotStarted {
-            // Lock around inference - llama-cpp is not thread-safe.
-            self.slot = Some(self.service.inference_slot());
+            // Lock around inference - llama-cpp is not thread-safe.  A cloud
+            // model holds no context, so it doesn't queue behind local ones.
+            if !ModelService::is_cloud_llm(self.llm.as_ref()) {
+                self.slot = Some(self.service.inference_slot());
+            }
             // Propagate cancellation event so the LLM can stop mid-inference.
             self.llm.set_cancelled(self.cancelled.clone());
             self.rx = Some(spawn_llm_stream(
@@ -669,7 +683,12 @@ impl Iterator for CompletionStream<'_> {
                     return None;
                 }
                 StreamMsg::Failed(ex) => {
-                    let fallback = if self.phase == StreamPhase::Primary {
+                    // A cloud model's failure is a message for the user (sign
+                    // in, plan, busy), not a GPU fault: no eviction, and no
+                    // quiet answer from a different model.
+                    let fallback = if self.phase == StreamPhase::Primary
+                        && !ModelService::is_cloud_llm(self.llm.as_ref())
+                    {
                         self.service.default_fallback_llm(&self.llm)
                     } else {
                         None
@@ -1053,6 +1072,10 @@ impl ModelService {
             .llm_for_response(capability)
             .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
 
+        if ModelService::is_cloud_llm(llm.as_ref()) {
+            // `invoke` would turn a refusal into answer text; keep it an error.
+            return llm.call(prompt, None, CallOptions { max_tokens, thinking }).map(|text| text.trim().to_string());
+        }
         let _slot = self.inference_slot();
         match catch_unwind(AssertUnwindSafe(|| llm.invoke(prompt, max_tokens, thinking))) {
             Ok(text) => Ok(text),
@@ -3473,7 +3496,12 @@ impl ModelService {
         // With exactly one model selected, it runs the routing and decision
         // nodes too.  Asked without a capability, so a vision-only selection
         // declines these text-only nodes and they stay on the default model.
-        let pinned_llm = self.pinned_llm_seam(None);
+        // Orchestration runs on device: a remote pin writes what the user
+        // reads, so the routing and decision models resolve local-only.
+        let pinned_llm = {
+            let _scope = local_only_scope(true);
+            self.pinned_llm_seam(None)
+        };
         if let Some(pinned) = pinned_llm.as_ref() {
             tracing::info!(
                 target: LOG,
@@ -3484,7 +3512,10 @@ impl ModelService {
 
         let run = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<OrchestrateOutcome> {
             let service = self.arc();
-            let decision_llm = self.decision_llm.read().clone();
+            // In a project child these are handles to the model host, which
+            // resolves them per call; mark them local-only so it does too.
+            let main_llm = local_only_handle(main_llm.clone());
+            let decision_llm = self.decision_llm.read().clone().map(local_only_handle);
             let orchestrator_llm: Arc<dyn BaseLLM> = pinned_llm.clone().unwrap_or_else(|| main_llm.clone());
             let agent_llm: Arc<dyn BaseLLM> =
                 pinned_llm.clone().or_else(|| decision_llm.clone()).unwrap_or_else(|| main_llm.clone());
@@ -3495,6 +3526,8 @@ impl ModelService {
             let mut options = SLPOrchestratorOptions::default();
             options.agent_llm = Some(ProviderOutput::from_value(agent_llm));
             options.large_llm = None;
+            // Not local-only: these write step output the user reads.  The
+            // router resolves its decision nodes inside a local-only scope.
             options.large_llm_provider = Some(provider0({
                 let service = service.clone();
                 move || ProviderOutput::from_value(service.large_llm_seam())
@@ -3513,6 +3546,7 @@ impl ModelService {
             }));
             options.model_path = self.model_gguf_path.read().clone();
             options.project_id = self.get_project_id();
+            options.answers_remotely = self.answers_remotely();
             options.executor = Some(self.get_llm_executor());
             let orchestrator = SLPOrchestrator::new(orchestrator_llm, options);
 

@@ -17,7 +17,8 @@ use serde_json::Value;
 use crate::platform::client::JsonObject;
 use crate::platform::service::now;
 
-/// Schema (identical to the Python `_SCHEMA`, so existing DBs keep working).
+/// Schema.  `model_catalog` is a pure cache; [`drop_outdated_model_catalog`]
+/// discards one written before its current columns.
 pub const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS workspace (
     id         TEXT PRIMARY KEY,
@@ -38,14 +39,26 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS model_catalog (
-    model_id      TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    size          TEXT,
-    description   TEXT,
-    access_level  TEXT,
-    is_accessible INTEGER NOT NULL DEFAULT 0,
-    sha256        TEXT,
-    fetched_at    REAL NOT NULL
+    name           TEXT PRIMARY KEY,
+    model_id       TEXT,            -- NULL for a remote model
+    size           TEXT,
+    description    TEXT,
+    access_level   TEXT,
+    is_accessible  INTEGER NOT NULL DEFAULT 0,
+    sha256         TEXT,
+    type           TEXT,
+    url            TEXT,
+    capabilities   TEXT,            -- JSON array of capability names
+    context_length INTEGER,
+    param_size_b        REAL,
+    param_size_estimated INTEGER,
+    active_param_size_b REAL,
+    attention           TEXT,
+    reasoning_budget_tokens INTEGER,
+    model_version       INTEGER,
+    thinking_default    INTEGER,
+    vision_chat_handler TEXT,
+    fetched_at     REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS mcp_catalog (
@@ -229,6 +242,21 @@ pub fn python_json_dumps(value: &Value) -> String {
     String::from_utf8(out).expect("JSON output is UTF-8")
 }
 
+/// Drop a `model_catalog` table from before its newest column (the
+/// reasoning budget; before that, attention, the other model spec fields,
+/// and remote models and their name key).  It only
+/// caches the cloud catalog, so the next fetch refills it.
+fn drop_outdated_model_catalog(conn: &Connection) -> anyhow::Result<()> {
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('model_catalog')")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<_, _>>()?;
+    if !columns.is_empty() && !columns.iter().any(|c| c == "reasoning_budget_tokens") {
+        conn.execute_batch("DROP TABLE model_catalog")?;
+    }
+    Ok(())
+}
+
 impl WorkspaceDB {
     /// Open (creating parent dirs and schema as needed) the DB at *db_path*.
     pub fn new(db_path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -239,6 +267,7 @@ impl WorkspaceDB {
             }
         }
         let conn = Connection::open(&db_path)?;
+        drop_outdated_model_catalog(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { db_path, conn: Mutex::new(conn) })
     }
@@ -334,7 +363,10 @@ impl WorkspaceDB {
     pub fn list_models(&self) -> anyhow::Result<Vec<JsonObject>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT model_id, name, size, description, access_level, is_accessible, sha256 \
+            "SELECT model_id, name, size, description, access_level, is_accessible, sha256, \
+                    type, url, capabilities, context_length, \
+                    param_size_b, model_version, thinking_default, vision_chat_handler, \
+                    param_size_estimated, active_param_size_b, attention, reasoning_budget_tokens \
              FROM model_catalog",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -346,13 +378,37 @@ impl WorkspaceDB {
             m.insert("access_level".into(), sql_to_json(r.get(4)?));
             m.insert("is_accessible".into(), Value::Bool(sql_truthy(&r.get::<_, SqlValue>(5)?)));
             m.insert("sha256".into(), sql_to_json(r.get(6)?));
+            m.insert("type".into(), sql_to_json(r.get(7)?));
+            m.insert("url".into(), sql_to_json(r.get(8)?));
+            if let SqlValue::Text(caps) = r.get::<_, SqlValue>(9)? {
+                if let Ok(caps @ Value::Array(_)) = serde_json::from_str::<Value>(&caps) {
+                    m.insert("capabilities".into(), caps);
+                }
+            }
+            m.insert("context_length".into(), sql_to_json(r.get(10)?));
+            m.insert("param_size_b".into(), sql_to_json(r.get(11)?));
+            m.insert("model_version".into(), sql_to_json(r.get(12)?));
+            let thinking_default = match r.get::<_, SqlValue>(13)? {
+                SqlValue::Null => Value::Null,
+                flag => Value::Bool(sql_truthy(&flag)),
+            };
+            m.insert("thinking_default".into(), thinking_default);
+            m.insert("vision_chat_handler".into(), sql_to_json(r.get(14)?));
+            let param_size_estimated = match r.get::<_, SqlValue>(15)? {
+                SqlValue::Null => Value::Null,
+                flag => Value::Bool(sql_truthy(&flag)),
+            };
+            m.insert("param_size_estimated".into(), param_size_estimated);
+            m.insert("active_param_size_b".into(), sql_to_json(r.get(16)?));
+            m.insert("attention".into(), sql_to_json(r.get(17)?));
+            m.insert("reasoning_budget_tokens".into(), sql_to_json(r.get(18)?));
             Ok(m)
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Replace the entire model catalog from a cloud API response
-    /// (`model_id`, `name` required).
+    /// Replace the entire model catalog from a cloud API response (`name`
+    /// required).
     ///
     /// Every row is validated before anything is written, and the replace is
     /// one transaction, so a malformed entry leaves the previous catalog intact.
@@ -361,14 +417,31 @@ impl WorkspaceDB {
         let rows = models
             .iter()
             .map(|m| {
+                let capabilities = match m.get("capabilities") {
+                    Some(caps @ Value::Array(_)) => SqlValue::Text(caps.to_string()),
+                    _ => SqlValue::Null,
+                };
                 Ok((
-                    required(m, "model_id")?,
-                    required(m, "name")?,
-                    optional(m, "size")?,
-                    optional(m, "description")?,
-                    optional(m, "access_level")?,
-                    int_flag(m, "is_accessible", false)?,
-                    optional(m, "sha256")?,
+                    (
+                        optional(m, "model_id")?,
+                        required(m, "name")?,
+                        optional(m, "size")?,
+                        optional(m, "description")?,
+                        optional(m, "access_level")?,
+                        int_flag(m, "is_accessible", false)?,
+                        optional(m, "sha256")?,
+                    ),
+                    (optional(m, "type")?, optional(m, "url")?, capabilities, optional(m, "context_length")?),
+                    (
+                        optional(m, "param_size_b")?,
+                        optional(m, "model_version")?,
+                        optional(m, "thinking_default")?,
+                        optional(m, "vision_chat_handler")?,
+                        optional(m, "param_size_estimated")?,
+                        optional(m, "active_param_size_b")?,
+                        optional(m, "attention")?,
+                        optional(m, "reasoning_budget_tokens")?,
+                    ),
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -379,11 +452,29 @@ impl WorkspaceDB {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO model_catalog
-                       (model_id, name, size, description, access_level, is_accessible, sha256, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       (model_id, name, size, description, access_level, is_accessible, sha256,
+                        type, url, capabilities, context_length,
+                        param_size_b, model_version, thinking_default, vision_chat_handler,
+                        param_size_estimated, active_param_size_b, attention,
+                        reasoning_budget_tokens, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ",
             )?;
-            for (model_id, name, size, description, access_level, is_accessible, sha256) in rows {
+            for (
+                (model_id, name, size, description, access_level, is_accessible, sha256),
+                (kind, url, capabilities, context_length),
+                (
+                    param_size_b,
+                    model_version,
+                    thinking_default,
+                    vision_chat_handler,
+                    param_size_estimated,
+                    active_param_size_b,
+                    attention,
+                    reasoning_budget_tokens,
+                ),
+            ) in rows
+            {
                 stmt.execute(params![
                     model_id,
                     name,
@@ -392,6 +483,18 @@ impl WorkspaceDB {
                     access_level,
                     is_accessible,
                     sha256,
+                    kind,
+                    url,
+                    capabilities,
+                    context_length,
+                    param_size_b,
+                    model_version,
+                    thinking_default,
+                    vision_chat_handler,
+                    param_size_estimated,
+                    active_param_size_b,
+                    attention,
+                    reasoning_budget_tokens,
                     fetched_at
                 ])?;
             }

@@ -1,7 +1,7 @@
 //! Port of `smartloop/model/slp_model.py`.
 //!
-//! The abstract Smartloop model ([`SLPModel`]).  The static facts a model class
-//! declares live in [`ModelClass`] (from the config registry).
+//! The abstract Smartloop model ([`SLPModel`]).  The facts that differ between
+//! models live in their [`ModelSpec`](crate::model::spec::ModelSpec).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,10 +52,6 @@ pub type DocumentProgressCallback = Arc<dyn Fn(Value) + Send + Sync>;
 /// Progress callback for training / building (receives the trainer's
 /// progress payload as JSON).
 pub type TrainProgressCallback = Arc<dyn Fn(Value) + Send + Sync>;
-
-/// The runtime stand-in for a Python model class (`Type[SLPModel]`), defined
-/// by the config module's registry: the static methods as fn pointers.
-pub use crate::config::supported_models::ModelClass;
 
 /// Base-class default for `default_capabilities()`: every model does at least
 /// general chat.

@@ -296,6 +296,25 @@ mod test_list_models {
 
     #[test]
     #[serial]
+    fn test_listed_models_hydrate_the_spec_registry() {
+        use smartloop::model::spec::MODEL_SPECS;
+
+        let row = obj(json!({
+            "name": "spec-hydration-probe", "model_id": "org/spec-hydration-probe",
+            "param_size_b": 7.0, "capabilities": ["general", "dp"],
+        }));
+        let client = FakeClient::with_models(vec![row]);
+        let svc = service(&client, None);
+        svc.list_models(false).unwrap();
+
+        let spec = MODEL_SPECS.get("spec-hydration-probe").expect("hydrated from the catalog");
+        assert_eq!(spec.model_id, "org/spec-hydration-probe");
+        assert_eq!(spec.param_size_b, 7.0);
+        assert_eq!(spec.capability_values(), ["general", "dp"]);
+    }
+
+    #[test]
+    #[serial]
     fn test_fetches_from_cloud_on_first_call() {
         let (_tmp, db) = db();
         let client = FakeClient::with_models(models());

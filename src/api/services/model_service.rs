@@ -33,7 +33,6 @@ use crate::agents::planner::{FETCH_SERVER_ID, SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOO
 use crate::api::config::api_settings;
 use crate::config::app_settings::AppSettings;
 use crate::config::model_config::ModelConfig;
-use crate::config::SUPPORTED_MODELS;
 use crate::constants::{canonical_model_name, display_model_label};
 use crate::conversation_store::{ConversationStore, MessageInput};
 use crate::db::feedback_indexer::FeedbackIndexer;
@@ -42,12 +41,14 @@ use crate::db::store_factory::StoreFactory;
 use crate::db::workspace_indexer::{WORKSPACE_COLLECTION, WorkspaceIndexer};
 use crate::feedback_store::{ConversationTurn, FeedbackEntry, FeedbackStore, Rating};
 use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationStream};
+use crate::llms::cloud_llm::CloudLLM;
 use crate::llms::llm_factory::{LlamaInstanceOptions, LlmFactory};
 use crate::llms::thinking::strip_thinking;
 use crate::mcp::client::{MCPClientError, MCPConnectResult};
 use crate::mcp::read_only_calls::ReadOnlyToolCaller;
 use crate::model::model_manager::Model;
 use crate::model::slp_model::TrainProgressCallback;
+use crate::model::spec::MODEL_SPECS;
 use crate::model_factory::ModelFactory;
 use crate::model_host::client::{LocalModelService, ModelClient, ModelHostError, get_model_client};
 use crate::model_host::remote_llm::RemoteLLM;
@@ -1071,14 +1072,14 @@ impl ModelService {
         {
             let mut ws = workspace.write();
             if ws.get_model(Some(&default)).is_none() {
-                let Some(model_type) = SUPPORTED_MODELS.get(&default) else {
+                let Some(spec) = MODEL_SPECS.get(&default) else {
                     return Err(ModelServiceError::value(format!(
                         "Default model {default} not found in workspace"
                     )));
                 };
                 ws.add_model(
                     &default,
-                    &(model_type.model_id)(),
+                    &spec.model_id,
                     Some(Self::default_model_config(&default)),
                     true,
                 );
@@ -1561,11 +1562,9 @@ impl ModelService {
                 );
                 continue;
             };
-            // The handler the model class declares alongside its VISION
+            // The handler the model's spec declares alongside its VISION
             // capability (falls back to GGUF-arch sniffing when absent).
-            let vision_handler = SUPPORTED_MODELS
-                .get(&ws_model.model_name)
-                .and_then(|cls| (cls.vision_chat_handler)());
+            let vision_handler = MODEL_SPECS.get(&ws_model.model_name).and_then(|spec| spec.vision_chat_handler.clone());
             if !LlmFactory::vision_handler_supported(&gguf_path, vision_handler.as_deref()) {
                 tracing::warn!(
                     target: LOG_TARGET,
@@ -1746,6 +1745,10 @@ impl ModelService {
             return None;
         }
         let ws_model = selected.remove(0);
+        if ws_model.is_remote() && crate::llms::cloud_llm::local_only() {
+            // Orchestration stays on device; the remote pin is for the answer.
+            return None;
+        }
 
         let caps: HashSet<String> = ws_model
             .effective_capabilities()
@@ -1783,6 +1786,11 @@ impl ModelService {
             return hook(capability);
         }
         let ws_model = self.pinned_model(capability)?;
+        if ws_model.is_remote() {
+            // Answered over HTTP from whichever process asks; there is
+            // nothing for the model host to hold.
+            return Some(self.cloud_llm(&ws_model));
+        }
         if self.remote_device().is_some() {
             // The pin says *which* model; putting it in memory is the host's
             // business.  Loading the GGUF here would be a second copy of the
@@ -1864,6 +1872,11 @@ impl ModelService {
     ) -> Option<Arc<dyn BaseLLM>> {
         if let Some(hook) = self.hooks().load_workspace_llm {
             return hook(ws_model, reason, reserve_gb, evict);
+        }
+        if ws_model.is_remote() {
+            // No weights, so no cache slot, fit guard or eviction.
+            *self.capability_skip.lock() = None;
+            return Some(self.cloud_llm(ws_model));
         }
         let Some(workspace) = self.workspace_handle() else {
             tracing::warn!(
@@ -1983,6 +1996,26 @@ impl ModelService {
         }
     }
 
+    /// A [`CloudLLM`] for a remote workspace model.  Built per call: it holds
+    /// no weights, and a fresh instance keeps one request's cancellation
+    /// event off another's.
+    pub fn cloud_llm(&self, ws_model: &WorkspaceModel) -> Arc<dyn BaseLLM> {
+        let project_id = self
+            .workspace_handle()
+            .and_then(|ws| ws.read().current_project().map(|p| p.id.clone()))
+            .unwrap_or_default();
+        let url = ws_model.url().unwrap_or_else(|| AppSettings::new().slp_api_base);
+        Arc::new(
+            CloudLLM::new(&project_id, &ws_model.model_name, &url, ws_model.context_length())
+                .with_reasoning_budget(ws_model.reasoning_budget_tokens()),
+        )
+    }
+
+    /// Whether `llm` answers over HTTP rather than from local weights.
+    pub fn is_cloud_llm(llm: &dyn BaseLLM) -> bool {
+        llm.as_any().is::<CloudLLM>()
+    }
+
     /// Whether `model_name` should reason, per the picker's setting.
     ///
     /// Reasoning is a property of the model, not of a request: it is stored
@@ -2075,16 +2108,22 @@ impl ModelService {
     }
 
     /// `workspace.ranked_models_for(capability, current_project)` through the
-    /// test seam.
+    /// test seam, without remote models inside a local-only scope.
     fn ranked_models_for(&self, capability: &str) -> Vec<WorkspaceModel> {
-        if let Some(hook) = self.hooks().ranked_models_for {
-            return hook(capability);
-        }
-        let Some(workspace) = self.workspace_handle() else {
-            return Vec::new();
+        let mut ranked = match self.hooks().ranked_models_for {
+            Some(hook) => hook(capability),
+            None => {
+                let Some(workspace) = self.workspace_handle() else {
+                    return Vec::new();
+                };
+                let ws = workspace.read();
+                ws.ranked_models_for(capability, ws.current_project())
+            }
         };
-        let ws = workspace.read();
-        ws.ranked_models_for(capability, ws.current_project())
+        if crate::llms::cloud_llm::local_only() {
+            ranked.retain(|m| !m.is_remote());
+        }
+        ranked
     }
 
     /// True when some selected model declares `capability` (loads nothing).
@@ -2165,7 +2204,22 @@ impl ModelService {
         // selected models both declare the capability, the bigger one does
         // the step, and a smaller one runs it only when the bigger cannot be
         // loaded.  Size ties go to broader coverage, then the newer version.
-        let ranked = Self::ranked_candidates(self.ranked_models_for(capability), &[capability], true);
+        //
+        // Then by tier, keeping that order within each: local models, which
+        // run here when they fit; remote ones, which always resolve; and the
+        // bootstrap model last, since any other selected model does the step
+        // better.
+        let mut ranked = Self::ranked_candidates(self.ranked_models_for(capability), &[capability], true);
+        let bootstrap = canonical_model_name(&api_settings().default_model);
+        ranked.sort_by_key(|m| {
+            if canonical_model_name(&m.model_name) == bootstrap {
+                2
+            } else if m.is_remote() {
+                1
+            } else {
+                0
+            }
+        });
         if ranked.is_empty() {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -2180,7 +2234,8 @@ impl ModelService {
         // model already serving — evicting it and then finding the bigger one
         // still does not fit leaves the step on the tiny default.  Only when
         // nothing is resident or fits does the second pass evict prior-step
-        // models to make room.
+        // models to make room.  A remote model always resolves, so with one
+        // selected the first pass ends on it and nothing is evicted.
         let reason = format!("capability '{}'", Self::cap_name(capability));
         for evict in [false, true] {
             for ws_model in &ranked {
@@ -2360,6 +2415,7 @@ impl ModelService {
                     ws.effective_model_enabled(&m.model_name, project)
                         && ws.effective_model_downloaded(&m.model_name)
                         && Some(m.model_name.as_str()) != router_name.as_deref()
+                        && !m.is_remote()
                         && m.effective_capabilities().iter().any(|c| text_caps.contains(&c.as_str()))
                 })
                 .cloned()
@@ -3998,6 +4054,25 @@ Search query:"
             // `type(None).__name__`.
             None => "NoneType".to_string(),
         }
+    }
+
+    /// Whether the final answer comes from a remote model.
+    ///
+    /// Resolved the way the answer is (`general`), so a selection mixing
+    /// local and remote models says remote only when no local model can
+    /// answer.  No remote selection, no resolution.
+    pub fn answers_remotely(&self) -> bool {
+        let remote: Vec<String> = self
+            .selected_models()
+            .into_iter()
+            .filter(|m| m.is_remote())
+            .map(|m| m.model_name)
+            .collect();
+        if remote.is_empty() {
+            return false;
+        }
+        let label = self.response_model_label(Some(ModelCapability::General.value()));
+        remote.contains(&label)
     }
 
     /// Reports response-model selection, the same way the orchestrator does.

@@ -26,7 +26,7 @@ use smartloop::utils::logging_setup::{
     current_listener, get_log_queue, get_logger, make_log_queue, reset_log_queue,
     root_queue_handler_count, setup_root_logging, shutdown_logging, start_listener,
     truncate_log_file, Formatter, Handler, ListenerOptions, LogQueue, QueueListener,
-    RotatingFileHandler, StreamHandler, DEBUG, DEFAULT_FORMAT, WARNING,
+    RotatingFileHandler, StreamHandler, DEBUG, DEFAULT_FORMAT, INFO, WARNING,
 };
 
 // --------------------------------------------------------------------------
@@ -222,6 +222,19 @@ fn test_log_level_debug_lifts_smartloop_gag() {
         let tmp = tempfile::tempdir().unwrap();
         let listener = run_install_with_log_level(tmp.path(), "DEBUG");
         assert_eq!(get_logger("smartloop").level(), DEBUG);
+        listener.stop();
+    });
+}
+
+/// DEBUG reaches smartloop only: a dependency stays at INFO.
+#[test]
+fn test_log_level_debug_keeps_dependencies_at_info() {
+    isolated("test_log_level_debug_keeps_dependencies_at_info", || {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = run_install_with_log_level(tmp.path(), "DEBUG");
+        assert!(get_logger("smartloop.agents.planner").is_enabled_for(DEBUG));
+        assert!(!get_logger("html5ever.tokenizer").is_enabled_for(DEBUG));
+        assert!(get_logger("html5ever.tokenizer").is_enabled_for(INFO));
         listener.stop();
     });
 }

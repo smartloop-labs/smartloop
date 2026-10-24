@@ -179,8 +179,14 @@ pub trait ChatService: Send + Sync {
     fn workspace_project_ids(&self) -> Option<Vec<String>>;
     /// `model_service._model.workspace.current_project.project_dir`.
     fn current_project_dir(&self) -> Option<String>;
+    /// Whether the answer comes from a remote model, whose usage the
+    /// platform records itself.
+    fn answers_remotely(&self) -> bool {
+        false
+    }
     /// `get_api_client().push_token_usage(...)` — a seam so tests can suppress
-    /// telemetry (the Python tests patch `get_api_client`).
+    /// telemetry (the Python tests patch `get_api_client`).  Skipped for a
+    /// remote answer, which the platform has already counted.
     fn push_token_usage(
         &self,
         project_id: Option<&str>,
@@ -188,6 +194,9 @@ pub trait ChatService: Send + Sync {
         prompt_tokens: usize,
         completion_tokens: usize,
     ) {
+        if self.answers_remotely() {
+            return;
+        }
         get_api_client().push_token_usage(
             project_id,
             model,
@@ -198,6 +207,10 @@ pub trait ChatService: Send + Sync {
 }
 
 impl ChatService for ModelService {
+    fn answers_remotely(&self) -> bool {
+        ModelService::answers_remotely(self)
+    }
+
     fn is_loaded(&self) -> bool {
         ModelService::is_loaded(self)
     }

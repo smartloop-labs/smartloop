@@ -968,7 +968,9 @@ pub static LOG_LISTENER: Lazy<Mutex<Option<Arc<QueueListener>>>> = Lazy::new(|| 
 /// stashes the listener in [`LOG_LISTENER`] so lifespan shutdown can stop it.
 pub fn install_centralized_logging() {
     let queue = make_log_queue();
-    setup_root_logging(&queue, "DEBUG");
+    // Root stays at INFO so dependencies (html5ever, llama.cpp) never log
+    // at DEBUG; only "smartloop" is lifted below.
+    setup_root_logging(&queue, "INFO");
     // The CLI entry point clamps "smartloop" to WARNING to keep the
     // interactive `slp` shell quiet — but the server is launched from that
     // same entry point, so it inherits that gag.  Lift it only when the user

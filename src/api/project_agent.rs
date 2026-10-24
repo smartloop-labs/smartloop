@@ -105,7 +105,9 @@ pub fn resolve_project_dir(project_id: &str) -> Option<String> {
 pub fn install_project_logging(project_dir: &str, log_level: &str) -> Option<Arc<QueueListener>> {
     let level = if log_level.is_empty() { "INFO".to_string() } else { log_level.to_uppercase() };
     let queue = make_log_queue();
-    setup_root_logging(&queue, "DEBUG");
+    // Root stays at INFO so dependencies (html5ever, llama.cpp) never log
+    // at DEBUG; only "smartloop" is lifted below.
+    setup_root_logging(&queue, "INFO");
     // A packaged build re-execs through the CLI entry point, which clamps
     // "smartloop" to WARNING to keep the interactive shell quiet.  Lift it
     // when DEBUG was actually asked for, exactly as the single-process server

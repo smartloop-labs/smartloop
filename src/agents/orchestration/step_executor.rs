@@ -132,6 +132,9 @@ pub struct StepExecutor {
     response: Arc<ResponseBuilder>,
     resolve_hook: Mutex<Option<ResolveHook>>,
     extract_hook: Mutex<Option<ExtractHook>>,
+    /// The final answer comes from a remote model: a conversational step
+    /// passes its context through rather than drafting a reply.
+    answers_remotely: bool,
 }
 
 impl StepExecutor {
@@ -158,7 +161,15 @@ impl StepExecutor {
             response,
             resolve_hook: Mutex::new(None),
             extract_hook: Mutex::new(None),
+            answers_remotely: false,
         }
+    }
+
+    /// This executor, for a request whose final answer comes from a remote
+    /// model when `on`.
+    pub fn with_remote_answer(mut self, on: bool) -> Self {
+        self.answers_remotely = on;
+        self
     }
 
     /// Replace (or restore, with `None`) the MCPAgent resolution call (tests).
@@ -393,8 +404,12 @@ impl StepExecutor {
             }
             let raw = if parts.is_empty() { directive.clone() } else { parts.join("\n\n") };
 
+            // A remote answer is written once, from this context, by the chat
+            // handler; drafting it here too would be a second upstream call.
             let capability = step.capability.as_deref().filter(|c| !c.is_empty());
-            if let (Some(llm), Some(capability)) = (llm.as_ref(), capability) {
+            if self.answers_remotely {
+                info!(target: LOGGER, "[step] conversational: the answer is remote — passing context through");
+            } else if let (Some(llm), Some(capability)) = (llm.as_ref(), capability) {
                 // The date is runtime grounding the model wasn't trained on, so
                 // it rides with the user turn (next to the request) instead of
                 // the system prompt where a small model is unlikely to use it.

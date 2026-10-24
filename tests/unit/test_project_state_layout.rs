@@ -283,11 +283,10 @@ mod test_document_ingest_destination {
     use std::sync::Arc;
 
     use parking_lot::RwLock;
-    use smartloop::config::supported_models::ModelClass;
     use smartloop::model::downloader::slp_downloader::{ProgressCallback, SLPDownloader, SharedWorkspace};
     use smartloop::model::generic::GenericModel;
     use smartloop::model::slp_model::{DocumentSource, SLPModel};
-    use smartloop::types::{ModelCapability, ModelType};
+    use smartloop::model::spec::ModelSpec;
     use smartloop::utils::log_utils::LoggerLike;
 
     /// `m.logger = MagicMock()`.
@@ -309,25 +308,6 @@ mod test_document_ingest_destination {
         }
     }
 
-    fn stub_model_id() -> String {
-        "test/model".to_string()
-    }
-    fn stub_model_version() -> i64 {
-        0
-    }
-    fn stub_param_size() -> f64 {
-        0.0
-    }
-    fn stub_capabilities() -> Vec<ModelCapability> {
-        vec![ModelCapability::General]
-    }
-    fn stub_thinking_default() -> bool {
-        false
-    }
-    fn stub_vision_handler() -> Option<String> {
-        None
-    }
-
     /// The concrete stand-in: `GenericModel` is abstract in Python; only the
     /// ingest path is under test.
     fn model(tmp_path: &Path, cwd: Option<&Path>) -> (GenericModel, Project) {
@@ -344,16 +324,8 @@ mod test_document_ingest_destination {
         // `m.workspace.current_project = project`.
         let workspace: SharedWorkspace =
             Arc::new(RwLock::new(Workspace::new("ws").with_projects(vec![project.clone()])));
-        let class = ModelClass {
-            class_name: "_Concrete",
-            model_id: stub_model_id,
-            model_version: stub_model_version,
-            param_size_in_b: stub_param_size,
-            default_capabilities: stub_capabilities,
-            thinking_default: stub_thinking_default,
-            vision_chat_handler: stub_vision_handler,
-        };
-        let m = GenericModel::new(workspace, Arc::new(NoDownloader), Arc::new(NullLogger), class, ModelType::Text);
+        let spec = Arc::new(ModelSpec::local("_concrete", "test/model"));
+        let m = GenericModel::new(workspace, Arc::new(NoDownloader), Arc::new(NullLogger), spec);
         (m, project)
     }
 

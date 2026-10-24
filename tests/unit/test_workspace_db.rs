@@ -183,6 +183,133 @@ mod test_model_persistence {
 
     #[test]
     #[serial]
+    fn test_remote_model_round_trips() {
+        let (_tmp, db) = db();
+        let remote = obj(json!({
+            "model_id": null,
+            "name": "kimi-k2",
+            "access_level": "free_login",
+            "is_accessible": true,
+            "type": "remote",
+            "url": "https://api.smartloop.ai",
+            "capabilities": ["general", "coding"],
+            "context_length": 131072,
+        }));
+        let mut rows = models();
+        rows.push(remote);
+        db.save_models(&rows).unwrap();
+
+        let result = db.list_models().unwrap();
+        let cached = result.iter().find(|m| m["name"] == json!("kimi-k2")).unwrap();
+        assert_eq!(cached["model_id"], Value::Null);
+        assert_eq!(cached["type"], json!("remote"));
+        assert_eq!(cached["url"], json!("https://api.smartloop.ai"));
+        assert_eq!(cached["capabilities"], json!(["general", "coding"]));
+        assert_eq!(cached["context_length"], json!(131072));
+        let local = result.iter().find(|m| m["name"] == json!("gemma3-1b")).unwrap();
+        assert_eq!(local["type"], Value::Null);
+        assert!(local.get("capabilities").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_spec_fields_round_trip() {
+        let (_tmp, db) = db();
+        let mut rows = models();
+        rows[0].extend(obj(json!({
+            "param_size_b": 1.5,
+            "param_size_estimated": true,
+            "active_param_size_b": 0.5,
+            "attention": "hybrid",
+            "reasoning_budget_tokens": 1024,
+            "model_version": 3,
+            "thinking_default": true,
+            "vision_chat_handler": "MTMDChatHandler",
+        })));
+        db.save_models(&rows).unwrap();
+
+        let result = db.list_models().unwrap();
+        let declared = result.iter().find(|m| m["name"] == json!("gemma3-1b")).unwrap();
+        assert_eq!(declared["param_size_b"], json!(1.5));
+        assert_eq!(declared["param_size_estimated"], json!(true));
+        assert_eq!(declared["active_param_size_b"], json!(0.5));
+        assert_eq!(declared["attention"], json!("hybrid"));
+        assert_eq!(declared["reasoning_budget_tokens"], json!(1024));
+        assert_eq!(declared["model_version"], json!(3));
+        assert_eq!(declared["thinking_default"], json!(true));
+        assert_eq!(declared["vision_chat_handler"], json!("MTMDChatHandler"));
+        // Undeclared stays null rather than reading as false or 0.
+        let bare = result.iter().find(|m| m["name"] == json!("gemma3-4b")).unwrap();
+        for key in [
+            "param_size_b",
+            "param_size_estimated",
+            "active_param_size_b",
+            "attention",
+            "reasoning_budget_tokens",
+            "model_version",
+            "thinking_default",
+            "vision_chat_handler",
+        ] {
+            assert_eq!(bare[key], Value::Null, "{key}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_catalog_cached_before_the_reasoning_budget_is_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE model_catalog (
+                     name TEXT PRIMARY KEY, model_id TEXT, size TEXT,
+                     description TEXT, access_level TEXT,
+                     is_accessible INTEGER NOT NULL DEFAULT 0, sha256 TEXT,
+                     type TEXT, url TEXT, capabilities TEXT, context_length INTEGER,
+                     param_size_b REAL, model_version INTEGER, thinking_default INTEGER,
+                     vision_chat_handler TEXT, param_size_estimated INTEGER,
+                     active_param_size_b REAL, attention TEXT,
+                     fetched_at REAL NOT NULL);
+                 INSERT INTO model_catalog (model_id, name, fetched_at)
+                     VALUES ('google/gemma-3-1b-it', 'gemma3-1b', 1.0);",
+            )
+            .unwrap();
+        }
+
+        let db = WorkspaceDB::new(&path).unwrap();
+        assert!(db.list_models().unwrap().is_empty());
+        db.save_models(&models()).unwrap();
+        assert_eq!(db.list_models().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_catalog_cached_before_remote_models_is_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE model_catalog (
+                     model_id TEXT PRIMARY KEY, name TEXT NOT NULL, size TEXT,
+                     description TEXT, access_level TEXT,
+                     is_accessible INTEGER NOT NULL DEFAULT 0, sha256 TEXT,
+                     fetched_at REAL NOT NULL);
+                 INSERT INTO model_catalog (model_id, name, fetched_at)
+                     VALUES ('google/gemma-3-1b-it', 'gemma3-1b', 1.0);",
+            )
+            .unwrap();
+        }
+
+        let db = WorkspaceDB::new(&path).unwrap();
+        assert!(db.list_models().unwrap().is_empty());
+        db.save_models(&models()).unwrap();
+        assert_eq!(db.list_models().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[serial]
     fn test_empty_save() {
         let (_tmp, db) = db();
         db.save_models(&models()).unwrap();
