@@ -169,6 +169,17 @@ fn test_a_mixture_of_experts_model_ranks_on_active_params() {
 }
 
 #[test]
+fn test_a_reasoning_budget_is_carried_only_when_declared() {
+    let mut registry = ModelRegistry::default();
+    registry.hydrate([
+        row(json!({"name": "thinker", "type": "remote", "reasoning_budget_tokens": 1024})),
+        row(json!({"name": "plain", "type": "remote"})),
+    ]);
+    assert_eq!(registry.get("thinker").unwrap().reasoning_budget_tokens, Some(1024));
+    assert_eq!(registry.get("plain").unwrap().reasoning_budget_tokens, None);
+}
+
+#[test]
 fn test_every_attention_type_parses() {
     for (value, attention) in [
         ("full", Attention::Full),

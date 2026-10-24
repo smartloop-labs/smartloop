@@ -221,6 +221,7 @@ mod test_model_persistence {
             "param_size_estimated": true,
             "active_param_size_b": 0.5,
             "attention": "hybrid",
+            "reasoning_budget_tokens": 1024,
             "model_version": 3,
             "thinking_default": true,
             "vision_chat_handler": "MTMDChatHandler",
@@ -233,6 +234,7 @@ mod test_model_persistence {
         assert_eq!(declared["param_size_estimated"], json!(true));
         assert_eq!(declared["active_param_size_b"], json!(0.5));
         assert_eq!(declared["attention"], json!("hybrid"));
+        assert_eq!(declared["reasoning_budget_tokens"], json!(1024));
         assert_eq!(declared["model_version"], json!(3));
         assert_eq!(declared["thinking_default"], json!(true));
         assert_eq!(declared["vision_chat_handler"], json!("MTMDChatHandler"));
@@ -243,6 +245,7 @@ mod test_model_persistence {
             "param_size_estimated",
             "active_param_size_b",
             "attention",
+            "reasoning_budget_tokens",
             "model_version",
             "thinking_default",
             "vision_chat_handler",
@@ -253,7 +256,7 @@ mod test_model_persistence {
 
     #[test]
     #[serial]
-    fn test_a_catalog_cached_before_attention_is_discarded() {
+    fn test_a_catalog_cached_before_the_reasoning_budget_is_discarded() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("workspace.db");
         {
@@ -266,6 +269,7 @@ mod test_model_persistence {
                      type TEXT, url TEXT, capabilities TEXT, context_length INTEGER,
                      param_size_b REAL, model_version INTEGER, thinking_default INTEGER,
                      vision_chat_handler TEXT, param_size_estimated INTEGER,
+                     active_param_size_b REAL, attention TEXT,
                      fetched_at REAL NOT NULL);
                  INSERT INTO model_catalog (model_id, name, fetched_at)
                      VALUES ('google/gemma-3-1b-it', 'gemma3-1b', 1.0);",

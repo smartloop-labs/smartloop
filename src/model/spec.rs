@@ -54,6 +54,9 @@ pub struct ModelSpec {
     /// Base URL a remote model's chat requests go to.
     pub url: Option<String>,
     pub context_length: Option<u32>,
+    /// Output tokens a reasoning model may spend thinking before it answers,
+    /// added to a capped request so the answer still fits.
+    pub reasoning_budget_tokens: Option<u32>,
 }
 
 impl ModelSpec {
@@ -74,6 +77,7 @@ impl ModelSpec {
             vision_chat_handler: None,
             url: None,
             context_length: None,
+            reasoning_budget_tokens: None,
         }
     }
 
@@ -167,6 +171,9 @@ impl ModelSpec {
         if let Some(context_length) = row.context_length {
             spec.context_length = Some(context_length);
         }
+        if let Some(budget) = row.reasoning_budget_tokens {
+            spec.reasoning_budget_tokens = Some(budget);
+        }
         spec
     }
 }
@@ -203,6 +210,8 @@ pub struct CatalogModel {
     pub url: Option<String>,
     #[serde(default)]
     pub context_length: Option<u32>,
+    #[serde(default)]
+    pub reasoning_budget_tokens: Option<u32>,
 }
 
 impl CatalogModel {
