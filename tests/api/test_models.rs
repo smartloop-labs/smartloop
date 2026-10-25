@@ -170,6 +170,98 @@ mod test_list_models {
 
     #[tokio::test]
     #[serial]
+    async fn test_a_remote_model_keeps_the_catalogs_capabilities() {
+        let client = TestClient::new();
+        // A remote model's capabilities come from the catalog, minus ones
+        // this build can't route and the internal-only "thinking".
+        client.platform().set_list_models(json!([
+            {"name": "kimi-k2", "model_id": null, "type": "remote",
+             "access_level": "free_login", "is_accessible": true,
+             "capabilities": ["general", "coding", "thinking", "teleport"],
+             "context_length": 131072},
+        ]));
+        let resp = client.get("/v1/models").await;
+
+        assert_eq!(resp.status_code, 200);
+        let body = resp.json();
+        let remote = &body[0];
+        assert_eq!(remote["type"], "remote");
+        assert_eq!(remote["capabilities"], json!(["general", "coding"]));
+        assert_eq!(remote["context_length"], 131072);
+        assert_eq!(remote["access_level"], "free_login");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_models_report_their_parameter_size() {
+        let client = TestClient::new();
+        client.platform().set_list_models(json!([
+            {"name": "remote-sized", "model_id": null, "type": "remote",
+             "is_accessible": true, "capabilities": ["general"], "param_size_b": 355.0,
+             "param_size_estimated": true, "active_param_size_b": 32.0, "attention": "quantum"},
+            {"name": "gemma4-e2b", "model_id": "google/gemma-4-e2b-it", "is_accessible": true},
+        ]));
+        let resp = client.get("/v1/models").await;
+
+        let body = resp.json();
+        let by_name = |name: &str| body.as_array().unwrap().iter().find(|m| m["name"] == name).unwrap().clone();
+        assert_eq!(by_name("remote-sized")["param_size_b"], 355.0);
+        assert_eq!(by_name("remote-sized")["param_size_estimated"], true);
+        assert_eq!(by_name("remote-sized")["active_param_size_b"], 32.0);
+        // An attention type this build doesn't know doesn't drop the row.
+        assert_eq!(by_name("remote-sized")["attention"], Value::Null);
+        // A catalog without the fields still reports the built-in size, as
+        // an exact one.
+        assert_eq!(by_name("gemma4-e2b")["param_size_b"], 2.0);
+        assert_eq!(by_name("gemma4-e2b")["param_size_estimated"], false);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_catalog_only_local_model_is_listed_with_its_spec() {
+        let client = TestClient::new();
+        client.platform().set_list_models(json!([
+            {"name": "catalog-only-8b", "model_id": "org/catalog-only-8b", "type": "local",
+             "is_accessible": true, "capabilities": ["general", "dp", "vision"],
+             "param_size_b": 8.0, "model_version": 4, "vision_chat_handler": "Gemma4ChatHandler"},
+        ]));
+        let resp = client.get("/v1/models").await;
+
+        let entry = &resp.json()[0];
+        assert_eq!(entry["name"], "catalog-only-8b");
+        assert_eq!(entry["capabilities"], json!(["general", "dp", "vision"]));
+        assert_eq!(entry["param_size_b"], 8.0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_missing_url_falls_back_to_the_platform() {
+        let client = TestClient::new();
+        client.platform().set_list_models(json!([
+            {"name": "kimi-k2", "model_id": "", "type": "remote"},
+        ]));
+        let resp = client.get("/v1/models").await;
+
+        let expected = smartloop::config::app_settings::AppSettings::new().slp_api_base;
+        assert_eq!(resp.json()[0]["url"], json!(expected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_free_login_sorts_between_free_and_pro() {
+        let client = TestClient::new();
+        client.platform().set_list_models(json!([
+            {"name": "pro-model", "model_id": "", "access_level": "pro"},
+            {"name": "login-model", "model_id": "", "access_level": "free_login"},
+            {"name": "free-model", "model_id": "", "access_level": "free"},
+        ]));
+        let resp = client.get("/v1/models").await;
+
+        assert_eq!(names(&resp.json()), vec!["free-model", "login-model", "pro-model"]);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_skips_unparseable_entry_without_dropping_the_rest() {
         let client = TestClient::new();
         // A row the client cannot represent at all -- here a required field the

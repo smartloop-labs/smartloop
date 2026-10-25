@@ -6,7 +6,7 @@
 //! cannot be loaded (no GGUF, faulted, or it does not fit).
 //!
 //! The Python test faked `_rank` on mocks.  A workspace model's rank comes
-//! from its model class, so the walk uses real built-in models whose sizes
+//! from its model spec, so the walk uses real built-in models whose sizes
 //! give the same big/mid/small spread (gemma4-e4b 4B, ministral3-3b 3B,
 //! gemma4-e2b 2B); the tie-break test ranks plain candidates through the
 //! [`RankedModel`] seam the sort is written against.
@@ -18,6 +18,9 @@ use parking_lot::Mutex;
 
 use smartloop::api::services::model_service::{ModelService, ModelServiceHooks, RankedModel};
 use smartloop::llms::base_llm::BaseLLM;
+use smartloop::llms::cloud_llm::local_only_scope;
+use smartloop::model::spec::MODEL_SPECS;
+use smartloop::types::ModelKind;
 use smartloop::workspace::{Workspace, WorkspaceModel};
 
 use crate::shared::model_service_a::{FakeLLM, attach_workspace, bare_service, same};
@@ -170,4 +173,93 @@ fn test_size_ties_go_to_broader_coverage_then_the_newer_version() {
     );
     let names: Vec<&str> = ordered.iter().map(|m| m.name).collect();
     assert_eq!(names, vec!["broad", "narrow-new", "new", "old"]);
+}
+
+fn remote_model(name: &str) -> WorkspaceModel {
+    WorkspaceModel { model_name: name.to_string(), kind: ModelKind::Remote, ..Default::default() }
+}
+
+/// A local model that fits only once earlier steps' models are evicted loses
+/// to a remote one: the remote model answers before anything is evicted.
+#[test]
+fn test_a_remote_model_answers_before_a_local_one_is_evicted_for() {
+    let kimi = FakeLLM::named("kimi");
+    let mut loads = HashMap::new();
+    loads.insert(BIG, (FakeLLM::named("big"), Fit::AfterEviction));
+    loads.insert("kimi-k2", (kimi.clone(), Fit::AsIs));
+    let (tried, llm) = walk(vec![ws_model(BIG), remote_model("kimi-k2")], loads);
+    assert_eq!(tried, vec![attempt(BIG, false), attempt("kimi-k2", false)]);
+    assert!(same(&llm.expect("a model"), &kimi));
+}
+
+/// Decisions resolve local-only: the remote model is not a candidate, so the
+/// local one is loaded, evicting if it must.
+#[test]
+fn test_a_local_only_resolution_skips_remote_models() {
+    let big = FakeLLM::named("big");
+    let mut loads = HashMap::new();
+    loads.insert(BIG, (big.clone(), Fit::AfterEviction));
+    loads.insert("kimi-k2", (FakeLLM::named("kimi"), Fit::AsIs));
+    let (tried, llm) = {
+        let _scope = local_only_scope(true);
+        walk(vec![ws_model(BIG), remote_model("kimi-k2")], loads)
+    };
+    assert_eq!(tried, vec![attempt(BIG, false), attempt(BIG, true)]);
+    assert!(same(&llm.expect("a model"), &big));
+}
+
+/// Publish a mixture-of-experts remote model's sizes to the (process-wide)
+/// spec registry, under a name only these tests use.
+fn sized_remote(name: &str, total_b: f64, active_b: f64) -> WorkspaceModel {
+    let serde_json::Value::Object(row) = serde_json::json!({
+        "name": name, "type": "remote", "capabilities": ["general", "reasoning"],
+        "param_size_b": total_b, "active_param_size_b": active_b,
+    }) else {
+        unreachable!()
+    };
+    MODEL_SPECS.hydrate(&[row]);
+    remote_model(name)
+}
+
+/// With two remote models selected, the one with more active parameters
+/// does the step — not whichever registered first, and not by total size.
+#[test]
+fn test_the_remote_model_with_more_active_params_is_used() {
+    let light = sized_remote("walk-moe-light", 900.0, 23.0);
+    let heavy = sized_remote("walk-moe-heavy", 753.0, 40.0);
+    let heavy_llm = FakeLLM::named("heavy");
+    let mut loads = HashMap::new();
+    loads.insert("walk-moe-light", (FakeLLM::named("light"), Fit::AsIs));
+    loads.insert("walk-moe-heavy", (heavy_llm.clone(), Fit::AsIs));
+    let (tried, llm) = walk(vec![light, heavy], loads);
+    assert_eq!(tried, vec![attempt("walk-moe-heavy", false)]);
+    assert!(same(&llm.expect("a model"), &heavy_llm));
+}
+
+/// However large a remote model is, a local model that fits goes first.
+#[test]
+fn test_a_large_remote_model_still_ranks_after_a_local_one() {
+    let remote = sized_remote("walk-moe-huge", 753.0, 40.0);
+    let big = FakeLLM::named("big");
+    let mut loads = HashMap::new();
+    loads.insert(BIG, (big.clone(), Fit::AsIs));
+    loads.insert("walk-moe-huge", (FakeLLM::named("huge"), Fit::AsIs));
+    let (tried, llm) = walk(vec![remote, ws_model(BIG)], loads);
+    assert_eq!(tried, vec![attempt(BIG, false)]);
+    assert!(same(&llm.expect("a model"), &big));
+}
+
+/// The bootstrap model is the last resort: a remote model that declares the
+/// capability does the step even though the bootstrap model fits.
+#[test]
+fn test_the_bootstrap_model_ranks_after_remote_models() {
+    let bootstrap = smartloop::api::config::api_settings().default_model;
+    let kimi = FakeLLM::named("kimi");
+    let mut loads = HashMap::new();
+    loads.insert("kimi-k2", (kimi.clone(), Fit::AsIs));
+    let mut ranked = vec![ws_model(&bootstrap), remote_model("kimi-k2")];
+    ranked[0].model_name = bootstrap.clone();
+    let (tried, llm) = walk(ranked, loads);
+    assert_eq!(tried, vec![attempt("kimi-k2", false)]);
+    assert!(same(&llm.expect("a model"), &kimi));
 }

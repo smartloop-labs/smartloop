@@ -14,6 +14,7 @@
 //! instance carries is sent with each request, and the host picks the model
 //! the same way it would in-process.
 
+use crate::llms::cloud_llm::{local_only, local_only_scope};
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -40,13 +41,17 @@ pub struct RemoteLLM {
     client: Arc<dyn ModelClient>,
     project_id: String,
     capability: Option<String>,
+    /// Resolve on device even when the project pins a remote model: set for
+    /// handles built for orchestration (see `cloud_llm::local_only_scope`).
+    local_only: bool,
     cancelled: Mutex<Option<CancelEvent>>,
     supports_thinking: Mutex<Option<bool>>,
 }
 
 impl RemoteLLM {
     /// A handle to the host's model for `capability`, on behalf of
-    /// `project_id`.
+    /// `project_id`.  Built inside a local-only scope, it keeps resolving on
+    /// device for every later call.
     pub fn new(
         client: Arc<dyn ModelClient>,
         project_id: impl Into<String>,
@@ -56,6 +61,7 @@ impl RemoteLLM {
             client,
             project_id: project_id.into(),
             capability,
+            local_only: local_only(),
             cancelled: Mutex::new(None),
             supports_thinking: Mutex::new(None),
         }
@@ -69,6 +75,17 @@ impl RemoteLLM {
     /// The capability sent with every request.
     pub fn capability(&self) -> Option<&str> {
         self.capability.as_deref()
+    }
+
+    /// Whether this handle resolves on device only.
+    pub fn is_local_only(&self) -> bool {
+        self.local_only
+    }
+
+    /// This handle, resolving on device only.
+    pub fn local_only_copy(&self) -> Self {
+        let _scope = local_only_scope(true);
+        Self::new(self.client.clone(), self.project_id.clone(), self.capability.clone())
     }
 }
 
@@ -103,6 +120,7 @@ impl BaseLLM for RemoteLLM {
     /// The host's response context window for this capability, or
     /// [`DEFAULT_MAX_CONTEXT_TOKENS`] when it cannot say.
     fn get_max_tokens(&self) -> usize {
+        let _scope = local_only_scope(self.local_only);
         match self.client.response_max_context_tokens(self.capability.as_deref()) {
             Ok(0) => DEFAULT_MAX_CONTEXT_TOKENS,
             Ok(tokens) => tokens,
@@ -115,6 +133,7 @@ impl BaseLLM for RemoteLLM {
 
     fn call(&self, prompt: &str, stop: Option<&[String]>, options: CallOptions) -> anyhow::Result<String> {
         let _ = stop;
+        let _scope = local_only_scope(self.local_only);
         self.client.generate(
             prompt,
             None,
@@ -131,6 +150,7 @@ impl BaseLLM for RemoteLLM {
         // the local LLM; here it cancels the gRPC stream the host is serving
         // from, which the host observes between chunks.
         let cancelled = self.cancelled();
+        let _scope = local_only_scope(self.local_only);
         let texts = match self.client.stream(
             prompt,
             None,
@@ -220,6 +240,7 @@ impl BaseLLM for RemoteLLM {
         if let Some(value) = *cached {
             return value;
         }
+        let _scope = local_only_scope(self.local_only);
         let value = self
             .client
             .supports_thinking(self.capability.as_deref())
@@ -236,6 +257,7 @@ impl BaseLLM for RemoteLLM {
     /// the host is free to load a different model for a capability between
     /// requests, and a stale name here would be worse than the round trip.
     fn model_label(&self) -> String {
+        let _scope = local_only_scope(self.local_only);
         match self.client.model_label(self.capability.as_deref()) {
             Ok(label) => label,
             Err(exc) => {

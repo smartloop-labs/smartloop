@@ -61,6 +61,8 @@ message GenerateRequest {
   optional int32 max_tokens = 4;
   optional bool thinking = 5;
   string project_id = 6;
+  // Resolve for orchestration: ignore a pinned remote model.
+  bool local_only = 7;
 }
 
 message GenerateResponse {
@@ -90,6 +92,7 @@ message StreamRequest {
   string capability = 3;
   optional bool thinking = 4;
   string project_id = 5;
+  bool local_only = 6;
 }
 
 message StreamChunk {
@@ -111,11 +114,13 @@ message EncodeTextsResponse {
 message SupportsThinkingRequest {
   string capability = 1;
   string project_id = 2;
+  bool local_only = 3;
 }
 
 message ModelLabelRequest {
   string capability = 1;
   string project_id = 2;
+  bool local_only = 3;
 }
 
 message CountTokensRequest {
@@ -126,6 +131,7 @@ message CountTokensRequest {
 message ResponseMaxContextRequest {
   string capability = 1;
   string project_id = 2;
+  bool local_only = 3;
 }
 
 message HasCapabilityRequest {

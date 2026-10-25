@@ -17,6 +17,7 @@ use parking_lot::Mutex;
 use crate::agents::planner::ModelTier;
 use crate::constants::{display_model_label, display_model_name};
 use crate::llms::BaseLLM;
+use crate::llms::cloud_llm::local_only_scope;
 use crate::types::ModelCapability;
 
 /// Python logger name of this module.
@@ -379,8 +380,12 @@ impl ModelRouter {
             // No local caching — see llm_for_tier: the provider owns the
             // capability cache and may evict to fit, so pinning a reference
             // here would prevent that VRAM from being reclaimed for the next
-            // step.
-            match provider(cap) {
+            // step.  Decisions stay on device: a remote model is never one.
+            let resolved = {
+                let _scope = local_only_scope(true);
+                provider(cap)
+            };
+            match resolved {
                 Ok(Some(llm)) => {
                     tracing::info!(
                         target: LOGGER,
@@ -753,6 +758,32 @@ mod tests {
         let got = router.llm_for_tier(ModelTier::Large, None, None);
         assert!(same_llm(&got, &large));
         assert!(router.large_llm.lock().is_some());
+    }
+
+    #[test]
+    fn only_decision_nodes_resolve_local_only() {
+        use crate::llms::cloud_llm::local_only;
+
+        let agent: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "x".into());
+        let cap: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "y".into());
+        let scopes = Arc::new(Mutex::new(Vec::new()));
+        let (seen, cap_for_provider) = (scopes.clone(), cap.clone());
+        let router = ModelRouter::new(
+            agent.clone(),
+            agent,
+            ModelRouterOptions {
+                capability_llm_provider: Some(Arc::new(move |_c: &str| {
+                    seen.lock().push(local_only());
+                    Ok(Some(cap_for_provider.clone()))
+                })),
+                ..Default::default()
+            },
+        );
+        router.llm_for_tier(ModelTier::Large, Some("general"), None);
+        router.llm_for_tier(ModelTier::Small, Some("general"), None);
+        router.decision_llm(Some("dp"), None);
+        assert_eq!(*scopes.lock(), vec![false, true, true]);
+        assert!(!local_only());
     }
 
     #[test]

@@ -26,9 +26,9 @@ use crate::api::routers::_errors::HTTPException;
 use crate::api::routers::models::{py_error_kind_of, run_blocking, validation_error, PyErrorKind};
 use crate::api::services::model_service::ModelServiceError;
 use crate::api::services::{get_model_service, ModelService};
-use crate::config::SUPPORTED_MODELS;
 use crate::constants::canonical_model_name;
 use crate::model::downloader::cancellation;
+use crate::model::spec::MODEL_SPECS;
 
 /// Python logger name (`logging.getLogger(__name__)`).
 pub const LOG_TARGET: &str = "smartloop.api.routers.downloads";
@@ -117,7 +117,7 @@ pub fn router() -> Router {
 /// (`Unknown model: <name>`).
 ///
 /// The workspace record first, because that is what the download is actually
-/// writing under; `SUPPORTED_MODELS` covers a cancel that races the
+/// writing under; the model specs cover a cancel that races the
 /// registration in `/v1/init`.
 pub fn resolve_model_id(model_name: &str, model_service: &ModelService) -> anyhow::Result<String> {
     let workspace = model_service.ensure_workspace(None)?;
@@ -127,10 +127,10 @@ pub fn resolve_model_id(model_name: &str, model_service: &ModelService) -> anyho
         }
     }
 
-    let Some(model_cls) = SUPPORTED_MODELS.get(model_name) else {
-        return Err(ModelServiceError::Value(format!("Unknown model: {model_name}")).into());
-    };
-    Ok((model_cls.model_id)())
+    match MODEL_SPECS.get(model_name).filter(|spec| !spec.model_id.is_empty()) {
+        Some(spec) => Ok(spec.model_id.clone()),
+        None => Err(ModelServiceError::Value(format!("Unknown model: {model_name}")).into()),
+    }
 }
 
 /// `DELETE /v1/downloads/{model_name}` — axum handler.

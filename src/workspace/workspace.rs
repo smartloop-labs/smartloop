@@ -30,11 +30,12 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::config::{AppSettings, ModelConfig, SUPPORTED_MODELS};
+use crate::config::{AppSettings, ModelConfig};
 use crate::constants::canonical_model_name;
 use crate::llms::llm_factory::LlmFactory;
+use crate::model::spec::{ModelSpec, MODEL_SPECS};
 use crate::paths::{expand_home, real_home};
-use crate::types::ModelCapability;
+use crate::types::{ModelCapability, ModelKind};
 use crate::workspace::context::{
     active_project_id, owned_project_id, pinned_project_id, projects_delegated,
 };
@@ -86,6 +87,10 @@ static INSTANCE: Lazy<Mutex<Option<SharedWorkspace>>> = Lazy::new(|| Mutex::new(
 /// Serializes `save()`: background tasks (document indexing, MCP
 /// provisioning) each persist from their own thread.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Models whose stored kind has already been reported as disagreeing with
+/// their spec, so the error is logged once per model rather than per lookup.
+static KIND_MISMATCH_REPORTED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// Override the import-time settings home (Python tests patch
 /// `workspace._settings`).  `None` restores `AppSettings::new().home_dir`.
@@ -629,7 +634,7 @@ pub struct ProjectModel {
     #[serde(default)]
     pub is_active: bool,
     /// Reason before answering.  `None` = follow the workspace default (and
-    /// below that the model class's).  Only meaningful for a model declaring
+    /// below that the model spec's).  Only meaningful for a model declaring
     /// `ModelCapability::Thinking`; see [`Workspace::effective_model_thinking`].
     #[serde(default)]
     pub thinking: Option<bool>,
@@ -674,7 +679,7 @@ pub struct WorkspaceModel {
     pub is_active: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Reason before answering; `None` = the model class's own default.  Set
+    /// Reason before answering; `None` = the model spec's own default.  Set
     /// from the model picker for models whose capabilities include "thinking".
     #[serde(default)]
     pub thinking: Option<bool>,
@@ -682,6 +687,10 @@ pub struct WorkspaceModel {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub config: Option<ModelConfig>,
+    /// Remote models run behind their spec's `url` and have no weights on
+    /// disk.
+    #[serde(rename = "type", default, skip_serializing_if = "ModelKind::is_local")]
+    pub kind: ModelKind,
     /// Runtime-only; never persisted (`Field(exclude=True)`).
     #[serde(skip)]
     pub models_dir: String,
@@ -698,15 +707,49 @@ impl Default for WorkspaceModel {
             thinking: None,
             capabilities: Vec::new(),
             config: None,
+            kind: ModelKind::Local,
             models_dir: String::new(),
         }
     }
 }
 
 impl WorkspaceModel {
-    /// `<models_dir>/<model_id>`, or `""` when `models_dir` is unset.
+    /// Where this model runs: its spec's kind, else the stored one.
+    ///
+    /// The spec is authoritative.  The stored `type` is only a fallback for a
+    /// model the catalog has not described yet: a build that predates remote
+    /// models drops the key on its next save.
+    pub fn kind(&self) -> ModelKind {
+        let Some(spec) = self.spec() else {
+            return self.kind;
+        };
+        if spec.kind != self.kind && KIND_MISMATCH_REPORTED.lock().insert(self.model_name.clone()) {
+            tracing::error!(
+                target: LOG_TARGET,
+                "[workspace] {} is registered as {} but its spec says {} — using the spec",
+                self.model_name,
+                self.kind.value(),
+                spec.kind.value()
+            );
+        }
+        spec.kind
+    }
+
+    /// Whether this model runs behind the platform API rather than on device.
+    pub fn is_remote(&self) -> bool {
+        self.kind() == ModelKind::Remote
+    }
+
+    /// Whether there is no on-disk location to name: `models_dir` unset, or a
+    /// remote model (whose empty `model_id` would otherwise resolve to the
+    /// whole models directory).
+    fn has_no_weights_path(&self) -> bool {
+        self.models_dir.is_empty() || self.is_remote() || self.model_id.is_empty()
+    }
+
+    /// `<models_dir>/<model_id>`, or `""` when there are no weights to locate.
     pub fn model_dir(&self) -> String {
-        if self.models_dir.is_empty() {
+        if self.has_no_weights_path() {
             return String::new();
         }
         join(&self.models_dir, &self.model_id)
@@ -714,7 +757,7 @@ impl WorkspaceModel {
 
     /// `<models_dir>/<model_id>/<basename(model_id)>.gguf`, or `""`.
     pub fn model_path(&self) -> String {
-        if self.models_dir.is_empty() {
+        if self.has_no_weights_path() {
             return String::new();
         }
         join(
@@ -725,7 +768,7 @@ impl WorkspaceModel {
 
     /// Directory where the built GGUF is written for this model.
     pub fn bin_dir(&self) -> String {
-        if self.models_dir.is_empty() {
+        if self.has_no_weights_path() {
             return String::new();
         }
         join(&self.model_dir(), "bin")
@@ -733,54 +776,74 @@ impl WorkspaceModel {
 
     /// GGUF file path under the model's bin directory.
     pub fn gguf_path(&self) -> String {
-        if self.models_dir.is_empty() {
+        if self.has_no_weights_path() {
             return String::new();
         }
         join(&self.bin_dir(), &format!("{}.gguf", path_name(&self.model_id)))
     }
 
-    /// Parameter count in billions, taken from the model class (the
-    /// authoritative source).  0 for models without a `SUPPORTED_MODELS`
-    /// entry or an explicit size.
-    pub fn param_size_b(&self) -> f64 {
-        match SUPPORTED_MODELS.get(&self.model_name) {
-            Some(model_cls) => (model_cls.param_size_in_b)(),
-            None => 0.0,
-        }
+    /// This model's spec, if one is known.
+    pub fn spec(&self) -> Option<Arc<ModelSpec>> {
+        MODEL_SPECS.get(&self.model_name)
     }
 
-    /// Model family version declared by the model class (0 if unknown).
+    /// Base URL a remote model's chat requests go to: its spec's, else the
+    /// platform API.  `None` for a local model.
+    pub fn url(&self) -> Option<String> {
+        if !self.is_remote() {
+            return None;
+        }
+        let url = self.spec().and_then(|spec| spec.url.clone()).filter(|u| !u.is_empty());
+        Some(url.unwrap_or_else(|| AppSettings::new().slp_api_base))
+    }
+
+    /// The context window the spec declares, if any.
+    pub fn context_length(&self) -> Option<u32> {
+        self.spec().and_then(|spec| spec.context_length)
+    }
+
+    /// The reasoning budget the spec declares, if any.
+    pub fn reasoning_budget_tokens(&self) -> Option<u32> {
+        self.spec().and_then(|spec| spec.reasoning_budget_tokens)
+    }
+
+    /// Parameter count in billions, taken from the spec (the authoritative
+    /// source).  0 for a model without a spec or a size.
+    pub fn param_size_b(&self) -> f64 {
+        self.spec().map(|spec| spec.param_size_b).unwrap_or(0.0)
+    }
+
+    /// Model family version declared by the spec (0 if unknown).
     ///
     /// Selection prefers a higher version over a lower one only between two
     /// models of the same size (see [`WorkspaceModel::rank`]).
     pub fn model_version(&self) -> i64 {
-        match SUPPORTED_MODELS.get(&self.model_name) {
-            Some(model_cls) => (model_cls.model_version)(),
-            None => 0,
-        }
+        self.spec().map(|spec| spec.model_version).unwrap_or(0)
     }
 
     /// Selection rank: larger size wins first, then newer model version.
     ///
     /// Size is the primary key so the most capable (largest) model is always
     /// preferred; the model version only breaks a tie between two models of
-    /// the same parameter count.
+    /// the same size.  A mixture-of-experts model is sized by its active
+    /// parameters.  Remote models rank among themselves this way; every
+    /// selection list still puts them after the local ones.
     pub fn rank(&self) -> (f64, i64) {
-        (self.param_size_b(), self.model_version())
+        let size = self.spec().map(|spec| spec.ranking_size_b()).unwrap_or(0.0);
+        (size, self.model_version())
     }
 
-    /// Capabilities declared by the model class — read-only.
+    /// Capabilities declared by the model's spec — read-only.
     ///
-    /// The stored `capabilities` field is ignored so class defaults stay
-    /// authoritative and updates to any model's capabilities take effect
-    /// immediately.  Models without a `SUPPORTED_MODELS` entry fall back to
-    /// metadata-inferred capabilities.
+    /// The stored `capabilities` field is ignored so the spec stays
+    /// authoritative and catalog updates to any model's capabilities take
+    /// effect immediately.  A local model without a spec falls back to
+    /// metadata-inferred capabilities; a remote one, which nothing can be
+    /// inferred about, declares none.
     pub fn effective_capabilities(&self) -> Vec<String> {
-        match SUPPORTED_MODELS.get(&self.model_name) {
-            Some(model_cls) => (model_cls.default_capabilities)()
-                .into_iter()
-                .map(|c| c.value().to_string())
-                .collect(),
+        match self.spec() {
+            Some(spec) => spec.capability_values(),
+            None if self.is_remote() => Vec::new(),
             None => self.infer_capabilities(),
         }
     }
@@ -1338,7 +1401,7 @@ impl Workspace {
     /// Whether `model_name` should reason before answering.
     ///
     /// Resolution: project override → workspace (app-default) entry →
-    /// `slp_thinking_enabled` → the model class's `thinking_default()` (via
+    /// `slp_thinking_enabled` → the model spec's `thinking_default` (via
     /// `LlmFactory::thinking_for`).
     ///
     /// Returns `None` for a model that does not declare thinking, which means
@@ -1572,22 +1635,9 @@ impl Workspace {
             Some(name) => name.to_string(),
             None => AppSettings::new().default_model,
         };
+        // Canonical names, so a legacy name matches its current one.
         let target = canonical_model_name(&model_name);
-        let target_cls = SUPPORTED_MODELS.get(&target);
-
-        self.models.iter().position(|m| {
-            // Compare by class where both sides are known models, so two names
-            // for the same model still match; otherwise fall back to the name,
-            // which keeps unknown (user-added) models from colliding with each
-            // other on a shared `None` class.
-            if canonical_model_name(&m.model_name) == target {
-                return true;
-            }
-            match target_cls {
-                Some(target_cls) => SUPPORTED_MODELS.get(&m.model_name) == Some(target_cls),
-                None => false,
-            }
-        })
+        self.models.iter().position(|m| canonical_model_name(&m.model_name) == target)
     }
 
     /// Look up a registered model by its short name (alias-aware); `None`
@@ -1656,11 +1706,38 @@ impl Workspace {
         entry
     }
 
-    /// Sort `candidates` best-first by [`WorkspaceModel::rank`] (stable, so
-    /// equal ranks keep registration order) and stamp their `models_dir`.
+    /// Register a remote model, or mark one already registered as remote.
+    /// It is never the active (bootstrap) model and is `downloaded` from the
+    /// start, since there is nothing to fetch.  Its endpoint, capabilities and
+    /// size come from its spec.
+    pub fn add_remote_model(&mut self, model_name: &str, enabled: bool) -> WorkspaceModel {
+        let model_name = canonical_model_name(model_name);
+        if let Some(existing) = self.get_model_mut(Some(&model_name)) {
+            existing.kind = ModelKind::Remote;
+            existing.downloaded = true;
+            existing.is_active = false;
+            return existing.clone();
+        }
+        let entry = WorkspaceModel {
+            model_name,
+            downloaded: true,
+            enabled,
+            kind: ModelKind::Remote,
+            models_dir: self.models_dir.clone(),
+            ..Default::default()
+        };
+        self.models.push(entry.clone());
+        entry
+    }
+
+    /// Sort `candidates` local first, then best-first by
+    /// [`WorkspaceModel::rank`] (stable, so equal ranks keep registration
+    /// order), and stamp their `models_dir`.
     fn rank_candidates(&self, mut candidates: Vec<WorkspaceModel>) -> Vec<WorkspaceModel> {
         candidates.sort_by(|a, b| {
-            b.rank().partial_cmp(&a.rank()).unwrap_or(std::cmp::Ordering::Equal)
+            a.is_remote()
+                .cmp(&b.is_remote())
+                .then(b.rank().partial_cmp(&a.rank()).unwrap_or(std::cmp::Ordering::Equal))
         });
         for m in &mut candidates {
             m.models_dir = self.models_dir.clone();
@@ -1680,6 +1757,7 @@ impl Workspace {
             .filter(|m| {
                 self.effective_model_enabled(&m.model_name, project)
                     && self.effective_model_downloaded(&m.model_name)
+                    && !m.is_remote()
                     && m.param_size_b() > 0.0
             })
             .cloned()
@@ -1688,6 +1766,9 @@ impl Workspace {
     }
 
     /// Enabled, downloaded models declaring `capability`, best-first.
+    ///
+    /// Remote models are included, after every local model and ranked among
+    /// themselves by active size (see `ModelService::get_llm_for_capability`).
     ///
     /// Callers walk this list down to a smaller same-capability model when
     /// the largest doesn't fit in memory, rather than dropping straight to the
@@ -1701,7 +1782,7 @@ impl Workspace {
             .filter(|m| {
                 self.effective_model_enabled(&m.model_name, project)
                     && self.effective_model_downloaded(&m.model_name)
-                    && m.param_size_b() > 0.0
+                    && (m.param_size_b() > 0.0 || m.is_remote())
                     && m.effective_capabilities().iter().any(|c| c.to_lowercase() == cap)
             })
             .cloned()

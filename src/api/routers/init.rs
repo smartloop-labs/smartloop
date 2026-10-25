@@ -23,17 +23,21 @@ use serde_json::{json, Value};
 
 use crate::api::config::API_SETTINGS;
 use crate::api::routers::_errors::{status_for, HTTPException};
-use crate::api::routers::models::{as_std_error, parse_json_body, py_error_kind_of, PyErrorKind};
+use crate::api::routers::models::{
+    as_std_error, parse_json_body, py_error_kind_of, AccessLevel, ModelEntry, PyErrorKind,
+};
 use crate::api::services::storage_service::{self, StorageModelService};
 use crate::api::services::{get_model_service, ModelService};
-use crate::config::SUPPORTED_MODELS;
 use crate::constants::{canonical_model_name, display_model_name};
 use crate::model::downloader::artifact_downloader::DownloadError;
 use crate::model::downloader::artifact_source::ArtifactMap;
 use crate::model::downloader::cancellation::{self, CancelToken};
 use crate::model::downloader::slp_downloader::{ProgressCallback, SharedLogger};
 use crate::model::downloader::{DownloadProgress, SLPArtifactDownloader};
+use crate::model::spec::MODEL_SPECS;
+use crate::platform::auth::has_credentials;
 use crate::platform::get_platform_service;
+use crate::types::ModelKind;
 use crate::utils::log_utils::LoggerLike;
 use crate::workspace::context::projects_delegated;
 use crate::workspace::workspace::{is_mmproj_gguf, Project, SharedWorkspace, Workspace};
@@ -989,6 +993,102 @@ async fn ensure_tasks(model_service: &Arc<dyn InitModelService>, workspace: &Sha
     .await
 }
 
+/// Whether `target` names a remote model the caller may add.
+///
+/// A model with a local spec skips the lookup.  The catalog settles
+/// entitlement; when it can't be read, a remote model already in the
+/// workspace is re-added as it stands, and anything else falls through to the
+/// local path, which reports an unknown model.
+async fn is_remote_target(workspace: &SharedWorkspace, target: &str) -> Result<bool, HTTPException> {
+    if MODEL_SPECS.get(target).is_some_and(|spec| !spec.is_remote()) {
+        return Ok(false);
+    }
+    let registered = workspace.read().get_model(Some(target));
+    if registered.as_ref().is_some_and(|m| !m.is_remote()) {
+        return Ok(false);
+    }
+    let name = target.to_string();
+    let catalog = blocking(move || {
+        let rows = get_platform_service().list_models(false).map_err(anyhow::Error::from)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| serde_json::from_value::<ModelEntry>(Value::Object(row)).ok())
+            .find(|entry| canonical_model_name(&entry.name) == name && entry.kind == ModelKind::Remote))
+    })
+    .await;
+    match (catalog, registered) {
+        (Ok(Some(entry)), _) => {
+            if !entry.is_accessible {
+                return Err(if has_credentials() {
+                    HTTPException::new(403, "This model is not available on your current plan.")
+                } else if entry.access_level == Some(AccessLevel::Paid) {
+                    HTTPException::new(403, "This model needs a paid plan.")
+                } else {
+                    HTTPException::new(401, "Sign in to use this model.")
+                });
+            }
+            Ok(true)
+        }
+        (Ok(None), _) => Ok(false),
+        (Err(e), Some(_)) => {
+            tracing::warn!(target: LOG_TARGET, "Model catalog unavailable ({e}); re-adding {target} from the workspace");
+            Ok(true)
+        }
+        (Err(e), None) => {
+            tracing::warn!(target: LOG_TARGET, "Model catalog unavailable while resolving {target}: {e}");
+            Ok(false)
+        }
+    }
+}
+
+/// `/v1/init` for a remote model: register it and finish at once.
+///
+/// There is nothing to download or load, so the stream is one `model_ready`
+/// progress event and the `complete` event.  Like a download, a
+/// project-scoped add registers the model disabled for the caller's
+/// follow-up PATCH to enable; unlike one, it is never promoted to an
+/// app-default, so new projects keep answering on device.
+async fn add_remote_model(
+    request: InitRequest,
+    model_service: Arc<dyn InitModelService>,
+    workspace: SharedWorkspace,
+    target: String,
+) -> Result<Response, HTTPException> {
+    let enabled = request.project_id.is_none();
+    {
+        let (ws, name) = (Arc::clone(&workspace), target.clone());
+        blocking(move || {
+            let mut ws = ws.write();
+            ws.add_remote_model(&name, enabled);
+            ws.save()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| HTTPException::new(500, e.to_string()))?;
+    }
+    seed_model_catalog();
+
+    let project = {
+        let ws = model_service.pipeline_workspace().unwrap_or(workspace);
+        let ws = ws.read();
+        get_project_info(&ws, &target)
+    };
+    let display = display_model_name(&target);
+    let events = futures::stream::iter([
+        sse_event(&json!({"status": "model_ready", "message": format!("Model {display} added.")}), "progress"),
+        sse_event(
+            &json!({
+                "status": "completed",
+                "message": "Model initialized.",
+                "model_name": target,
+                "project": project,
+            }),
+            "complete",
+        ),
+    ]);
+    Ok(sse_response(events))
+}
+
 /// `POST /v1/init` — initialize the workspace and download the model.
 ///
 /// Downloads the GGUF via the Smartloop artifact endpoints and returns a
@@ -1045,12 +1145,16 @@ pub async fn init_with_seams(
         .filter(|name| !name.is_empty())
         .unwrap_or(default_model);
 
+    if is_remote_target(&workspace, &target).await? {
+        return add_remote_model(request, model_service, workspace, target).await;
+    }
+
     // Register the model in the workspace if not already present
     let existing = workspace.read().get_model(Some(&target));
     let ws_model = match existing {
         Some(ws_model) => ws_model,
         None => {
-            let Some(model_cls) = SUPPORTED_MODELS.get(&target) else {
+            let Some(spec) = MODEL_SPECS.get(&target).filter(|spec| !spec.is_remote()) else {
                 return Err(HTTPException::new(400, format!("Unknown model: {target}")));
             };
             // Register a project-scoped download disabled: the caller's
@@ -1060,7 +1164,7 @@ pub async fn init_with_seams(
             // workspace-wide.
             workspace
                 .write()
-                .add_model(&target, &(model_cls.model_id)(), None, request.project_id.is_none())
+                .add_model(&target, &spec.model_id, None, request.project_id.is_none())
         }
     };
 

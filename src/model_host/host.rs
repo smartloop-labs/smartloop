@@ -35,6 +35,7 @@ use crate::model_host::client::{
 use crate::llms::base_llm::{BatchPrompt, CancelEvent};
 use crate::model_host::pb;
 use crate::model_host::pb::model_host_server::{ModelHost as ModelHostService, ModelHostServer};
+use crate::llms::cloud_llm::local_only_scope;
 use crate::workspace::context::use_project;
 
 /// Logger name used by the Python module.
@@ -434,6 +435,7 @@ impl ModelHostService for ModelHostServicer {
         let project_id = request.project_id.clone();
         let result = self
             .blocking(project_id, move |client| {
+                let _scope = local_only_scope(request.local_only);
                 client.generate(
                     &request.prompt,
                     non_empty(&request.model_name),
@@ -511,6 +513,7 @@ impl ModelHostService for ModelHostServicer {
         tokio::task::spawn_blocking(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 bind_project(client.as_ref(), &request.project_id, |client| {
+                    let _scope = local_only_scope(request.local_only);
                     serve_stream(client, &request, &cancelled, &sender)
                 })
             }));
@@ -564,9 +567,10 @@ impl ModelHostService for ModelHostServicer {
         request: Request<pb::SupportsThinkingRequest>,
     ) -> Result<Response<pb::BoolReply>, Status> {
         let request = request.into_inner();
-        let capability = request.capability;
+        let (capability, local_only) = (request.capability, request.local_only);
         let value = self
             .unary(request.project_id, move |client| {
+                let _scope = local_only_scope(local_only);
                 client.supports_thinking(non_empty(&capability))
             })
             .await?;
@@ -587,9 +591,12 @@ impl ModelHostService for ModelHostServicer {
         request: Request<pb::ModelLabelRequest>,
     ) -> Result<Response<pb::StringReply>, Status> {
         let request = request.into_inner();
-        let capability = request.capability;
+        let (capability, local_only) = (request.capability, request.local_only);
         let value = self
-            .unary(request.project_id, move |client| client.model_label(non_empty(&capability)))
+            .unary(request.project_id, move |client| {
+                let _scope = local_only_scope(local_only);
+                client.model_label(non_empty(&capability))
+            })
             .await?;
         Ok(Response::new(pb::StringReply { value }))
     }
@@ -622,9 +629,10 @@ impl ModelHostService for ModelHostServicer {
         request: Request<pb::ResponseMaxContextRequest>,
     ) -> Result<Response<pb::IntReply>, Status> {
         let request = request.into_inner();
-        let capability = request.capability;
+        let (capability, local_only) = (request.capability, request.local_only);
         let value = self
             .unary(request.project_id, move |client| {
+                let _scope = local_only_scope(local_only);
                 client.response_max_context_tokens(non_empty(&capability))
             })
             .await?;

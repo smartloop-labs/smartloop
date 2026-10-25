@@ -19,6 +19,7 @@ pub use service::PlatformService;
 pub use workspace_db::WorkspaceDB;
 
 use crate::config::app_settings::AppSettings;
+use crate::platform::client::JsonObject;
 use crate::workspace::workspace::Workspace;
 
 /// The singleton and the DB path it is bound to (`None` = pure proxy).
@@ -99,4 +100,27 @@ pub fn get_platform_service() -> Arc<PlatformService> {
     slot.service = Some(service.clone());
     slot.db_path = bound_path;
     service
+}
+
+/// The model catalog last cached in the workspace DB, without touching the
+/// network or creating a DB that isn't there yet.  Empty when there is no
+/// workspace or nothing cached.
+pub fn cached_model_catalog() -> Vec<JsonObject> {
+    if let Some(service) = PLATFORM_SERVICE_OVERRIDE.lock().clone() {
+        return service.db().and_then(|db| db.list_models().ok()).unwrap_or_default();
+    }
+    let Some(ws) = Workspace::load().filter(|ws| !ws.workspace_dir.is_empty()) else {
+        return Vec::new();
+    };
+    let path = PathBuf::from(&ws.workspace_dir).join("workspace.db");
+    if !path.exists() {
+        return Vec::new();
+    }
+    match WorkspaceDB::new(&path).and_then(|db| db.list_models()) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(target: "smartloop.platform", "Could not read the cached model catalog: {:#}", e);
+            Vec::new()
+        }
+    }
 }

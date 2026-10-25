@@ -17,10 +17,9 @@ use crate::config::model_config::ModelConfig;
 use crate::llms::base_llm::BaseLLM;
 use crate::model::downloader::slp_downloader::{SharedLogger, SharedWorkspace};
 use crate::model::downloader::{HFDownloader, SLPArtifactDownloader, SLPDownloader};
-use crate::model::slp_model::{DocumentProgressCallback, DocumentSource, ModelClass, SLPModel, TrainProgressCallback};
-use crate::model::{
-    Gemma4_2bModel, Gemma4_4bModel, GemmaItModel, GemmaItTextModel, Ministral3bModel, Qwen2VL_2bModel, Qwen3_5_2bModel,
-};
+use crate::model::generic::GenericModel;
+use crate::model::slp_model::{DocumentProgressCallback, DocumentSource, SLPModel, TrainProgressCallback};
+use crate::model::spec::ModelSpec;
 use crate::utils::log_utils::{ConsoleLogger, LoggerLike};
 use crate::workspace::types::Document;
 use crate::workspace::Workspace;
@@ -125,25 +124,18 @@ impl std::fmt::Debug for Model {
     }
 }
 
-/// Construct the concrete model named by `t.class_name` (Python's
-/// `t(workspace, downloader, logger)`); `None` for an unknown class name.
+/// Construct the model `spec` describes; `None` for a remote model, which
+/// has no weights to run here.
 pub fn instantiate_model(
-    t: &ModelClass,
+    spec: &Arc<ModelSpec>,
     workspace: SharedWorkspace,
     downloader: Arc<dyn SLPDownloader>,
     logger: SharedLogger,
 ) -> Option<Arc<dyn SLPModel>> {
-    let model: Arc<dyn SLPModel> = match t.class_name {
-        "GemmaItTextModel" => Arc::new(GemmaItTextModel::new(workspace, downloader, logger)),
-        "GemmaItModel" => Arc::new(GemmaItModel::new(workspace, downloader, logger)),
-        "Gemma4_2bModel" => Arc::new(Gemma4_2bModel::new(workspace, downloader, logger)),
-        "Gemma4_4bModel" => Arc::new(Gemma4_4bModel::new(workspace, downloader, logger)),
-        "Ministral3bModel" => Arc::new(Ministral3bModel::new(workspace, downloader, logger)),
-        "Qwen2VL_2bModel" => Arc::new(Qwen2VL_2bModel::new(workspace, downloader, logger)),
-        "Qwen3_5_2bModel" => Arc::new(Qwen3_5_2bModel::new(workspace, downloader, logger)),
-        _ => return None,
-    };
-    Some(model)
+    if spec.is_remote() {
+        return None;
+    }
+    Some(Arc::new(GenericModel::new(workspace, downloader, logger, Arc::clone(spec))))
 }
 
 /// `json.dump(data, f, indent=4)`: four-space indentation and, as Python's
@@ -262,8 +254,8 @@ impl ModelManager {
     /// The Python fallback for a missing, empty or corrupt file called
     /// `ModelManager._create_new_model`, which does not exist, so that path
     /// raised `AttributeError`; it fails the same way here.
-    pub fn load_model(t: &ModelClass, config: ModelConfig) -> anyhow::Result<Model> {
-        let _ = t;
+    pub fn load_model(spec: &Arc<ModelSpec>, config: ModelConfig) -> anyhow::Result<Model> {
+        let _ = spec;
         let create_new_model = || -> anyhow::Result<Model> {
             anyhow::bail!("type object 'ModelManager' has no attribute '_create_new_model'")
         };
@@ -324,13 +316,13 @@ impl ModelManager {
     /// `config` defaults to the active workspace model's config.  Callers are
     /// responsible for calling `model.save()` after their operation succeeds.
     pub fn get_model(
-        t: &ModelClass,
+        spec: &Arc<ModelSpec>,
         workspace: SharedWorkspace,
         logger: Option<SharedLogger>,
         config: Option<ModelConfig>,
     ) -> anyhow::Result<Model> {
         let logger: SharedLogger = logger.unwrap_or_else(|| Arc::new(ConsoleLogger::new()));
-        let result = Self::build_model(t, workspace, &logger, config);
+        let result = Self::build_model(spec, workspace, &logger, config);
         if let Err(e) = &result {
             logger.error(&format!("Failed to initialise model: {e}"));
         }
@@ -338,7 +330,7 @@ impl ModelManager {
     }
 
     fn build_model(
-        t: &ModelClass,
+        spec: &Arc<ModelSpec>,
         workspace: SharedWorkspace,
         logger: &SharedLogger,
         config: Option<ModelConfig>,
@@ -358,7 +350,7 @@ impl ModelManager {
             let mut ws = workspace.write();
             // Ensure the model is registered (without changing workspace active model)
             if ws.get_model(Some(&config.model_name)).is_none() {
-                ws.add_model(&config.model_name, &(t.model_id)(), Some(config.clone()), true);
+                ws.add_model(&config.model_name, &spec.model_id, Some(config.clone()), true);
             }
 
             // A `project_id` in the config used to be applied by moving the
@@ -404,8 +396,8 @@ impl ModelManager {
         } else {
             Arc::new(SLPArtifactDownloader::new(Arc::clone(&workspace), Arc::clone(logger), None))
         };
-        let slp_model = instantiate_model(t, Arc::clone(&workspace), downloader, Arc::clone(logger))
-            .ok_or_else(|| anyhow::anyhow!("Unknown model class: {}", t.class_name))?;
+        let slp_model = instantiate_model(spec, Arc::clone(&workspace), downloader, Arc::clone(logger))
+            .ok_or_else(|| anyhow::anyhow!("{} is a remote model and runs behind the platform API", spec.name))?;
 
         Ok(Model::new(model_id, workspace, Some(slp_model)))
     }
