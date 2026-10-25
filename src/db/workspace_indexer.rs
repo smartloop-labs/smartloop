@@ -40,8 +40,18 @@ pub const CHUNK_OVERLAP: usize = 200;
 pub const INDEX_EXTENSIONS: &[&str] = &[
     ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp", ".cs",
     ".rb", ".php", ".swift", ".kt", ".scala", ".yaml", ".yml", ".toml", ".json", ".cfg", ".ini",
-    ".md", ".txt", ".rst", ".html", ".css", ".sql", ".proto", ".graphql", ".sh",
+    ".md", ".txt", ".rst", ".html", ".css", ".sql", ".proto", ".graphql", ".sh", ".csv",
 ];
+
+/// Documents indexed through a [`DocumentConverter`], when the indexer has
+/// one: binary formats that have to be parsed to text first.
+pub const DOCUMENT_EXTENSIONS: &[&str] = &[".pdf", ".docx", ".pptx", ".xlsx"];
+
+/// Documents larger than this are left out rather than parsed.
+pub const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Parses a document (see [`DOCUMENT_EXTENSIONS`]) to text.
+pub type DocumentConverter = Arc<dyn Fn(&Path) -> anyhow::Result<String> + Send + Sync>;
 
 /// Directory names skipped anywhere in the tree (plus `*.egg-info`).
 pub const SKIP_DIRS: &[&str] = &[
@@ -53,8 +63,8 @@ pub const SKIP_DIRS: &[&str] = &[
 pub const MANIFEST_FILENAME: &str = ".workspace_manifest.json";
 
 /// Directories holding the framework's own state, skipped when they sit at
-/// the root of the scan.  The scan root *is* `project_dir` (see the indexer
-/// task), so the vector store's own files are always inside it.
+/// the root of the scan when the scan root is `project_dir` (an unbound
+/// project, see the indexer task), where the vector store's own files are.
 ///
 /// `documents` holds the uploaded documents, which the document indexer
 /// already indexes.  Scanning it too indexed every `.md`/`.txt` upload a
@@ -74,6 +84,27 @@ pub const SKIP_ROOT_DIRS: &[&str] = &["db", "documents"];
 /// the reply the user was waiting for, and never answering a question anyone
 /// would ask of a workspace.
 pub const SKIP_ROOT_FILES: &[&str] = &[PROJECT_STATE_FILE];
+
+/// What the manifest records for a file: its content hash, and the size and
+/// modified time (nanoseconds since the epoch) it had when hashed.  While the
+/// size and modified time still match, the file is taken as unchanged without
+/// being read, so a pass over a large folder costs a `stat` per file rather
+/// than a full read.  A write that keeps the size and lands within the
+/// filesystem's timestamp resolution goes unnoticed, the trade every
+/// mtime-based tool (make, git's index) makes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestEntry {
+    pub hash: String,
+    pub size: u64,
+    pub mtime: u64,
+}
+
+/// `path`'s `(size, mtime)`, or `None` when it can't be read.
+fn stat(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    Some((meta.len(), u64::try_from(mtime).ok()?))
+}
 
 /// Result of an [`WorkspaceIndexer::index`] pass:
 /// `{"indexed": N, "skipped": N, "removed": N}`.
@@ -147,10 +178,15 @@ pub struct WorkspaceIndexer {
     project_dir: String,
     store: Arc<dyn VectorStore>,
     manifest_path: String,
-    /// rel_path → sha256.
-    manifest: Mutex<BTreeMap<String, String>>,
+    /// rel_path → what it was when last hashed.
+    manifest: Mutex<BTreeMap<String, ManifestEntry>>,
     /// Serialises concurrent `index()` calls.
     lock: Mutex<()>,
+    /// Parses documents; without one they are left out of the index.
+    converter: Option<DocumentConverter>,
+    /// What is happening to a document right now, for progress: `Reading
+    /// <file>` while it is parsed, `Indexing <file>` while it is embedded.
+    activity: Mutex<Option<String>>,
 }
 
 impl WorkspaceIndexer {
@@ -174,7 +210,20 @@ impl WorkspaceIndexer {
             manifest_path,
             manifest: Mutex::new(manifest),
             lock: Mutex::new(()),
+            converter: None,
+            activity: Mutex::new(None),
         }
+    }
+
+    /// What is happening to a document right now, if anything.
+    pub fn activity(&self) -> Option<String> {
+        self.activity.lock().clone()
+    }
+
+    /// Index documents too, parsed to text by `converter`.
+    pub fn with_converter(mut self, converter: DocumentConverter) -> Self {
+        self.converter = Some(converter);
+        self
     }
 
     /// Project directory this indexer belongs to.
@@ -192,14 +241,18 @@ impl WorkspaceIndexer {
         self.manifest.lock().len()
     }
 
-    /// A copy of the in-memory manifest (rel_path → sha256).
+    /// The in-memory manifest's hashes (rel_path → sha256).
     pub fn manifest(&self) -> BTreeMap<String, String> {
-        self.manifest.lock().clone()
+        self.manifest.lock().iter().map(|(rel, entry)| (rel.clone(), entry.hash.clone())).collect()
     }
 
     /// Replace the in-memory manifest (test seam for assigning `_manifest`).
+    /// No size or modified time is recorded, so each file is hashed again.
     pub fn set_manifest(&self, manifest: BTreeMap<String, String>) {
-        *self.manifest.lock() = manifest;
+        *self.manifest.lock() = manifest
+            .into_iter()
+            .map(|(rel, hash)| (rel, ManifestEntry { hash, size: 0, mtime: 0 }))
+            .collect();
     }
 
     /// Walk `work_dir` and incrementally index changed/new files inside an
@@ -224,11 +277,11 @@ impl WorkspaceIndexer {
     }
 
     /// Load the manifest (empty on missing/corrupt file, with a warning).
-    fn load_manifest(manifest_path: &str) -> BTreeMap<String, String> {
+    fn load_manifest(manifest_path: &str) -> BTreeMap<String, ManifestEntry> {
         if Path::new(manifest_path).is_file() {
             let loaded = std::fs::read_to_string(manifest_path)
                 .map_err(anyhow::Error::from)
-                .and_then(|raw| Ok(serde_json::from_str::<BTreeMap<String, String>>(&raw)?));
+                .and_then(|raw| Ok(serde_json::from_str::<BTreeMap<String, ManifestEntry>>(&raw)?));
             match loaded {
                 Ok(manifest) => return manifest,
                 Err(e) => {
@@ -240,7 +293,7 @@ impl WorkspaceIndexer {
     }
 
     /// Persist the manifest (`indent=2` JSON); failures are logged.
-    fn save_manifest(&self, manifest: &BTreeMap<String, String>) {
+    fn save_manifest(&self, manifest: &BTreeMap<String, ManifestEntry>) {
         let written = py_pretty_json(manifest)
             .and_then(|json| Ok(std::fs::write(&self.manifest_path, json)?));
         if let Err(e) = written {
@@ -256,15 +309,38 @@ impl WorkspaceIndexer {
         let mut stats = IndexStats::default();
         let old_manifest = self.manifest.lock().clone();
 
+        // The framework's own state sits at the root only when the scan is of
+        // `project_dir` itself; a user's folder may well have a `documents/`.
+        let own_state = std::fs::canonicalize(&self.project_dir).is_ok_and(|dir| dir == work_dir);
+
         // Collect all current candidate files: rel_path -> abs_path
         let mut current_files: Vec<(String, PathBuf)> = Vec::new();
-        walk(&work_dir, &work_dir, &mut current_files);
+        walk(&work_dir, &work_dir, own_state, &mut current_files);
         let current_set: HashSet<&str> = current_files.iter().map(|(rel, _)| rel.as_str()).collect();
 
-        let mut new_manifest: BTreeMap<String, String> = BTreeMap::new();
+        let mut new_manifest: BTreeMap<String, ManifestEntry> = BTreeMap::new();
 
         // Index new / changed files
         for (rel_path, abs_path) in &current_files {
+            let document = is_document(abs_path);
+            if document
+                && (self.converter.is_none()
+                    || std::fs::metadata(abs_path).map_or(true, |m| m.len() > MAX_DOCUMENT_BYTES))
+            {
+                continue;
+            }
+            // Same size and modified time as when it was last hashed: taken
+            // as unchanged without reading it.
+            let (size, mtime) = stat(abs_path).unwrap_or_default();
+            if let Some(old) = old_manifest.get(rel_path)
+                && mtime != 0
+                && (old.size, old.mtime) == (size, mtime)
+            {
+                new_manifest.insert(rel_path.clone(), old.clone());
+                stats.skipped += 1;
+                continue;
+            }
+
             let hash = match file_hash(&abs_path.to_string_lossy()) {
                 Ok(h) => h,
                 Err(e) => {
@@ -273,17 +349,33 @@ impl WorkspaceIndexer {
                 }
             };
 
-            new_manifest.insert(rel_path.clone(), hash.clone());
+            new_manifest.insert(rel_path.clone(), ManifestEntry { hash: hash.clone(), size, mtime });
 
-            if old_manifest.get(rel_path) == Some(&hash) {
+            if old_manifest.get(rel_path).is_some_and(|old| old.hash == hash) {
                 stats.skipped += 1;
                 continue;
             }
 
-            let mut text = match read_text_lossy(abs_path) {
+            let read = match &self.converter {
+                Some(convert) if document => {
+                    tracing::info!(target: LOG_TARGET, "[workspace-index] Parsing {rel_path}");
+                    *self.activity.lock() = Some(format!("Reading {rel_path}"));
+                    let parsed = convert(abs_path);
+                    *self.activity.lock() = None;
+                    parsed
+                }
+                _ => read_text_lossy(abs_path).map_err(anyhow::Error::from),
+            };
+            let mut text = match read {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::debug!(target: LOG_TARGET, "[workspace-index] Cannot read {rel_path}: {e}");
+                    // Kept in the manifest, so a document that won't parse
+                    // isn't parsed again every pass until it changes.
+                    if document {
+                        tracing::warn!(target: LOG_TARGET, "[workspace-index] Cannot parse {rel_path}: {e}");
+                    } else {
+                        tracing::debug!(target: LOG_TARGET, "[workspace-index] Cannot read {rel_path}: {e}");
+                    }
                     continue;
                 }
             };
@@ -328,7 +420,12 @@ impl WorkspaceIndexer {
                 })
                 .collect();
 
-            match self.store.add_chunks(&chunk_dicts) {
+            if document {
+                *self.activity.lock() = Some(format!("Indexing {rel_path}"));
+            }
+            let added = self.store.add_chunks(&chunk_dicts);
+            *self.activity.lock() = None;
+            match added {
                 Ok(()) => stats.indexed += 1,
                 Err(e) => {
                     tracing::warn!(target: LOG_TARGET, "[workspace-index] Failed to index {rel_path}: {e}");
@@ -364,11 +461,12 @@ impl WorkspaceIndexer {
 /// `os.walk(work_dir, topdown=True)` with the indexer's pruning: skipped and
 /// `*.egg-info` directories anywhere, [`SKIP_ROOT_DIRS`] at the root,
 /// directories visited in sorted order, symlinked directories not followed.
-fn walk(root: &Path, work_dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+/// [`SKIP_ROOT_DIRS`] and [`SKIP_ROOT_FILES`] apply only when `own_state`.
+fn walk(root: &Path, work_dir: &Path, own_state: bool, out: &mut Vec<(String, PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
-    let at_root = std::fs::canonicalize(root).map(|r| r == work_dir).unwrap_or(false);
+    let at_root = own_state && std::fs::canonicalize(root).map(|r| r == work_dir).unwrap_or(false);
 
     let mut dirs: Vec<(String, bool)> = Vec::new();
     let mut files: Vec<String> = Vec::new();
@@ -397,7 +495,7 @@ fn walk(root: &Path, work_dir: &Path, out: &mut Vec<(String, PathBuf)>) {
             .extension()
             .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
             .unwrap_or_default();
-        if !INDEX_EXTENSIONS.contains(&ext.as_str()) {
+        if !INDEX_EXTENSIONS.contains(&ext.as_str()) && !DOCUMENT_EXTENSIONS.contains(&ext.as_str()) {
             continue;
         }
         let abs_path = root.join(&fname);
@@ -420,13 +518,22 @@ fn walk(root: &Path, work_dir: &Path, out: &mut Vec<(String, PathBuf)>) {
         if is_symlink {
             continue;
         }
-        walk(&root.join(d), work_dir, out);
+        walk(&root.join(d), work_dir, own_state, out);
     }
+}
+
+/// Whether `path` is one of [`DOCUMENT_EXTENSIONS`].
+fn is_document(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+        .unwrap_or_default();
+    DOCUMENT_EXTENSIONS.contains(&ext.as_str())
 }
 
 /// `json.dump(obj, f, indent=2)`: two-space indentation, `": "` separators,
 /// non-ASCII escaped.
-fn py_pretty_json(manifest: &BTreeMap<String, String>) -> anyhow::Result<Vec<u8>> {
+fn py_pretty_json<T: Serialize>(manifest: &T) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut out, AsciiPrettyFormatter::new());
     manifest.serialize(&mut ser)?;

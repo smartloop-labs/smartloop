@@ -43,6 +43,7 @@ use crate::constants::{display_model_name, resolve_current_date, OPENING_TOKENS,
 use crate::db::embeddings;
 use crate::llms::base_llm::CancelEvent;
 use crate::model_host::client::{ModelClient, ModelHostError, TextStream};
+use crate::tasks::IndexerTask;
 use crate::types::ModelCapability;
 use crate::workspace::context::{
     active_project_id, bind, scope_project, set_active_project, use_project, ProjectBoundExecutor,
@@ -179,6 +180,26 @@ pub trait ChatService: Send + Sync {
     fn workspace_project_ids(&self) -> Option<Vec<String>>;
     /// `model_service._model.workspace.current_project.project_dir`.
     fn current_project_dir(&self) -> Option<String>;
+    /// The user's folder the current project is bound to, or `None`.
+    fn current_work_dir(&self) -> Option<String> {
+        None
+    }
+    /// Bring the index of the current project's folder up to date, blocking
+    /// until it is; `false` when there is nothing to index or it failed.
+    fn index_work_dir(&self) -> bool {
+        false
+    }
+    /// What the folder index is doing right now (`Reading <file>`,
+    /// `Indexing <file>`), if anything.
+    fn indexing_activity(&self) -> Option<String> {
+        None
+    }
+    /// Bind the current project to `dir`, already checked by the caller;
+    /// `false` when there is no project to bind or it couldn't be saved.
+    fn bind_work_dir(&self, dir: &str) -> bool {
+        let _ = dir;
+        false
+    }
     /// Whether the answer comes from a remote model, whose usage the
     /// platform records itself.
     fn answers_remotely(&self) -> bool {
@@ -352,6 +373,44 @@ impl ChatService for ModelService {
         let ws = model.workspace.read();
         ws.current_project().map(|p| p.project_dir.clone())
     }
+    fn current_work_dir(&self) -> Option<String> {
+        let model = self.model.read().clone()?;
+        let ws = model.workspace.read();
+        ws.current_project().and_then(|p| p.work_dir())
+    }
+    fn index_work_dir(&self) -> bool {
+        let Some(indexer) = self.task_queue.read().get_task_as::<IndexerTask>("indexer") else { return false };
+        match indexer.index_workspace_now() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(target: LOG_TARGET, "[cwd] indexing the project's folder failed: {}", e);
+                false
+            }
+        }
+    }
+    fn indexing_activity(&self) -> Option<String> {
+        self.task_queue.read().get_task_as::<IndexerTask>("indexer")?.workspace_activity()
+    }
+    fn bind_work_dir(&self, dir: &str) -> bool {
+        let project_id = self.model.read().clone().and_then(|model| {
+            let ws = model.workspace.read();
+            ws.current_project().map(|p| p.id.clone())
+        });
+        let Some(project_id) = project_id else { return false };
+        let bound = self
+            .update_project_record(&project_id, |p| p.cwd = Some(dir.to_string()))
+            .and_then(|()| self.persist_model());
+        match bound {
+            Ok(()) => {
+                tracing::info!(target: LOG_TARGET, "[cwd] project {} bound to {}", project_id, dir);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(target: LOG_TARGET, "[cwd] could not bind project {} to {}: {}", project_id, dir, e);
+                false
+            }
+        }
+    }
 }
 
 /// A model client standing in for one that could not be resolved: every call
@@ -479,6 +538,10 @@ fn try_status_event(step: &str, status: &str, message: &str) -> Option<String> {
     let payload = serde_json::to_string(&chunk).ok()?;
     Some(format!("data: {payload}\n\n"))
 }
+
+/// How long a turn waits for its project's folder to be indexed before it
+/// answers from what is ready.
+const INDEX_WAIT: Duration = Duration::from_secs(180);
 
 /// Single-worker pool for running sync LLM operations (`_executor`).
 pub static EXECUTOR: Lazy<ProjectBoundExecutor> =
@@ -1711,14 +1774,34 @@ pub fn bind_request_project(request: &ChatCompletionRequest, model_service: &dyn
     }
 }
 
-/// The working directory for this request — always framework-level.
+/// The working directory for this request.
 ///
-/// The client sends a `cwd`, but it is deliberately ignored: it may point
-/// outside the sandbox container, or at a folder that does not exist on a
-/// copied install.  Everything the framework stores and scans lives under
-/// `project_dir`.
-pub fn request_cwd(model_service: &dyn ChatService) -> Option<String> {
-    model_service.current_project_dir()
+/// The client's `cwd` is honoured only inside the folder the project is
+/// bound to.  A project with no folder yet — or whose folder has gone, moved
+/// or deleted — is bound to the `cwd` of the first turn that names a usable
+/// one: not the home folder or above it, and not the framework's own state.
+/// Anything else falls back to `project_dir`, so once a project has its
+/// folder a client can't point the file tools anywhere outside it.
+pub fn request_cwd(request: &ChatCompletionRequest, model_service: &dyn ChatService) -> Option<String> {
+    let cwd = request.cwd.as_deref().filter(|c| !c.is_empty());
+    let root = model_service.current_work_dir().filter(|root| Path::new(root).is_dir());
+    let bound = match (cwd, root) {
+        (Some(cwd), Some(root)) => crate::paths::dir_within(cwd, &root),
+        (Some(cwd), None) => crate::paths::bindable_dir(cwd)
+            .filter(|dir| !is_framework_state(dir, model_service))
+            .filter(|dir| model_service.bind_work_dir(dir)),
+        (None, _) => None,
+    };
+    bound.or_else(|| model_service.current_project_dir())
+}
+
+/// Whether `dir` lies in the framework's own workspace, which holds every
+/// project's state and is never a folder to work in.
+fn is_framework_state(dir: &str, model_service: &dyn ChatService) -> bool {
+    model_service
+        .workspace_dir()
+        .and_then(|ws| std::fs::canonicalize(ws).ok())
+        .is_some_and(|ws| Path::new(dir).starts_with(ws))
 }
 
 /// Resolve the current date from the client's `additional_message_params`.
@@ -2410,6 +2493,46 @@ fn stream_chunks_inner(
             yield status_event("attachments", "completed", "Attachments resolved");
         }
 
+        // A project bound to the user's folder answers from it, so the turn
+        // waits for the folder's index to catch up: a document added or
+        // changed there is read now, not on the next background pass.  The
+        // wait is capped so a large first index can't hold the answer back
+        // for good; it carries on in the background.
+        let _ = request_cwd(&request, &*svc);
+        if let Some(folder) = svc.current_work_dir() {
+            yield status_event("index", "processing", &format!("Checking documents in {folder}"));
+            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<bool>();
+            let worker = svc.clone();
+            std::thread::spawn(bind(move || {
+                let _ = done_tx.send(worker.index_work_dir());
+            }));
+            let started = Instant::now();
+            // Each change is its own status line: `Reading <file>` while it
+            // is parsed, then `Indexing <file>` while it is embedded.
+            let mut shown: Option<String> = None;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(500), &mut done_rx).await {
+                    Ok(_) => {
+                        if shown.is_some() {
+                            yield status_event("index", "completed", "Documents indexed");
+                        }
+                        break;
+                    }
+                    Err(_) if started.elapsed() >= INDEX_WAIT => {
+                        yield status_event("index", "completed", "Still indexing; answering from what's ready");
+                        break;
+                    }
+                    Err(_) => {
+                        let activity = svc.indexing_activity();
+                        if let Some(message) = activity.as_deref().filter(|_| activity != shown) {
+                            yield status_event("index", "processing", message);
+                            shown = activity.clone();
+                        }
+                    }
+                }
+            }
+        }
+
         // Image attachments on the current turn are handed to the orchestrator
         // so a vision-capable model reads the pixels + the user's own question,
         // instead of a pre-processed text transcription.
@@ -2495,7 +2618,7 @@ fn stream_chunks_inner(
             let args = OrchestrateArgs {
                 user_message: last_user_msg.clone().unwrap_or_default(),
                 skills: project_skills.clone(),
-                cwd: request_cwd(&*svc),
+                cwd: request_cwd(&request, &*svc),
                 conversation_history: conversation_history.clone(),
                 has_attachments,
                 images: image_attachments.clone(),
@@ -2719,7 +2842,7 @@ fn stream_chunks_inner(
             let overhead_prompt = format_messages_to_prompt(
                 &messages,
                 Some(""),
-                request_cwd(&*svc).as_deref(),
+                request_cwd(&request, &*svc).as_deref(),
                 project_info.as_deref(),
                 Some(&current_date),
             );
@@ -2745,7 +2868,7 @@ fn stream_chunks_inner(
         let prompt = format_messages_to_prompt(
             &messages,
             orchestrator_context.as_deref(),
-            request_cwd(&*svc).as_deref(),
+            request_cwd(&request, &*svc).as_deref(),
             project_info.as_deref(),
             Some(&current_date),
         );
@@ -2945,7 +3068,7 @@ fn stream_chunks_inner(
 
         // Auto file-write: if user asked to create/generate/write, save LLM
         // response to file
-        let out_cwd = request_cwd(&*svc).filter(|c| !c.is_empty());
+        let out_cwd = request_cwd(&request, &*svc).filter(|c| !c.is_empty());
         if !fin.parts.is_empty()
             && let (Some(user_msg), Some(cwd)) =
                 (last_user_msg.as_deref().filter(|m| !m.is_empty()), out_cwd.as_deref())
@@ -3267,7 +3390,7 @@ async fn complete_body(
         let args = OrchestrateArgs {
             user_message,
             skills: project_skills.clone(),
-            cwd: request_cwd(&**svc),
+            cwd: request_cwd(request, &**svc),
             conversation_history: conversation_history.clone(),
             images: image_attachments.clone(),
             current_date: Some(request_current_date(request)),
@@ -3321,7 +3444,7 @@ async fn complete_body(
     let prompt = format_messages_to_prompt(
         &messages,
         orchestrator_context.as_deref(),
-        request_cwd(&**svc).as_deref(),
+        request_cwd(request, &**svc).as_deref(),
         project_info.as_deref(),
         Some(&request_current_date(request)),
     );
@@ -3391,7 +3514,7 @@ async fn complete_body(
 
     // Auto file-write: if user asked to create/generate/write, save LLM
     // response to file
-    let out_cwd = request_cwd(&**svc).filter(|c| !c.is_empty());
+    let out_cwd = request_cwd(request, &**svc).filter(|c| !c.is_empty());
     if let (Some(user_msg), Some(cwd)) =
         (last_user_msg.as_deref().filter(|m| !m.is_empty()), out_cwd.as_deref())
         && !response_text.is_empty()

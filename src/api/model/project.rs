@@ -81,6 +81,10 @@ pub struct UpdateProjectRequest {
     /// Enable/disable web search for this project; omit to leave unchanged.
     #[serde(default)]
     pub web_search_enabled: Option<bool>,
+    /// The user's folder to bind the project to, which chat turns may then
+    /// work in; `""` unbinds it, omit to leave unchanged.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 fn default_true() -> bool {

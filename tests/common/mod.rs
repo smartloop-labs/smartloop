@@ -2862,6 +2862,16 @@ pub mod api_chat {
         pub workspace_dir: Mutex<Option<String>>,
         /// `(session_id, role, content)` of every `append_to_session`.
         pub session_writes: Mutex<Vec<(String, String, String)>>,
+        /// `current_project.project_dir`.
+        pub project_dir: Mutex<Option<String>>,
+        /// The folder the current project is bound to.
+        pub work_dir: Mutex<Option<String>>,
+        /// `index_work_dir` calls; each steps through `index_activity` over
+        /// `index_hold`, then finishes.
+        pub index_calls: Mutex<usize>,
+        pub index_activity: Mutex<Vec<String>>,
+        pub index_now: Mutex<Option<String>>,
+        pub index_hold: Mutex<Duration>,
     }
 
     impl Default for FakeChatService {
@@ -2879,6 +2889,12 @@ pub mod api_chat {
                 orchestrate_calls: Mutex::new(Vec::new()),
                 workspace_dir: Mutex::new(None),
                 session_writes: Mutex::new(Vec::new()),
+                project_dir: Mutex::new(None),
+                work_dir: Mutex::new(None),
+                index_calls: Mutex::new(0),
+                index_activity: Mutex::new(Vec::new()),
+                index_now: Mutex::new(None),
+                index_hold: Mutex::new(Duration::ZERO),
             }
         }
     }
@@ -2989,7 +3005,28 @@ pub mod api_chat {
             None
         }
         fn current_project_dir(&self) -> Option<String> {
-            None
+            self.project_dir.lock().clone()
+        }
+        fn current_work_dir(&self) -> Option<String> {
+            self.work_dir.lock().clone()
+        }
+        fn bind_work_dir(&self, dir: &str) -> bool {
+            *self.work_dir.lock() = Some(dir.to_string());
+            true
+        }
+        fn index_work_dir(&self) -> bool {
+            *self.index_calls.lock() += 1;
+            let steps = self.index_activity.lock().clone();
+            let each = *self.index_hold.lock() / (steps.len().max(1) as u32);
+            for step in steps {
+                *self.index_now.lock() = Some(step);
+                std::thread::sleep(each);
+            }
+            *self.index_now.lock() = None;
+            true
+        }
+        fn indexing_activity(&self) -> Option<String> {
+            self.index_now.lock().clone()
         }
         /// The `_no_telemetry` fixture: the usage tail stays offline.
         fn push_token_usage(

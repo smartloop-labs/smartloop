@@ -80,7 +80,10 @@ fn source_text<'a>(search_ctx: &'a SearchContext, attr: &str) -> &'a str {
 /// `setattr(search_ctx, attr, "")`).
 fn clear_source(search_ctx: &mut SearchContext, attr: &str) {
     match attr {
-        "workspace_context" => search_ctx.workspace_context.clear(),
+        "workspace_context" => {
+            search_ctx.workspace_context.clear();
+            search_ctx.workspace_citations.clear();
+        }
         "feedback_context" => search_ctx.feedback_context.clear(),
         "vector_context" => search_ctx.vector_context.clear(),
         "web_context" => search_ctx.web_context.clear(),

@@ -36,7 +36,7 @@ use crate::api::services::get_model_service;
 use crate::db::embeddings::device_idle_seconds;
 use crate::db::store::Chunk;
 use crate::db::store_factory::StoreFactory;
-use crate::db::workspace_indexer::{IndexStats, WorkspaceIndexer};
+use crate::db::workspace_indexer::{DocumentConverter, IndexStats, WorkspaceIndexer};
 use crate::llms::base_llm::BaseLLM;
 use crate::parsers::base_parser::{ParserError, SharedLLM};
 use crate::parsers::parser_factory::ParserFactory;
@@ -71,11 +71,19 @@ pub trait WorkspaceIndex: Send + Sync {
     fn index(&self, work_dir: &str) -> IndexStats;
     /// Number of files currently indexed.
     fn file_count(&self) -> usize;
+    /// What is happening to a document right now (`Reading <file>`,
+    /// `Indexing <file>`), if anything.
+    fn activity(&self) -> Option<String> {
+        None
+    }
 }
 
 impl WorkspaceIndex for WorkspaceIndexer {
     fn index(&self, work_dir: &str) -> IndexStats {
         WorkspaceIndexer::index(self, work_dir)
+    }
+    fn activity(&self) -> Option<String> {
+        WorkspaceIndexer::activity(self)
     }
     fn file_count(&self) -> usize {
         WorkspaceIndexer::file_count(self)
@@ -905,6 +913,22 @@ impl IndexerTask {
         *self.last_workspace_scan.lock() = 0.0;
     }
 
+    /// Index the project's folder now and return once it is done, for a chat
+    /// turn that waits on it.  No quiet-period deferral: the turn waiting is
+    /// what would keep the model busy.  A background pass already running is
+    /// waited out by the indexer's own lock, then this one finds little left.
+    pub fn index_workspace_now(&self) -> anyhow::Result<()> {
+        self.workspace_scan_inflight.store(true, Ordering::SeqCst);
+        let outcome = self.scan_workspace(false);
+        self.workspace_scan_inflight.store(false, Ordering::SeqCst);
+        outcome
+    }
+
+    /// What the workspace pass is doing to a document right now, if anything.
+    pub fn workspace_activity(&self) -> Option<String> {
+        self.workspace_indexer.lock().as_ref().and_then(|indexer| indexer.activity())
+    }
+
     /// Executor entry point for the background workspace index pass.
     fn run_workspace_scan(&self) {
         let outcome = catch_unwind(AssertUnwindSafe(|| self.scan_workspace_files()));
@@ -928,15 +952,24 @@ impl IndexerTask {
     /// underlying [`WorkspaceIndexer`] is hash-incremental, so repeat passes
     /// only re-embed changed files.
     pub fn scan_workspace_files(&self) -> anyhow::Result<()> {
+        self.scan_workspace(true)
+    }
+
+    /// [`IndexerTask::scan_workspace_files`], deferring to a busy model only
+    /// when `defer`.
+    fn scan_workspace(&self, defer: bool) -> anyhow::Result<()> {
         let Some(project) = self.project() else {
             return Ok(());
         };
 
-        // Everything the framework knows about lives under project_dir, so
-        // that is what gets scanned.  A client-supplied path is never used to
-        // locate content: it may be unreadable (sandbox) or absent on a copied
-        // install, which would silently empty the index.
-        let work_dir = project.project_dir.clone();
+        // The folder the project is bound to, when it still is one this
+        // process may work in (see `chat::request_cwd`); otherwise the
+        // project's own directory, as for a project with no folder.  The
+        // index itself always lives under project_dir.
+        let work_dir = project
+            .work_dir()
+            .and_then(|dir| crate::paths::bindable_dir(&dir))
+            .unwrap_or_else(|| project.project_dir.clone());
         if work_dir.is_empty() || !Path::new(&work_dir).is_dir() {
             return Ok(());
         }
@@ -961,7 +994,7 @@ impl IndexerTask {
             Some(provider) => provider(),
             None => device_idle_seconds(),
         };
-        if idle < Self::WORKSPACE_QUIET_SECONDS {
+        if defer && idle < Self::WORKSPACE_QUIET_SECONDS {
             self.core.logger.debug(&format!(
                 "[Indexer] Workspace scan deferred — model busy (idle {idle:.1}s < {:.1}s)",
                 Self::WORKSPACE_QUIET_SECONDS
@@ -984,8 +1017,10 @@ impl IndexerTask {
                 Some(indexer) if dir.as_deref() == Some(project.project_dir.as_str()) => indexer.clone(),
                 _ => {
                     let workspace_dir = self.workspace().read().workspace_dir.clone();
-                    let indexer: Arc<dyn WorkspaceIndex> =
-                        Arc::new(WorkspaceIndexer::new(&project.project_dir, Some(&workspace_dir))?);
+                    let converter: DocumentConverter = Arc::new(convert_document);
+                    let indexer: Arc<dyn WorkspaceIndex> = Arc::new(
+                        WorkspaceIndexer::new(&project.project_dir, Some(&workspace_dir))?.with_converter(converter),
+                    );
                     *slot = Some(indexer.clone());
                     *dir = Some(project.project_dir.clone());
                     indexer
@@ -1093,6 +1128,19 @@ impl IndexerTask {
             ));
         }
     }
+}
+
+/// Parse a document in the project's folder to text for the workspace
+/// index, with the parsers uploads go through.
+fn convert_document(path: &Path) -> anyhow::Result<String> {
+    let model_service = get_model_service();
+    let llm = match model_service.get_llm() {
+        Some(llm) => llm,
+        None => model_service.load_model()?,
+    };
+    let shared: SharedLLM = llm;
+    let path = path.to_string_lossy();
+    ParserFactory::new(Some(shared)).get_parser(&guess_mime_type(Path::new(path.as_ref())), &path)?.parse()
 }
 
 /// Whether `exc` is the Rust form of a Python `ValueError` from parsing.
