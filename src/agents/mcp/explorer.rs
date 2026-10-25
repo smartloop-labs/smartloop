@@ -22,7 +22,6 @@ use serde_json::{Map, Value};
 
 use crate::agents::fetch_agent::{FetchAgent, UrlFetcher};
 use crate::agents::mcp::argument_extractor::MCPArgumentExtractor;
-use crate::agents::mcp::file_ops::FileOperations;
 use crate::agents::mcp::mcp_agent::{
     format_call, is_entitlement_notice, mark_tool_unavailable, missing_required, MCPAgent,
     ResolvedCall,
@@ -304,6 +303,10 @@ pub struct SearchContext {
     pub feedback_context: String,
     #[serde(default)]
     pub workspace_context: String,
+    /// Citations for the folder files in `workspace_context`, one per file,
+    /// in the shape document citations take.
+    #[serde(default)]
+    pub workspace_citations: Vec<Map<String, Value>>,
     /// Latest-info content from the hosted web search (Pro feature).
     #[serde(default)]
     pub web_context: String,
@@ -1238,12 +1241,17 @@ Does answering the latest message require a new web search?
     }
 
     /// Workspace file search — thread-safe, I/O bound.
+    ///
+    /// Returns the context text and a citation per file in it.  A citation
+    /// carries the file's path under `cwd`, so a client can open it, and the
+    /// text it put in front of the model as `_extract`, which the answer is
+    /// checked against before the file is credited.
     pub fn search_workspace(
         query: &str,
         model_service: &dyn ExplorerSearchService,
         cwd: &str,
         conversation_history: Option<&[ConversationTurn]>,
-    ) -> String {
+    ) -> (String, Vec<Map<String, Value>>) {
         match model_service.search_workspace(query, cwd, 10, conversation_history) {
             Ok(ws_chunks) => {
                 if !ws_chunks.is_empty() {
@@ -1263,24 +1271,42 @@ Does answering the latest message require a new web search?
                             }
                         }
                     }
-                    let text = seen_files
+                    let extracts: Vec<(&String, String)> = seen_files
                         .iter()
-                        .map(|(fname, chunk)| format!("--- {} ---\n{}", fname, take_chars(&chunk.text, 2000)))
+                        .map(|(fname, chunk)| (fname, take_chars(&chunk.text, 2000).to_string()))
+                        .collect();
+                    let text = extracts
+                        .iter()
+                        .map(|(fname, extract)| format!("--- {} ---\n{}", fname, extract))
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let citations = extracts
+                        .iter()
+                        .map(|(fname, extract)| {
+                            let mut citation = Map::new();
+                            citation.insert("document_id".into(), Value::String((*fname).clone()));
+                            citation.insert("document_name".into(), Value::String((*fname).clone()));
+                            let path = Path::new(cwd).join(fname.as_str());
+                            citation.insert("path".into(), Value::String(path.to_string_lossy().into_owned()));
+                            citation.insert("_extract".into(), Value::String(extract.clone()));
+                            citation.insert("_chunks".into(), Value::Array(Vec::new()));
+                            citation.insert("_vectors".into(), Value::Array(Vec::new()));
+                            citation
+                        })
+                        .collect();
                     tracing::info!(
                         target: LOGGER,
                         "[collect] Workspace search returned {} file(s)",
                         seen_files.len()
                     );
-                    return text;
+                    return (text, citations);
                 }
             }
             Err(e) => {
                 tracing::warn!(target: LOGGER, "[collect] Workspace search failed: {}", e);
             }
         }
-        String::new()
+        (String::new(), Vec::new())
     }
 
     /// Fan-out vector/feedback/workspace searches in parallel.
@@ -1390,7 +1416,7 @@ Does answering the latest message require a new web search?
         ctx.feedback_context = join(f_fb);
 
         if let Some(f_ws) = f_ws {
-            ctx.workspace_context = join(f_ws);
+            (ctx.workspace_context, ctx.workspace_citations) = join(f_ws);
         }
 
         if let Some(f_mcp) = f_mcp {
@@ -2027,26 +2053,11 @@ Does answering the latest message require a new web search?
         let mut file_contents: Vec<String> = Vec::new();
         for fpath in picked.iter().take(3) {
             let full_path = cwd_path.join(fpath);
-            let ext = splitext_ext(fpath).to_lowercase();
-            let content = if FileOperations::BINARY_EXTENSIONS.contains(&ext.as_str()) {
-                let parsed = self
-                    .llm
-                    .clone()
-                    .and_then(|llm| FileOperations::new(llm).parse_binary_file(&full_path.to_string_lossy()));
-                match parsed {
-                    Some(content) => content,
-                    None => {
-                        tracing::warn!(target: LOGGER, "[explore] Could not parse binary file {}", fpath);
-                        continue;
-                    }
-                }
-            } else {
-                match read_text_lossy(&full_path) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        tracing::warn!(target: LOGGER, "[explore] Could not read {}: {}", fpath, e);
-                        continue;
-                    }
+            let content = match read_text_lossy(&full_path) {
+                Ok(content) => content,
+                Err(e) => {
+                    tracing::warn!(target: LOGGER, "[explore] Could not read {}: {}", fpath, e);
+                    continue;
                 }
             };
             let content = if char_len(&content) > MAX_FILE_CHARS {

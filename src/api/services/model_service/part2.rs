@@ -1619,10 +1619,11 @@ impl ModelService {
     }
 
     /// Update an existing project (label, description, skills on disk,
-    /// web-search toggle).
+    /// web-search toggle, bound folder).
     ///
     /// Renaming only changes the label: skills and documents live under
-    /// `project_dir` (keyed by id), so nothing moves on disk.
+    /// `project_dir` (keyed by id), so nothing moves on disk.  `cwd` binds
+    /// the user's folder, already resolved by the caller; `""` unbinds it.
     pub fn update_project(
         &self,
         project_id: &str,
@@ -1630,6 +1631,7 @@ impl ModelService {
         description: Option<&str>,
         skills: Option<Vec<Skill>>,
         web_search_enabled: Option<bool>,
+        cwd: Option<&str>,
     ) -> anyhow::Result<Value> {
         self.ensure_model()?;
         let updated = self.with_project_mut(project_id, |project| {
@@ -1643,6 +1645,9 @@ impl ModelService {
             }
             if let Some(enabled) = web_search_enabled {
                 project.web_search_enabled = enabled;
+            }
+            if let Some(cwd) = cwd {
+                project.cwd = non_empty(Some(cwd)).map(str::to_string);
             }
             project.clone()
         })?;

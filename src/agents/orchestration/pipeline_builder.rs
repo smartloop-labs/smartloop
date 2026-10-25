@@ -546,8 +546,12 @@ impl PipelineBuilder {
         let planner_skills: Option<Vec<String>> =
             Some(c.skill_bodies.clone()).filter(|b| !b.is_empty());
 
+        // Chunks from the project's folder count as documents too: a plain
+        // question about them is EXPLORE, the same as one about an upload.
         let document_context: Option<String> = if !vector_context.is_empty() {
             Some(vector_context.clone())
+        } else if !sc.workspace_context.is_empty() {
+            Some(sc.workspace_context.clone())
         } else {
             c.document_context.clone().filter(|d| !d.is_empty())
         };
@@ -1024,9 +1028,14 @@ impl PipelineBuilder {
                 parts.push(ResponseBuilder::frame_web_results(&sc.web_context));
             }
             let content = parts.join("\n\n---\n\n");
-            if let Some(citations) = sc.citations.as_ref().filter(|c| !c.is_empty()) {
-                ctx.write().explore_citations =
-                    Some(citations.iter().cloned().map(Value::Object).collect());
+            // Documents first, then the folder files the answer drew on.
+            let mut citations: Vec<Value> =
+                sc.citations.iter().flatten().cloned().map(Value::Object).collect();
+            if !sc.workspace_context.is_empty() {
+                citations.extend(sc.workspace_citations.iter().cloned().map(Value::Object));
+            }
+            if !citations.is_empty() {
+                ctx.write().explore_citations = Some(citations);
             }
             return plan_step_result(&node_id, step, &content, None);
         }

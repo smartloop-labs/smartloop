@@ -26,6 +26,8 @@
 //! the real home only through the `home` interface.  This module answers
 //! *where*, and the caller still has to cope with a denial.
 
+use std::path::Path;
+
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -240,4 +242,36 @@ pub fn expanduser(path: &str) -> String {
     } else {
         expanded
     }
+}
+
+/// `path`, `~`-expanded and canonicalized, when it names a folder this
+/// process can list; `None` otherwise.
+///
+/// The check a folder has to pass before a project is bound to it: under the
+/// App Sandbox a folder the user never picked resolves but can't be read, and
+/// binding it would only fail later, on every chat turn.
+pub fn reachable_dir(path: &str) -> Option<String> {
+    let path = std::fs::canonicalize(expand_home(path)).ok()?;
+    std::fs::read_dir(&path).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// [`reachable_dir`], short of the folders a project is never bound to:
+/// `/`, the home folder and anything above it, which would put the user's
+/// whole home in reach of the file tools and the indexer.
+pub fn bindable_dir(path: &str) -> Option<String> {
+    let dir = reachable_dir(path)?;
+    let at = Path::new(&dir);
+    let home = std::fs::canonicalize(real_home()).ok();
+    let holds_home = at.parent().is_none() || home.is_some_and(|home| home.starts_with(at));
+    (!holds_home).then_some(dir)
+}
+
+/// `path`, canonicalized, when it is `root` or a folder inside it; `None`
+/// when it lies elsewhere or either side doesn't resolve.  Canonicalizing
+/// both sides first means `..` and symlinks can't step out of `root`.
+pub fn dir_within(path: &str, root: &str) -> Option<String> {
+    let root = std::fs::canonicalize(expand_home(root)).ok()?;
+    let path = std::fs::canonicalize(expand_home(path)).ok()?;
+    (path.is_dir() && path.starts_with(&root)).then(|| path.to_string_lossy().into_owned())
 }

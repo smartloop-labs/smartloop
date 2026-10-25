@@ -133,6 +133,17 @@ pub async fn update_project(
     Path(project_id): Path<String>,
     ValidatedJson(request): ValidatedJson<UpdateProjectRequest>,
 ) -> Result<Json<ProjectResponse>, HTTPException> {
+    // A folder is bound only once it resolves and can be listed, so a path
+    // the process can't reach is refused here rather than on every turn;
+    // the home folder and those above it never are.
+    let cwd = match request.cwd.as_deref() {
+        None => None,
+        Some("") => Some(String::new()),
+        Some(path) => match crate::paths::bindable_dir(path) {
+            Some(dir) => Some(dir),
+            None => return Err(HTTPException::new(400, format!("Can't work in {path}: not a readable folder, or it holds the home folder"))),
+        },
+    };
     let model_service = get_model_service();
     let result = run_blocking(move || {
         let skills: Vec<Skill> = request.skills.iter().map(skill_from_request).collect();
@@ -142,6 +153,7 @@ pub async fn update_project(
             request.description.as_deref(),
             Some(skills),
             request.web_search_enabled,
+            cwd.as_deref(),
         )
     })
     .await?;
