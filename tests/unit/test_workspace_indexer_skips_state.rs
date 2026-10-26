@@ -96,6 +96,22 @@ mod test_state_files_are_not_content {
 
     #[test]
     #[serial(embeddings)]
+    fn test_hidden_directories_are_skipped() {
+        // Run from the home folder, the walk met `~/.smartloop` — the
+        // framework's own models, db and logs — and indexed them.
+        let td = tempfile::tempdir().unwrap();
+        for dir in [".smartloop", ".config"] {
+            std::fs::create_dir_all(td.path().join(dir)).unwrap();
+            write(td.path().join(dir).join("notes.md"), "state");
+        }
+        write(td.path().join("notes.md"), "real content");
+        let (idx, _store) = indexer(td.path());
+        idx.index(td.path().to_str().unwrap());
+        assert_eq!(keys(&idx), set(&["notes.md"]));
+    }
+
+    #[test]
+    #[serial(embeddings)]
     fn test_the_vector_store_directory_is_skipped() {
         let td = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(td.path().join("db")).unwrap();
