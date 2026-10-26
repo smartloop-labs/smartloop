@@ -88,14 +88,17 @@ fn test_a_bound_project_is_not_moved_to_another_folder() {
 }
 
 #[test]
-fn test_the_home_folder_is_never_bound() {
+fn test_the_home_folder_is_bound_but_root_never() {
     let tmp = tempfile::tempdir().unwrap();
     let service = bound(tmp.path());
     *service.work_dir.lock() = None;
 
-    assert_eq!(request_cwd(&request(Some("~")), &service), Some(s(&tmp.path().join("state"))));
     assert_eq!(request_cwd(&request(Some("/")), &service), Some(s(&tmp.path().join("state"))));
     assert_eq!(*service.work_dir.lock(), None);
+
+    let home = reachable_dir("~");
+    assert_eq!(request_cwd(&request(Some("~")), &service), home);
+    assert_eq!(*service.work_dir.lock(), home);
 }
 
 #[test]
@@ -143,10 +146,10 @@ fn test_dir_within_rejects_siblings_with_a_shared_prefix() {
 }
 
 #[test]
-fn test_bindable_dir_refuses_home_and_above() {
+fn test_bindable_dir_refuses_only_root() {
     let tmp = tempfile::tempdir().unwrap();
 
-    assert_eq!(bindable_dir("~"), None);
+    assert_eq!(bindable_dir("~"), reachable_dir("~"));
     assert_eq!(bindable_dir("/"), None);
     assert_eq!(bindable_dir(&tmp.path().to_string_lossy()), Some(s(tmp.path())));
 }
