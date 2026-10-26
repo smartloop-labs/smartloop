@@ -1863,6 +1863,8 @@ Does answering the latest message require a new web search?
     ) -> (String, Option<Vec<Map<String, Value>>>) {
         let _ = (project_dir, enriched, skill_instruction);
         tracing::info!(target: LOGGER, "[explore] Starting exploration in {}", work_dir);
+        // The SLP home is the framework's own state, not a folder to search.
+        let ws_dir = Some(work_dir).filter(|d| !crate::paths::in_slp_home(d));
 
         let urls: Vec<String> = URL_IN_MESSAGE.find_iter(user_message).map(|m| m.as_str().to_string()).collect();
         let need_fetch = !urls.is_empty() && mcp_servers.is_some_and(|s| !s.is_empty());
@@ -1899,7 +1901,7 @@ Does answering the latest message require a new web search?
             let search_ctx = self.collect_parallel(
                 user_message,
                 model_service,
-                Some(work_dir),
+                ws_dir,
                 None,
                 None,
                 None,
@@ -1936,7 +1938,7 @@ Does answering the latest message require a new web search?
                 let search_ctx = self.collect_parallel(
                     user_message,
                     model_service,
-                    Some(work_dir),
+                    ws_dir,
                     None,
                     None,
                     None,
@@ -1987,7 +1989,9 @@ Does answering the latest message require a new web search?
         let cwd_path = Path::new(cwd);
 
         let mut candidates: Vec<String> = Vec::new();
-        walk(cwd_path, &mut |root, dirs, files| {
+        // Nothing to read in the framework's own state.
+        let walk_root = if crate::paths::in_slp_home(cwd) { Path::new("") } else { cwd_path };
+        walk(walk_root, &mut |root, dirs, files| {
             dirs.retain(|d| {
                 !d.starts_with('.') && !EXPLORE_SKIP_DIRS.contains(&d.as_str()) && !d.ends_with(".egg-info")
             });

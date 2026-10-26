@@ -256,15 +256,18 @@ pub fn reachable_dir(path: &str) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
-/// [`reachable_dir`], short of the folders a project is never bound to:
-/// `/`, the home folder and anything above it, which would put the user's
-/// whole home in reach of the file tools and the indexer.
+/// [`reachable_dir`], short of `/`, which a project is never bound to.  The
+/// home folder is fine: the indexer and explorer skip hidden folders, so
+/// `~/.smartloop` and the like stay out of reach.
 pub fn bindable_dir(path: &str) -> Option<String> {
     let dir = reachable_dir(path)?;
-    let at = Path::new(&dir);
-    let home = std::fs::canonicalize(real_home()).ok();
-    let holds_home = at.parent().is_none() || home.is_some_and(|home| home.starts_with(at));
-    (!holds_home).then_some(dir)
+    Path::new(&dir).parent().is_some().then_some(dir)
+}
+
+/// Whether `dir` is the SLP home (`SLP_HOME`, else `~/.smartloop`) or a
+/// folder inside it: the framework's own state, never a folder to explore.
+pub fn in_slp_home(dir: &str) -> bool {
+    dir_within(dir, &crate::auth::credential_store::slp_home().to_string_lossy()).is_some()
 }
 
 /// `path`, canonicalized, when it is `root` or a folder inside it; `None`
