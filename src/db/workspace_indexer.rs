@@ -458,8 +458,8 @@ impl WorkspaceIndexer {
     }
 }
 
-/// `os.walk(work_dir, topdown=True)` with the indexer's pruning: skipped and
-/// `*.egg-info` directories anywhere, [`SKIP_ROOT_DIRS`] at the root,
+/// `os.walk(work_dir, topdown=True)` with the indexer's pruning: hidden,
+/// skipped and `*.egg-info` directories anywhere, [`SKIP_ROOT_DIRS`] at the root,
 /// directories visited in sorted order, symlinked directories not followed.
 /// [`SKIP_ROOT_DIRS`] and [`SKIP_ROOT_FILES`] apply only when `own_state`.
 fn walk(root: &Path, work_dir: &Path, own_state: bool, out: &mut Vec<(String, PathBuf)>) {
@@ -506,8 +506,11 @@ fn walk(root: &Path, work_dir: &Path, own_state: bool, out: &mut Vec<(String, Pa
         out.push((rel_path, abs_path));
     }
 
+    // Hidden directories are state too: `~/.smartloop`, `.cache`, `.config`
+    // when the folder is the home one.
     dirs.retain(|(d, _)| {
-        !SKIP_DIRS.contains(&d.as_str())
+        !d.starts_with('.')
+            && !SKIP_DIRS.contains(&d.as_str())
             && !d.ends_with(".egg-info")
             && !(at_root && SKIP_ROOT_DIRS.contains(&d.as_str()))
     });

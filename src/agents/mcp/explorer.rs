@@ -55,7 +55,7 @@ pub const EXPLORE_EXTENSIONS: &[&str] = &[
     ".yaml", ".yml", ".toml", ".json", ".cfg", ".ini", ".md", ".txt", ".rst", ".html", ".css",
     ".sql", ".proto", ".graphql", ".sh",
 ];
-/// Directory names `explore_and_read` never descends into.
+/// Directory names `explore_and_read` never descends into, besides hidden ones.
 pub const EXPLORE_SKIP_DIRS: &[&str] = &[
     ".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".mypy_cache",
     ".pytest_cache", "dist", "build", ".eggs", "*.egg-info", ".out",
@@ -1988,7 +1988,9 @@ Does answering the latest message require a new web search?
 
         let mut candidates: Vec<String> = Vec::new();
         walk(cwd_path, &mut |root, dirs, files| {
-            dirs.retain(|d| !EXPLORE_SKIP_DIRS.contains(&d.as_str()) && !d.ends_with(".egg-info"));
+            dirs.retain(|d| {
+                !d.starts_with('.') && !EXPLORE_SKIP_DIRS.contains(&d.as_str()) && !d.ends_with(".egg-info")
+            });
             let mut sorted_files = files.to_vec();
             sorted_files.sort();
             for fname in sorted_files {
