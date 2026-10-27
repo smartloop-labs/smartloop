@@ -812,6 +812,13 @@ impl IndexerTask {
         let current_docs = self.project_documents(&project);
         let existing_hashes: HashSet<&str> = current_docs.iter().map(|d| d.id.as_str()).collect();
         let existing_paths: HashSet<&str> = current_docs.iter().map(|d| d.path.as_str()).collect();
+        // The inbox names registered documents go by: a converted one's path
+        // moves to its converted copy, so its original is known by name.
+        let mut registered_names: HashSet<String> = current_docs
+            .iter()
+            .filter_map(|d| d.name.clone().filter(|n| !n.is_empty()))
+            .collect();
+        registered_names.extend(manifest_entries.values().filter_map(|e| e.get("filename")?.as_str().map(str::to_string)));
 
         let mut new_docs: Vec<Document> = Vec::new();
         for (filename, file_path) in &disk_files {
@@ -823,6 +830,20 @@ impl IndexerTask {
                 Ok(bytes) => {
                     let doc_hash = hex::encode(Md5::digest(&bytes).as_slice());
                     if existing_hashes.contains(doc_hash.as_str()) {
+                        // A second copy of a document already here (an upload
+                        // stored as `name_1` beside it) never registers: left
+                        // in, it would list as pending for good.
+                        if !registered_names.contains(filename) {
+                            match std::fs::remove_file(file_path) {
+                                Ok(()) => self.core.logger.info(&format!(
+                                    "[Indexer] {filename} duplicates a document already in the project — removed"
+                                )),
+                                Err(exc) => self
+                                    .core
+                                    .logger
+                                    .warning(&format!("[Indexer] Could not remove duplicate {filename}: {exc}")),
+                            }
+                        }
                         continue;
                     }
                     new_docs.push(Document {
