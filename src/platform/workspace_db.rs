@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     active_param_size_b REAL,
     attention           TEXT,
     reasoning_budget_tokens INTEGER,
+    always_reasons      INTEGER,
+    reasoning_efforts   TEXT,            -- JSON array of effort names
+    default_reasoning_effort TEXT,
     model_version       INTEGER,
     thinking_default    INTEGER,
     vision_chat_handler TEXT,
@@ -243,7 +246,8 @@ pub fn python_json_dumps(value: &Value) -> String {
 }
 
 /// Drop a `model_catalog` table from before its newest column (the
-/// reasoning budget; before that, attention, the other model spec fields,
+/// reasoning controls; before that, the reasoning budget, attention, the
+/// other model spec fields,
 /// and remote models and their name key).  It only
 /// caches the cloud catalog, so the next fetch refills it.
 fn drop_outdated_model_catalog(conn: &Connection) -> anyhow::Result<()> {
@@ -251,7 +255,7 @@ fn drop_outdated_model_catalog(conn: &Connection) -> anyhow::Result<()> {
         .prepare("SELECT name FROM pragma_table_info('model_catalog')")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
-    if !columns.is_empty() && !columns.iter().any(|c| c == "reasoning_budget_tokens") {
+    if !columns.is_empty() && !columns.iter().any(|c| c == "default_reasoning_effort") {
         conn.execute_batch("DROP TABLE model_catalog")?;
     }
     Ok(())
@@ -366,7 +370,8 @@ impl WorkspaceDB {
             "SELECT model_id, name, size, description, access_level, is_accessible, sha256, \
                     type, url, capabilities, context_length, \
                     param_size_b, model_version, thinking_default, vision_chat_handler, \
-                    param_size_estimated, active_param_size_b, attention, reasoning_budget_tokens \
+                    param_size_estimated, active_param_size_b, attention, reasoning_budget_tokens, \
+                    always_reasons, reasoning_efforts, default_reasoning_effort \
              FROM model_catalog",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -402,6 +407,17 @@ impl WorkspaceDB {
             m.insert("active_param_size_b".into(), sql_to_json(r.get(16)?));
             m.insert("attention".into(), sql_to_json(r.get(17)?));
             m.insert("reasoning_budget_tokens".into(), sql_to_json(r.get(18)?));
+            let always_reasons = match r.get::<_, SqlValue>(19)? {
+                SqlValue::Null => Value::Null,
+                flag => Value::Bool(sql_truthy(&flag)),
+            };
+            m.insert("always_reasons".into(), always_reasons);
+            if let SqlValue::Text(efforts) = r.get::<_, SqlValue>(20)? {
+                if let Ok(efforts @ Value::Array(_)) = serde_json::from_str::<Value>(&efforts) {
+                    m.insert("reasoning_efforts".into(), efforts);
+                }
+            }
+            m.insert("default_reasoning_effort".into(), sql_to_json(r.get(21)?));
             Ok(m)
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -419,6 +435,10 @@ impl WorkspaceDB {
             .map(|m| {
                 let capabilities = match m.get("capabilities") {
                     Some(caps @ Value::Array(_)) => SqlValue::Text(caps.to_string()),
+                    _ => SqlValue::Null,
+                };
+                let reasoning_efforts = match m.get("reasoning_efforts") {
+                    Some(efforts @ Value::Array(_)) => SqlValue::Text(efforts.to_string()),
                     _ => SqlValue::Null,
                 };
                 Ok((
@@ -442,6 +462,7 @@ impl WorkspaceDB {
                         optional(m, "attention")?,
                         optional(m, "reasoning_budget_tokens")?,
                     ),
+                    (optional(m, "always_reasons")?, reasoning_efforts, optional(m, "default_reasoning_effort")?),
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -456,8 +477,9 @@ impl WorkspaceDB {
                         type, url, capabilities, context_length,
                         param_size_b, model_version, thinking_default, vision_chat_handler,
                         param_size_estimated, active_param_size_b, attention,
-                        reasoning_budget_tokens, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        reasoning_budget_tokens, always_reasons, reasoning_efforts,
+                        default_reasoning_effort, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ",
             )?;
             for (
@@ -473,6 +495,7 @@ impl WorkspaceDB {
                     attention,
                     reasoning_budget_tokens,
                 ),
+                (always_reasons, reasoning_efforts, default_reasoning_effort),
             ) in rows
             {
                 stmt.execute(params![
@@ -495,6 +518,9 @@ impl WorkspaceDB {
                     active_param_size_b,
                     attention,
                     reasoning_budget_tokens,
+                    always_reasons,
+                    reasoning_efforts,
+                    default_reasoning_effort,
                     fetched_at
                 ])?;
             }

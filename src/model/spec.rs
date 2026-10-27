@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::constants::{canonical_model_name, BOOTSTRAP_MODEL};
 use crate::model::slp_model::DEFAULT_CAPABILITIES;
 use crate::platform::client::JsonObject;
-use crate::types::{Attention, ModelCapability, ModelKind, ModelType};
+use crate::types::{Attention, ModelCapability, ModelKind, ModelType, ReasoningEffort};
 
 /// What this build knows about one model.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +57,13 @@ pub struct ModelSpec {
     /// Output tokens a reasoning model may spend thinking before it answers,
     /// added to a capped request so the answer still fits.
     pub reasoning_budget_tokens: Option<u32>,
+    /// Remote models: reasoning cannot be turned off.
+    pub always_reasons: bool,
+    /// Remote models: the reasoning efforts a request may ask for, lowest
+    /// first; empty when the model takes none.
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+    /// Remote models: the effort the platform sends when a request names none.
+    pub default_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ModelSpec {
@@ -78,6 +85,9 @@ impl ModelSpec {
             url: None,
             context_length: None,
             reasoning_budget_tokens: None,
+            always_reasons: false,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
         }
     }
 
@@ -174,6 +184,30 @@ impl ModelSpec {
         if let Some(budget) = row.reasoning_budget_tokens {
             spec.reasoning_budget_tokens = Some(budget);
         }
+        if let Some(always) = row.always_reasons {
+            spec.always_reasons = always;
+        }
+        if let Some(efforts) = row.reasoning_efforts {
+            let mut known: Vec<ReasoningEffort> = efforts
+                .iter()
+                .filter_map(|e| {
+                    let effort = ReasoningEffort::from_value(e);
+                    if effort.is_none() {
+                        tracing::warn!("[models] {} declares unknown reasoning effort '{e}' — ignoring it", spec.name);
+                    }
+                    effort
+                })
+                .collect();
+            known.sort();
+            known.dedup();
+            spec.reasoning_efforts = known;
+        }
+        if let Some(effort) = row.default_reasoning_effort.filter(|e| !e.is_empty()) {
+            match ReasoningEffort::from_value(&effort) {
+                Some(effort) => spec.default_reasoning_effort = Some(effort),
+                None => tracing::warn!("[models] {} declares unknown default reasoning effort '{effort}' — ignoring it", spec.name),
+            }
+        }
         spec
     }
 }
@@ -212,6 +246,14 @@ pub struct CatalogModel {
     pub context_length: Option<u32>,
     #[serde(default)]
     pub reasoning_budget_tokens: Option<u32>,
+    #[serde(default)]
+    pub always_reasons: Option<bool>,
+    /// Kept as text, like `attention`, so an effort this build doesn't know
+    /// is ignored rather than failing the row.
+    #[serde(default)]
+    pub reasoning_efforts: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_reasoning_effort: Option<String>,
 }
 
 impl CatalogModel {

@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use smartloop::model::spec::{seed_specs, CatalogModel, ModelRegistry, ModelSpec};
 use smartloop::platform::client::JsonObject;
-use smartloop::types::{Attention, ModelCapability, ModelKind, ModelType};
+use smartloop::types::{Attention, ModelCapability, ModelKind, ModelType, ReasoningEffort};
 
 use ModelCapability::{Coding, Dp, General, Reasoning, Thinking, Vision};
 
@@ -177,6 +177,33 @@ fn test_a_reasoning_budget_is_carried_only_when_declared() {
     ]);
     assert_eq!(registry.get("thinker").unwrap().reasoning_budget_tokens, Some(1024));
     assert_eq!(registry.get("plain").unwrap().reasoning_budget_tokens, None);
+}
+
+#[test]
+fn test_reasoning_controls_are_carried_with_unknown_efforts_dropped() {
+    let mut registry = ModelRegistry::default();
+    registry.hydrate([
+        row(json!({
+            "name": "effortful",
+            "type": "remote",
+            "always_reasons": true,
+            "reasoning_efforts": ["high", "low", "extreme", "minimal"],
+            "default_reasoning_effort": "low",
+        })),
+        row(json!({"name": "plain", "type": "remote"})),
+    ]);
+    let spec = registry.get("effortful").unwrap();
+    assert!(spec.always_reasons);
+    assert_eq!(
+        spec.reasoning_efforts,
+        vec![ReasoningEffort::Minimal, ReasoningEffort::Low, ReasoningEffort::High]
+    );
+    assert_eq!(spec.default_reasoning_effort, Some(ReasoningEffort::Low));
+
+    let plain = registry.get("plain").unwrap();
+    assert!(!plain.always_reasons);
+    assert!(plain.reasoning_efforts.is_empty());
+    assert_eq!(plain.default_reasoning_effort, None);
 }
 
 #[test]

@@ -102,6 +102,44 @@ impl Attention {
     }
 }
 
+/// How hard a remote reasoning model thinks before it answers (the
+/// catalog's `reasoning_efforts`).  OpenAI's `reasoning_effort` scale, which
+/// OpenRouter also uses; upstream providers may or may not honor it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// Resolve a wire value; `None` when unknown.
+    pub fn from_value(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(ReasoningEffort::None),
+            "minimal" => Some(ReasoningEffort::Minimal),
+            "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            _ => None,
+        }
+    }
+
+    /// The wire value, e.g. `"low"`.
+    pub fn value(self) -> &'static str {
+        match self {
+            ReasoningEffort::None => "none",
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+}
+
 /// What a model can be routed to (or, for `Thinking`, how it answers).
 ///
 /// Deserialization accepts the legacy spelling `"skills"` (any case, padded)
