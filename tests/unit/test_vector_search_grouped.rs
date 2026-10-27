@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 
 use smartloop::api::services::model_service::ModelService;
 use smartloop::db::store::{ChunkResult, VectorStore};
+use smartloop::workspace::types::Document;
 
 use crate::shared::model_service_b::{FakeStore, project, service_with_workspace};
 
@@ -131,4 +132,26 @@ fn test_citations_carry_the_document_text_as_a_private_extract() {
     let by_name = |name: &str| citations.iter().find(|c| c["document_name"] == name).cloned().unwrap_or(Value::Null);
     assert_eq!(by_name("alpha.pdf")["_extract"], "Alpha body");
     assert_eq!(by_name("beta.pdf")["_extract"], "Beta body");
+}
+
+/// A citation says where its document's file is, relative to the project as
+/// the documents API gives it, so a client can open the source; a document
+/// the project doesn't list has none.
+#[test]
+fn test_citations_carry_the_document_path_relative_to_the_project() {
+    let mut proj = project("proj-1", "/tmp/proj-1", true);
+    proj.documents = vec![Document {
+        id: "d1".into(),
+        path: "/tmp/proj-1/documents/alpha.pdf".into(),
+        name: Some("alpha.pdf".into()),
+        ..Document::default()
+    }];
+    let svc = service_with_workspace("/tmp", vec![proj], vec![]);
+    svc.caches("proj-1").lock().doc_store = Some(fake_store());
+
+    let (_, citations) = svc.get_document_groups(Some("alpha beta"), None, None).expect("citations");
+
+    let by_name = |name: &str| citations.iter().find(|c| c["document_name"] == name).cloned().unwrap_or(Value::Null);
+    assert_eq!(by_name("alpha.pdf")["document_path"], "documents/alpha.pdf");
+    assert!(by_name("beta.pdf").get("document_path").is_none());
 }
