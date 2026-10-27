@@ -278,6 +278,10 @@ pub struct ClassificationResult {
     pub action_kind: Option<String>,
     #[serde(default)]
     pub has_document_context: bool,
+    /// The request is programming work (see [`CODING_RE`]).  A modifier, like
+    /// write/grep: it picks the model, not the intent.
+    #[serde(default)]
+    pub has_coding_intent: bool,
     #[serde(default)]
     pub reasoning: String,
     /// Best-matching model capability for this request (e.g. coding, finance, vision)
@@ -422,6 +426,26 @@ pub const GREP_KEYWORDS: &[&str] = &[
     "search across",
 ];
 
+/// Signals that the request is programming work, so it routes to a
+/// `coding` model.  Kept to phrases that rarely mean anything else: a
+/// fenced code block, a source-file name, a language name, or a coding verb
+/// bound to a code noun.  Bare words like "code" or "compile" are left out —
+/// "zip code" and "compile a list" are not programming.
+pub static CODING_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"(?i)```",
+        r"|\b[\w\-]+\.(?:rs|py|ts|tsx|js|jsx|go|java|kt|swift|rb|cpp|cc|hpp|cs|php|scala|sh)\b",
+        r"|\b(?:python|javascript|typescript|golang|kotlin|rustlang|c\+\+|c#)",
+        r"|\b(?:refactor\w*|debug(?:ging)?|stack ?trace|traceback|segfault|syntax error|compiler|compil(?:e|ation) error",
+        r"|unit tests?|regex|regular expression|code ?review|codebase|source code|code snippet",
+        r"|(?:this|my|following|your) code|sql|bash script|shell script)\b",
+        r"|\b(?:write|implement|refactor|optimi[sz]e) (?:a |an |the |this |my )?",
+        r"(?:function|method|class|program|algorithm|endpoint|api|cli|unit test)\b",
+        r"|\bfix (?:a |the |this |my )?bug\b",
+    ))
+    .unwrap()
+});
+
 /// URL extraction pattern (simple but effective).
 pub static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s<>'")\]]+"#).unwrap());
 
@@ -526,6 +550,7 @@ impl Planner {
                 result.capability = Self::match_capability(
                     capabilities,
                     has_attachments,
+                    result.has_coding_intent,
                     skills.as_ref().is_some_and(|s| !s.is_empty()),
                     result.has_document_context,
                 );
@@ -542,20 +567,24 @@ impl Planner {
     ///
     /// Priority:
     ///   1. `vision`    — attachments imply image/document OCR work.
-    ///   2. `reasoning` — a matched skill defines the procedure to run.
-    ///   3. `dp`        — indexed document context: data-processing model.
-    ///   4. `general`   — default for open-ended chat / general answers.
+    ///   2. `coding`    — programming work, which a coding model writes
+    ///      better than a skill or document model does.
+    ///   3. `reasoning` — a matched skill defines the procedure to run.
+    ///   4. `dp`        — indexed document context: data-processing model.
+    ///   5. `general`   — default for open-ended chat / general answers.
     ///
     /// Returns the first capability whose signal fires *and* is present
     /// in `capabilities`, or `None` when nothing matches.
     pub fn match_capability(
         capabilities: &[String],
         has_attachments: bool,
+        has_coding_intent: bool,
         has_matched_skills: bool,
         has_document_context: bool,
     ) -> Option<String> {
         let priority = [
             (ModelCapability::Vision, has_attachments),
+            (ModelCapability::Coding, has_coding_intent),
             (ModelCapability::Reasoning, has_matched_skills),
             (ModelCapability::Dp, has_document_context),
             (ModelCapability::General, true),
@@ -618,6 +647,9 @@ impl Planner {
 
         // Grep intent
         result.has_grep_intent = GREP_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
+
+        // Coding intent
+        result.has_coding_intent = CODING_RE.is_match(user_message);
 
         // Document context from vector search / uploads / attachments
         result.has_document_context =

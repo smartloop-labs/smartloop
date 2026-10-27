@@ -34,7 +34,7 @@ use crate::agents::orchestration::context::MCPExecutionResult;
 use crate::agents::planner::{
     mcp_connection_is_usable, MCPToolContext, PlanStep, StepType, SYSTEM_TOOLS_SERVER_ID,
 };
-use crate::agents::web_search_agent::WebSearchAgent;
+use crate::agents::web_search_agent::{LlmResolver, WebSearchAgent};
 use crate::api::services::model_service::ModelService;
 use crate::llms::BaseLLM;
 use crate::parsers::DocumentChunk;
@@ -446,6 +446,15 @@ impl Explorer {
             mcp_agent: Arc::new(mcp_agent),
             follow_up_calls: Arc::new(crate::mcp::call_plans::follow_up_calls),
         }
+    }
+
+    /// Rerank web results on a model resolved per search (see
+    /// [`LlmResolver`]) instead of the explorer's own model.
+    pub fn with_web_llm_resolver(mut self, resolver: LlmResolver) -> Self {
+        let fetcher: Arc<dyn UrlFetcher> = self.fetch_agent.clone();
+        let agent = WebSearchAgent::new(Some(fetcher), 3, 10, self.llm.clone()).with_llm_resolver(resolver);
+        self.web_search_agent = Arc::new(agent);
+        self
     }
 
     // ================================================================ skills

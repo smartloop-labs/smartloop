@@ -236,14 +236,29 @@ fn test_the_remote_model_with_more_active_params_is_used() {
     assert!(same(&llm.expect("a model"), &heavy_llm));
 }
 
-/// However large a remote model is, a local model that fits goes first.
+/// A remote model well beyond a local one's size does the step: quality
+/// first, even though the local model fits.
 #[test]
-fn test_a_large_remote_model_still_ranks_after_a_local_one() {
+fn test_a_much_larger_remote_model_ranks_before_a_local_one() {
     let remote = sized_remote("walk-moe-huge", 753.0, 40.0);
+    let huge = FakeLLM::named("huge");
+    let mut loads = HashMap::new();
+    loads.insert(BIG, (FakeLLM::named("big"), Fit::AsIs));
+    loads.insert("walk-moe-huge", (huge.clone(), Fit::AsIs));
+    let (tried, llm) = walk(vec![ws_model(BIG), remote], loads);
+    assert_eq!(tried, vec![attempt("walk-moe-huge", false)]);
+    assert!(same(&llm.expect("a model"), &huge));
+}
+
+/// Between similar models — the remote one within the local margin — the
+/// local one goes first: a 4B on device over a 4.5B-active cloud model.
+#[test]
+fn test_a_similar_remote_model_ranks_after_a_local_one() {
+    let remote = sized_remote("walk-moe-similar", 30.0, 4.5);
     let big = FakeLLM::named("big");
     let mut loads = HashMap::new();
     loads.insert(BIG, (big.clone(), Fit::AsIs));
-    loads.insert("walk-moe-huge", (FakeLLM::named("huge"), Fit::AsIs));
+    loads.insert("walk-moe-similar", (FakeLLM::named("similar"), Fit::AsIs));
     let (tried, llm) = walk(vec![remote, ws_model(BIG)], loads);
     assert_eq!(tried, vec![attempt(BIG, false)]);
     assert!(same(&llm.expect("a model"), &big));

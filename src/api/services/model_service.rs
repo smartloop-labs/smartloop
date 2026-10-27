@@ -343,6 +343,12 @@ pub trait RankedModel {
     fn model_capabilities(&self) -> Vec<String>;
 }
 
+/// How much larger a remote model must be before it outranks a local one
+/// for the same capability: a local model counts as this many times its
+/// active size, so a remote model up to ~25% larger still loses to it.
+/// Within that margin the models are similar and the one on device wins.
+pub const LOCAL_SIZE_MARGIN: f64 = 1.25;
+
 impl RankedModel for WorkspaceModel {
     fn model_rank(&self) -> (f64, i64) {
         self.rank()
@@ -1493,13 +1499,75 @@ impl ModelService {
         Ok(Arc::new(llm))
     }
 
+    /// Enabled, downloaded models declaring vision: the local ones
+    /// (`remote == false`) or the remote ones, in workspace order.
+    fn vision_candidates(&self, remote: bool) -> Vec<WorkspaceModel> {
+        let Some(workspace) = self.workspace_handle() else {
+            return Vec::new();
+        };
+        let ws = workspace.read();
+        let project = ws.current_project();
+        ws.models
+            .iter()
+            .filter(|m| {
+                m.is_remote() == remote
+                    && ws.effective_model_enabled(&m.model_name, project)
+                    && ws.effective_model_downloaded(&m.model_name)
+                    && m.effective_capabilities().iter().any(|c| c == ModelCapability::Vision.value())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The best selected remote vision model (largest first), unless this
+    /// thread resolves on device only.
+    fn best_remote_vision_model(&self) -> Option<WorkspaceModel> {
+        if crate::llms::cloud_llm::local_only() {
+            return None;
+        }
+        Self::ranked_candidates(self.vision_candidates(true), &[ModelCapability::Vision.value()], true)
+            .into_iter()
+            .next()
+    }
+
+    /// The vision model for a question about the user's images.
+    ///
+    /// Quality first, local among similar models — the rule every capability
+    /// step follows (see [`LOCAL_SIZE_MARGIN`]): a remote vision model well
+    /// beyond the largest local one answers; otherwise the local path
+    /// ([`Self::get_vision_llm`]) does, and still falls back to the remote
+    /// model when nothing local can run.
+    pub fn get_vision_answer_llm(&self, on_model_selected: Option<&dyn Fn(&str)>) -> Option<Arc<dyn BaseLLM>> {
+        if !AppSettings::new().vision_enabled {
+            return None;
+        }
+        if let Some(remote) = self.best_remote_vision_model() {
+            let best_local = self.vision_candidates(false).iter().map(|m| m.rank().0).fold(0.0, f64::max);
+            if remote.rank().0 > best_local * LOCAL_SIZE_MARGIN {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    "[vision] {} answers the image question — larger than any local vision model",
+                    remote.model_name
+                );
+                if let Some(cb) = on_model_selected {
+                    cb(&remote.model_name);
+                }
+                return Some(self.cloud_llm(&remote));
+            }
+        }
+        self.get_vision_llm(on_model_selected)
+    }
+
     /// Return a loaded *multimodal* vision LLM, or `None` when unavailable.
     /// `on_model_selected(model_name)` fires right before the chosen model loads.
     ///
-    /// Vision-capable models are considered smallest-first, but a model is
+    /// Local vision models are considered smallest-first, but a model is
     /// only usable for OCR when its mmproj / CLIP projector GGUF is present,
     /// the llama.cpp build has a chat handler for its architecture, and it
-    /// fits in available memory.  Unrunnable candidates are skipped.
+    /// fits in available memory.  Unrunnable candidates are skipped.  Local
+    /// first: OCR transcribes every page of every indexed document, so it
+    /// stays on device and a remote vision model reads the pages only when
+    /// no local one can run.
     pub fn get_vision_llm(&self, on_model_selected: Option<&dyn Fn(&str)>) -> Option<Arc<dyn BaseLLM>> {
         let app = AppSettings::new();
         if !app.vision_enabled {
@@ -1523,19 +1591,7 @@ impl ModelService {
         }
         let workspace = self.workspace_handle()?;
 
-        let candidates: Vec<WorkspaceModel> = {
-            let ws = workspace.read();
-            let project = ws.current_project();
-            ws.models
-                .iter()
-                .filter(|m| {
-                    ws.effective_model_enabled(&m.model_name, project)
-                        && ws.effective_model_downloaded(&m.model_name)
-                        && m.effective_capabilities().iter().any(|c| c == ModelCapability::Vision.value())
-                })
-                .cloned()
-                .collect()
-        };
+        let candidates = self.vision_candidates(false);
         // Smallest first: lowest latency OCR; same-size ties broken by cap
         // overlap then version.
         let candidates = Self::ranked_candidates(candidates, &[ModelCapability::Vision.value()], false);
@@ -1641,6 +1697,14 @@ impl ModelService {
                     transient_failure = true;
                 }
             }
+        }
+
+        if let Some(remote) = self.best_remote_vision_model() {
+            tracing::info!(target: LOG_TARGET, "[vision] No local vision model can run — using {}", remote.model_name);
+            if let Some(cb) = on_model_selected {
+                cb(&remote.model_name);
+            }
+            return Some(self.cloud_llm(&remote));
         }
 
         if transient_failure {
@@ -2203,22 +2267,30 @@ impl ModelService {
         // override the workspace defaults).  Walked largest-first: when two
         // selected models both declare the capability, the bigger one does
         // the step, and a smaller one runs it only when the bigger cannot be
-        // loaded.  Size ties go to broader coverage, then the newer version.
+        // loaded.  Size ties go to the local model, then broader coverage,
+        // then the newer version.
         //
-        // Then by tier, keeping that order within each: local models, which
-        // run here when they fit; remote ones, which always resolve; and the
-        // bootstrap model last, since any other selected model does the step
+        // Quality first, local among similar models: a bigger model (by
+        // active size) does the step whether it runs here or in the cloud,
+        // but a local model within LOCAL_SIZE_MARGIN of a remote one wins —
+        // a 3B on device over the same 3B remote, but a 23B-active cloud
+        // model over a 2B local one.  Every candidate declares the step's
+        // capability, so size is what separates them.  A local model that
+        // does not fit is passed over for the next one down.  The bootstrap
+        // model goes last, since any other selected model does the step
         // better.
         let mut ranked = Self::ranked_candidates(self.ranked_models_for(capability), &[capability], true);
         let bootstrap = canonical_model_name(&api_settings().default_model);
-        ranked.sort_by_key(|m| {
-            if canonical_model_name(&m.model_name) == bootstrap {
-                2
-            } else if m.is_remote() {
-                1
-            } else {
-                0
-            }
+        let quality = |m: &WorkspaceModel| {
+            let size = m.rank().0;
+            if m.is_remote() { size } else { size * LOCAL_SIZE_MARGIN }
+        };
+        ranked.sort_by(|a, b| {
+            let is_bootstrap = |m: &WorkspaceModel| canonical_model_name(&m.model_name) == bootstrap;
+            is_bootstrap(a)
+                .cmp(&is_bootstrap(b))
+                .then(quality(b).partial_cmp(&quality(a)).unwrap_or(std::cmp::Ordering::Equal))
+                .then(a.is_remote().cmp(&b.is_remote()))
         });
         if ranked.is_empty() {
             tracing::warn!(

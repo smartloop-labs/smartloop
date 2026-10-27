@@ -161,6 +161,11 @@ impl CloudLLM {
     }
 
     fn body(&self, messages: &[ChatMessage], stream: bool, max_tokens: Option<usize>) -> Value {
+        self.body_for(json!(messages), stream, max_tokens)
+    }
+
+    /// The request body for already-shaped OpenAI `messages`.
+    fn body_for(&self, messages: Value, stream: bool, max_tokens: Option<usize>) -> Value {
         let mut body = json!({
             "model": self.model_name,
             "messages": messages,
@@ -182,6 +187,26 @@ impl CloudLLM {
         let content = data.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or_default();
         let finish = data.pointer("/choices/0/finish_reason").and_then(Value::as_str);
         Ok((content.to_string(), finish.map(str::to_string)))
+    }
+
+    /// One non-streaming completion over OpenAI-shaped `messages`, whose
+    /// `content` may be a list of parts (text / `image_url`) — the vision
+    /// path.  Returns the raw response, shaped like a local model's
+    /// `create_chat_completion`, so callers read `choices` the same way.
+    /// `max_tokens` sizes the answer; the reasoning budget comes on top.
+    pub fn create_chat_completion(
+        &self,
+        messages: Vec<Value>,
+        max_tokens: Option<usize>,
+        temperature: f32,
+    ) -> anyhow::Result<Value> {
+        let max_tokens = max_tokens.map(|cap| cap + self.reasoning_budget_tokens);
+        let mut body = self.body_for(Value::Array(messages), false, max_tokens);
+        body["temperature"] = json!(temperature);
+        let response = self.post(&body).map_err(anyhow::Error::msg)?;
+        response
+            .json()
+            .map_err(|e| anyhow::anyhow!("{} sent an unreadable answer: {e}", self.model_name))
     }
 
     /// POST the chat request, redeeming the refresh token once on a 401.

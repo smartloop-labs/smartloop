@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 
 use smartloop::agents::planner::{
     extract_paths, ClassificationResult, ClassifyOptions, ExecutionPlan, IntentType, MCPToolContext,
-    MatchedTool, PlanContext, Planner, StepType, BASH_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL,
+    MatchedTool, ModelTier, PlanContext, Planner, StepType, BASH_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL,
     SYSTEM_TOOLS_SERVER_ID,
 };
 use smartloop::llms::base_llm::{CallOptions, CancelEvent, ChatMessage, GenerationStream};
@@ -363,6 +363,70 @@ fn test_classify_llm_fallback_unparseable() {
     llm.set_invoke_return("I don't know what to do");
     let result = planner.classify("something ambiguous", &[], ClassifyOptions::default());
     assert_eq!(result.intent, IntentType::Conversation);
+}
+
+/// Programming requests raise the coding signal; look-alikes don't.
+#[test]
+fn test_detect_signals_coding_intent() {
+    let planner = planner();
+    for msg in [
+        "refactor this function to be async",
+        "why does main.rs panic on startup?",
+        "write a function that parses ISO dates",
+        "here is the error:\n```\nTypeError: x is undefined\n```",
+        "explain this code to me",
+        "fix the bug in the login flow",
+        "how do I do this in python",
+        "write a SQL query for monthly revenue",
+    ] {
+        let result = planner.detect_signals(msg, &[], None, None, false);
+        assert!(result.has_coding_intent, "expected coding intent: {msg}");
+    }
+    for msg in [
+        "what is the zip code for Seattle?",
+        "compile a list of hotels in Lisbon",
+        "explain the function of the liver",
+        "write a script for my wedding toast",
+        "summarize the code of conduct",
+        "what does this will say about the house?",
+    ] {
+        let result = planner.detect_signals(msg, &[], None, None, false);
+        assert!(!result.has_coding_intent, "unexpected coding intent: {msg}");
+    }
+}
+
+/// Coding outranks skills and documents, but not attachments, and only
+/// when a selected model declares it.
+#[test]
+fn test_match_capability_coding_priority() {
+    let all: Vec<String> =
+        ["general", "reasoning", "dp", "vision", "coding"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(Planner::match_capability(&all, false, true, true, true).as_deref(), Some("coding"));
+    assert_eq!(Planner::match_capability(&all, true, true, true, true).as_deref(), Some("vision"));
+    assert_eq!(Planner::match_capability(&all, false, false, true, true).as_deref(), Some("reasoning"));
+
+    let no_coding: Vec<String> = ["general", "dp"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(Planner::match_capability(&no_coding, false, true, false, true).as_deref(), Some("dp"));
+}
+
+/// A coding conversation plans one LARGE step on the coding model.
+#[test]
+fn test_classify_coding_conversation_routes_to_coding() {
+    let planner = planner();
+    let result = planner.classify(
+        "refactor this function to use iterators",
+        &[],
+        ClassifyOptions {
+            available_capabilities: Some(vec!["general".into(), "coding".into()]),
+            ..Default::default()
+        },
+    );
+    assert!(result.has_coding_intent);
+    assert_eq!(result.capability.as_deref(), Some("coding"));
+    let plan = planner.create_plan(&result, &ctx("refactor this function to use iterators"), None);
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].model_tier, ModelTier::Large);
+    assert_eq!(plan.steps[0].capability.as_deref(), Some("coding"));
 }
 
 // ------------------------------------------------------------------ //

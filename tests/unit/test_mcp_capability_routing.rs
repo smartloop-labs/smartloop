@@ -366,14 +366,14 @@ fn test_a_different_model_for_the_tool_call_is_still_announced() {
     reasoner.set_supports_thinking(true);
     let reasoner = reasoner.as_llm();
     let (router, router_llm, progress) = multi_model_router(Arc::new(move |cap: &str| {
-        if cap == ModelCapability::Thinking.value() {
+        if cap == ModelCapability::Reasoning.value() {
             Some(reasoner.clone())
         } else {
             Some(worker.clone())
         }
     }));
 
-    router.llm_for_tier(ModelTier::Large, Some(ModelCapability::Reasoning.value()), None);
+    router.llm_for_tier(ModelTier::Large, Some(ModelCapability::Dp.value()), None);
     router.reasoning_llm(router_llm);
 
     let selected: Vec<String> = messages(&progress)
@@ -383,8 +383,117 @@ fn test_a_different_model_for_the_tool_call_is_still_announced() {
     assert_eq!(
         selected,
         vec![
-            "Selected Qwen3.5 2B for reasoning".to_string(),
+            "Selected Qwen3.5 2B for document processing".to_string(),
             "Selected Qwen3 4B for tool resolution".to_string(),
         ]
     );
+}
+
+// ------------------------------------------------ TestToolResolutionPromotesToReasoning
+// The router model (sl-mini) only routes.  When no thinking model is on
+// device, tool resolution moves up to a model declaring `reasoning` — a cloud
+// one included — rather than staying on the router model.
+
+/// Each lookup the provider saw: `(capability, local_only)`.
+type Lookups = Arc<Mutex<Vec<(String, bool)>>>;
+
+fn promoting_router(
+    capability_llm: Arc<dyn Fn(&str) -> Option<Arc<dyn BaseLLM>> + Send + Sync>,
+    declared: &'static [&'static str],
+) -> (ModelRouter, Arc<dyn BaseLLM>, Recorded, Lookups) {
+    let router_model = named_llm("sl-mini");
+    router_model.set_supports_thinking(false);
+    let router_llm = router_model.as_llm();
+    let lookups: Lookups = Arc::new(Mutex::new(Vec::new()));
+    let seen = lookups.clone();
+    let router = ModelRouter::new(
+        router_llm.clone(),
+        router_llm.clone(),
+        ModelRouterOptions {
+            capability_llm_provider: Some(Arc::new(move |cap: &str| {
+                seen.lock().push((cap.to_string(), smartloop::llms::cloud_llm::local_only()));
+                Ok(capability_llm(cap))
+            })),
+            capability_available: Some(Arc::new(move |cap: &str| Ok(declared.contains(&cap)))),
+            ..Default::default()
+        },
+    );
+    let (progress, calls) = recording_progress();
+    router.begin_request(Some(progress));
+    (router, router_llm, calls, lookups)
+}
+
+#[test]
+fn test_tool_resolution_promotes_to_a_remote_reasoning_model() {
+    let cloud = named_llm("minimax-m3");
+    cloud.set_supports_thinking(false);
+    let cloud = cloud.as_llm();
+    let provided = cloud.clone();
+    let (router, router_llm, progress, lookups) =
+        promoting_router(Arc::new(move |_cap: &str| Some(provided.clone())), &["general", "reasoning"]);
+
+    assert!(same_llm(&router.reasoning_llm(router_llm), &cloud));
+    // No thinking model is selected, so only the reasoning lookup ran — and
+    // it was allowed off device.
+    assert_eq!(*lookups.lock(), vec![("reasoning".to_string(), false)]);
+    assert_eq!(messages(&progress), vec!["Selected minimax-m3 for tool resolution".to_string()]);
+}
+
+/// A reasoning model is asked first — the best one, a cloud one included —
+/// so a small local thinking model does not take the call from it.
+#[test]
+fn test_a_reasoning_model_is_preferred_over_a_thinking_one() {
+    let small_thinker = named_llm("qwen3.5-2b");
+    small_thinker.set_supports_thinking(true);
+    let small_thinker = small_thinker.as_llm();
+    let cloud = named_llm("minimax-m3").as_llm();
+    let (thinking_pick, reasoning_pick) = (small_thinker, cloud.clone());
+    let (router, router_llm, progress, lookups) = promoting_router(
+        Arc::new(move |cap: &str| {
+            if cap == ModelCapability::Thinking.value() {
+                Some(thinking_pick.clone())
+            } else {
+                Some(reasoning_pick.clone())
+            }
+        }),
+        &["general", "reasoning", "thinking"],
+    );
+
+    assert!(same_llm(&router.reasoning_llm(router_llm), &cloud));
+    assert_eq!(*lookups.lock(), vec![("reasoning".to_string(), false)]);
+    assert_eq!(messages(&progress), vec!["Selected minimax-m3 for tool resolution".to_string()]);
+}
+
+/// With no reasoning model selected, a thinking model resolves on device.
+/// A thinking lookup that lands on a model that cannot think (the host's
+/// fallback to the router model) is neither used nor announced.
+#[test]
+fn test_a_thinking_model_resolves_when_none_declares_reasoning() {
+    let local = named_llm("qwen3-thinker");
+    local.set_supports_thinking(true);
+    let local = local.as_llm();
+    let provided = local.clone();
+    let (router, router_llm, _progress, lookups) =
+        promoting_router(Arc::new(move |_cap: &str| Some(provided.clone())), &["thinking"]);
+    assert!(same_llm(&router.reasoning_llm(router_llm), &local));
+    assert_eq!(*lookups.lock(), vec![("thinking".to_string(), true)]);
+
+    let cannot_think = named_llm("sl-mini");
+    cannot_think.set_supports_thinking(false);
+    let cannot_think = cannot_think.as_llm();
+    let (router, router_llm, progress, _lookups) =
+        promoting_router(Arc::new(move |_cap: &str| Some(cannot_think.clone())), &["thinking"]);
+    assert!(same_llm(&router.reasoning_llm(router_llm.clone()), &router_llm));
+    assert!(messages(&progress).is_empty());
+}
+
+/// No selected model reasons: the router model keeps the call.
+#[test]
+fn test_without_a_reasoning_model_the_router_model_resolves() {
+    let (router, router_llm, progress, lookups) =
+        promoting_router(Arc::new(|_cap: &str| None), &["general"]);
+
+    assert!(same_llm(&router.reasoning_llm(router_llm.clone()), &router_llm));
+    assert!(lookups.lock().is_empty());
+    assert!(messages(&progress).is_empty());
 }
