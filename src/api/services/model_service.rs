@@ -2071,7 +2071,8 @@ impl ModelService {
         let url = ws_model.url().unwrap_or_else(|| AppSettings::new().slp_api_base);
         Arc::new(
             CloudLLM::new(&project_id, &ws_model.model_name, &url, ws_model.context_length())
-                .with_reasoning_budget(ws_model.reasoning_budget_tokens()),
+                .with_reasoning_budget(ws_model.reasoning_budget_tokens())
+                .with_reasoning_efforts(ws_model.reasoning_efforts()),
         )
     }
 

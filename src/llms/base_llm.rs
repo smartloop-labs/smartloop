@@ -16,6 +16,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::SYSTEM_PROMPT;
+use crate::types::ReasoningEffort;
 
 /// `<system>…</system>`, `<user>…</user>` and `<assistant>…</assistant>`
 /// (`re.DOTALL`, non-greedy).
@@ -60,6 +61,9 @@ pub struct CallOptions {
     pub max_tokens: Option<usize>,
     /// Force the reasoning block on/off for this call; `None` means off.
     pub thinking: Option<bool>,
+    /// How hard a remote reasoning model should think for this call; `None`
+    /// leaves it to the platform's default.  Local models ignore it.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// One prompt of [`BaseLLM::invoke_batch`], with its own per-call options.
@@ -68,12 +72,19 @@ pub struct BatchPrompt {
     pub prompt: String,
     pub max_tokens: Option<usize>,
     pub thinking: Option<bool>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl BatchPrompt {
     /// A prompt with default options.
     pub fn new(prompt: impl Into<String>, max_tokens: Option<usize>) -> Self {
-        Self { prompt: prompt.into(), max_tokens, thinking: None }
+        Self { prompt: prompt.into(), max_tokens, thinking: None, reasoning_effort: None }
+    }
+
+    /// Ask a remote reasoning model for `effort` on this prompt.
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 }
 
@@ -183,7 +194,11 @@ pub trait BaseLLM: Send + Sync {
     /// `thinking` forces the reasoning block on (`true`) or off (`false`) for
     /// this call, whatever the user's setting says; `None` leaves it alone.
     fn invoke(&self, prompt: &str, max_tokens: Option<usize>, thinking: Option<bool>) -> String {
-        let options = CallOptions { max_tokens, thinking };
+        self.invoke_with(prompt, CallOptions { max_tokens, thinking, ..Default::default() })
+    }
+
+    /// [`Self::invoke`] with every per-call option.
+    fn invoke_with(&self, prompt: &str, options: CallOptions) -> String {
         match self.call(prompt, None, options) {
             Ok(response) => clean_reply(&response),
             Err(e) => {
@@ -204,7 +219,14 @@ pub trait BaseLLM: Send + Sync {
         let is_cancelled = || cancelled.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
         prompts
             .iter()
-            .map(|p| if is_cancelled() { String::new() } else { self.invoke(&p.prompt, p.max_tokens, p.thinking) })
+            .map(|p| {
+                if is_cancelled() {
+                    return String::new();
+                }
+                let options =
+                    CallOptions { max_tokens: p.max_tokens, thinking: p.thinking, reasoning_effort: p.reasoning_effort };
+                self.invoke_with(&p.prompt, options)
+            })
             .collect()
     }
 

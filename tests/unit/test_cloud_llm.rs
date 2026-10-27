@@ -9,7 +9,8 @@ use serial_test::serial;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use smartloop::llms::base_llm::{BaseLLM, CallOptions};
+use smartloop::llms::base_llm::{BaseLLM, BatchPrompt, CallOptions};
+use smartloop::types::ReasoningEffort;
 use smartloop::llms::cloud_llm::{
     credentials_allowed, describe_failure, CloudLLM, DEFAULT_CONTEXT_LENGTH, DEFAULT_REASONING_BUDGET_TOKENS,
 };
@@ -106,7 +107,7 @@ async fn test_call_returns_the_whole_answer() {
     let llm = Arc::new(llm);
 
     let answer = tokio::task::spawn_blocking(move || {
-        llm.call(PROMPT, None, CallOptions { max_tokens: Some(64), thinking: None })
+        llm.call(PROMPT, None, CallOptions { max_tokens: Some(64), thinking: None, ..Default::default() })
     })
     .await
     .unwrap()
@@ -117,6 +118,78 @@ async fn test_call_returns_the_whole_answer() {
     assert_eq!(sent["stream"], false);
     // The cap sizes the answer; the reasoning budget comes on top.
     assert_eq!(sent["max_tokens"], 64 + DEFAULT_REASONING_BUDGET_TOKENS);
+}
+
+/// A server answering every chat request "ok", and a model on it listing
+/// `efforts`.
+async fn effort_llm(efforts: Vec<ReasoningEffort>) -> (MockServer, Arc<CloudLLM>, EnvGuard) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        })))
+        .mount(&server)
+        .await;
+    let (llm, env) = llm(&server, Some(bearer("t")));
+    (server, Arc::new(llm.with_reasoning_efforts(efforts)), env)
+}
+
+async fn call_with_effort(llm: Arc<CloudLLM>, effort: Option<ReasoningEffort>) {
+    tokio::task::spawn_blocking(move || {
+        llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), reasoning_effort: effort, ..Default::default() })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_listed_reasoning_effort_is_sent() {
+    let (server, llm, _env) = effort_llm(vec![ReasoningEffort::Low, ReasoningEffort::High]).await;
+    call_with_effort(llm, Some(ReasoningEffort::Low)).await;
+
+    let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
+    assert_eq!(sent["reasoning"], json!({"effort": "low"}));
+    assert_eq!(sent["max_tokens"], 256 + DEFAULT_REASONING_BUDGET_TOKENS);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_an_unlisted_or_absent_reasoning_effort_is_not_sent() {
+    for effort in [Some(ReasoningEffort::None), None] {
+        let (server, llm, _env) = effort_llm(vec![ReasoningEffort::Low]).await;
+        call_with_effort(llm, effort).await;
+
+        let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
+        assert!(sent.get("reasoning").is_none(), "{effort:?}");
+        assert_eq!(sent["max_tokens"], 256 + DEFAULT_REASONING_BUDGET_TOKENS, "{effort:?}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_reasoning_off_adds_no_reasoning_budget() {
+    let (server, llm, _env) = effort_llm(vec![ReasoningEffort::None, ReasoningEffort::Low]).await;
+    call_with_effort(llm, Some(ReasoningEffort::None)).await;
+
+    let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
+    assert_eq!(sent["reasoning"], json!({"effort": "none"}));
+    assert_eq!(sent["max_tokens"], 256);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_batch_prompt_carries_its_reasoning_effort() {
+    let (server, llm, _env) = effort_llm(vec![ReasoningEffort::Minimal]).await;
+    let prompts =
+        vec![BatchPrompt::new(PROMPT, Some(256)).with_reasoning_effort(Some(ReasoningEffort::Minimal))];
+    let replies = tokio::task::spawn_blocking(move || llm.invoke_batch(&prompts, None)).await.unwrap();
+
+    assert_eq!(replies, vec!["ok".to_string()]);
+    let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
+    assert_eq!(sent["reasoning"], json!({"effort": "minimal"}));
 }
 
 #[tokio::test]
@@ -133,10 +206,12 @@ async fn test_the_catalog_reasoning_budget_replaces_the_default() {
     let (llm, _env) = llm(&server, Some(bearer("t")));
     let llm = Arc::new(llm.with_reasoning_budget(Some(4096)));
 
-    tokio::task::spawn_blocking(move || llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), thinking: None }))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::task::spawn_blocking(move || {
+        llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), thinking: None, ..Default::default() })
+    })
+    .await
+    .unwrap()
+    .unwrap();
 
     let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
     assert_eq!(sent["max_tokens"], 256 + 4096);
@@ -329,7 +404,7 @@ async fn test_a_truncated_answer_is_retried_with_twice_the_room() {
     let llm = Arc::new(llm);
 
     let reply = tokio::task::spawn_blocking(move || {
-        llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), thinking: None })
+        llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), thinking: None, ..Default::default() })
     })
     .await
     .unwrap()
@@ -352,7 +427,7 @@ async fn test_an_answer_still_truncated_comes_back_empty() {
     let llm = Arc::new(llm);
 
     let reply = tokio::task::spawn_blocking(move || {
-        llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), thinking: None })
+        llm.call(PROMPT, None, CallOptions { max_tokens: Some(256), thinking: None, ..Default::default() })
     })
     .await
     .unwrap()

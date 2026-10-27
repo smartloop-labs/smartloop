@@ -78,7 +78,7 @@ impl BaseLLM for GateLlm {
     fn invoke(&self, prompt: &str, max_tokens: Option<usize>, thinking: Option<bool>) -> String {
         // A mock's `invoke` returns its value verbatim; a failure surfaces the
         // way the real wrapper reports one.
-        match self.call(prompt, None, CallOptions { max_tokens, thinking }) {
+        match self.call(prompt, None, CallOptions { max_tokens, thinking, ..Default::default() }) {
             Ok(verdict) => verdict,
             Err(e) => format!("Error generating response: {e}"),
         }

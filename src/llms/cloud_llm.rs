@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use crate::config::app_settings::AppSettings;
 use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::platform::client::{AuthHeadersFn, Headers, RefreshFn, SLPPlatformClient};
+use crate::types::ReasoningEffort;
 
 const LOG_TARGET: &str = "smartloop.llms.cloud";
 
@@ -101,6 +102,9 @@ pub struct CloudLLM {
     model_name: String,
     context_length: usize,
     reasoning_budget_tokens: usize,
+    /// Efforts the catalog lists for the model; a call asking for any
+    /// other gets none sent, leaving the platform's default.
+    reasoning_efforts: Vec<ReasoningEffort>,
     client: SLPPlatformClient,
     send_credentials: bool,
     cancelled: RwLock<Option<CancelEvent>>,
@@ -131,6 +135,7 @@ impl CloudLLM {
             model_name: model_name.to_string(),
             context_length: context_length.map(|n| n as usize).filter(|n| *n > 0).unwrap_or(DEFAULT_CONTEXT_LENGTH),
             reasoning_budget_tokens: DEFAULT_REASONING_BUDGET_TOKENS,
+            reasoning_efforts: Vec::new(),
             client: SLPPlatformClient::with_hooks(url, auth_headers_fn, refresh_fn),
             send_credentials,
             cancelled: RwLock::new(None),
@@ -145,6 +150,29 @@ impl CloudLLM {
         self
     }
 
+    /// Use the catalog's reasoning efforts.
+    pub fn with_reasoning_efforts(mut self, efforts: Vec<ReasoningEffort>) -> Self {
+        self.reasoning_efforts = efforts;
+        self
+    }
+
+    /// The effort to send for a call asking `requested`: only one the model
+    /// lists.
+    fn reasoning_effort(&self, requested: Option<ReasoningEffort>) -> Option<ReasoningEffort> {
+        let effort = requested?;
+        if self.reasoning_efforts.contains(&effort) {
+            Some(effort)
+        } else {
+            tracing::debug!(
+                target: LOG_TARGET,
+                "[cloud] {} takes no '{}' reasoning effort; sending none",
+                self.model_name,
+                effort.value()
+            );
+            None
+        }
+    }
+
     pub fn model_name(&self) -> &str {
         &self.model_name
     }
@@ -155,17 +183,31 @@ impl CloudLLM {
 
     /// The `max_tokens` to send for a caller's cap.  The cap sizes the
     /// answer; the model's reasoning comes on top, or a short cap is spent
-    /// thinking and the answer comes back empty.
-    fn request_max_tokens(&self, options: CallOptions) -> Option<usize> {
-        options.max_tokens.map(|cap| cap + self.reasoning_budget_tokens)
+    /// thinking and the answer comes back empty.  With reasoning off there
+    /// is nothing to add.
+    fn request_max_tokens(&self, max_tokens: Option<usize>, effort: Option<ReasoningEffort>) -> Option<usize> {
+        let budget = if effort == Some(ReasoningEffort::None) { 0 } else { self.reasoning_budget_tokens };
+        max_tokens.map(|cap| cap + budget)
     }
 
-    fn body(&self, messages: &[ChatMessage], stream: bool, max_tokens: Option<usize>) -> Value {
-        self.body_for(json!(messages), stream, max_tokens)
+    fn body(
+        &self,
+        messages: &[ChatMessage],
+        stream: bool,
+        max_tokens: Option<usize>,
+        effort: Option<ReasoningEffort>,
+    ) -> Value {
+        self.body_for(json!(messages), stream, max_tokens, effort)
     }
 
     /// The request body for already-shaped OpenAI `messages`.
-    fn body_for(&self, messages: Value, stream: bool, max_tokens: Option<usize>) -> Value {
+    fn body_for(
+        &self,
+        messages: Value,
+        stream: bool,
+        max_tokens: Option<usize>,
+        effort: Option<ReasoningEffort>,
+    ) -> Value {
         let mut body = json!({
             "model": self.model_name,
             "messages": messages,
@@ -175,12 +217,20 @@ impl CloudLLM {
         if let Some(max_tokens) = max_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
+        if let Some(effort) = effort {
+            body["reasoning"] = json!({"effort": effort.value()});
+        }
         body
     }
 
     /// One non-streaming completion: the answer and why it stopped.
-    fn complete(&self, messages: &[ChatMessage], max_tokens: Option<usize>) -> anyhow::Result<(String, Option<String>)> {
-        let response = self.post(&self.body(messages, false, max_tokens)).map_err(anyhow::Error::msg)?;
+    fn complete(
+        &self,
+        messages: &[ChatMessage],
+        max_tokens: Option<usize>,
+        effort: Option<ReasoningEffort>,
+    ) -> anyhow::Result<(String, Option<String>)> {
+        let response = self.post(&self.body(messages, false, max_tokens, effort)).map_err(anyhow::Error::msg)?;
         let data: Value = response
             .json()
             .map_err(|e| anyhow::anyhow!("{} sent an unreadable answer: {e}", self.model_name))?;
@@ -200,8 +250,8 @@ impl CloudLLM {
         max_tokens: Option<usize>,
         temperature: f32,
     ) -> anyhow::Result<Value> {
-        let max_tokens = max_tokens.map(|cap| cap + self.reasoning_budget_tokens);
-        let mut body = self.body_for(Value::Array(messages), false, max_tokens);
+        let max_tokens = self.request_max_tokens(max_tokens, None);
+        let mut body = self.body_for(Value::Array(messages), false, max_tokens, None);
         body["temperature"] = json!(temperature);
         let response = self.post(&body).map_err(anyhow::Error::msg)?;
         response
@@ -285,14 +335,15 @@ impl BaseLLM for CloudLLM {
     /// complete.
     fn call(&self, prompt: &str, _stop: Option<&[String]>, options: CallOptions) -> anyhow::Result<String> {
         let messages = self.create_messages_from_prompt(prompt);
-        let Some(max_tokens) = self.request_max_tokens(options) else {
-            let (content, finish) = self.complete(&messages, None)?;
+        let effort = self.reasoning_effort(options.reasoning_effort);
+        let Some(max_tokens) = self.request_max_tokens(options.max_tokens, effort) else {
+            let (content, finish) = self.complete(&messages, None, effort)?;
             if finish.as_deref() == Some("length") {
                 tracing::warn!(target: LOG_TARGET, "[cloud] {} ran out of context mid-answer", self.model_name);
             }
             return Ok(content);
         };
-        let (content, finish) = self.complete(&messages, Some(max_tokens))?;
+        let (content, finish) = self.complete(&messages, Some(max_tokens), effort)?;
         if finish.as_deref() != Some("length") {
             return Ok(content);
         }
@@ -303,7 +354,7 @@ impl BaseLLM for CloudLLM {
             content.chars().count(),
             max_tokens * 2
         );
-        let (content, finish) = self.complete(&messages, Some(max_tokens * 2))?;
+        let (content, finish) = self.complete(&messages, Some(max_tokens * 2), effort)?;
         if finish.as_deref() != Some("length") {
             return Ok(content);
         }
@@ -318,7 +369,9 @@ impl BaseLLM for CloudLLM {
 
     fn stream<'a>(&'a self, prompt: &str, options: CallOptions) -> GenerationStream<'a> {
         let messages = self.create_messages_from_prompt(prompt);
-        let response = match self.post(&self.body(&messages, true, self.request_max_tokens(options))) {
+        let effort = self.reasoning_effort(options.reasoning_effort);
+        let max_tokens = self.request_max_tokens(options.max_tokens, effort);
+        let response = match self.post(&self.body(&messages, true, max_tokens, effort)) {
             Ok(response) => response,
             Err(message) => std::panic::panic_any(message),
         };

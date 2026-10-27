@@ -3589,7 +3589,7 @@ pub mod model_service_b {
         }
 
         fn invoke(&self, prompt: &str, max_tokens: Option<usize>, thinking: Option<bool>) -> String {
-            let options = CallOptions { max_tokens, thinking };
+            let options = CallOptions { max_tokens, thinking, ..Default::default() };
             match self.call(prompt, None, options) {
                 Ok(text) => text,
                 Err(e) => format!("Error generating response: {e}"),

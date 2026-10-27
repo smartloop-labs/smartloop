@@ -477,6 +477,7 @@ impl ModelHostService for ModelHostServicer {
                         prompt: p.prompt.clone(),
                         max_tokens: p.max_tokens.map(|n| n.max(0) as usize),
                         thinking: p.thinking,
+                        reasoning_effort: None,
                     })
                     .collect();
                 client.generate_batch(

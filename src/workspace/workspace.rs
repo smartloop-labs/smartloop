@@ -35,7 +35,7 @@ use crate::constants::canonical_model_name;
 use crate::llms::llm_factory::LlmFactory;
 use crate::model::spec::{ModelSpec, MODEL_SPECS};
 use crate::paths::{expand_home, real_home};
-use crate::types::{ModelCapability, ModelKind};
+use crate::types::{ModelCapability, ModelKind, ReasoningEffort};
 use crate::workspace::context::{
     active_project_id, owned_project_id, pinned_project_id, projects_delegated,
 };
@@ -805,6 +805,11 @@ impl WorkspaceModel {
     /// The reasoning budget the spec declares, if any.
     pub fn reasoning_budget_tokens(&self) -> Option<u32> {
         self.spec().and_then(|spec| spec.reasoning_budget_tokens)
+    }
+
+    /// The reasoning efforts the spec lists, lowest first; empty when none.
+    pub fn reasoning_efforts(&self) -> Vec<ReasoningEffort> {
+        self.spec().map(|spec| spec.reasoning_efforts.clone()).unwrap_or_default()
     }
 
     /// Parameter count in billions, taken from the spec (the authoritative

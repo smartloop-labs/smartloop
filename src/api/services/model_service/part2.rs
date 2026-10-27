@@ -657,7 +657,7 @@ impl Iterator for CompletionStream<'_> {
             self.rx = Some(spawn_llm_stream(
                 self.llm.clone(),
                 self.prompt.clone(),
-                CallOptions { max_tokens: None, thinking: self.thinking },
+                CallOptions { max_tokens: None, thinking: self.thinking, ..Default::default() },
                 self.cancelled.clone(),
             ));
             self.phase = StreamPhase::Primary;
@@ -1074,7 +1074,8 @@ impl ModelService {
 
         if ModelService::is_cloud_llm(llm.as_ref()) {
             // `invoke` would turn a refusal into answer text; keep it an error.
-            return llm.call(prompt, None, CallOptions { max_tokens, thinking }).map(|text| text.trim().to_string());
+            let options = CallOptions { max_tokens, thinking, ..Default::default() };
+            return llm.call(prompt, None, options).map(|text| text.trim().to_string());
         }
         let _slot = self.inference_slot();
         match catch_unwind(AssertUnwindSafe(|| llm.invoke(prompt, max_tokens, thinking))) {

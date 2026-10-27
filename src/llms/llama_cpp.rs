@@ -603,7 +603,7 @@ impl BaseLLM for LlamaCpp {
             let prompt = self.fit_prompt(&p.prompt);
             let messages = self.create_messages_from_prompt(&prompt);
             let max_tokens = p.max_tokens.unwrap_or_else(|| self.get_available_tokens(&prompt));
-            let options = CallOptions { max_tokens: p.max_tokens, thinking: p.thinking };
+            let options = CallOptions { max_tokens: p.max_tokens, thinking: p.thinking, ..Default::default() };
             let (_, item) = capture_prompt(|| {
                 let _override = self.thinking_override(Some(Self::requested_thinking(&options)));
                 let _budget = self.thinking_for_budget(Some(max_tokens));

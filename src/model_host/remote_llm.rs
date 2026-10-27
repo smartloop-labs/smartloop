@@ -199,7 +199,7 @@ impl BaseLLM for RemoteLLM {
     /// step.  `max_tokens` and `thinking` travel to the host with the request:
     /// they belong to this call, not to the loaded model.
     fn invoke(&self, prompt: &str, max_tokens: Option<usize>, thinking: Option<bool>) -> String {
-        match self.call(prompt, None, CallOptions { max_tokens, thinking }) {
+        match self.call(prompt, None, CallOptions { max_tokens, thinking, ..Default::default() }) {
             Ok(response) => {
                 let mut response = response.trim().to_string();
                 if let Some(stripped) = response.strip_suffix("<|eot_id|>") {
