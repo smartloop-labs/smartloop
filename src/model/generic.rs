@@ -581,8 +581,16 @@ impl SLPModel for GenericModel {
         }
 
         let total_found = documents.len();
-        let mut new_docs: Vec<Document> = documents.into_iter().filter(|doc| !existing_ids.contains(&doc.id)).collect();
+        let (mut new_docs, duplicates): (Vec<Document>, Vec<Document>) =
+            documents.into_iter().partition(|doc| !existing_ids.contains(&doc.id));
         let skipped = total_found - new_docs.len();
+        // Their copies went into the documents dir under fresh names; left
+        // there, the indexer would find them again, never to register.
+        for doc in &duplicates {
+            if let Err(e) = fs::remove_file(&doc.path) {
+                self.logger.warning(&format!("[add_document] Could not remove duplicate copy {}: {e}", doc.path));
+            }
+        }
         if skipped > 0 {
             self.logger.info(&format!("[add_document] {skipped} document(s) skipped (duplicate hash)"));
         }
