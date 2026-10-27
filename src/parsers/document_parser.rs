@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use crate::api::services::get_model_service;
 use crate::api::services::model_service::ModelService;
 use crate::config::app_settings::AppSettings;
+use crate::llms::cloud_llm::CloudLLM;
 use crate::llms::llama::ChatCompletionRequest;
 use crate::llms::thinking::strip_thinking;
 use crate::parsers::base_parser::{BaseParser, SharedLLM};
@@ -130,6 +131,20 @@ impl VisionClient for VisionChatCompletions {
         let Some(llm) = self.model_service.get_vision_llm(None) else {
             anyhow::bail!("No vision-capable model available");
         };
+        // A cloud vision model reads the page over HTTP.
+        if let Some(cloud) = llm.as_any().downcast_ref::<CloudLLM>() {
+            let t0 = Instant::now();
+            let response =
+                cloud.create_chat_completion(request.messages, Some(request.max_tokens as usize), request.temperature)?;
+            tracing::info!(
+                target: LOGGER,
+                "[vision-ocr] {} completed in {:.1}s",
+                cloud.model_name(),
+                t0.elapsed().as_secs_f64()
+            );
+            let content = response.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or("");
+            return Ok(strip_thinking(content));
+        }
         let Some(model) = llm.llama_model() else {
             anyhow::bail!("'{}' object has no attribute 'model'", llm.llm_type());
         };

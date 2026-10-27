@@ -32,7 +32,7 @@ use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
 use crate::agents::orchestrator::{ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions};
 use crate::llms::base_llm::{BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
-use crate::llms::cloud_llm::local_only_scope;
+use crate::llms::cloud_llm::{local_only_scope, CloudLLM};
 use crate::model_host::remote_llm::RemoteLLM;
 use crate::llms::llama::ChatCompletionRequest;
 use crate::mcp::account::probe_account;
@@ -3553,6 +3553,12 @@ impl ModelService {
             options.project_id = self.get_project_id();
             options.answers_remotely = self.answers_remotely();
             options.executor = Some(self.get_llm_executor());
+            // Gathered context answers on the `general` response model (see
+            // the chat router), so it is sized against that model's window.
+            options.answer_window = Some(Arc::new({
+                let service = service.clone();
+                move || service.get_response_max_context_tokens(Some(ModelCapability::General.value()))
+            }));
             let orchestrator = SLPOrchestrator::new(orchestrator_llm, options);
 
             // A tool call that renews an expired OAuth token mutates the
@@ -4075,6 +4081,10 @@ impl ModelService {
 
     /// One non-streaming chat completion on the vision model, under a slot.
     fn ask_vision(&self, vision_llm: &Arc<dyn BaseLLM>, messages: &[Value], max_tokens: usize) -> anyhow::Result<Value> {
+        // A cloud model takes the images over HTTP: no local slot to hold.
+        if let Some(cloud) = vision_llm.as_any().downcast_ref::<CloudLLM>() {
+            return cloud.create_chat_completion(messages.to_vec(), Some(max_tokens), 0.0);
+        }
         let _slot = self.inference_slot();
         let model = vision_llm.llama_model().ok_or_else(|| anyhow::anyhow!("vision model has no local weights"))?;
         let output = model.create_chat_completion(ChatCompletionRequest {
@@ -4101,7 +4111,7 @@ impl ModelService {
         on_model_selected: Option<ModelSelectedCallback>,
     ) -> anyhow::Result<String> {
         let selected: Option<&dyn Fn(&str)> = on_model_selected.as_ref().map(|f| f.as_ref() as &dyn Fn(&str));
-        let llm = self.get_vision_llm(selected).ok_or_else(|| runtime_err("No vision-capable model available"))?;
+        let llm = self.get_vision_answer_llm(selected).ok_or_else(|| runtime_err("No vision-capable model available"))?;
 
         let mut content: Vec<Value> = vec![json!({"type": "text", "text": prompt})];
         for (data, mime) in images {
@@ -4124,8 +4134,9 @@ impl ModelService {
                 // The GPU clip encode of a large image can exhaust device
                 // memory inside native code.  Reload once with the CLIP
                 // encoder on CPU — the LLM itself stays on GPU — and retry
-                // instead of degrading to the blind text pipeline.
-                if self.vision_clip_cpu.load(Ordering::SeqCst) {
+                // instead of degrading to the blind text pipeline.  A cloud
+                // model has no local encoder to move.
+                if Self::is_cloud_llm(llm.as_ref()) || self.vision_clip_cpu.load(Ordering::SeqCst) {
                     return Err(e);
                 }
                 tracing::warn!(

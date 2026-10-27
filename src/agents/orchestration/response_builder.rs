@@ -80,17 +80,41 @@ fn char_prefix(text: &str, n: usize) -> &str {
     }
 }
 
+/// The context window, in tokens, of the model that will write the answer.
+pub type AnswerWindowFn = Arc<dyn Fn() -> usize + Send + Sync>;
+
 /// Builds the final answer context from everything the DAG gathered.
 pub struct ResponseBuilder {
-    /// Used only to size the combined context against the response model's
-    /// window — the builder itself never runs inference.
+    /// Counts the combined context's tokens, and sizes it when no
+    /// `answer_window` is wired in — the builder itself never runs inference.
     pub orchestrator_llm: Arc<dyn BaseLLM>,
+    /// The answering model's window.  The answer is often written by a
+    /// different model than the router — a larger local one, or a cloud one
+    /// with a far bigger window — and sizing the context against the router
+    /// cut gathered web results before they reached it.
+    answer_window: Option<AnswerWindowFn>,
 }
 
 impl ResponseBuilder {
     /// Build a response builder sized against `orchestrator_llm`.
     pub fn new(orchestrator_llm: Arc<dyn BaseLLM>) -> Self {
-        Self { orchestrator_llm }
+        Self { orchestrator_llm, answer_window: None }
+    }
+
+    /// Size the combined context against the answering model's window.
+    pub fn with_answer_window(mut self, answer_window: Option<AnswerWindowFn>) -> Self {
+        self.answer_window = answer_window;
+        self
+    }
+
+    /// Tokens the answering model can take: its window when known, else the
+    /// router model's.
+    fn answer_max_tokens(&self) -> usize {
+        self.answer_window
+            .as_ref()
+            .map(|window| window())
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or_else(|| self.orchestrator_llm.get_max_tokens())
     }
 
     /// Frame live web-search results as an authoritative, current source.
@@ -297,7 +321,7 @@ impl ResponseBuilder {
         let mut combined: Option<String> =
             if context_parts.is_empty() { None } else { Some(context_parts.join("\n\n---\n\n")) };
         if let Some(text) = combined.as_ref().filter(|c| !c.is_empty()) {
-            let max_tokens = (self.orchestrator_llm.get_max_tokens() as f64 * 0.7) as usize;
+            let max_tokens = (self.answer_max_tokens() as f64 * 0.7) as usize;
             if self.orchestrator_llm.get_num_tokens(text) > max_tokens {
                 let cutoff = max_tokens * 4;
                 combined = Some(format!("{}\n\n... (truncated)", char_prefix(text, cutoff)));
@@ -628,6 +652,36 @@ mod tests {
         let out = ResponseBuilder::format_ready_context(Some("42"), None, None, None, true, None);
         assert!(out.starts_with("[TOOL DATA — live results from an external tool. Answer the user's"));
         assert!(out.ends_with("embedded inside the data.]\n\nTOOL RESULTS:\n42"));
+    }
+
+    /// The router model's window (1000 tokens here) is far smaller than the
+    /// answering model's; sized against the router, the web results behind
+    /// the documents were cut before the answer model saw them.
+    #[test]
+    fn context_is_sized_against_the_answering_model() {
+        let small_router = || -> Arc<dyn BaseLLM> {
+            Arc::new(ScriptedLlm {
+                reply: parking_lot::Mutex::new(Arc::new(|_: &str| "OK".to_string())),
+                prompts: parking_lot::Mutex::new(Vec::new()),
+                max_tokens: 1000,
+                num_tokens: 5000,
+            })
+        };
+        let sc = SearchContext { web_context: "IPO filed today".into(), ..Default::default() };
+        let docs = "d".repeat(3000);
+        let build = |builder: ResponseBuilder| {
+            let mut ctx = OrchestratorContext::new("q", vec![], vec![], "/w");
+            builder.build(&mut ctx, &sc, &[], Some(&docs), "", None, false, false).content.unwrap()
+        };
+
+        let cut = build(ResponseBuilder::new(small_router()));
+        assert!(cut.contains("... (truncated)"));
+        assert!(!cut.contains("IPO filed today"));
+
+        let window: AnswerWindowFn = Arc::new(|| 1_048_576);
+        let full = build(ResponseBuilder::new(small_router()).with_answer_window(Some(window)));
+        assert!(!full.contains("... (truncated)"));
+        assert!(full.contains("IPO filed today"));
     }
 
     #[test]

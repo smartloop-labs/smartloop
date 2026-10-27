@@ -195,12 +195,18 @@ pub trait WebSearcher: Send + Sync {
     fn is_enabled(&self) -> bool;
 }
 
+/// Resolves the rerank model when a search runs, so the choice follows the
+/// request's selection and memory rather than whatever was resident when
+/// the agent was built.  `None` falls back to the agent's fixed `llm`.
+pub type LlmResolver = Arc<dyn Fn() -> Option<Arc<dyn BaseLLM>> + Send + Sync>;
+
 /// Search the web via the hosted endpoint and return fetched content.
 pub struct WebSearchAgent {
     fetch_agent: Mutex<Option<Arc<dyn UrlFetcher>>>,
     top_k: usize,
     num_candidates: usize,
     llm: Option<Arc<dyn BaseLLM>>,
+    llm_resolver: Option<LlmResolver>,
     /// URLs of the sources kept after the last `search()` (top_k, reranked
     /// order).  Read by the orchestrator so the sources surface as links in
     /// the final answer rather than only as context the model may not echo.
@@ -239,6 +245,7 @@ impl WebSearchAgent {
             top_k,
             num_candidates,
             llm,
+            llm_resolver: None,
             last_sources: RwLock::new(Vec::new()),
             last_source_extracts: RwLock::new(HashMap::new()),
         }
@@ -252,9 +259,22 @@ impl WebSearchAgent {
             .clone()
     }
 
+    /// Resolve the rerank model per search with `resolver` (see
+    /// [`LlmResolver`]); the fixed `llm` stays the fallback.
+    pub fn with_llm_resolver(mut self, resolver: LlmResolver) -> Self {
+        self.llm_resolver = Some(resolver);
+        self
+    }
+
     /// The rerank LLM, if any.
     pub fn llm(&self) -> Option<&Arc<dyn BaseLLM>> {
         self.llm.as_ref()
+    }
+
+    /// The model this search reranks with: the resolver's pick, else the
+    /// fixed `llm`.
+    fn rerank_llm(&self) -> Option<Arc<dyn BaseLLM>> {
+        self.llm_resolver.as_ref().and_then(|resolve| resolve()).or_else(|| self.llm.clone())
     }
 
     /// Search the web for `query` and return fetched result content.
@@ -441,12 +461,14 @@ impl WebSearchAgent {
     /// when no LLM is wired in or the call fails, so web search never degrades
     /// below the positional ranking.
     pub fn rerank(&self, query: &str, candidates: Vec<(String, String)>) -> Vec<(String, String)> {
-        let Some(llm) = self.llm.as_ref() else {
-            return candidates;
-        };
         if candidates.len() <= 1 {
             return candidates;
         }
+        // Resolved only once there is something to rank, so a single result
+        // never loads a model.
+        let Some(llm) = self.rerank_llm() else {
+            return candidates;
+        };
         // Judge relevance on a short snippet of each source — full content is
         // too much for the rerank model's window and adds no signal.
         let lines: Vec<String> = candidates

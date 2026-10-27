@@ -125,6 +125,9 @@ pub const SKIP_REASONS: &[(&str, &str)] = &[
 /// qwen3.5-2b for thinking" tells the reader nothing about what is happening.
 pub const RESOLUTION_PURPOSE: &str = "tool resolution";
 
+/// What the user is told a model was picked for when it ranks web results.
+pub const WEB_SEARCH_PURPOSE: &str = "web search";
+
 /// True when two handles point at the same model instance (Python `is`).
 fn same_llm(a: &Arc<dyn BaseLLM>, b: &Arc<dyn BaseLLM>) -> bool {
     std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
@@ -303,32 +306,46 @@ impl ModelRouter {
     ///
     /// MCP tool resolution is that call: one pass over every discovered tool
     /// that has to pick the tool *and* fill its required arguments, and a
-    /// reasoning block is the difference between a considered answer and a
-    /// guess.  So if the workspace has a model declaring
-    /// `ModelCapability::Thinking` enabled, that model runs it — rather than
-    /// whichever model the step would otherwise use, which on a multi-model
-    /// selection is the small router model.
+    /// considered answer beats a guess.  The router model only routes, so it
+    /// never makes that call while a better one is selected.  In order:
     ///
-    /// Best-effort, like every other decision-node routing: `decision_llm`
-    /// takes the capability model only when it is resident or comfortably
-    /// fits, so this never forces a load onto a memory-tight device.  A
-    /// `fallback` that already reasons is kept as-is — no lookup, no switch.
+    ///   1. the best model declaring `ModelCapability::Reasoning` — the
+    ///      largest, local or remote, with the local one winning a size tie;
+    ///   2. a model declaring `ModelCapability::Thinking`, on device, when it
+    ///      is resident or comfortably fits;
+    ///   3. `fallback`, the model the step would otherwise use.
+    ///
+    /// Neither step forces the generic large-model load.  A `fallback` that
+    /// already reasons is kept as-is — no lookup, no switch.  A candidate is
+    /// announced only once it is accepted, so a thinking lookup that lands on
+    /// a model that cannot think never names it as the pick.
     pub fn reasoning_llm(&self, fallback: Arc<dyn BaseLLM>) -> Arc<dyn BaseLLM> {
-        let capability = ModelCapability::Thinking.value();
         if fallback.supports_thinking() {
             return fallback;
         }
-        if !self.capability_model_exists(Some(capability)) {
-            return fallback;
+        let reasoning = ModelCapability::Reasoning.value();
+        if self.capability_model_exists(Some(reasoning)) {
+            if let Some(llm) = self.resolve(reasoning, false, "reasoning").filter(|l| !same_llm(l, &fallback)) {
+                tracing::info!(
+                    target: LOGGER,
+                    "[models] tool resolution → {} (reasoning)",
+                    Self::model_label(llm.as_ref())
+                );
+                self.announce(reasoning, &llm, Some(RESOLUTION_PURPOSE));
+                return llm;
+            }
         }
-        let resolved = self.decision_llm(Some(capability), Some(RESOLUTION_PURPOSE));
-        if resolved.supports_thinking() {
-            tracing::info!(
-                target: LOGGER,
-                "[models] tool resolution → {} (thinking)",
-                Self::model_label(resolved.as_ref())
-            );
-            return resolved;
+        let thinking = ModelCapability::Thinking.value();
+        if self.capability_model_exists(Some(thinking)) {
+            if let Some(llm) = self.resolve(thinking, true, "decision").filter(|l| l.supports_thinking()) {
+                tracing::info!(
+                    target: LOGGER,
+                    "[models] tool resolution → {} (thinking)",
+                    Self::model_label(llm.as_ref())
+                );
+                self.announce(thinking, &llm, Some(RESOLUTION_PURPOSE));
+                return llm;
+            }
         }
         fallback
     }
@@ -357,6 +374,49 @@ impl ModelRouter {
         }
     }
 
+    /// Ask the provider for `capability`'s model, on device only when
+    /// `local_only`.  `kind` names the lookup in the log.  `None` when there
+    /// is no provider, nothing resolves, or the load fails.
+    ///
+    /// No local caching — see llm_for_tier: the provider owns the capability
+    /// cache and may evict to fit, so pinning a reference here would prevent
+    /// that VRAM from being reclaimed for the next step.
+    fn resolve(&self, capability: &str, local_only: bool, kind: &str) -> Option<Arc<dyn BaseLLM>> {
+        let provider = self.capability_llm_provider.as_ref()?;
+        let resolved = {
+            let _scope = local_only_scope(local_only);
+            provider(capability)
+        };
+        match resolved {
+            Ok(Some(llm)) => {
+                tracing::info!(
+                    target: LOGGER,
+                    "[models] {} capability '{}' → {}",
+                    kind,
+                    capability,
+                    Self::model_label(llm.as_ref())
+                );
+                Some(llm)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(target: LOGGER, "[models] {} capability load failed ({}): {}", kind, capability, e);
+                None
+            }
+        }
+    }
+
+    /// Report `llm` as the model picked for `capability`, unless it is the
+    /// model this request already runs on.  Announcing that anyway puts a
+    /// second "Selected …" beside the first, naming one model twice under
+    /// two labels — which is what a single-model workspace saw for every MCP
+    /// step, since the model that reasons is also the one that answers.
+    fn announce(&self, capability: &str, llm: &Arc<dyn BaseLLM>, purpose: Option<&str>) {
+        if !same_llm(llm, &self.agent_llm) {
+            self.emit_model_selected(Some(capability), llm.as_ref(), purpose);
+        }
+    }
+
     /// Resolve a capability model for a low-value *decision* node (skill
     /// matching, multi-step planning, MCP tool selection).
     ///
@@ -368,54 +428,55 @@ impl ModelRouter {
     /// comfortably fits (the provider's own headroom guard decides), and
     /// otherwise falls straight back to the small orchestrator model. This
     /// keeps the better intent judgement "when available" without adding VRAM
-    /// pressure — and risking an OOM — on memory-tight devices.
+    /// pressure — and risking an OOM — on memory-tight devices.  Decisions
+    /// stay on device: a remote model is never one.
     pub fn decision_llm(
         &self,
         capability: Option<&str>,
         purpose: Option<&str>,
     ) -> Arc<dyn BaseLLM> {
-        if let (Some(cap), Some(provider)) =
-            (capability.filter(|c| !c.is_empty()), self.capability_llm_provider.as_ref())
-        {
-            // No local caching — see llm_for_tier: the provider owns the
-            // capability cache and may evict to fit, so pinning a reference
-            // here would prevent that VRAM from being reclaimed for the next
-            // step.  Decisions stay on device: a remote model is never one.
-            let resolved = {
-                let _scope = local_only_scope(true);
-                provider(cap)
-            };
-            match resolved {
-                Ok(Some(llm)) => {
-                    tracing::info!(
-                        target: LOGGER,
-                        "[models] decision capability '{}' → {}",
-                        cap,
-                        Self::model_label(llm.as_ref())
-                    );
-                    // Nothing was switched when the capability resolves to the
-                    // model this request is already running on.  Announcing it
-                    // anyway puts a second "Selected …" beside the first,
-                    // naming one model twice under two labels — which is what
-                    // a single-model workspace saw for every MCP step, since
-                    // the model that reasons is also the one that answers.
-                    if !same_llm(&llm, &self.agent_llm) {
-                        self.emit_model_selected(Some(cap), llm.as_ref(), purpose);
-                    }
-                    return llm;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        target: LOGGER,
-                        "[models] decision capability load failed ({}): {}",
-                        cap,
-                        e
-                    );
-                }
+        if let Some(cap) = capability.filter(|c| !c.is_empty()) {
+            if let Some(llm) = self.resolve(cap, true, "decision") {
+                self.announce(cap, &llm, purpose);
+                return llm;
             }
         }
         self.agent_llm.clone()
+    }
+
+    /// Resolve a model for a light task that still benefits from a good
+    /// model — reranking web results, say.
+    ///
+    /// Local first, then remote: any selected local model that fits does the
+    /// task, even a small one, since the task is light.  Only when nothing
+    /// local resolves — or the lookup lands back on the router model — does
+    /// a remote model take it, ahead of the router model.  Unlike
+    /// [`Self::decision_llm`] a remote model is allowed; unlike
+    /// [`Self::llm_for_tier`] a miss never forces the generic large-model
+    /// load — it lands on `agent_llm`.
+    pub fn light_llm(&self, capability: Option<&str>, purpose: Option<&str>) -> Arc<dyn BaseLLM> {
+        let cap = capability.filter(|c| !c.is_empty()).unwrap_or(ModelCapability::General.value());
+        let picked = self
+            .resolve(cap, true, "light")
+            .filter(|llm| !self.is_router_model(llm))
+            .or_else(|| self.resolve(cap, false, "light"));
+        if let Some(llm) = picked {
+            self.announce(cap, &llm, purpose);
+            return llm;
+        }
+        self.agent_llm.clone()
+    }
+
+    /// True when `llm` is the router (bootstrap) model.  A handle to a model
+    /// in another process is a fresh object each time, so it is also matched
+    /// by the name it reports — only an explicit one, since the fallback
+    /// label (a class name) is shared by unrelated in-process models.
+    fn is_router_model(&self, llm: &Arc<dyn BaseLLM>) -> bool {
+        if same_llm(llm, &self.orchestrator_llm) {
+            return true;
+        }
+        let label = llm.model_label();
+        !label.is_empty() && label == self.orchestrator_llm.model_label()
     }
 
     /// Name this model the way the user's model picker names it.
@@ -784,6 +845,77 @@ mod tests {
         router.decision_llm(Some("dp"), None);
         assert_eq!(*scopes.lock(), vec![false, true, true]);
         assert!(!local_only());
+    }
+
+    #[test]
+    fn a_light_task_may_resolve_remote_and_defaults_to_general() {
+        use crate::llms::cloud_llm::local_only;
+
+        let agent: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "x".into());
+        let cap: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "y".into());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (seen, cap_for_provider) = (calls.clone(), cap.clone());
+        let router = ModelRouter::new(
+            agent.clone(),
+            agent,
+            ModelRouterOptions {
+                capability_llm_provider: Some(Arc::new(move |c: &str| {
+                    seen.lock().push((c.to_string(), local_only()));
+                    Ok(Some(cap_for_provider.clone()))
+                })),
+                ..Default::default()
+            },
+        );
+        let got = router.light_llm(None, Some(WEB_SEARCH_PURPOSE));
+        assert!(same_llm(&got, &cap));
+        // A selected local model answered on device, so the cloud was not asked.
+        assert_eq!(*calls.lock(), vec![("general".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_light_task_landing_on_the_router_model_asks_the_cloud() {
+        use crate::llms::cloud_llm::local_only;
+
+        let router_model: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "x".into());
+        let cloud: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "y".into());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (seen, on_device, remote) = (calls.clone(), router_model.clone(), cloud.clone());
+        let router = ModelRouter::new(
+            router_model.clone(),
+            router_model,
+            ModelRouterOptions {
+                capability_llm_provider: Some(Arc::new(move |_c: &str| {
+                    let local = local_only();
+                    seen.lock().push(local);
+                    Ok(Some(if local { on_device.clone() } else { remote.clone() }))
+                })),
+                ..Default::default()
+            },
+        );
+        assert!(same_llm(&router.light_llm(None, None), &cloud));
+        assert_eq!(*calls.lock(), vec![true, false]);
+    }
+
+    #[test]
+    fn a_light_task_with_no_capable_model_stays_on_the_agent_model() {
+        let agent: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "x".into());
+        let large_loads = Arc::new(Mutex::new(0));
+        let loads = large_loads.clone();
+        let router = ModelRouter::new(
+            agent.clone(),
+            agent.clone(),
+            ModelRouterOptions {
+                capability_llm_provider: Some(Arc::new(|_c: &str| Ok(None))),
+                large_llm_provider: Some(Arc::new(move || {
+                    *loads.lock() += 1;
+                    Ok(None)
+                })),
+                ..Default::default()
+            },
+        );
+        let got = router.light_llm(Some("coding"), None);
+        assert!(same_llm(&got, &agent));
+        assert_eq!(*large_loads.lock(), 0);
     }
 
     #[test]

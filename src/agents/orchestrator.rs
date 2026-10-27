@@ -39,17 +39,17 @@ use crate::agents::orchestration::judge_step::JudgeStep;
 pub use crate::agents::orchestration::model_router::{
     CapabilityAvailable, CapabilityLlmProvider, CapabilitySkipReasonFn, LargeLlmProvider,
 };
-use crate::agents::orchestration::model_router::{ModelRouter, ModelRouterOptions};
+use crate::agents::orchestration::model_router::{ModelRouter, ModelRouterOptions, WEB_SEARCH_PURPOSE};
 use crate::agents::orchestration::pipeline_builder::PipelineBuilder;
 /// The per-request context as the pipeline's handlers share it.
 pub use crate::agents::orchestration::pipeline_builder::{SharedOrchestratorContext, SharedSearchContext};
-use crate::agents::orchestration::response_builder::ResponseBuilder;
+use crate::agents::orchestration::response_builder::{AnswerWindowFn, ResponseBuilder};
 use crate::agents::orchestration::skill_processor::SkillProcessor;
 use crate::agents::orchestration::step::Step;
 use crate::agents::orchestration::step_executor::StepExecutor;
 use crate::agents::orchestration::tool_fanout::ToolFanout;
 use crate::agents::planner::{MCPToolContext, Planner};
-use crate::agents::web_search_agent::{ProgressCallback, WebSearchAgent, WebSearcher};
+use crate::agents::web_search_agent::{LlmResolver, ProgressCallback, WebSearchAgent, WebSearcher};
 use crate::api::services::model_service::ModelService;
 use crate::paths::expand_home;
 use crate::utils::mcp_result_formatter::ResultFormatter;
@@ -121,6 +121,9 @@ pub struct SLPOrchestratorOptions {
     /// Shared, long-lived I/O executor; a per-instance one is created when
     /// absent (e.g. in tests).
     pub executor: Option<Arc<LLMExecutor>>,
+    /// The answering model's context window; the gathered context is sized
+    /// against it.  Absent, the orchestrator model's window is used.
+    pub answer_window: Option<AnswerWindowFn>,
 }
 
 /// Optional arguments of [`SLPOrchestrator::execute`] (Python kwargs).
@@ -200,14 +203,24 @@ impl SLPOrchestrator {
         let tool_caller =
             Arc::new(MCPToolCaller::new(Arc::clone(&arg_extractor), Arc::clone(&result_mapper), None));
         let result_formatter = Arc::new(ResultFormatter::new(Arc::clone(&orchestrator_llm)));
-        let explorer = Arc::new(Explorer::new(
-            Arc::clone(&agent_llm),
-            Some(Arc::clone(&tool_caller)),
-            Some(Arc::clone(&arg_extractor)),
-            false,
-        ));
+        // Web results rerank on a model chosen per search: local first, a
+        // remote one when nothing local fits — not the fixed agent model.
+        let web_llm: LlmResolver = {
+            let models = Arc::clone(&models);
+            Arc::new(move || Some(models.light_llm(None, Some(WEB_SEARCH_PURPOSE))))
+        };
+        let explorer = Arc::new(
+            Explorer::new(
+                Arc::clone(&agent_llm),
+                Some(Arc::clone(&tool_caller)),
+                Some(Arc::clone(&arg_extractor)),
+                false,
+            )
+            .with_web_llm_resolver(Arc::clone(&web_llm)),
+        );
         let fetch_agent = Arc::new(FetchAgent::new());
-        let web_search_agent = Arc::new(WebSearchAgent::new(None, 3, 10, Some(Arc::clone(&agent_llm))));
+        let web_search_agent =
+            Arc::new(WebSearchAgent::new(None, 3, 10, Some(Arc::clone(&agent_llm))).with_llm_resolver(web_llm));
         // MCPAgent: reasons over the tools discovery recorded for every
         // connected server and answers with one call, required arguments
         // filled. This is the resolution path for external MCP tool steps (no
@@ -215,7 +228,9 @@ impl SLPOrchestrator {
         let mcp_agent = Arc::new(MCPAgent::new(Arc::clone(&agent_llm)));
 
         // -- Orchestration components, constructed in dependency order --
-        let response = Arc::new(ResponseBuilder::new(Arc::clone(&orchestrator_llm)));
+        let response = Arc::new(
+            ResponseBuilder::new(Arc::clone(&orchestrator_llm)).with_answer_window(options.answer_window.clone()),
+        );
         let judge = Arc::new(JudgeStep::new(Arc::clone(&models)));
         let doc_fanout = Arc::new(DocumentFanoutStep::new(Arc::clone(&models)));
         let skills = Arc::new(SkillProcessor::new(Arc::clone(&models), Arc::clone(&explorer)));
