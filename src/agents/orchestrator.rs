@@ -43,7 +43,7 @@ use crate::agents::orchestration::model_router::{ModelRouter, ModelRouterOptions
 use crate::agents::orchestration::pipeline_builder::PipelineBuilder;
 /// The per-request context as the pipeline's handlers share it.
 pub use crate::agents::orchestration::pipeline_builder::{SharedOrchestratorContext, SharedSearchContext};
-use crate::agents::orchestration::response_builder::ResponseBuilder;
+use crate::agents::orchestration::response_builder::{AnswerWindowFn, ResponseBuilder};
 use crate::agents::orchestration::skill_processor::SkillProcessor;
 use crate::agents::orchestration::step::Step;
 use crate::agents::orchestration::step_executor::StepExecutor;
@@ -121,6 +121,9 @@ pub struct SLPOrchestratorOptions {
     /// Shared, long-lived I/O executor; a per-instance one is created when
     /// absent (e.g. in tests).
     pub executor: Option<Arc<LLMExecutor>>,
+    /// The answering model's context window; the gathered context is sized
+    /// against it.  Absent, the orchestrator model's window is used.
+    pub answer_window: Option<AnswerWindowFn>,
 }
 
 /// Optional arguments of [`SLPOrchestrator::execute`] (Python kwargs).
@@ -225,7 +228,9 @@ impl SLPOrchestrator {
         let mcp_agent = Arc::new(MCPAgent::new(Arc::clone(&agent_llm)));
 
         // -- Orchestration components, constructed in dependency order --
-        let response = Arc::new(ResponseBuilder::new(Arc::clone(&orchestrator_llm)));
+        let response = Arc::new(
+            ResponseBuilder::new(Arc::clone(&orchestrator_llm)).with_answer_window(options.answer_window.clone()),
+        );
         let judge = Arc::new(JudgeStep::new(Arc::clone(&models)));
         let doc_fanout = Arc::new(DocumentFanoutStep::new(Arc::clone(&models)));
         let skills = Arc::new(SkillProcessor::new(Arc::clone(&models), Arc::clone(&explorer)));

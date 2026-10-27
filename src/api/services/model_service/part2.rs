@@ -3553,6 +3553,12 @@ impl ModelService {
             options.project_id = self.get_project_id();
             options.answers_remotely = self.answers_remotely();
             options.executor = Some(self.get_llm_executor());
+            // Gathered context answers on the `general` response model (see
+            // the chat router), so it is sized against that model's window.
+            options.answer_window = Some(Arc::new({
+                let service = service.clone();
+                move || service.get_response_max_context_tokens(Some(ModelCapability::General.value()))
+            }));
             let orchestrator = SLPOrchestrator::new(orchestrator_llm, options);
 
             // A tool call that renews an expired OAuth token mutates the
