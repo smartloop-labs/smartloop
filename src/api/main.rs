@@ -50,11 +50,11 @@ use crate::workspace::{DocumentStatus, Workspace};
 /// Logger name of this module.
 pub const LOGGER: &str = "smartloop.api.main";
 
-/// Logger uvicorn wrote its access lines to; the token redaction applies here.
-pub const ACCESS_LOGGER: &str = "uvicorn.access";
+/// Logger for HTTP access lines; the token redaction applies here.
+pub const ACCESS_LOGGER: &str = "smartloop.api.access";
 
-/// Logger uvicorn wrote its lifecycle lines to.
-pub const SERVER_LOGGER: &str = "uvicorn.error";
+/// Logger for server lifecycle lines.
+pub const SERVER_LOGGER: &str = "smartloop.api.server";
 
 /// App title / description / version (the FastAPI metadata).  The OpenAPI
 /// document and Swagger UI live in [`crate::api::openapi`].
@@ -1036,7 +1036,7 @@ async fn shutdown_signal(requested: Option<Arc<Notify>>) -> ServeExit {
     }
 }
 
-/// Log one request the way uvicorn's access logger did, with tokens redacted
+/// Log one request in common access-log form, with tokens redacted
 /// from the request line.
 async fn access_log(request: Request, next: Next) -> Response {
     let client = request
@@ -1087,7 +1087,7 @@ pub async fn serve_listener(
     }
     tracing::info!(
         target: SERVER_LOGGER,
-        "Uvicorn running on http://{}:{} (Press CTRL+C to quit)",
+        "Smartloop API running on http://{}:{} (Press CTRL+C to quit)",
         local.ip(),
         local.port()
     );
@@ -1120,9 +1120,9 @@ pub async fn serve(host: &str, port: u16) -> anyhow::Result<ServeExit> {
 
 /// [`serve`] with an optional programmatic shutdown trigger.
 pub async fn serve_on(host: &str, port: u16, shutdown: Option<Arc<Notify>>) -> anyhow::Result<ServeExit> {
-    // uvicorn ran the lifespan startup before binding; keep that order so a
-    // supervisor started during startup sees the configured port first and is
-    // corrected by the port capture afterwards.
+    // Run the lifespan startup before binding so a supervisor started during
+    // startup sees the configured port first and is corrected by the port
+    // capture afterwards.
     tracing::info!(target: SERVER_LOGGER, "Started server process [{}]", std::process::id());
     tracing::info!(target: SERVER_LOGGER, "Waiting for application startup.");
     let state = lifespan_startup().await;
@@ -1152,7 +1152,7 @@ pub async fn serve_on(host: &str, port: u16, shutdown: Option<Arc<Notify>>) -> a
     }
     tracing::info!(
         target: SERVER_LOGGER,
-        "Uvicorn running on http://{}:{} (Press CTRL+C to quit)",
+        "Smartloop API running on http://{}:{} (Press CTRL+C to quit)",
         host,
         local.port()
     );
