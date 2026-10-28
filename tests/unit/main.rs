@@ -13,6 +13,7 @@ mod test_argument_extractor_placeholder_echo;
 mod test_argument_extractor_schema_echo;
 mod test_artifact_downloader;
 mod test_artifact_source;
+mod test_attachment_token_limit;
 mod test_auth_writes_are_workspace_work;
 mod test_bootstrap_is_workspace_work;
 mod test_bound_port_in_settings;

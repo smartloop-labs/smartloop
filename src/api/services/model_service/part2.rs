@@ -3905,7 +3905,15 @@ impl ModelService {
                     is_markdown = true;
 
                     // Enforce the token limit using the loaded LLM's tokenizer.
-                    let max_tokens = llm.get_max_tokens();
+                    // A sole selected cloud model answers with the whole
+                    // attachment, so its context window is the limit, not
+                    // the local orchestrator's.
+                    let max_tokens = self
+                        .pinned_model_seam(None)
+                        .filter(|ws_model| ws_model.is_remote())
+                        .and_then(|ws_model| ws_model.context_length())
+                        .map(|context_length| context_length as usize)
+                        .unwrap_or_else(|| llm.get_max_tokens());
                     let estimated_tokens = llm.get_num_tokens(&markdown);
                     if estimated_tokens > max_tokens {
                         return Err(value_err(format!(
