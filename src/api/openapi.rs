@@ -53,6 +53,7 @@ pub struct DocumentUpload {
         crate::api::routers::web_search::get_web_search_config,
         crate::api::routers::web_search::set_web_search_enabled,
         crate::api::routers::web_search::get_web_search_status,
+        crate::api::routers::cloud_usage::get_cloud_quota,
         crate::api::routers::documents::list_documents_for_project,
         crate::api::routers::documents::add_document_to_project,
         crate::api::routers::documents::upload_document_file,

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use serial_test::serial;
 use smartloop::auth::credential_store;
 use smartloop::platform::client::{
-    Headers, JsonObject, PlatformError, SEARCH_STATUS_TIMEOUT, SEARCH_TIMEOUT, SLPPlatformClient,
+    Headers, JsonObject, PlatformError, CLOUD_USAGE_TIMEOUT, SEARCH_STATUS_TIMEOUT, SEARCH_TIMEOUT, SLPPlatformClient,
 };
 use smartloop::workspace::context::pin_project;
 
@@ -541,6 +541,63 @@ mod test_web_search_status {
 
         let client = client_with_auth(server.base_url(), &[]);
         let err = client.web_search_status(SEARCH_STATUS_TIMEOUT).unwrap_err();
+        assert_connection(&err, "API error");
+    }
+}
+
+mod test_cloud_usage {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_quota_returns_the_whole_body() {
+        let _c = autouse();
+        let server = StubServer::start();
+        let body = json!({
+            "limit": null, "used": null, "remaining": null, "percent_used": 42.5,
+            "percent_available": 50.0, "in_flight": 1, "requests": 12,
+            "prompt_tokens": 9000, "completion_tokens": 3000, "period": "2026-10",
+            "resets_at": "2026-11-01T00:00:00Z", "plan": "paid"
+        });
+        server.route("/v1/chat/quota", 200, body.clone());
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let quota = client.cloud_quota(CLOUD_USAGE_TIMEOUT).unwrap();
+        assert_eq!(Value::Object(quota), body);
+    }
+
+    fn check_refusal_keeps_its_status(status: u16) {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route("/v1/chat/quota", status, json!({"detail": "nope"}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.cloud_quota(CLOUD_USAGE_TIMEOUT).unwrap_err();
+        assert!(err.is_permission());
+        assert_eq!(err.status_code(), Some(status));
+    }
+
+    #[test]
+    #[serial]
+    fn test_signed_out_is_permission_401() {
+        check_refusal_keeps_its_status(401);
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_cloud_access_is_permission_403() {
+        check_refusal_keeps_its_status(403);
+    }
+
+    #[test]
+    #[serial]
+    fn test_server_error_raises_connection_error() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route("/v1/chat/quota", 500, json!({"detail": "boom"}));
+
+        let client = client_with_auth(server.base_url(), &[]);
+        let err = client.cloud_quota(CLOUD_USAGE_TIMEOUT).unwrap_err();
         assert_connection(&err, "API error");
     }
 }
