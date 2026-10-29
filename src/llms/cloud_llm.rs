@@ -102,8 +102,7 @@ pub struct CloudLLM {
     model_name: String,
     context_length: usize,
     reasoning_budget_tokens: usize,
-    /// Efforts the catalog lists for the model; a call asking for any
-    /// other gets none sent, leaving the platform's default.
+    /// Efforts the catalog lists for the model, lowest first.
     reasoning_efforts: Vec<ReasoningEffort>,
     client: SLPPlatformClient,
     send_credentials: bool,
@@ -151,26 +150,36 @@ impl CloudLLM {
     }
 
     /// Use the catalog's reasoning efforts.
-    pub fn with_reasoning_efforts(mut self, efforts: Vec<ReasoningEffort>) -> Self {
+    pub fn with_reasoning_efforts(mut self, mut efforts: Vec<ReasoningEffort>) -> Self {
+        efforts.sort();
+        efforts.dedup();
         self.reasoning_efforts = efforts;
         self
     }
 
-    /// The effort to send for a call asking `requested`: only one the model
-    /// lists.
+    /// The effort to send for a call asking `requested`: the lowest one the
+    /// model lists at or above it, or its highest when it lists none that
+    /// high.  So asking for `none` gets the least thinking a model allows
+    /// (`minimal` on one that always reasons).  `None` for a model that
+    /// lists no efforts, leaving the platform's default.
     fn reasoning_effort(&self, requested: Option<ReasoningEffort>) -> Option<ReasoningEffort> {
-        let effort = requested?;
-        if self.reasoning_efforts.contains(&effort) {
-            Some(effort)
-        } else {
+        let requested = requested?;
+        let effort = self
+            .reasoning_efforts
+            .iter()
+            .copied()
+            .find(|e| *e >= requested)
+            .or_else(|| self.reasoning_efforts.last().copied());
+        if effort.is_some_and(|e| e != requested) {
             tracing::debug!(
                 target: LOG_TARGET,
-                "[cloud] {} takes no '{}' reasoning effort; sending none",
+                "[cloud] {} takes no '{}' reasoning effort; sending '{}'",
                 self.model_name,
-                effort.value()
+                requested.value(),
+                effort.map_or("", ReasoningEffort::value)
             );
-            None
         }
+        effort
     }
 
     pub fn model_name(&self) -> &str {

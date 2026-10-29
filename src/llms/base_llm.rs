@@ -223,9 +223,15 @@ pub trait BaseLLM: Send + Sync {
                 if is_cancelled() {
                     return String::new();
                 }
-                let options =
-                    CallOptions { max_tokens: p.max_tokens, thinking: p.thinking, reasoning_effort: p.reasoning_effort };
-                self.invoke_with(&p.prompt, options)
+                match p.reasoning_effort {
+                    // Through `invoke`, so a model that overrides it answers
+                    // a batch the same way.
+                    None => self.invoke(&p.prompt, p.max_tokens, p.thinking),
+                    effort => self.invoke_with(
+                        &p.prompt,
+                        CallOptions { max_tokens: p.max_tokens, thinking: p.thinking, reasoning_effort: effort },
+                    ),
+                }
             })
             .collect()
     }

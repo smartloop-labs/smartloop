@@ -157,14 +157,32 @@ async fn test_a_listed_reasoning_effort_is_sent() {
 
 #[tokio::test]
 #[serial]
-async fn test_an_unlisted_or_absent_reasoning_effort_is_not_sent() {
-    for effort in [Some(ReasoningEffort::None), None] {
-        let (server, llm, _env) = effort_llm(vec![ReasoningEffort::Low]).await;
-        call_with_effort(llm, effort).await;
+async fn test_an_unlisted_reasoning_effort_sends_the_nearest_listed_one() {
+    use ReasoningEffort::{High, Low, Medium, Minimal, None as Off};
+    for (listed, requested, sent_effort) in [
+        // A model that always reasons answers "none" at its lowest.
+        (vec![Minimal, Low, Medium, High], Off, "minimal"),
+        (vec![Low, High], Medium, "high"),
+        (vec![Low], High, "low"),
+    ] {
+        let (server, llm, _env) = effort_llm(listed).await;
+        call_with_effort(llm, Some(requested)).await;
 
         let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
-        assert!(sent.get("reasoning").is_none(), "{effort:?}");
-        assert_eq!(sent["max_tokens"], 256 + DEFAULT_REASONING_BUDGET_TOKENS, "{effort:?}");
+        assert_eq!(sent["reasoning"], json!({"effort": sent_effort}), "{requested:?}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_no_reasoning_effort_is_sent_unless_asked_and_listed() {
+    for (listed, requested) in [(vec![ReasoningEffort::Low], None), (vec![], Some(ReasoningEffort::Low))] {
+        let (server, llm, _env) = effort_llm(listed).await;
+        call_with_effort(llm, requested).await;
+
+        let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
+        assert!(sent.get("reasoning").is_none(), "{requested:?}");
+        assert_eq!(sent["max_tokens"], 256 + DEFAULT_REASONING_BUDGET_TOKENS, "{requested:?}");
     }
 }
 
