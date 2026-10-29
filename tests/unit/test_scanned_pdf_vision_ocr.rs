@@ -22,7 +22,9 @@ use serial_test::serial;
 use smartloop::parsers::document_parser::{
     set_vision_available_override, set_vision_client_override, VisionClient, VisionClientPair, VisionRequest,
 };
+use smartloop::llms::cloud_llm::local_only;
 use smartloop::parsers::parser_factory::ParserFactory;
+use smartloop::tasks::indexer_task::parse_for_index;
 
 // --- fakes for the in-process vision client ----------------------------------
 
@@ -253,4 +255,37 @@ fn test_image_is_described_via_vision_model() {
     assert!(parts.iter().any(|p| p.get("type").and_then(|t| t.as_str()) == Some("image_url")));
     // ...and its description is in the parser output.
     assert!(text.contains("A blue square. Text: HELLO WORLD"));
+}
+
+/// Records whether each OCR call resolved its model on device only.
+struct ScopeProbe(Mutex<Vec<bool>>);
+
+impl VisionClient for ScopeProbe {
+    fn create(&self, _request: VisionRequest) -> anyhow::Result<String> {
+        self.0.lock().push(local_only());
+        Ok("Transcribed.".to_string())
+    }
+}
+
+/// Indexing OCRs every page in the background, so the vision model it
+/// reaches is resolved on device only; an attachment the user adds is not
+/// held to that.
+#[test]
+#[serial(vision_ocr)]
+fn test_only_indexing_ocr_resolves_on_device() {
+    let _reset = ResetOverrides;
+    let probe = Arc::new(ScopeProbe(Mutex::new(Vec::new())));
+    let client = probe.clone();
+    set_vision_client_override(Some(Arc::new(move || -> Option<VisionClientPair> {
+        Some((client.clone() as Arc<dyn VisionClient>, "vision".to_string()))
+    })));
+    set_vision_available(true);
+    let (_dir, path) = scanned_pdf(2);
+
+    parse_for_index(None, "application/pdf", path.to_str().expect("utf-8 path")).expect("parse");
+    assert_eq!(std::mem::take(&mut *probe.0.lock()), vec![true, true]);
+    assert!(!local_only(), "the scope ends with the parse");
+
+    parse("application/pdf", &path);
+    assert_eq!(*probe.0.lock(), vec![false, false]);
 }

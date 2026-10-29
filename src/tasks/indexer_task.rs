@@ -38,6 +38,7 @@ use crate::db::store::Chunk;
 use crate::db::store_factory::StoreFactory;
 use crate::db::workspace_indexer::{DocumentConverter, IndexStats, WorkspaceIndexer};
 use crate::llms::base_llm::BaseLLM;
+use crate::llms::cloud_llm::local_only_scope;
 use crate::parsers::base_parser::{ParserError, SharedLLM};
 use crate::parsers::parser_factory::ParserFactory;
 use crate::tasks::base_task::{
@@ -626,9 +627,7 @@ impl IndexerTask {
     /// Load the model and parse a non-text document to markdown.
     fn convert_to_text(&self, mime_type: &str, path: &str) -> anyhow::Result<String> {
         let llm = self.ensure_model_loaded()?;
-        let shared: SharedLLM = llm;
-        let parser = ParserFactory::new(Some(shared)).get_parser(mime_type, path)?;
-        parser.parse()
+        parse_for_index(Some(llm), mime_type, path)
     }
 
     /// Record `status` on the workspace's copy of the document and persist.
@@ -1159,9 +1158,17 @@ fn convert_document(path: &Path) -> anyhow::Result<String> {
         Some(llm) => llm,
         None => model_service.load_model()?,
     };
-    let shared: SharedLLM = llm;
     let path = path.to_string_lossy();
-    ParserFactory::new(Some(shared)).get_parser(&guess_mime_type(Path::new(path.as_ref())), &path)?.parse()
+    parse_for_index(Some(llm), &guess_mime_type(Path::new(path.as_ref())), &path)
+}
+
+/// Parse `path` to markdown for the index.  Indexing reads every document
+/// in the background, so its OCR resolves the vision model on device only:
+/// a remote vision model never reads the pages.  Attachments the user adds
+/// parse outside this scope and may use one.
+pub fn parse_for_index(llm: Option<SharedLLM>, mime_type: &str, path: &str) -> anyhow::Result<String> {
+    let _scope = local_only_scope(true);
+    ParserFactory::new(llm).get_parser(mime_type, path)?.parse()
 }
 
 /// Whether `exc` is the Rust form of a Python `ValueError` from parsing.
