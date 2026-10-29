@@ -16,11 +16,15 @@ use std::io::{BufRead, BufReader};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use regex::Regex;
 use serde_json::{json, Value};
 
 use crate::config::app_settings::AppSettings;
-use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
+use crate::llms::base_llm::{
+    clean_reply, BaseLLM, BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream,
+};
 use crate::platform::client::{AuthHeadersFn, Headers, RefreshFn, SLPPlatformClient};
 use crate::types::ReasoningEffort;
 
@@ -33,6 +37,20 @@ pub const DEFAULT_CONTEXT_LENGTH: usize = 32_768;
 /// none.  Reasoning models count their thinking against `max_tokens`, and
 /// the ones measured spent 50-350 tokens before answering a short prompt.
 pub const DEFAULT_REASONING_BUDGET_TOKENS: usize = 1024;
+
+/// Most answer tokens one packed batch request asks for, summed over its
+/// prompts' caps.  The catalog gives no output limit; the long-window models
+/// it lists answer at least this much.
+pub const PACK_MAX_ANSWER_TOKENS: usize = 32_768;
+
+/// Characters per token assumed when sizing a packed request against the
+/// window.  Tighter than [`BaseLLM::get_num_tokens`]'s four: dense text
+/// (tables, JSON) tokenizes closer to two or three, and a request that
+/// overflows the window fails outright.
+const PACK_CHARS_PER_TOKEN: usize = 3;
+
+static ANSWER_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?s)<answer id="(\d+)">(.*?)</answer>"#).expect("valid regex"));
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -304,6 +322,139 @@ impl CloudLLM {
     fn is_cancelled(&self) -> bool {
         self.cancelled.read().as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
     }
+
+    /// One batch prompt on its own request, answered as `invoke` answers.
+    fn invoke_one(&self, prompt: &BatchPrompt) -> String {
+        self.invoke_with(
+            &prompt.prompt,
+            CallOptions { max_tokens: prompt.max_tokens, thinking: prompt.thinking, reasoning_effort: prompt.reasoning_effort },
+        )
+    }
+
+    /// Split `prompts` into the groups [`BaseLLM::invoke_batch`] sends as one
+    /// request each, in order.  Consecutive prompts share a request when
+    /// they carry the same instructions and options and fit the window
+    /// together, with their summed answer caps within
+    /// [`PACK_MAX_ANSWER_TOKENS`].  A prompt with no cap, or more than a
+    /// system and a user message, goes alone.
+    fn pack(&self, prompts: &[BatchPrompt]) -> Vec<Vec<PackTask>> {
+        let mut groups: Vec<Vec<PackTask>> = Vec::new();
+        let mut used = 0usize;
+        for (index, prompt) in prompts.iter().enumerate() {
+            let task = PackTask::new(index, prompt, self.create_messages_from_prompt(&prompt.prompt));
+            let fits = |group: &[PackTask]| {
+                let first = &group[0];
+                let answer = group.iter().map(|t| t.cap).sum::<usize>() + task.cap;
+                let effort = self.reasoning_effort(first.options.reasoning_effort);
+                let output = self.request_max_tokens(Some(answer), effort).unwrap_or(answer);
+                first.packable()
+                    && task.packable()
+                    && first.system == task.system
+                    && first.options == task.options
+                    && answer <= PACK_MAX_ANSWER_TOKENS
+                    && used + task.tokens + output <= self.context_length
+            };
+            match groups.last_mut() {
+                Some(group) if fits(group) => {
+                    used += task.tokens;
+                    group.push(task);
+                }
+                _ => {
+                    used = task.system.as_deref().map_or(0, pack_tokens) + task.tokens;
+                    groups.push(vec![task]);
+                }
+            }
+        }
+        groups
+    }
+
+    /// Ask for `tasks` in one request.  Each answer comes back under its
+    /// task's position; `None` for one the model left out or was cut off
+    /// before finishing.
+    fn invoke_packed(&self, tasks: &[PackTask]) -> anyhow::Result<Vec<Option<String>>> {
+        let first = &tasks[0];
+        let preamble = format!(
+            "This request holds {} separate tasks, each in a <task id=\"N\"> block. Do each task on its own, \
+             as if it were the only one: nothing in one task may inform another task's answer. Answer every \
+             task, in order, inside <answer id=\"N\"></answer> carrying that task's id, and write nothing \
+             outside those blocks.",
+            tasks.len()
+        );
+        let system = match &first.system {
+            Some(system) => format!("{system}\n\n{preamble}"),
+            None => preamble,
+        };
+        let user = tasks
+            .iter()
+            .enumerate()
+            .map(|(id, task)| format!("<task id=\"{}\">\n{}\n</task>", id + 1, task.user))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let messages = [ChatMessage::new("system", system), ChatMessage::new("user", user)];
+        let effort = self.reasoning_effort(first.options.reasoning_effort);
+        let answer: usize = tasks.iter().map(|t| t.cap).sum();
+        let (content, finish) = self.complete(&messages, self.request_max_tokens(Some(answer), effort), effort)?;
+        if finish.as_deref() == Some("length") {
+            tracing::warn!(
+                target: LOG_TARGET,
+                "[cloud] {} hit its token limit answering {} packed prompts",
+                self.model_name,
+                tasks.len()
+            );
+        }
+        let mut answers = vec![None; tasks.len()];
+        for caps in ANSWER_PATTERN.captures_iter(&content) {
+            let id = caps[1].parse::<usize>().unwrap_or(0);
+            if let Some(slot) = id.checked_sub(1).and_then(|i| answers.get_mut(i)) {
+                *slot = Some(caps[2].trim().to_string());
+            }
+        }
+        Ok(answers)
+    }
+}
+
+/// One prompt of a batch, split for packing.
+struct PackTask {
+    /// Position in the batch.
+    index: usize,
+    system: Option<String>,
+    user: String,
+    /// The prompt's answer cap; `0` when it has none.
+    cap: usize,
+    options: CallOptions,
+    /// Estimated tokens of `user` in a packed request.
+    tokens: usize,
+    /// Whether the prompt is a system and a user message, or a user message alone.
+    simple: bool,
+}
+
+impl PackTask {
+    fn new(index: usize, prompt: &BatchPrompt, messages: Vec<ChatMessage>) -> Self {
+        let options = CallOptions {
+            max_tokens: prompt.max_tokens,
+            thinking: prompt.thinking,
+            reasoning_effort: prompt.reasoning_effort,
+        };
+        let (system, user, simple) = match messages.as_slice() {
+            [system, user] if system.role == "system" && user.role == "user" => {
+                (Some(system.content.clone()), user.content.clone(), true)
+            }
+            [user] if user.role == "user" => (None, user.content.clone(), true),
+            _ => (None, String::new(), false),
+        };
+        // The task's wrapper and answer tags ride on top of its text.
+        let tokens = pack_tokens(&user) + 16;
+        Self { index, system, user, cap: prompt.max_tokens.unwrap_or(0), options, tokens, simple }
+    }
+
+    fn packable(&self) -> bool {
+        self.simple && self.cap > 0
+    }
+}
+
+/// Estimated tokens of `text` when sizing a packed request.
+fn pack_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(PACK_CHARS_PER_TOKEN)
 }
 
 /// The text delta of one streamed chunk, or the error it reports.
@@ -412,6 +563,50 @@ impl BaseLLM for CloudLLM {
                 Err(message) => std::panic::panic_any(message),
             }
         }))
+    }
+
+    /// Prompts sharing their instructions go out together, as many to a
+    /// request as fit (see [`CloudLLM::pack`]): a request per prompt is a
+    /// round trip and a quota hold each, run one after another.  A prompt the
+    /// packed reply leaves unanswered is asked again on its own, and a failed
+    /// request answers each of its prompts with the error, as `invoke` would.
+    fn invoke_batch(&self, prompts: &[BatchPrompt], cancelled: Option<CancelEvent>) -> Vec<String> {
+        let is_cancelled = || cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst));
+        let mut replies = vec![String::new(); prompts.len()];
+        for group in self.pack(prompts) {
+            if is_cancelled() {
+                break;
+            }
+            if let [task] = group.as_slice() {
+                replies[task.index] = self.invoke_one(&prompts[task.index]);
+                continue;
+            }
+            match self.invoke_packed(&group) {
+                Ok(answers) => {
+                    let missing = answers.iter().filter(|a| a.is_none()).count();
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        "[cloud] {} answered {} packed prompts in one request ({missing} to ask again)",
+                        self.model_name,
+                        group.len() - missing
+                    );
+                    for (task, answer) in group.iter().zip(answers) {
+                        replies[task.index] = match answer {
+                            Some(answer) => clean_reply(&answer),
+                            None if is_cancelled() => String::new(),
+                            None => self.invoke_one(&prompts[task.index]),
+                        };
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(target: LOG_TARGET, "LLM invocation failed: {e}");
+                    for task in &group {
+                        replies[task.index] = format!("Error generating response: {e}");
+                    }
+                }
+            }
+        }
+        replies
     }
 
     fn model_label(&self) -> String {

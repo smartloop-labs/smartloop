@@ -468,3 +468,171 @@ async fn test_an_uncapped_answer_is_not_retried() {
     assert_eq!(reply, "Long answer");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+const EXTRACT: &str = "<system>Extract what is relevant.</system><user>Document {n}</user>";
+
+fn extract_prompts(count: usize, cap: usize) -> Vec<BatchPrompt> {
+    (1..=count).map(|n| BatchPrompt::new(EXTRACT.replace("{n}", &n.to_string()), Some(cap))).collect()
+}
+
+/// Answers each request with `reply(user message)`.
+async fn answering(server: &MockServer, reply: fn(&str) -> String) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            let user = body["messages"][1]["content"].as_str().unwrap_or_default().to_string();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": reply(&user)}, "finish_reason": "stop"}],
+            }))
+        })
+        .mount(server)
+        .await;
+}
+
+/// Each `<task id="N">` of a packed request answered as `answer N`, in
+/// reverse order; a lone prompt answered `alone`.
+fn answer_tasks(user: &str) -> String {
+    let ids: Vec<usize> = user
+        .match_indices("<task id=\"")
+        .map(|(at, _)| user[at + 10..].split('"').next().unwrap().parse().unwrap())
+        .collect();
+    if ids.is_empty() {
+        return "alone".to_string();
+    }
+    ids.iter().rev().map(|id| format!("<answer id=\"{id}\">answer {id}</answer>")).collect::<Vec<_>>().join("\n")
+}
+
+async fn run_batch(llm: CloudLLM, prompts: Vec<BatchPrompt>) -> Vec<String> {
+    let llm = Arc::new(llm);
+    tokio::task::spawn_blocking(move || llm.invoke_batch(&prompts, None)).await.unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_batch_sharing_instructions_goes_out_as_one_request() {
+    let server = MockServer::start().await;
+    answering(&server, answer_tasks).await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+
+    let replies = run_batch(llm, extract_prompts(3, 256)).await;
+
+    assert_eq!(replies, vec!["answer 1", "answer 2", "answer 3"]);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = requests[0].body_json().unwrap();
+    let system = sent["messages"][0]["content"].as_str().unwrap();
+    assert!(system.starts_with("Extract what is relevant."));
+    assert_eq!(system.matches("Extract what is relevant.").count(), 1);
+    let user = sent["messages"][1]["content"].as_str().unwrap();
+    assert!(user.contains("<task id=\"3\">\nDocument 3\n</task>"));
+    assert_eq!(sent["max_tokens"], 3 * 256 + DEFAULT_REASONING_BUDGET_TOKENS);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_prompt_the_packed_reply_leaves_out_is_asked_alone() {
+    let server = MockServer::start().await;
+    answering(&server, |user| {
+        if user.contains("<task") {
+            "<answer id=\"1\">first</answer>\n<answer id=\"2\">cut o".to_string()
+        } else {
+            "alone".to_string()
+        }
+    })
+    .await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+
+    let replies = run_batch(llm, extract_prompts(2, 256)).await;
+
+    assert_eq!(replies, vec!["first", "alone"]);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let retried: Value = requests[1].body_json().unwrap();
+    assert_eq!(retried["messages"][1]["content"], "Document 2");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_batch_splits_where_the_answer_budget_runs_out() {
+    let server = MockServer::start().await;
+    answering(&server, answer_tasks).await;
+    let _env = EnvGuard::set("SLP_API_BASE", server.uri());
+    let llm = CloudLLM::with_hooks("p1", "kimi-k2", &server.uri(), Some(1_000_000), Some(bearer("t")), None);
+    let cap = smartloop::llms::cloud_llm::PACK_MAX_ANSWER_TOKENS / 2;
+
+    let replies = run_batch(llm, extract_prompts(3, cap)).await;
+
+    assert_eq!(replies, vec!["answer 1", "answer 2", "alone"]);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_batch_splits_where_the_window_runs_out() {
+    let server = MockServer::start().await;
+    answering(&server, answer_tasks).await;
+    let _env = EnvGuard::set("SLP_API_BASE", server.uri());
+    // Room for the reasoning budget and one task's text, not two.
+    let llm = CloudLLM::with_hooks("p1", "kimi-k2", &server.uri(), Some(1600), Some(bearer("t")), None);
+    let long = "x".repeat(900);
+    let prompts: Vec<BatchPrompt> = (1..=2)
+        .map(|n| BatchPrompt::new(format!("<system>Extract.</system><user>{n}{long}</user>"), Some(64)))
+        .collect();
+
+    let replies = run_batch(llm, prompts).await;
+
+    assert_eq!(replies, vec!["alone", "alone"]);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_prompts_with_different_instructions_go_out_apart() {
+    let server = MockServer::start().await;
+    answering(&server, answer_tasks).await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+    let prompts = vec![
+        BatchPrompt::new("<system>One.</system><user>a</user>", Some(64)),
+        BatchPrompt::new("<system>Two.</system><user>b</user>", Some(64)),
+        BatchPrompt::new("<system>Two.</system><user>c</user>", None),
+    ];
+
+    let replies = run_batch(llm, prompts).await;
+
+    assert_eq!(replies, vec!["alone", "alone", "alone"]);
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_failed_packed_request_answers_each_prompt_with_the_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({"detail": "Allowance spent."})))
+        .mount(&server)
+        .await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+
+    let replies = run_batch(llm, extract_prompts(2, 256)).await;
+
+    assert_eq!(replies, vec!["Error generating response: Allowance spent."; 2]);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_cancelled_batch_sends_nothing() {
+    let server = MockServer::start().await;
+    answering(&server, answer_tasks).await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+    let llm = Arc::new(llm);
+    let prompts = extract_prompts(2, 256);
+    let cancelled = Arc::new(AtomicBool::new(true));
+
+    let replies = tokio::task::spawn_blocking(move || llm.invoke_batch(&prompts, Some(cancelled))).await.unwrap();
+
+    assert_eq!(replies, vec![String::new(), String::new()]);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
