@@ -32,6 +32,7 @@ pub const RELEASES_LATEST: &str = "/v1/releases/latest";
 pub const MCP_CATALOG: &str = "/v1/mcp-catalog";
 pub const WEBSEARCH: &str = "/v1/websearch";
 pub const WEBSEARCH_STATUS: &str = "/v1/websearch/status";
+pub const CHAT_QUOTA: &str = "/v1/chat/quota";
 pub const APPLE_VERIFY: &str = "/v1/payments/apple/verify";
 pub const CHECKOUT_SESSION: &str = "/v1/payments/create-checkout-session";
 
@@ -43,6 +44,8 @@ pub const TIMEOUT: u64 = 30;
 /// and the status check runs ahead of every query.
 pub const SEARCH_TIMEOUT: u64 = 15;
 pub const SEARCH_STATUS_TIMEOUT: u64 = 5;
+/// The cloud allowance is read for a Settings page, not a turn.
+pub const CLOUD_USAGE_TIMEOUT: u64 = 10;
 
 /// The refresh grant is a single small POST, and it lands *inside* another
 /// call's budget — the web-search gate allows itself 5s precisely because it
@@ -284,6 +287,10 @@ pub trait PlatformApi: Send + Sync {
     fn web_search_status_detail(&self, timeout: u64) -> PlatformResult<JsonObject> {
         let _ = timeout;
         Err(unsupported("web_search_status_detail"))
+    }
+    fn cloud_quota(&self, timeout: u64) -> PlatformResult<JsonObject> {
+        let _ = timeout;
+        Err(unsupported("cloud_quota"))
     }
     fn verify_apple_transaction(&self, transaction_id: &str) -> PlatformResult<JsonObject> {
         let _ = transaction_id;
@@ -875,6 +882,22 @@ impl SLPPlatformClient {
         }
     }
 
+    /// GET /v1/chat/quota (auth required). The account's cloud model
+    /// allowance this period: `percent_used`, `percent_available`,
+    /// `resets_at`, `plan`, request and token counts.  Credit amounts
+    /// (`limit`, `used`, `remaining`) are null except for superusers.
+    ///
+    /// 401 and 403 raise `PermissionError` carrying the status: a 401 means
+    /// sign in, a 403 that the account has no cloud access.  Anything else is
+    /// `ConnectionError`.
+    pub fn cloud_quota(&self, timeout: u64) -> PlatformResult<JsonObject> {
+        let resp = self
+            .authed(|h| self.send(Method::GET, CHAT_QUOTA, h, &[], None, timeout))
+            .map_err(|e| connection_error(&e))?;
+        raise_for_status(resp.status, &[], ErrorClass::Permission)?;
+        object(resp.json()?)
+    }
+
     /// POST /v1/payments/apple/verify (auth required).
     ///
     /// Hands a Mac App Store transaction id to the platform, which checks it
@@ -993,6 +1016,9 @@ impl PlatformApi for SLPPlatformClient {
     }
     fn web_search_status_detail(&self, timeout: u64) -> PlatformResult<JsonObject> {
         SLPPlatformClient::web_search_status_detail(self, timeout)
+    }
+    fn cloud_quota(&self, timeout: u64) -> PlatformResult<JsonObject> {
+        SLPPlatformClient::cloud_quota(self, timeout)
     }
     fn verify_apple_transaction(&self, transaction_id: &str) -> PlatformResult<JsonObject> {
         SLPPlatformClient::verify_apple_transaction(self, transaction_id)

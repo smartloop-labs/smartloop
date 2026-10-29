@@ -641,6 +641,7 @@ pub fn app() -> Router {
         .merge(routers::project_io_router())
         .merge(routers::releases_router())
         .merge(routers::web_search_router())
+        .merge(routers::cloud_usage_router())
         .merge(routers::storage_router())
         .merge(routers::downloads_router())
         .merge(crate::api::openapi::router())
