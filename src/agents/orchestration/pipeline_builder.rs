@@ -643,6 +643,7 @@ impl PipelineBuilder {
                 classification.reasoning
             );
         }
+        ctx.write().request_capability = classification.capability.clone();
 
         let plan_context = self.planner.build_context(
             &c.user_message,

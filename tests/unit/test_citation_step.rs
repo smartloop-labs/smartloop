@@ -207,6 +207,7 @@ impl ChatService for FakeService {
             citations: self.citations.clone(),
             skill_instruction: None,
             mutation: false,
+            capability: None,
         })
     }
     fn get_project_id(&self) -> Option<String> {

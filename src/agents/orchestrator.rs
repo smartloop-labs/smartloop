@@ -409,7 +409,9 @@ impl SLPOrchestrator {
             let ctx = self.build_context(user_message, mcp_servers, &options)?;
             let (mut dag, mut handlers) = self.plan(&ctx);
             let results = self.run(&ctx, &mut dag, &mut handlers);
-            Ok(self.reason(&ctx, &results))
+            let mut result = self.reason(&ctx, &results);
+            result.capability = ctx.read().request_capability.clone();
+            Ok(result)
         };
         match std::panic::catch_unwind(AssertUnwindSafe(attempt)) {
             Ok(Ok(result)) => result,

@@ -69,6 +69,9 @@ pub struct OrchestratorContext {
     pub skill_report: Option<String>,
     /// Citations from the documents the explore step actually drew on.
     pub explore_citations: Option<Vec<Value>>,
+    /// The capability the planner classified the request as (e.g. coding),
+    /// carried back so the answer is written by a model declaring it.
+    pub request_capability: Option<String>,
     /// The request's cancellation signal, set when the client goes away.
     pub cancelled: Option<CancelEvent>,
 }
@@ -134,4 +137,7 @@ pub struct MCPExecutionResult {
     /// content directly
     #[serde(default)]
     pub mutation: bool,
+    /// The capability the planner classified the request as (e.g. coding)
+    #[serde(default)]
+    pub capability: Option<String>,
 }

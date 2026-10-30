@@ -64,7 +64,7 @@ const LOG: &str = "smartloop.api.services.model_service";
 pub type ModelSelectedCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// `orchestrate` result:
-/// `(context, matched, error, citations, skill_instruction, mutation)`.
+/// `(context, matched, error, citations, skill_instruction, mutation, capability)`.
 ///
 /// * `context` — the formatted tool output;
 /// * `matched` — true when the orchestrator produced content;
@@ -72,7 +72,8 @@ pub type ModelSelectedCallback = Arc<dyn Fn(&str) + Send + Sync>;
 /// * `citations` — source document dicts (or `None`);
 /// * `skill_instruction` — the matched skill content (or `None`);
 /// * `mutation` — the router should stream `context` verbatim instead of
-///   running it through another LLM.
+///   running it through another LLM;
+/// * `capability` — what the planner classified the request as (e.g. coding).
 pub type OrchestrateOutcome = (
     Option<String>,
     bool,
@@ -80,6 +81,7 @@ pub type OrchestrateOutcome = (
     Option<Vec<Value>>,
     Option<String>,
     bool,
+    Option<String>,
 );
 
 /// Signals that an image-attachment request wants to *use* indexed documents
@@ -3329,7 +3331,7 @@ impl ModelService {
         requested_skill: Option<&str>,
         current_date: Option<&str>,
     ) -> OrchestrateOutcome {
-        let none: OrchestrateOutcome = (None, false, None, None, None, false);
+        let none: OrchestrateOutcome = (None, false, None, None, None, false, None);
         tracing::info!(target: LOG, "[orchestrator] entered orchestrate: {:?}", prefix_chars(user_message, 120));
 
         // A missing handle is recoverable when the weights are the host's —
@@ -3456,7 +3458,7 @@ impl ModelService {
         let Some(current_project) = model.workspace.read().current_project().cloned() else {
             if let Some(perception) = image_perception.clone() {
                 tracing::info!(target: LOG, "[orchestrator] no current project — streaming image perception directly.");
-                return (Some(perception), true, None, None, None, true);
+                return (Some(perception), true, None, None, None, true, None);
             }
             tracing::warn!(target: LOG, "[orchestrator] BYPASSED — no current project. Falling back to raw stream_completion.");
             return none;
@@ -3658,15 +3660,15 @@ impl ModelService {
                 // No tool handled it, but a perceived image's description must
                 // still reach the final response as context.
                 if image_perception.is_some() {
-                    return Ok((with_image_context(None), true, None, None, None, false));
+                    return Ok((with_image_context(None), true, None, None, None, false, result.capability));
                 }
-                return Ok(none.clone());
+                return Ok((None, false, None, None, None, false, result.capability));
             }
 
             if let Some(error) = result.error.as_ref().filter(|e| !e.is_empty()) {
                 let tool = result.tool_name.clone().unwrap_or_else(|| "None".into());
                 tracing::warn!(target: LOG, "Tool call failed ({tool}): {error}");
-                return Ok((None, true, Some(format!("Tool '{tool}' failed: {error}")), None, None, false));
+                return Ok((None, true, Some(format!("Tool '{tool}' failed: {error}")), None, None, false, None));
             }
 
             if let Some(content) = result.content.as_ref().filter(|c| !c.is_empty()) {
@@ -3686,10 +3688,11 @@ impl ModelService {
                     citations,
                     result.skill_instruction.clone(),
                     result.mutation,
+                    result.capability,
                 ));
             }
 
-            Ok((with_image_context(None), true, None, None, result.skill_instruction.clone(), false))
+            Ok((with_image_context(None), true, None, None, result.skill_instruction.clone(), false, result.capability))
         }));
 
         let failure = match run {
@@ -3698,7 +3701,7 @@ impl ModelService {
             Err(panic) => panic_message(&panic),
         };
         tracing::warn!(target: LOG, "Tool call attempt failed: {failure}");
-        (None, true, Some(format!("Tool call failed: {failure}")), None, None, false)
+        (None, true, Some(format!("Tool call failed: {failure}")), None, None, false, None)
     }
 
     // --------------------------------------------------------------- auto-write

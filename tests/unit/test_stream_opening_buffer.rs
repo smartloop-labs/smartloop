@@ -42,6 +42,7 @@ where
         citations: Some(Vec::new()),
         skill_instruction: None,
         mutation: false,
+        capability: None,
     };
     *svc.workspace_dir.lock() = Some("/tmp/ws".to_string());
     Arc::new(svc)
