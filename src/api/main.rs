@@ -46,15 +46,13 @@ use crate::workspace::context::{owns_workspace, pinned_project_id};
 use crate::workspace::migrations::{adopt_confined_home, migrate_project_state, split_project_state};
 use crate::workspace::workspace::SharedWorkspace;
 use crate::workspace::{DocumentStatus, Workspace};
+pub struct LogTarget;
 
-/// Logger name of this module.
-pub const LOGGER: &str = "smartloop.api.main";
-
-/// Logger for HTTP access lines; the token redaction applies here.
-pub const ACCESS_LOGGER: &str = "smartloop.api.access";
-
-/// Logger for server lifecycle lines.
-pub const SERVER_LOGGER: &str = "smartloop.api.server";
+impl LogTarget {
+    pub const ACCESS: &str = "smartloop.api.access";
+    pub const SERVER: &str = "smartloop.api.server";
+    pub const MAIN: &str = "smartloop.api.main";
+}
 
 /// App title / description / version (the FastAPI metadata).  The OpenAPI
 /// document and Swagger UI live in [`crate::api::openapi`].
@@ -162,7 +160,7 @@ pub fn get_model_file_path() -> Option<String> {
 
 /// Background task: poll for config and model file, then load the model.
 pub async fn wait_for_config_and_load(model_service: Arc<ModelService>) {
-    tracing::info!(target: LOGGER, "Waiting for config and model file to be ready...");
+    tracing::info!(target: LogTarget::ACCESS, "Waiting for config and model file to be ready...");
     loop {
         if !Path::new(&Workspace::config_file()).exists() {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -175,11 +173,11 @@ pub async fn wait_for_config_and_load(model_service: Arc<ModelService>) {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    tracing::info!(target: LOGGER, "Config and model file detected! Loading model...");
+    tracing::info!(target: LogTarget::MAIN, "Config and model file detected! Loading model...");
     match blocking(move || model_service.load_model()).await {
-        Ok(Ok(_)) => tracing::info!(target: LOGGER, "Model loaded successfully."),
-        Ok(Err(e)) => tracing::error!(target: LOGGER, "Failed to load model: {}", e),
-        Err(e) => tracing::error!(target: LOGGER, "Failed to load model: {}", e),
+        Ok(Ok(_)) => tracing::info!(target: LogTarget::MAIN, "Model loaded successfully."),
+        Ok(Err(e)) => tracing::error!(target: LogTarget::MAIN, "Failed to load model: {}", e),
+        Err(e) => tracing::error!(target: LogTarget::MAIN, "Failed to load model: {}", e),
     }
 }
 
@@ -236,7 +234,7 @@ pub fn bootstrap_orchestrator_model(model_service: &ModelService) -> Result<(), 
     bootstrap_orchestrator_model_with(
         || model_service.ensure_workspace(None),
         |workspace| {
-            Box::new(SLPArtifactDownloader::new(workspace.clone(), Arc::new(get_logger(LOGGER)), None))
+            Box::new(SLPArtifactDownloader::new(workspace.clone(), Arc::new(get_logger(LogTarget::MAIN)), None))
                 as Box<dyn OrchestratorDownloader>
         },
     )
@@ -257,7 +255,7 @@ where
 {
     if let Some(pinned) = pinned_project_id() {
         tracing::warn!(
-            target: LOGGER,
+            target: LogTarget::MAIN,
             "[bootstrap] orchestrator model is missing, but this process serves only project {}; \
              leaving the download to the workspace owner",
             pinned
@@ -279,7 +277,7 @@ where
     let name = target.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
     let model_id = SLPArtifactDownloader::resolve_model_id(&name);
 
-    tracing::info!(target: LOGGER, "Bootstrapping orchestrator model '{}'...", name);
+    tracing::info!(target: LogTarget::MAIN, "Bootstrapping orchestrator model '{}'...", name);
     downloader.bootstrap_download(&name)?;
 
     // Register (or reuse) the workspace entry and mark it downloaded so the
@@ -295,7 +293,7 @@ where
         }
         ws.save().map_err(anyhow::Error::from)?;
     }
-    tracing::info!(target: LOGGER, "Orchestrator model '{}' bootstrapped successfully", name);
+    tracing::info!(target: LogTarget::MAIN, "Orchestrator model '{}' bootstrapped successfully", name);
     Ok(())
 }
 
@@ -322,8 +320,8 @@ pub struct LifespanState {
 /// pre-load the model (bootstrapping it if missing) and set up the task queue.
 pub async fn lifespan_startup() -> LifespanState {
     let settings = api_settings();
-    tracing::info!(target: LOGGER, "Starting Smartloop API server...");
-    tracing::info!(target: LOGGER, "Debug mode setting: {}", py_bool(settings.debug_mode));
+    tracing::info!(target: LogTarget::MAIN, "Starting Smartloop API server...");
+    tracing::info!(target: LogTarget::MAIN, "Debug mode setting: {}", py_bool(settings.debug_mode));
 
     let home_dir = settings.home_dir();
     let api_port = settings.api_port;
@@ -337,7 +335,7 @@ pub async fn lifespan_startup() -> LifespanState {
         // leaves the install running where it already is, which is worse
         // than the move but better than not starting.
         if let Err(e) = best_effort(|| adopt_confined_home(&home_dir)) {
-            tracing::error!(target: LOGGER, "Adopting the sandboxed home failed; continuing startup: {}", e);
+            tracing::error!(target: LogTarget::MAIN, "Adopting the sandboxed home failed; continuing startup: {}", e);
         }
 
         let mut workspace = Workspace::load();
@@ -349,7 +347,7 @@ pub async fn lifespan_startup() -> LifespanState {
         if supervision_enabled()
             && let Err(e) = best_effort(|| start_supervisor(api_port, None))
         {
-            tracing::error!(target: LOGGER, "Supervisor failed to start; serving projects in-process: {}", e);
+            tracing::error!(target: LogTarget::MAIN, "Supervisor failed to start; serving projects in-process: {}", e);
         }
 
         // Skills/documents moved from the user-space folder into project_dir
@@ -358,7 +356,7 @@ pub async fn lifespan_startup() -> LifespanState {
         // path may be unreadable under the sandbox, which is precisely the
         // case this migration exists for, so it must never block startup.
         if let Err(e) = best_effort(|| migrate_project_state(workspace.as_ref())) {
-            tracing::error!(target: LOGGER, "Project state migration failed; continuing startup: {}", e);
+            tracing::error!(target: LogTarget::MAIN, "Project state migration failed; continuing startup: {}", e);
         }
 
         // Break the single config.json into a workspace record plus one
@@ -368,18 +366,18 @@ pub async fn lifespan_startup() -> LifespanState {
         // the same reason as above: a workspace that cannot be split still
         // runs.
         if let Err(e) = best_effort(|| split_project_state(workspace.as_mut())) {
-            tracing::error!(target: LOGGER, "Project state split failed; continuing startup: {}", e);
+            tracing::error!(target: LogTarget::MAIN, "Project state split failed; continuing startup: {}", e);
         }
         workspace
     })
     .await
     .unwrap_or_else(|e| {
-        tracing::error!(target: LOGGER, "Loading the workspace failed: {}", e);
+        tracing::error!(target: LogTarget::MAIN, "Loading the workspace failed: {}", e);
         None
     });
 
     if settings.debug_mode {
-        tracing::info!(target: LOGGER, "🔧 Debug mode enabled - will load base model with LoRA adapters");
+        tracing::info!(target: LogTarget::MAIN, "🔧 Debug mode enabled - will load base model with LoRA adapters");
     }
 
     // Credentials and releases are workspace-level, and belong to whoever
@@ -405,20 +403,20 @@ pub async fn lifespan_startup() -> LifespanState {
         // earns its keep now: a per-project agent that reaches the device
         // through a model host has no reason to load weights of its own, and
         // bringing one up should not wait on (or trigger) a download.
-        tracing::info!(target: LOGGER, "Model pre-load disabled (slp_api_preload_model=0)");
+        tracing::info!(target: LogTarget::MAIN, "Model pre-load disabled (slp_api_preload_model=0)");
     } else if workspace.is_some() {
-        tracing::info!(target: LOGGER, "Pre-loading model for current project...");
+        tracing::info!(target: LogTarget::MAIN, "Pre-loading model for current project...");
         let service = Arc::clone(&model_service);
         let outcome = blocking(move || match service.load_model() {
             Ok(_) => {
-                tracing::info!(target: LOGGER, "Model pre-loaded successfully");
+                tracing::info!(target: LogTarget::MAIN, "Model pre-loaded successfully");
             }
             Err(e) if is_file_not_found(&e) => {
                 // The orchestrator base model GGUF isn't on disk yet. Pull it
                 // via the unauthenticated bootstrap source and retry, rather
                 // than leaving the server running with no model loaded.
                 tracing::warn!(
-                    target: LOGGER,
+                    target: LogTarget::MAIN,
                     "Orchestrator model missing ({}); attempting bootstrap download...",
                     e
                 );
@@ -426,17 +424,17 @@ pub async fn lifespan_startup() -> LifespanState {
                     .map_err(anyhow::Error::from)
                     .and_then(|()| service.load_model().map(|_| ()));
                 match retried {
-                    Ok(()) => tracing::info!(target: LOGGER, "Model pre-loaded successfully after bootstrap"),
-                    Err(e2) => tracing::error!(target: LOGGER, "Failed to bootstrap and pre-load model: {}", e2),
+                    Ok(()) => tracing::info!(target: LogTarget::MAIN, "Model pre-loaded successfully after bootstrap"),
+                    Err(e2) => tracing::error!(target: LogTarget::MAIN, "Failed to bootstrap and pre-load model: {}", e2),
                 }
             }
             Err(e) => {
-                tracing::error!(target: LOGGER, "Failed to pre-load model: {}", e);
+                tracing::error!(target: LogTarget::MAIN, "Failed to pre-load model: {}", e);
             }
         })
         .await;
         if let Err(e) = outcome {
-            tracing::error!(target: LOGGER, "Failed to pre-load model: {}", e);
+            tracing::error!(target: LogTarget::MAIN, "Failed to pre-load model: {}", e);
         }
     } else {
         state.config_watcher_task = Some(tokio::spawn(wait_for_config_and_load(Arc::clone(&model_service))));
@@ -448,9 +446,9 @@ pub async fn lifespan_startup() -> LifespanState {
         let service = Arc::clone(&model_service);
         let shared: SharedWorkspace = Arc::new(RwLock::new(workspace));
         match blocking(move || service.setup_tasks(Some(shared))).await {
-            Ok(Ok(())) => tracing::info!(target: LOGGER, "Task queue initialized"),
-            Ok(Err(e)) => tracing::warn!(target: LOGGER, "Could not initialize agents: {}", e),
-            Err(e) => tracing::warn!(target: LOGGER, "Could not initialize agents: {}", e),
+            Ok(Ok(())) => tracing::info!(target: LogTarget::MAIN, "Task queue initialized"),
+            Ok(Err(e)) => tracing::warn!(target: LogTarget::MAIN, "Could not initialize agents: {}", e),
+            Err(e) => tracing::warn!(target: LogTarget::MAIN, "Could not initialize agents: {}", e),
         }
     }
 
@@ -469,11 +467,11 @@ pub async fn lifespan_shutdown(state: LifespanState) {
         task.abort();
     }
 
-    tracing::info!(target: LOGGER, "Shutting down Smartloop API server...");
+    tracing::info!(target: LogTarget::MAIN, "Shutting down Smartloop API server...");
 
     // Children first: they are using the model host this also stops.
     if let Err(e) = blocking(stop_supervisor).await {
-        tracing::error!(target: LOGGER, "Supervisor shutdown failed; continuing: {}", e);
+        tracing::error!(target: LogTarget::MAIN, "Supervisor shutdown failed; continuing: {}", e);
     }
 
     let model_service = get_model_service();
@@ -483,10 +481,10 @@ pub async fn lifespan_shutdown(state: LifespanState) {
     })
     .await
     {
-        tracing::error!(target: LOGGER, "Shutdown failed: {}", e);
+        tracing::error!(target: LogTarget::MAIN, "Shutdown failed: {}", e);
     }
 
-    tracing::info!(target: LOGGER, "Model unloaded, shutdown complete");
+    tracing::info!(target: LogTarget::MAIN, "Model unloaded, shutdown complete");
 
     // Tear down centralized logging last so the lines above still flush
     // through the rotating file handler.
@@ -1056,7 +1054,7 @@ async fn access_log(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     let status = response.status();
     tracing::info!(
-        target: ACCESS_LOGGER,
+        target: LogTarget::ACCESS,
         "{} - \"{} {} HTTP/{}\" {} {}",
         client,
         method,
@@ -1076,10 +1074,10 @@ pub async fn serve_listener(
     capture_port: bool,
     shutdown: Option<Arc<Notify>>,
 ) -> anyhow::Result<ServeExit> {
-    tracing::info!(target: SERVER_LOGGER, "Started server process [{}]", std::process::id());
-    tracing::info!(target: SERVER_LOGGER, "Waiting for application startup.");
+    tracing::info!(target: LogTarget::SERVER, "Started server process [{}]", std::process::id());
+    tracing::info!(target: LogTarget::SERVER, "Waiting for application startup.");
     let state = lifespan_startup().await;
-    tracing::info!(target: SERVER_LOGGER, "Application startup complete.");
+    tracing::info!(target: LogTarget::SERVER, "Application startup complete.");
 
     let local = listener.local_addr()?;
     if capture_port && let Err(e) = capture_bound_port(local.port()) {
@@ -1087,7 +1085,7 @@ pub async fn serve_listener(
         return Err(e.into());
     }
     tracing::info!(
-        target: SERVER_LOGGER,
+        target: LogTarget::SERVER,
         "Smartloop API running on http://{}:{} (Press CTRL+C to quit)",
         local.ip(),
         local.port()
@@ -1100,14 +1098,14 @@ pub async fn serve_listener(
         .with_graceful_shutdown(async move {
             let reason = shutdown_signal(shutdown).await;
             *exit_slot.lock() = reason;
-            tracing::info!(target: SERVER_LOGGER, "Shutting down");
+            tracing::info!(target: LogTarget::SERVER, "Shutting down");
         })
         .await;
 
-    tracing::info!(target: SERVER_LOGGER, "Waiting for application shutdown.");
+    tracing::info!(target: LogTarget::SERVER, "Waiting for application shutdown.");
     lifespan_shutdown(state).await;
-    tracing::info!(target: SERVER_LOGGER, "Application shutdown complete.");
-    tracing::info!(target: SERVER_LOGGER, "Finished server process [{}]", std::process::id());
+    tracing::info!(target: LogTarget::SERVER, "Application shutdown complete.");
+    tracing::info!(target: LogTarget::SERVER, "Finished server process [{}]", std::process::id());
     result?;
     let reason = *exit.lock();
     Ok(reason)
@@ -1124,25 +1122,25 @@ pub async fn serve_on(host: &str, port: u16, shutdown: Option<Arc<Notify>>) -> a
     // Run the lifespan startup before binding so a supervisor started during
     // startup sees the configured port first and is corrected by the port
     // capture afterwards.
-    tracing::info!(target: SERVER_LOGGER, "Started server process [{}]", std::process::id());
-    tracing::info!(target: SERVER_LOGGER, "Waiting for application startup.");
+    tracing::info!(target: LogTarget::SERVER, "Started server process [{}]", std::process::id());
+    tracing::info!(target: LogTarget::SERVER, "Waiting for application startup.");
     let state = lifespan_startup().await;
-    tracing::info!(target: SERVER_LOGGER, "Application startup complete.");
+    tracing::info!(target: LogTarget::SERVER, "Application startup complete.");
 
     let listener = match tokio::net::TcpListener::bind((host, port)).await {
         Ok(listener) => listener,
         Err(e) => {
             tracing::error!(
-                target: SERVER_LOGGER,
+                target: LogTarget::SERVER,
                 "[Errno {}] error while attempting to bind on address ('{}', {}): {}",
                 e.raw_os_error().unwrap_or(0),
                 host,
                 port,
                 e
             );
-            tracing::info!(target: SERVER_LOGGER, "Waiting for application shutdown.");
+            tracing::info!(target: LogTarget::SERVER, "Waiting for application shutdown.");
             lifespan_shutdown(state).await;
-            tracing::info!(target: SERVER_LOGGER, "Application shutdown complete.");
+            tracing::info!(target: LogTarget::SERVER, "Application shutdown complete.");
             return Err(e.into());
         }
     };
@@ -1152,7 +1150,7 @@ pub async fn serve_on(host: &str, port: u16, shutdown: Option<Arc<Notify>>) -> a
         return Err(e.into());
     }
     tracing::info!(
-        target: SERVER_LOGGER,
+        target: LogTarget::SERVER,
         "Smartloop API running on http://{}:{} (Press CTRL+C to quit)",
         host,
         local.port()
@@ -1165,14 +1163,14 @@ pub async fn serve_on(host: &str, port: u16, shutdown: Option<Arc<Notify>>) -> a
         .with_graceful_shutdown(async move {
             let reason = shutdown_signal(shutdown).await;
             *exit_slot.lock() = reason;
-            tracing::info!(target: SERVER_LOGGER, "Shutting down");
+            tracing::info!(target: LogTarget::SERVER, "Shutting down");
         })
         .await;
 
-    tracing::info!(target: SERVER_LOGGER, "Waiting for application shutdown.");
+    tracing::info!(target: LogTarget::SERVER, "Waiting for application shutdown.");
     lifespan_shutdown(state).await;
-    tracing::info!(target: SERVER_LOGGER, "Application shutdown complete.");
-    tracing::info!(target: SERVER_LOGGER, "Finished server process [{}]", std::process::id());
+    tracing::info!(target: LogTarget::SERVER, "Application shutdown complete.");
+    tracing::info!(target: LogTarget::SERVER, "Finished server process [{}]", std::process::id());
     result?;
     let reason = *exit.lock();
     Ok(reason)
@@ -1204,7 +1202,7 @@ pub fn run_server() {
     // Write PID file for tracking
     let pid_file = pid_file_path();
     if let Err(e) = write_pid_file(&pid_file) {
-        tracing::error!(target: LOGGER, "Could not write the PID file: {}", e);
+        tracing::error!(target: LogTarget::SERVER, "Could not write the PID file: {}", e);
     }
 
     let version = APP_SETTINGS.read().version.clone();
@@ -1213,9 +1211,9 @@ pub fn run_server() {
     let settings = api_settings();
     let outcome = runtime().and_then(|rt| rt.block_on(serve(&settings.api_host, settings.api_port)));
     match outcome {
-        Ok(ServeExit::Interrupted) => tracing::info!(target: LOGGER, "Interrupted — server stopped"),
+        Ok(ServeExit::Interrupted) => tracing::info!(target: LogTarget::SERVER, "Interrupted — server stopped"),
         Ok(_) => {}
-        Err(e) => tracing::error!(target: LOGGER, "Server failed: {}", e),
+        Err(e) => tracing::error!(target: LogTarget::SERVER, "Server failed: {}", e),
     }
 
     // Clean up PID and port files on exit
@@ -1263,7 +1261,7 @@ pub fn start_server_foreground(host: &str, port: u16, service: bool) -> anyhow::
                     // and all that is left is to leave, certainly without the
                     // restart-with-backoff below treating a deliberate stop as
                     // something to recover from.
-                    tracing::info!(target: LOGGER, "Interrupted — agent stopped");
+                    tracing::info!(target: LogTarget::SERVER, "Interrupted — agent stopped");
                     break;
                 }
                 Ok(ServeExit::Terminated) => break,
@@ -1272,7 +1270,7 @@ pub fn start_server_foreground(host: &str, port: u16, service: bool) -> anyhow::
                     if !service {
                         return Err(e);
                     }
-                    tracing::error!(target: LOGGER, "Server crashed: {:#}", e);
+                    tracing::error!(target: LogTarget::SERVER, "Server crashed: {:#}", e);
                 }
             }
 
@@ -1291,7 +1289,7 @@ pub fn start_server_foreground(host: &str, port: u16, service: bool) -> anyhow::
             }
 
             tracing::warn!(
-                target: LOGGER,
+                target: LogTarget::SERVER,
                 "Server exited after {:.1}s — restarting in {}s ...",
                 uptime,
                 backoff
