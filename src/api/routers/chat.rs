@@ -699,21 +699,18 @@ const ORCHESTRATION_TIMEOUT_CONTENT: &str = concat!(
     "stopped. This often means the loaded model is ",
     "too small to synthesize the gathered context. ",
     "Try a simpler request, or enable a larger ",
-    "model in **Settings → Models**."
+    "model (`/models` in the terminal, **Settings → Models** in Studio)."
 );
 
 const NO_RESPONSE_GUIDANCE: &str = concat!(
     "**No response generated.**\n\n",
-    "The current model wasn't able to synthesize the ",
-    "fetched content. This usually means the loaded ",
-    "model doesn't have the capabilities needed for ",
-    "document reading or skill-based synthesis.\n\n",
-    "To fix this, open **Settings → Models** and enable ",
-    "a model tagged with **DP** (document processing) or ",
-    "**skills** capability. Larger knowledge-capable ",
-    "models handle URL fetches, document Q&A, and ",
-    "long-context summaries much more reliably than ",
-    "the small default router model."
+    "The model answered with nothing, twice. Either it ",
+    "ran out of room before the answer began, or it ",
+    "can't work from the gathered content.\n\n",
+    "Try again, or a simpler request; or enable a larger ",
+    "model, one tagged **DP** (document processing) or ",
+    "**coding** for code (`/models` in the terminal, ",
+    "**Settings → Models** in Studio)."
 );
 
 // ---------------------------------------------------------------- small utils

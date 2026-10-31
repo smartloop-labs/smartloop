@@ -3725,6 +3725,10 @@ impl ModelService {
         let Some(cwd) = non_empty(cwd) else {
             return WriteOutcome::default();
         };
+        // No answer came: there's nothing of the user's to save.
+        if llm_response.trim_start().starts_with("**No response generated.**") {
+            return WriteOutcome::default();
+        }
         let cwd = PathBuf::from(expand_home(cwd));
         let mut content_to_write = llm_response.to_string();
 

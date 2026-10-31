@@ -33,6 +33,12 @@ pub const DEFAULT_CONTEXT_LENGTH: usize = 32_768;
 /// the ones measured spent 50-350 tokens before answering a short prompt.
 pub const DEFAULT_REASONING_BUDGET_TOKENS: usize = 1024;
 
+/// Room an answer gets when the caller caps nothing: enough for a reply
+/// that gives files back whole. Without a cap the endpoint applies its own,
+/// which a long answer, or the reasoning before it, runs through with
+/// nothing to show.
+pub const DEFAULT_ANSWER_TOKENS: usize = 16_384;
+
 const CHAT_PATH: &str = "/v1/chat/completions";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Whole-request budget, streamed body included: long enough for a long
@@ -156,8 +162,11 @@ impl CloudLLM {
     /// The `max_tokens` to send for a caller's cap.  The cap sizes the
     /// answer; the model's reasoning comes on top, or a short cap is spent
     /// thinking and the answer comes back empty.
+    /// The cap sent with a request: the caller's, or `DEFAULT_ANSWER_TOKENS`
+    /// when it sets none, so the endpoint's own default never cuts an
+    /// answer short; the reasoning budget on top either way.
     fn request_max_tokens(&self, options: CallOptions) -> Option<usize> {
-        options.max_tokens.map(|cap| cap + self.reasoning_budget_tokens)
+        Some(options.max_tokens.unwrap_or(DEFAULT_ANSWER_TOKENS) + self.reasoning_budget_tokens)
     }
 
     fn body(&self, messages: &[ChatMessage], stream: bool, max_tokens: Option<usize>) -> Value {

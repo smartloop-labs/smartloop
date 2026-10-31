@@ -10,9 +10,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use smartloop::llms::base_llm::{BaseLLM, CallOptions};
-use smartloop::llms::cloud_llm::{
-    credentials_allowed, describe_failure, CloudLLM, DEFAULT_CONTEXT_LENGTH, DEFAULT_REASONING_BUDGET_TOKENS,
-};
+use smartloop::llms::cloud_llm::{DEFAULT_ANSWER_TOKENS, credentials_allowed, describe_failure, CloudLLM, DEFAULT_CONTEXT_LENGTH, DEFAULT_REASONING_BUDGET_TOKENS,};
 use smartloop::platform::client::{AuthHeadersFn, Headers};
 
 use crate::shared::workspace_support::EnvGuard;
@@ -144,7 +142,7 @@ async fn test_the_catalog_reasoning_budget_replaces_the_default() {
 
 #[tokio::test]
 #[serial]
-async fn test_an_uncapped_request_stays_uncapped() {
+async fn test_an_uncapped_request_gets_the_default_cap() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -158,8 +156,10 @@ async fn test_an_uncapped_request_stays_uncapped() {
 
     tokio::task::spawn_blocking(move || llm.call(PROMPT, None, CallOptions::default())).await.unwrap().unwrap();
 
+    // The endpoint's own default would cut a long answer short, so the
+    // request carries room for one, and the reasoning on top.
     let sent: Value = server.received_requests().await.unwrap()[0].body_json().unwrap();
-    assert!(sent.get("max_tokens").is_none());
+    assert_eq!(sent["max_tokens"], DEFAULT_ANSWER_TOKENS + DEFAULT_REASONING_BUDGET_TOKENS);
 }
 
 #[tokio::test]
@@ -364,7 +364,7 @@ async fn test_an_answer_still_truncated_comes_back_empty() {
 
 #[tokio::test]
 #[serial]
-async fn test_an_uncapped_answer_is_not_retried() {
+async fn test_an_uncapped_answer_cut_off_is_retried_with_more_room() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).respond_with(answer("Long answer", "length")).mount(&server).await;
     let (llm, _env) = llm(&server, Some(bearer("t")));
@@ -372,6 +372,11 @@ async fn test_an_uncapped_answer_is_not_retried() {
 
     let reply = tokio::task::spawn_blocking(move || llm.call(PROMPT, None, CallOptions::default())).await.unwrap().unwrap();
 
-    assert_eq!(reply, "Long answer");
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    // Cut off at the default cap, it's asked again with twice the room; cut
+    // off there too, the truncated answer is discarded, as a capped one is.
+    assert_eq!(reply, "");
+    let sent = server.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 2);
+    let second: Value = sent[1].body_json().unwrap();
+    assert_eq!(second["max_tokens"], (DEFAULT_ANSWER_TOKENS + DEFAULT_REASONING_BUDGET_TOKENS) * 2);
 }
