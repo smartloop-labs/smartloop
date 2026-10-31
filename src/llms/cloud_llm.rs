@@ -13,7 +13,16 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::io::{BufRead, BufReader};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+
+/// The most tokens one answer may have at each endpoint and model, as the
+/// endpoint said when a request asked for more ("max_tokens is at most
+/// N"), kept for the process: a client is made anew for each answer.
+static ANSWER_CAPS: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -107,10 +116,6 @@ pub struct CloudLLM {
     model_name: String,
     context_length: usize,
     reasoning_budget_tokens: usize,
-    /// The most tokens one answer may have, as the endpoint said when a
-    /// request asked for more ("max_tokens is at most N"); 0 until then.
-    /// Not the context window: that's `context_length`.
-    output_cap: AtomicUsize,
     client: SLPPlatformClient,
     send_credentials: bool,
     cancelled: RwLock<Option<CancelEvent>>,
@@ -141,7 +146,6 @@ impl CloudLLM {
             model_name: model_name.to_string(),
             context_length: context_length.map(|n| n as usize).filter(|n| *n > 0).unwrap_or(DEFAULT_CONTEXT_LENGTH),
             reasoning_budget_tokens: DEFAULT_REASONING_BUDGET_TOKENS,
-            output_cap: AtomicUsize::new(0),
             client: SLPPlatformClient::with_hooks(url, auth_headers_fn, refresh_fn),
             send_credentials,
             cancelled: RwLock::new(None),
@@ -176,11 +180,16 @@ impl CloudLLM {
     }
 
     /// `tokens`, or the endpoint's answer cap when that's known and less.
+    /// Not the context window: that's `context_length`.
     fn within_cap(&self, tokens: usize) -> usize {
-        match self.output_cap.load(Ordering::Relaxed) {
-            0 => tokens,
-            cap => tokens.min(cap),
+        match ANSWER_CAPS.lock().get(&self.cap_key()) {
+            Some(cap) => tokens.min(*cap),
+            None => tokens,
         }
+    }
+
+    fn cap_key(&self) -> String {
+        format!("{}|{}", self.client.base_url(), self.model_name)
     }
 
     /// The answer cap an endpoint's refusal names ("max_tokens is at most
@@ -279,7 +288,7 @@ impl CloudLLM {
                 && cap < asked
             {
                 tracing::info!(target: LOG_TARGET, "[cloud] {} allows {cap} answer tokens; asking for that", self.model_name);
-                self.output_cap.store(cap, Ordering::Relaxed);
+                ANSWER_CAPS.lock().insert(self.cap_key(), cap);
                 body["max_tokens"] = json!(cap);
                 continue;
             }
@@ -379,6 +388,9 @@ impl BaseLLM for CloudLLM {
             Err(message) => std::panic::panic_any(message),
         };
         let mut lines = BufReader::new(response).lines();
+        // Characters of answer and of reasoning seen, to say where the
+        // room went when the stream is cut off.
+        let (mut answered, mut reasoned) = (0usize, 0usize);
         Box::new(std::iter::from_fn(move || loop {
             if self.is_cancelled() {
                 return None;
@@ -395,13 +407,24 @@ impl BaseLLM for CloudLLM {
                 return None;
             }
             let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+            reasoned += chunk
+                .pointer("/choices/0/delta/reasoning_content")
+                .and_then(Value::as_str)
+                .map_or(0, |s| s.chars().count());
             // Text already streamed can't be taken back, so a cut-off stream
-            // is only reported.
+            // is only reported, with where the room went.
             if chunk.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length") {
-                tracing::warn!(target: LOG_TARGET, "[cloud] {} stream was cut off at its token limit", self.model_name);
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "[cloud] {} stream was cut off at its token limit ({answered} chars of answer, {reasoned} of reasoning)",
+                    self.model_name
+                );
             }
             match chunk_text(&chunk) {
-                Ok(Some(text)) => return Some(GenerationChunk { text }),
+                Ok(Some(text)) => {
+                    answered += text.chars().count();
+                    return Some(GenerationChunk { text });
+                }
                 Ok(None) => continue,
                 Err(message) => std::panic::panic_any(message),
             }

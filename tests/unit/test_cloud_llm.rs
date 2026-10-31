@@ -394,8 +394,10 @@ async fn test_an_answer_cap_the_endpoint_names_is_learned() {
         .mount(&server)
         .await;
     Mock::given(method("POST")).respond_with(answer("ok", "stop")).mount(&server).await;
-    let (llm, _env) = llm(&server, Some(bearer("t")));
-    let llm = Arc::new(llm);
+    // Its own model name: a learned cap is kept for the process by endpoint
+    // and model, and a mock server's port can come round again.
+    let _env = EnvGuard::set("SLP_API_BASE", server.uri());
+    let llm = Arc::new(CloudLLM::with_hooks("p1", "minimax-m3", &server.uri(), Some(8192), Some(bearer("t")), Some(Arc::new(|| false))));
 
     let first = llm.clone();
     let reply = tokio::task::spawn_blocking(move || first.call(PROMPT, None, CallOptions::default())).await.unwrap().unwrap();
