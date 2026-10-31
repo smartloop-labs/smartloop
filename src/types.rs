@@ -117,8 +117,6 @@ pub enum ModelCapability {
     Dp,
     /// `"vision"`
     Vision,
-    /// `"coding"`
-    Coding,
     /// `"thinking"` — the chat template reads `enable_thinking`.  Not a
     /// routing target.
     Thinking,
@@ -126,12 +124,11 @@ pub enum ModelCapability {
 
 impl ModelCapability {
     /// All capabilities in declaration order.
-    pub const ALL: [ModelCapability; 6] = [
+    pub const ALL: [ModelCapability; 5] = [
         ModelCapability::General,
         ModelCapability::Reasoning,
         ModelCapability::Dp,
         ModelCapability::Vision,
-        ModelCapability::Coding,
         ModelCapability::Thinking,
     ];
 
@@ -142,7 +139,6 @@ impl ModelCapability {
             ModelCapability::Reasoning => "reasoning",
             ModelCapability::Dp => "dp",
             ModelCapability::Vision => "vision",
-            ModelCapability::Coding => "coding",
             ModelCapability::Thinking => "thinking",
         }
     }
@@ -154,10 +150,13 @@ impl ModelCapability {
         if let Some(c) = Self::ALL.iter().find(|c| c.value() == value) {
             return Some(*c);
         }
-        if value.trim().to_lowercase() == "skills" {
-            return Some(ModelCapability::Reasoning);
+        match value.trim().to_lowercase().as_str() {
+            "skills" => Some(ModelCapability::Reasoning),
+            // Code is a document: reading and writing it is document
+            // processing, so a model tagged for coding is a `dp` model.
+            "coding" => Some(ModelCapability::Dp),
+            _ => None,
         }
-        None
     }
 }
 

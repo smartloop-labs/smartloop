@@ -55,7 +55,7 @@ fn test_details_follow_the_catalog_not_the_registration() {
 
     assert_eq!(ws.models.len(), 1);
     assert_eq!(again.url().as_deref(), Some("https://api.smartloop.ai"));
-    assert_eq!(again.effective_capabilities(), caps(&["coding"]));
+    assert_eq!(again.effective_capabilities(), caps(&["dp"]));
     // Re-adding keeps the user's enabled choice.
     assert!(!again.enabled);
 }
@@ -156,7 +156,7 @@ fn test_a_capability_only_remote_models_declare_ranks_them() {
     remote_spec("remote-coder", json!({"capabilities": ["general", "coding"]}));
     let mut ws = workspace();
     ws.add_remote_model("remote-coder", true);
-    assert_eq!(ranked_names(&ws, "coding"), vec!["remote-coder"]);
+    assert_eq!(ranked_names(&ws, "dp"), vec!["remote-coder"]);
 }
 
 #[test]

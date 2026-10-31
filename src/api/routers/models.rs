@@ -930,7 +930,7 @@ pub struct UpdateWorkspaceModelRequest {
     #[serde(default)]
     pub thinking: Option<bool>,
     /// The model's capabilities as set here, over the catalog's and what
-    /// its name says, for routing: `["general", "coding"]`. An empty list
+    /// its name says, for routing: `["general", "dp"]`. An empty list
     /// takes the override off.
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,

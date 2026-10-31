@@ -186,7 +186,7 @@ mod test_list_models {
         let body = resp.json();
         let remote = &body[0];
         assert_eq!(remote["type"], "remote");
-        assert_eq!(remote["capabilities"], json!(["general", "coding"]));
+        assert_eq!(remote["capabilities"], json!(["general", "dp"]));
         assert_eq!(remote["context_length"], 131072);
         assert_eq!(remote["access_level"], "free_login");
     }

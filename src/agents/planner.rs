@@ -612,8 +612,8 @@ impl Planner {
     ///
     /// Priority:
     ///   1. `vision`    — attachments imply image/document OCR work.
-    ///   2. `coding`    — programming work, which a coding model writes
-    ///      better than a skill or document model does.
+    ///   2. `dp`        — programming work: code is a document, read and
+    ///      written by the document-processing model, ahead of a skill.
     ///   3. `reasoning` — a matched skill defines the procedure to run.
     ///   4. `dp`        — indexed document context: data-processing model.
     ///   5. `general`   — default for open-ended chat / general answers.
@@ -629,7 +629,7 @@ impl Planner {
     ) -> Option<String> {
         let priority = [
             (ModelCapability::Vision, has_attachments),
-            (ModelCapability::Coding, has_coding_intent),
+            (ModelCapability::Dp, has_coding_intent),
             (ModelCapability::Reasoning, has_matched_skills),
             (ModelCapability::Dp, has_document_context),
             (ModelCapability::General, true),

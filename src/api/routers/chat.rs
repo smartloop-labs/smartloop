@@ -114,8 +114,10 @@ pub struct OrchestrateOutcome {
     pub skill_instruction: Option<String>,
     /// Stream `context` verbatim instead of running it through another LLM.
     pub mutation: bool,
-    /// What the planner classified the request as (e.g. coding), if it ran.
+    /// What the planner classified the request as (e.g. dp), if it ran.
     pub capability: Option<String>,
+    /// Whether the planner read the request as programming work.
+    pub coding: bool,
 }
 
 /// The subset of `ModelService` the chat router uses.
@@ -273,7 +275,7 @@ impl ChatService for ModelService {
                 Value::Object(obj)
             })
             .collect();
-        let (context, matched, error, citations, skill_instruction, mutation, capability) =
+        let (context, matched, error, citations, skill_instruction, mutation, capability, coding) =
             ModelService::orchestrate(
                 self,
                 &args.user_message,
@@ -295,7 +297,7 @@ impl ChatService for ModelService {
                 })
                 .collect()
         });
-        Ok(OrchestrateOutcome { context, matched, error, citations, skill_instruction, mutation, capability })
+        Ok(OrchestrateOutcome { context, matched, error, citations, skill_instruction, mutation, capability, coding })
     }
     fn get_project_id(&self) -> Option<String> {
         ModelService::get_project_id(self)
@@ -708,8 +710,8 @@ const NO_RESPONSE_GUIDANCE: &str = concat!(
     "ran out of room before the answer began, or it ",
     "can't work from the gathered content.\n\n",
     "Try again, or a simpler request; or enable a larger ",
-    "model, one tagged **DP** (document processing) or ",
-    "**coding** for code (`/models` in the terminal, ",
+    "model, one tagged **DP** (document processing), which ",
+    "reads and writes code too (`/models` in the terminal, ",
     "**Settings → Models** in Studio)."
 );
 
@@ -725,9 +727,13 @@ fn truthy(s: &Option<String>) -> bool {
 /// gathered context goes to the best `general` model, and a bare chat stays on
 /// the default model.  The planner's other picks (`dp`, `vision`, …) choose
 /// the model for its steps, not for the answer.
-pub fn response_capability(context: &Option<String>, classified: Option<&str>) -> Option<ModelCapability> {
-    if classified == Some(ModelCapability::Coding.value()) {
-        Some(ModelCapability::Coding)
+/// The model the answer is written on: programming work goes to the
+/// document-processing model, which reads and writes code, with or without
+/// gathered context; anything with context is answered on the general
+/// model; a bare chat on the default.
+pub fn response_capability(context: &Option<String>, coding: bool) -> Option<ModelCapability> {
+    if coding {
+        Some(ModelCapability::Dp)
     } else if truthy(context) {
         Some(ModelCapability::General)
     } else {
@@ -2634,7 +2640,7 @@ fn stream_chunks_inner(
 
         // Orchestrator handles vector search, MCP tools, and explore in one step
         let mut orchestrator_context: Option<String> = None;
-        let mut classified_capability: Option<String> = None;
+        let mut classified_coding = false;
         let mut citations: Option<Vec<CitationDict>> = None;
         let mut is_mutation = false;
         if truthy(&last_user_msg) {
@@ -2753,7 +2759,7 @@ fn stream_chunks_inner(
                 }
             };
             orchestrator_context = outcome.context;
-            classified_capability = outcome.capability;
+            classified_coding = outcome.coding;
             citations = outcome.citations;
             is_mutation = outcome.mutation;
             let tool_error = outcome.error;
@@ -2835,7 +2841,7 @@ fn stream_chunks_inner(
         // Size the context against the model that will actually consume it —
         // otherwise web/document context overflows the response model and the
         // search content never reaches the LLM.
-        let response_capability = response_capability(&orchestrator_context, classified_capability.as_deref());
+        let response_capability = response_capability(&orchestrator_context, classified_coding);
 
         // The response model is resolved by the call below, and resolving it
         // can mean loading a model.  It reports through ModelRouter like every
@@ -3422,7 +3428,7 @@ async fn complete_body(
 
     // Orchestrator handles vector search, MCP tools, and explore in one step
     let mut orchestrator_context: Option<String> = None;
-    let mut classified_capability: Option<String> = None;
+    let mut classified_coding = false;
     let mut tool_error: Option<String> = None;
     let mut citations: Option<Vec<CitationDict>> = None;
     let mut is_mutation = false;
@@ -3439,7 +3445,7 @@ async fn complete_body(
         let orchestrate_svc = svc.clone();
         let outcome = run_on_executor(move || orchestrate_svc.orchestrate(args)).await??;
         orchestrator_context = outcome.context;
-        classified_capability = outcome.capability;
+        classified_coding = outcome.coding;
         tool_error = outcome.error;
         citations = outcome.citations;
         is_mutation = outcome.mutation;
@@ -3516,7 +3522,7 @@ async fn complete_body(
     // A stream has chunks to reset the budget, so it only ever measures
     // silence; a non-streaming call has no progress signal at all, so the same
     // number necessarily bounds the whole generation.
-    let response_capability = response_capability(&orchestrator_context, classified_capability.as_deref());
+    let response_capability = response_capability(&orchestrator_context, classified_coding);
     let stall_timeout = AppSettings::new().stream_stall_timeout_s;
     let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<String>>();
     let generate_svc = svc.clone();

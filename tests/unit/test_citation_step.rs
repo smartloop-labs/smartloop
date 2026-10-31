@@ -208,6 +208,7 @@ impl ChatService for FakeService {
             skill_instruction: None,
             mutation: false,
             capability: None,
+            coding: false,
         })
     }
     fn get_project_id(&self) -> Option<String> {

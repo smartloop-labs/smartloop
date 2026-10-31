@@ -644,6 +644,7 @@ impl PipelineBuilder {
             );
         }
         ctx.write().request_capability = classification.capability.clone();
+        ctx.write().request_coding = classification.has_coding_intent;
 
         let plan_context = self.planner.build_context(
             &c.user_message,

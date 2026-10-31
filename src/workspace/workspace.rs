@@ -866,8 +866,9 @@ impl WorkspaceModel {
 
         caps.push(ModelCapability::General.value().to_string());
 
+        // A model made for code reads and writes documents: code is one.
         if ["code", "coder", "starcoder", "deepseek-coder"].iter().any(|kw| combined.contains(kw)) {
-            caps.push(ModelCapability::Coding.value().to_string());
+            caps.push(ModelCapability::Dp.value().to_string());
         }
 
         // Vision is inferred only from an explicit vision marker in the name
@@ -883,7 +884,9 @@ impl WorkspaceModel {
             // reasoning (skill matching, MCP tool resolution, planning) and
             // document processing.
             caps.push(ModelCapability::Reasoning.value().to_string());
-            caps.push(ModelCapability::Dp.value().to_string());
+            if !caps.iter().any(|c| c == ModelCapability::Dp.value()) {
+                caps.push(ModelCapability::Dp.value().to_string());
+            }
         }
 
         caps

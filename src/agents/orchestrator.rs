@@ -411,6 +411,7 @@ impl SLPOrchestrator {
             let results = self.run(&ctx, &mut dag, &mut handlers);
             let mut result = self.reason(&ctx, &results);
             result.capability = ctx.read().request_capability.clone();
+            result.coding = ctx.read().request_coding;
             Ok(result)
         };
         match std::panic::catch_unwind(AssertUnwindSafe(attempt)) {

@@ -43,6 +43,7 @@ where
         skill_instruction: None,
         mutation: false,
         capability: None,
+        coding: false,
     };
     *svc.workspace_dir.lock() = Some("/tmp/ws".to_string());
     Arc::new(svc)

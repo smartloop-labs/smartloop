@@ -83,6 +83,8 @@ pub type OrchestrateOutcome = (
     Option<String>,
     bool,
     Option<String>,
+    // Whether the planner read the request as programming work.
+    bool,
 );
 
 /// Signals that an image-attachment request wants to *use* indexed documents
@@ -3332,7 +3334,7 @@ impl ModelService {
         requested_skill: Option<&str>,
         current_date: Option<&str>,
     ) -> OrchestrateOutcome {
-        let none: OrchestrateOutcome = (None, false, None, None, None, false, None);
+        let none: OrchestrateOutcome = (None, false, None, None, None, false, None, false);
         tracing::info!(target: LOG, "[orchestrator] entered orchestrate: {:?}", prefix_chars(user_message, 120));
 
         // A missing handle is recoverable when the weights are the host's —
@@ -3459,7 +3461,7 @@ impl ModelService {
         let Some(current_project) = model.workspace.read().current_project().cloned() else {
             if let Some(perception) = image_perception.clone() {
                 tracing::info!(target: LOG, "[orchestrator] no current project — streaming image perception directly.");
-                return (Some(perception), true, None, None, None, true, None);
+                return (Some(perception), true, None, None, None, true, None, false);
             }
             tracing::warn!(target: LOG, "[orchestrator] BYPASSED — no current project. Falling back to raw stream_completion.");
             return none;
@@ -3661,15 +3663,15 @@ impl ModelService {
                 // No tool handled it, but a perceived image's description must
                 // still reach the final response as context.
                 if image_perception.is_some() {
-                    return Ok((with_image_context(None), true, None, None, None, false, result.capability));
+                    return Ok((with_image_context(None), true, None, None, None, false, result.capability, result.coding));
                 }
-                return Ok((None, false, None, None, None, false, result.capability));
+                return Ok((None, false, None, None, None, false, result.capability, result.coding));
             }
 
             if let Some(error) = result.error.as_ref().filter(|e| !e.is_empty()) {
                 let tool = result.tool_name.clone().unwrap_or_else(|| "None".into());
                 tracing::warn!(target: LOG, "Tool call failed ({tool}): {error}");
-                return Ok((None, true, Some(format!("Tool '{tool}' failed: {error}")), None, None, false, None));
+                return Ok((None, true, Some(format!("Tool '{tool}' failed: {error}")), None, None, false, None, false));
             }
 
             if let Some(content) = result.content.as_ref().filter(|c| !c.is_empty()) {
@@ -3690,10 +3692,11 @@ impl ModelService {
                     result.skill_instruction.clone(),
                     result.mutation,
                     result.capability,
+                    result.coding,
                 ));
             }
 
-            Ok((with_image_context(None), true, None, None, result.skill_instruction.clone(), false, result.capability))
+            Ok((with_image_context(None), true, None, None, result.skill_instruction.clone(), false, result.capability, result.coding))
         }));
 
         let failure = match run {
@@ -3702,7 +3705,7 @@ impl ModelService {
             Err(panic) => panic_message(&panic),
         };
         tracing::warn!(target: LOG, "Tool call attempt failed: {failure}");
-        (None, true, Some(format!("Tool call failed: {failure}")), None, None, false, None)
+        (None, true, Some(format!("Tool call failed: {failure}")), None, None, false, None, false)
     }
 
     // --------------------------------------------------------------- auto-write

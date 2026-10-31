@@ -5,7 +5,7 @@ use smartloop::model::spec::{seed_specs, CatalogModel, ModelRegistry, ModelSpec}
 use smartloop::platform::client::JsonObject;
 use smartloop::types::{Attention, ModelCapability, ModelKind, ModelType};
 
-use ModelCapability::{Coding, Dp, General, Reasoning, Thinking, Vision};
+use ModelCapability::{Dp, General, Reasoning, Thinking, Vision};
 
 fn row(value: Value) -> CatalogModel {
     let Value::Object(obj) = value else { panic!("row must be an object") };
@@ -146,7 +146,8 @@ fn test_a_remote_model_carries_size_and_endpoint() {
     assert_eq!(spec.context_length, Some(1048576));
     assert_eq!(spec.param_size_b, 355.0);
     assert!(spec.param_size_estimated);
-    assert_eq!(spec.capabilities, vec![General, Coding]);
+    // A catalog row's "coding" is document processing: code is a document.
+    assert_eq!(spec.capabilities, vec![General, Dp]);
     // No weights, so nothing resolves by an empty id.
     assert!(registry.get_by_id("").is_none());
 }

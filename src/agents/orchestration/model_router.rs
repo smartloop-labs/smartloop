@@ -104,7 +104,6 @@ pub const CAPABILITY_LABELS: &[(&str, &str)] = &[
     ("reasoning", "reasoning"),
     ("dp", "document processing"),
     ("vision", "vision"),
-    ("coding", "coding"),
     ("thinking", "thinking"),
 ];
 

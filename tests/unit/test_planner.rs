@@ -436,38 +436,39 @@ fn test_detect_signals_coding_intent() {
     }
 }
 
-/// Coding outranks skills and documents, but not attachments, and only
-/// when a selected model declares it.
+/// Coding work goes to the document-processing model, ahead of a skill,
+/// but not of attachments, and only when a selected model declares `dp`.
 #[test]
-fn test_match_capability_coding_priority() {
-    let all: Vec<String> =
-        ["general", "reasoning", "dp", "vision", "coding"].iter().map(|s| s.to_string()).collect();
-    assert_eq!(Planner::match_capability(&all, false, true, true, true).as_deref(), Some("coding"));
+fn test_match_capability_coding_goes_to_document_processing() {
+    let all: Vec<String> = ["general", "reasoning", "dp", "vision"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(Planner::match_capability(&all, false, true, true, true).as_deref(), Some("dp"));
     assert_eq!(Planner::match_capability(&all, true, true, true, true).as_deref(), Some("vision"));
     assert_eq!(Planner::match_capability(&all, false, false, true, true).as_deref(), Some("reasoning"));
 
-    let no_coding: Vec<String> = ["general", "dp"].iter().map(|s| s.to_string()).collect();
-    assert_eq!(Planner::match_capability(&no_coding, false, true, false, true).as_deref(), Some("dp"));
+    let no_dp: Vec<String> = ["general", "reasoning"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(Planner::match_capability(&no_dp, false, true, true, false).as_deref(), Some("reasoning"));
+    assert_eq!(Planner::match_capability(&no_dp, false, true, false, false).as_deref(), Some("general"));
 }
 
-/// A coding conversation plans one LARGE step on the coding model.
+/// A coding conversation plans one LARGE step on the document-processing
+/// model.
 #[test]
-fn test_classify_coding_conversation_routes_to_coding() {
+fn test_classify_coding_conversation_routes_to_document_processing() {
     let planner = planner();
     let result = planner.classify(
         "refactor this function to use iterators",
         &[],
         ClassifyOptions {
-            available_capabilities: Some(vec!["general".into(), "coding".into()]),
+            available_capabilities: Some(vec!["general".into(), "dp".into()]),
             ..Default::default()
         },
     );
     assert!(result.has_coding_intent);
-    assert_eq!(result.capability.as_deref(), Some("coding"));
+    assert_eq!(result.capability.as_deref(), Some("dp"));
     let plan = planner.create_plan(&result, &ctx("refactor this function to use iterators"), None);
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(plan.steps[0].model_tier, ModelTier::Large);
-    assert_eq!(plan.steps[0].capability.as_deref(), Some("coding"));
+    assert_eq!(plan.steps[0].capability.as_deref(), Some("dp"));
 }
 
 // ------------------------------------------------------------------ //

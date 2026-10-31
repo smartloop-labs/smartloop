@@ -11,25 +11,19 @@ fn context(text: &str) -> Option<String> {
 }
 
 #[test]
-fn a_coding_request_is_answered_on_coding() {
-    assert_eq!(response_capability(&context("TOOL RESULTS: fn main() {}"), Some("coding")), Some(ModelCapability::Coding));
+fn a_coding_request_is_answered_on_document_processing() {
+    assert_eq!(response_capability(&context("TOOL RESULTS: fn main() {}"), true), Some(ModelCapability::Dp));
+    assert_eq!(response_capability(&None, true), Some(ModelCapability::Dp));
+    assert_eq!(response_capability(&context(""), true), Some(ModelCapability::Dp));
 }
 
 #[test]
-fn a_coding_request_without_context_is_still_answered_on_coding() {
-    assert_eq!(response_capability(&None, Some("coding")), Some(ModelCapability::Coding));
-    assert_eq!(response_capability(&context(""), Some("coding")), Some(ModelCapability::Coding));
-}
-
-#[test]
-fn other_picks_with_context_are_answered_on_general() {
-    for classified in [Some("dp"), Some("vision"), Some("reasoning"), Some("general"), None] {
-        assert_eq!(response_capability(&context("DOCUMENT CONTEXT"), classified), Some(ModelCapability::General));
-    }
+fn other_requests_with_context_are_answered_on_general() {
+    assert_eq!(response_capability(&context("DOCUMENT CONTEXT"), false), Some(ModelCapability::General));
 }
 
 #[test]
 fn a_bare_chat_stays_on_the_default_model() {
-    assert_eq!(response_capability(&None, Some("dp")), None);
-    assert_eq!(response_capability(&context(""), None), None);
+    assert_eq!(response_capability(&None, false), None);
+    assert_eq!(response_capability(&context(""), false), None);
 }

@@ -76,7 +76,7 @@ fn test_a_tagged_small_step_gets_the_capability_model() {
     let cap_llm = named_llm("Gemma 3n E2B").as_llm();
     let (router, agent_llm) = router_for(Some(cap_llm.clone()));
 
-    let resolved = router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Coding.value()), None);
+    let resolved = router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Dp.value()), None);
 
     assert!(same_llm(&resolved, &cap_llm));
     assert!(!same_llm(&resolved, &agent_llm));
@@ -94,7 +94,7 @@ fn test_an_untagged_small_step_still_gets_the_agent_model() {
 fn test_it_falls_back_when_the_capability_model_will_not_load() {
     let (router, agent_llm) = router_for(None);
 
-    let resolved = router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Coding.value()), None);
+    let resolved = router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Dp.value()), None);
 
     assert!(same_llm(&resolved, &agent_llm));
 }
