@@ -727,12 +727,13 @@ fn truthy(s: &Option<String>) -> bool {
 /// gathered context goes to the best `general` model, and a bare chat stays on
 /// the default model.  The planner's other picks (`dp`, `vision`, …) choose
 /// the model for its steps, not for the answer.
-/// The model the answer is written on: programming work goes to the
-/// document-processing model, which reads and writes code, with or without
-/// gathered context; anything with context is answered on the general
+/// The model the answer is written on: document-processing work, which
+/// is programming work too, goes to the `dp` model, with or without
+/// gathered context, when the planner `classified` the request so or read
+/// it as `coding`; anything else with context is answered on the general
 /// model; a bare chat on the default.
-pub fn response_capability(context: &Option<String>, coding: bool) -> Option<ModelCapability> {
-    if coding {
+pub fn response_capability(context: &Option<String>, classified: Option<&str>, coding: bool) -> Option<ModelCapability> {
+    if coding || classified == Some(ModelCapability::Dp.value()) {
         Some(ModelCapability::Dp)
     } else if truthy(context) {
         Some(ModelCapability::General)
@@ -2640,6 +2641,7 @@ fn stream_chunks_inner(
 
         // Orchestrator handles vector search, MCP tools, and explore in one step
         let mut orchestrator_context: Option<String> = None;
+        let mut classified_capability: Option<String> = None;
         let mut classified_coding = false;
         let mut citations: Option<Vec<CitationDict>> = None;
         let mut is_mutation = false;
@@ -2759,6 +2761,7 @@ fn stream_chunks_inner(
                 }
             };
             orchestrator_context = outcome.context;
+            classified_capability = outcome.capability;
             classified_coding = outcome.coding;
             citations = outcome.citations;
             is_mutation = outcome.mutation;
@@ -2841,10 +2844,11 @@ fn stream_chunks_inner(
         // Size the context against the model that will actually consume it —
         // otherwise web/document context overflows the response model and the
         // search content never reaches the LLM.
-        let response_capability = response_capability(&orchestrator_context, classified_coding);
+        let response_capability = response_capability(&orchestrator_context, classified_capability.as_deref(), classified_coding);
         tracing::info!(
             target: LOG_TARGET,
-            "[response] coding={} context={} → capability {}",
+            "[response] classified={:?} coding={} context={} → capability {}",
+            classified_capability,
             classified_coding,
             truthy(&orchestrator_context),
             response_capability.map_or("default", |c| c.value())
@@ -3435,6 +3439,7 @@ async fn complete_body(
 
     // Orchestrator handles vector search, MCP tools, and explore in one step
     let mut orchestrator_context: Option<String> = None;
+    let mut classified_capability: Option<String> = None;
     let mut classified_coding = false;
     let mut tool_error: Option<String> = None;
     let mut citations: Option<Vec<CitationDict>> = None;
@@ -3452,6 +3457,7 @@ async fn complete_body(
         let orchestrate_svc = svc.clone();
         let outcome = run_on_executor(move || orchestrate_svc.orchestrate(args)).await??;
         orchestrator_context = outcome.context;
+        classified_capability = outcome.capability;
         classified_coding = outcome.coding;
         tool_error = outcome.error;
         citations = outcome.citations;
@@ -3529,10 +3535,11 @@ async fn complete_body(
     // A stream has chunks to reset the budget, so it only ever measures
     // silence; a non-streaming call has no progress signal at all, so the same
     // number necessarily bounds the whole generation.
-    let response_capability = response_capability(&orchestrator_context, classified_coding);
+    let response_capability = response_capability(&orchestrator_context, classified_capability.as_deref(), classified_coding);
     tracing::info!(
         target: LOG_TARGET,
-        "[response] coding={} context={} → capability {}",
+        "[response] classified={:?} coding={} context={} → capability {}",
+        classified_capability,
         classified_coding,
         truthy(&orchestrator_context),
         response_capability.map_or("default", |c| c.value())
