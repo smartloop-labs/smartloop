@@ -2842,6 +2842,13 @@ fn stream_chunks_inner(
         // otherwise web/document context overflows the response model and the
         // search content never reaches the LLM.
         let response_capability = response_capability(&orchestrator_context, classified_coding);
+        tracing::info!(
+            target: LOG_TARGET,
+            "[response] coding={} context={} → capability {}",
+            classified_coding,
+            truthy(&orchestrator_context),
+            response_capability.map_or("default", |c| c.value())
+        );
 
         // The response model is resolved by the call below, and resolving it
         // can mean loading a model.  It reports through ModelRouter like every
@@ -3523,6 +3530,13 @@ async fn complete_body(
     // silence; a non-streaming call has no progress signal at all, so the same
     // number necessarily bounds the whole generation.
     let response_capability = response_capability(&orchestrator_context, classified_coding);
+    tracing::info!(
+        target: LOG_TARGET,
+        "[response] coding={} context={} → capability {}",
+        classified_coding,
+        truthy(&orchestrator_context),
+        response_capability.map_or("default", |c| c.value())
+    );
     let stall_timeout = AppSettings::new().stream_stall_timeout_s;
     let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<String>>();
     let generate_svc = svc.clone();
