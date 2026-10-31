@@ -469,6 +469,9 @@ pub struct ModelEntry {
     pub enabled: bool,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Whether `capabilities` were set here, over the catalog's.
+    #[serde(default)]
+    pub capabilities_overridden: bool,
     /// Reasoning is a per-model setting, not a per-request one: a model the
     /// user switches thinking on for reasons on every call.  `None` for a
     /// model whose capabilities lack "thinking" — the picker shows the toggle
@@ -627,6 +630,7 @@ pub fn list_models_with(
             (Some(ws), Some(ws_model)) => {
                 entry.enabled = ws.effective_model_enabled(&entry.name, project);
                 entry.capabilities = display_capabilities(&ws_model.effective_capabilities());
+                entry.capabilities_overridden = ws_model.capabilities_override.is_some();
                 entry.thinking = ws.effective_model_thinking(&entry.name, project);
             }
             _ => {
@@ -925,7 +929,9 @@ pub struct UpdateWorkspaceModelRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub thinking: Option<bool>,
-    /// Accepted for backward compatibility but ignored.
+    /// The model's capabilities as set here, over the catalog's and what
+    /// its name says, for routing: `["general", "coding"]`. An empty list
+    /// takes the override off.
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
 }
@@ -1049,6 +1055,26 @@ pub async fn update_workspace_model<H: WorkspaceModelHost + ?Sized>(
             // always-resident orchestrator, never).
             model_service.apply_thinking_setting(&model_name);
         }
+        if let Some(capabilities) = request.capabilities {
+            let mut set: Vec<String> = Vec::new();
+            for value in &capabilities {
+                let value = value.trim().to_lowercase();
+                let Some(cap) = ModelCapability::from_value(&value) else {
+                    let known: Vec<&str> = ModelCapability::ALL.iter().map(|c| c.value()).collect();
+                    return Ok(Err(HTTPException::new(
+                        400,
+                        format!("Unknown capability '{value}'; one of {}", known.join(", ")),
+                    )));
+                };
+                if !set.iter().any(|s| *s == cap.value()) {
+                    set.push(cap.value().to_string());
+                }
+            }
+            let mut ws = workspace.write();
+            if let Some(model) = ws.get_model_mut(Some(&model_name)) {
+                model.capabilities_override = (!set.is_empty()).then_some(set);
+            }
+        }
         let ws = workspace.read();
         ws.save()?;
         let model = ws
@@ -1060,6 +1086,7 @@ pub async fn update_workspace_model<H: WorkspaceModelHost + ?Sized>(
             "enabled": model.enabled,
             "thinking": ws.effective_model_thinking(&model_name, None),
             "capabilities": display_capabilities(&model.effective_capabilities()),
+            "capabilities_overridden": model.capabilities_override.is_some(),
         })))
     })();
 

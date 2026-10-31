@@ -685,6 +685,11 @@ pub struct WorkspaceModel {
     pub thinking: Option<bool>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Capabilities set here, over whatever the catalog or the model's
+    /// name says: by `PATCH /v1/models/workspace/{name}`. None reads them
+    /// from the spec as usual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities_override: Option<Vec<String>>,
     #[serde(default)]
     pub config: Option<ModelConfig>,
     /// Remote models run behind their spec's `url` and have no weights on
@@ -706,6 +711,7 @@ impl Default for WorkspaceModel {
             enabled: true,
             thinking: None,
             capabilities: Vec::new(),
+            capabilities_override: None,
             config: None,
             kind: ModelKind::Local,
             models_dir: String::new(),
@@ -835,12 +841,16 @@ impl WorkspaceModel {
 
     /// Capabilities declared by the model's spec — read-only.
     ///
-    /// The stored `capabilities` field is ignored so the spec stays
-    /// authoritative and catalog updates to any model's capabilities take
-    /// effect immediately.  A local model without a spec falls back to
+    /// An override set here wins, for a local or a remote model alike.
+    /// Otherwise the stored `capabilities` field is ignored so the spec
+    /// stays authoritative and catalog updates to any model's capabilities
+    /// take effect immediately.  A local model without a spec falls back to
     /// metadata-inferred capabilities; a remote one, which nothing can be
     /// inferred about, declares none.
     pub fn effective_capabilities(&self) -> Vec<String> {
+        if let Some(set) = &self.capabilities_override {
+            return set.clone();
+        }
         match self.spec() {
             Some(spec) => spec.capability_values(),
             None if self.is_remote() => Vec::new(),

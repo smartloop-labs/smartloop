@@ -93,3 +93,30 @@ async fn test_a_model_that_cannot_reason_is_rejected() {
     assert!(svc.thinking_applied.lock().is_empty());
     assert!(svc.unloaded.lock().is_empty());
 }
+
+/// Capabilities set here win over the catalog's and the model's name, for
+/// a local or a remote model; an empty list takes the override off; a
+/// name the router can't route is refused.
+#[tokio::test]
+async fn capabilities_can_be_set_here_over_the_catalog() {
+    let workspace = workspace();
+    let service = Service::new(workspace.clone());
+    let update = |caps: Vec<&str>| {
+        UpdateWorkspaceModelRequest { capabilities: Some(caps.into_iter().map(str::to_string).collect()), ..Default::default() }
+    };
+    let before = workspace.read().get_model(Some("qwen3.5-2b")).unwrap().effective_capabilities();
+    assert!(!before.iter().any(|c| c == "coding"), "{before:?}");
+
+    let reply = update_workspace_model("qwen3.5-2b", update(vec!["coding", "general", "Coding"]), &service).await.unwrap();
+    assert_eq!(reply["capabilities"], serde_json::json!(["coding", "general"]));
+    assert_eq!(reply["capabilities_overridden"], serde_json::json!(true));
+    assert_eq!(workspace.read().get_model(Some("qwen3.5-2b")).unwrap().effective_capabilities(), ["coding", "general"]);
+
+    let refused = update_workspace_model("qwen3.5-2b", update(vec!["poetry"]), &service).await.unwrap_err();
+    assert_eq!(refused.status_code, 400);
+    assert_eq!(workspace.read().get_model(Some("qwen3.5-2b")).unwrap().effective_capabilities(), ["coding", "general"]);
+
+    let reply = update_workspace_model("qwen3.5-2b", update(vec![]), &service).await.unwrap();
+    assert_eq!(reply["capabilities_overridden"], serde_json::json!(false));
+    assert_eq!(workspace.read().get_model(Some("qwen3.5-2b")).unwrap().effective_capabilities(), before);
+}
