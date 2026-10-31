@@ -75,6 +75,9 @@ pub struct OrchestratorContext {
     /// Whether the planner read the request as programming work, which is
     /// answered on the document-processing model whatever else was found.
     pub request_coding: bool,
+    /// Whether the request brings the files it's about, so the documents
+    /// found for it needn't be extracted from.
+    pub request_carries_files: bool,
     /// The request's cancellation signal, set when the client goes away.
     pub cancelled: Option<CancelEvent>,
 }

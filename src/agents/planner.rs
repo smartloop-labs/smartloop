@@ -282,6 +282,10 @@ pub struct ClassificationResult {
     /// write/grep: it picks the model, not the intent.
     #[serde(default)]
     pub has_coding_intent: bool,
+    /// The request brings the files it's about, as fenced blocks: a
+    /// client that read the project put them in the message, so there's
+    /// nothing to plan, fetch or extract before answering.
+    pub carries_files: bool,
     #[serde(default)]
     pub reasoning: String,
     /// Best-matching model capability for this request (e.g. coding, finance, vision)
@@ -697,6 +701,8 @@ impl Planner {
         // in a code project and the message asks for a change or about the
         // code, as [`IN_PROJECT_RE`] reads it.  A question about a document
         // that happens to sit in a code project stays general.
+        result.carries_files = user_message.matches("```").count() >= 4 && user_message.len() >= 4_000;
+
         let in_project = cwd.filter(|c| !c.is_empty()).is_some_and(is_code_project);
         result.has_coding_intent =
             CODING_RE.is_match(user_message) || (in_project && IN_PROJECT_RE.is_match(user_message));
@@ -710,6 +716,13 @@ impl Planner {
 
     /// Derive intent from detected signals.  Returns `None` when ambiguous.
     pub fn resolve_intent(&self, result: &mut ClassificationResult) -> Option<IntentType> {
+        // Coding work that brings its files is answered outright: a plan,
+        // reads of the paths it names and an extraction pass would only
+        // rebuild, slowly and on smaller models, what the message holds.
+        if result.has_coding_intent && result.carries_files {
+            result.reasoning = "coding work with its files in hand — answering directly".to_string();
+            return Some(IntentType::Conversation);
+        }
         // Build set of active signals
         let mut active: BTreeSet<Signal> = BTreeSet::new();
         if !result.matched_tools.is_empty() {

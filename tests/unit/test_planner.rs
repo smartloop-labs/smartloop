@@ -401,6 +401,24 @@ fn test_detect_signals_coding_intent_from_the_folder_and_the_ask() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Coding work that brings its files, as a client that read the project
+/// sends it, is answered outright: no plan, no reads, no extraction.
+#[test]
+fn test_coding_work_with_its_files_in_hand_is_answered_directly() {
+    let planner = planner();
+    let mut message = String::from("I'm working in the Rust project at /tmp/app. Fix the panic in main.\n\nIts files:\n- src/main.rs\n- src/lib.rs\n\nTheir contents now:\n");
+    for name in ["src/main.rs", "src/lib.rs"] {
+        message.push_str(&format!("\n`{name}`\n```rs\n{}\n```\n", "fn f() {}\n".repeat(300)));
+    }
+    let mut result = planner.detect_signals(&message, &[], None, None, false);
+    assert!(result.has_coding_intent && result.carries_files);
+    assert_eq!(planner.resolve_intent(&mut result), Some(IntentType::Conversation));
+    // The same request without the files plans as before.
+    let mut bare = planner.detect_signals("Fix the panic in src/main.rs", &[], None, None, false);
+    assert!(bare.has_coding_intent && !bare.carries_files);
+    assert_ne!(planner.resolve_intent(&mut bare), Some(IntentType::Conversation));
+}
+
 /// Programming requests raise the coding signal; look-alikes don't.
 #[test]
 fn test_detect_signals_coding_intent() {

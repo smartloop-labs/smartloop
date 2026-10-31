@@ -40,7 +40,10 @@ pub const DEFAULT_CONTEXT_LENGTH: usize = 32_768;
 /// Reasoning allowance added to a capped request when the catalog gives
 /// none.  Reasoning models count their thinking against `max_tokens`, and
 /// the ones measured spent 50-350 tokens before answering a short prompt.
-pub const DEFAULT_REASONING_BUDGET_TOKENS: usize = 1024;
+/// Room given to a model's reasoning on top of the answer's, when its
+/// catalog row sets none: the reasoning models served from the cloud think
+/// in thousands of tokens before a line of answer.
+pub const DEFAULT_REASONING_BUDGET_TOKENS: usize = 4096;
 
 /// Room an answer gets when the caller caps nothing: enough for a reply
 /// that gives files back whole. Without a cap the endpoint applies its own,

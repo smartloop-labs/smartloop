@@ -175,7 +175,10 @@ pub fn write_file_blocks(root: &Path, blocks: &[(String, String)]) -> std::io::R
 /// Write `content` as `<root>/<name>.md`, adding a counter rather than
 /// replacing an existing file.  Returns the full path.
 pub fn write_document(root: &Path, name: &str, content: &str) -> std::io::Result<String> {
-    std::fs::create_dir_all(root)?;
+    // Under `.out/`, which the folder's index and sync leave alone: a saved
+    // answer is the user's to keep, not a document of the project.
+    let root = root.join(".out");
+    std::fs::create_dir_all(&root)?;
     let mut full_path = root.join(format!("{name}.md"));
     let mut counter = 1;
     while full_path.exists() {

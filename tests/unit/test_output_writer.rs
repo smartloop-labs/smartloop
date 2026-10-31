@@ -110,14 +110,16 @@ fn test_write_file_blocks_skips_paths_outside_root() {
     assert!(!dir.path().parent().unwrap().join("escape.txt").exists());
 }
 
+/// A saved answer goes under `.out/`, which the folder's index and sync
+/// leave alone, so it never comes back as a document of the project.
 #[test]
-fn test_write_document_goes_in_root_without_replacing() {
+fn test_write_document_goes_in_out_without_replacing() {
     let dir = tempfile::tempdir().unwrap();
     let first = write_document(dir.path(), "notes", "# One").unwrap();
     let second = write_document(dir.path(), "notes", "# Two").unwrap();
-    assert_eq!(first, dir.path().join("notes.md").to_string_lossy());
-    assert_eq!(second, dir.path().join("notes_1.md").to_string_lossy());
-    assert!(!dir.path().join(".out").exists());
+    assert_eq!(first, dir.path().join(".out/notes.md").to_string_lossy());
+    assert_eq!(second, dir.path().join(".out/notes_1.md").to_string_lossy());
+    assert!(!dir.path().join("notes.md").exists());
 }
 
 #[test]
