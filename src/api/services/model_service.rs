@@ -2299,6 +2299,13 @@ impl ModelService {
             );
             return None;
         }
+        tracing::info!(
+            target: LOG_TARGET,
+            "[capability-model] '{capability}' candidates in order: {} (project {}, local_only={})",
+            ranked.iter().map(|m| m.model_name.as_str()).collect::<Vec<_>>().join(", "),
+            self.get_project_id().unwrap_or_default(),
+            crate::llms::cloud_llm::local_only()
+        );
 
         // Two passes.  The first takes the largest model that is already
         // resident or fits as things stand, without evicting anything: a
