@@ -31,6 +31,7 @@ use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
 use crate::agents::orchestrator::{ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions};
+use crate::api::services::output_writer::{self, WriteOutcome};
 use crate::llms::base_llm::{BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::llms::cloud_llm::{local_only_scope, CloudLLM};
 use crate::model_host::remote_llm::RemoteLLM;
@@ -3706,24 +3707,25 @@ impl ModelService {
 
     // --------------------------------------------------------------- auto-write
 
-    /// Write LLM output to `<cwd>/.out/<name>.md` when the user asked to
-    /// create/generate/write.
+    /// Write LLM output into `cwd` when the user asked to create/generate/write.
     ///
     /// Two modes: a bare "write"/"save" command writes the last assistant
     /// response from session history (refine back and forth, then save); an
-    /// inline write intent writes the current `llm_response`.  Returns the
-    /// written path, or `None` when no write was needed.
+    /// inline write intent writes the current `llm_response`.  An answer that
+    /// lays out files is written as those files (see [`output_writer`]);
+    /// anything else is saved as one `<name>.md`.  Returns what was written —
+    /// empty when no write was needed.
     pub fn maybe_write_output(
         &self,
         user_message: &str,
         llm_response: &str,
         cwd: Option<&str>,
         session_id: Option<&str>,
-    ) -> Option<String> {
-        let cwd = non_empty(cwd)?;
-        let llm = self.resident_llm()?;
-
-        let cwd = expand_home(cwd);
+    ) -> WriteOutcome {
+        let Some(cwd) = non_empty(cwd) else {
+            return WriteOutcome::default();
+        };
+        let cwd = PathBuf::from(expand_home(cwd));
         let mut content_to_write = llm_response.to_string();
 
         if BARE_WRITE_RE.is_match(user_message) {
@@ -3740,23 +3742,31 @@ impl ModelService {
                     }
                     None => {
                         tracing::info!(target: LOG, "[auto-write] Bare write command but no prior assistant response found");
-                        return None;
+                        return WriteOutcome::default();
                     }
                 }
             } else if llm_response.is_empty() {
-                return None;
+                return WriteOutcome::default();
             }
         } else if llm_response.is_empty() || !WRITE_INTENT_RE.is_match(user_message) {
-            return None;
+            return WriteOutcome::default();
         }
 
-        if content_to_write.is_empty() {
-            return None;
+        let blocks = output_writer::extract_file_blocks(&content_to_write);
+        if !blocks.is_empty() {
+            return output_writer::write_file_blocks(&cwd, &blocks).unwrap_or_else(|e| {
+                tracing::warn!(target: LOG, "[auto-write] Failed: {e}");
+                WriteOutcome::default()
+            });
         }
-        let mut content_to_write = Self::extract_document_content(&content_to_write);
+
+        let content_to_write = Self::extract_document_content(&content_to_write);
         if content_to_write.is_empty() {
-            return None;
+            return WriteOutcome::default();
         }
+        let Some(llm) = self.resident_llm() else {
+            return WriteOutcome::default();
+        };
 
         // Ask the LLM only for the filename — write the actual content.
         let prompt = format!(
@@ -3768,45 +3778,21 @@ impl ModelService {
         let outcome = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<Option<String>> {
             let raw = llm.invoke(&prompt, None, None);
             let file_name = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
-            if file_name.is_empty() {
+            let safe_name = SAFE_FILENAME_RE.replace_all(&file_name, "_").trim_matches('_').to_string();
+            if safe_name.is_empty() {
                 return Ok(None);
             }
-
-            let safe_name = SAFE_FILENAME_RE.replace_all(&file_name, "_").trim_matches('_').to_string();
-            let out_dir = Path::new(&cwd).join(".out");
-            std::fs::create_dir_all(&out_dir)?;
-            let mut full_path = out_dir.join(format!("{safe_name}.md"));
-
-            // If the file already exists, append a counter.
-            let mut counter = 1;
-            while full_path.exists() {
-                full_path = out_dir.join(format!("{safe_name}_{counter}.md"));
-                counter += 1;
-            }
-
-            if !content_to_write.ends_with('\n') {
-                content_to_write.push('\n');
-            }
-            content_to_write.push_str("\nCo-Authored By: Smartloop AI\n");
-
-            std::fs::write(&full_path, &content_to_write)?;
-            let full_path = full_path.to_string_lossy().into_owned();
-            tracing::info!(
-                target: LOG,
-                "[auto-write] Saved to {full_path} ({} chars)",
-                content_to_write.chars().count()
-            );
-            Ok(Some(full_path))
+            Ok(Some(output_writer::write_document(&cwd, &safe_name, &content_to_write)?))
         }));
         match outcome {
-            Ok(Ok(path)) => path,
+            Ok(Ok(path)) => WriteOutcome { written: path.into_iter().collect(), skipped: Vec::new() },
             Ok(Err(e)) => {
                 tracing::warn!(target: LOG, "[auto-write] Failed: {e}");
-                None
+                WriteOutcome::default()
             }
             Err(panic) => {
                 tracing::warn!(target: LOG, "[auto-write] Failed: {}", panic_message(&panic));
-                None
+                WriteOutcome::default()
             }
         }
     }

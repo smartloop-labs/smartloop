@@ -426,10 +426,52 @@ pub const GREP_KEYWORDS: &[&str] = &[
     "search across",
 ];
 
+/// Files at a folder's top that make it a code project.
+pub const PROJECT_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Gemfile",
+    "composer.json",
+    "Package.swift",
+    "CMakeLists.txt",
+    "mix.exs",
+];
+
+/// Whether `dir` is a code project: one of [`PROJECT_MARKERS`] sits at its
+/// top.
+pub fn is_code_project(dir: &str) -> bool {
+    let dir = expand_home(dir);
+    let dir = Path::new(&dir);
+    PROJECT_MARKERS.iter().any(|marker| dir.join(marker).is_file())
+}
+
+/// What makes a request coding work once the turn is in a code project:
+/// a verb that changes something, or a noun of the code itself.  Looser
+/// than [`CODING_RE`], which has to stand on its own anywhere.
+pub static IN_PROJECT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"(?i)\b(?:add|fix|create|implement|write|change|update|refactor|rename|remove|delete|move|build|run|",
+        r"test|debug|generate|scaffold|wire|hook|support|make|extract|split|merge|migrate|upgrade|bump|",
+        r"lint|format|compile|deploy|release|install)\b",
+        r"|\b(?:function|fn|method|module|struct|class|trait|enum|interface|type|file|crate|package|",
+        r"dependency|dependencies|import|endpoint|route|handler|api|cli|command|flag|option|config|",
+        r"test|tests|bug|error|panic|crash|exception|warning|compile|build|lint|readme|changelog)s?\b",
+    ))
+    .unwrap()
+});
+
 /// Signals that the request is programming work, so it routes to a
 /// `coding` model.  Kept to phrases that rarely mean anything else: a
-/// fenced code block, a source-file name, a language name, or a coding verb
-/// bound to a code noun.  Bare words like "code" or "compile" are left out —
+/// fenced code block, a source-file name, a language name, a coding verb
+/// bound to a code noun, or a language/framework naming a project ("a rust
+/// project", "react app").  Bare words like "code" or "compile" are left out —
 /// "zip code" and "compile a list" are not programming.
 pub static CODING_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
@@ -442,6 +484,9 @@ pub static CODING_RE: Lazy<Regex> = Lazy::new(|| {
         r"|\b(?:write|implement|refactor|optimi[sz]e) (?:a |an |the |this |my )?",
         r"(?:function|method|class|program|algorithm|endpoint|api|cli|unit test)\b",
         r"|\bfix (?:a |the |this |my )?bug\b",
+        r"|\b(?:rust|go|golang|node(?:\.?js)?|deno|react|vue|svelte|angular|next\.?js|django|flask|fastapi|rails|",
+        r"java|kotlin|python|typescript|javascript|c\+\+|c#|elixir|haskell|zig)",
+        r"\s+(?:project|app|application|crate|package|library|module|cli|service|server|api|website|starter)\b",
     ))
     .unwrap()
 });
@@ -648,8 +693,13 @@ impl Planner {
         // Grep intent
         result.has_grep_intent = GREP_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
 
-        // Coding intent
-        result.has_coding_intent = CODING_RE.is_match(user_message);
+        // Coding intent: the message says so outright, or the turn works
+        // in a code project and the message asks for a change or about the
+        // code, as [`IN_PROJECT_RE`] reads it.  A question about a document
+        // that happens to sit in a code project stays general.
+        let in_project = cwd.filter(|c| !c.is_empty()).is_some_and(is_code_project);
+        result.has_coding_intent =
+            CODING_RE.is_match(user_message) || (in_project && IN_PROJECT_RE.is_match(user_message));
 
         // Document context from vector search / uploads / attachments
         result.has_document_context =

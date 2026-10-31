@@ -365,6 +365,42 @@ fn test_classify_llm_fallback_unparseable() {
     assert_eq!(result.intent, IntentType::Conversation);
 }
 
+/// In a code project, a request to change something or about the code is
+/// coding work; a question about a document there, or the same request
+/// outside a project, is not.
+#[test]
+fn test_detect_signals_coding_intent_from_the_folder_and_the_ask() {
+    let planner = planner();
+    let dir = std::env::temp_dir().join(format!("slp-planner-code-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let here = dir.to_string_lossy().into_owned();
+    let coding = |msg: &str| planner.detect_signals(msg, &[], Some(&here), None, false).has_coding_intent;
+    // A plain folder: only outright coding phrases count.
+    assert!(!smartloop::agents::planner::is_code_project(&here));
+    assert!(!coding("add a greeting and call it from main"));
+    assert!(coding("write a function that parses ISO dates"));
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+    assert!(smartloop::agents::planner::is_code_project(&here));
+    for msg in [
+        "add a greeting and call it from main",
+        "why does it panic on startup?",
+        "rename the config flag to --verbose",
+        "the build fails with a warning",
+        "update the readme",
+    ] {
+        assert!(coding(msg), "expected coding intent in a code project: {msg}");
+    }
+    for msg in [
+        "what does the contract say about renewals?",
+        "summarize the quarterly report",
+        "who is the author of this proposal?",
+    ] {
+        assert!(!coding(msg), "unexpected coding intent in a code project: {msg}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Programming requests raise the coding signal; look-alikes don't.
 #[test]
 fn test_detect_signals_coding_intent() {
@@ -378,6 +414,9 @@ fn test_detect_signals_coding_intent() {
         "fix the bug in the login flow",
         "how do I do this in python",
         "write a SQL query for monthly revenue",
+        "create a rust project",
+        "scaffold a React app with routing",
+        "set up a node.js server",
     ] {
         let result = planner.detect_signals(msg, &[], None, None, false);
         assert!(result.has_coding_intent, "expected coding intent: {msg}");
@@ -389,6 +428,8 @@ fn test_detect_signals_coding_intent() {
         "write a script for my wedding toast",
         "summarize the code of conduct",
         "what does this will say about the house?",
+        "create a project plan for the launch",
+        "rust removal tips for my bike",
     ] {
         let result = planner.detect_signals(msg, &[], None, None, false);
         assert!(!result.has_coding_intent, "unexpected coding intent: {msg}");

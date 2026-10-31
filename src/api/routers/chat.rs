@@ -38,6 +38,7 @@ use crate::api::services::{get_api_client, get_model_service, ModelService};
 // user's question — reused below to decide a source is about the answer, so
 // the two ends of the citation contract agree on what "related" means.
 use crate::api::services::model_service::MIN_BEST_DISTANCE;
+use crate::api::services::output_writer::WriteOutcome;
 use crate::config::app_settings::AppSettings;
 use crate::constants::{display_model_name, resolve_current_date, OPENING_TOKENS, SYSTEM_PROMPT};
 use crate::db::embeddings;
@@ -160,14 +161,14 @@ pub trait ChatService: Send + Sync {
         citations: Option<&[CitationDict]>,
         message_id: Option<&str>,
     );
-    /// `ModelService.maybe_write_output`; returns the written path.
+    /// `ModelService.maybe_write_output`; returns what was written.
     fn maybe_write_output(
         &self,
         user_message: &str,
         llm_response: &str,
         cwd: Option<&str>,
         session_id: Option<&str>,
-    ) -> Option<String>;
+    ) -> WriteOutcome;
     /// `ModelService.model_client`: how this process reaches the generative model.
     fn model_client(&self) -> Arc<dyn ModelClient>;
     /// `ModelService.unload_auxiliary_models`.
@@ -342,7 +343,7 @@ impl ChatService for ModelService {
         llm_response: &str,
         cwd: Option<&str>,
         session_id: Option<&str>,
-    ) -> Option<String> {
+    ) -> WriteOutcome {
         ModelService::maybe_write_output(self, user_message, llm_response, cwd, session_id)
     }
     fn model_client(&self) -> Arc<dyn ModelClient> {
@@ -870,9 +871,9 @@ fn last_user_content(messages: &[ChatMessage]) -> Option<String> {
     messages.iter().rev().find(|m| m.role == Role::User).and_then(|m| m.content.clone())
 }
 
-/// `f"\n\n[{Path(p).name}]({Path(p).as_posix()})"` — forward slashes in the
-/// URL so the Markdown parser doesn't treat backslashes as escape characters
-/// (e.g. `\.out` → `.out` on Windows).
+/// `[name](path)` for a written file — forward slashes in the URL so the
+/// Markdown parser doesn't treat backslashes as escape characters (e.g.
+/// `\src` → `src` on Windows).
 fn file_link(written_path: &str) -> String {
     let name = Path::new(written_path)
         .file_name()
@@ -880,7 +881,28 @@ fn file_link(written_path: &str) -> String {
         .unwrap_or_default();
     let posix =
         if cfg!(windows) { written_path.replace('\\', "/") } else { written_path.to_string() };
-    format!("\n\n[{name}]({posix})")
+    format!("[{name}]({posix})")
+}
+
+/// What an auto-write put on disk, appended to the answer: a link per file
+/// written, and the files left alone because they already existed.
+pub fn write_summary(outcome: &WriteOutcome) -> String {
+    let mut summary = String::new();
+    match outcome.written.as_slice() {
+        [] => {}
+        [path] => summary.push_str(&format!("\n\n{}", file_link(path))),
+        paths => {
+            summary.push_str(&format!("\n\nWrote {} files:\n", paths.len()));
+            for path in paths {
+                summary.push_str(&format!("\n- {}", file_link(path)));
+            }
+        }
+    }
+    if !outcome.skipped.is_empty() {
+        let names: Vec<String> = outcome.skipped.iter().map(|p| format!("`{p}`")).collect();
+        summary.push_str(&format!("\n\nLeft unchanged (already exist): {}", names.join(", ")));
+    }
+    summary
 }
 
 /// The message of a caught panic payload.
@@ -3091,20 +3113,22 @@ fn stream_chunks_inner(
             && let (Some(user_msg), Some(cwd)) =
                 (last_user_msg.as_deref().filter(|m| !m.is_empty()), out_cwd.as_deref())
         {
-            let written_path = svc.maybe_write_output(
+            let outcome = svc.maybe_write_output(
                 user_msg,
                 &full_response,
                 Some(cwd),
                 request.session_id.as_deref(),
             );
-            if let Some(written_path) = written_path.filter(|p| !p.is_empty()) {
-                yield status_event("file-write", "completed", &written_path);
-                // Surface the file path as visible content so the user can click it
-                let link = file_link(&written_path);
-                yield chunk_frame(&stream_model, content_delta(link.clone()), None);
-                // Persist the file link in session history
+            if !outcome.is_empty() {
+                for written_path in &outcome.written {
+                    yield status_event("file-write", "completed", written_path);
+                }
+                // Surface the file paths as visible content so the user can click them
+                let summary = write_summary(&outcome);
+                yield chunk_frame(&stream_model, content_delta(summary.clone()), None);
+                // Persist the file links in session history
                 if let Some(session_id) = request.session_id.as_deref().filter(|s| !s.is_empty()) {
-                    svc.append_to_session(session_id, "assistant", &link, None, None);
+                    svc.append_to_session(session_id, "assistant", &summary, None, None);
                 }
             }
         }
@@ -3537,11 +3561,10 @@ async fn complete_body(
     if let (Some(user_msg), Some(cwd)) =
         (last_user_msg.as_deref().filter(|m| !m.is_empty()), out_cwd.as_deref())
         && !response_text.is_empty()
-        && let Some(written_path) = svc
-            .maybe_write_output(user_msg, &response_text, Some(cwd), request.session_id.as_deref())
-            .filter(|p| !p.is_empty())
     {
-        response_text = format!("{response_text}{}", file_link(&written_path));
+        let outcome =
+            svc.maybe_write_output(user_msg, &response_text, Some(cwd), request.session_id.as_deref());
+        response_text.push_str(&write_summary(&outcome));
     }
 
     // Verified once and reused for both the session record and the response.

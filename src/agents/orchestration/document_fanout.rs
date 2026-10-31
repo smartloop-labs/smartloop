@@ -259,13 +259,21 @@ impl DocumentFanoutStep {
         // DP model's window (e.g. 8192 vs 6080), so sizing from it overflows
         // the extractor and generation silently fails.
         let mut max_chars = DEFAULT_MAX_CHARS;
-        let dp_llm = self.models.llm_for_tier(ModelTier::Large, Some(ModelCapability::Dp.value()), None);
+        // A coding request's documents are its source files: the coding
+        // model reads them, as it writes the answer, rather than a second
+        // large model loaded for document processing.
+        let capability = match ctx.read().request_capability.as_deref() {
+            Some(cap) if cap == ModelCapability::Coding.value() => ModelCapability::Coding,
+            _ => ModelCapability::Dp,
+        };
+        let dp_llm = self.models.llm_for_tier(ModelTier::Large, Some(capability.value()), None);
         tracing::info!(
             target: LOGGER,
-            "[doc-batch] {} → {} ({} document(s))",
+            "[doc-batch] {} → {} ({} document(s), {})",
             node_id,
             ModelRouter::model_label(dp_llm.as_ref()),
-            indices.len()
+            indices.len(),
+            capability.value()
         );
         let ctx_tokens = dp_llm.get_max_tokens();
         if ctx_tokens > 0 {

@@ -248,8 +248,8 @@ impl ChatService for FakeService {
         _llm_response: &str,
         _cwd: Option<&str>,
         _session_id: Option<&str>,
-    ) -> Option<String> {
-        None
+    ) -> smartloop::api::services::output_writer::WriteOutcome {
+        smartloop::api::services::output_writer::WriteOutcome::default()
     }
     fn model_client(&self) -> Arc<dyn ModelClient> {
         // Chat generates through the model client, whose default

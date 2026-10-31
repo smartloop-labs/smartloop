@@ -113,6 +113,7 @@ mod test_model_thinking_api;
 mod test_openapi_docs;
 mod test_model_thinking_setting;
 mod test_orchestrate_timeout_unload;
+mod test_output_writer;
 mod test_parent_watch;
 mod test_paths;
 mod test_planner;
