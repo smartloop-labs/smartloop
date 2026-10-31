@@ -380,3 +380,36 @@ async fn test_an_uncapped_answer_cut_off_is_retried_with_more_room() {
     let second: Value = sent[1].body_json().unwrap();
     assert_eq!(second["max_tokens"], (DEFAULT_ANSWER_TOKENS + DEFAULT_REASONING_BUDGET_TOKENS) * 2);
 }
+
+/// Refused for asking more answer tokens than the endpoint allows, the
+/// request is sent again within the cap it named, and the cap holds for
+/// requests after. The context window is another number and unaffected.
+#[tokio::test]
+#[serial]
+async fn test_an_answer_cap_the_endpoint_names_is_learned() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("RuntimeError: max_tokens is at most 16384 for minimax-m3."))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST")).respond_with(answer("ok", "stop")).mount(&server).await;
+    let (llm, _env) = llm(&server, Some(bearer("t")));
+    let llm = Arc::new(llm);
+
+    let first = llm.clone();
+    let reply = tokio::task::spawn_blocking(move || first.call(PROMPT, None, CallOptions::default())).await.unwrap().unwrap();
+    assert_eq!(reply, "ok");
+    let sent = server.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 2);
+    let refused: Value = sent[0].body_json().unwrap();
+    let within: Value = sent[1].body_json().unwrap();
+    assert_eq!(refused["max_tokens"], DEFAULT_ANSWER_TOKENS + DEFAULT_REASONING_BUDGET_TOKENS);
+    assert_eq!(within["max_tokens"], 16384);
+
+    tokio::task::spawn_blocking(move || llm.call(PROMPT, None, CallOptions::default())).await.unwrap().unwrap();
+    let sent = server.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 3);
+    let next: Value = sent[2].body_json().unwrap();
+    assert_eq!(next["max_tokens"], 16384);
+}

@@ -13,7 +13,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::io::{BufRead, BufReader};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -107,6 +107,10 @@ pub struct CloudLLM {
     model_name: String,
     context_length: usize,
     reasoning_budget_tokens: usize,
+    /// The most tokens one answer may have, as the endpoint said when a
+    /// request asked for more ("max_tokens is at most N"); 0 until then.
+    /// Not the context window: that's `context_length`.
+    output_cap: AtomicUsize,
     client: SLPPlatformClient,
     send_credentials: bool,
     cancelled: RwLock<Option<CancelEvent>>,
@@ -137,6 +141,7 @@ impl CloudLLM {
             model_name: model_name.to_string(),
             context_length: context_length.map(|n| n as usize).filter(|n| *n > 0).unwrap_or(DEFAULT_CONTEXT_LENGTH),
             reasoning_budget_tokens: DEFAULT_REASONING_BUDGET_TOKENS,
+            output_cap: AtomicUsize::new(0),
             client: SLPPlatformClient::with_hooks(url, auth_headers_fn, refresh_fn),
             send_credentials,
             cancelled: RwLock::new(None),
@@ -164,9 +169,26 @@ impl CloudLLM {
     /// thinking and the answer comes back empty.
     /// The cap sent with a request: the caller's, or `DEFAULT_ANSWER_TOKENS`
     /// when it sets none, so the endpoint's own default never cuts an
-    /// answer short; the reasoning budget on top either way.
+    /// answer short; the reasoning budget on top either way, and never
+    /// past what the endpoint said an answer may have.
     fn request_max_tokens(&self, options: CallOptions) -> Option<usize> {
-        Some(options.max_tokens.unwrap_or(DEFAULT_ANSWER_TOKENS) + self.reasoning_budget_tokens)
+        Some(self.within_cap(options.max_tokens.unwrap_or(DEFAULT_ANSWER_TOKENS) + self.reasoning_budget_tokens))
+    }
+
+    /// `tokens`, or the endpoint's answer cap when that's known and less.
+    fn within_cap(&self, tokens: usize) -> usize {
+        match self.output_cap.load(Ordering::Relaxed) {
+            0 => tokens,
+            cap => tokens.min(cap),
+        }
+    }
+
+    /// The answer cap an endpoint's refusal names ("max_tokens is at most
+    /// 16384 for minimax-m3"), if it's that refusal.
+    fn cap_in(text: &str) -> Option<usize> {
+        let rest = text.split("is at most ").nth(1)?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok().filter(|n| *n > 0)
     }
 
     fn body(&self, messages: &[ChatMessage], stream: bool, max_tokens: Option<usize>) -> Value {
@@ -219,6 +241,8 @@ impl CloudLLM {
     }
 
     /// POST the chat request, redeeming the refresh token once on a 401.
+    /// Send `body`; refused for asking more answer tokens than the endpoint
+    /// allows, it learns the cap and sends again within it.
     fn post(&self, body: &Value) -> Result<reqwest::blocking::Response, String> {
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -226,29 +250,41 @@ impl CloudLLM {
             .build()
             .map_err(|e| format!("Could not reach {}: {e}", self.model_name))?;
         let url = format!("{}{CHAT_PATH}", self.client.base_url());
-        let send = |headers: &Headers| {
-            let mut request = http.post(&url).json(body);
-            for (name, value) in headers {
-                request = request.header(name.as_str(), value.as_str());
+        let mut body = body.clone();
+        loop {
+            let send = |headers: &Headers| {
+                let mut request = http.post(&url).json(&body);
+                for (name, value) in headers {
+                    request = request.header(name.as_str(), value.as_str());
+                }
+                request.send()
+            };
+            let sent = if self.send_credentials {
+                self.client.authed(send)
+            } else {
+                send(&self.client.headers(None))
+            };
+            let response = sent.map_err(|e| {
+                tracing::warn!(target: LOG_TARGET, "[cloud] {} request failed: {e}", self.model_name);
+                format!("Could not reach {}. Check your connection and try again.", self.model_name)
+            })?;
+            let status = response.status().as_u16();
+            if status < 400 {
+                return Ok(response);
             }
-            request.send()
-        };
-        let sent = if self.send_credentials {
-            self.client.authed(send)
-        } else {
-            send(&self.client.headers(None))
-        };
-        let response = sent.map_err(|e| {
-            tracing::warn!(target: LOG_TARGET, "[cloud] {} request failed: {e}", self.model_name);
-            format!("Could not reach {}. Check your connection and try again.", self.model_name)
-        })?;
-        let status = response.status().as_u16();
-        if status >= 400 {
             let text = response.text().unwrap_or_default();
             tracing::warn!(target: LOG_TARGET, "[cloud] {} answered {status}: {text}", self.model_name);
+            let asked = body["max_tokens"].as_u64().map(|n| n as usize);
+            if let (Some(cap), Some(asked)) = (Self::cap_in(&text), asked)
+                && cap < asked
+            {
+                tracing::info!(target: LOG_TARGET, "[cloud] {} allows {cap} answer tokens; asking for that", self.model_name);
+                self.output_cap.store(cap, Ordering::Relaxed);
+                body["max_tokens"] = json!(cap);
+                continue;
+            }
             return Err(describe_failure(status, &text, &self.model_name));
         }
-        Ok(response)
     }
 
     fn is_cancelled(&self) -> bool {
@@ -305,14 +341,25 @@ impl BaseLLM for CloudLLM {
         if finish.as_deref() != Some("length") {
             return Ok(content);
         }
+        // Cut off at the cap: once more with twice the room, as far as the
+        // endpoint allows. At its limit already, the answer is what it is.
+        let more = self.within_cap(max_tokens * 2);
+        if more <= max_tokens {
+            tracing::warn!(
+                target: LOG_TARGET,
+                "[cloud] {} hit max_tokens={max_tokens}, the most an answer may have — keeping the truncated answer",
+                self.model_name
+            );
+            return Ok(content);
+        }
         tracing::warn!(
             target: LOG_TARGET,
             "[cloud] {} hit max_tokens={max_tokens} ({} chars answered) — retrying with {}",
             self.model_name,
             content.chars().count(),
-            max_tokens * 2
+            more
         );
-        let (content, finish) = self.complete(&messages, Some(max_tokens * 2))?;
+        let (content, finish) = self.complete(&messages, Some(more))?;
         if finish.as_deref() != Some("length") {
             return Ok(content);
         }
@@ -320,7 +367,7 @@ impl BaseLLM for CloudLLM {
             target: LOG_TARGET,
             "[cloud] {} hit max_tokens={} again — discarding the truncated answer",
             self.model_name,
-            max_tokens * 2
+            more
         );
         Ok(String::new())
     }
