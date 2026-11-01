@@ -895,6 +895,11 @@ pub struct Project {
     pub system: bool,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The client that made the project (`docent`, `studio`), when it said:
+    /// a client that works a folder of code makes projects another client
+    /// has no use for, and can leave them out of its list by this.
+    #[serde(default)]
+    pub client: Option<String>,
     #[serde(default)]
     pub documents: Vec<Document>,
     #[serde(default)]
@@ -926,6 +931,7 @@ impl Default for Project {
             description: None,
             system: false,
             cwd: None,
+            client: None,
             documents: Vec::new(),
             skills: Vec::new(),
             mcp_servers: Vec::new(),
@@ -1091,6 +1097,7 @@ impl Project {
             description,
             system,
             cwd,
+            client,
             documents,
             skills,
             mcp_servers,
@@ -1108,6 +1115,7 @@ impl Project {
         self.description = description;
         self.system = system;
         self.cwd = cwd;
+        self.client = client;
         merge_records_by_id(&mut self.documents, documents);
         merge_records_by_id(&mut self.skills, skills);
         merge_records_by_id(&mut self.mcp_servers, mcp_servers);

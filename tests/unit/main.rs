@@ -116,6 +116,7 @@ mod test_orchestrate_timeout_unload;
 mod test_parent_watch;
 mod test_paths;
 mod test_planner;
+mod test_project_client;
 mod test_planner_e2e;
 mod test_platform_client;
 mod test_platform_service;

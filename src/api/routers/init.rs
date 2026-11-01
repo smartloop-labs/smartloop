@@ -169,7 +169,7 @@ impl InitModelService for ModelService {
         system: bool,
         cwd: Option<&str>,
     ) -> anyhow::Result<()> {
-        ModelService::create_project(self, name, description, system, None, cwd).map(|_| ())
+        ModelService::create_project(self, name, description, system, None, cwd, None).map(|_| ())
     }
 
     fn has_indexer_task(&self) -> bool {

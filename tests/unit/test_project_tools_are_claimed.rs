@@ -82,7 +82,7 @@ fn test_the_install_runs_under_a_claim_on_the_new_project() {
     let f = fixture();
     delegate_projects(true);
 
-    f.svc.create_project("alpha", None, false, None, None).expect("project created");
+    f.svc.create_project("alpha", None, false, None, None, None).expect("project created");
 
     let created = created_id(&f.svc);
     let claims: Vec<Option<String>> = f.claims.lock().iter().map(|(_, claim)| claim.clone()).collect();
@@ -96,7 +96,7 @@ fn test_the_claim_does_not_outlive_the_install() {
     let f = fixture();
     delegate_projects(true);
 
-    f.svc.create_project("alpha", None, false, None, None).expect("project created");
+    f.svc.create_project("alpha", None, false, None, None, None).expect("project created");
 
     assert_eq!(owned_project_id(), None);
 }
@@ -110,7 +110,7 @@ fn test_the_claim_does_not_outlive_the_install() {
 fn test_the_single_server_fallback_still_installs() {
     let f = fixture();
 
-    f.svc.create_project("alpha", None, false, None, None).expect("project created");
+    f.svc.create_project("alpha", None, false, None, None, None).expect("project created");
 
     let created = created_id(&f.svc);
     let calls: Vec<String> = f.claims.lock().iter().map(|(id, _)| id.clone()).collect();

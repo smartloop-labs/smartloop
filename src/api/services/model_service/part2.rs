@@ -1550,6 +1550,7 @@ impl ModelService {
         system: bool,
         skills: Option<Vec<Skill>>,
         cwd: Option<&str>,
+        client: Option<&str>,
     ) -> anyhow::Result<Value> {
         self.ensure_model()?;
         let model = self.model_or_err()?;
@@ -1572,6 +1573,7 @@ impl ModelService {
                 current: true,
                 name: Some(name.to_string()),
                 description: description.map(str::to_string),
+                client: client.map(str::to_string),
                 system,
                 skills: skills.clone().unwrap_or_default(),
                 ..Project::default()
