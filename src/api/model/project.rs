@@ -89,6 +89,11 @@ pub struct UpdateProjectRequest {
     /// work in; `""` unbinds it, omit to leave unchanged.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The client the project belongs to (`docent`, `studio`): a client
+    /// claims a project made before the field existed; `""` lets it go,
+    /// omit to leave unchanged.
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 fn default_true() -> bool {

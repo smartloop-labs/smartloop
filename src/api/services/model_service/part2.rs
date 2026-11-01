@@ -1662,6 +1662,7 @@ impl ModelService {
         skills: Option<Vec<Skill>>,
         web_search_enabled: Option<bool>,
         cwd: Option<&str>,
+        client: Option<&str>,
     ) -> anyhow::Result<Value> {
         self.ensure_model()?;
         let updated = self.with_project_mut(project_id, |project| {
@@ -1678,6 +1679,11 @@ impl ModelService {
             }
             if let Some(cwd) = cwd {
                 project.cwd = non_empty(Some(cwd)).map(str::to_string);
+            }
+            if let Some(client) = client {
+                // A client claiming a project made before the field existed;
+                // `""` lets it go.
+                project.client = non_empty(Some(client)).map(str::to_string);
             }
             project.clone()
         })?;
@@ -1705,6 +1711,7 @@ impl ModelService {
             "name": p.name,
             "cwd": p.work_dir().unwrap_or_default(),
             "description": p.description,
+            "client": p.client,
             "model_name": self.model_name.read().clone(),
             "current": p.current,
             "system": p.system,

@@ -155,6 +155,7 @@ pub async fn update_project(
             Some(skills),
             request.web_search_enabled,
             cwd.as_deref(),
+            request.client.as_deref(),
         )
     })
     .await?;
