@@ -1578,7 +1578,8 @@ impl ModelService {
                 current: true,
                 name: Some(name.to_string()),
                 description: description.map(str::to_string),
-                client: client.map(str::to_string),
+                // The system project is every client's, and stays nobody's.
+                client: if system { None } else { client.map(str::to_string) },
                 system,
                 skills: skills.clone().unwrap_or_default(),
                 ..Project::default()
@@ -1680,9 +1681,12 @@ impl ModelService {
             if let Some(cwd) = cwd {
                 project.cwd = non_empty(Some(cwd)).map(str::to_string);
             }
-            if let Some(client) = client {
+            if let Some(client) = client
+                && !project.system
+            {
                 // A client claiming a project made before the field existed;
-                // `""` lets it go.
+                // `""` lets it go.  The system project is every client's,
+                // and stays nobody's.
                 project.client = non_empty(Some(client)).map(str::to_string);
             }
             project.clone()

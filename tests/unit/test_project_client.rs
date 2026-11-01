@@ -81,6 +81,13 @@ mod through_the_service {
         let kept = svc.update_project(&made["id"].as_str().unwrap().to_string(), Some("todo"), None, None, None, None, None).expect("updated");
         assert_eq!(kept["client"], "docent");
 
+        // The system project is every client's: no client makes it theirs,
+        // at creation or later.
+        let system = svc.create_project("general_chat", None, true, None, None, Some("docent")).expect("created");
+        assert!(system["client"].is_null());
+        let still = svc.update_project(system["id"].as_str().unwrap(), None, None, None, None, None, Some("docent")).expect("updated");
+        assert!(still["client"].is_null());
+
         pin_project(None);
         delegate_projects(false);
         Workspace::set_config_file(None);
