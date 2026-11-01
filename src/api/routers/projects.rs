@@ -80,6 +80,7 @@ pub async fn create_project(
             request.system,
             Some(skills),
             request.cwd.as_deref(),
+            request.client.as_deref(),
         )
     })
     .await?;
