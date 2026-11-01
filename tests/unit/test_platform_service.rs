@@ -301,7 +301,7 @@ mod test_list_models {
 
         let row = obj(json!({
             "name": "spec-hydration-probe", "model_id": "org/spec-hydration-probe",
-            "param_size_b": 7.0, "capabilities": ["general", "dp"],
+            "param_size_b": 7.0, "capabilities": ["general", "vision"],
         }));
         let client = FakeClient::with_models(vec![row]);
         let svc = service(&client, None);
@@ -310,7 +310,8 @@ mod test_list_models {
         let spec = MODEL_SPECS.get("spec-hydration-probe").expect("hydrated from the catalog");
         assert_eq!(spec.model_id, "org/spec-hydration-probe");
         assert_eq!(spec.param_size_b, 7.0);
-        assert_eq!(spec.capability_values(), ["general", "dp"]);
+        // "general" said the model holds a text conversation: `text`.
+        assert_eq!(spec.capability_values(), ["text", "vision"]);
     }
 
     #[test]

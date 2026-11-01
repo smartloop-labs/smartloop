@@ -38,13 +38,14 @@ use crate::api::services::{get_api_client, get_model_service, ModelService};
 // user's question — reused below to decide a source is about the answer, so
 // the two ends of the citation contract agree on what "related" means.
 use crate::api::services::model_service::MIN_BEST_DISTANCE;
+use crate::api::services::output_writer::WriteOutcome;
 use crate::config::app_settings::AppSettings;
 use crate::constants::{display_model_name, resolve_current_date, OPENING_TOKENS, SYSTEM_PROMPT};
 use crate::db::embeddings;
 use crate::llms::base_llm::CancelEvent;
 use crate::model_host::client::{ModelClient, ModelHostError, TextStream};
 use crate::tasks::IndexerTask;
-use crate::types::ModelCapability;
+use crate::types::ANSWER_TIER;
 use crate::workspace::context::{
     active_project_id, bind, scope_project, set_active_project, use_project, ProjectBoundExecutor,
 };
@@ -98,7 +99,7 @@ pub struct OrchestrateArgs {
 }
 
 /// Result of [`ChatService::orchestrate`]:
-/// `(context, matched, error, citations, skill_instruction, mutation)`.
+/// `(context, matched, error, citations, skill_instruction, mutation, capability)`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OrchestrateOutcome {
     /// The formatted tool output.
@@ -113,6 +114,10 @@ pub struct OrchestrateOutcome {
     pub skill_instruction: Option<String>,
     /// Stream `context` verbatim instead of running it through another LLM.
     pub mutation: bool,
+    /// What the planner classified the request as (e.g. dp), if it ran.
+    pub capability: Option<String>,
+    /// Whether the planner read the request as programming work.
+    pub coding: bool,
 }
 
 /// The subset of `ModelService` the chat router uses.
@@ -144,11 +149,11 @@ pub trait ChatService: Send + Sync {
     /// `ModelService.get_max_context_tokens`.
     fn get_max_context_tokens(&self) -> usize;
     /// `ModelService.get_response_max_context_tokens`.
-    fn get_response_max_context_tokens(&self, capability: Option<ModelCapability>) -> usize;
+    fn get_response_max_context_tokens(&self, capability: Option<&str>) -> usize;
     /// `ModelService.begin_response_request`.
     fn begin_response_request(&self, progress_callback: Option<ProgressCallback>);
     /// `ModelService.announce_response_model`.
-    fn announce_response_model(&self, capability: Option<ModelCapability>);
+    fn announce_response_model(&self, capability: Option<&str>);
     /// `ModelService.append_to_session`.
     fn append_to_session(
         &self,
@@ -158,14 +163,14 @@ pub trait ChatService: Send + Sync {
         citations: Option<&[CitationDict]>,
         message_id: Option<&str>,
     );
-    /// `ModelService.maybe_write_output`; returns the written path.
+    /// `ModelService.maybe_write_output`; returns what was written.
     fn maybe_write_output(
         &self,
         user_message: &str,
         llm_response: &str,
         cwd: Option<&str>,
         session_id: Option<&str>,
-    ) -> Option<String>;
+    ) -> WriteOutcome;
     /// `ModelService.model_client`: how this process reaches the generative model.
     fn model_client(&self) -> Arc<dyn ModelClient>;
     /// `ModelService.unload_auxiliary_models`.
@@ -270,7 +275,7 @@ impl ChatService for ModelService {
                 Value::Object(obj)
             })
             .collect();
-        let (context, matched, error, citations, skill_instruction, mutation) =
+        let (context, matched, error, citations, skill_instruction, mutation, capability, coding) =
             ModelService::orchestrate(
                 self,
                 &args.user_message,
@@ -292,7 +297,7 @@ impl ChatService for ModelService {
                 })
                 .collect()
         });
-        Ok(OrchestrateOutcome { context, matched, error, citations, skill_instruction, mutation })
+        Ok(OrchestrateOutcome { context, matched, error, citations, skill_instruction, mutation, capability, coding })
     }
     fn get_project_id(&self) -> Option<String> {
         ModelService::get_project_id(self)
@@ -306,14 +311,14 @@ impl ChatService for ModelService {
     fn get_max_context_tokens(&self) -> usize {
         ModelService::get_max_context_tokens(self)
     }
-    fn get_response_max_context_tokens(&self, capability: Option<ModelCapability>) -> usize {
-        ModelService::get_response_max_context_tokens(self, capability.map(|c| c.value()))
+    fn get_response_max_context_tokens(&self, capability: Option<&str>) -> usize {
+        ModelService::get_response_max_context_tokens(self, capability)
     }
     fn begin_response_request(&self, progress_callback: Option<ProgressCallback>) {
         ModelService::begin_response_request(self, progress_callback)
     }
-    fn announce_response_model(&self, capability: Option<ModelCapability>) {
-        ModelService::announce_response_model(self, capability.map(|c| c.value()))
+    fn announce_response_model(&self, capability: Option<&str>) {
+        ModelService::announce_response_model(self, capability)
     }
     fn append_to_session(
         &self,
@@ -340,7 +345,7 @@ impl ChatService for ModelService {
         llm_response: &str,
         cwd: Option<&str>,
         session_id: Option<&str>,
-    ) -> Option<String> {
+    ) -> WriteOutcome {
         ModelService::maybe_write_output(self, user_message, llm_response, cwd, session_id)
     }
     fn model_client(&self) -> Arc<dyn ModelClient> {
@@ -696,21 +701,17 @@ const ORCHESTRATION_TIMEOUT_CONTENT: &str = concat!(
     "stopped. This often means the loaded model is ",
     "too small to synthesize the gathered context. ",
     "Try a simpler request, or enable a larger ",
-    "model in **Settings → Models**."
+    "model (`/models` in the terminal, **Settings → Models** in Studio)."
 );
 
 const NO_RESPONSE_GUIDANCE: &str = concat!(
     "**No response generated.**\n\n",
-    "The current model wasn't able to synthesize the ",
-    "fetched content. This usually means the loaded ",
-    "model doesn't have the capabilities needed for ",
-    "document reading or skill-based synthesis.\n\n",
-    "To fix this, open **Settings → Models** and enable ",
-    "a model tagged with **DP** (document processing) or ",
-    "**skills** capability. Larger knowledge-capable ",
-    "models handle URL fetches, document Q&A, and ",
-    "long-context summaries much more reliably than ",
-    "the small default router model."
+    "The model answered with nothing, twice. Either it ",
+    "ran out of room before the answer began, or it ",
+    "can't work from the gathered content.\n\n",
+    "Try again, or a simpler request; or enable a larger ",
+    "model (`/models` in the terminal, **Settings → Models** ",
+    "in Studio): the biggest one that fits writes the answer."
 );
 
 // ---------------------------------------------------------------- small utils
@@ -718,6 +719,15 @@ const NO_RESPONSE_GUIDANCE: &str = concat!(
 /// Python truthiness of an optional string.
 fn truthy(s: &Option<String>) -> bool {
     s.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+/// The tier the final answer is written on.  Programming work, and anything
+/// that gathered context, is answered on the answer tier: the router steps
+/// up to the largest model that fits, local or remote, and down when it
+/// doesn't.  A bare chat stays on the default model.  The planner's picks
+/// (vision, reasoning) choose the model for its steps, not for the answer.
+pub fn response_tier(context: &Option<String>, coding: bool) -> Option<&'static str> {
+    (coding || truthy(context)).then_some(ANSWER_TIER)
 }
 
 /// Python truthiness of an optional list of asset ids.
@@ -853,9 +863,9 @@ fn last_user_content(messages: &[ChatMessage]) -> Option<String> {
     messages.iter().rev().find(|m| m.role == Role::User).and_then(|m| m.content.clone())
 }
 
-/// `f"\n\n[{Path(p).name}]({Path(p).as_posix()})"` — forward slashes in the
-/// URL so the Markdown parser doesn't treat backslashes as escape characters
-/// (e.g. `\.out` → `.out` on Windows).
+/// `[name](path)` for a written file — forward slashes in the URL so the
+/// Markdown parser doesn't treat backslashes as escape characters (e.g.
+/// `\src` → `src` on Windows).
 fn file_link(written_path: &str) -> String {
     let name = Path::new(written_path)
         .file_name()
@@ -863,7 +873,24 @@ fn file_link(written_path: &str) -> String {
         .unwrap_or_default();
     let posix =
         if cfg!(windows) { written_path.replace('\\', "/") } else { written_path.to_string() };
-    format!("\n\n[{name}]({posix})")
+    format!("[{name}]({posix})")
+}
+
+/// What an auto-write put on disk, appended to the answer: a link per file
+/// written.
+pub fn write_summary(outcome: &WriteOutcome) -> String {
+    let mut summary = String::new();
+    match outcome.written.as_slice() {
+        [] => {}
+        [path] => summary.push_str(&format!("\n\n{}", file_link(path))),
+        paths => {
+            summary.push_str(&format!("\n\nWrote {} files:\n", paths.len()));
+            for path in paths {
+                summary.push_str(&format!("\n- {}", file_link(path)));
+            }
+        }
+    }
+    summary
 }
 
 /// The message of a caught panic payload.
@@ -2075,7 +2102,7 @@ struct Producer {
     svc: Arc<dyn ChatService>,
     prompt: String,
     model: String,
-    capability: Option<ModelCapability>,
+    capability: Option<&'static str>,
     cancelled: CancelEvent,
     orchestrator_context: Option<String>,
     last_user_msg: Option<String>,
@@ -2134,7 +2161,7 @@ impl Producer {
         let stream = client.stream(
             prompt,
             Some(&self.model),
-            self.capability.map(|c| c.value()),
+            self.capability,
             Some(self.cancelled.clone()),
             Some(false),
         )?;
@@ -2268,7 +2295,7 @@ impl Producer {
                 retry = match self.svc.model_client().generate(
                     &simple_prompt,
                     Some(&self.model),
-                    self.capability.map(|c| c.value()),
+                    self.capability,
                     None,
                     Some(false),
                 ) {
@@ -2598,6 +2625,7 @@ fn stream_chunks_inner(
 
         // Orchestrator handles vector search, MCP tools, and explore in one step
         let mut orchestrator_context: Option<String> = None;
+        let mut classified_coding = false;
         let mut citations: Option<Vec<CitationDict>> = None;
         let mut is_mutation = false;
         if truthy(&last_user_msg) {
@@ -2716,6 +2744,7 @@ fn stream_chunks_inner(
                 }
             };
             orchestrator_context = outcome.context;
+            classified_coding = outcome.coding;
             citations = outcome.citations;
             is_mutation = outcome.mutation;
             let tool_error = outcome.error;
@@ -2797,8 +2826,14 @@ fn stream_chunks_inner(
         // Size the context against the model that will actually consume it —
         // otherwise web/document context overflows the response model and the
         // search content never reaches the LLM.
-        let response_capability =
-            if truthy(&orchestrator_context) { Some(ModelCapability::General) } else { None };
+        let response_capability = response_tier(&orchestrator_context, classified_coding);
+        tracing::info!(
+            target: LOG_TARGET,
+            "[response] coding={} context={} → {}",
+            classified_coding,
+            truthy(&orchestrator_context),
+            response_capability.unwrap_or("default")
+        );
 
         // The response model is resolved by the call below, and resolving it
         // can mean loading a model.  It reports through ModelRouter like every
@@ -3073,20 +3108,22 @@ fn stream_chunks_inner(
             && let (Some(user_msg), Some(cwd)) =
                 (last_user_msg.as_deref().filter(|m| !m.is_empty()), out_cwd.as_deref())
         {
-            let written_path = svc.maybe_write_output(
+            let outcome = svc.maybe_write_output(
                 user_msg,
                 &full_response,
                 Some(cwd),
                 request.session_id.as_deref(),
             );
-            if let Some(written_path) = written_path.filter(|p| !p.is_empty()) {
-                yield status_event("file-write", "completed", &written_path);
-                // Surface the file path as visible content so the user can click it
-                let link = file_link(&written_path);
-                yield chunk_frame(&stream_model, content_delta(link.clone()), None);
-                // Persist the file link in session history
+            if !outcome.is_empty() {
+                for written_path in &outcome.written {
+                    yield status_event("file-write", "completed", written_path);
+                }
+                // Surface the file paths as visible content so the user can click them
+                let summary = write_summary(&outcome);
+                yield chunk_frame(&stream_model, content_delta(summary.clone()), None);
+                // Persist the file links in session history
                 if let Some(session_id) = request.session_id.as_deref().filter(|s| !s.is_empty()) {
-                    svc.append_to_session(session_id, "assistant", &link, None, None);
+                    svc.append_to_session(session_id, "assistant", &summary, None, None);
                 }
             }
         }
@@ -3383,6 +3420,7 @@ async fn complete_body(
 
     // Orchestrator handles vector search, MCP tools, and explore in one step
     let mut orchestrator_context: Option<String> = None;
+    let mut classified_coding = false;
     let mut tool_error: Option<String> = None;
     let mut citations: Option<Vec<CitationDict>> = None;
     let mut is_mutation = false;
@@ -3399,6 +3437,7 @@ async fn complete_body(
         let orchestrate_svc = svc.clone();
         let outcome = run_on_executor(move || orchestrate_svc.orchestrate(args)).await??;
         orchestrator_context = outcome.context;
+        classified_coding = outcome.coding;
         tool_error = outcome.error;
         citations = outcome.citations;
         is_mutation = outcome.mutation;
@@ -3475,8 +3514,14 @@ async fn complete_body(
     // A stream has chunks to reset the budget, so it only ever measures
     // silence; a non-streaming call has no progress signal at all, so the same
     // number necessarily bounds the whole generation.
-    let response_capability =
-        if truthy(&orchestrator_context) { Some(ModelCapability::General) } else { None };
+    let response_capability = response_tier(&orchestrator_context, classified_coding);
+    tracing::info!(
+        target: LOG_TARGET,
+        "[response] coding={} context={} → {}",
+        classified_coding,
+        truthy(&orchestrator_context),
+        response_capability.unwrap_or("default")
+    );
     let stall_timeout = AppSettings::new().stream_stall_timeout_s;
     let (tx, mut rx) = tokio::sync::oneshot::channel::<anyhow::Result<String>>();
     let generate_svc = svc.clone();
@@ -3487,7 +3532,7 @@ async fn complete_body(
         let result = generate_svc.model_client().generate(
             &generate_prompt,
             Some(&generate_model),
-            response_capability.map(|c| c.value()),
+            response_capability,
             None,
             Some(false),
         );
@@ -3518,11 +3563,10 @@ async fn complete_body(
     if let (Some(user_msg), Some(cwd)) =
         (last_user_msg.as_deref().filter(|m| !m.is_empty()), out_cwd.as_deref())
         && !response_text.is_empty()
-        && let Some(written_path) = svc
-            .maybe_write_output(user_msg, &response_text, Some(cwd), request.session_id.as_deref())
-            .filter(|p| !p.is_empty())
     {
-        response_text = format!("{response_text}{}", file_link(&written_path));
+        let outcome =
+            svc.maybe_write_output(user_msg, &response_text, Some(cwd), request.session_id.as_deref());
+        response_text.push_str(&write_summary(&outcome));
     }
 
     // Verified once and reused for both the session record and the response.

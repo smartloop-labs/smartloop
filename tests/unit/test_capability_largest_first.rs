@@ -165,10 +165,10 @@ fn test_size_ties_go_to_broader_coverage_then_the_newer_version() {
         vec![
             candidate("old", 4.0, 1, &["reasoning"]),
             candidate("narrow-new", 4.0, 3, &["reasoning"]),
-            candidate("broad", 4.0, 2, &["reasoning", "general"]),
+            candidate("broad", 4.0, 2, &["reasoning", "vision"]),
             candidate("new", 4.0, 2, &["reasoning"]),
         ],
-        &["reasoning", "general"],
+        &["reasoning", "vision"],
         true,
     );
     let names: Vec<&str> = ordered.iter().map(|m| m.name).collect();
@@ -212,7 +212,7 @@ fn test_a_local_only_resolution_skips_remote_models() {
 /// spec registry, under a name only these tests use.
 fn sized_remote(name: &str, total_b: f64, active_b: f64) -> WorkspaceModel {
     let serde_json::Value::Object(row) = serde_json::json!({
-        "name": name, "type": "remote", "capabilities": ["general", "reasoning"],
+        "name": name, "type": "remote", "capabilities": ["reasoning"],
         "param_size_b": total_b, "active_param_size_b": active_b,
     }) else {
         unreachable!()

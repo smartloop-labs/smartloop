@@ -97,15 +97,15 @@ pub struct ModelRouterOptions {
     pub capability_skip_reason: Option<CapabilitySkipReasonFn>,
 }
 
-/// Client-facing labels for capabilities.  The enum values (e.g. "dp") are
-/// internal terms; map them to human-readable text before surfacing in SSEs.
+/// Client-facing labels for routing keys: the capabilities, and the answer
+/// tier.  The wire values are internal terms; map them to human-readable
+/// text before surfacing in SSEs.
 pub const CAPABILITY_LABELS: &[(&str, &str)] = &[
-    ("general", "general"),
+    ("text", "text"),
     ("reasoning", "reasoning"),
-    ("dp", "document processing"),
     ("vision", "vision"),
-    ("coding", "coding"),
     ("thinking", "thinking"),
+    (crate::types::ANSWER_TIER, "the answer"),
 ];
 
 /// Why a capability model was skipped, phrased for the user.  `memory` is the
@@ -455,7 +455,7 @@ impl ModelRouter {
     /// [`Self::llm_for_tier`] a miss never forces the generic large-model
     /// load — it lands on `agent_llm`.
     pub fn light_llm(&self, capability: Option<&str>, purpose: Option<&str>) -> Arc<dyn BaseLLM> {
-        let cap = capability.filter(|c| !c.is_empty()).unwrap_or(ModelCapability::General.value());
+        let cap = capability.filter(|c| !c.is_empty()).unwrap_or(crate::types::ANSWER_TIER);
         let picked = self
             .resolve(cap, true, "light")
             .filter(|llm| !self.is_router_model(llm))
@@ -771,14 +771,14 @@ mod tests {
         let (cb, seen) = recorder();
         router.begin_request(Some(cb));
         for _ in 0..3 {
-            let got = router.llm_for_tier(ModelTier::Large, Some("dp"), None);
+            let got = router.llm_for_tier(ModelTier::Large, Some("vision"), None);
             assert!(same_llm(&got, &cap));
         }
         assert_eq!(
             *seen.lock(),
             vec![
-                "Loading model for document processing…".to_string(),
-                "Selected ScriptedLlm for document processing".to_string(),
+                "Loading model for vision…".to_string(),
+                "Selected ScriptedLlm for vision".to_string(),
             ]
         );
     }
@@ -840,15 +840,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        router.llm_for_tier(ModelTier::Large, Some("general"), None);
-        router.llm_for_tier(ModelTier::Small, Some("general"), None);
-        router.decision_llm(Some("dp"), None);
+        router.llm_for_tier(ModelTier::Large, Some(crate::types::ANSWER_TIER), None);
+        router.llm_for_tier(ModelTier::Small, Some(crate::types::ANSWER_TIER), None);
+        router.decision_llm(Some("reasoning"), None);
         assert_eq!(*scopes.lock(), vec![false, true, true]);
         assert!(!local_only());
     }
 
     #[test]
-    fn a_light_task_may_resolve_remote_and_defaults_to_general() {
+    fn a_light_task_may_resolve_remote_and_defaults_to_the_answer_tier() {
         use crate::llms::cloud_llm::local_only;
 
         let agent: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "x".into());
@@ -869,7 +869,7 @@ mod tests {
         let got = router.light_llm(None, Some(WEB_SEARCH_PURPOSE));
         assert!(same_llm(&got, &cap));
         // A selected local model answered on device, so the cloud was not asked.
-        assert_eq!(*calls.lock(), vec![("general".to_string(), true)]);
+        assert_eq!(*calls.lock(), vec![(crate::types::ANSWER_TIER.to_string(), true)]);
     }
 
     #[test]

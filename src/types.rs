@@ -102,62 +102,94 @@ impl Attention {
     }
 }
 
-/// What a model can be routed to (or, for `Thinking`, how it answers).
+/// Something a model has, that a step can ask for: text, vision, reasoning,
+/// or (for `Thinking`) a way of answering.  The same four the platform's
+/// model definition names.
+///
+/// What a turn is *about* — general chat, documents, code — is not a
+/// capability: every text model does all of it, and which one answers is
+/// the router's step-up/step-down call on size, resources and what is
+/// resident (see [`ANSWER_TIER`]).  The values `general`, `dp` and
+/// `coding` that older catalogs and settings carry read as `text`, which
+/// is what they said of a model; a model declared `vision` alone is the
+/// one kind that holds no text conversation.
 ///
 /// Deserialization accepts the legacy spelling `"skills"` (any case, padded)
 /// for `Reasoning`, mirroring the Python `_missing_` hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ModelCapability {
-    /// `"general"`
-    General,
+    /// `"text"` — holds a text conversation: answers, reads documents,
+    /// writes code.  Every model but a vision-only one.
+    Text,
     /// `"reasoning"` — the model that reasons over a set of options before
     /// acting (skill matching, MCP server/tool choice, planning).
     Reasoning,
-    /// `"dp"`
-    Dp,
     /// `"vision"`
     Vision,
-    /// `"coding"`
-    Coding,
     /// `"thinking"` — the chat template reads `enable_thinking`.  Not a
     /// routing target.
     Thinking,
 }
 
+/// The routing key for the model that writes an answer, or extracts from
+/// documents: not a capability a model declares, but the tier every text
+/// model is a candidate for, walked largest-first (local ahead of remote
+/// on a size tie) to the first that fits — the step-up/step-down logic in
+/// [`crate::agents::orchestration::model_router::ModelRouter`].
+pub const ANSWER_TIER: &str = "answer";
+
 impl ModelCapability {
     /// All capabilities in declaration order.
-    pub const ALL: [ModelCapability; 6] = [
-        ModelCapability::General,
+    pub const ALL: [ModelCapability; 4] = [
+        ModelCapability::Text,
         ModelCapability::Reasoning,
-        ModelCapability::Dp,
         ModelCapability::Vision,
-        ModelCapability::Coding,
         ModelCapability::Thinking,
     ];
+
+    /// Values older catalogs, overrides and settings used for what a turn
+    /// is about.  Each said the model holds a text conversation, so each
+    /// reads as [`Self::Text`].
+    pub const LEGACY: [&'static str; 3] = ["general", "dp", "coding"];
 
     /// The enum's wire value.
     pub fn value(&self) -> &'static str {
         match self {
-            ModelCapability::General => "general",
+            ModelCapability::Text => "text",
             ModelCapability::Reasoning => "reasoning",
-            ModelCapability::Dp => "dp",
             ModelCapability::Vision => "vision",
-            ModelCapability::Coding => "coding",
             ModelCapability::Thinking => "thinking",
         }
     }
 
     /// Resolve a capability string, including names it used to go by
-    /// (`"skills"` -> `Reasoning`).  `None` when the value is unknown
-    /// (Python raises `ValueError` there).
+    /// (`"skills"` -> `Reasoning`; `general`, `dp`, `coding` -> `Text`).
+    /// `None` when the value is unknown.
     pub fn from_value(value: &str) -> Option<Self> {
+        let value = value.trim().to_lowercase();
         if let Some(c) = Self::ALL.iter().find(|c| c.value() == value) {
             return Some(*c);
         }
-        if value.trim().to_lowercase() == "skills" {
-            return Some(ModelCapability::Reasoning);
+        match value.as_str() {
+            "skills" => Some(ModelCapability::Reasoning),
+            v if Self::LEGACY.contains(&v) => Some(ModelCapability::Text),
+            _ => None,
         }
-        None
+    }
+
+    /// Whether `value` is one of the retired capability names.
+    pub fn is_legacy(value: &str) -> bool {
+        let value = value.trim().to_lowercase();
+        Self::LEGACY.contains(&value.as_str())
+    }
+
+    /// Whether a model declaring `caps` holds a text conversation: every
+    /// model does, except one that declares nothing but vision.  A list
+    /// that declares nothing is a text model's, as every model was before
+    /// `text` was declared.
+    pub fn text_model<S: AsRef<str>>(caps: &[S]) -> bool {
+        let vision = ModelCapability::Vision.value();
+        caps.is_empty() || caps.iter().any(|c| c.as_ref().to_lowercase() != vision)
     }
 }
 

@@ -282,6 +282,10 @@ pub struct ClassificationResult {
     /// write/grep: it picks the model, not the intent.
     #[serde(default)]
     pub has_coding_intent: bool,
+    /// The request brings the files it's about, as fenced blocks: a
+    /// client that read the project put them in the message, so there's
+    /// nothing to plan, fetch or extract before answering.
+    pub carries_files: bool,
     #[serde(default)]
     pub reasoning: String,
     /// Best-matching model capability for this request (e.g. coding, finance, vision)
@@ -386,6 +390,8 @@ pub struct ClassifyOptions {
     pub has_attachments: bool,
     pub history: Option<String>,
     pub cwd: Option<String>,
+    /// What the selected models declare (vision, reasoning, thinking);
+    /// `Some` even when empty while a model is selected, `None` with none.
     pub available_capabilities: Option<Vec<String>>,
 }
 
@@ -426,10 +432,52 @@ pub const GREP_KEYWORDS: &[&str] = &[
     "search across",
 ];
 
+/// Files at a folder's top that make it a code project.
+pub const PROJECT_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Gemfile",
+    "composer.json",
+    "Package.swift",
+    "CMakeLists.txt",
+    "mix.exs",
+];
+
+/// Whether `dir` is a code project: one of [`PROJECT_MARKERS`] sits at its
+/// top.
+pub fn is_code_project(dir: &str) -> bool {
+    let dir = expand_home(dir);
+    let dir = Path::new(&dir);
+    PROJECT_MARKERS.iter().any(|marker| dir.join(marker).is_file())
+}
+
+/// What makes a request coding work once the turn is in a code project:
+/// a verb that changes something, or a noun of the code itself.  Looser
+/// than [`CODING_RE`], which has to stand on its own anywhere.
+pub static IN_PROJECT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"(?i)\b(?:add|fix|create|implement|write|change|update|refactor|rename|remove|delete|move|build|run|",
+        r"test|debug|generate|scaffold|wire|hook|support|make|extract|split|merge|migrate|upgrade|bump|",
+        r"lint|format|compile|deploy|release|install)\b",
+        r"|\b(?:function|fn|method|module|struct|class|trait|enum|interface|type|file|crate|package|",
+        r"dependency|dependencies|import|endpoint|route|handler|api|cli|command|flag|option|config|",
+        r"test|tests|bug|error|panic|crash|exception|warning|compile|build|lint|readme|changelog)s?\b",
+    ))
+    .unwrap()
+});
+
 /// Signals that the request is programming work, so it routes to a
 /// `coding` model.  Kept to phrases that rarely mean anything else: a
-/// fenced code block, a source-file name, a language name, or a coding verb
-/// bound to a code noun.  Bare words like "code" or "compile" are left out —
+/// fenced code block, a source-file name, a language name, a coding verb
+/// bound to a code noun, or a language/framework naming a project ("a rust
+/// project", "react app").  Bare words like "code" or "compile" are left out —
 /// "zip code" and "compile a list" are not programming.
 pub static CODING_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
@@ -442,6 +490,9 @@ pub static CODING_RE: Lazy<Regex> = Lazy::new(|| {
         r"|\b(?:write|implement|refactor|optimi[sz]e) (?:a |an |the |this |my )?",
         r"(?:function|method|class|program|algorithm|endpoint|api|cli|unit test)\b",
         r"|\bfix (?:a |the |this |my )?bug\b",
+        r"|\b(?:rust|go|golang|node(?:\.?js)?|deno|react|vue|svelte|angular|next\.?js|django|flask|fastapi|rails|",
+        r"java|kotlin|python|typescript|javascript|c\+\+|c#|elixir|haskell|zig)",
+        r"\s+(?:project|app|application|crate|package|library|module|cli|service|server|api|website|starter)\b",
     ))
     .unwrap()
 });
@@ -545,56 +596,24 @@ impl Planner {
             }
         }
 
+        // Which model answers is routed, not classified.  Attachments are
+        // image work, which a model has to declare `vision` for; everything
+        // else — chat, documents, code — is text work on the answer tier,
+        // where the router steps up to the largest model that fits.  With
+        // no model selected at all (`available_capabilities` is `None`) a
+        // conversation plans nothing and streams on the router model.
         if let Some(capabilities) = available_capabilities.as_deref() {
-            if !capabilities.is_empty() {
-                result.capability = Self::match_capability(
-                    capabilities,
-                    has_attachments,
-                    result.has_coding_intent,
-                    skills.as_ref().is_some_and(|s| !s.is_empty()),
-                    result.has_document_context,
-                );
-                if let Some(cap) = result.capability.as_deref().filter(|c| !c.is_empty()) {
-                    tracing::info!(target: "smartloop.agents.planner", "[classify] capability → {}", cap);
-                }
-            }
+            let vision = ModelCapability::Vision.value();
+            let key = if has_attachments && capabilities.iter().any(|c| c == vision) {
+                vision
+            } else {
+                crate::types::ANSWER_TIER
+            };
+            result.capability = Some(key.to_string());
+            tracing::info!(target: "smartloop.agents.planner", "[classify] routes on → {}", key);
         }
 
         result
-    }
-
-    /// Pick a capability from planning signals in priority order.
-    ///
-    /// Priority:
-    ///   1. `vision`    — attachments imply image/document OCR work.
-    ///   2. `coding`    — programming work, which a coding model writes
-    ///      better than a skill or document model does.
-    ///   3. `reasoning` — a matched skill defines the procedure to run.
-    ///   4. `dp`        — indexed document context: data-processing model.
-    ///   5. `general`   — default for open-ended chat / general answers.
-    ///
-    /// Returns the first capability whose signal fires *and* is present
-    /// in `capabilities`, or `None` when nothing matches.
-    pub fn match_capability(
-        capabilities: &[String],
-        has_attachments: bool,
-        has_coding_intent: bool,
-        has_matched_skills: bool,
-        has_document_context: bool,
-    ) -> Option<String> {
-        let priority = [
-            (ModelCapability::Vision, has_attachments),
-            (ModelCapability::Coding, has_coding_intent),
-            (ModelCapability::Reasoning, has_matched_skills),
-            (ModelCapability::Dp, has_document_context),
-            (ModelCapability::General, true),
-        ];
-        for (cap, signal) in priority {
-            if signal && capabilities.iter().any(|c| c == cap.value()) {
-                return Some(cap.value().to_string());
-            }
-        }
-        None
     }
 
     /// Extract all deterministic signals from the user message.
@@ -648,8 +667,15 @@ impl Planner {
         // Grep intent
         result.has_grep_intent = GREP_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
 
-        // Coding intent
-        result.has_coding_intent = CODING_RE.is_match(user_message);
+        // Coding intent: the message says so outright, or the turn works
+        // in a code project and the message asks for a change or about the
+        // code, as [`IN_PROJECT_RE`] reads it.  A question about a document
+        // that happens to sit in a code project stays general.
+        result.carries_files = user_message.matches("```").count() >= 4 && user_message.len() >= 4_000;
+
+        let in_project = cwd.filter(|c| !c.is_empty()).is_some_and(is_code_project);
+        result.has_coding_intent =
+            CODING_RE.is_match(user_message) || (in_project && IN_PROJECT_RE.is_match(user_message));
 
         // Document context from vector search / uploads / attachments
         result.has_document_context =
@@ -660,6 +686,13 @@ impl Planner {
 
     /// Derive intent from detected signals.  Returns `None` when ambiguous.
     pub fn resolve_intent(&self, result: &mut ClassificationResult) -> Option<IntentType> {
+        // Coding work that brings its files is answered outright: a plan,
+        // reads of the paths it names and an extraction pass would only
+        // rebuild, slowly and on smaller models, what the message holds.
+        if result.has_coding_intent && result.carries_files {
+            result.reasoning = "coding work with its files in hand — answering directly".to_string();
+            return Some(IntentType::Conversation);
+        }
         // Build set of active signals
         let mut active: BTreeSet<Signal> = BTreeSet::new();
         if !result.matched_tools.is_empty() {
@@ -957,6 +990,10 @@ impl Planner {
                 // project it runs as a parallel source in the collect step (see
                 // Explorer.collect_parallel), so latest-info context is gathered for
                 // every query without a brittle keyword gate.
+                // One LARGE step on what the request routes on — vision for
+                // attachments, else the answer tier — when a model is
+                // selected; with none, nothing to plan: the router model
+                // streams the answer itself.
                 if let Some(cap) = classification.capability.as_deref().filter(|c| !c.is_empty()) {
                     return ExecutionPlan {
                         steps: vec![PlanStep {
@@ -970,10 +1007,10 @@ impl Planner {
                             capability: Some(cap.to_string()),
                             ..Default::default()
                         }],
-                        reasoning: format!("conversation → capability '{cap}'"),
+                        reasoning: format!("conversation → '{cap}'"),
                     };
                 }
-                ExecutionPlan { steps: Vec::new(), reasoning: "conversation (no capability)".to_string() }
+                ExecutionPlan { steps: Vec::new(), reasoning: "conversation (no model selected)".to_string() }
             }
             IntentType::ToolCall => self.plan_tool_call(classification, context),
             IntentType::Action => self.plan_action(classification, context),

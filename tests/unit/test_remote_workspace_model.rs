@@ -6,7 +6,7 @@
 
 use serde_json::json;
 use smartloop::model::spec::MODEL_SPECS;
-use smartloop::types::ModelKind;
+use smartloop::types::{ModelKind, ANSWER_TIER};
 use smartloop::workspace::workspace::{Workspace, WorkspaceModel};
 
 use crate::shared::platform_support::obj;
@@ -55,7 +55,8 @@ fn test_details_follow_the_catalog_not_the_registration() {
 
     assert_eq!(ws.models.len(), 1);
     assert_eq!(again.url().as_deref(), Some("https://api.smartloop.ai"));
-    assert_eq!(again.effective_capabilities(), caps(&["coding"]));
+    // "coding" said the model holds a text conversation: `text`.
+    assert_eq!(again.effective_capabilities(), caps(&["text"]));
     // Re-adding keeps the user's enabled choice.
     assert!(!again.enabled);
 }
@@ -88,8 +89,8 @@ fn test_remote_capabilities_come_from_the_catalog() {
         kind: ModelKind::Remote,
         ..Default::default()
     };
-    // Name inference would add "coding"; the catalog's list wins.
-    assert_eq!(model.effective_capabilities(), caps(&["general"]));
+    // The catalog's list wins over the name — and "general" declares nothing.
+    assert_eq!(model.effective_capabilities(), caps(&["text"]));
 }
 
 #[test]
@@ -122,7 +123,7 @@ fn test_remote_models_rank_among_themselves_by_active_params() {
     let mut ws = workspace();
     ws.add_remote_model("remote-light", true);
     ws.add_remote_model("remote-heavy", true);
-    assert_eq!(ranked_names(&ws, "general"), vec!["remote-heavy", "remote-light"]);
+    assert_eq!(ranked_names(&ws, ANSWER_TIER), vec!["remote-heavy", "remote-light"]);
 }
 
 #[test]
@@ -148,15 +149,15 @@ fn test_remote_models_rank_after_local_ones() {
     ws.add_remote_model("remote-ranked", true);
     ws.add_model("gemma4-e4b", "gemma4-e4b", None, true);
     ws.get_model_mut(Some("gemma4-e4b")).unwrap().downloaded = true;
-    assert_eq!(ranked_names(&ws, "general"), vec!["gemma4-e4b", "remote-ranked"]);
+    assert_eq!(ranked_names(&ws, ANSWER_TIER), vec!["gemma4-e4b", "remote-ranked"]);
 }
 
 #[test]
 fn test_a_capability_only_remote_models_declare_ranks_them() {
-    remote_spec("remote-coder", json!({"capabilities": ["general", "coding"]}));
+    remote_spec("remote-coder", json!({"capabilities": ["reasoning"]}));
     let mut ws = workspace();
     ws.add_remote_model("remote-coder", true);
-    assert_eq!(ranked_names(&ws, "coding"), vec!["remote-coder"]);
+    assert_eq!(ranked_names(&ws, "reasoning"), vec!["remote-coder"]);
 }
 
 #[test]

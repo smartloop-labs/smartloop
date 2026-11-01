@@ -64,6 +64,10 @@ pub struct CreateProjectRequest {
     /// `~/smartloop/<name>` when omitted.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The client making the project (`docent`, `studio`), for clients that
+    /// list only their own kind; omitted, the project belongs to no client.
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 /// Request to update an existing project.
@@ -85,6 +89,11 @@ pub struct UpdateProjectRequest {
     /// work in; `""` unbinds it, omit to leave unchanged.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The client the project belongs to (`docent`, `studio`): a client
+    /// claims a project made before the field existed; `""` lets it go,
+    /// omit to leave unchanged.
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -100,6 +109,9 @@ pub struct ProjectResponse {
     /// Visible project directory path.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The client that made the project, when it said (`docent`, `studio`).
+    #[serde(default)]
+    pub client: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -125,6 +137,7 @@ impl Default for ProjectResponse {
             id: String::new(),
             name: None,
             cwd: None,
+            client: None,
             description: None,
             model_name: None,
             skills: Vec::new(),

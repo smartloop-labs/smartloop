@@ -685,6 +685,11 @@ pub struct WorkspaceModel {
     pub thinking: Option<bool>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Capabilities set here, over whatever the catalog or the model's
+    /// name says: by `PATCH /v1/models/workspace/{name}`. None reads them
+    /// from the spec as usual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities_override: Option<Vec<String>>,
     #[serde(default)]
     pub config: Option<ModelConfig>,
     /// Remote models run behind their spec's `url` and have no weights on
@@ -706,6 +711,7 @@ impl Default for WorkspaceModel {
             enabled: true,
             thinking: None,
             capabilities: Vec::new(),
+            capabilities_override: None,
             config: None,
             kind: ModelKind::Local,
             models_dir: String::new(),
@@ -835,12 +841,33 @@ impl WorkspaceModel {
 
     /// Capabilities declared by the model's spec — read-only.
     ///
-    /// The stored `capabilities` field is ignored so the spec stays
-    /// authoritative and catalog updates to any model's capabilities take
-    /// effect immediately.  A local model without a spec falls back to
+    /// An override set here wins, for a local or a remote model alike.
+    /// Otherwise the stored `capabilities` field is ignored so the spec
+    /// stays authoritative and catalog updates to any model's capabilities
+    /// take effect immediately.  A local model without a spec falls back to
     /// metadata-inferred capabilities; a remote one, which nothing can be
     /// inferred about, declares none.
+    /// Whether the model holds a text conversation, so it is a candidate
+    /// for the answer tier: every model but one declared vision-only. An
+    /// override set here is read as declared; a spec knows from its whole
+    /// catalog row; a remote model without one is a chat model, as every
+    /// model the platform lists is; a local one without one is read off
+    /// its name.
+    pub fn is_text_model(&self) -> bool {
+        if let Some(set) = &self.capabilities_override {
+            return ModelCapability::text_model(set);
+        }
+        match self.spec() {
+            Some(spec) => ModelCapability::text_model(&spec.capability_values()),
+            None if self.is_remote() => true,
+            None => ModelCapability::text_model(&self.infer_capabilities()),
+        }
+    }
+
     pub fn effective_capabilities(&self) -> Vec<String> {
+        if let Some(set) = &self.capabilities_override {
+            return set.clone();
+        }
         match self.spec() {
             Some(spec) => spec.capability_values(),
             None if self.is_remote() => Vec::new(),
@@ -854,12 +881,6 @@ impl WorkspaceModel {
         let mut caps: Vec<String> = Vec::new();
         let size = self.param_size_b();
 
-        caps.push(ModelCapability::General.value().to_string());
-
-        if ["code", "coder", "starcoder", "deepseek-coder"].iter().any(|kw| combined.contains(kw)) {
-            caps.push(ModelCapability::Coding.value().to_string());
-        }
-
         // Vision is inferred only from an explicit vision marker in the name
         // (e.g. Qwen2.5-VL).  gemma-3-4b is NOT inferred as vision: llama-cpp
         // has no Gemma3 vision handler, so tagging it vision only produces a
@@ -869,11 +890,10 @@ impl WorkspaceModel {
         }
 
         if size >= 3.0 {
-            // GENERAL already added above; larger models additionally handle
-            // reasoning (skill matching, MCP tool resolution, planning) and
-            // document processing.
+            // Larger models handle reasoning (skill matching, MCP tool
+            // resolution, planning).  Text chat, documents and code need no
+            // tag: every model does them, and the answer tier ranks by size.
             caps.push(ModelCapability::Reasoning.value().to_string());
-            caps.push(ModelCapability::Dp.value().to_string());
         }
 
         caps
@@ -895,6 +915,11 @@ pub struct Project {
     pub system: bool,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The client that made the project (`docent`, `studio`), when it said:
+    /// a client that works a folder of code makes projects another client
+    /// has no use for, and can leave them out of its list by this.
+    #[serde(default)]
+    pub client: Option<String>,
     #[serde(default)]
     pub documents: Vec<Document>,
     #[serde(default)]
@@ -926,6 +951,7 @@ impl Default for Project {
             description: None,
             system: false,
             cwd: None,
+            client: None,
             documents: Vec::new(),
             skills: Vec::new(),
             mcp_servers: Vec::new(),
@@ -1091,6 +1117,7 @@ impl Project {
             description,
             system,
             cwd,
+            client,
             documents,
             skills,
             mcp_servers,
@@ -1108,6 +1135,7 @@ impl Project {
         self.description = description;
         self.system = system;
         self.cwd = cwd;
+        self.client = client;
         merge_records_by_id(&mut self.documents, documents);
         merge_records_by_id(&mut self.skills, skills);
         merge_records_by_id(&mut self.mcp_servers, mcp_servers);
@@ -1777,6 +1805,8 @@ impl Workspace {
     /// Per-project settings (`project`) override the workspace defaults.
     pub fn ranked_models_for(&self, capability: &str, project: Option<&Project>) -> Vec<WorkspaceModel> {
         let cap = capability.to_lowercase();
+        // The answer tier is every text model, not a declared capability.
+        let answer = cap == crate::types::ANSWER_TIER;
         let candidates: Vec<WorkspaceModel> = self
             .models
             .iter()
@@ -1784,7 +1814,13 @@ impl Workspace {
                 self.effective_model_enabled(&m.model_name, project)
                     && self.effective_model_downloaded(&m.model_name)
                     && (m.param_size_b() > 0.0 || m.is_remote())
-                    && m.effective_capabilities().iter().any(|c| c.to_lowercase() == cap)
+                    && {
+                        if answer {
+                            m.is_text_model()
+                        } else {
+                            m.effective_capabilities().iter().any(|c| c.to_lowercase() == cap)
+                        }
+                    }
             })
             .cloned()
             .collect();

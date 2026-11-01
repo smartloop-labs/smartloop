@@ -31,6 +31,7 @@ use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
 use crate::agents::orchestrator::{ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions};
+use crate::api::services::output_writer::{self, WriteOutcome};
 use crate::llms::base_llm::{BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::llms::cloud_llm::{local_only_scope, CloudLLM};
 use crate::model_host::remote_llm::RemoteLLM;
@@ -64,7 +65,7 @@ const LOG: &str = "smartloop.api.services.model_service";
 pub type ModelSelectedCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// `orchestrate` result:
-/// `(context, matched, error, citations, skill_instruction, mutation)`.
+/// `(context, matched, error, citations, skill_instruction, mutation, capability)`.
 ///
 /// * `context` — the formatted tool output;
 /// * `matched` — true when the orchestrator produced content;
@@ -72,13 +73,17 @@ pub type ModelSelectedCallback = Arc<dyn Fn(&str) + Send + Sync>;
 /// * `citations` — source document dicts (or `None`);
 /// * `skill_instruction` — the matched skill content (or `None`);
 /// * `mutation` — the router should stream `context` verbatim instead of
-///   running it through another LLM.
+///   running it through another LLM;
+/// * `capability` — what the planner classified the request as (e.g. coding).
 pub type OrchestrateOutcome = (
     Option<String>,
     bool,
     Option<String>,
     Option<Vec<Value>>,
     Option<String>,
+    bool,
+    Option<String>,
+    // Whether the planner read the request as programming work.
     bool,
 );
 
@@ -1550,6 +1555,7 @@ impl ModelService {
         system: bool,
         skills: Option<Vec<Skill>>,
         cwd: Option<&str>,
+        client: Option<&str>,
     ) -> anyhow::Result<Value> {
         self.ensure_model()?;
         let model = self.model_or_err()?;
@@ -1572,6 +1578,8 @@ impl ModelService {
                 current: true,
                 name: Some(name.to_string()),
                 description: description.map(str::to_string),
+                // The system project is every client's, and stays nobody's.
+                client: if system { None } else { client.map(str::to_string) },
                 system,
                 skills: skills.clone().unwrap_or_default(),
                 ..Project::default()
@@ -1655,6 +1663,7 @@ impl ModelService {
         skills: Option<Vec<Skill>>,
         web_search_enabled: Option<bool>,
         cwd: Option<&str>,
+        client: Option<&str>,
     ) -> anyhow::Result<Value> {
         self.ensure_model()?;
         let updated = self.with_project_mut(project_id, |project| {
@@ -1671,6 +1680,14 @@ impl ModelService {
             }
             if let Some(cwd) = cwd {
                 project.cwd = non_empty(Some(cwd)).map(str::to_string);
+            }
+            if let Some(client) = client
+                && !project.system
+            {
+                // A client claiming a project made before the field existed;
+                // `""` lets it go.  The system project is every client's,
+                // and stays nobody's.
+                project.client = non_empty(Some(client)).map(str::to_string);
             }
             project.clone()
         })?;
@@ -1698,6 +1715,9 @@ impl ModelService {
             "name": p.name,
             "cwd": p.work_dir().unwrap_or_default(),
             "description": p.description,
+            // The system project is every client's: a client a record may
+            // carry from before that held is not reported.
+            "client": if p.system { None } else { p.client.clone() },
             "model_name": self.model_name.read().clone(),
             "current": p.current,
             "system": p.system,
@@ -3329,7 +3349,7 @@ impl ModelService {
         requested_skill: Option<&str>,
         current_date: Option<&str>,
     ) -> OrchestrateOutcome {
-        let none: OrchestrateOutcome = (None, false, None, None, None, false);
+        let none: OrchestrateOutcome = (None, false, None, None, None, false, None, false);
         tracing::info!(target: LOG, "[orchestrator] entered orchestrate: {:?}", prefix_chars(user_message, 120));
 
         // A missing handle is recoverable when the weights are the host's —
@@ -3456,7 +3476,7 @@ impl ModelService {
         let Some(current_project) = model.workspace.read().current_project().cloned() else {
             if let Some(perception) = image_perception.clone() {
                 tracing::info!(target: LOG, "[orchestrator] no current project — streaming image perception directly.");
-                return (Some(perception), true, None, None, None, true);
+                return (Some(perception), true, None, None, None, true, None, false);
             }
             tracing::warn!(target: LOG, "[orchestrator] BYPASSED — no current project. Falling back to raw stream_completion.");
             return none;
@@ -3553,11 +3573,11 @@ impl ModelService {
             options.project_id = self.get_project_id();
             options.answers_remotely = self.answers_remotely();
             options.executor = Some(self.get_llm_executor());
-            // Gathered context answers on the `general` response model (see
-            // the chat router), so it is sized against that model's window.
+            // Gathered context answers on the answer tier's model (see the
+            // chat router), so it is sized against that model's window.
             options.answer_window = Some(Arc::new({
                 let service = service.clone();
-                move || service.get_response_max_context_tokens(Some(ModelCapability::General.value()))
+                move || service.get_response_max_context_tokens(Some(crate::types::ANSWER_TIER))
             }));
             let orchestrator = SLPOrchestrator::new(orchestrator_llm, options);
 
@@ -3566,10 +3586,14 @@ impl ModelService {
             // workspace of its own — the service owns it.
             orchestrator.tool_caller.set_persist(Some(self.persist_hook()));
 
-            let available_capabilities: Vec<String> = {
+            // What the selected models declare, and whether any is selected
+            // at all: text work needs no declaration, so a selection may
+            // declare nothing and still be one.
+            let (available_capabilities, any_selected): (Vec<String>, bool) = {
                 let workspace = model.workspace.read();
                 let project = workspace.current_project();
                 let mut caps: Vec<String> = Vec::new();
+                let mut any_selected = false;
                 let mut snapshot: Vec<String> = Vec::new();
                 for m in &workspace.models {
                     let enabled = workspace.effective_model_enabled(&m.model_name, project);
@@ -3583,6 +3607,7 @@ impl ModelService {
                         effective
                     ));
                     if enabled && downloaded {
+                        any_selected = true;
                         for cap in effective {
                             if !caps.contains(&cap) {
                                 caps.push(cap);
@@ -3596,7 +3621,7 @@ impl ModelService {
                     snapshot.join(", "),
                     caps
                 );
-                caps
+                (caps, any_selected)
             };
 
             // Propagate the cancellation event onto the orchestrator's primary
@@ -3638,11 +3663,7 @@ impl ModelService {
                         project_dir: Some(orchestrator_cwd.clone()),
                         model_service: Some(service.clone()),
                         conversation_history: conversation_history.as_ref().map(|h| history_maps(h)),
-                        available_capabilities: if available_capabilities.is_empty() {
-                            None
-                        } else {
-                            Some(available_capabilities.clone())
-                        },
+                        available_capabilities: any_selected.then(|| available_capabilities.clone()),
                         progress_callback: progress_callback.clone(),
                         requested_skill: requested_skill.map(str::to_string),
                         current_date: current_date.map(str::to_string),
@@ -3658,15 +3679,15 @@ impl ModelService {
                 // No tool handled it, but a perceived image's description must
                 // still reach the final response as context.
                 if image_perception.is_some() {
-                    return Ok((with_image_context(None), true, None, None, None, false));
+                    return Ok((with_image_context(None), true, None, None, None, false, result.capability, result.coding));
                 }
-                return Ok(none.clone());
+                return Ok((None, false, None, None, None, false, result.capability, result.coding));
             }
 
             if let Some(error) = result.error.as_ref().filter(|e| !e.is_empty()) {
                 let tool = result.tool_name.clone().unwrap_or_else(|| "None".into());
                 tracing::warn!(target: LOG, "Tool call failed ({tool}): {error}");
-                return Ok((None, true, Some(format!("Tool '{tool}' failed: {error}")), None, None, false));
+                return Ok((None, true, Some(format!("Tool '{tool}' failed: {error}")), None, None, false, None, false));
             }
 
             if let Some(content) = result.content.as_ref().filter(|c| !c.is_empty()) {
@@ -3686,10 +3707,12 @@ impl ModelService {
                     citations,
                     result.skill_instruction.clone(),
                     result.mutation,
+                    result.capability,
+                    result.coding,
                 ));
             }
 
-            Ok((with_image_context(None), true, None, None, result.skill_instruction.clone(), false))
+            Ok((with_image_context(None), true, None, None, result.skill_instruction.clone(), false, result.capability, result.coding))
         }));
 
         let failure = match run {
@@ -3698,29 +3721,34 @@ impl ModelService {
             Err(panic) => panic_message(&panic),
         };
         tracing::warn!(target: LOG, "Tool call attempt failed: {failure}");
-        (None, true, Some(format!("Tool call failed: {failure}")), None, None, false)
+        (None, true, Some(format!("Tool call failed: {failure}")), None, None, false, None, false)
     }
 
     // --------------------------------------------------------------- auto-write
 
-    /// Write LLM output to `<cwd>/.out/<name>.md` when the user asked to
-    /// create/generate/write.
+    /// Write LLM output into `cwd` when the user asked to create/generate/write.
     ///
     /// Two modes: a bare "write"/"save" command writes the last assistant
     /// response from session history (refine back and forth, then save); an
-    /// inline write intent writes the current `llm_response`.  Returns the
-    /// written path, or `None` when no write was needed.
+    /// inline write intent writes the current `llm_response`.  The answer is
+    /// saved as one `<name>.md` under `.out/` (see [`output_writer`]); writing
+    /// an answer's files into the project is the client's job.  Returns what
+    /// was written — empty when no write was needed.
     pub fn maybe_write_output(
         &self,
         user_message: &str,
         llm_response: &str,
         cwd: Option<&str>,
         session_id: Option<&str>,
-    ) -> Option<String> {
-        let cwd = non_empty(cwd)?;
-        let llm = self.resident_llm()?;
-
-        let cwd = expand_home(cwd);
+    ) -> WriteOutcome {
+        let Some(cwd) = non_empty(cwd) else {
+            return WriteOutcome::default();
+        };
+        // No answer came: there's nothing of the user's to save.
+        if llm_response.trim_start().starts_with("**No response generated.**") {
+            return WriteOutcome::default();
+        }
+        let cwd = PathBuf::from(expand_home(cwd));
         let mut content_to_write = llm_response.to_string();
 
         if BARE_WRITE_RE.is_match(user_message) {
@@ -3737,23 +3765,23 @@ impl ModelService {
                     }
                     None => {
                         tracing::info!(target: LOG, "[auto-write] Bare write command but no prior assistant response found");
-                        return None;
+                        return WriteOutcome::default();
                     }
                 }
             } else if llm_response.is_empty() {
-                return None;
+                return WriteOutcome::default();
             }
         } else if llm_response.is_empty() || !WRITE_INTENT_RE.is_match(user_message) {
-            return None;
+            return WriteOutcome::default();
         }
 
+        let content_to_write = Self::extract_document_content(&content_to_write);
         if content_to_write.is_empty() {
-            return None;
+            return WriteOutcome::default();
         }
-        let mut content_to_write = Self::extract_document_content(&content_to_write);
-        if content_to_write.is_empty() {
-            return None;
-        }
+        let Some(llm) = self.resident_llm() else {
+            return WriteOutcome::default();
+        };
 
         // Ask the LLM only for the filename — write the actual content.
         let prompt = format!(
@@ -3765,45 +3793,21 @@ impl ModelService {
         let outcome = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<Option<String>> {
             let raw = llm.invoke(&prompt, None, None);
             let file_name = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
-            if file_name.is_empty() {
+            let safe_name = SAFE_FILENAME_RE.replace_all(&file_name, "_").trim_matches('_').to_string();
+            if safe_name.is_empty() {
                 return Ok(None);
             }
-
-            let safe_name = SAFE_FILENAME_RE.replace_all(&file_name, "_").trim_matches('_').to_string();
-            let out_dir = Path::new(&cwd).join(".out");
-            std::fs::create_dir_all(&out_dir)?;
-            let mut full_path = out_dir.join(format!("{safe_name}.md"));
-
-            // If the file already exists, append a counter.
-            let mut counter = 1;
-            while full_path.exists() {
-                full_path = out_dir.join(format!("{safe_name}_{counter}.md"));
-                counter += 1;
-            }
-
-            if !content_to_write.ends_with('\n') {
-                content_to_write.push('\n');
-            }
-            content_to_write.push_str("\nCo-Authored By: Smartloop AI\n");
-
-            std::fs::write(&full_path, &content_to_write)?;
-            let full_path = full_path.to_string_lossy().into_owned();
-            tracing::info!(
-                target: LOG,
-                "[auto-write] Saved to {full_path} ({} chars)",
-                content_to_write.chars().count()
-            );
-            Ok(Some(full_path))
+            Ok(Some(output_writer::write_document(&cwd, &safe_name, &content_to_write)?))
         }));
         match outcome {
-            Ok(Ok(path)) => path,
+            Ok(Ok(path)) => WriteOutcome { written: path.into_iter().collect() },
             Ok(Err(e)) => {
                 tracing::warn!(target: LOG, "[auto-write] Failed: {e}");
-                None
+                WriteOutcome::default()
             }
             Err(panic) => {
                 tracing::warn!(target: LOG, "[auto-write] Failed: {}", panic_message(&panic));
-                None
+                WriteOutcome::default()
             }
         }
     }

@@ -17,6 +17,7 @@ use smartloop::agents::planner::{
 };
 use smartloop::llms::base_llm::{CallOptions, CancelEvent, ChatMessage, GenerationStream};
 use smartloop::llms::BaseLLM;
+use smartloop::types::ANSWER_TIER;
 
 // ------------------------------------------------------------------ //
 // Fixtures                                                            //
@@ -365,6 +366,60 @@ fn test_classify_llm_fallback_unparseable() {
     assert_eq!(result.intent, IntentType::Conversation);
 }
 
+/// In a code project, a request to change something or about the code is
+/// coding work; a question about a document there, or the same request
+/// outside a project, is not.
+#[test]
+fn test_detect_signals_coding_intent_from_the_folder_and_the_ask() {
+    let planner = planner();
+    let dir = std::env::temp_dir().join(format!("slp-planner-code-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let here = dir.to_string_lossy().into_owned();
+    let coding = |msg: &str| planner.detect_signals(msg, &[], Some(&here), None, false).has_coding_intent;
+    // A plain folder: only outright coding phrases count.
+    assert!(!smartloop::agents::planner::is_code_project(&here));
+    assert!(!coding("add a greeting and call it from main"));
+    assert!(coding("write a function that parses ISO dates"));
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+    assert!(smartloop::agents::planner::is_code_project(&here));
+    for msg in [
+        "add a greeting and call it from main",
+        "why does it panic on startup?",
+        "rename the config flag to --verbose",
+        "the build fails with a warning",
+        "update the readme",
+    ] {
+        assert!(coding(msg), "expected coding intent in a code project: {msg}");
+    }
+    for msg in [
+        "what does the contract say about renewals?",
+        "summarize the quarterly report",
+        "who is the author of this proposal?",
+    ] {
+        assert!(!coding(msg), "unexpected coding intent in a code project: {msg}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Coding work that brings its files, as a client that read the project
+/// sends it, is answered outright: no plan, no reads, no extraction.
+#[test]
+fn test_coding_work_with_its_files_in_hand_is_answered_directly() {
+    let planner = planner();
+    let mut message = String::from("I'm working in the Rust project at /tmp/app. Fix the panic in main.\n\nIts files:\n- src/main.rs\n- src/lib.rs\n\nTheir contents now:\n");
+    for name in ["src/main.rs", "src/lib.rs"] {
+        message.push_str(&format!("\n`{name}`\n```rs\n{}\n```\n", "fn f() {}\n".repeat(300)));
+    }
+    let mut result = planner.detect_signals(&message, &[], None, None, false);
+    assert!(result.has_coding_intent && result.carries_files);
+    assert_eq!(planner.resolve_intent(&mut result), Some(IntentType::Conversation));
+    // The same request without the files plans as before.
+    let mut bare = planner.detect_signals("Fix the panic in src/main.rs", &[], None, None, false);
+    assert!(bare.has_coding_intent && !bare.carries_files);
+    assert_ne!(planner.resolve_intent(&mut bare), Some(IntentType::Conversation));
+}
+
 /// Programming requests raise the coding signal; look-alikes don't.
 #[test]
 fn test_detect_signals_coding_intent() {
@@ -378,6 +433,9 @@ fn test_detect_signals_coding_intent() {
         "fix the bug in the login flow",
         "how do I do this in python",
         "write a SQL query for monthly revenue",
+        "create a rust project",
+        "scaffold a React app with routing",
+        "set up a node.js server",
     ] {
         let result = planner.detect_signals(msg, &[], None, None, false);
         assert!(result.has_coding_intent, "expected coding intent: {msg}");
@@ -389,44 +447,66 @@ fn test_detect_signals_coding_intent() {
         "write a script for my wedding toast",
         "summarize the code of conduct",
         "what does this will say about the house?",
+        "create a project plan for the launch",
+        "rust removal tips for my bike",
     ] {
         let result = planner.detect_signals(msg, &[], None, None, false);
         assert!(!result.has_coding_intent, "unexpected coding intent: {msg}");
     }
 }
 
-/// Coding outranks skills and documents, but not attachments, and only
-/// when a selected model declares it.
+/// What a turn is about is not a capability: a coding conversation is
+/// still read as coding work, but it names no capability and plans one
+/// LARGE step on the answer tier, where the router steps up to the largest
+/// model that fits.
 #[test]
-fn test_match_capability_coding_priority() {
-    let all: Vec<String> =
-        ["general", "reasoning", "dp", "vision", "coding"].iter().map(|s| s.to_string()).collect();
-    assert_eq!(Planner::match_capability(&all, false, true, true, true).as_deref(), Some("coding"));
-    assert_eq!(Planner::match_capability(&all, true, true, true, true).as_deref(), Some("vision"));
-    assert_eq!(Planner::match_capability(&all, false, false, true, true).as_deref(), Some("reasoning"));
-
-    let no_coding: Vec<String> = ["general", "dp"].iter().map(|s| s.to_string()).collect();
-    assert_eq!(Planner::match_capability(&no_coding, false, true, false, true).as_deref(), Some("dp"));
-}
-
-/// A coding conversation plans one LARGE step on the coding model.
-#[test]
-fn test_classify_coding_conversation_routes_to_coding() {
+fn test_classify_coding_conversation_plans_on_the_answer_tier() {
     let planner = planner();
     let result = planner.classify(
         "refactor this function to use iterators",
         &[],
         ClassifyOptions {
-            available_capabilities: Some(vec!["general".into(), "coding".into()]),
+            available_capabilities: Some(vec!["reasoning".into(), "vision".into()]),
             ..Default::default()
         },
     );
     assert!(result.has_coding_intent);
-    assert_eq!(result.capability.as_deref(), Some("coding"));
+    assert_eq!(result.capability.as_deref(), Some(ANSWER_TIER));
     let plan = planner.create_plan(&result, &ctx("refactor this function to use iterators"), None);
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(plan.steps[0].model_tier, ModelTier::Large);
-    assert_eq!(plan.steps[0].capability.as_deref(), Some("coding"));
+    assert_eq!(plan.steps[0].capability.as_deref(), Some(ANSWER_TIER));
+}
+
+/// Attachments are the one signal that names a capability a model has to
+/// declare: the conversation step asks for vision when a selected model
+/// has it, and takes the answer tier otherwise.  With no model selected
+/// nothing routes, and nothing is planned.
+#[test]
+fn test_classify_with_attachments_asks_for_vision() {
+    let planner = planner();
+    let with = |caps: Option<Vec<&str>>| {
+        planner.classify(
+            "what does this picture show",
+            &[],
+            ClassifyOptions {
+                has_attachments: true,
+                available_capabilities: caps.map(|c| c.into_iter().map(str::to_string).collect()),
+                ..Default::default()
+            },
+        )
+    };
+    let mut result = with(Some(vec!["vision"]));
+    assert_eq!(result.capability.as_deref(), Some("vision"));
+    result.intent = IntentType::Conversation;
+    let plan = planner.create_plan(&result, &ctx("what does this picture show"), None);
+    assert_eq!(plan.steps[0].capability.as_deref(), Some("vision"));
+
+    assert_eq!(with(Some(vec![])).capability.as_deref(), Some(ANSWER_TIER));
+    let mut none = with(None);
+    assert_eq!(none.capability, None);
+    none.intent = IntentType::Conversation;
+    assert!(planner.create_plan(&none, &ctx("what does this picture show"), None).steps.is_empty());
 }
 
 // ------------------------------------------------------------------ //

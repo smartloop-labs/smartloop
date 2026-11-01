@@ -215,16 +215,13 @@ fn test_unknown_workspace_model_is_left_alone() {
 
 #[test]
 fn test_the_bootstrap_model_answers_the_capability_question() {
-    // It declares only the [General] floor, and the answer is no.
+    // It declares nothing, and the answer is no.
     assert!(!LlmFactory::supports_thinking(Some("sl-mini")));
     assert_eq!(LlmFactory::thinking_for(Some("sl-mini"), None), None);
 }
 
 #[test]
-fn test_capabilities_are_never_empty_and_sl_mini_is_unchanged() {
-    for spec in MODEL_SPECS.specs() {
-        assert!(!spec.capabilities.is_empty(), "{}", spec.name);
-    }
+fn test_sl_mini_declares_nothing_like_the_base_default() {
 
     // The base default has to match what capability inference already gave a
     // 1B text model, or adding it would silently re-scope the orchestrator.
@@ -233,7 +230,9 @@ fn test_capabilities_are_never_empty_and_sl_mini_is_unchanged() {
         model_id: "smartloop-ai/slp-orchestra-mini".to_string(),
         ..WorkspaceModel::default()
     };
-    assert_eq!(sl_mini.effective_capabilities(), vec![ModelCapability::General.value().to_string()]);
+    // The seed declares `text`, which is what inference gave it too.
+    assert_eq!(sl_mini.effective_capabilities(), ["text"]);
+    assert!(ModelCapability::text_model(&sl_mini.effective_capabilities()));
 }
 
 #[test]

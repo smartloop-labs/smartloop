@@ -45,7 +45,9 @@ pub struct ModelSpec {
     /// for a dense one, where it equals `param_size_b`.
     pub active_param_size_b: Option<f64>,
     pub attention: Option<Attention>,
-    /// Capabilities the model declares — never empty.
+    /// Capabilities the model declares.  `text` for every model but a
+    /// vision-only one; a list that declares nothing reads as a text
+    /// model's.
     pub capabilities: Vec<ModelCapability>,
     /// Whether reasoning starts ON for a model that supports it.
     pub thinking_default: bool,
@@ -60,8 +62,8 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
-    /// A local model with the base defaults: version 0, unknown size,
-    /// `[General]`, thinking off, text-only.
+    /// A local model with the base defaults: version 0, unknown size, no
+    /// declared capabilities, thinking off, text-only.
     pub fn local(name: &str, model_id: &str) -> Self {
         Self {
             name: canonical_model_name(name),
@@ -107,7 +109,7 @@ impl ModelSpec {
         }
     }
 
-    /// Capability wire values, e.g. `["general", "dp"]`.
+    /// Capability wire values, e.g. `["vision", "thinking"]`.
     pub fn capability_values(&self) -> Vec<String> {
         self.capabilities.iter().map(|c| c.value().to_string()).collect()
     }
@@ -145,19 +147,19 @@ impl ModelSpec {
                 None => tracing::warn!("[models] {} declares unknown attention '{attention}' — ignoring it", spec.name),
             }
         }
-        let capabilities = row.capabilities.unwrap_or_default();
-        let known: Vec<ModelCapability> = capabilities
-            .iter()
-            .filter_map(|c| {
-                let cap = ModelCapability::from_value(c);
-                if cap.is_none() {
-                    tracing::warn!("[models] {} declares unknown capability '{c}' — ignoring it", spec.name);
+        // A declared list replaces the base's.  `general`, `dp` and `coding`,
+        // what older catalogs said of every text model, each read as `text`,
+        // once.  An absent or empty list declares nothing and keeps the base.
+        if let Some(capabilities) = row.capabilities.filter(|c| !c.is_empty()) {
+            let mut declared: Vec<ModelCapability> = Vec::new();
+            for c in &capabilities {
+                match ModelCapability::from_value(c) {
+                    Some(cap) if !declared.contains(&cap) => declared.push(cap),
+                    Some(_) => {}
+                    None => tracing::warn!("[models] {} declares unknown capability '{c}' — ignoring it", spec.name),
                 }
-                cap
-            })
-            .collect();
-        if !known.is_empty() {
-            spec.capabilities = known;
+            }
+            spec.capabilities = declared;
         }
         if let Some(thinking) = row.thinking_default {
             spec.thinking_default = thinking;
@@ -232,7 +234,7 @@ impl CatalogModel {
 /// the catalog publishes for them, so a first run or an offline machine
 /// behaves exactly as an online one.
 pub fn seed_specs() -> Vec<ModelSpec> {
-    use ModelCapability::{Dp, General, Reasoning, Thinking, Vision};
+    use ModelCapability::{Reasoning, Text, Thinking, Vision};
 
     let spec = |name: &str,
                 model_id: &str,
@@ -249,10 +251,10 @@ pub fn seed_specs() -> Vec<ModelSpec> {
 
     vec![
         // The 1B text-only orchestrator model.
-        spec(BOOTSTRAP_MODEL, "smartloop-ai/slp-orchestra-mini", 3, 1.0, vec![General], None),
+        spec(BOOTSTRAP_MODEL, "smartloop-ai/slp-orchestra-mini", 3, 1.0, vec![Text], None),
         // llama.cpp has no Gemma3-specific handler; Gemma 3's mmproj loads
         // through the generic mtmd path (projector auto-detected from the GGUF).
-        spec("gemma3-4b", "google/gemma-3-4b-it", 3, 4.0, vec![General, Dp], Some("MTMDChatHandler")),
+        spec("gemma3-4b", "google/gemma-3-4b-it", 3, 4.0, vec![Text], Some("MTMDChatHandler")),
         // Gemma 4's chat template reads enable_thinking (defaulting it to false)
         // and emits reasoning on a <|channel>thought…<channel|> channel; THINKING
         // is declared so the picker offers the toggle, left off by default.
@@ -261,7 +263,7 @@ pub fn seed_specs() -> Vec<ModelSpec> {
             "google/gemma-4-e2b-it",
             4,
             2.0,
-            vec![General, Dp, Vision, Thinking],
+            vec![Text, Vision, Thinking],
             Some("Gemma4ChatHandler"),
         ),
         spec(
@@ -269,7 +271,7 @@ pub fn seed_specs() -> Vec<ModelSpec> {
             "google/gemma-4-e4b-it",
             4,
             4.0,
-            vec![General, Dp, Vision, Thinking],
+            vec![Text, Vision, Thinking],
             Some("Gemma4ChatHandler"),
         ),
         // Smaller than Qwen2.5-VL-3B so it fits on GPU alongside the
@@ -284,7 +286,7 @@ pub fn seed_specs() -> Vec<ModelSpec> {
             "mistralai/Ministral-3-3B-Instruct-2512",
             3,
             3.0,
-            vec![General, Dp, Vision],
+            vec![Text, Vision],
             Some("MTMDChatHandler"),
         ),
         // A hybrid-reasoning model that can think in a `<think>` block. Its
@@ -298,7 +300,7 @@ pub fn seed_specs() -> Vec<ModelSpec> {
             "Qwen/Qwen3.5-2B",
             3,
             2.0,
-            vec![General, Reasoning, Dp, Vision, Thinking],
+            vec![Text, Reasoning, Vision, Thinking],
             Some("MTMDChatHandler"),
         ),
     ]

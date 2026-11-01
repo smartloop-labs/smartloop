@@ -27,7 +27,6 @@ use crate::agents::orchestration::step::{NodePair, SharedSearchContext, Step, St
 use crate::agents::planner::ModelTier;
 use crate::config::app_settings::AppSettings;
 use crate::llms::base_llm::BatchPrompt;
-use crate::types::ModelCapability;
 
 /// Python logger name of this module.
 pub const LOGGER: &str = "smartloop.agents.orchestration.document_fanout";
@@ -48,7 +47,9 @@ pub const OUTPUT_RESERVE_TOKENS: usize = 1024;
 /// rest of the context window — ~64k tokens on a large window, twenty minutes
 /// of a small model repeating itself while the whole turn waits on it.  A
 /// concise extract runs ~1k tokens.
-pub const EXTRACT_MAX_TOKENS: usize = 2048;
+/// Room for one batch's extraction. A reasoning model thinks before it
+/// extracts, within the same room, so a small cap came back empty.
+pub const EXTRACT_MAX_TOKENS: usize = 4096;
 
 /// Floor on the extract budget, so a short document still has room for
 /// its facts (and a NONE costs nothing either way).
@@ -256,10 +257,11 @@ impl DocumentFanoutStep {
     ) {
         // Size the extraction input to the EXTRACTION model's actual context
         // window — not the router's.  The router's max_tokens can exceed the
-        // DP model's window (e.g. 8192 vs 6080), so sizing from it overflows
-        // the extractor and generation silently fails.
+        // extractor's window (e.g. 8192 vs 6080), so sizing from it overflows
+        // the extractor and generation silently fails.  Extraction is text
+        // work, so it runs on the answer tier's model.
         let mut max_chars = DEFAULT_MAX_CHARS;
-        let dp_llm = self.models.llm_for_tier(ModelTier::Large, Some(ModelCapability::Dp.value()), None);
+        let dp_llm = self.models.llm_for_tier(ModelTier::Large, Some(crate::types::ANSWER_TIER), None);
         tracing::info!(
             target: LOGGER,
             "[doc-batch] {} → {} ({} document(s))",
@@ -574,8 +576,13 @@ impl Step for DocumentFanoutStep {
         Self::NAME
     }
 
-    /// True when the retrieved documents warrant the fan-out.
-    fn applies_to(&self, _ctx: &OrchestratorContext, search_ctx: Option<&SearchContext>) -> bool {
+    /// True when the retrieved documents warrant the fan-out: not for
+    /// coding work that brought its files, whose documents are those files
+    /// again.
+    fn applies_to(&self, ctx: &OrchestratorContext, search_ctx: Option<&SearchContext>) -> bool {
+        if ctx.request_coding && ctx.request_carries_files {
+            return false;
+        }
         search_ctx.is_some_and(|sc| sc.documents.len() >= Self::THRESHOLD)
     }
 

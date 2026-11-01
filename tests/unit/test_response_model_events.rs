@@ -19,7 +19,7 @@ use smartloop::workspace::WorkspaceModel;
 
 use crate::shared::model_service_b::{FakeLLM, default_model, project, same, service_with_workspace, ws_model};
 
-const GENERAL: &str = "general";
+const ANSWER: &str = smartloop::types::ANSWER_TIER;
 
 fn llm(name: &str) -> Arc<dyn BaseLLM> {
     FakeLLM::named(name).dyn_llm()
@@ -111,7 +111,7 @@ fn test_a_pending_capability_load_warns_before_it_blocks() {
     let svc = service(Options { selection: Selection::Available, ..Options::default() });
     let sink = events(&svc);
 
-    svc.announce_response_model(Some(GENERAL));
+    svc.announce_response_model(Some(ANSWER));
 
     assert_eq!(messages(&sink), vec!["Loading model for the response…"]);
 }
@@ -121,7 +121,7 @@ fn test_nothing_is_announced_when_no_model_provides_it() {
     let svc = service(Options { selection: Selection::Unavailable, ..Options::default() });
     let sink = events(&svc);
 
-    svc.announce_response_model(Some(GENERAL));
+    svc.announce_response_model(Some(ANSWER));
 
     assert!(messages(&sink).is_empty());
 }
@@ -154,7 +154,7 @@ fn test_a_capability_model_is_named() {
     let svc = service(Options { capability_llm: Some(llm("Gemma 3n E2B")), ..Options::default() });
     let sink = events(&svc);
 
-    svc.llm_for_response(Some(GENERAL));
+    svc.llm_for_response(Some(ANSWER));
 
     assert_eq!(messages(&sink), vec!["Selected Gemma 3n E2B for the response"]);
 }
@@ -164,7 +164,7 @@ fn test_the_large_model_fallback_is_named() {
     let svc = service(Options { capability_llm: None, large_llm: Some(llm("Ministral 3B")), ..Options::default() });
     let sink = events(&svc);
 
-    svc.llm_for_response(Some(GENERAL));
+    svc.llm_for_response(Some(ANSWER));
 
     assert_eq!(messages(&sink), vec!["Selected Ministral 3B for the response"]);
 }
@@ -184,9 +184,9 @@ fn test_the_capability_tag_never_reaches_the_user() {
     let svc = service(Options { capability_llm: Some(llm("Gemma 3n E2B")), ..Options::default() });
     let sink = events(&svc);
 
-    svc.llm_for_response(Some(GENERAL));
+    svc.llm_for_response(Some(ANSWER));
 
-    assert!(!messages(&sink).iter().any(|m| m.to_lowercase().contains("general")));
+    assert!(!messages(&sink).iter().any(|m| m.to_lowercase().contains(ANSWER)));
 }
 
 // --------------------------------------------------------- falling back says why
@@ -200,7 +200,7 @@ fn test_memory_is_named() {
     });
     let sink = events(&svc);
 
-    svc.llm_for_response(Some(GENERAL));
+    svc.llm_for_response(Some(ANSWER));
 
     assert_eq!(messages(&sink), vec!["Selected sl-mini — not enough memory for gemma4-e2b"]);
 }
@@ -215,7 +215,7 @@ fn test_a_failed_pin_also_falls_back_with_a_reason() {
     });
     let sink = events(&svc);
 
-    svc.llm_for_response(Some(GENERAL));
+    svc.llm_for_response(Some(ANSWER));
 
     assert!(messages(&sink)[0].contains("not enough memory"));
 }
@@ -238,9 +238,9 @@ fn test_each_request_reports_its_model_again() {
     let svc = service(Options { capability_llm: Some(llm("Gemma 3n E2B")), ..Options::default() });
 
     let first = events(&svc);
-    svc.llm_for_response(Some(GENERAL));
+    svc.llm_for_response(Some(ANSWER));
     let second = events(&svc);
-    svc.llm_for_response(Some(GENERAL));
+    svc.llm_for_response(Some(ANSWER));
 
     assert_eq!(messages(&first), vec!["Selected Gemma 3n E2B for the response"]);
     assert_eq!(messages(&second), vec!["Selected Gemma 3n E2B for the response"]);
@@ -252,8 +252,8 @@ fn test_one_request_reports_once() {
     let svc = service(Options { capability_llm: Some(llm("Gemma 3n E2B")), ..Options::default() });
     let sink = events(&svc);
 
-    svc.llm_for_response(Some(GENERAL));
-    svc.llm_for_response(Some(GENERAL));
+    svc.llm_for_response(Some(ANSWER));
+    svc.llm_for_response(Some(ANSWER));
 
     assert_eq!(messages(&sink), vec!["Selected Gemma 3n E2B for the response"]);
 }
@@ -265,15 +265,15 @@ fn test_the_router_tracks_a_model_switch() {
     let switched = llm("Ministral 3B");
     *svc.llm.write() = Some(switched.clone());
 
-    svc.llm_for_response(Some(GENERAL));
+    svc.llm_for_response(Some(ANSWER));
 
     assert!(same(&svc.response_router().orchestrator_llm, &switched));
 }
 
-/// A log line naming `ModelCapability::General` is one nobody can grep for.
+/// A log line naming `ModelCapability::Vision` is one nobody can grep for.
 #[test]
 fn test_capability_names_are_logged_by_value_not_member() {
-    assert_eq!(ModelService::cap_name(ModelCapability::General.value()), "general");
-    assert_eq!(ModelService::cap_name("dp"), "dp");
+    assert_eq!(ModelService::cap_name(ModelCapability::Vision.value()), "vision");
+    assert_eq!(ModelService::cap_name("reasoning"), "reasoning");
     assert_eq!(ModelService::cap_name_opt(None), "None");
 }

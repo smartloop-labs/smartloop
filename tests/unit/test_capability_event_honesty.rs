@@ -258,12 +258,9 @@ fn test_the_same_purpose_is_still_reported_once() {
 fn test_no_purpose_keeps_the_capability_label() {
     let (router, rec) = router(Some(llm("Gemma 3n E2B")), true);
 
-    router.llm_for_tier(ModelTier::Large, Some(ModelCapability::Dp.value()), None);
+    router.llm_for_tier(ModelTier::Large, Some(ModelCapability::Vision.value()), None);
 
-    assert_eq!(
-        rec.messages(),
-        vec!["Loading model for document processing…", "Selected Gemma 3n E2B for document processing"]
-    );
+    assert_eq!(rec.messages(), vec!["Loading model for vision…", "Selected Gemma 3n E2B for vision"]);
 }
 
 /// End to end through `SkillProcessor::synthesize` — the reported case.

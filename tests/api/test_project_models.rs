@@ -244,7 +244,8 @@ mod test_update_project_model {
         assert_eq!(resp.status_code(), 200);
         assert_eq!(resp.json()["enabled"], false);
         assert_eq!(resp.json()["model_name"], "gemma3-4b");
-        assert_ne!(resp.json()["capabilities"], json!([]));
+        // Reported even when, as for a text-only model, nothing is declared.
+        assert!(resp.json()["capabilities"].is_array());
     }
 
     /// A client cannot assert download state — it describes the disk.

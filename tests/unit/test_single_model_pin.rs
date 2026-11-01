@@ -27,6 +27,7 @@ use parking_lot::Mutex;
 
 use smartloop::api::services::model_service::{ModelService, ModelServiceHooks};
 use smartloop::llms::base_llm::BaseLLM;
+use smartloop::types::ANSWER_TIER;
 use smartloop::workspace::WorkspaceModel;
 
 use crate::shared::model_service_b::{FakeLLM, default_model, project, same, service_with_workspace, ws_model};
@@ -143,7 +144,7 @@ fn test_no_selection_is_not_pinned() {
 fn test_pinned_model_serves_a_capability_it_does_not_declare() {
     let pin = service(vec![model("chat-model", true, true)]);
 
-    let llm = pin.svc.get_llm_for_capability("dp");
+    let llm = pin.svc.get_llm_for_capability("reasoning");
 
     assert!(llm.is_some());
     assert_eq!(pin.last_load().as_deref(), Some("chat-model"));
@@ -153,7 +154,7 @@ fn test_pinned_model_serves_a_capability_it_does_not_declare() {
 fn test_unloadable_pinned_model_falls_back_rather_than_failing() {
     let pin = service_with(vec![model("chat-model", true, true)], false);
 
-    assert!(pin.svc.get_llm_for_capability("dp").is_none());
+    assert!(pin.svc.get_llm_for_capability("reasoning").is_none());
 }
 
 /// Even a small selection: detection only promotes bigger models.
@@ -180,7 +181,7 @@ fn test_pin_writes_the_response_when_no_capability_is_tagged() {
 fn test_multi_selection_still_routes_by_capability() {
     let pin = service(vec![model(BIG_DOC_MODEL, true, true), model("chat-model", true, true)]);
 
-    pin.svc.get_llm_for_capability("dp");
+    pin.svc.get_llm_for_capability(ANSWER_TIER);
 
     assert_eq!(pin.last_load().as_deref(), Some(BIG_DOC_MODEL));
 }
@@ -217,7 +218,7 @@ fn broken_pin() -> Pin {
 
 #[test]
 fn test_failed_pin_leaves_the_capability_caller_to_fall_back() {
-    assert!(broken_pin().svc.get_llm_for_capability("dp").is_none());
+    assert!(broken_pin().svc.get_llm_for_capability("reasoning").is_none());
 }
 
 /// The pinned model is the only candidate detection could find.
@@ -237,7 +238,7 @@ fn test_failed_pin_answers_on_the_default_model_untagged() {
 #[test]
 fn test_failed_pin_answers_on_the_default_model_with_a_capability() {
     let pin = broken_pin();
-    assert!(pin.is_bootstrap(&pin.svc.llm_for_response(Some("dp"))));
+    assert!(pin.is_bootstrap(&pin.svc.llm_for_response(Some("reasoning"))));
 }
 
 // ── a vision-only selection is pinned only to vision work ─────────────────
@@ -254,13 +255,13 @@ fn test_a_vision_only_selection_is_pinned_for_a_vision_step() {
     assert_eq!(pin.svc.pinned_model(Some("vision")).map(|m| m.model_name).as_deref(), Some("qwen2-vl-2b"));
 }
 
-/// The regression: a vision-only model pinned to 'general' or 'dp' hands text
-/// work to a model that cannot do it.
+/// The regression: a vision-only model pinned to the answer tier, or to a
+/// capability it doesn't declare, hands text work to a model that cannot do it.
 #[test]
 fn test_a_vision_only_selection_is_not_pinned_for_a_text_step() {
     let pin = vision_only();
-    assert!(pin.svc.pinned_model(Some("general")).is_none());
-    assert!(pin.svc.pinned_model(Some("dp")).is_none());
+    assert!(pin.svc.pinned_model(Some(ANSWER_TIER)).is_none());
+    assert!(pin.svc.pinned_model(Some("reasoning")).is_none());
 }
 
 /// The planner, the skill matcher and the relevance judge ask with no
@@ -277,7 +278,7 @@ fn test_a_vision_only_selection_is_not_pinned_without_a_capability() {
 #[test]
 fn test_a_text_step_falls_back_to_the_default_model() {
     let pin = vision_only();
-    assert!(pin.svc.get_llm_for_capability("dp").is_none());
+    assert!(pin.svc.get_llm_for_capability("reasoning").is_none());
     assert!(pin.loads.lock().is_empty());
 }
 
@@ -297,16 +298,16 @@ fn test_a_vision_step_still_loads_the_selection() {
 fn test_the_response_to_a_text_step_is_written_by_the_default_model() {
     let pin = vision_only();
     assert!(pin.is_bootstrap(&pin.svc.llm_for_response(None)));
-    assert!(pin.is_bootstrap(&pin.svc.llm_for_response(Some("dp"))));
+    assert!(pin.is_bootstrap(&pin.svc.llm_for_response(Some("reasoning"))));
 }
 
-/// 'general' resolves to the bootstrap model (resident, so nothing is
+/// The answer tier resolves to the bootstrap model (resident, so nothing is
 /// loaded), never to the vision-only selection.
 #[test]
-fn test_a_general_step_resolves_to_the_bootstrap_model_not_the_selection() {
+fn test_an_answer_tier_step_resolves_to_the_bootstrap_model_not_the_selection() {
     let pin = vision_only();
 
-    let llm = pin.svc.llm_for_response(Some("general"));
+    let llm = pin.svc.llm_for_response(Some(ANSWER_TIER));
 
     assert!(pin.is_bootstrap(&llm));
     assert!(!pin.loads.lock().iter().any(|name| name == "qwen2-vl-2b"));
@@ -333,16 +334,16 @@ fn test_the_vision_only_selection_is_not_the_large_agent_model() {
 #[test]
 fn test_a_text_capability_is_not_announced_as_available() {
     let pin = vision_only();
-    assert!(!pin.svc.has_capability_model("dp"));
+    assert!(!pin.svc.has_capability_model("reasoning"));
     assert!(pin.svc.has_capability_model("vision"));
 }
 
-/// The pin is unchanged for anything that declares 'general'.
+/// The pin is unchanged for any text model.
 #[test]
-fn test_a_general_capable_selection_still_serves_every_capability() {
+fn test_a_text_selection_still_serves_every_capability() {
     let pin = service(vec![model("chat-model", true, true)]);
 
     assert_eq!(pin.svc.pinned_model(Some("vision")).map(|m| m.model_name).as_deref(), Some("chat-model"));
-    assert_eq!(pin.svc.pinned_model(Some("dp")).map(|m| m.model_name).as_deref(), Some("chat-model"));
+    assert_eq!(pin.svc.pinned_model(Some("reasoning")).map(|m| m.model_name).as_deref(), Some("chat-model"));
     assert_eq!(pin.svc.pinned_model(None).map(|m| m.model_name).as_deref(), Some("chat-model"));
 }
