@@ -101,6 +101,7 @@ pub struct ModelRouterOptions {
 /// tier.  The wire values are internal terms; map them to human-readable
 /// text before surfacing in SSEs.
 pub const CAPABILITY_LABELS: &[(&str, &str)] = &[
+    ("text", "text"),
     ("reasoning", "reasoning"),
     ("vision", "vision"),
     ("thinking", "thinking"),

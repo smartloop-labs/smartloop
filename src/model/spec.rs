@@ -45,14 +45,10 @@ pub struct ModelSpec {
     /// for a dense one, where it equals `param_size_b`.
     pub active_param_size_b: Option<f64>,
     pub attention: Option<Attention>,
-    /// Capabilities the model declares — never empty.
+    /// Capabilities the model declares.  `text` for every model but a
+    /// vision-only one; a list that declares nothing reads as a text
+    /// model's.
     pub capabilities: Vec<ModelCapability>,
-    /// Whether the model holds a text conversation. Every model does but one
-    /// declared vision-only, so this is read off the whole declared list
-    /// before the legacy values are dropped: a catalog row saying `general`,
-    /// `dp` or `coding` beside `vision` describes a text model, where the
-    /// capabilities that survive (`vision` alone) would not say so.
-    pub text: bool,
     /// Whether reasoning starts ON for a model that supports it.
     pub thinking_default: bool,
     /// llama.cpp chat-handler name for image input, `None` for text-only.
@@ -79,7 +75,6 @@ impl ModelSpec {
             active_param_size_b: None,
             attention: None,
             capabilities: DEFAULT_CAPABILITIES.to_vec(),
-            text: true,
             thinking_default: false,
             vision_chat_handler: None,
             url: None,
@@ -152,24 +147,19 @@ impl ModelSpec {
                 None => tracing::warn!("[models] {} declares unknown attention '{attention}' — ignoring it", spec.name),
             }
         }
-        // A declared list replaces the base's, even one that boils down to
-        // nothing: `general`, `dp` and `coding` are what older catalogs said
-        // about every text model, and say nothing now.  An absent or empty
-        // list declares nothing and keeps the base.
+        // A declared list replaces the base's.  `general`, `dp` and `coding`,
+        // what older catalogs said of every text model, each read as `text`,
+        // once.  An absent or empty list declares nothing and keeps the base.
         if let Some(capabilities) = row.capabilities.filter(|c| !c.is_empty()) {
-            // Read before the legacy values go: they are what says a vision
-            // model holds a text conversation too.
-            spec.text = capabilities.iter().any(|c| c.trim().to_lowercase() != ModelCapability::Vision.value());
-            spec.capabilities = capabilities
-                .iter()
-                .filter_map(|c| {
-                    let cap = ModelCapability::from_value(c);
-                    if cap.is_none() && !ModelCapability::is_legacy(c) {
-                        tracing::warn!("[models] {} declares unknown capability '{c}' — ignoring it", spec.name);
-                    }
-                    cap
-                })
-                .collect();
+            let mut declared: Vec<ModelCapability> = Vec::new();
+            for c in &capabilities {
+                match ModelCapability::from_value(c) {
+                    Some(cap) if !declared.contains(&cap) => declared.push(cap),
+                    Some(_) => {}
+                    None => tracing::warn!("[models] {} declares unknown capability '{c}' — ignoring it", spec.name),
+                }
+            }
+            spec.capabilities = declared;
         }
         if let Some(thinking) = row.thinking_default {
             spec.thinking_default = thinking;
@@ -244,7 +234,7 @@ impl CatalogModel {
 /// the catalog publishes for them, so a first run or an offline machine
 /// behaves exactly as an online one.
 pub fn seed_specs() -> Vec<ModelSpec> {
-    use ModelCapability::{Reasoning, Thinking, Vision};
+    use ModelCapability::{Reasoning, Text, Thinking, Vision};
 
     let spec = |name: &str,
                 model_id: &str,
@@ -254,7 +244,6 @@ pub fn seed_specs() -> Vec<ModelSpec> {
                 vision_chat_handler: Option<&str>| ModelSpec {
         model_version,
         param_size_b,
-        text: capabilities.is_empty() || capabilities.iter().any(|c| *c != Vision),
         capabilities,
         vision_chat_handler: vision_chat_handler.map(str::to_string),
         ..ModelSpec::local(name, model_id)
@@ -262,10 +251,10 @@ pub fn seed_specs() -> Vec<ModelSpec> {
 
     vec![
         // The 1B text-only orchestrator model.
-        spec(BOOTSTRAP_MODEL, "smartloop-ai/slp-orchestra-mini", 3, 1.0, vec![], None),
+        spec(BOOTSTRAP_MODEL, "smartloop-ai/slp-orchestra-mini", 3, 1.0, vec![Text], None),
         // llama.cpp has no Gemma3-specific handler; Gemma 3's mmproj loads
         // through the generic mtmd path (projector auto-detected from the GGUF).
-        spec("gemma3-4b", "google/gemma-3-4b-it", 3, 4.0, vec![], Some("MTMDChatHandler")),
+        spec("gemma3-4b", "google/gemma-3-4b-it", 3, 4.0, vec![Text], Some("MTMDChatHandler")),
         // Gemma 4's chat template reads enable_thinking (defaulting it to false)
         // and emits reasoning on a <|channel>thought…<channel|> channel; THINKING
         // is declared so the picker offers the toggle, left off by default.
@@ -274,7 +263,7 @@ pub fn seed_specs() -> Vec<ModelSpec> {
             "google/gemma-4-e2b-it",
             4,
             2.0,
-            vec![Vision, Thinking],
+            vec![Text, Vision, Thinking],
             Some("Gemma4ChatHandler"),
         ),
         spec(
@@ -282,7 +271,7 @@ pub fn seed_specs() -> Vec<ModelSpec> {
             "google/gemma-4-e4b-it",
             4,
             4.0,
-            vec![Vision, Thinking],
+            vec![Text, Vision, Thinking],
             Some("Gemma4ChatHandler"),
         ),
         // Smaller than Qwen2.5-VL-3B so it fits on GPU alongside the
@@ -297,7 +286,7 @@ pub fn seed_specs() -> Vec<ModelSpec> {
             "mistralai/Ministral-3-3B-Instruct-2512",
             3,
             3.0,
-            vec![Vision],
+            vec![Text, Vision],
             Some("MTMDChatHandler"),
         ),
         // A hybrid-reasoning model that can think in a `<think>` block. Its
@@ -311,7 +300,7 @@ pub fn seed_specs() -> Vec<ModelSpec> {
             "Qwen/Qwen3.5-2B",
             3,
             2.0,
-            vec![Reasoning, Vision, Thinking],
+            vec![Text, Reasoning, Vision, Thinking],
             Some("MTMDChatHandler"),
         ),
     ]

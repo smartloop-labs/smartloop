@@ -1060,11 +1060,8 @@ pub async fn update_workspace_model<H: WorkspaceModelHost + ?Sized>(
             let mut set: Vec<String> = Vec::new();
             for value in &capabilities {
                 let value = value.trim().to_lowercase();
-                // What a turn is about was once set here as a capability;
-                // it still parses, and routes nothing.
-                if ModelCapability::is_legacy(&value) {
-                    continue;
-                }
+                // `general`, `dp` and `coding`, once set here for what a turn
+                // is about, read as `text`.
                 let Some(cap) = ModelCapability::from_value(&value) else {
                     let known: Vec<&str> = ModelCapability::ALL.iter().map(|c| c.value()).collect();
                     return Ok(Err(HTTPException::new(

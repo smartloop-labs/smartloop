@@ -5,7 +5,7 @@ use smartloop::model::spec::{seed_specs, CatalogModel, ModelRegistry, ModelSpec}
 use smartloop::platform::client::JsonObject;
 use smartloop::types::{Attention, ModelCapability, ModelKind, ModelType};
 
-use ModelCapability::{Reasoning, Thinking, Vision};
+use ModelCapability::{Reasoning, Text, Thinking, Vision};
 
 fn row(value: Value) -> CatalogModel {
     let Value::Object(obj) = value else { panic!("row must be an object") };
@@ -22,13 +22,13 @@ fn test_seeds_pin_every_built_in_model() {
     // (name, model_id, version, size, capabilities, handler) for each model
     // this build knows offline; the catalog publishes the same values.
     let expected: Vec<(&str, &str, i64, f64, Vec<ModelCapability>, Option<&str>)> = vec![
-        ("sl-mini", "smartloop-ai/slp-orchestra-mini", 3, 1.0, vec![], None),
-        ("gemma3-4b", "google/gemma-3-4b-it", 3, 4.0, vec![], Some("MTMDChatHandler")),
-        ("gemma4-e2b", "google/gemma-4-e2b-it", 4, 2.0, vec![Vision, Thinking], Some("Gemma4ChatHandler")),
-        ("gemma4-e4b", "google/gemma-4-e4b-it", 4, 4.0, vec![Vision, Thinking], Some("Gemma4ChatHandler")),
+        ("sl-mini", "smartloop-ai/slp-orchestra-mini", 3, 1.0, vec![Text], None),
+        ("gemma3-4b", "google/gemma-3-4b-it", 3, 4.0, vec![Text], Some("MTMDChatHandler")),
+        ("gemma4-e2b", "google/gemma-4-e2b-it", 4, 2.0, vec![Text, Vision, Thinking], Some("Gemma4ChatHandler")),
+        ("gemma4-e4b", "google/gemma-4-e4b-it", 4, 4.0, vec![Text, Vision, Thinking], Some("Gemma4ChatHandler")),
         ("qwen2-vl-2b", "Qwen/Qwen2-VL-2B-Instruct", 2, 2.0, vec![Vision], Some("Qwen25VLChatHandler")),
-        ("ministral3-3b", "mistralai/Ministral-3-3B-Instruct-2512", 3, 3.0, vec![Vision], Some("MTMDChatHandler")),
-        ("qwen3.5-2b", "Qwen/Qwen3.5-2B", 3, 2.0, vec![Reasoning, Vision, Thinking], Some("MTMDChatHandler")),
+        ("ministral3-3b", "mistralai/Ministral-3-3B-Instruct-2512", 3, 3.0, vec![Text, Vision], Some("MTMDChatHandler")),
+        ("qwen3.5-2b", "Qwen/Qwen3.5-2B", 3, 2.0, vec![Text, Reasoning, Vision, Thinking], Some("MTMDChatHandler")),
     ];
     let seeds = seed_specs();
     assert_eq!(seeds.len(), expected.len());
@@ -80,7 +80,7 @@ fn test_a_catalog_row_overrides_only_what_it_declares() {
     assert!(spec.thinking_default);
     // Undeclared (absent, null or empty) keeps the seed.
     assert_eq!(spec.model_version, 4);
-    assert_eq!(spec.capabilities, vec![Vision, Thinking]);
+    assert_eq!(spec.capabilities, vec![Text, Vision, Thinking]);
     assert_eq!(spec.vision_chat_handler.as_deref(), Some("Gemma4ChatHandler"));
 }
 
@@ -112,10 +112,9 @@ fn test_a_new_local_model_needs_only_a_catalog_row() {
     assert_eq!(spec.model_id, "google/gemma-4-e8b-it");
     assert_eq!(spec.kind, ModelKind::Local);
     assert_eq!(spec.param_size_b, 8.0);
-    // "general" and "dp" say what every text model does, so nothing — but
-    // they do say this vision model holds a text conversation.
-    assert_eq!(spec.capabilities, vec![Vision]);
-    assert!(spec.text);
+    // "general" and "dp" each said the model holds a text conversation:
+    // they read as `text`, once.
+    assert_eq!(spec.capabilities, vec![Text, Vision]);
     assert_eq!(spec.model_type(), ModelType::MultiModal);
     assert_eq!(registry.get_by_id("google/gemma-4-e8b-it").unwrap().name, "gemma4-e8b");
 }
@@ -142,10 +141,9 @@ fn test_a_remote_model_carries_size_and_endpoint() {
     assert_eq!(spec.context_length, Some(1048576));
     assert_eq!(spec.param_size_b, 355.0);
     assert!(spec.param_size_estimated);
-    // A catalog row's "general" and "coding" name what the turn is about,
-    // not a capability: they parse, and declare nothing.
-    assert!(spec.capabilities.is_empty());
-    assert!(spec.text);
+    // A catalog row's "general" and "coding" each said the model holds a
+    // text conversation: `text`, once.
+    assert_eq!(spec.capabilities, vec![Text]);
     // No weights, so nothing resolves by an empty id.
     assert!(registry.get_by_id("").is_none());
 }
@@ -213,10 +211,9 @@ fn test_unknown_capabilities_are_dropped() {
     let mut registry = ModelRegistry::default();
     registry.hydrate([row(json!({"name": "x", "capabilities": ["vision", "telepathy"]}))]);
     assert_eq!(registry.get("x").unwrap().capabilities, vec![Vision]);
-    // A declared list replaces the seed's even when, as with the retired
-    // "general", nothing in it is a capability.
-    registry.hydrate([row(json!({"name": "x", "capabilities": ["general"]}))]);
-    assert!(registry.get("x").unwrap().capabilities.is_empty());
+    // The retired "general", "dp" and "coding" each read as `text`, once.
+    registry.hydrate([row(json!({"name": "x", "capabilities": ["general", "dp", "coding"]}))]);
+    assert_eq!(registry.get("x").unwrap().capabilities, vec![Text]);
 }
 
 #[test]
@@ -274,14 +271,15 @@ fn test_only_a_model_declared_vision_alone_is_not_a_text_model() {
             "capabilities": ["vision"], "vision_chat_handler": "MTMDChatHandler", "param_size_b": 2.0,
         })),
     ]);
+    let text = |spec: &ModelSpec| ModelCapability::text_model(&spec.capability_values());
     let minimax = registry.get("minimax-m3").unwrap();
-    assert_eq!(minimax.capabilities, vec![Vision]);
-    assert!(minimax.text, "the legacy tags beside vision say it chats");
+    assert_eq!(minimax.capabilities, vec![Text, Vision]);
+    assert!(text(&minimax), "the legacy tags beside vision say it chats");
     let ocr = registry.get("ocr-only").unwrap();
     assert_eq!(ocr.capabilities, vec![Vision]);
-    assert!(!ocr.text);
+    assert!(!text(&ocr));
     // The seeds agree: Qwen2-VL is declared vision alone; the text models are text.
-    assert!(!registry.get("qwen2-vl-2b").unwrap().text);
-    assert!(registry.get("qwen3.5-2b").unwrap().text);
-    assert!(registry.get("slp-orchestra-mini").unwrap().text);
+    assert!(!text(&registry.get("qwen2-vl-2b").unwrap()));
+    assert!(text(&registry.get("qwen3.5-2b").unwrap()));
+    assert!(text(&registry.get("slp-orchestra-mini").unwrap()));
 }

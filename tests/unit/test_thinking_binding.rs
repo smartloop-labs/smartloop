@@ -230,7 +230,8 @@ fn test_sl_mini_declares_nothing_like_the_base_default() {
         model_id: "smartloop-ai/slp-orchestra-mini".to_string(),
         ..WorkspaceModel::default()
     };
-    assert!(sl_mini.effective_capabilities().is_empty());
+    // The seed declares `text`, which is what inference gave it too.
+    assert_eq!(sl_mini.effective_capabilities(), ["text"]);
     assert!(ModelCapability::text_model(&sl_mini.effective_capabilities()));
 }
 

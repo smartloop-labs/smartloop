@@ -85,8 +85,8 @@ async fn test_a_remote_model_is_registered_without_a_download() {
     assert!(model.downloaded);
     assert!(!model.is_active);
     assert_eq!(model.url().as_deref(), Some("https://edge.smartloop.ai"));
-    // "general" and "coding" in the catalog row declare nothing.
-    assert!(model.effective_capabilities().is_empty());
+    // "general" and "coding" in the catalog row each read as `text`, once.
+    assert_eq!(model.effective_capabilities(), ["text"]);
     assert_eq!(model.context_length(), Some(131072));
     // Project-scoped: left for the follow-up PATCH, and never promoted.
     assert!(!model.enabled);

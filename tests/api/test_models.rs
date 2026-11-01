@@ -188,7 +188,9 @@ mod test_list_models {
         let body = resp.json();
         let remote = &body[0];
         assert_eq!(remote["type"], "remote");
-        assert_eq!(remote["capabilities"], json!([]));
+        // "general" and "coding" read as `text`; thinking stays internal;
+        // "teleport" is nothing.
+        assert_eq!(remote["capabilities"], json!(["text"]));
         assert_eq!(remote["context_length"], 131072);
         assert_eq!(remote["access_level"], "free_login");
     }
@@ -231,7 +233,7 @@ mod test_list_models {
 
         let entry = &resp.json()[0];
         assert_eq!(entry["name"], "catalog-only-8b");
-        assert_eq!(entry["capabilities"], json!(["vision"]));
+        assert_eq!(entry["capabilities"], json!(["text", "vision"]));
         assert_eq!(entry["param_size_b"], 8.0);
     }
 

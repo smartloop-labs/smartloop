@@ -108,15 +108,15 @@ async fn capabilities_can_be_set_here_over_the_catalog() {
     assert!(!before.iter().any(|c| c == "vision"), "{before:?}");
 
     // "general" and "coding" are what older clients said about every text
-    // model: they still parse, and declare nothing.
+    // model: each reads as `text`, once.
     let reply = update_workspace_model("gemma3-4b", update(vec!["vision", "general", "Coding"]), &service).await.unwrap();
-    assert_eq!(reply["capabilities"], serde_json::json!(["vision"]));
+    assert_eq!(reply["capabilities"], serde_json::json!(["vision", "text"]));
     assert_eq!(reply["capabilities_overridden"], serde_json::json!(true));
-    assert_eq!(workspace.read().get_model(Some("gemma3-4b")).unwrap().effective_capabilities(), ["vision"]);
+    assert_eq!(workspace.read().get_model(Some("gemma3-4b")).unwrap().effective_capabilities(), ["vision", "text"]);
 
     let refused = update_workspace_model("gemma3-4b", update(vec!["poetry"]), &service).await.unwrap_err();
     assert_eq!(refused.status_code, 400);
-    assert_eq!(workspace.read().get_model(Some("gemma3-4b")).unwrap().effective_capabilities(), ["vision"]);
+    assert_eq!(workspace.read().get_model(Some("gemma3-4b")).unwrap().effective_capabilities(), ["vision", "text"]);
 
     let reply = update_workspace_model("gemma3-4b", update(vec![]), &service).await.unwrap();
     assert_eq!(reply["capabilities_overridden"], serde_json::json!(false));

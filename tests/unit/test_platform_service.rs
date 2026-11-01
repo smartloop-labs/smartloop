@@ -310,8 +310,8 @@ mod test_list_models {
         let spec = MODEL_SPECS.get("spec-hydration-probe").expect("hydrated from the catalog");
         assert_eq!(spec.model_id, "org/spec-hydration-probe");
         assert_eq!(spec.param_size_b, 7.0);
-        // "general" says what every text model does; only vision is a capability.
-        assert_eq!(spec.capability_values(), ["vision"]);
+        // "general" said the model holds a text conversation: `text`.
+        assert_eq!(spec.capability_values(), ["text", "vision"]);
     }
 
     #[test]

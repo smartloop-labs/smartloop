@@ -55,8 +55,8 @@ fn test_details_follow_the_catalog_not_the_registration() {
 
     assert_eq!(ws.models.len(), 1);
     assert_eq!(again.url().as_deref(), Some("https://api.smartloop.ai"));
-    // "coding" names what a turn is about, not a capability: nothing declared.
-    assert_eq!(again.effective_capabilities(), caps(&[]));
+    // "coding" said the model holds a text conversation: `text`.
+    assert_eq!(again.effective_capabilities(), caps(&["text"]));
     // Re-adding keeps the user's enabled choice.
     assert!(!again.enabled);
 }
@@ -90,7 +90,7 @@ fn test_remote_capabilities_come_from_the_catalog() {
         ..Default::default()
     };
     // The catalog's list wins over the name — and "general" declares nothing.
-    assert_eq!(model.effective_capabilities(), caps(&[]));
+    assert_eq!(model.effective_capabilities(), caps(&["text"]));
 }
 
 #[test]

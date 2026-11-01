@@ -858,7 +858,7 @@ impl WorkspaceModel {
             return ModelCapability::text_model(set);
         }
         match self.spec() {
-            Some(spec) => spec.text,
+            Some(spec) => ModelCapability::text_model(&spec.capability_values()),
             None if self.is_remote() => true,
             None => ModelCapability::text_model(&self.infer_capabilities()),
         }

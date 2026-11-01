@@ -102,20 +102,25 @@ impl Attention {
     }
 }
 
-/// Something a model has, that a step can ask for: vision, reasoning, or
-/// (for `Thinking`) a way of answering.
+/// Something a model has, that a step can ask for: text, vision, reasoning,
+/// or (for `Thinking`) a way of answering.  The same four the platform's
+/// model definition names.
 ///
 /// What a turn is *about* — general chat, documents, code — is not a
 /// capability: every text model does all of it, and which one answers is
 /// the router's step-up/step-down call on size, resources and what is
 /// resident (see [`ANSWER_TIER`]).  The values `general`, `dp` and
-/// `coding` that older catalogs and settings carry still parse, and carry
-/// no routing weight.
+/// `coding` that older catalogs and settings carry read as `text`, which
+/// is what they said of a model; a model declared `vision` alone is the
+/// one kind that holds no text conversation.
 ///
 /// Deserialization accepts the legacy spelling `"skills"` (any case, padded)
 /// for `Reasoning`, mirroring the Python `_missing_` hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ModelCapability {
+    /// `"text"` — holds a text conversation: answers, reads documents,
+    /// writes code.  Every model but a vision-only one.
+    Text,
     /// `"reasoning"` — the model that reasons over a set of options before
     /// acting (skill matching, MCP server/tool choice, planning).
     Reasoning,
@@ -135,19 +140,22 @@ pub const ANSWER_TIER: &str = "answer";
 
 impl ModelCapability {
     /// All capabilities in declaration order.
-    pub const ALL: [ModelCapability; 3] = [
+    pub const ALL: [ModelCapability; 4] = [
+        ModelCapability::Text,
         ModelCapability::Reasoning,
         ModelCapability::Vision,
         ModelCapability::Thinking,
     ];
 
     /// Values older catalogs, overrides and settings used for what a turn
-    /// is about.  They parse, and route nothing.
+    /// is about.  Each said the model holds a text conversation, so each
+    /// reads as [`Self::Text`].
     pub const LEGACY: [&'static str; 3] = ["general", "dp", "coding"];
 
     /// The enum's wire value.
     pub fn value(&self) -> &'static str {
         match self {
+            ModelCapability::Text => "text",
             ModelCapability::Reasoning => "reasoning",
             ModelCapability::Vision => "vision",
             ModelCapability::Thinking => "thinking",
@@ -155,14 +163,16 @@ impl ModelCapability {
     }
 
     /// Resolve a capability string, including names it used to go by
-    /// (`"skills"` -> `Reasoning`).  `None` when the value is unknown, or
-    /// one of [`Self::LEGACY`].
+    /// (`"skills"` -> `Reasoning`; `general`, `dp`, `coding` -> `Text`).
+    /// `None` when the value is unknown.
     pub fn from_value(value: &str) -> Option<Self> {
+        let value = value.trim().to_lowercase();
         if let Some(c) = Self::ALL.iter().find(|c| c.value() == value) {
             return Some(*c);
         }
-        match value.trim().to_lowercase().as_str() {
+        match value.as_str() {
             "skills" => Some(ModelCapability::Reasoning),
+            v if Self::LEGACY.contains(&v) => Some(ModelCapability::Text),
             _ => None,
         }
     }
@@ -174,7 +184,9 @@ impl ModelCapability {
     }
 
     /// Whether a model declaring `caps` holds a text conversation: every
-    /// model does, except one that declares nothing but vision.
+    /// model does, except one that declares nothing but vision.  A list
+    /// that declares nothing is a text model's, as every model was before
+    /// `text` was declared.
     pub fn text_model<S: AsRef<str>>(caps: &[S]) -> bool {
         let vision = ModelCapability::Vision.value();
         caps.is_empty() || caps.iter().any(|c| c.as_ref().to_lowercase() != vision)
