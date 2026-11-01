@@ -3714,10 +3714,10 @@ impl ModelService {
     ///
     /// Two modes: a bare "write"/"save" command writes the last assistant
     /// response from session history (refine back and forth, then save); an
-    /// inline write intent writes the current `llm_response`.  An answer that
-    /// lays out files is written as those files (see [`output_writer`]);
-    /// anything else is saved as one `<name>.md`.  Returns what was written —
-    /// empty when no write was needed.
+    /// inline write intent writes the current `llm_response`.  The answer is
+    /// saved as one `<name>.md` under `.out/` (see [`output_writer`]); writing
+    /// an answer's files into the project is the client's job.  Returns what
+    /// was written — empty when no write was needed.
     pub fn maybe_write_output(
         &self,
         user_message: &str,
@@ -3759,14 +3759,6 @@ impl ModelService {
             return WriteOutcome::default();
         }
 
-        let blocks = output_writer::extract_file_blocks(&content_to_write);
-        if !blocks.is_empty() {
-            return output_writer::write_file_blocks(&cwd, &blocks).unwrap_or_else(|e| {
-                tracing::warn!(target: LOG, "[auto-write] Failed: {e}");
-                WriteOutcome::default()
-            });
-        }
-
         let content_to_write = Self::extract_document_content(&content_to_write);
         if content_to_write.is_empty() {
             return WriteOutcome::default();
@@ -3792,7 +3784,7 @@ impl ModelService {
             Ok(Some(output_writer::write_document(&cwd, &safe_name, &content_to_write)?))
         }));
         match outcome {
-            Ok(Ok(path)) => WriteOutcome { written: path.into_iter().collect(), skipped: Vec::new() },
+            Ok(Ok(path)) => WriteOutcome { written: path.into_iter().collect() },
             Ok(Err(e)) => {
                 tracing::warn!(target: LOG, "[auto-write] Failed: {e}");
                 WriteOutcome::default()

@@ -889,7 +889,7 @@ fn file_link(written_path: &str) -> String {
 }
 
 /// What an auto-write put on disk, appended to the answer: a link per file
-/// written, and the files left alone because they already existed.
+/// written.
 pub fn write_summary(outcome: &WriteOutcome) -> String {
     let mut summary = String::new();
     match outcome.written.as_slice() {
@@ -901,10 +901,6 @@ pub fn write_summary(outcome: &WriteOutcome) -> String {
                 summary.push_str(&format!("\n- {}", file_link(path)));
             }
         }
-    }
-    if !outcome.skipped.is_empty() {
-        let names: Vec<String> = outcome.skipped.iter().map(|p| format!("`{p}`")).collect();
-        summary.push_str(&format!("\n\nLeft unchanged (already exist): {}", names.join(", ")));
     }
     summary
 }
