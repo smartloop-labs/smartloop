@@ -27,7 +27,6 @@ use crate::agents::orchestration::step::{NodePair, SharedSearchContext, Step, St
 use crate::agents::planner::ModelTier;
 use crate::config::app_settings::AppSettings;
 use crate::llms::base_llm::BatchPrompt;
-use crate::types::ModelCapability;
 
 /// Python logger name of this module.
 pub const LOGGER: &str = "smartloop.agents.orchestration.document_fanout";
@@ -258,10 +257,11 @@ impl DocumentFanoutStep {
     ) {
         // Size the extraction input to the EXTRACTION model's actual context
         // window — not the router's.  The router's max_tokens can exceed the
-        // DP model's window (e.g. 8192 vs 6080), so sizing from it overflows
-        // the extractor and generation silently fails.
+        // extractor's window (e.g. 8192 vs 6080), so sizing from it overflows
+        // the extractor and generation silently fails.  Extraction is text
+        // work, so it runs on the answer tier's model.
         let mut max_chars = DEFAULT_MAX_CHARS;
-        let dp_llm = self.models.llm_for_tier(ModelTier::Large, Some(ModelCapability::Dp.value()), None);
+        let dp_llm = self.models.llm_for_tier(ModelTier::Large, Some(crate::types::ANSWER_TIER), None);
         tracing::info!(
             target: LOGGER,
             "[doc-batch] {} → {} ({} document(s))",

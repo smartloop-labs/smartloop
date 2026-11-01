@@ -135,7 +135,7 @@ mod test_prompt_question_placement;
 mod test_remote_answer_skips_draft;
 mod test_remote_llm;
 mod test_resolution_model_loads_like_vision;
-mod test_response_capability;
+mod test_response_tier;
 mod test_response_model_events;
 mod test_scanned_pdf_vision_ocr;
 mod test_semver;

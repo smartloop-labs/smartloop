@@ -864,13 +864,6 @@ impl WorkspaceModel {
         let mut caps: Vec<String> = Vec::new();
         let size = self.param_size_b();
 
-        caps.push(ModelCapability::General.value().to_string());
-
-        // A model made for code reads and writes documents: code is one.
-        if ["code", "coder", "starcoder", "deepseek-coder"].iter().any(|kw| combined.contains(kw)) {
-            caps.push(ModelCapability::Dp.value().to_string());
-        }
-
         // Vision is inferred only from an explicit vision marker in the name
         // (e.g. Qwen2.5-VL).  gemma-3-4b is NOT inferred as vision: llama-cpp
         // has no Gemma3 vision handler, so tagging it vision only produces a
@@ -880,13 +873,10 @@ impl WorkspaceModel {
         }
 
         if size >= 3.0 {
-            // GENERAL already added above; larger models additionally handle
-            // reasoning (skill matching, MCP tool resolution, planning) and
-            // document processing.
+            // Larger models handle reasoning (skill matching, MCP tool
+            // resolution, planning).  Text chat, documents and code need no
+            // tag: every model does them, and the answer tier ranks by size.
             caps.push(ModelCapability::Reasoning.value().to_string());
-            if !caps.iter().any(|c| c == ModelCapability::Dp.value()) {
-                caps.push(ModelCapability::Dp.value().to_string());
-            }
         }
 
         caps
@@ -1790,6 +1780,8 @@ impl Workspace {
     /// Per-project settings (`project`) override the workspace defaults.
     pub fn ranked_models_for(&self, capability: &str, project: Option<&Project>) -> Vec<WorkspaceModel> {
         let cap = capability.to_lowercase();
+        // The answer tier is every text model, not a declared capability.
+        let answer = cap == crate::types::ANSWER_TIER;
         let candidates: Vec<WorkspaceModel> = self
             .models
             .iter()
@@ -1797,7 +1789,14 @@ impl Workspace {
                 self.effective_model_enabled(&m.model_name, project)
                     && self.effective_model_downloaded(&m.model_name)
                     && (m.param_size_b() > 0.0 || m.is_remote())
-                    && m.effective_capabilities().iter().any(|c| c.to_lowercase() == cap)
+                    && {
+                        let caps = m.effective_capabilities();
+                        if answer {
+                            ModelCapability::text_model(&caps)
+                        } else {
+                            caps.iter().any(|c| c.to_lowercase() == cap)
+                        }
+                    }
             })
             .cloned()
             .collect();

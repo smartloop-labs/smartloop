@@ -17,6 +17,7 @@ use smartloop::agents::planner::{
 };
 use smartloop::llms::base_llm::{CallOptions, CancelEvent, ChatMessage, GenerationStream};
 use smartloop::llms::BaseLLM;
+use smartloop::types::ANSWER_TIER;
 
 // ------------------------------------------------------------------ //
 // Fixtures                                                            //
@@ -454,39 +455,58 @@ fn test_detect_signals_coding_intent() {
     }
 }
 
-/// Coding work goes to the document-processing model, ahead of a skill,
-/// but not of attachments, and only when a selected model declares `dp`.
+/// What a turn is about is not a capability: a coding conversation is
+/// still read as coding work, but it names no capability and plans one
+/// LARGE step on the answer tier, where the router steps up to the largest
+/// model that fits.
 #[test]
-fn test_match_capability_coding_goes_to_document_processing() {
-    let all: Vec<String> = ["general", "reasoning", "dp", "vision"].iter().map(|s| s.to_string()).collect();
-    assert_eq!(Planner::match_capability(&all, false, true, true, true).as_deref(), Some("dp"));
-    assert_eq!(Planner::match_capability(&all, true, true, true, true).as_deref(), Some("vision"));
-    assert_eq!(Planner::match_capability(&all, false, false, true, true).as_deref(), Some("reasoning"));
-
-    let no_dp: Vec<String> = ["general", "reasoning"].iter().map(|s| s.to_string()).collect();
-    assert_eq!(Planner::match_capability(&no_dp, false, true, true, false).as_deref(), Some("reasoning"));
-    assert_eq!(Planner::match_capability(&no_dp, false, true, false, false).as_deref(), Some("general"));
-}
-
-/// A coding conversation plans one LARGE step on the document-processing
-/// model.
-#[test]
-fn test_classify_coding_conversation_routes_to_document_processing() {
+fn test_classify_coding_conversation_plans_on_the_answer_tier() {
     let planner = planner();
     let result = planner.classify(
         "refactor this function to use iterators",
         &[],
         ClassifyOptions {
-            available_capabilities: Some(vec!["general".into(), "dp".into()]),
+            available_capabilities: Some(vec!["reasoning".into(), "vision".into()]),
             ..Default::default()
         },
     );
     assert!(result.has_coding_intent);
-    assert_eq!(result.capability.as_deref(), Some("dp"));
+    assert_eq!(result.capability.as_deref(), Some(ANSWER_TIER));
     let plan = planner.create_plan(&result, &ctx("refactor this function to use iterators"), None);
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(plan.steps[0].model_tier, ModelTier::Large);
-    assert_eq!(plan.steps[0].capability.as_deref(), Some("dp"));
+    assert_eq!(plan.steps[0].capability.as_deref(), Some(ANSWER_TIER));
+}
+
+/// Attachments are the one signal that names a capability a model has to
+/// declare: the conversation step asks for vision when a selected model
+/// has it, and takes the answer tier otherwise.  With no model selected
+/// nothing routes, and nothing is planned.
+#[test]
+fn test_classify_with_attachments_asks_for_vision() {
+    let planner = planner();
+    let with = |caps: Option<Vec<&str>>| {
+        planner.classify(
+            "what does this picture show",
+            &[],
+            ClassifyOptions {
+                has_attachments: true,
+                available_capabilities: caps.map(|c| c.into_iter().map(str::to_string).collect()),
+                ..Default::default()
+            },
+        )
+    };
+    let mut result = with(Some(vec!["vision"]));
+    assert_eq!(result.capability.as_deref(), Some("vision"));
+    result.intent = IntentType::Conversation;
+    let plan = planner.create_plan(&result, &ctx("what does this picture show"), None);
+    assert_eq!(plan.steps[0].capability.as_deref(), Some("vision"));
+
+    assert_eq!(with(Some(vec![])).capability.as_deref(), Some(ANSWER_TIER));
+    let mut none = with(None);
+    assert_eq!(none.capability, None);
+    none.intent = IntentType::Conversation;
+    assert!(planner.create_plan(&none, &ctx("what does this picture show"), None).steps.is_empty());
 }
 
 // ------------------------------------------------------------------ //

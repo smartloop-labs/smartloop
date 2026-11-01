@@ -3558,11 +3558,11 @@ impl ModelService {
             options.project_id = self.get_project_id();
             options.answers_remotely = self.answers_remotely();
             options.executor = Some(self.get_llm_executor());
-            // Gathered context answers on the `general` response model (see
-            // the chat router), so it is sized against that model's window.
+            // Gathered context answers on the answer tier's model (see the
+            // chat router), so it is sized against that model's window.
             options.answer_window = Some(Arc::new({
                 let service = service.clone();
-                move || service.get_response_max_context_tokens(Some(ModelCapability::General.value()))
+                move || service.get_response_max_context_tokens(Some(crate::types::ANSWER_TIER))
             }));
             let orchestrator = SLPOrchestrator::new(orchestrator_llm, options);
 
@@ -3571,10 +3571,14 @@ impl ModelService {
             // workspace of its own — the service owns it.
             orchestrator.tool_caller.set_persist(Some(self.persist_hook()));
 
-            let available_capabilities: Vec<String> = {
+            // What the selected models declare, and whether any is selected
+            // at all: text work needs no declaration, so a selection may
+            // declare nothing and still be one.
+            let (available_capabilities, any_selected): (Vec<String>, bool) = {
                 let workspace = model.workspace.read();
                 let project = workspace.current_project();
                 let mut caps: Vec<String> = Vec::new();
+                let mut any_selected = false;
                 let mut snapshot: Vec<String> = Vec::new();
                 for m in &workspace.models {
                     let enabled = workspace.effective_model_enabled(&m.model_name, project);
@@ -3588,6 +3592,7 @@ impl ModelService {
                         effective
                     ));
                     if enabled && downloaded {
+                        any_selected = true;
                         for cap in effective {
                             if !caps.contains(&cap) {
                                 caps.push(cap);
@@ -3601,7 +3606,7 @@ impl ModelService {
                     snapshot.join(", "),
                     caps
                 );
-                caps
+                (caps, any_selected)
             };
 
             // Propagate the cancellation event onto the orchestrator's primary
@@ -3643,11 +3648,7 @@ impl ModelService {
                         project_dir: Some(orchestrator_cwd.clone()),
                         model_service: Some(service.clone()),
                         conversation_history: conversation_history.as_ref().map(|h| history_maps(h)),
-                        available_capabilities: if available_capabilities.is_empty() {
-                            None
-                        } else {
-                            Some(available_capabilities.clone())
-                        },
+                        available_capabilities: any_selected.then(|| available_capabilities.clone()),
                         progress_callback: progress_callback.clone(),
                         requested_skill: requested_skill.map(str::to_string),
                         current_date: current_date.map(str::to_string),

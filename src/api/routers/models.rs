@@ -930,8 +930,9 @@ pub struct UpdateWorkspaceModelRequest {
     #[serde(default)]
     pub thinking: Option<bool>,
     /// The model's capabilities as set here, over the catalog's and what
-    /// its name says, for routing: `["general", "dp"]`. An empty list
-    /// takes the override off.
+    /// its name says, for routing: `["vision", "reasoning"]`. An empty
+    /// list takes the override off; `general`, `dp` and `coding` are
+    /// accepted and dropped, as text work needs no capability.
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
 }
@@ -1059,6 +1060,11 @@ pub async fn update_workspace_model<H: WorkspaceModelHost + ?Sized>(
             let mut set: Vec<String> = Vec::new();
             for value in &capabilities {
                 let value = value.trim().to_lowercase();
+                // What a turn is about was once set here as a capability;
+                // it still parses, and routes nothing.
+                if ModelCapability::is_legacy(&value) {
+                    continue;
+                }
                 let Some(cap) = ModelCapability::from_value(&value) else {
                     let known: Vec<&str> = ModelCapability::ALL.iter().map(|c| c.value()).collect();
                     return Ok(Err(HTTPException::new(

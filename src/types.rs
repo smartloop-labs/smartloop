@@ -102,19 +102,23 @@ impl Attention {
     }
 }
 
-/// What a model can be routed to (or, for `Thinking`, how it answers).
+/// Something a model has, that a step can ask for: vision, reasoning, or
+/// (for `Thinking`) a way of answering.
+///
+/// What a turn is *about* — general chat, documents, code — is not a
+/// capability: every text model does all of it, and which one answers is
+/// the router's step-up/step-down call on size, resources and what is
+/// resident (see [`ANSWER_TIER`]).  The values `general`, `dp` and
+/// `coding` that older catalogs and settings carry still parse, and carry
+/// no routing weight.
 ///
 /// Deserialization accepts the legacy spelling `"skills"` (any case, padded)
 /// for `Reasoning`, mirroring the Python `_missing_` hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ModelCapability {
-    /// `"general"`
-    General,
     /// `"reasoning"` — the model that reasons over a set of options before
     /// acting (skill matching, MCP server/tool choice, planning).
     Reasoning,
-    /// `"dp"`
-    Dp,
     /// `"vision"`
     Vision,
     /// `"thinking"` — the chat template reads `enable_thinking`.  Not a
@@ -122,41 +126,58 @@ pub enum ModelCapability {
     Thinking,
 }
 
+/// The routing key for the model that writes an answer, or extracts from
+/// documents: not a capability a model declares, but the tier every text
+/// model is a candidate for, walked largest-first (local ahead of remote
+/// on a size tie) to the first that fits — the step-up/step-down logic in
+/// [`crate::agents::orchestration::model_router::ModelRouter`].
+pub const ANSWER_TIER: &str = "answer";
+
 impl ModelCapability {
     /// All capabilities in declaration order.
-    pub const ALL: [ModelCapability; 5] = [
-        ModelCapability::General,
+    pub const ALL: [ModelCapability; 3] = [
         ModelCapability::Reasoning,
-        ModelCapability::Dp,
         ModelCapability::Vision,
         ModelCapability::Thinking,
     ];
 
+    /// Values older catalogs, overrides and settings used for what a turn
+    /// is about.  They parse, and route nothing.
+    pub const LEGACY: [&'static str; 3] = ["general", "dp", "coding"];
+
     /// The enum's wire value.
     pub fn value(&self) -> &'static str {
         match self {
-            ModelCapability::General => "general",
             ModelCapability::Reasoning => "reasoning",
-            ModelCapability::Dp => "dp",
             ModelCapability::Vision => "vision",
             ModelCapability::Thinking => "thinking",
         }
     }
 
     /// Resolve a capability string, including names it used to go by
-    /// (`"skills"` -> `Reasoning`).  `None` when the value is unknown
-    /// (Python raises `ValueError` there).
+    /// (`"skills"` -> `Reasoning`).  `None` when the value is unknown, or
+    /// one of [`Self::LEGACY`].
     pub fn from_value(value: &str) -> Option<Self> {
         if let Some(c) = Self::ALL.iter().find(|c| c.value() == value) {
             return Some(*c);
         }
         match value.trim().to_lowercase().as_str() {
             "skills" => Some(ModelCapability::Reasoning),
-            // Code is a document: reading and writing it is document
-            // processing, so a model tagged for coding is a `dp` model.
-            "coding" => Some(ModelCapability::Dp),
             _ => None,
         }
+    }
+
+    /// Whether `value` is one of the retired capability names.
+    pub fn is_legacy(value: &str) -> bool {
+        let value = value.trim().to_lowercase();
+        Self::LEGACY.contains(&value.as_str())
+    }
+
+    /// Whether a model declaring `caps` holds a text conversation: every
+    /// model does, except one that declares nothing but vision.
+    pub fn text_model<S: AsRef<str>>(caps: &[S]) -> bool {
+        let vision = ModelCapability::Vision.value();
+        caps.is_empty() || caps.iter().any(|c| c.as_ref().to_lowercase() != vision)
     }
 }
 

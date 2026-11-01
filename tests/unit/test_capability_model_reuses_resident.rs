@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use smartloop::api::services::model_service::{CachedLlm, ModelService, ModelServiceHooks};
 use smartloop::llms::base_llm::BaseLLM;
+use smartloop::types::ANSWER_TIER;
 use smartloop::workspace::{Workspace, WorkspaceModel};
 
 use crate::shared::model_service_a::{FakeLLM, attach_workspace, bare_service, same};
@@ -55,12 +56,12 @@ fn resolve(svc: &Arc<ModelService>, capability: &str, ranked: Vec<WorkspaceModel
     (llm, loaded.load(Ordering::SeqCst))
 }
 
-/// The regression: capability GENERAL resolves to the model already
-/// answering as the router, so it must hand back that instance.
+/// The regression: the answer tier resolves to the model already answering
+/// as the router, so it must hand back that instance.
 #[test]
 fn test_the_orchestrator_model_is_not_loaded_twice() {
     let svc = svc();
-    let (llm, loaded) = resolve(&svc, "general", vec![ws_model("sl-mini")]);
+    let (llm, loaded) = resolve(&svc, ANSWER_TIER, vec![ws_model("sl-mini")]);
 
     assert!(same(&llm.expect("resident"), &svc.llm.read().clone().unwrap()));
     assert!(!loaded);
@@ -71,7 +72,7 @@ fn test_the_orchestrator_model_is_not_loaded_twice() {
 #[test]
 fn test_a_legacy_name_still_matches_the_resident_model() {
     let svc = svc();
-    let (llm, loaded) = resolve(&svc, "general", vec![ws_model("slp-orchestra-mini")]);
+    let (llm, loaded) = resolve(&svc, ANSWER_TIER, vec![ws_model("slp-orchestra-mini")]);
 
     assert!(same(&llm.expect("resident"), &svc.llm.read().clone().unwrap()));
     assert!(!loaded);
@@ -97,7 +98,7 @@ fn test_the_resident_large_model_is_reused_too() {
 #[test]
 fn test_a_model_that_is_not_resident_is_still_loaded() {
     let svc = svc();
-    let (llm, loaded) = resolve(&svc, "dp", vec![ws_model("coder-7b")]);
+    let (llm, loaded) = resolve(&svc, "reasoning", vec![ws_model("coder-7b")]);
 
     assert!(loaded);
     let llm = llm.expect("a loaded model");

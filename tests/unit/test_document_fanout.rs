@@ -344,7 +344,7 @@ mod fanout_handlers {
         let dp_llm = llm_8k("DP EXTRACT");
         let provider_llm = dp_llm.shared();
         let provider: CapabilityLlmProvider = Arc::new(move |capability: &str| {
-            Ok(if capability == "dp" { Some(Arc::clone(&provider_llm)) } else { None })
+            Ok(if capability == smartloop::types::ANSWER_TIER { Some(Arc::clone(&provider_llm)) } else { None })
         });
         let orch = SLPOrchestrator::new(
             llm.shared(),

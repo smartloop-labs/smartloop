@@ -390,6 +390,8 @@ pub struct ClassifyOptions {
     pub has_attachments: bool,
     pub history: Option<String>,
     pub cwd: Option<String>,
+    /// What the selected models declare (vision, reasoning, thinking);
+    /// `Some` even when empty while a model is selected, `None` with none.
     pub available_capabilities: Option<Vec<String>>,
 }
 
@@ -594,56 +596,24 @@ impl Planner {
             }
         }
 
+        // Which model answers is routed, not classified.  Attachments are
+        // image work, which a model has to declare `vision` for; everything
+        // else — chat, documents, code — is text work on the answer tier,
+        // where the router steps up to the largest model that fits.  With
+        // no model selected at all (`available_capabilities` is `None`) a
+        // conversation plans nothing and streams on the router model.
         if let Some(capabilities) = available_capabilities.as_deref() {
-            if !capabilities.is_empty() {
-                result.capability = Self::match_capability(
-                    capabilities,
-                    has_attachments,
-                    result.has_coding_intent,
-                    skills.as_ref().is_some_and(|s| !s.is_empty()),
-                    result.has_document_context,
-                );
-                if let Some(cap) = result.capability.as_deref().filter(|c| !c.is_empty()) {
-                    tracing::info!(target: "smartloop.agents.planner", "[classify] capability → {}", cap);
-                }
-            }
+            let vision = ModelCapability::Vision.value();
+            let key = if has_attachments && capabilities.iter().any(|c| c == vision) {
+                vision
+            } else {
+                crate::types::ANSWER_TIER
+            };
+            result.capability = Some(key.to_string());
+            tracing::info!(target: "smartloop.agents.planner", "[classify] routes on → {}", key);
         }
 
         result
-    }
-
-    /// Pick a capability from planning signals in priority order.
-    ///
-    /// Priority:
-    ///   1. `vision`    — attachments imply image/document OCR work.
-    ///   2. `dp`        — programming work: code is a document, read and
-    ///      written by the document-processing model, ahead of a skill.
-    ///   3. `reasoning` — a matched skill defines the procedure to run.
-    ///   4. `dp`        — indexed document context: data-processing model.
-    ///   5. `general`   — default for open-ended chat / general answers.
-    ///
-    /// Returns the first capability whose signal fires *and* is present
-    /// in `capabilities`, or `None` when nothing matches.
-    pub fn match_capability(
-        capabilities: &[String],
-        has_attachments: bool,
-        has_coding_intent: bool,
-        has_matched_skills: bool,
-        has_document_context: bool,
-    ) -> Option<String> {
-        let priority = [
-            (ModelCapability::Vision, has_attachments),
-            (ModelCapability::Dp, has_coding_intent),
-            (ModelCapability::Reasoning, has_matched_skills),
-            (ModelCapability::Dp, has_document_context),
-            (ModelCapability::General, true),
-        ];
-        for (cap, signal) in priority {
-            if signal && capabilities.iter().any(|c| c == cap.value()) {
-                return Some(cap.value().to_string());
-            }
-        }
-        None
     }
 
     /// Extract all deterministic signals from the user message.
@@ -1020,6 +990,10 @@ impl Planner {
                 // project it runs as a parallel source in the collect step (see
                 // Explorer.collect_parallel), so latest-info context is gathered for
                 // every query without a brittle keyword gate.
+                // One LARGE step on what the request routes on — vision for
+                // attachments, else the answer tier — when a model is
+                // selected; with none, nothing to plan: the router model
+                // streams the answer itself.
                 if let Some(cap) = classification.capability.as_deref().filter(|c| !c.is_empty()) {
                     return ExecutionPlan {
                         steps: vec![PlanStep {
@@ -1033,10 +1007,10 @@ impl Planner {
                             capability: Some(cap.to_string()),
                             ..Default::default()
                         }],
-                        reasoning: format!("conversation → capability '{cap}'"),
+                        reasoning: format!("conversation → '{cap}'"),
                     };
                 }
-                ExecutionPlan { steps: Vec::new(), reasoning: "conversation (no capability)".to_string() }
+                ExecutionPlan { steps: Vec::new(), reasoning: "conversation (no model selected)".to_string() }
             }
             IntentType::ToolCall => self.plan_tool_call(classification, context),
             IntentType::Action => self.plan_action(classification, context),

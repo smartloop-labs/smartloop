@@ -53,9 +53,10 @@ pub type DocumentProgressCallback = Arc<dyn Fn(Value) + Send + Sync>;
 /// progress payload as JSON).
 pub type TrainProgressCallback = Arc<dyn Fn(Value) + Send + Sync>;
 
-/// Base-class default for `default_capabilities()`: every model does at least
-/// general chat.
-pub const DEFAULT_CAPABILITIES: &[ModelCapability] = &[ModelCapability::General];
+/// Base-class default for `default_capabilities()`: none.  Text chat needs
+/// no capability — every model does it — so a model declares only what
+/// sets it apart (vision, reasoning, thinking).
+pub const DEFAULT_CAPABILITIES: &[ModelCapability] = &[];
 
 /// Abstract base trait for a Smartloop model.
 pub trait SLPModel: Send + Sync {

@@ -1819,7 +1819,9 @@ impl ModelService {
             .iter()
             .map(|c| Self::cap_name(c).to_lowercase())
             .collect();
-        if caps.contains(ModelCapability::General.value()) {
+        // A text model serves every step; only a vision-only selection is
+        // pinned to the steps that ask for what it declares.
+        if ModelCapability::text_model(&caps.iter().cloned().collect::<Vec<_>>()) {
             return Some(ws_model);
         }
 
@@ -1832,7 +1834,7 @@ impl ModelService {
         sorted.sort();
         tracing::info!(
             target: LOG_TARGET,
-            "[models] Sole selected model {} declares {} but not 'general' — {} runs on the default model",
+            "[models] Sole selected model {} declares {} and no text work — {} runs on the default model",
             ws_model.model_name,
             if sorted.is_empty() { "no capability".to_string() } else { py_list_repr(&sorted) },
             if cap.is_empty() { "this step".to_string() } else { format!("capability '{cap}'") }
@@ -2204,7 +2206,7 @@ impl ModelService {
             return false;
         }
         // A pinned model serves every capability it can — declared or not for
-        // a general-capable selection, only its own for a specialist one.
+        // a text model, only its own for a vision-only one.
         if self.pinned_model(Some(capability)).is_some() {
             return true;
         }
@@ -2246,7 +2248,7 @@ impl ModelService {
         };
 
         // One selected model runs every step, whatever capability the step
-        // asked for (a selection without 'general' covers only its own).
+        // asked for (a vision-only selection covers only its own).
         if let Some(pinned) = self.pinned_model(Some(capability)) {
             let llm = self.load_workspace_llm(
                 &pinned,
@@ -2470,15 +2472,10 @@ impl ModelService {
             .workspace_handle()
             .ok_or_else(|| ModelServiceError::runtime("Model not loaded"))?;
         let router_name = self.model_name.read().clone();
-        // Pick the agent/large model from any general-capable (text) model —
-        // filtering by these excludes vision-only models without requiring a
-        // specific REASONING tag.  Walk largest-first; when the biggest
-        // doesn't fit, fall to the next lower tier rather than the tiny router.
-        let text_caps = [
-            ModelCapability::General.value(),
-            ModelCapability::Reasoning.value(),
-            ModelCapability::Dp.value(),
-        ];
+        // Pick the agent/large model from any text model — which excludes
+        // only vision-only models, without requiring a REASONING tag.  Walk
+        // largest-first; when the biggest doesn't fit, fall to the next
+        // lower tier rather than the tiny router.
         let (orchestrator_size, orchestrator_rank, agent_models, models_dir) = {
             let ws = workspace.read();
             let project = ws.current_project();
@@ -2495,7 +2492,7 @@ impl ModelService {
                         && ws.effective_model_downloaded(&m.model_name)
                         && Some(m.model_name.as_str()) != router_name.as_deref()
                         && !m.is_remote()
-                        && m.effective_capabilities().iter().any(|c| text_caps.contains(&c.as_str()))
+                        && ModelCapability::text_model(&m.effective_capabilities())
                 })
                 .cloned()
                 .collect();
@@ -2504,12 +2501,12 @@ impl ModelService {
         if agent_models.is_empty() {
             tracing::info!(
                 target: LOG_TARGET,
-                "[large-model] No general-capable model downloaded — using the router model for agent/synthesis tasks"
+                "[large-model] No text model downloaded — using the router model for agent/synthesis tasks"
             );
             return Ok(());
         }
-        // Rank largest→smallest; same-size models with more cap overlap win.
-        let agent_models = Self::ranked_candidates(agent_models, &text_caps, true);
+        // Rank largest→smallest; same-size models declaring reasoning win.
+        let agent_models = Self::ranked_candidates(agent_models, &[ModelCapability::Reasoning.value()], true);
 
         let cap = AppSettings::new().llm_large_n_ctx_cap;
 
@@ -4137,9 +4134,9 @@ Search query:"
 
     /// Whether the final answer comes from a remote model.
     ///
-    /// Resolved the way the answer is (`general`), so a selection mixing
-    /// local and remote models says remote only when no local model can
-    /// answer.  No remote selection, no resolution.
+    /// Resolved the way the answer is (the answer tier), so a selection
+    /// mixing local and remote models says remote only when no local model
+    /// can answer.  No remote selection, no resolution.
     pub fn answers_remotely(&self) -> bool {
         let remote: Vec<String> = self
             .selected_models()
@@ -4150,7 +4147,7 @@ Search query:"
         if remote.is_empty() {
             return false;
         }
-        let label = self.response_model_label(Some(ModelCapability::General.value()));
+        let label = self.response_model_label(Some(crate::types::ANSWER_TIER));
         remote.contains(&label)
     }
 

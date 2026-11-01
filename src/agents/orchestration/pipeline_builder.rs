@@ -654,13 +654,14 @@ impl PipelineBuilder {
             planner_skills,
             document_context.as_deref(),
         );
-        // Multi-step tool selection is complex reasoning — prefer the large
-        // 'dp' model when it is resident or fits, else fall back to the mini.
-        // Resolved lazily, only for MULTI_STEP, so simple requests never touch
-        // the 4B and a memory-tight device is never pushed into an OOM.
+        // Multi-step tool selection is complex reasoning — prefer a model
+        // declaring it when one is resident or fits, else fall back to the
+        // mini.  Resolved lazily, only for MULTI_STEP, so simple requests
+        // never touch the 4B and a memory-tight device is never pushed into
+        // an OOM.
         let mut plan_llm: Option<Arc<dyn BaseLLM>> = None;
         if classification.intent == IntentType::MultiStep {
-            let llm = self.models.decision_llm(Some(ModelCapability::Dp.value()), None);
+            let llm = self.models.decision_llm(Some(ModelCapability::Reasoning.value()), None);
             tracing::info!(
                 target: LOG_TARGET,
                 "[models] PLAN (multi-step) → {}",

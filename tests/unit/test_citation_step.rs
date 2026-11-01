@@ -42,7 +42,6 @@ use smartloop::constants::OPENING_TOKENS;
 use smartloop::db::embeddings;
 use smartloop::llms::base_llm::{CancelEvent, GenerationChunk};
 use smartloop::model_host::client::{InProcessModelClient, LocalModelService, ModelClient};
-use smartloop::types::ModelCapability;
 use smartloop::workspace::types::Skill;
 
 const DOC: &str = "invoice-contoso.pdf";
@@ -223,11 +222,11 @@ impl ChatService for FakeService {
     fn get_max_context_tokens(&self) -> usize {
         4096
     }
-    fn get_response_max_context_tokens(&self, _capability: Option<ModelCapability>) -> usize {
+    fn get_response_max_context_tokens(&self, _capability: Option<&str>) -> usize {
         4096
     }
     fn begin_response_request(&self, _progress_callback: Option<ProgressCallback>) {}
-    fn announce_response_model(&self, _capability: Option<ModelCapability>) {}
+    fn announce_response_model(&self, _capability: Option<&str>) {}
     fn append_to_session(
         &self,
         session_id: &str,

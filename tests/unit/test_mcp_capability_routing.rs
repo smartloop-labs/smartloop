@@ -76,7 +76,7 @@ fn test_a_tagged_small_step_gets_the_capability_model() {
     let cap_llm = named_llm("Gemma 3n E2B").as_llm();
     let (router, agent_llm) = router_for(Some(cap_llm.clone()));
 
-    let resolved = router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Dp.value()), None);
+    let resolved = router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Vision.value()), None);
 
     assert!(same_llm(&resolved, &cap_llm));
     assert!(!same_llm(&resolved, &agent_llm));
@@ -94,7 +94,7 @@ fn test_an_untagged_small_step_still_gets_the_agent_model() {
 fn test_it_falls_back_when_the_capability_model_will_not_load() {
     let (router, agent_llm) = router_for(None);
 
-    let resolved = router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Dp.value()), None);
+    let resolved = router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Vision.value()), None);
 
     assert!(same_llm(&resolved, &agent_llm));
 }
@@ -114,7 +114,7 @@ fn test_a_provider_failure_does_not_break_the_step() {
     router.begin_request(Some(progress));
 
     assert!(same_llm(
-        &router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Dp.value()), None),
+        &router.llm_for_tier(ModelTier::Small, Some(ModelCapability::Vision.value()), None),
         &agent_llm
     ));
 }
@@ -373,7 +373,7 @@ fn test_a_different_model_for_the_tool_call_is_still_announced() {
         }
     }));
 
-    router.llm_for_tier(ModelTier::Large, Some(ModelCapability::Dp.value()), None);
+    router.llm_for_tier(ModelTier::Large, Some(ModelCapability::Vision.value()), None);
     router.reasoning_llm(router_llm);
 
     let selected: Vec<String> = messages(&progress)
@@ -383,7 +383,7 @@ fn test_a_different_model_for_the_tool_call_is_still_announced() {
     assert_eq!(
         selected,
         vec![
-            "Selected Qwen3.5 2B for document processing".to_string(),
+            "Selected Qwen3.5 2B for vision".to_string(),
             "Selected Qwen3 4B for tool resolution".to_string(),
         ]
     );
@@ -430,7 +430,7 @@ fn test_tool_resolution_promotes_to_a_remote_reasoning_model() {
     let cloud = cloud.as_llm();
     let provided = cloud.clone();
     let (router, router_llm, progress, lookups) =
-        promoting_router(Arc::new(move |_cap: &str| Some(provided.clone())), &["general", "reasoning"]);
+        promoting_router(Arc::new(move |_cap: &str| Some(provided.clone())), &["reasoning"]);
 
     assert!(same_llm(&router.reasoning_llm(router_llm), &cloud));
     // No thinking model is selected, so only the reasoning lookup ran — and
@@ -456,7 +456,7 @@ fn test_a_reasoning_model_is_preferred_over_a_thinking_one() {
                 Some(reasoning_pick.clone())
             }
         }),
-        &["general", "reasoning", "thinking"],
+        &["reasoning", "thinking"],
     );
 
     assert!(same_llm(&router.reasoning_llm(router_llm), &cloud));
@@ -491,7 +491,7 @@ fn test_a_thinking_model_resolves_when_none_declares_reasoning() {
 #[test]
 fn test_without_a_reasoning_model_the_router_model_resolves() {
     let (router, router_llm, progress, lookups) =
-        promoting_router(Arc::new(|_cap: &str| None), &["general"]);
+        promoting_router(Arc::new(|_cap: &str| None), &[]);
 
     assert!(same_llm(&router.reasoning_llm(router_llm.clone()), &router_llm));
     assert!(lookups.lock().is_empty());
