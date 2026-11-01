@@ -87,6 +87,14 @@ mod through_the_service {
         assert!(system["client"].is_null());
         let still = svc.update_project(system["id"].as_str().unwrap(), None, None, None, None, None, Some("docent")).expect("updated");
         assert!(still["client"].is_null());
+        // A record marked before that held reports no client either.
+        {
+            let model = svc.model.read().clone().expect("model");
+            let mut workspace = model.workspace.write();
+            let record = workspace.project_mut(system["id"].as_str().unwrap()).expect("system project");
+            record.client = Some("docent".into());
+            assert!(svc.project_to_dict(record)["client"].is_null());
+        }
 
         pin_project(None);
         delegate_projects(false);

@@ -1715,7 +1715,9 @@ impl ModelService {
             "name": p.name,
             "cwd": p.work_dir().unwrap_or_default(),
             "description": p.description,
-            "client": p.client,
+            // The system project is every client's: a client a record may
+            // carry from before that held is not reported.
+            "client": if p.system { None } else { p.client.clone() },
             "model_name": self.model_name.read().clone(),
             "current": p.current,
             "system": p.system,
