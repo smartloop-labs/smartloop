@@ -112,8 +112,10 @@ fn test_a_new_local_model_needs_only_a_catalog_row() {
     assert_eq!(spec.model_id, "google/gemma-4-e8b-it");
     assert_eq!(spec.kind, ModelKind::Local);
     assert_eq!(spec.param_size_b, 8.0);
-    // "general" and "dp" say what every text model does, so nothing.
+    // "general" and "dp" say what every text model does, so nothing — but
+    // they do say this vision model holds a text conversation.
     assert_eq!(spec.capabilities, vec![Vision]);
+    assert!(spec.text);
     assert_eq!(spec.model_type(), ModelType::MultiModal);
     assert_eq!(registry.get_by_id("google/gemma-4-e8b-it").unwrap().name, "gemma4-e8b");
 }
@@ -143,6 +145,7 @@ fn test_a_remote_model_carries_size_and_endpoint() {
     // A catalog row's "general" and "coding" name what the turn is about,
     // not a capability: they parse, and declare nothing.
     assert!(spec.capabilities.is_empty());
+    assert!(spec.text);
     // No weights, so nothing resolves by an empty id.
     assert!(registry.get_by_id("").is_none());
 }
@@ -252,4 +255,33 @@ fn test_unparseable_rows_are_skipped() {
     assert!(CatalogModel::from_row(&obj(json!({"model_id": "org/x"}))).is_none());
     assert!(CatalogModel::from_row(&obj(json!({"name": "x", "param_size_b": "big"}))).is_none());
     assert!(CatalogModel::from_row(&obj(json!({"name": "x", "description": "extra fields pass"}))).is_some());
+}
+
+/// A model that declares nothing but vision is the one kind that holds no
+/// text conversation; a vision model whose row also says `general`, `dp` or
+/// `coding` — the whole cloud catalog — is a text model, though only
+/// `vision` survives as a capability.
+#[test]
+fn test_only_a_model_declared_vision_alone_is_not_a_text_model() {
+    let mut registry = ModelRegistry::seeded();
+    registry.hydrate([
+        row(json!({
+            "name": "minimax-m3", "model_id": null, "type": "remote", "url": "https://api.smartloop.ai",
+            "capabilities": ["general", "dp", "vision", "coding"], "param_size_b": 428.0, "active_param_size_b": 23.0,
+        })),
+        row(json!({
+            "name": "ocr-only", "model_id": "acme/ocr-only", "type": "local",
+            "capabilities": ["vision"], "vision_chat_handler": "MTMDChatHandler", "param_size_b": 2.0,
+        })),
+    ]);
+    let minimax = registry.get("minimax-m3").unwrap();
+    assert_eq!(minimax.capabilities, vec![Vision]);
+    assert!(minimax.text, "the legacy tags beside vision say it chats");
+    let ocr = registry.get("ocr-only").unwrap();
+    assert_eq!(ocr.capabilities, vec![Vision]);
+    assert!(!ocr.text);
+    // The seeds agree: Qwen2-VL is declared vision alone; the text models are text.
+    assert!(!registry.get("qwen2-vl-2b").unwrap().text);
+    assert!(registry.get("qwen3.5-2b").unwrap().text);
+    assert!(registry.get("slp-orchestra-mini").unwrap().text);
 }

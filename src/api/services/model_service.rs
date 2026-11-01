@@ -1814,16 +1814,16 @@ impl ModelService {
             return None;
         }
 
+        // A text model serves every step; only a vision-only selection is
+        // pinned to the steps that ask for what it declares.
+        if ws_model.is_text_model() {
+            return Some(ws_model);
+        }
         let caps: HashSet<String> = ws_model
             .effective_capabilities()
             .iter()
             .map(|c| Self::cap_name(c).to_lowercase())
             .collect();
-        // A text model serves every step; only a vision-only selection is
-        // pinned to the steps that ask for what it declares.
-        if ModelCapability::text_model(&caps.iter().cloned().collect::<Vec<_>>()) {
-            return Some(ws_model);
-        }
 
         let cap = capability.map(|c| Self::cap_name(c).to_lowercase()).unwrap_or_default();
         if !cap.is_empty() && caps.contains(&cap) {
@@ -2492,7 +2492,7 @@ impl ModelService {
                         && ws.effective_model_downloaded(&m.model_name)
                         && Some(m.model_name.as_str()) != router_name.as_deref()
                         && !m.is_remote()
-                        && ModelCapability::text_model(&m.effective_capabilities())
+                        && m.is_text_model()
                 })
                 .cloned()
                 .collect();

@@ -847,6 +847,23 @@ impl WorkspaceModel {
     /// take effect immediately.  A local model without a spec falls back to
     /// metadata-inferred capabilities; a remote one, which nothing can be
     /// inferred about, declares none.
+    /// Whether the model holds a text conversation, so it is a candidate
+    /// for the answer tier: every model but one declared vision-only. An
+    /// override set here is read as declared; a spec knows from its whole
+    /// catalog row; a remote model without one is a chat model, as every
+    /// model the platform lists is; a local one without one is read off
+    /// its name.
+    pub fn is_text_model(&self) -> bool {
+        if let Some(set) = &self.capabilities_override {
+            return ModelCapability::text_model(set);
+        }
+        match self.spec() {
+            Some(spec) => spec.text,
+            None if self.is_remote() => true,
+            None => ModelCapability::text_model(&self.infer_capabilities()),
+        }
+    }
+
     pub fn effective_capabilities(&self) -> Vec<String> {
         if let Some(set) = &self.capabilities_override {
             return set.clone();
@@ -1798,11 +1815,10 @@ impl Workspace {
                     && self.effective_model_downloaded(&m.model_name)
                     && (m.param_size_b() > 0.0 || m.is_remote())
                     && {
-                        let caps = m.effective_capabilities();
                         if answer {
-                            ModelCapability::text_model(&caps)
+                            m.is_text_model()
                         } else {
-                            caps.iter().any(|c| c.to_lowercase() == cap)
+                            m.effective_capabilities().iter().any(|c| c.to_lowercase() == cap)
                         }
                     }
             })

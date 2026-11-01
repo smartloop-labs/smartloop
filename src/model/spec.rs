@@ -47,6 +47,12 @@ pub struct ModelSpec {
     pub attention: Option<Attention>,
     /// Capabilities the model declares — never empty.
     pub capabilities: Vec<ModelCapability>,
+    /// Whether the model holds a text conversation. Every model does but one
+    /// declared vision-only, so this is read off the whole declared list
+    /// before the legacy values are dropped: a catalog row saying `general`,
+    /// `dp` or `coding` beside `vision` describes a text model, where the
+    /// capabilities that survive (`vision` alone) would not say so.
+    pub text: bool,
     /// Whether reasoning starts ON for a model that supports it.
     pub thinking_default: bool,
     /// llama.cpp chat-handler name for image input, `None` for text-only.
@@ -73,6 +79,7 @@ impl ModelSpec {
             active_param_size_b: None,
             attention: None,
             capabilities: DEFAULT_CAPABILITIES.to_vec(),
+            text: true,
             thinking_default: false,
             vision_chat_handler: None,
             url: None,
@@ -150,6 +157,9 @@ impl ModelSpec {
         // about every text model, and say nothing now.  An absent or empty
         // list declares nothing and keeps the base.
         if let Some(capabilities) = row.capabilities.filter(|c| !c.is_empty()) {
+            // Read before the legacy values go: they are what says a vision
+            // model holds a text conversation too.
+            spec.text = capabilities.iter().any(|c| c.trim().to_lowercase() != ModelCapability::Vision.value());
             spec.capabilities = capabilities
                 .iter()
                 .filter_map(|c| {
@@ -244,6 +254,7 @@ pub fn seed_specs() -> Vec<ModelSpec> {
                 vision_chat_handler: Option<&str>| ModelSpec {
         model_version,
         param_size_b,
+        text: capabilities.is_empty() || capabilities.iter().any(|c| *c != Vision),
         capabilities,
         vision_chat_handler: vision_chat_handler.map(str::to_string),
         ..ModelSpec::local(name, model_id)
