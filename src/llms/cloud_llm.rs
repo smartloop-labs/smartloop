@@ -1,8 +1,14 @@
-//! A remote catalog model, answered over HTTP by the platform API.
+//! A remote catalog model, answered over HTTP.
 //!
-//! The prompt is split back into chat messages and sent to
-//! `{url}/v1/chat/completions` under the catalog name; the platform forwards
-//! it to the model's upstream provider and records token usage itself.
+//! The prompt is split back into chat messages and sent one of two ways:
+//!
+//! * **Direct** (the default): to the model's provider, with the
+//!   short-lived key a [`cloud_session`](crate::llms::cloud_session) holds.
+//!   The platform only issues the key; it never sees the chat.
+//! * **Proxy** (`SLP_CLOUD_DIRECT=false`): to `{url}/v1/chat/completions`
+//!   under the catalog name; the
+//!   platform forwards it upstream and records token usage itself.
+//!
 //! Not to be confused with `model_host::remote_llm::RemoteLLM`, which is a
 //! local model loaded in the model-host process.
 //!
@@ -30,6 +36,7 @@ use serde_json::{json, Value};
 
 use crate::config::app_settings::AppSettings;
 use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
+use crate::llms::cloud_session::{self, SessionModel};
 use crate::platform::client::{AuthHeadersFn, Headers, RefreshFn, SLPPlatformClient};
 
 const LOG_TARGET: &str = "smartloop.llms.cloud";
@@ -113,6 +120,48 @@ pub fn describe_failure(status: u16, body: &str, model: &str) -> String {
     }
 }
 
+/// The message to show for a request the provider refused, called directly
+/// with a session key.  Providers report `{"error": {"message": ...}}`.
+pub fn describe_provider_failure(status: u16, body: &str, model: &str) -> String {
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_string));
+    match status {
+        // The key's spend limit: the allowance this session was given is used.
+        402 => "You've used your cloud allowance for now.".to_string(),
+        // The key's model allowlist.
+        404 => format!("{model} isn't available on your current plan."),
+        429 => format!("{model} is busy right now. Try again shortly."),
+        401 => format!("{model} refused this session. Try again."),
+        400 | 403 => message.unwrap_or_else(|| format!("{model} could not answer this request.")),
+        _ => format!("{model} did not answer (HTTP {status})."),
+    }
+}
+
+/// The provider request for `model`: the server's fields for it, then the
+/// app's, under the provider's model id.  The project id stays home, and the
+/// answer is held to the server's cap.
+fn direct_body(model: &SessionModel, body: &Value) -> Value {
+    let mut out = Value::Object(model.body.clone());
+    if let Value::Object(fields) = body {
+        for (name, value) in fields {
+            if name != "project_id" {
+                out[name] = value.clone();
+            }
+        }
+    }
+    out["model"] = json!(model.provider_model);
+    if let (Some(cap), Some(asked)) = (model.max_tokens, out["max_tokens"].as_u64())
+        && asked as usize > cap
+    {
+        out["max_tokens"] = json!(cap);
+    }
+    if out["stream"] == json!(true) && out.get("stream_options").is_none() {
+        out["stream_options"] = json!({"include_usage": true});
+    }
+    out
+}
+
 /// A remote model as a [`BaseLLM`].
 pub struct CloudLLM {
     project_id: String,
@@ -121,6 +170,9 @@ pub struct CloudLLM {
     reasoning_budget_tokens: usize,
     client: SLPPlatformClient,
     send_credentials: bool,
+    /// The platform to take session keys from, when calling providers
+    /// directly; `None` sends chats to `client`.
+    session_client: Option<SLPPlatformClient>,
     cancelled: RwLock<Option<CancelEvent>>,
 }
 
@@ -139,11 +191,15 @@ impl CloudLLM {
         auth_headers_fn: Option<AuthHeadersFn>,
         refresh_fn: Option<RefreshFn>,
     ) -> Self {
-        let api_base = AppSettings::new().slp_api_base;
+        let settings = AppSettings::new();
+        let api_base = settings.slp_api_base;
         let send_credentials = credentials_allowed(url, &api_base);
         if !send_credentials {
             tracing::warn!(target: LOG_TARGET, "[cloud] {model_name} is served from {url}; not sending credentials there");
         }
+        // Only a model the platform serves has a session to call it with.
+        let session_client = (settings.cloud_direct && send_credentials)
+            .then(|| SLPPlatformClient::with_hooks(&api_base, auth_headers_fn.clone(), refresh_fn.clone()));
         Self {
             project_id: project_id.to_string(),
             model_name: model_name.to_string(),
@@ -151,6 +207,7 @@ impl CloudLLM {
             reasoning_budget_tokens: DEFAULT_REASONING_BUDGET_TOKENS,
             client: SLPPlatformClient::with_hooks(url, auth_headers_fn, refresh_fn),
             send_credentials,
+            session_client,
             cancelled: RwLock::new(None),
         }
     }
@@ -169,6 +226,11 @@ impl CloudLLM {
 
     pub fn url(&self) -> &str {
         self.client.base_url()
+    }
+
+    /// Whether chats go straight to the provider with a session key.
+    pub fn is_direct(&self) -> bool {
+        self.session_client.is_some()
     }
 
     /// The `max_tokens` to send for a caller's cap.  The cap sizes the
@@ -252,15 +314,24 @@ impl CloudLLM {
             .map_err(|e| anyhow::anyhow!("{} sent an unreadable answer: {e}", self.model_name))
     }
 
-    /// POST the chat request, redeeming the refresh token once on a 401.
-    /// Send `body`; refused for asking more answer tokens than the endpoint
-    /// allows, it learns the cap and sends again within it.
+    /// Send `body` the way this model is reached; refused for asking more
+    /// answer tokens than the endpoint allows, it learns the cap and sends
+    /// again within it.
     fn post(&self, body: &Value) -> Result<reqwest::blocking::Response, String> {
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| format!("Could not reach {}: {e}", self.model_name))?;
+        match &self.session_client {
+            Some(platform) => self.post_direct(&http, platform, body),
+            None => self.post_proxy(&http, body),
+        }
+    }
+
+    /// POST to the platform's chat endpoint, redeeming the refresh token
+    /// once on a 401.
+    fn post_proxy(&self, http: &reqwest::blocking::Client, body: &Value) -> Result<reqwest::blocking::Response, String> {
         let url = format!("{}{CHAT_PATH}", self.client.base_url());
         let mut body = body.clone();
         loop {
@@ -276,27 +347,83 @@ impl CloudLLM {
             } else {
                 send(&self.client.headers(None))
             };
-            let response = sent.map_err(|e| {
-                tracing::warn!(target: LOG_TARGET, "[cloud] {} request failed: {e}", self.model_name);
-                format!("Could not reach {}. Check your connection and try again.", self.model_name)
-            })?;
+            let response = sent.map_err(|e| self.unreachable(e))?;
             let status = response.status().as_u16();
             if status < 400 {
                 return Ok(response);
             }
             let text = response.text().unwrap_or_default();
             tracing::warn!(target: LOG_TARGET, "[cloud] {} answered {status}: {text}", self.model_name);
-            let asked = body["max_tokens"].as_u64().map(|n| n as usize);
-            if let (Some(cap), Some(asked)) = (Self::cap_in(&text), asked)
-                && cap < asked
-            {
-                tracing::info!(target: LOG_TARGET, "[cloud] {} allows {cap} answer tokens; asking for that", self.model_name);
-                ANSWER_CAPS.lock().insert(self.cap_key(), cap);
-                body["max_tokens"] = json!(cap);
+            if self.learn_cap(&text, &mut body) {
                 continue;
             }
             return Err(describe_failure(status, &text, &self.model_name));
         }
+    }
+
+    /// POST to the provider with the session's key.  A key the provider
+    /// refuses (expired, revoked, or out of allowance) is traded for a new
+    /// session once.
+    fn post_direct(
+        &self,
+        http: &reqwest::blocking::Client,
+        platform: &SLPPlatformClient,
+        body: &Value,
+    ) -> Result<reqwest::blocking::Response, String> {
+        let mut session = cloud_session::session(platform, &self.project_id, &self.model_name)?;
+        let mut renewed = false;
+        let mut body = body.clone();
+        loop {
+            let Some(model) = session.model(&self.model_name) else {
+                return Err(format!("{} isn't available on your current plan.", self.model_name));
+            };
+            if let Some(cap) = model.max_tokens {
+                let mut caps = ANSWER_CAPS.lock();
+                let known = caps.entry(self.cap_key()).or_insert(cap);
+                *known = (*known).min(cap);
+            }
+            let mut request = http.post(session.chat_url()).json(&direct_body(model, &body));
+            for (name, value) in session.headers() {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            let response = request.send().map_err(|e| self.unreachable(e))?;
+            let status = response.status().as_u16();
+            if status < 400 {
+                return Ok(response);
+            }
+            let text = response.text().unwrap_or_default();
+            tracing::warn!(target: LOG_TARGET, "[cloud] {} provider answered {status}: {text}", self.model_name);
+            if matches!(status, 401 | 402 | 403) && !renewed {
+                renewed = true;
+                cloud_session::invalidate(platform, &session);
+                session = cloud_session::session(platform, &self.project_id, &self.model_name)?;
+                continue;
+            }
+            if self.learn_cap(&text, &mut body) {
+                continue;
+            }
+            return Err(describe_provider_failure(status, &text, &self.model_name));
+        }
+    }
+
+    /// The message for a request that never got an answer.
+    fn unreachable(&self, e: reqwest::Error) -> String {
+        tracing::warn!(target: LOG_TARGET, "[cloud] {} request failed: {e}", self.model_name);
+        format!("Could not reach {}. Check your connection and try again.", self.model_name)
+    }
+
+    /// When `text` refuses `body` for asking more answer tokens than allowed,
+    /// remember the cap and lower `body` to it.  Whether to send again.
+    fn learn_cap(&self, text: &str, body: &mut Value) -> bool {
+        let asked = body["max_tokens"].as_u64().map(|n| n as usize);
+        let (Some(cap), Some(asked)) = (Self::cap_in(text), asked) else { return false };
+        if cap >= asked {
+            return false;
+        }
+        tracing::info!(target: LOG_TARGET, "[cloud] {} allows {cap} answer tokens; asking for that", self.model_name);
+        ANSWER_CAPS.lock().insert(self.cap_key(), cap);
+        body["max_tokens"] = json!(cap);
+        true
     }
 
     fn is_cancelled(&self) -> bool {
@@ -410,10 +537,11 @@ impl BaseLLM for CloudLLM {
                 return None;
             }
             let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
-            reasoned += chunk
-                .pointer("/choices/0/delta/reasoning_content")
-                .and_then(Value::as_str)
-                .map_or(0, |s| s.chars().count());
+            reasoned += ["/choices/0/delta/reasoning_content", "/choices/0/delta/reasoning"]
+                .iter()
+                .filter_map(|p| chunk.pointer(p).and_then(Value::as_str))
+                .map(|s| s.chars().count())
+                .sum::<usize>();
             // Text already streamed can't be taken back, so a cut-off stream
             // is only reported, with where the room went.
             if chunk.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length") {

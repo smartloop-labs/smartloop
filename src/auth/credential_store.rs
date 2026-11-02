@@ -342,6 +342,8 @@ pub fn clear_tokens() {
     if let Err(e) = save_creds(&creds) {
         tracing::error!(target: "smartloop.auth.credential_store", "Failed to save credentials: {e}");
     }
+    // Cloud session keys were issued to the account now signed out.
+    crate::llms::cloud_session::clear();
 }
 
 // -- unified resolver ------------------------------------------------------
