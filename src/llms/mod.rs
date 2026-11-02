@@ -2,6 +2,7 @@
 
 pub mod base_llm;
 pub mod cloud_llm;
+pub mod cloud_session;
 pub mod llama;
 pub mod llama_cpp;
 pub mod llm_factory;

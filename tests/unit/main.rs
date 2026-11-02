@@ -101,6 +101,7 @@ mod test_model_access_level;
 mod test_remote_workspace_model;
 mod test_cloud_llm;
 mod test_cloud_model_routing;
+mod test_cloud_session;
 mod test_cloud_vision;
 mod test_model_display_name;
 mod test_model_host;
