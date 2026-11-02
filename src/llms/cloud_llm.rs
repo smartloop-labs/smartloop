@@ -2,10 +2,11 @@
 //!
 //! The prompt is split back into chat messages and sent one of two ways:
 //!
-//! * **Direct** (`SLP_CLOUD_DIRECT`): to the model's provider, with the
+//! * **Direct** (the default): to the model's provider, with the
 //!   short-lived key a [`cloud_session`](crate::llms::cloud_session) holds.
 //!   The platform only issues the key; it never sees the chat.
-//! * **Proxy**: to `{url}/v1/chat/completions` under the catalog name; the
+//! * **Proxy** (`SLP_CLOUD_DIRECT=false`): to `{url}/v1/chat/completions`
+//!   under the catalog name; the
 //!   platform forwards it upstream and records token usage itself.
 //!
 //! Not to be confused with `model_host::remote_llm::RemoteLLM`, which is a

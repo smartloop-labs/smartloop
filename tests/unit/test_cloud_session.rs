@@ -227,11 +227,20 @@ async fn test_an_insecure_provider_endpoint_is_refused() {
 
 #[test]
 #[serial]
-fn test_proxy_stays_the_default() {
+fn test_direct_is_the_default() {
     let _env = EnvGuard::set("SLP_API_BASE", "https://api.smartloop.ai");
-    let _off = EnvGuard::remove("SLP_CLOUD_DIRECT");
-    let llm = CloudLLM::new("p1", "kimi-k2", "https://api.smartloop.ai", None);
-    assert!(!llm.is_direct());
+    let _unset = EnvGuard::remove("SLP_CLOUD_DIRECT");
+    assert!(CloudLLM::new("p1", "kimi-k2", "https://api.smartloop.ai", None).is_direct());
+    // A model served from elsewhere has no session to call it with.
+    assert!(!CloudLLM::new("p1", "other", "https://models.example.com", None).is_direct());
+}
+
+#[test]
+#[serial]
+fn test_the_proxy_can_still_be_chosen() {
+    let _env = EnvGuard::set("SLP_API_BASE", "https://api.smartloop.ai");
+    let _off = EnvGuard::set("SLP_CLOUD_DIRECT", "false");
+    assert!(!CloudLLM::new("p1", "kimi-k2", "https://api.smartloop.ai", None).is_direct());
 }
 
 #[test]

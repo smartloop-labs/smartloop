@@ -128,8 +128,8 @@ pub struct AppSettings {
     /// `SLP_AGENT_MEMORY_LIMIT_MB` — 0 = no ceiling.
     pub agent_memory_limit_mb: i64,
     /// `SLP_CLOUD_DIRECT` — cloud models are called at their provider with a
-    /// short-lived key from `/v1/chat/session`, not through the platform's
-    /// `/v1/chat/completions`.  Off until the session endpoint ships.
+    /// short-lived key from `/v1/chat/session` (the default).  `false` sends
+    /// them through the platform's `/v1/chat/completions` instead.
     pub cloud_direct: bool,
 }
 
@@ -195,7 +195,7 @@ impl AppSettings {
             stream_stall_timeout_s: 0.0,
             agent_idle_ttl_s: 900.0,
             agent_memory_limit_mb: 0,
-            cloud_direct: false,
+            cloud_direct: true,
         }
     }
 
