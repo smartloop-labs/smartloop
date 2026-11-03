@@ -37,7 +37,6 @@ use crate::agents::planner::{
     mcp_connection_is_usable, PlanStep, StepType, SYSTEM_TOOLS_SERVER_ID,
     SYSTEM_TOOLS_SERVER_NAME,
 };
-use crate::constants::{resolve_current_date, SYSTEM_PROMPT};
 use crate::llms::BaseLLM;
 use crate::mcp::client::MCPToolCallResult;
 use crate::paths::expand_home;
@@ -132,9 +131,6 @@ pub struct StepExecutor {
     response: Arc<ResponseBuilder>,
     resolve_hook: Mutex<Option<ResolveHook>>,
     extract_hook: Mutex<Option<ExtractHook>>,
-    /// The final answer comes from a remote model: a conversational step
-    /// passes its context through rather than drafting a reply.
-    answers_remotely: bool,
 }
 
 impl StepExecutor {
@@ -161,15 +157,7 @@ impl StepExecutor {
             response,
             resolve_hook: Mutex::new(None),
             extract_hook: Mutex::new(None),
-            answers_remotely: false,
         }
-    }
-
-    /// This executor, for a request whose final answer comes from a remote
-    /// model when `on`.
-    pub fn with_remote_answer(mut self, on: bool) -> Self {
-        self.answers_remotely = on;
-        self
     }
 
     /// Replace (or restore, with `None`) the MCPAgent resolution call (tests).
@@ -336,8 +324,6 @@ impl StepExecutor {
             cwd,
             project_dir,
             model_service,
-            conversation_history,
-            current_date,
         ) = {
             let c = ctx.read();
             (
@@ -347,8 +333,6 @@ impl StepExecutor {
                 c.effective_cwd.clone(),
                 c.project_dir.clone(),
                 c.model_service.clone(),
-                c.conversation_history.clone(),
-                c.current_date.clone(),
             )
         };
 
@@ -384,9 +368,10 @@ impl StepExecutor {
         }
 
         // -- CONVERSATIONAL --
-        // When a capability model was resolved, generate the response here so
-        // the router can stream the final content directly.  Otherwise fall
-        // back to collecting raw context for the router's LLM.
+        // Collect the context only.  The chat handler writes the answer from
+        // it, streaming token by token and closing with the cited sources;
+        // drafting it here would make the client wait for a whole reply that
+        // only feeds a second generation.
         if step_type == StepType::Conversational {
             let mut parts: Vec<String> = Vec::new();
             if let Some(prev) = previous_results {
@@ -403,47 +388,6 @@ impl StepExecutor {
                 parts.push(directive.clone());
             }
             let raw = if parts.is_empty() { directive.clone() } else { parts.join("\n\n") };
-
-            // A remote answer is written once, from this context, by the chat
-            // handler; drafting it here too would be a second upstream call.
-            let capability = step.capability.as_deref().filter(|c| !c.is_empty());
-            if self.answers_remotely {
-                info!(target: LOGGER, "[step] conversational: the answer is remote — passing context through");
-            } else if let (Some(llm), Some(capability)) = (llm.as_ref(), capability) {
-                // The date is runtime grounding the model wasn't trained on, so
-                // it rides with the user turn (next to the request) instead of
-                // the system prompt where a small model is unlikely to use it.
-                let date_str = match current_date.as_deref() {
-                    Some(d) if !d.is_empty() => d.to_string(),
-                    _ => resolve_current_date(None, None),
-                };
-                // Include the session's prior turns so a follow-up like "the
-                // top place from that list" can reference the assistant's
-                // earlier reply instead of claiming nothing was provided.
-                let mut history_block = String::new();
-                for turn in conversation_history.as_deref().unwrap_or(&[]) {
-                    let role = turn.get("role").map(String::as_str).unwrap_or("");
-                    let content = turn.get("content").map(String::as_str).unwrap_or("");
-                    if (role == "user" || role == "assistant") && !content.is_empty() {
-                        history_block.push_str(&format!("<{role}>{content}</{role}>"));
-                    }
-                }
-                let user_block = format!("{raw}\n\n[Current date: {date_str}]");
-                let prompt = format!(
-                    "<system>{SYSTEM_PROMPT}</system>{history_block}<user>{user_block}</user>"
-                );
-                let response = llm.invoke(&prompt, None, None).trim().to_string();
-                if !response.is_empty() {
-                    info!(
-                        target: LOGGER,
-                        "[step] conversational generated {} chars via capability={}",
-                        response.chars().count(),
-                        capability
-                    );
-                    return Some((response.clone(), response));
-                }
-            }
-
             info!(
                 target: LOGGER,
                 "[step] conversational collected {} chars of raw context",
