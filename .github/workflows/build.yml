@@ -24,6 +24,9 @@ env:
   # dl.smartloop.ai; see slp-infra-project cloudflare/README.md.
   R2_BUCKET: smartloop-releases
   CARGO_TERM_COLOR: always
+  # Every archive must carry the embedding model: Studio's installer refuses
+  # one without it.  See BUNDLE_EMBEDDINGS in the Makefile.
+  REQUIRE_EMBEDDINGS: "1"
 
 jobs:
   # Runs on every PR and branch push as well as on releases. Builds without
