@@ -23,9 +23,6 @@ fn isolate_process_home() {
         std::env::remove_var("SLP_CONFIG_FILE");
         std::env::remove_var("SNAP_NAME");
         std::env::remove_var("SNAP_REAL_HOME");
-        // Cloud tests mock the platform's chat endpoint; the ones about
-        // direct provider calls turn this on themselves.
-        std::env::set_var("SLP_CLOUD_DIRECT", "false");
     }
 }
 

@@ -99,6 +99,8 @@ fn test_the_response_uses_the_pinned_remote_model() {
 #[serial]
 async fn test_a_cloud_failure_does_not_fall_back_to_the_local_model() {
     let server = MockServer::start().await;
+    // A session cached by an earlier test could answer for this one.
+    smartloop::llms::cloud_session::clear();
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(401).set_body_json(json!({"detail": "Unauthorized"})))
         .mount(&server)
@@ -136,6 +138,8 @@ async fn test_a_cloud_failure_does_not_fall_back_to_the_local_model() {
 #[serial]
 async fn test_a_non_streamed_cloud_failure_is_an_error_not_answer_text() {
     let server = MockServer::start().await;
+    // A session cached by an earlier test could answer for this one.
+    smartloop::llms::cloud_session::clear();
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(429))
         .mount(&server)
