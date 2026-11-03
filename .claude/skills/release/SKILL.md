@@ -41,12 +41,15 @@ All `gh` calls run as the **mehfuzh** account: prefix them with `GH_TOKEN=$(gh a
    - Watch it in the background: `gh run watch <id> --exit-status --interval 30`. It takes a while (macOS/Linux/Windows builds + publish).
    - On failure: `gh run view <id> --log-failed | tail -50`, report the failing job, and stop. Do not continue to the desktop release.
 
-5. **Verify it is downloadable** — every archive the desktop app fetches must return 200:
+5. **Verify every archive is downloadable and complete** — each must return 200 *and* be roughly the size of the previous release's (~430–450 MB; each bundles the `bge-m3` embedding model):
    ```
    for f in darwin-arm64-slp.tar.gz linux-amd64-slp.tar.gz linux-arm64-slp.tar.gz windows-amd64-slp.zip; do
-     echo "$f $(curl -s -o /dev/null -w '%{http_code}' https://dl.smartloop.ai/slp/<version>/$f)"
+     for v in <previous> <version>; do
+       echo "$v $f $(curl -sI https://dl.smartloop.ai/slp/$v/$f | grep -i -E '^HTTP|content-length' | tr -d '\r' | tr '\n' ' ')"
+     done
    done
    ```
+   A 200 is not enough: v1.2.20's linux-arm64 archive published at 28 MB because its embedding download hit a connection reset and the build only warned (fixed in the Makefile by retries plus `REQUIRE_EMBEDDINGS=1` in CI). If an archive is far smaller, check its build job log for `could not bundle embedding`, then re-run `gh workflow run build.yml -f tag=v<version>` — safe to repeat: archives are overwritten and the crate index replaces the same version's entry. `dl.smartloop.ai` serves these uncached (`cf-cache-status: DYNAMIC`), so a re-upload is live immediately.
 
 6. **Report** the version, tag, build run URL and the download check.
 
