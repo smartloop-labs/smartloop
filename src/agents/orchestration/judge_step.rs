@@ -87,7 +87,10 @@ fn clear_source(search_ctx: &mut SearchContext, attr: &str) {
         "feedback_context" => search_ctx.feedback_context.clear(),
         "vector_context" => search_ctx.vector_context.clear(),
         "web_context" => search_ctx.web_context.clear(),
-        "mcp_context" => search_ctx.mcp_context.clear(),
+        "mcp_context" => {
+            search_ctx.mcp_context.clear();
+            search_ctx.tool_citations.clear();
+        }
         _ => {}
     }
 }

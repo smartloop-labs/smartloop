@@ -76,7 +76,9 @@ static PLACEHOLDER_RE: Lazy<Regex> = Lazy::new(|| {
 /// dependency's `raw` field, which is what keeps the context focused instead
 /// of dragging the whole accumulated chain forward.
 ///
-/// `data` = `{"tool_name", "content", "raw", "is_tool_result"}`.
+/// `data` = `{"tool_name", "content", "raw", "is_tool_result", "server_id",
+/// "server_name"}` — the server fields name where a tool step's result came
+/// from, so the answer can cite it; `null` for every other step.
 pub fn plan_step_result(
     node_id: &str,
     step: &PlanStep,
@@ -91,13 +93,16 @@ pub fn plan_step_result(
         Some(r) if !r.is_empty() => r,
         _ => content,
     };
+    let is_tool = step.step_type == StepType::Tool;
     NodeResult::with_data(
         node_id,
         json!({
             "tool_name": tool_name,
             "content": content,
             "raw": raw_value,
-            "is_tool_result": step.step_type == StepType::Tool,
+            "is_tool_result": is_tool,
+            "server_id": if is_tool { step.server_id.clone() } else { None },
+            "server_name": if is_tool { step.server_name.clone() } else { None },
         }),
     )
 }
@@ -1788,15 +1793,27 @@ mod tests {
         assert!(r.success);
         assert_eq!(
             r.data,
-            json!({"tool_name": "explore", "content": "body", "raw": "body", "is_tool_result": false})
+            json!({
+                "tool_name": "explore",
+                "content": "body",
+                "raw": "body",
+                "is_tool_result": false,
+                "server_id": null,
+                "server_name": null,
+            })
         );
 
         s.step_type = StepType::Tool;
         s.tool_name = Some("create_issue".into());
+        s.server_id = Some("linear-1".into());
+        s.server_name = Some("Linear".into());
         let r = plan_step_result("n1", &s, "fmt", Some("raw"));
         assert_eq!(r.data["tool_name"], "create_issue");
         assert_eq!(r.data["raw"], "raw");
         assert_eq!(r.data["is_tool_result"], true);
+        // Names the server so the answer can cite the tool's source.
+        assert_eq!(r.data["server_id"], "linear-1");
+        assert_eq!(r.data["server_name"], "Linear");
     }
 
     #[test]

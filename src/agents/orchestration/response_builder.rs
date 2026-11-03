@@ -145,6 +145,49 @@ impl ResponseBuilder {
         )
     }
 
+    /// The live sources gathered for this turn, as citations: the web pages
+    /// (`{"url", "document_id", "document_name"}`, so a client renders them
+    /// as links) followed by the connected-app tools whose results reached
+    /// the context.
+    ///
+    /// Each web page carries the fetched text privately, so a link is only
+    /// credited when the answer actually drew on that page.  Sources whose
+    /// fetch failed have no text to check against and are kept as-is, as are
+    /// tool citations (see [`crate::agents::mcp::explorer::mcp_tool_citation`]).
+    pub fn source_citations(search_ctx: &SearchContext) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        for u in &search_ctx.web_sources {
+            let mut web_citation = Map::new();
+            web_citation.insert("document_id".into(), Value::String(u.clone()));
+            web_citation.insert("document_name".into(), Value::String(u.clone()));
+            web_citation.insert("url".into(), Value::String(u.clone()));
+            if let Some(web_extract) =
+                search_ctx.web_source_extracts.get(u).filter(|e| !e.is_empty())
+            {
+                web_citation.insert("_extract".into(), Value::String(web_extract.clone()));
+            }
+            out.push(Value::Object(web_citation));
+        }
+        out.extend(search_ctx.tool_citations.iter().cloned().map(Value::Object));
+        out
+    }
+
+    /// `citations` with [`Self::source_citations`] appended last — they are
+    /// the live sources the answer is grounded in.  `None` stays `None` only
+    /// when there is nothing to add.
+    fn with_source_citations(
+        citations: Option<Vec<Value>>,
+        search_ctx: &SearchContext,
+    ) -> Option<Vec<Value>> {
+        let sources = Self::source_citations(search_ctx);
+        if sources.is_empty() {
+            return citations;
+        }
+        let mut merged = citations.unwrap_or_default();
+        merged.extend(sources);
+        Some(merged)
+    }
+
     /// Build the final [`MCPExecutionResult`].
     ///
     /// One path regardless of skill vs prompt origin.  Uses
@@ -222,7 +265,10 @@ impl ResponseBuilder {
                 tool_name: all_tool_names.last().cloned(),
                 server_name: Some(SYSTEM_TOOLS_SERVER_NAME.to_string()),
                 tool_names: all_tool_names,
-                citations: explore_citations,
+                // The synthesized document was written from the web pages and
+                // tool results gathered for this turn (a skill run takes this
+                // path), so they are cited here exactly as on the path below.
+                citations: Self::with_source_citations(explore_citations, search_ctx),
                 ..Default::default()
             };
         }
@@ -342,27 +388,6 @@ impl ResponseBuilder {
         let mut doc_citations: Option<Vec<Value>> =
             if tool_context.is_empty() { explore_citations } else { None };
 
-        // Web sources surface as citations too ({"url", "document_id",
-        // "document_name"}), so the client renders them as clickable links
-        // alongside document citations.  Appended last — they're the live
-        // sources the answer is grounded in.  Each carries the fetched page
-        // text privately, so a link is only credited when the answer actually
-        // drew on that page.  Sources whose fetch failed have no text to check
-        // against and are kept as-is.
-        let mut web_citations: Vec<Value> = Vec::new();
-        for u in &search_ctx.web_sources {
-            let mut web_citation = Map::new();
-            web_citation.insert("document_id".into(), Value::String(u.clone()));
-            web_citation.insert("document_name".into(), Value::String(u.clone()));
-            web_citation.insert("url".into(), Value::String(u.clone()));
-            if let Some(web_extract) =
-                search_ctx.web_source_extracts.get(u).filter(|e| !e.is_empty())
-            {
-                web_citation.insert("_extract".into(), Value::String(web_extract.clone()));
-            }
-            web_citations.push(Value::Object(web_citation));
-        }
-
         // A conversational route has no tool plan — its `tool_context` is the
         // model's own generated answer, not external tool output.  Don't frame
         // it as "live data returned by an external tool" or the final response
@@ -391,11 +416,7 @@ impl ResponseBuilder {
             current_date.as_deref(),
         );
 
-        if !web_citations.is_empty() {
-            let mut merged = doc_citations.unwrap_or_default();
-            merged.extend(web_citations);
-            doc_citations = Some(merged);
-        }
+        doc_citations = Self::with_source_citations(doc_citations, search_ctx);
 
         tracing::info!(
             target: LOGGER,
@@ -690,6 +711,62 @@ mod tests {
         let result =
             builder().build(&mut ctx, &SearchContext::default(), &[], None, "", None, true, false);
         assert!(!result.handled);
+    }
+
+    #[test]
+    fn synthesized_answer_cites_web_and_tool_sources() {
+        // A skill run lands on the synthesized path.  It used to return only
+        // document citations, so a web search made for a skill (or any MCP
+        // call) produced an answer with no references at all.
+        let mut ctx = OrchestratorContext::new("q", vec![], vec![], "/w");
+        let mut sc = SearchContext {
+            web_context: "page".into(),
+            web_sources: vec!["https://a".into()],
+            ..Default::default()
+        };
+        sc.web_source_extracts.insert("https://a".into(), "page text".into());
+        sc.add_tool_citation(crate::agents::mcp::explorer::mcp_tool_citation("Notion", "notion-search"));
+        let result = builder().build(&mut ctx, &sc, &[], None, "synthesized doc", None, false, true);
+        assert!(result.handled);
+        let cites = result.citations.unwrap();
+        assert_eq!(cites.len(), 2);
+        assert_eq!(cites[0]["url"], json!("https://a"));
+        assert_eq!(cites[1]["document_id"], json!("mcp:Notion.notion-search"));
+        assert_eq!(cites[1]["document_name"], json!("Notion · notion-search"));
+        assert_eq!(cites[1]["source"], json!("mcp"));
+    }
+
+    #[test]
+    fn tool_results_path_cites_the_tools_that_ran() {
+        let mut ctx = OrchestratorContext::new("q", vec![], vec![], "/w");
+        let mut sc = SearchContext::default();
+        sc.add_tool_citation(crate::agents::mcp::explorer::mcp_tool_citation("Linear", "list_issues"));
+        // Same tool twice collapses to one reference.
+        sc.add_tool_citation(crate::agents::mcp::explorer::mcp_tool_citation("Linear", "list_issues"));
+        let result = builder().build(
+            &mut ctx,
+            &sc,
+            &["list_issues".to_string()],
+            None,
+            "issue data",
+            None,
+            false,
+            false,
+        );
+        let cites = result.citations.unwrap();
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0]["tool_name"], json!("list_issues"));
+        assert_eq!(cites[0]["server_name"], json!("Linear"));
+        // No private extract: verification keeps a tool citation.
+        assert!(cites[0].get("_extract").is_none());
+    }
+
+    #[test]
+    fn no_sources_leaves_citations_untouched() {
+        let mut ctx = OrchestratorContext::new("q", vec![], vec![], "/w");
+        let sc = SearchContext::default();
+        let result = builder().build(&mut ctx, &sc, &[], None, "synthesized doc", None, false, true);
+        assert!(result.citations.is_none());
     }
 
     #[test]

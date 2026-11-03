@@ -319,6 +319,12 @@ pub struct SearchContext {
     /// Result of an auto-run read-only MCP tool (a "collect" step).
     #[serde(default)]
     pub mcp_context: String,
+    /// One citation per MCP tool whose result reached the context — the
+    /// read-only call made during explore and every planned tool step — so
+    /// the answer credits the connected app it came from, the way web pages
+    /// and documents are credited.  See [`mcp_tool_citation`].
+    #[serde(default)]
+    pub tool_citations: Vec<Map<String, Value>>,
     #[serde(default)]
     pub citations: Option<Vec<Map<String, Value>>>,
     /// Per-document search results (`{"document_name", "content"}`), ordered
@@ -330,7 +336,70 @@ pub struct SearchContext {
     pub cited_documents: Option<Vec<String>>,
 }
 
+/// Header that opens each server's section of the explore-time MCP context:
+/// `MCP TOOL (<server>.<tool>):`.  Written by `run_mcp_server_inner` and read
+/// back by [`mcp_context_citations`].
+const MCP_TOOL_HEADER_PREFIX: &str = "MCP TOOL (";
+const MCP_TOOL_HEADER_SUFFIX: &str = "):";
+
+/// The citation for one MCP tool call: `document_id` keys it (so repeated
+/// calls of the same tool collapse to one reference) and `document_name` is
+/// what a client shows.
+///
+/// It carries no `_extract`, so answer verification always keeps it.  That is
+/// deliberate and matches the judge's policy on tool output: the call was made
+/// on purpose and its result was handed to the model as the data to answer
+/// from, and tool payloads are usually JSON, which an embedding comparison
+/// against a prose answer would score as unrelated.
+pub fn mcp_tool_citation(server_name: &str, tool_name: &str) -> Map<String, Value> {
+    let server = server_name.trim();
+    let tool = tool_name.trim();
+    let (id, name) = if server.is_empty() {
+        (format!("mcp:{tool}"), tool.to_string())
+    } else {
+        (format!("mcp:{server}.{tool}"), format!("{server} · {tool}"))
+    };
+    let mut citation = Map::new();
+    citation.insert("document_id".into(), Value::String(id));
+    citation.insert("document_name".into(), Value::String(name));
+    citation.insert("source".into(), Value::String("mcp".into()));
+    if !server.is_empty() {
+        citation.insert("server_name".into(), Value::String(server.to_string()));
+    }
+    citation.insert("tool_name".into(), Value::String(tool.to_string()));
+    citation
+}
+
+/// Citations for the tools named in an explore-time MCP context, one per
+/// `MCP TOOL (<server>.<tool>):` section, in order.
+///
+/// The header joins server and tool with a dot; tool names don't contain one,
+/// server names might, so it splits on the last.
+pub fn mcp_context_citations(mcp_context: &str) -> Vec<Map<String, Value>> {
+    mcp_context
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix(MCP_TOOL_HEADER_PREFIX)?
+                .strip_suffix(MCP_TOOL_HEADER_SUFFIX)
+        })
+        .filter_map(|call| {
+            let (server, tool) = call.rsplit_once('.').unwrap_or(("", call));
+            (!tool.trim().is_empty()).then(|| mcp_tool_citation(server, tool))
+        })
+        .collect()
+}
+
 impl SearchContext {
+    /// Record `citation` unless one with the same `document_id` is already
+    /// there.
+    pub fn add_tool_citation(&mut self, citation: Map<String, Value>) {
+        let id = citation.get("document_id").cloned();
+        if !self.tool_citations.iter().any(|c| c.get("document_id").cloned() == id) {
+            self.tool_citations.push(citation);
+        }
+    }
+
     /// True when any source contributed context.
     pub fn has_context(&self) -> bool {
         !(self.vector_context.is_empty()
@@ -1075,7 +1144,10 @@ Does answering the latest message require a new web search?
             tool_name,
             take_chars(&body, 1000)
         );
-        format!("MCP TOOL ({}.{}):\n{}", server.name, tool_name, body)
+        format!(
+            "{MCP_TOOL_HEADER_PREFIX}{}.{}{MCP_TOOL_HEADER_SUFFIX}\n{}",
+            server.name, tool_name, body
+        )
     }
 
     /// Run one read-only tool and return its text, or `""`.
@@ -1430,6 +1502,9 @@ Does answering the latest message require a new web search?
 
         if let Some(f_mcp) = f_mcp {
             ctx.mcp_context = join(f_mcp);
+            for citation in mcp_context_citations(&ctx.mcp_context) {
+                ctx.add_tool_citation(citation);
+            }
         }
 
         // Web search runs alongside local retrieval, not behind it.  Gating
@@ -2425,4 +2500,29 @@ fn walk(top: &Path, visit: &mut dyn FnMut(&Path, &mut Vec<String>, &[String]) ->
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tool_citation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn explore_mcp_context_yields_one_citation_per_call() {
+        let ctx = "MCP TOOL (Notion.notion-search):\n{\"results\": []}\n\n\
+                   MCP TOOL (my.server.io.get_page):\nbody";
+        let cites = mcp_context_citations(ctx);
+        assert_eq!(cites.len(), 2);
+        assert_eq!(cites[0]["document_id"], json!("mcp:Notion.notion-search"));
+        assert_eq!(cites[0]["document_name"], json!("Notion · notion-search"));
+        // Split on the last dot: server names may contain one, tools don't.
+        assert_eq!(cites[1]["server_name"], json!("my.server.io"));
+        assert_eq!(cites[1]["tool_name"], json!("get_page"));
+    }
+
+    #[test]
+    fn plain_text_has_no_tool_citations() {
+        assert!(mcp_context_citations("").is_empty());
+        assert!(mcp_context_citations("just some text\nMCP TOOL mention").is_empty());
+    }
 }
