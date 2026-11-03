@@ -160,14 +160,18 @@ endef
 # first-run download.  Placed at <install dir>/embeddings/<file>, which the
 # embeddings loader resolves next to the executable.  Pulled from our own
 # public bucket rather than the HuggingFace Hub (which gates GGUF downloads
-# behind a token).  Best-effort: if the download fails the app still fetches it
-# at runtime, so the build doesn't hard-fail on a transient outage.
+# behind a token).  The download is retried; if it still fails, a local build
+# carries on without the model (the app fetches it at runtime), but a release
+# build sets REQUIRE_EMBEDDINGS=1 and fails instead: Studio's installer refuses
+# an archive without it, and v1.2.20's linux-arm64 archive shipped without it
+# after one connection reset.
 EMBED_CACHE_DIR ?= build/embeddings
+REQUIRE_EMBEDDINGS ?=
 define BUNDLE_EMBEDDINGS
 @mkdir -p $(EMBED_CACHE_DIR) $(DIST_DIR)/embeddings
 @if [ ! -f "$(EMBED_CACHE_DIR)/$(EMBED_GGUF_FILE)" ]; then \
 		echo "Downloading embedding model from $(EMBED_GGUF_BASE_URL)/$(EMBED_GGUF_FILE)"; \
-		curl -fsSL "$(EMBED_GGUF_BASE_URL)/$(EMBED_GGUF_FILE)" -o "$(EMBED_CACHE_DIR)/$(EMBED_GGUF_FILE).part" \
+		curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$(EMBED_GGUF_BASE_URL)/$(EMBED_GGUF_FILE)" -o "$(EMBED_CACHE_DIR)/$(EMBED_GGUF_FILE).part" \
 			&& mv "$(EMBED_CACHE_DIR)/$(EMBED_GGUF_FILE).part" "$(EMBED_CACHE_DIR)/$(EMBED_GGUF_FILE)" \
 			|| rm -f "$(EMBED_CACHE_DIR)/$(EMBED_GGUF_FILE).part"; \
 	fi
@@ -176,6 +180,10 @@ define BUNDLE_EMBEDDINGS
 		echo "Bundled embedding model $(EMBED_GGUF_FILE)"; \
 	else \
 		rmdir $(DIST_DIR)/embeddings 2>/dev/null || true; \
+		if [ -n "$(REQUIRE_EMBEDDINGS)" ]; then \
+			echo "ERROR: could not bundle embedding GGUF and REQUIRE_EMBEDDINGS is set."; \
+			exit 1; \
+		fi; \
 		echo "WARNING: could not bundle embedding GGUF; the app will download it at first use."; \
 	fi
 endef
