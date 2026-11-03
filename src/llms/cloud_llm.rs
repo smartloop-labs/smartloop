@@ -1,13 +1,9 @@
 //! A remote catalog model, answered over HTTP.
 //!
-//! The prompt is split back into chat messages and sent one of two ways:
-//!
-//! * **Direct** (the default): to the model's provider, with the
-//!   short-lived key a [`cloud_session`](crate::llms::cloud_session) holds.
-//!   The platform only issues the key; it never sees the chat.
-//! * **Proxy** (`SLP_CLOUD_DIRECT=false`): to `{url}/v1/chat/completions`
-//!   under the catalog name; the
-//!   platform forwards it upstream and records token usage itself.
+//! The prompt is split back into chat messages and sent to the model's
+//! provider with the short-lived key a
+//! [`cloud_session`](crate::llms::cloud_session) holds.  The platform only
+//! issues the key and settles what it spent; it never sees the chat.
 //!
 //! Not to be confused with `model_host::remote_llm::RemoteLLM`, which is a
 //! local model loaded in the model-host process.
@@ -29,7 +25,7 @@ use parking_lot::Mutex;
 /// endpoint said when a request asked for more ("max_tokens is at most
 /// N"), kept for the process: a client is made anew for each answer.
 static ANSWER_CAPS: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde_json::{json, Value};
@@ -37,7 +33,7 @@ use serde_json::{json, Value};
 use crate::config::app_settings::AppSettings;
 use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::llms::cloud_session::{self, SessionModel};
-use crate::platform::client::{AuthHeadersFn, Headers, RefreshFn, SLPPlatformClient};
+use crate::platform::client::{AuthHeadersFn, RefreshFn, SLPPlatformClient};
 
 const LOG_TARGET: &str = "smartloop.llms.cloud";
 
@@ -58,7 +54,6 @@ pub const DEFAULT_REASONING_BUDGET_TOKENS: usize = 4096;
 /// nothing to show.
 pub const DEFAULT_ANSWER_TOKENS: usize = 16_384;
 
-const CHAT_PATH: &str = "/v1/chat/completions";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Whole-request budget, streamed body included: long enough for a long
 /// answer, short enough that a hung upstream frees the chat.
@@ -89,18 +84,6 @@ pub fn local_only_scope(on: bool) -> LocalOnlyScope {
 /// Whether this thread is resolving a model for orchestration.
 pub fn local_only() -> bool {
     LOCAL_ONLY.with(Cell::get)
-}
-
-/// Whether our platform credentials may be sent to `url`: only to the
-/// configured platform API host or a `smartloop.ai` host.  The catalog names
-/// the url, and a user's bearer token must not follow it anywhere else.
-pub fn credentials_allowed(url: &str, api_base: &str) -> bool {
-    let host = |u: &str| url::Url::parse(u).ok().and_then(|u| u.host_str().map(str::to_lowercase));
-    let Some(target) = host(url) else { return false };
-    if host(api_base).is_some_and(|base| base == target) {
-        return true;
-    }
-    target == "smartloop.ai" || target.ends_with(".smartloop.ai")
 }
 
 /// The message to show for a failed request, from the status and body.
@@ -139,15 +122,13 @@ pub fn describe_provider_failure(status: u16, body: &str, model: &str) -> String
 }
 
 /// The provider request for `model`: the server's fields for it, then the
-/// app's, under the provider's model id.  The project id stays home, and the
-/// answer is held to the server's cap.
+/// app's, under the provider's model id, and the answer held to the server's
+/// cap.
 fn direct_body(model: &SessionModel, body: &Value) -> Value {
     let mut out = Value::Object(model.body.clone());
     if let Value::Object(fields) = body {
         for (name, value) in fields {
-            if name != "project_id" {
-                out[name] = value.clone();
-            }
+            out[name] = value.clone();
         }
     }
     out["model"] = json!(model.provider_model);
@@ -168,11 +149,12 @@ pub struct CloudLLM {
     model_name: String,
     context_length: usize,
     reasoning_budget_tokens: usize,
-    client: SLPPlatformClient,
-    send_credentials: bool,
-    /// The platform to take session keys from, when calling providers
-    /// directly; `None` sends chats to `client`.
-    session_client: Option<SLPPlatformClient>,
+    /// Where the catalog says the model is served; only keys learned answer
+    /// caps.  The provider to call comes from the session.
+    url: String,
+    /// The platform API the session keys come from, under the user's own
+    /// credentials.  Those never leave for the provider.
+    platform: SLPPlatformClient,
     cancelled: RwLock<Option<CancelEvent>>,
 }
 
@@ -191,23 +173,14 @@ impl CloudLLM {
         auth_headers_fn: Option<AuthHeadersFn>,
         refresh_fn: Option<RefreshFn>,
     ) -> Self {
-        let settings = AppSettings::new();
-        let api_base = settings.slp_api_base;
-        let send_credentials = credentials_allowed(url, &api_base);
-        if !send_credentials {
-            tracing::warn!(target: LOG_TARGET, "[cloud] {model_name} is served from {url}; not sending credentials there");
-        }
-        // Only a model the platform serves has a session to call it with.
-        let session_client = (settings.cloud_direct && send_credentials)
-            .then(|| SLPPlatformClient::with_hooks(&api_base, auth_headers_fn.clone(), refresh_fn.clone()));
+        let api_base = AppSettings::new().slp_api_base;
         Self {
             project_id: project_id.to_string(),
             model_name: model_name.to_string(),
             context_length: context_length.map(|n| n as usize).filter(|n| *n > 0).unwrap_or(DEFAULT_CONTEXT_LENGTH),
             reasoning_budget_tokens: DEFAULT_REASONING_BUDGET_TOKENS,
-            client: SLPPlatformClient::with_hooks(url, auth_headers_fn, refresh_fn),
-            send_credentials,
-            session_client,
+            url: url.trim_end_matches('/').to_string(),
+            platform: SLPPlatformClient::with_hooks(&api_base, auth_headers_fn, refresh_fn),
             cancelled: RwLock::new(None),
         }
     }
@@ -225,12 +198,7 @@ impl CloudLLM {
     }
 
     pub fn url(&self) -> &str {
-        self.client.base_url()
-    }
-
-    /// Whether chats go straight to the provider with a session key.
-    pub fn is_direct(&self) -> bool {
-        self.session_client.is_some()
+        &self.url
     }
 
     /// The `max_tokens` to send for a caller's cap.  The cap sizes the
@@ -254,7 +222,7 @@ impl CloudLLM {
     }
 
     fn cap_key(&self) -> String {
-        format!("{}|{}", self.client.base_url(), self.model_name)
+        format!("{}|{}", self.url, self.model_name)
     }
 
     /// The answer cap an endpoint's refusal names ("max_tokens is at most
@@ -275,7 +243,6 @@ impl CloudLLM {
             "model": self.model_name,
             "messages": messages,
             "stream": stream,
-            "project_id": self.project_id,
         });
         if let Some(max_tokens) = max_tokens {
             body["max_tokens"] = json!(max_tokens);
@@ -314,51 +281,15 @@ impl CloudLLM {
             .map_err(|e| anyhow::anyhow!("{} sent an unreadable answer: {e}", self.model_name))
     }
 
-    /// Send `body` the way this model is reached; refused for asking more
-    /// answer tokens than the endpoint allows, it learns the cap and sends
-    /// again within it.
+    /// Send `body` to the provider; refused for asking more answer tokens
+    /// than it allows, it learns the cap and sends again within it.
     fn post(&self, body: &Value) -> Result<reqwest::blocking::Response, String> {
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| format!("Could not reach {}: {e}", self.model_name))?;
-        match &self.session_client {
-            Some(platform) => self.post_direct(&http, platform, body),
-            None => self.post_proxy(&http, body),
-        }
-    }
-
-    /// POST to the platform's chat endpoint, redeeming the refresh token
-    /// once on a 401.
-    fn post_proxy(&self, http: &reqwest::blocking::Client, body: &Value) -> Result<reqwest::blocking::Response, String> {
-        let url = format!("{}{CHAT_PATH}", self.client.base_url());
-        let mut body = body.clone();
-        loop {
-            let send = |headers: &Headers| {
-                let mut request = http.post(&url).json(&body);
-                for (name, value) in headers {
-                    request = request.header(name.as_str(), value.as_str());
-                }
-                request.send()
-            };
-            let sent = if self.send_credentials {
-                self.client.authed(send)
-            } else {
-                send(&self.client.headers(None))
-            };
-            let response = sent.map_err(|e| self.unreachable(e))?;
-            let status = response.status().as_u16();
-            if status < 400 {
-                return Ok(response);
-            }
-            let text = response.text().unwrap_or_default();
-            tracing::warn!(target: LOG_TARGET, "[cloud] {} answered {status}: {text}", self.model_name);
-            if self.learn_cap(&text, &mut body) {
-                continue;
-            }
-            return Err(describe_failure(status, &text, &self.model_name));
-        }
+        self.post_direct(&http, &self.platform, body)
     }
 
     /// POST to the provider with the session's key.  A key the provider
@@ -428,6 +359,62 @@ impl CloudLLM {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.read().as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
+    }
+}
+
+/// How a streamed answer arrived, logged once it ends: time to the first
+/// token, how many chunks the text came in, and the provider's own token
+/// counts with the rate they make over the time the answer streamed.  The
+/// reasoning before the first token is counted, but never shown.
+struct StreamTiming {
+    started: Instant,
+    first: Option<Instant>,
+    last: Option<Instant>,
+    chunks: usize,
+    usage: Option<Value>,
+    reported: bool,
+}
+
+impl StreamTiming {
+    fn new(started: Instant) -> Self {
+        Self { started, first: None, last: None, chunks: 0, usage: None, reported: false }
+    }
+
+    fn chunk(&mut self) {
+        let now = Instant::now();
+        self.first.get_or_insert(now);
+        self.last = Some(now);
+        self.chunks += 1;
+    }
+
+    fn report(&mut self, model: &str) {
+        if std::mem::replace(&mut self.reported, true) {
+            return;
+        }
+        let ms = |d: Duration| d.as_millis();
+        let total = self.started.elapsed();
+        let Some(first) = self.first else {
+            tracing::info!(target: LOG_TARGET, "[cloud] {model} streamed no text in {} ms", ms(total));
+            return;
+        };
+        let streaming = self.last.map_or(Duration::ZERO, |last| last - first);
+        let tokens = |key: &str| self.usage.as_ref().and_then(|u| u.pointer(key)).and_then(Value::as_u64);
+        let completion = tokens("/completion_tokens");
+        let reasoning = tokens("/completion_tokens_details/reasoning_tokens").unwrap_or(0);
+        let rate = completion
+            .map(|c| c.saturating_sub(reasoning))
+            .filter(|_| streaming.as_secs_f64() > 0.0)
+            .map(|answer| format!("{:.0} tok/s", answer as f64 / streaming.as_secs_f64()))
+            .unwrap_or_else(|| "rate unknown".to_string());
+        tracing::info!(
+            target: LOG_TARGET,
+            "[cloud] {model} first token after {} ms; {} chunk(s) over {} ms; {} answer + {reasoning} reasoning token(s); {rate}; {} ms in all",
+            ms(first - self.started),
+            self.chunks,
+            ms(streaming),
+            completion.map_or("?".to_string(), |c| c.saturating_sub(reasoning).to_string()),
+            ms(total),
+        );
     }
 }
 
@@ -513,6 +500,7 @@ impl BaseLLM for CloudLLM {
 
     fn stream<'a>(&'a self, prompt: &str, options: CallOptions) -> GenerationStream<'a> {
         let messages = self.create_messages_from_prompt(prompt);
+        let started = Instant::now();
         let response = match self.post(&self.body(&messages, true, self.request_max_tokens(options))) {
             Ok(response) => response,
             Err(message) => std::panic::panic_any(message),
@@ -521,11 +509,16 @@ impl BaseLLM for CloudLLM {
         // Characters of answer and of reasoning seen, to say where the
         // room went when the stream is cut off.
         let (mut answered, mut reasoned) = (0usize, 0usize);
+        let mut timing = StreamTiming::new(started);
         Box::new(std::iter::from_fn(move || loop {
             if self.is_cancelled() {
                 return None;
             }
-            let line = match lines.next()? {
+            let Some(line) = lines.next() else {
+                timing.report(&self.model_name);
+                return None;
+            };
+            let line = match line {
                 Ok(line) => line,
                 Err(e) => {
                     tracing::warn!(target: LOG_TARGET, "[cloud] {} stream broke off: {e}", self.model_name);
@@ -534,9 +527,13 @@ impl BaseLLM for CloudLLM {
             };
             let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
             if data == "[DONE]" {
+                timing.report(&self.model_name);
                 return None;
             }
             let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+            if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
+                timing.usage = Some(usage.clone());
+            }
             reasoned += ["/choices/0/delta/reasoning_content", "/choices/0/delta/reasoning"]
                 .iter()
                 .filter_map(|p| chunk.pointer(p).and_then(Value::as_str))
@@ -554,6 +551,7 @@ impl BaseLLM for CloudLLM {
             match chunk_text(&chunk) {
                 Ok(Some(text)) => {
                     answered += text.chars().count();
+                    timing.chunk();
                     return Some(GenerationChunk { text });
                 }
                 Ok(None) => continue,

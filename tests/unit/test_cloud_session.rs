@@ -1,5 +1,5 @@
-//! `CloudLLM` with `SLP_CLOUD_DIRECT`: a session key from the platform, the
-//! chat sent straight to the provider.
+//! `CloudLLM`: a session key from the platform, the chat sent straight to
+//! the provider.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -66,14 +66,13 @@ fn session_body_from(provider_uri: &str, key: &str) -> Value {
 }
 
 /// A direct-mode model whose platform is `platform`.
-fn direct_llm(platform: &MockServer, name: &str) -> (CloudLLM, EnvGuard, EnvGuard) {
+fn direct_llm(platform: &MockServer, name: &str) -> (CloudLLM, EnvGuard) {
     let base = EnvGuard::set("SLP_API_BASE", platform.uri());
-    let direct = EnvGuard::set("SLP_CLOUD_DIRECT", "true");
     // Mock servers reuse ports, so a session cached by an earlier test
     // could otherwise answer for this one.
     cloud_session::clear();
     let llm = CloudLLM::with_hooks("p1", name, &platform.uri(), Some(8192), Some(bearer("platform-token")), Some(Arc::new(|| false)));
-    (llm, base, direct)
+    (llm, base)
 }
 
 async fn drain(llm: Arc<CloudLLM>) -> Result<String, String> {
@@ -110,8 +109,7 @@ async fn test_chat_goes_to_the_provider_with_the_session_key() {
         .mount(&provider)
         .await;
 
-    let (llm, _b, _d) = direct_llm(&platform, "kimi-k2");
-    assert!(llm.is_direct());
+    let (llm, _b) = direct_llm(&platform, "kimi-k2");
     let llm = Arc::new(llm);
     assert_eq!(drain(llm.clone()).await.unwrap(), "Hello");
     assert_eq!(drain(llm).await.unwrap(), "Hello");
@@ -152,7 +150,7 @@ async fn test_a_refused_key_is_renewed_once() {
         .mount(&provider)
         .await;
 
-    let (llm, _b, _d) = direct_llm(&platform, "kimi-k2");
+    let (llm, _b) = direct_llm(&platform, "kimi-k2");
     assert_eq!(drain(Arc::new(llm)).await.unwrap(), "ok");
     assert_eq!(minted.load(Ordering::SeqCst), 2);
 }
@@ -178,7 +176,7 @@ async fn test_a_spent_allowance_reports_the_platforms_reason() {
         .mount(&provider)
         .await;
 
-    let (llm, _b, _d) = direct_llm(&platform, "kimi-k2");
+    let (llm, _b) = direct_llm(&platform, "kimi-k2");
     assert_eq!(drain(Arc::new(llm)).await.unwrap_err(), "Allowance used. Resets Monday.");
 }
 
@@ -188,7 +186,7 @@ async fn test_a_model_outside_the_session_is_refused_locally() {
     let (platform, provider) = (MockServer::start().await, MockServer::start().await);
     mount_sessions(&platform, &provider, &["sk-1"]).await;
 
-    let (llm, _b, _d) = direct_llm(&platform, "not-on-plan");
+    let (llm, _b) = direct_llm(&platform, "not-on-plan");
     let err = drain(Arc::new(llm)).await.unwrap_err();
     assert_eq!(err, "not-on-plan isn't available on your current plan.");
     assert!(provider.received_requests().await.unwrap().is_empty());
@@ -204,7 +202,7 @@ async fn test_signed_out_session_asks_to_sign_in() {
         .mount(&platform)
         .await;
 
-    let (llm, _b, _d) = direct_llm(&platform, "kimi-k2");
+    let (llm, _b) = direct_llm(&platform, "kimi-k2");
     assert_eq!(drain(Arc::new(llm)).await.unwrap_err(), "Sign in to use kimi-k2.");
     assert!(provider.received_requests().await.unwrap().is_empty());
 }
@@ -221,26 +219,8 @@ async fn test_an_insecure_provider_endpoint_is_refused() {
         .mount(&platform)
         .await;
 
-    let (llm, _b, _d) = direct_llm(&platform, "kimi-k2");
+    let (llm, _b) = direct_llm(&platform, "kimi-k2");
     assert_eq!(drain(Arc::new(llm)).await.unwrap_err(), "The cloud session named an insecure endpoint.");
-}
-
-#[test]
-#[serial]
-fn test_direct_is_the_default() {
-    let _env = EnvGuard::set("SLP_API_BASE", "https://api.smartloop.ai");
-    let _unset = EnvGuard::remove("SLP_CLOUD_DIRECT");
-    assert!(CloudLLM::new("p1", "kimi-k2", "https://api.smartloop.ai", None).is_direct());
-    // A model served from elsewhere has no session to call it with.
-    assert!(!CloudLLM::new("p1", "other", "https://models.example.com", None).is_direct());
-}
-
-#[test]
-#[serial]
-fn test_the_proxy_can_still_be_chosen() {
-    let _env = EnvGuard::set("SLP_API_BASE", "https://api.smartloop.ai");
-    let _off = EnvGuard::set("SLP_CLOUD_DIRECT", "false");
-    assert!(!CloudLLM::new("p1", "kimi-k2", "https://api.smartloop.ai", None).is_direct());
 }
 
 #[test]

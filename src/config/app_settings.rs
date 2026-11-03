@@ -127,10 +127,6 @@ pub struct AppSettings {
     pub agent_idle_ttl_s: f64,
     /// `SLP_AGENT_MEMORY_LIMIT_MB` — 0 = no ceiling.
     pub agent_memory_limit_mb: i64,
-    /// `SLP_CLOUD_DIRECT` — cloud models are called at their provider with a
-    /// short-lived key from `/v1/chat/session` (the default).  `false` sends
-    /// them through the platform's `/v1/chat/completions` instead.
-    pub cloud_direct: bool,
 }
 
 /// A settings value failed validation (pydantic's `ValidationError`).
@@ -195,7 +191,6 @@ impl AppSettings {
             stream_stall_timeout_s: 0.0,
             agent_idle_ttl_s: 900.0,
             agent_memory_limit_mb: 0,
-            cloud_direct: true,
         }
     }
 
@@ -267,7 +262,6 @@ impl AppSettings {
             stream_stall_timeout_s: r.float("slp_stream_stall_timeout_s", d.stream_stall_timeout_s)?,
             agent_idle_ttl_s: r.float("slp_agent_idle_ttl_s", d.agent_idle_ttl_s)?,
             agent_memory_limit_mb: r.int("slp_agent_memory_limit_mb", d.agent_memory_limit_mb)?,
-            cloud_direct: r.boolean("slp_cloud_direct", d.cloud_direct)?,
         })
     }
 

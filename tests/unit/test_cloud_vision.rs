@@ -50,7 +50,7 @@ fn svc_with(local: Option<&str>, remote: &str) -> Arc<ModelService> {
 async fn test_a_cloud_model_receives_the_image_parts() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/chat/completions"))
         .respond_with(|request: &Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let part = &body["messages"][0]["content"][1];
@@ -65,6 +65,7 @@ async fn test_a_cloud_model_receives_the_image_parts() {
         .mount(&server)
         .await;
     let _env = EnvGuard::set("SLP_API_BASE", server.uri());
+    crate::test_cloud_llm::mount_session(&server, &["vision-cloud"]).await;
     let llm = CloudLLM::with_hooks("p1", "vision-cloud", &server.uri(), None, None, Some(Arc::new(|| false)));
 
     let messages = vec![json!({"role": "user", "content": [
