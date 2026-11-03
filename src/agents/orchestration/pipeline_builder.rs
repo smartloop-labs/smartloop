@@ -64,7 +64,11 @@ use crate::agents::orchestration::skill_processor::{
 use crate::agents::orchestration::step::Step;
 use crate::agents::orchestration::step_executor::{plan_step_result, StepExecutor};
 use crate::agents::orchestration::tool_fanout::ToolFanout;
-use crate::agents::planner::{ClassifyOptions, IntentType, ModelTier, PlanStep, Planner, StepType};
+use crate::agents::mcp::explorer::mcp_tool_citation;
+use crate::agents::planner::{
+    ClassifyOptions, IntentType, ModelTier, PlanStep, Planner, StepType, FETCH_SERVER_ID,
+    SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
+};
 use crate::agents::web_search_agent::WebSearcher;
 use crate::llms::base_llm::BaseLLM;
 use crate::types::ModelCapability;
@@ -1521,6 +1525,22 @@ Assess whether these search results are relevant to the user's request. If relev
                 }
                 let label = if tool_name.is_empty() { "step output" } else { tool_name.as_str() };
                 if is_tool || has_skill || this.judge.serves_intent(&c.user_message, label, &text) {
+                    // A connected server's tool answered: credit it, the way
+                    // the web pages and documents an answer drew on are.
+                    // Built-in file/shell tools and URL fetches are the
+                    // assistant's own actions, not a source.
+                    if is_tool {
+                        let server_id = data_str(data, "server_id");
+                        let server_name = data_str(data, "server_name");
+                        let builtin = server_id == SYSTEM_TOOLS_SERVER_ID
+                            || server_id == FETCH_SERVER_ID
+                            || server_name == SYSTEM_TOOLS_SERVER_NAME;
+                        if !builtin && !server_name.is_empty() && !tool_name.is_empty() {
+                            search_ctx
+                                .lock()
+                                .add_tool_citation(mcp_tool_citation(&server_name, &tool_name));
+                        }
+                    }
                     all_accumulated.push((tool_name, text, is_tool));
                 } else {
                     rejected.push((tool_name, text, is_tool));
