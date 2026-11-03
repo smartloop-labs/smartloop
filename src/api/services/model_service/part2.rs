@@ -3571,7 +3571,6 @@ impl ModelService {
             }));
             options.model_path = self.model_gguf_path.read().clone();
             options.project_id = self.get_project_id();
-            options.answers_remotely = self.answers_remotely();
             options.executor = Some(self.get_llm_executor());
             // Gathered context answers on the answer tier's model (see the
             // chat router), so it is sized against that model's window.

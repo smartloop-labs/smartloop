@@ -1,8 +1,9 @@
-//! A conversational step drafts no reply when the answer is remote.
+//! A conversational step drafts no reply; it passes its context through.
 //!
-//! The chat handler writes the final answer from the step's context.  When
-//! that answer comes from a pinned remote model, a draft from the step would
-//! be a second upstream call whose text only feeds the first.
+//! The chat handler writes the final answer from the step's context,
+//! streaming it token by token and closing with the cited sources.  A draft
+//! from the step would hold the client until a whole reply was written, and
+//! that reply would only feed a second generation.
 
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ use smartloop::utils::mcp_result_formatter::ResultFormatter;
 
 use crate::shared::orch_exec::StubLLM;
 
-fn executor(answers_remotely: bool) -> StepExecutor {
+fn executor() -> StepExecutor {
     let llm = StubLLM::shared("");
     let arg_extractor = Arc::new(MCPArgumentExtractor::new(llm.clone()));
     let tool_caller = Arc::new(MCPToolCaller::new(
@@ -41,11 +42,10 @@ fn executor(answers_remotely: bool) -> StepExecutor {
         Arc::new(MCPAgent::new(llm.clone())),
         Arc::new(ResponseBuilder::new(llm)),
     )
-    .with_remote_answer(answers_remotely)
 }
 
 /// Run one conversational step on `answer`; returns the step's output.
-fn converse(answers_remotely: bool, answer: Arc<StubLLM>) -> Option<(String, String)> {
+fn converse(answer: Arc<StubLLM>) -> Option<(String, String)> {
     let ctx = Arc::new(RwLock::new(OrchestratorContext::new("hello there", Vec::new(), Vec::new(), "/tmp")));
     let step = PlanStep {
         step: 1,
@@ -55,22 +55,14 @@ fn converse(answers_remotely: bool, answer: Arc<StubLLM>) -> Option<(String, Str
         ..Default::default()
     };
     let llm: Arc<dyn BaseLLM> = answer;
-    executor(answers_remotely).execute(&ctx, &step, None, None, Some(llm))
+    executor().execute(&ctx, &step, None, None, Some(llm))
 }
 
 #[test]
-fn test_a_local_answer_is_drafted_by_the_step() {
+fn test_the_step_passes_its_context_through_without_drafting() {
     let answer = Arc::new(StubLLM::new("Hi!"));
-    let out = converse(false, answer.clone());
-    assert_eq!(out.map(|(text, _)| text).as_deref(), Some("Hi!"));
-    assert_eq!(answer.prompts.lock().len(), 1);
-}
-
-#[test]
-fn test_a_remote_answer_is_not_drafted_by_the_step() {
-    let answer = Arc::new(StubLLM::new("Hi!"));
-    let out = converse(true, answer.clone());
-    assert!(answer.prompts.lock().is_empty());
+    let out = converse(answer.clone());
+    assert!(answer.prompts.lock().is_empty(), "the step must not call the answer model");
     let (text, _) = out.expect("the step still passes its context through");
     assert!(text.contains("hello there"), "context: {text}");
 }
