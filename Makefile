@@ -1,4 +1,4 @@
-.PHONY: help install build run run-debug run-single run-debug-single run-local test test-unit test-api test-cov build-binary check-apple-symbols sign notarize archive archive-zip publish-binary publish-embeddings release-linux release-windows release clean clean-server clean-actions
+.PHONY: help install build run run-debug run-single run-debug-single run-local test test-unit test-api test-cov build-binary check-apple-symbols sign notarize archive archive-zip clean clean-server clean-actions
 
 UNAME_S := $(shell uname -s)
 DIST_DIR := dist/slp
@@ -7,8 +7,6 @@ DIST_DIR := dist/slp
 # reports it via `slp --version`).  Read the first `version =` line of the
 # [package] table.
 SLP_VERSION := $(shell awk -F'"' '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{print $$2; exit}' Cargo.toml)
-SLP_GCS_BUCKET := gs://smartloop-gcp-us-east-releases
-DL_GCS_BUCKET := gs://dl.smartloop.ai
 SERVER_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 RAW_ARCH := $(shell uname -m)
 
@@ -20,15 +18,12 @@ else
     SERVER_ARCH := $(RAW_ARCH)
 endif
 ARCHIVE_NAME := $(SERVER_PLATFORM)-$(SERVER_ARCH)-slp.tar.gz
-DL_GCS_PATH := $(DL_GCS_BUCKET)/$(SLP_VERSION)
 
-RELEASE_GCS_PATH := $(SLP_GCS_BUCKET)/slp/$(SLP_VERSION)
-
-# The embedding GGUF is version-independent — it is named by model, immutable,
-# and shared across releases — so it sits beside slp/ rather than under a
-# version dir.  Served publicly at https://dl.smartloop.ai/embeddings/.
+# Releases are published by CI, not from here: .github/workflows/build.yml
+# uploads every platform's archive to Cloudflare R2 (smartloop-releases),
+# served at https://dl.smartloop.ai. The embedding GGUF lives there too, under
+# embeddings/; it is named by model and shared across releases.
 # Defaults mirror the app's slp_embedding_gguf_file / _base_url settings.
-EMBED_GCS_PATH := $(SLP_GCS_BUCKET)/embeddings
 EMBED_GGUF_FILE ?= $(or $(SLP_EMBEDDING_GGUF_FILE),bge-m3-Q4_K_M.gguf)
 EMBED_GGUF_BASE_URL ?= $(or $(SLP_EMBEDDING_GGUF_BASE_URL),https://dl.smartloop.ai/embeddings)
 WIN_ARCHIVE_NAME := windows-amd64-slp.zip
@@ -215,10 +210,6 @@ help:
 	@echo "  notarize        - Notarize the binary with Apple (macOS only)"
 	@echo "  archive         - Create slp tar.gz from dist/slp"
 	@echo "  archive-zip     - Create windows-amd64-slp.zip from dist/slp"
-	@echo "  publish-binary  - Build, sign, notarize, archive, and upload slp to GCS"
-	@echo "  release-linux   - Build, archive, and upload linux-amd64-slp.tar.gz to the release bucket"
-	@echo "  release-windows - Build, zip, and upload windows-amd64-slp.zip to the release bucket"
-	@echo "  publish-embeddings - Upload the embedding GGUF (EMBED_GGUF=<path>) to the release bucket"
 	@echo "  clean-server    - Remove dist/ staging and archives"
 	@echo "  clean-actions   - Delete all GitHub Actions workflow runs"
 
@@ -384,58 +375,6 @@ archive-zip:
 		"$${SYSTEMROOT:-C:/Windows}/System32/tar.exe" -a -cf $(WIN_ARCHIVE_NAME) -C dist slp; \
 	fi
 	@echo "Created $(WIN_ARCHIVE_NAME)"
-
-release-linux: build-binary archive
-	@echo "Uploading $(ARCHIVE_NAME) to $(RELEASE_GCS_PATH)/linux-amd64-slp.tar.gz..."
-	gsutil cp $(ARCHIVE_NAME) "$(RELEASE_GCS_PATH)/linux-amd64-slp.tar.gz"
-	@rm -f $(ARCHIVE_NAME)
-	@echo "Published linux build to $(RELEASE_GCS_PATH)/linux-amd64-slp.tar.gz"
-
-release-windows: build-binary archive-zip
-	@echo "Uploading $(WIN_ARCHIVE_NAME) to $(RELEASE_GCS_PATH)/windows-amd64-slp.zip..."
-	gsutil cp $(WIN_ARCHIVE_NAME) "$(RELEASE_GCS_PATH)/windows-amd64-slp.zip"
-	@rm -f $(WIN_ARCHIVE_NAME)
-	@echo "Published windows build to $(RELEASE_GCS_PATH)/windows-amd64-slp.zip"
-
-# Platform-appropriate build + package + upload to the release bucket.
-ifeq ($(PLATFORM),windows)
-release: release-windows
-else ifeq ($(PLATFORM),linux)
-release: release-linux
-else
-release: publish-binary
-endif
-
-publish-binary: build-binary sign notarize archive
-	@echo "Validating version..."
-	@BINARY_VERSION=$$($(DIST_BIN) --version 2>&1 | awk '{print $$NF}'); \
-	if [ "$$BINARY_VERSION" != "$(SLP_VERSION)" ]; then \
-		echo "ERROR: Binary version ($$BINARY_VERSION) does not match expected version ($(SLP_VERSION))"; \
-		exit 1; \
-	fi
-	@echo "Version validated: $(SLP_VERSION)"
-	@echo "Generating checksums..."
-	@shasum -a 256 $(ARCHIVE_NAME) | sed 's| .*/| |' > checksums-sha256.txt
-	@echo "Uploading to $(DL_GCS_PATH)/..."
-	gsutil cp $(ARCHIVE_NAME) $(DL_GCS_PATH)/$(ARCHIVE_NAME)
-	gsutil cp checksums-sha256.txt $(DL_GCS_PATH)/checksums-sha256.txt
-	@rm -f $(ARCHIVE_NAME) checksums-sha256.txt
-	@echo "Published to $(DL_GCS_PATH)/$(ARCHIVE_NAME)"
-
-publish-embeddings:
-	@if [ -z "$(EMBED_GGUF)" ]; then \
-		echo "ERROR: set EMBED_GGUF=/path/to/$(EMBED_GGUF_FILE)"; \
-		exit 1; \
-	fi
-	@echo "Generating checksum for $(EMBED_GGUF_FILE)..."
-	@shasum -a 256 "$(EMBED_GGUF)" | sed 's| .*/| |' > checksums-sha256.txt
-	@echo "Uploading to $(EMBED_GCS_PATH)/..."
-	gsutil -h "Cache-Control:public, max-age=31536000, immutable" \
-		cp "$(EMBED_GGUF)" $(EMBED_GCS_PATH)/$(EMBED_GGUF_FILE)
-	gsutil -h "Cache-Control:public, max-age=300" \
-		cp checksums-sha256.txt $(EMBED_GCS_PATH)/checksums-sha256.txt
-	@rm -f checksums-sha256.txt
-	@echo "Published to $(EMBED_GCS_PATH)/$(EMBED_GGUF_FILE)"
 
 clean-server:
 	@echo "Cleaning packaging artifacts..."
