@@ -2173,6 +2173,14 @@ impl ModelService {
             .unwrap_or(false)
     }
 
+    /// Whether the model that would answer for `capability` calls functions
+    /// natively — asked through the model host, like [`Self::supports_thinking`].
+    pub fn supports_native_tools(&self, capability: Option<&str>) -> bool {
+        self.llm_for_response(capability)
+            .map(|llm| llm.supports_native_tools())
+            .unwrap_or(false)
+    }
+
     /// `workspace.ranked_models_for(capability, current_project)` through the
     /// test seam, without remote models inside a local-only scope.
     fn ranked_models_for(&self, capability: &str) -> Vec<WorkspaceModel> {

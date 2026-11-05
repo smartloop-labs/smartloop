@@ -191,6 +191,15 @@ pub trait ModelClient: Send + Sync {
         Ok(false)
     }
 
+    /// Whether the model serving `capability` calls functions natively.
+    ///
+    /// Not required: a client that cannot answer says no, and MCP resolution
+    /// keeps its prompt-based path.
+    fn supports_native_tools(&self, capability: Option<&str>) -> anyhow::Result<bool> {
+        let _ = capability;
+        Ok(false)
+    }
+
     /// Name of the resident orchestrator model, if any.
     fn model_name(&self) -> anyhow::Result<Option<String>>;
 
@@ -317,6 +326,12 @@ pub trait LocalModelService: Send + Sync {
         false
     }
 
+    /// `ModelService.supports_native_tools`.
+    fn supports_native_tools(&self, capability: Option<&str>) -> bool {
+        let _ = capability;
+        false
+    }
+
     /// `ModelService._model_name`: the resident orchestrator model.
     fn resident_model_name(&self) -> Option<String>;
 
@@ -391,6 +406,10 @@ impl LocalModelService for ModelService {
 
     fn supports_thinking(&self, capability: Option<&str>) -> bool {
         ModelService::supports_thinking(self, capability)
+    }
+
+    fn supports_native_tools(&self, capability: Option<&str>) -> bool {
+        ModelService::supports_native_tools(self, capability)
     }
 
     fn resident_model_name(&self) -> Option<String> {
@@ -513,6 +532,10 @@ impl ModelClient for InProcessModelClient {
 
     fn supports_thinking(&self, capability: Option<&str>) -> anyhow::Result<bool> {
         Ok(self.service.supports_thinking(capability))
+    }
+
+    fn supports_native_tools(&self, capability: Option<&str>) -> anyhow::Result<bool> {
+        Ok(self.service.supports_native_tools(capability))
     }
 
     fn model_name(&self) -> anyhow::Result<Option<String>> {
@@ -1072,6 +1095,18 @@ impl ModelClient for RemoteModelClient {
         };
         let reply = self.unary(request, None, |mut stub, request| async move {
             stub.supports_thinking(request).await
+        })?;
+        Ok(reply.value)
+    }
+
+    fn supports_native_tools(&self, capability: Option<&str>) -> anyhow::Result<bool> {
+        let request = pb::SupportsThinkingRequest {
+            capability: capability.unwrap_or_default().to_string(),
+            project_id: pinned_project_id().unwrap_or_default(),
+            local_only: crate::llms::cloud_llm::local_only(),
+        };
+        let reply = self.unary(request, None, |mut stub, request| async move {
+            stub.supports_native_tools(request).await
         })?;
         Ok(reply.value)
     }

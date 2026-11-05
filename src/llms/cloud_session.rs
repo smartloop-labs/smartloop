@@ -9,10 +9,13 @@
 //! ## Contract
 //!
 //! `POST {SLP_API_BASE}/v1/chat/session` (platform auth), body
-//! `{"project_id": "..."}`, answers:
+//! `{"project_id": "...", "replaces": "<session_id>"}` (`replaces` only when
+//! the previous session's key was refused, so the server settles it at once
+//! instead of holding its budget until it expires), answers:
 //!
 //! ```json
 //! {
+//!   "session_id": "...",
 //!   "base_url": "https://openrouter.ai/api/v1",
 //!   "key": "sk-or-...",
 //!   "expires_at": "2026-11-02T18:30:00Z",
@@ -34,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
@@ -55,6 +58,12 @@ const RENEW_BEFORE: chrono::Duration = chrono::Duration::seconds(60);
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a freshly minted key may be refused while the provider has not
+/// caught up with it.  OpenRouter answers `401 User not found` for a key a
+/// few seconds old; a refusal inside this window is waited out, not taken
+/// as a dead key (each replacement reserves another budget).
+pub const KEY_PROPAGATION: Duration = Duration::from_secs(20);
+
 /// One model the session's key may call, and how.
 #[derive(Clone, Debug, Deserialize)]
 pub struct SessionModel {
@@ -73,6 +82,13 @@ pub struct SessionModel {
 /// A provider endpoint and the short-lived key to call it with.
 #[derive(Clone, Deserialize)]
 pub struct CloudSession {
+    /// The server's name for this session, sent as `replaces` when its key is
+    /// refused.  Absent from an older server.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// When this process received the session.
+    #[serde(skip, default = "Instant::now")]
+    minted_at: Instant,
     pub base_url: String,
     key: String,
     pub expires_at: DateTime<Utc>,
@@ -117,6 +133,12 @@ impl CloudSession {
         headers
     }
 
+    /// Whether the key is young enough that a refusal may only mean the
+    /// provider has not caught up with it yet.
+    pub fn is_new(&self) -> bool {
+        self.minted_at.elapsed() < KEY_PROPAGATION
+    }
+
     /// Whether the session can still be used at `now`.
     pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
         self.expires_at - RENEW_BEFORE > now
@@ -153,10 +175,40 @@ pub fn session(client: &SLPPlatformClient, project_id: &str, model: &str) -> Res
     {
         return Ok(current.clone());
     }
-    let fresh = Arc::new(fetch(client, project_id, model)?);
+    let fresh = Arc::new(fetch(client, project_id, model, None)?);
     tracing::info!(
         target: LOG_TARGET,
         "[session] new cloud session for {} models, expires {}",
+        fresh.models.len(),
+        fresh.expires_at
+    );
+    sessions.insert(client.base_url().to_string(), fresh.clone());
+    Ok(fresh)
+}
+
+/// A session in place of `stale`, whose key was refused.
+///
+/// If another request already replaced it, that replacement is used.
+/// Otherwise the new mint names `stale` as the session it `replaces`, so the
+/// server settles it now rather than holding its budget until it expires.
+pub fn replace(
+    client: &SLPPlatformClient,
+    stale: &Arc<CloudSession>,
+    project_id: &str,
+    model: &str,
+) -> Result<Arc<CloudSession>, String> {
+    let mut sessions = SESSIONS.lock();
+    if let Some(current) = sessions.get(client.base_url())
+        && !Arc::ptr_eq(current, stale)
+        && current.is_fresh(Utc::now())
+    {
+        return Ok(current.clone());
+    }
+    sessions.remove(client.base_url());
+    let fresh = Arc::new(fetch(client, project_id, model, stale.session_id.as_deref())?);
+    tracing::info!(
+        target: LOG_TARGET,
+        "[session] replaced a refused cloud session ({} models, expires {})",
         fresh.models.len(),
         fresh.expires_at
     );
@@ -179,14 +231,22 @@ pub fn clear() {
     SESSIONS.lock().clear();
 }
 
-fn fetch(client: &SLPPlatformClient, project_id: &str, model: &str) -> Result<CloudSession, String> {
+fn fetch(
+    client: &SLPPlatformClient,
+    project_id: &str,
+    model: &str,
+    replaces: Option<&str>,
+) -> Result<CloudSession, String> {
     let http = reqwest::blocking::Client::builder()
         .connect_timeout(FETCH_TIMEOUT)
         .timeout(FETCH_TIMEOUT)
         .build()
         .map_err(|e| format!("Could not reach {model}: {e}"))?;
     let url = format!("{}{CHAT_SESSION}", client.base_url());
-    let body = json!({ "project_id": project_id });
+    let mut body = json!({ "project_id": project_id });
+    if let Some(replaces) = replaces {
+        body["replaces"] = json!(replaces);
+    }
     let response = client
         .authed(|headers: &Headers| {
             let mut request = http.post(&url).json(&body);

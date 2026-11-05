@@ -46,7 +46,7 @@ fn server(name: &str) -> MCPServer {
 
 fn call(tool_name: &str, arguments: Value) -> Option<ResolvedCall> {
     let arguments: Map<String, Value> = arguments.as_object().cloned().unwrap_or_default();
-    Some(ResolvedCall { server_id: "Notion".to_string(), tool_name: tool_name.to_string(), arguments, reasoned: false })
+    Some(ResolvedCall { server_id: "Notion".to_string(), tool_name: tool_name.to_string(), arguments, reasoned: false, native: false, also: Vec::new() })
 }
 
 // ------------------------------------------------- the resolved call is reported

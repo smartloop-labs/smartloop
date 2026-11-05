@@ -208,6 +208,13 @@ pub trait BaseLLM: Send + Sync {
             .collect()
     }
 
+    /// Whether this model calls functions natively, so a prompt may carry
+    /// a tools block (see [`crate::llms::tool_calls`]).  `false` by default:
+    /// a model that does not keeps the prompt-based MCP resolution.
+    fn supports_native_tools(&self) -> bool {
+        false
+    }
+
     /// True when this model's chat template can reason.
     fn supports_thinking(&self) -> bool {
         false

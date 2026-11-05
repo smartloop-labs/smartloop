@@ -2196,6 +2196,7 @@ pub mod agents_mcp_agent {
         reply: Mutex<ReplyFn>,
         calls: Mutex<Vec<InvokeCall>>,
         supports_thinking: Mutex<bool>,
+        supports_native_tools: Mutex<bool>,
         model_label: Mutex<String>,
         max_tokens: Mutex<usize>,
         num_tokens: Mutex<usize>,
@@ -2215,6 +2216,7 @@ pub mod agents_mcp_agent {
                 reply: Mutex::new(reply),
                 calls: Mutex::new(Vec::new()),
                 supports_thinking: Mutex::new(false),
+                supports_native_tools: Mutex::new(false),
                 model_label: Mutex::new(String::new()),
                 max_tokens: Mutex::new(0),
                 num_tokens: Mutex::new(0),
@@ -2240,6 +2242,10 @@ pub mod agents_mcp_agent {
 
         pub fn set_supports_thinking(&self, value: bool) {
             *self.supports_thinking.lock() = value;
+        }
+
+        pub fn set_supports_native_tools(&self, value: bool) {
+            *self.supports_native_tools.lock() = value;
         }
 
         pub fn set_model_label(&self, label: &str) {
@@ -2312,6 +2318,10 @@ pub mod agents_mcp_agent {
 
         fn supports_thinking(&self) -> bool {
             *self.supports_thinking.lock()
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            *self.supports_native_tools.lock()
         }
 
         fn model_label(&self) -> String {

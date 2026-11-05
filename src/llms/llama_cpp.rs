@@ -5,8 +5,8 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, ReentrantMutex, ReentrantMutexGuard};
@@ -19,6 +19,9 @@ use crate::llms::base_llm::{
 };
 use crate::llms::llama::batch::capture_prompt;
 use crate::llms::thinking::{ThinkingFilter, strip_thinking};
+use crate::llms::tool_calls::{split_messages, split_tools, template_renders_tools};
+use crate::model::spec::MODEL_SPECS;
+use crate::types::ModelCapability;
 
 pub use crate::llms::llama::{
     ChatCompletionChunks, ChatCompletionOutput, ChatCompletionRequest, ChatHandler, ChatHandlerRequest, Llama,
@@ -79,7 +82,13 @@ pub struct LlamaCpp {
     /// shows and therefore what a status event has to say.
     slp_model_name: Option<String>,
     cancelled: Mutex<Option<CancelEvent>>,
+    /// [`BaseLLM::supports_native_tools`], worked out once.
+    native_tools: OnceLock<bool>,
 }
+
+/// Chat handlers that render the model's own embedded template, so a
+/// `tools` variable reaches it (the others impose a fixed format).
+const EMBEDDED_TEMPLATE_HANDLERS: [&str; 2] = ["MTMDChatHandler", "Gemma4ChatHandler"];
 
 impl LlamaCpp {
     /// Overhead reserved for chat-template formatting when sizing prompt/output.
@@ -96,6 +105,7 @@ impl LlamaCpp {
             temperature: 0.3,
             slp_model_name: model_name,
             cancelled: Mutex::new(None),
+            native_tools: OnceLock::new(),
         }
     }
 
@@ -338,11 +348,22 @@ impl LlamaCpp {
     /// The body of `_call` once the context lock is held.
     fn call_locked(&self, prompt: &str, options: CallOptions) -> anyhow::Result<String> {
         let start_time = time_now();
-        let prompt = self.fit_prompt(prompt);
+        // A tools block is lifted out before fitting, so truncation can never
+        // cut a tool definition in half; it is rendered by the chat template.
+        let (prompt, tools) = split_tools(prompt);
+        let tools = tools.filter(|_| self.supports_native_tools());
+        // A tool conversation is rendered by the template as it is; it is
+        // never truncated, since a cut would break its JSON.
+        let conversation = split_messages(prompt).filter(|_| tools.is_some());
+        let prompt = if conversation.is_some() { prompt.to_string() } else { self.fit_prompt(prompt) };
         let prompt_tokens = self.num_tokens(&prompt)?;
-        tracing::info!(target: LOG_TARGET, "Generating response | prompt_tokens={prompt_tokens}");
+        tracing::info!(
+            target: LOG_TARGET,
+            "Generating response | prompt_tokens={prompt_tokens}{}",
+            tools.as_ref().map(|t| format!(" tools={}", t.len())).unwrap_or_default()
+        );
 
-        let result = self.generate(&prompt, prompt_tokens, start_time, options);
+        let result = self.generate(&prompt, prompt_tokens, start_time, options, tools, conversation);
         let text = match result {
             Ok(text) => text,
             Err(ex) => {
@@ -377,7 +398,15 @@ impl LlamaCpp {
         TABS.replace_all(text.trim(), "").into_owned()
     }
 
-    fn generate(&self, prompt: &str, prompt_tokens: usize, start_time: f64, options: CallOptions) -> anyhow::Result<String> {
+    fn generate(
+        &self,
+        prompt: &str,
+        prompt_tokens: usize,
+        start_time: f64,
+        options: CallOptions,
+        tools: Option<Vec<Value>>,
+        conversation: Option<Vec<Value>>,
+    ) -> anyhow::Result<String> {
         let messages = self.create_messages_from_prompt(prompt);
         let available_tokens = match options.max_tokens {
             Some(m) => m,
@@ -390,7 +419,12 @@ impl LlamaCpp {
         let stream = {
             let _override = self.thinking_override(Some(Self::requested_thinking(&options)));
             let _budget = self.thinking_for_budget(Some(available_tokens));
-            self.model.create_chat_completion(self.completion_request(&messages, available_tokens, true))?
+            let mut request = self.completion_request(&messages, available_tokens, true);
+            request.tools = tools;
+            if let Some(conversation) = conversation {
+                request.messages = conversation;
+            }
+            self.model.create_chat_completion(request)?
         };
 
         let mut parts: Vec<String> = Vec::new();
@@ -690,6 +724,47 @@ impl BaseLLM for LlamaCpp {
     /// the answer.
     fn supports_thinking(&self) -> bool {
         self.model.state().thinking().is_some()
+    }
+
+    /// True when the catalog declares `tools` for this model *and* the chat
+    /// template it renders reads a `tools` variable.
+    ///
+    /// Both, because neither alone is enough: the declaration is the
+    /// catalog's judgement that the model is big enough to be trusted with a
+    /// whole tool catalog (a 2B template renders tools too), and the template
+    /// check guards a model loaded through a fixed-format vision handler or a
+    /// GGUF whose template was stripped, where the tools would never reach
+    /// the model.  Cached: neither changes while the model is loaded.
+    fn supports_native_tools(&self) -> bool {
+        *self.native_tools.get_or_init(|| {
+            let Some(spec) = self.slp_model_name.as_deref().and_then(|name| MODEL_SPECS.get(name)) else {
+                return false;
+            };
+            if !spec.supports(ModelCapability::Tools) {
+                return false;
+            }
+            if spec.vision_chat_handler.as_deref().is_some_and(|h| !EMBEDDED_TEMPLATE_HANDLERS.contains(&h)) {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    "[tools] {} declares tools but renders a fixed vision template — using prompt-based tool resolution",
+                    spec.name
+                );
+                return false;
+            }
+            let renders = self
+                .model
+                .metadata()
+                .get("tokenizer.chat_template")
+                .is_some_and(|t| template_renders_tools(t));
+            if !renders {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    "[tools] {} declares tools but its chat template does not render them — using prompt-based tool resolution",
+                    spec.name
+                );
+            }
+            renders
+        })
     }
 
     /// The model's name as the user chose it, or `""`.

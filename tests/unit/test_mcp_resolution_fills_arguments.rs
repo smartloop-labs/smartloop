@@ -149,6 +149,8 @@ fn test_a_complete_resolution_is_called_as_returned() {
         tool_name: "create_issue".into(),
         arguments: args(json!({"title": "Login is broken"})),
         reasoned: true,
+        native: false,
+        also: Vec::new(),
     });
 
     let resolved = wired.executor.resolve_tool_args(&wired.ctx, &mut wired.step, None, None);
@@ -185,6 +187,8 @@ fn test_resolution_reads_what_earlier_steps_returned() {
         tool_name: "create_issue".into(),
         arguments: args(json!({"title": "Login is broken"})),
         reasoned: false,
+        native: false,
+        also: Vec::new(),
     });
 
     let previous = vec![json!({"tool_name": "list_teams", "result": "team ENG"})];
@@ -203,4 +207,52 @@ fn test_an_unresolvable_step_is_skipped() {
     // no server, so the real lookup finds none either.)
 
     assert_eq!(wired.executor.resolve_tool_args(&wired.ctx, &mut wired.step, None, None), None);
+}
+
+/// A native tool call saw the whole schema, so the optional arguments it
+/// filled (a ticket's priority) reach the tool.
+#[test]
+fn test_a_native_resolution_keeps_optional_arguments() {
+    let mut wired = wired();
+    *wired.resolve_returns.lock() = Some(ResolvedCall {
+        server_id: "srv-1".into(),
+        tool_name: "create_issue".into(),
+        arguments: args(json!({"title": "Login is broken", "priority": 1})),
+        reasoned: true,
+        native: true,
+        also: Vec::new(),
+    });
+
+    let resolved = wired.executor.resolve_tool_args(&wired.ctx, &mut wired.step, None, None);
+
+    assert_eq!(
+        resolved,
+        Some((
+            wired.server.clone(),
+            "create_issue".to_string(),
+            args(json!({"title": "Login is broken", "priority": 1}))
+        ))
+    );
+    assert_eq!(*wired.extract_calls.lock(), 0);
+}
+
+/// The prompt-based resolution still calls with required arguments only.
+#[test]
+fn test_a_prompt_resolution_drops_optional_arguments() {
+    let mut wired = wired();
+    *wired.resolve_returns.lock() = Some(ResolvedCall {
+        server_id: "srv-1".into(),
+        tool_name: "create_issue".into(),
+        arguments: args(json!({"title": "Login is broken", "priority": 1})),
+        reasoned: true,
+        native: false,
+        also: Vec::new(),
+    });
+
+    let resolved = wired.executor.resolve_tool_args(&wired.ctx, &mut wired.step, None, None);
+
+    assert_eq!(
+        resolved,
+        Some((wired.server.clone(), "create_issue".to_string(), args(json!({"title": "Login is broken"}))))
+    );
 }

@@ -129,6 +129,12 @@ pub enum ModelCapability {
     /// `"thinking"` — the chat template reads `enable_thinking`.  Not a
     /// routing target.
     Thinking,
+    /// `"tools"` — the model calls functions natively: its chat template
+    /// renders a `tools` list (or its API takes one) and it answers with a
+    /// structured tool call.  MCP resolution hands such a model the catalog
+    /// as real tool definitions instead of a numbered prompt.  Not a routing
+    /// target, but shown in the model listing.
+    Tools,
 }
 
 /// The routing key for the model that writes an answer, or extracts from
@@ -140,11 +146,12 @@ pub const ANSWER_TIER: &str = "answer";
 
 impl ModelCapability {
     /// All capabilities in declaration order.
-    pub const ALL: [ModelCapability; 4] = [
+    pub const ALL: [ModelCapability; 5] = [
         ModelCapability::Text,
         ModelCapability::Reasoning,
         ModelCapability::Vision,
         ModelCapability::Thinking,
+        ModelCapability::Tools,
     ];
 
     /// Values older catalogs, overrides and settings used for what a turn
@@ -159,6 +166,7 @@ impl ModelCapability {
             ModelCapability::Reasoning => "reasoning",
             ModelCapability::Vision => "vision",
             ModelCapability::Thinking => "thinking",
+            ModelCapability::Tools => "tools",
         }
     }
 

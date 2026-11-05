@@ -907,6 +907,9 @@ impl StepExecutor {
         // requires — one call that saw the tool list, the request and the
         // prior results together beats two that each saw part of it.
         let mut resolved_arguments: Map<String, Value> = Map::new();
+        // Whether those came from the model's native tool calling, which saw
+        // the whole schema and may have filled optional parameters too.
+        let mut resolved_native = false;
 
         if !is_system {
             // External MCP tools resolve through the MCPAgent: it reasons over
@@ -937,14 +940,16 @@ impl StepExecutor {
                         // below reads that flag again.)
                         tool_name = picked.tool_name.clone();
                         resolved_arguments = picked.arguments.clone();
+                        resolved_native = picked.native;
                         let mut keys: Vec<String> = resolved_arguments.keys().cloned().collect();
                         keys.sort();
                         info!(
                             target: LOGGER,
-                            "[resolve] MCPAgent resolved '{}' on server '{}' (thinking={}, args={})",
+                            "[resolve] MCPAgent resolved '{}' on server '{}' (thinking={}, native={}, args={})",
                             tool_name,
                             srv.name,
                             py_bool(picked.reasoned),
+                            py_bool(picked.native),
                             py_list(&keys)
                         );
                     }
@@ -1186,7 +1191,14 @@ impl StepExecutor {
             // smaller question with less context and can only lose.  A partial
             // fill falls through to the extractor below rather than being
             // patched up here.
-            let properties_now = object_of(input_schema.get("properties"));
+            // A native call keeps the optional arguments it filled — the
+            // reason to call natively — unless an ```mcp block scoped the
+            // step to its declared arguments.
+            let properties_now = if resolved_native && step.inferred_args.is_none() {
+                object_of(full_schema.get("properties"))
+            } else {
+                object_of(input_schema.get("properties"))
+            };
             let args: Map<String, Value> = resolved_arguments
                 .into_iter()
                 .filter(|(k, _)| properties_now.contains_key(k))
@@ -1358,6 +1370,25 @@ impl StepExecutor {
         let (result, _refreshed) =
             self.tool_caller.call_with_refresh(&mut server, tool_name, Some(arguments), cwd);
         self.finish_call(&result, tool_name, "execute")
+    }
+
+    /// Run `llm`'s own tool loop for `instruction` over `mcp_servers` (see
+    /// [`crate::agents::mcp::tool_loop`]), calling tools the way a planned
+    /// step does.  The model is fed each call's raw result, which carries the
+    /// ids its next call needs.  `None` when the loop could not start.
+    pub fn run_tool_loop(
+        &self,
+        llm: &dyn BaseLLM,
+        instruction: &str,
+        mcp_servers: &[MCPServer],
+        cwd: Option<&str>,
+        emit: &dyn Fn(&str),
+    ) -> Option<crate::agents::mcp::tool_loop::LoopOutcome> {
+        let call = |server: &MCPServer, tool: &str, arguments: &Map<String, Value>| {
+            self.call_tool(server, tool, arguments, cwd)
+                .map(|(formatted, raw)| if raw.trim().is_empty() { formatted } else { raw })
+        };
+        crate::agents::mcp::tool_loop::run_tool_loop(&self.mcp_agent, llm, instruction, mcp_servers, &call, emit)
     }
 
     /// The planner-facing catalogue of usable connections: every enabled,

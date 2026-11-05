@@ -37,6 +37,24 @@
 //! resolve node to a model declaring `ModelCapability::Thinking` when the
 //! workspace has one enabled, rather than to whichever model the step would
 //! otherwise use.
+//!
+//! ## Native tool calling
+//!
+//! A model that calls functions natively (`BaseLLM::supports_native_tools`:
+//! the catalog declares `ModelCapability::Tools` — a large model such as a
+//! Qwen 27B — and its chat template or API takes a `tools` list) is handed the
+//! catalog as real tool definitions, full JSON schemas included, and answers
+//! in its own trained call format ([`crate::llms::tool_calls`]).  It sees the
+//! optional parameters too, and may fill them when the request states their
+//! value — the description, labels and priority of a ticket it is asked to
+//! create — where the numbered prompt shows required parameters only.
+//!
+//! This is the same resolve node in the same DAG: only *how* the call is
+//! worked out differs.  The answer is a [`ResolvedCall`] like any other, and
+//! the call, the result mapping and everything downstream are unchanged.  A
+//! native attempt that yields no usable call (the catalog does not fit, the
+//! reply does not parse, the model names no listed tool) falls back to the
+//! prompt-based resolution below, on the same model.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashSet, VecDeque};
@@ -46,11 +64,12 @@ use std::sync::{Arc, OnceLock};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use regex::Regex;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::agents::mcp::argument_extractor::MCPArgumentExtractor;
 use crate::agents::planner::{mcp_connection_is_usable, FETCH_SERVER_ID, SYSTEM_TOOLS_SERVER_ID};
 use crate::constants::display_model_label;
+use crate::llms::tool_calls::{parse_tool_calls, with_tools};
 use crate::llms::BaseLLM;
 use crate::workspace::workspace::MCPServer;
 
@@ -61,6 +80,14 @@ pub const LOGGER: &str = "smartloop.agents.mcp.mcp_agent";
 /// `LlamaCpp::THINKING_MIN_BUDGET` (512) so the reasoning block is not
 /// suppressed: the JSON answer is ~60 tokens and the rest is room to think.
 pub const RESOLVE_MAX_TOKENS: usize = 1024;
+
+/// Output budget for a native tool call.  Larger than [`RESOLVE_MAX_TOKENS`]:
+/// a native call may carry optional arguments with real prose in them (a
+/// ticket's description), on top of the reasoning block.
+pub const NATIVE_RESOLVE_MAX_TOKENS: usize = 2048;
+
+/// Longest function name an OpenAI-compatible endpoint accepts.
+const MAX_FUNCTION_NAME: usize = 64;
 
 // Catalog trimming.  The whole tool list goes into one prompt now, so it is
 // bounded here rather than by retrieval: a long description is guidance the
@@ -123,6 +150,14 @@ pub struct ResolvedCall {
     pub tool_name: String,
     pub arguments: Map<String, Value>,
     pub reasoned: bool,
+    /// Resolved through the model's native tool calling, so `arguments` may
+    /// hold optional parameters the request stated, not only required ones.
+    pub native: bool,
+    /// The further calls the model asked for in the same answer, in order —
+    /// a native model plans "find the user, then file the issue" as two
+    /// calls at once.  This step makes only the first; the collect pass
+    /// hands a write among these to the planner (see `Explorer`).
+    pub also: Vec<ResolvedCall>,
 }
 
 impl ResolvedCall {
@@ -133,6 +168,8 @@ impl ResolvedCall {
             tool_name: tool_name.into(),
             arguments: Map::new(),
             reasoned: false,
+            native: false,
+            also: Vec::new(),
         }
     }
 }
@@ -528,6 +565,18 @@ impl MCPAgent {
             Some(l) => l,
             None => self.llm.as_ref(),
         };
+
+        if effective_llm.supports_native_tools() {
+            if let Some(resolved) = self.resolve_native(directive, context, &entries, effective_llm) {
+                Self::remember(key, Some(resolved.clone()));
+                return Some(resolved);
+            }
+            tracing::info!(
+                target: LOGGER,
+                "[mcp-agent] native tool call gave no usable call — falling back to prompt-based resolution"
+            );
+        }
+
         let prompt = self.prompt(directive, context, &entries, Some(effective_llm));
         let reasoned = Self::can_think(effective_llm);
         let budget = Self::budget(effective_llm, &prompt, RESOLVE_MAX_TOKENS);
@@ -559,7 +608,7 @@ impl MCPAgent {
         };
 
         let entry = &entries[choice];
-        let arguments = self.clean_arguments(&entry.schema, &raw_arguments);
+        let arguments = self.clean_arguments(&entry.schema, &raw_arguments, false);
         tracing::info!(
             target: LOGGER,
             "[mcp-agent] resolved {}",
@@ -570,9 +619,222 @@ impl MCPAgent {
             tool_name: entry.tool_name.clone(),
             arguments,
             reasoned,
+            native: false,
+            also: Vec::new(),
         };
         Self::remember(key, Some(resolved.clone()));
         Some(resolved)
+    }
+
+    // ------------------------------------------------------------------ native
+
+    /// Resolve with the model's own tool calling, or `None` to fall back.
+    pub fn resolve_native(
+        &self,
+        directive: &str,
+        context: Option<&str>,
+        entries: &[Entry],
+        llm: &dyn BaseLLM,
+    ) -> Option<ResolvedCall> {
+        let (tools, names) = self.native_tools(entries);
+        let size: usize = tools.iter().map(|t| t.to_string().chars().count()).sum();
+        let budget = self.catalog_budget(llm);
+        if size > budget {
+            tracing::info!(
+                target: LOGGER,
+                "[mcp-agent] {} tool definition(s) need {} chars, over the {} this model can be shown — not calling natively",
+                tools.len(),
+                size,
+                budget
+            );
+            return None;
+        }
+
+        let prompt = with_tools(&self.native_prompt(directive, context), &tools);
+        let reasoned = Self::can_think(llm);
+        let max_tokens = Self::budget(llm, &prompt, NATIVE_RESOLVE_MAX_TOKENS);
+        tracing::info!(
+            target: LOGGER,
+            "[mcp-agent] resolving natively over {} tool(s) with {} (thinking={}, max_tokens={})",
+            tools.len(),
+            Self::model_label(llm),
+            if reasoned { "True" } else { "False" },
+            max_tokens
+        );
+        // Reasoning forced on for the same reason as the prompt path.
+        let text = llm.invoke(&prompt, Some(max_tokens), Some(true));
+
+        let calls = parse_tool_calls(&text);
+        let found = calls.iter().find_map(|call| Self::native_entry(&call.name, &names, entries).map(|i| (i, call)));
+        let Some((index, call)) = found else {
+            tracing::info!(
+                target: LOGGER,
+                "[mcp-agent] no listed tool in the native reply ({} call(s)): {}",
+                calls.len(),
+                take_chars(text.trim(), 200)
+            );
+            return None;
+        };
+        let also: Vec<ResolvedCall> = calls
+            .iter()
+            .filter(|other| !std::ptr::eq(*other, call))
+            .filter_map(|other| {
+                let i = Self::native_entry(&other.name, &names, entries)?;
+                let e = &entries[i];
+                Some(ResolvedCall {
+                    server_id: e.server_id.clone(),
+                    tool_name: e.tool_name.clone(),
+                    arguments: self.clean_arguments(&e.schema, &other.arguments, true),
+                    reasoned,
+                    native: true,
+                    also: Vec::new(),
+                })
+            })
+            .collect();
+        if !also.is_empty() {
+            tracing::info!(
+                target: LOGGER,
+                "[mcp-agent] model asked for {} calls — this step makes the first; then {}",
+                calls.len(),
+                also.iter().map(|c| c.tool_name.as_str()).collect::<Vec<_>>().join(", ")
+            );
+        }
+
+        let entry = &entries[index];
+        let arguments = self.clean_arguments(&entry.schema, &call.arguments, true);
+        tracing::info!(
+            target: LOGGER,
+            "[mcp-agent] resolved natively {}",
+            format_call(&entry.server_name, &entry.tool_name, &arguments)
+        );
+        Some(ResolvedCall {
+            server_id: entry.server_id.clone(),
+            tool_name: entry.tool_name.clone(),
+            arguments,
+            reasoned,
+            native: true,
+            also,
+        })
+    }
+
+    /// OpenAI function definitions for `entries`, and the function name each
+    /// entry was given (parallel to `entries`).
+    ///
+    /// A tool keeps its own name when no other server lists the same one, so
+    /// the model sees the name it was trained on; a clash is qualified with
+    /// the server.  Names are cut to what an endpoint accepts.  Descriptions
+    /// are trimmed as in the prompt catalog; the schema is passed whole.
+    pub fn native_tools(&self, entries: &[Entry]) -> (Vec<Value>, Vec<String>) {
+        let sanitize = |raw: &str| -> String {
+            let name: String = raw
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                .collect();
+            take_chars(&name, MAX_FUNCTION_NAME)
+        };
+        let mut names: Vec<String> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let clashes = entries.iter().filter(|e| e.tool_name == entry.tool_name).count() > 1;
+            let base = if clashes {
+                sanitize(&format!("{}__{}", entry.server_name, entry.tool_name))
+            } else {
+                sanitize(&entry.tool_name)
+            };
+            let mut name = base.clone();
+            let mut n = 2;
+            while names.contains(&name) {
+                let suffix = format!("_{n}");
+                name = format!("{}{suffix}", take_chars(&base, MAX_FUNCTION_NAME - suffix.len()));
+                n += 1;
+            }
+            names.push(name);
+        }
+
+        let tools = entries
+            .iter()
+            .zip(&names)
+            .map(|(entry, name)| {
+                let mut description = format!("[{}]", entry.server_name);
+                if !entry.description.is_empty() {
+                    description.push(' ');
+                    description.push_str(&Self::trim(&entry.description, MAX_TOOL_DESC * 2));
+                }
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": Self::native_parameters(&entry.schema),
+                    }
+                })
+            })
+            .collect();
+        (tools, names)
+    }
+
+    /// A tool's input schema as a function's `parameters`: an object schema
+    /// always, with each property's description trimmed.
+    fn native_parameters(schema: &Map<String, Value>) -> Value {
+        let mut parameters = schema.clone();
+        parameters.insert("type".into(), json!("object"));
+        let properties = schema_properties(schema)
+            .into_iter()
+            .map(|(name, mut info)| {
+                if let Some(desc) = info.get("description").and_then(Value::as_str) {
+                    let trimmed = Self::trim(desc, MAX_PARAM_DESC);
+                    info["description"] = Value::String(trimmed);
+                }
+                (name, info)
+            })
+            .collect();
+        parameters.insert("properties".into(), Value::Object(properties));
+        Value::Object(parameters)
+    }
+
+    /// The entry a native call names: by the name it was given, else by the
+    /// tool's own or qualified name (a model may echo either).
+    pub fn native_entry(name: &str, names: &[String], entries: &[Entry]) -> Option<usize> {
+        let name = name.trim();
+        names
+            .iter()
+            .position(|n| n == name)
+            .or_else(|| entries.iter().position(|e| e.qualified == name))
+            .or_else(|| {
+                let mut matching = entries.iter().enumerate().filter(|(_, e)| e.tool_name == name);
+                match (matching.next(), matching.next()) {
+                    (Some((i, _)), None) => Some(i),
+                    _ => None,
+                }
+            })
+    }
+
+    /// The messages of a native resolution; the tools travel beside them.
+    pub fn native_prompt(&self, directive: &str, context: Option<&str>) -> String {
+        let mut context_block = String::new();
+        if let Some(ctx) = context.filter(|c| !c.trim().is_empty()) {
+            context_block = format!(
+                "\n\nContext from earlier steps (use it to fill arguments):\n{}",
+                Self::trim(ctx, MAX_CONTEXT_CHARS)
+            );
+        }
+        format!(
+            "<system>
+You carry out one step of a plan by calling exactly ONE of the provided tools.
+
+- The request names what the user wants, not the tool. A request about content
+  a connected server holds is served by that server's search or read tool;
+  reading is cheap and a near miss is useful.
+- Fill the tool's arguments from the request and the context. Include an
+  optional argument only when its value is stated or clearly implied there —
+  for something you are asked to create (a ticket, an issue, a page), that
+  means its title, description, labels, priority and the like.
+- Never invent an id, a cursor, a token or a URL.
+- If no tool could serve the request, answer with the single word NONE.
+</system>
+<user>
+Request: {directive}{context_block}
+</user>"
+        )
     }
 
     /// Keep this resolution for the other caller in the same request.
@@ -969,7 +1231,16 @@ JSON:
     /// a small model answers "MISSING", echoes the field's description back as
     /// its value, or fabricates a cursor it cannot know.  Anything the tool
     /// does not declare is dropped rather than sent.
-    pub fn clean_arguments(&self, schema: &Map<String, Value>, raw: &Map<String, Value>) -> Map<String, Value> {
+    ///
+    /// `keep_optional` keeps declared optional parameters too — a native
+    /// call, whose model saw the whole schema and was told to fill an
+    /// optional one only when its value is stated.
+    pub fn clean_arguments(
+        &self,
+        schema: &Map<String, Value>,
+        raw: &Map<String, Value>,
+        keep_optional: bool,
+    ) -> Map<String, Value> {
         if raw.is_empty() {
             return Map::new();
         }
@@ -983,7 +1254,9 @@ JSON:
 
         let mut cleaned = Map::new();
         for (key, value) in raw {
-            if !properties.contains_key(key) || (!required.is_empty() && !required.contains(key)) {
+            if !properties.contains_key(key)
+                || (!keep_optional && !required.is_empty() && !required.contains(key))
+            {
                 continue;
             }
             let placeholder = match value {

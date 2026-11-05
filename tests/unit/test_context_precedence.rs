@@ -150,7 +150,9 @@ mod test_sources_combine {
             let derived = Regex::new(r"let skill_matched = matched_skills\.is_some_and\(\|\w+\| !\w+\.is_empty\(\)\)").unwrap();
             assert!(derived.is_match(src), "skill_matched must mean \"a skill matched\"");
         }
-        assert!(block.contains("run_mcp("));
+        // `run_mcp_with_deferred` is `run_mcp` that also hands on the write
+        // tools it resolved and left for a planned step.
+        assert!(block.contains("run_mcp(") || block.contains("run_mcp_with_deferred("));
         // Beyond that, the only condition on it is "is there a server at all".
         assert!(!src.contains("mcp_document_context"));
     }

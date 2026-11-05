@@ -146,6 +146,11 @@ pub struct ChatCompletionRequest {
     pub stop: Vec<String>,
     pub seed: Option<u32>,
     pub stream: bool,
+    /// OpenAI function definitions rendered as the template's `tools`
+    /// variable, for a model that calls functions natively; `None` renders
+    /// the template without tools.
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
 }
 
 impl Default for ChatCompletionRequest {
@@ -164,6 +169,7 @@ impl Default for ChatCompletionRequest {
             stop: Vec::new(),
             seed: None,
             stream: false,
+            tools: None,
         }
     }
 }
@@ -923,7 +929,11 @@ impl LlamaModel for Llama {
 
     fn create_chat_completion(&self, request: ChatCompletionRequest) -> anyhow::Result<ChatCompletionOutput<'_>> {
         let handler = resolve_chat_handler(self)?;
-        handler(ChatHandlerRequest { llama: Some(self), request, template_kwargs: Map::new() })
+        let mut template_kwargs = Map::new();
+        if let Some(tools) = request.tools.clone() {
+            template_kwargs.insert("tools".to_string(), Value::Array(tools));
+        }
+        handler(ChatHandlerRequest { llama: Some(self), request, template_kwargs })
     }
 
     fn model_path(&self) -> String {

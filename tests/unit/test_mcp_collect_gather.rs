@@ -100,6 +100,8 @@ fn first_tool(s: &MCPServer, arguments: Value) -> Option<ResolvedCall> {
         tool_name: s.tools[0].name.clone(),
         arguments: args(arguments),
         reasoned: false,
+        native: false,
+        also: Vec::new(),
     })
 }
 
@@ -158,6 +160,72 @@ fn test_a_write_tool_is_left_to_a_planned_step() {
 
     assert_eq!(run(&fx, "write it down", &servers), "");
     assert!(fx.calls.lock().is_empty(), "a write tool was called during collect");
+}
+
+/// The write tool is not called, but it is handed on, so the planner can make
+/// it a step rather than trust a classifier that never saw the tool list.
+#[test]
+#[serial(mcp_global)]
+fn test_a_write_tool_is_reported_for_the_planner() {
+    let servers = [server("Linear", "save_issue")];
+    let fx = explorer_with(vec![], |s| first_tool(s, json!({})), follow_ups(vec![]), None);
+
+    let (text, picks) = fx.ex.run_mcp_with_deferred("create the issue on linear", Some(&servers), None, None, None);
+
+    assert_eq!(text, "");
+    assert!(fx.calls.lock().is_empty());
+    assert_eq!(picks.deferred.len(), 1);
+    assert_eq!(picks.deferred[0].server_name, "Linear");
+    assert_eq!(picks.deferred[0].tool_name, "save_issue");
+    assert!(picks.consulted.is_empty());
+}
+
+/// The model looked the user up and planned the write after it: the lookup
+/// runs now, and the write is handed on like a write resolved first.
+#[test]
+#[serial(mcp_global)]
+fn test_a_write_planned_after_a_read_is_reported_for_the_planner() {
+    let servers = [server("Linear", "list_users")];
+    let fx = explorer_with(
+        vec![(("Linear", "list_users"), "Chris Coveney")],
+        |s| {
+            let mut read = first_tool(s, json!({})).unwrap();
+            read.also = vec![ResolvedCall::new(s.id.clone(), "save_issue")];
+            Some(read)
+        },
+        follow_ups(vec![]),
+        None,
+    );
+
+    let (text, picks) =
+        fx.ex.run_mcp_with_deferred("assign an issue to Chris", Some(&servers), None, None, None);
+
+    assert!(text.contains("Chris Coveney"));
+    assert_eq!(picks.consulted.len(), 1);
+    assert_eq!(picks.consulted[0].tool_name, "list_users");
+    assert_eq!(picks.deferred.len(), 1);
+    assert_eq!(picks.deferred[0].tool_name, "save_issue");
+    assert_eq!(fx.calls.lock().len(), 1, "only the read was called");
+}
+
+/// A read-only tool runs as before, defers nothing, and is reported as consulted.
+#[test]
+#[serial(mcp_global)]
+fn test_a_read_tool_is_reported_as_consulted() {
+    let servers = [server("Linear", "list_issues")];
+    let fx = explorer_with(
+        vec![(("Linear", "list_issues"), "ENG-1 Login is broken")],
+        |s| first_tool(s, json!({})),
+        follow_ups(vec![]),
+        None,
+    );
+    let (text, picks) = fx.ex.run_mcp_with_deferred("my issues", Some(&servers), None, None, None);
+    assert!(text.contains("ENG-1"));
+    assert!(picks.deferred.is_empty());
+    // The read is reported as consulted, so the planner knows which server
+    // the request was about.
+    assert_eq!(picks.consulted.len(), 1);
+    assert_eq!(picks.consulted[0].tool_name, "list_issues");
 }
 
 #[test]
