@@ -22,7 +22,7 @@ $ErrorActionPreference = 'Stop'
 # the console to the OEM code page, which mojibakes the block glyphs.
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
-$Version    = '1.2.22'
+$Version    = '1.2.21'
 $BaseUrl    = "https://dl.smartloop.ai/slp/$Version"
 $BaseDir    = Join-Path $HOME '.smartloop'
 $InstallDir = Join-Path $BaseDir $Version
