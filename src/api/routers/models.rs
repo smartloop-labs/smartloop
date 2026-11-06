@@ -248,6 +248,8 @@ pub(crate) fn parse_json_body<T: DeserializeOwned>(
 ///
 /// `ModelCapability::Thinking` is internal-only — it drives the setting and
 /// the picker toggle, not routing — so it is stripped from the list.
+/// `ModelCapability::Tools` is shown: whether a model calls tools natively is
+/// worth seeing when choosing one for MCP work.
 pub fn display_capabilities<S: AsRef<str>>(caps: &[S]) -> Vec<String> {
     let thinking = ModelCapability::Thinking.value();
     caps.iter()

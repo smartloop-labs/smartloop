@@ -850,3 +850,216 @@ fn test_extract_paths_no_match() {
     let found = extract_paths("no paths here", &path_str(tmp.path()));
     assert!(found.is_empty());
 }
+
+// ------------------------------------------------------------------ //
+// Promoting a write tool the collect pass resolved                    //
+// ------------------------------------------------------------------ //
+
+mod promote_deferred {
+    use smartloop::agents::planner::{
+        promote_deferred_tool, promoted_instruction, ClassificationResult, IntentType, MatchedTool,
+        PROMOTED_HISTORY_CHARS,
+    };
+
+    fn linear_save_issue() -> Vec<MatchedTool> {
+        vec![MatchedTool {
+            server_id: "linear-1".into(),
+            server_name: "Linear".into(),
+            tool_name: "save_issue".into(),
+        }]
+    }
+
+    /// "create the issue on linear": the router called it an ACTION (a
+    /// `file-read` with no path); the collect pass picked the Linear tool.
+    #[test]
+    fn a_misclassified_action_becomes_the_tool_call() {
+        let mut c = ClassificationResult {
+            intent: IntentType::Action,
+            action_kind: Some("read".into()),
+            ..Default::default()
+        };
+        assert!(promote_deferred_tool(&mut c, &linear_save_issue(), &[]));
+        assert_eq!(c.intent, IntentType::ToolCall);
+        assert_eq!(c.matched_tools, linear_save_issue());
+        assert_eq!(c.action_kind, None);
+    }
+
+    /// The router's answer did not parse and defaulted to conversation, then
+    /// became explore because the lookup returned data; the write the model
+    /// planned still wins.
+    #[test]
+    fn an_explore_is_promoted_by_a_deferred_write() {
+        let mut c = ClassificationResult { intent: IntentType::Explore, ..Default::default() };
+        assert!(promote_deferred_tool(&mut c, &linear_save_issue(), &linear_list_users()));
+        assert_eq!(c.intent, IntentType::ToolCall);
+        assert_eq!(c.matched_tools, linear_save_issue());
+    }
+
+    #[test]
+    fn a_conversation_is_promoted_too() {
+        let mut c = ClassificationResult { intent: IntentType::Conversation, ..Default::default() };
+        assert!(promote_deferred_tool(&mut c, &linear_save_issue(), &[]));
+        assert_eq!(c.intent, IntentType::ToolCall);
+    }
+
+    #[test]
+    fn nothing_deferred_changes_nothing() {
+        let mut c = ClassificationResult { intent: IntentType::Action, ..Default::default() };
+        assert!(!promote_deferred_tool(&mut c, &[], &[]));
+        assert_eq!(c.intent, IntentType::Action);
+    }
+
+    /// A concrete target in the message, a keyword match or a multi-step plan
+    /// is the message speaking for itself.
+    #[test]
+    fn an_explicit_target_keeps_its_classification() {
+        let cases = [
+            ClassificationResult { intent: IntentType::Action, detected_paths: vec!["/tmp/a.txt".into()], ..Default::default() },
+            ClassificationResult { intent: IntentType::Action, bash_commands: vec!["ls".into()], ..Default::default() },
+            ClassificationResult { intent: IntentType::ToolCall, detected_urls: vec!["https://x.dev".into()], ..Default::default() },
+            ClassificationResult { intent: IntentType::ToolCall, matched_tools: linear_save_issue(), ..Default::default() },
+            ClassificationResult { intent: IntentType::MultiStep, ..Default::default() },
+        ];
+        for mut c in cases {
+            let before = c.clone();
+            assert!(!promote_deferred_tool(&mut c, &linear_save_issue(), &[]));
+            assert_eq!(c, before);
+        }
+    }
+
+    fn linear_list_users() -> Vec<MatchedTool> {
+        vec![MatchedTool {
+            server_id: "linear-1".into(),
+            server_name: "Linear".into(),
+            tool_name: "list_users".into(),
+        }]
+    }
+
+    /// "create an issue for this for chris on linear": the collect pass looked
+    /// the user up first (a read, so it ran) and deferred nothing; the router
+    /// called it an ACTION with nothing to act on.
+    #[test]
+    fn a_targetless_action_goes_to_the_server_the_collect_pass_read() {
+        let mut c = ClassificationResult { intent: IntentType::Action, ..Default::default() };
+        assert!(promote_deferred_tool(&mut c, &[], &linear_list_users()));
+        assert_eq!(c.intent, IntentType::ToolCall);
+        assert_eq!(c.matched_tools[0].server_name, "Linear");
+    }
+
+    /// A read that already ran answers a question; only the doomed ACTION
+    /// plan is replaced, and an ACTION with a target of its own is kept.
+    #[test]
+    fn a_read_does_not_override_other_intents() {
+        let cases = [
+            ClassificationResult { intent: IntentType::Conversation, ..Default::default() },
+            ClassificationResult { intent: IntentType::Explore, ..Default::default() },
+            ClassificationResult { intent: IntentType::Action, has_grep_intent: true, ..Default::default() },
+            ClassificationResult { intent: IntentType::Action, has_write_intent: true, ..Default::default() },
+        ];
+        for mut c in cases {
+            let before = c.clone();
+            assert!(!promote_deferred_tool(&mut c, &[], &linear_list_users()));
+            assert_eq!(c, before);
+        }
+    }
+
+    /// A deferred write outranks a read on another server.
+    #[test]
+    fn a_deferred_write_outranks_a_read() {
+        let mut c = ClassificationResult { intent: IntentType::Action, ..Default::default() };
+        assert!(promote_deferred_tool(&mut c, &linear_save_issue(), &linear_list_users()));
+        assert_eq!(c.matched_tools, linear_save_issue());
+    }
+
+    #[test]
+    fn the_instruction_carries_what_was_already_looked_up() {
+        let text = promoted_instruction("create it for chirs", "", r#"MCP TOOL (Linear.list_users): {"users":[]}"#);
+        assert!(text.contains("Already looked up for this request"));
+        assert!(text.contains(r#"{"users":[]}"#));
+        assert!(!text.contains("Earlier in this conversation"));
+    }
+
+    #[test]
+    fn the_instruction_carries_the_recent_conversation() {
+        assert_eq!(promoted_instruction("create the issue", "  ", ""), "create the issue");
+
+        let history = "user: pages render slowly\nassistant: consolidate the database calls";
+        let text = promoted_instruction("create the issue on linear", history, "");
+        assert!(text.starts_with("create the issue on linear"));
+        assert!(text.contains("consolidate the database calls"));
+
+        let long = format!("{}END", "x".repeat(PROMOTED_HISTORY_CHARS * 2));
+        let text = promoted_instruction("create it", &long, "");
+        assert!(text.ends_with("END"), "the most recent turns are kept");
+        assert!(text.chars().count() < PROMOTED_HISTORY_CHARS + 200);
+    }
+}
+
+// ------------------------------------------------------------------ //
+// The best model routes; the on-device model is the fallback          //
+// ------------------------------------------------------------------ //
+
+/// An ambiguous message is classified by the model passed in, not the
+/// planner's own router model.
+#[test]
+fn test_the_preferred_model_classifies() {
+    let router = mock_llm();
+    router.set_invoke_return("ACTION");
+    let big = mock_llm();
+    big.set_invoke_return("TOOL_CALL");
+    let planner = planner_with(&router);
+
+    let result = planner.classify(
+        "file that slowness problem for chris",
+        &sample_mcp_tools(),
+        ClassifyOptions { llm: Some(big.clone()), ..Default::default() },
+    );
+
+    assert_eq!(result.intent, IntentType::ToolCall);
+    assert!(big.invoke_called());
+    assert!(!router.invoke_called(), "the router is only the fallback");
+}
+
+/// A preferred model that fails or answers with no intent word hands the
+/// classification to the on-device model.
+#[test]
+fn test_the_on_device_model_is_the_fallback() {
+    let router = mock_llm();
+    router.set_invoke_return("TOOL_CALL");
+    let big = mock_llm();
+    big.set_invoke_return("Error generating response: 429 nearly out");
+    let planner = planner_with(&router);
+
+    let result = planner.classify(
+        "file that slowness problem for chris",
+        &sample_mcp_tools(),
+        ClassifyOptions { llm: Some(big.clone()), ..Default::default() },
+    );
+
+    assert_eq!(result.intent, IntentType::ToolCall);
+    assert!(big.invoke_called() && router.invoke_called());
+    assert!(result.reasoning.contains("fallback model"));
+}
+
+/// A tool call no keyword matched is one open TOOL step, resolved at the
+/// step over every connected server — not an empty plan.
+#[test]
+fn test_an_unmatched_tool_call_plans_an_open_tool_step() {
+    let planner = planner();
+    let classification = ClassificationResult { intent: IntentType::ToolCall, ..Default::default() };
+    let context = PlanContext {
+        user_message: "create the issue on linear".into(),
+        mcp_tools: sample_mcp_tools(),
+        ..Default::default()
+    };
+
+    let plan = planner.create_plan(&classification, &context, None);
+
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].step_type, StepType::Tool);
+    assert_eq!(plan.steps[0].tool_name, None);
+    assert_eq!(plan.steps[0].server_id, None);
+
+    let none = planner.create_plan(&classification, &ctx("create the issue on linear"), None);
+    assert!(none.steps.is_empty(), "no connected servers, nothing to call");
+}

@@ -235,6 +235,12 @@ mod test_the_idle_reading_comes_from_the_right_process {
         ) -> Result<Response<pb::BoolReply>, Status> {
             unimplemented()
         }
+        async fn supports_native_tools(
+            &self,
+            _: Request<pb::SupportsThinkingRequest>,
+        ) -> Result<Response<pb::BoolReply>, Status> {
+            unimplemented()
+        }
         async fn model_name(&self, _: Request<pb::ProjectRequest>) -> Result<Response<pb::StringReply>, Status> {
             unimplemented()
         }

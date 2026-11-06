@@ -35,6 +35,8 @@ service ModelHost {
   // project-scoped even here.
   rpc IsLoaded(ProjectRequest) returns (BoolReply);
   rpc SupportsThinking(SupportsThinkingRequest) returns (BoolReply);
+  // Whether the model serving a capability calls functions natively.
+  rpc SupportsNativeTools(SupportsThinkingRequest) returns (BoolReply);
   rpc ModelName(ProjectRequest) returns (StringReply);
   rpc ModelLabel(ModelLabelRequest) returns (StringReply);
   rpc CountTokens(CountTokensRequest) returns (IntReply);

@@ -33,7 +33,10 @@ use serde_json::{json, Value};
 use crate::config::app_settings::AppSettings;
 use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::llms::cloud_session::{self, SessionModel};
+use crate::llms::tool_calls::{openai_messages, parse_tool_calls, render_tool_calls, split_messages, split_tools, NativeToolCall};
+use crate::model::spec::MODEL_SPECS;
 use crate::platform::client::{AuthHeadersFn, RefreshFn, SLPPlatformClient};
+use crate::types::ModelCapability;
 
 const LOG_TARGET: &str = "smartloop.llms.cloud";
 
@@ -141,6 +144,20 @@ fn direct_body(model: &SessionModel, body: &Value) -> Value {
         out["stream_options"] = json!({"include_usage": true});
     }
     out
+}
+
+/// Waits before retrying a key the provider refused while it is new (see
+/// [`cloud_session::KEY_PROPAGATION`]), in units of [`KEY_WAIT_UNIT_MS`]:
+/// 1s, 2s, 3s — six seconds in all.
+const KEY_PROPAGATION_WAITS: [u64; 3] = [1, 2, 3];
+
+/// Milliseconds per unit of [`KEY_PROPAGATION_WAITS`]; tests shorten it.
+static KEY_WAIT_UNIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+
+/// Shorten the new-key waits (tests only).
+#[doc(hidden)]
+pub fn set_key_wait_unit_ms(ms: u64) {
+    KEY_WAIT_UNIT_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// A remote model as a [`BaseLLM`].
@@ -251,13 +268,36 @@ impl CloudLLM {
     }
 
     /// One non-streaming completion: the answer and why it stopped.
-    fn complete(&self, messages: &[ChatMessage], max_tokens: Option<usize>) -> anyhow::Result<(String, Option<String>)> {
-        let response = self.post(&self.body(messages, false, max_tokens)).map_err(anyhow::Error::msg)?;
+    ///
+    /// With `tools`, the request offers them and a structured `tool_calls`
+    /// reply comes back as text in the canonical
+    /// `<tool_call>{…}</tool_call>` shape (see [`crate::llms::tool_calls`]),
+    /// so a caller reads a local and a remote model's call the same way.
+    fn complete(
+        &self,
+        messages: &Value,
+        max_tokens: Option<usize>,
+        tools: Option<&[Value]>,
+    ) -> anyhow::Result<(String, Option<String>)> {
+        let mut body = self.body_for(messages.clone(), false, max_tokens);
+        if let Some(tools) = tools {
+            body["tools"] = Value::Array(tools.to_vec());
+            body["tool_choice"] = json!("auto");
+        }
+        let response = self.post(&body).map_err(anyhow::Error::msg)?;
         let data: Value = response
             .json()
             .map_err(|e| anyhow::anyhow!("{} sent an unreadable answer: {e}", self.model_name))?;
         let content = data.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or_default();
         let finish = data.pointer("/choices/0/finish_reason").and_then(Value::as_str);
+        let calls: Vec<NativeToolCall> = data
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(Value::as_array)
+            .map(|calls| calls.iter().flat_map(|c| parse_tool_calls(&c.to_string())).collect())
+            .unwrap_or_default();
+        if !calls.is_empty() {
+            return Ok((render_tool_calls(&calls), finish.map(str::to_string)));
+        }
         Ok((content.to_string(), finish.map(str::to_string)))
     }
 
@@ -303,6 +343,7 @@ impl CloudLLM {
     ) -> Result<reqwest::blocking::Response, String> {
         let mut session = cloud_session::session(platform, &self.project_id, &self.model_name)?;
         let mut renewed = false;
+        let mut young_retries = 0usize;
         let mut body = body.clone();
         loop {
             let Some(model) = session.model(&self.model_name) else {
@@ -324,10 +365,25 @@ impl CloudLLM {
             }
             let text = response.text().unwrap_or_default();
             tracing::warn!(target: LOG_TARGET, "[cloud] {} provider answered {status}: {text}", self.model_name);
+            // A key minted seconds ago is refused until the provider has
+            // caught up with it: wait that out with the same key, since a
+            // replacement reserves another budget and is just as new.
+            if status == 401 && session.is_new() && young_retries < KEY_PROPAGATION_WAITS.len() {
+                let unit = KEY_WAIT_UNIT_MS.load(std::sync::atomic::Ordering::SeqCst);
+                let wait = Duration::from_millis(KEY_PROPAGATION_WAITS[young_retries] * unit);
+                young_retries += 1;
+                tracing::info!(
+                    target: LOG_TARGET,
+                    "[cloud] {} key is new — retrying the same key in {:.1}s",
+                    self.model_name,
+                    wait.as_secs_f64()
+                );
+                std::thread::sleep(wait);
+                continue;
+            }
             if matches!(status, 401 | 402 | 403) && !renewed {
                 renewed = true;
-                cloud_session::invalidate(platform, &session);
-                session = cloud_session::session(platform, &self.project_id, &self.model_name)?;
+                session = cloud_session::replace(platform, &session, &self.project_id, &self.model_name)?;
                 continue;
             }
             if self.learn_cap(&text, &mut body) {
@@ -450,20 +506,33 @@ impl BaseLLM for CloudLLM {
         self.context_length
     }
 
+    /// True when the catalog declares `tools` for this model: its endpoint
+    /// then takes an OpenAI `tools` list and answers with `tool_calls`.
+    fn supports_native_tools(&self) -> bool {
+        MODEL_SPECS.get(&self.model_name).is_some_and(|spec| spec.supports(ModelCapability::Tools))
+    }
+
     /// A capped answer that runs out of tokens is retried once with twice
     /// the room.  If it is still cut off it comes back empty: callers treat
     /// an empty reply as unusable, where a truncated one would pass as
     /// complete.
     fn call(&self, prompt: &str, _stop: Option<&[String]>, options: CallOptions) -> anyhow::Result<String> {
-        let messages = self.create_messages_from_prompt(prompt);
+        let (prompt, tools) = split_tools(prompt);
+        let tools = tools.filter(|_| self.supports_native_tools());
+        let tools = tools.as_deref();
+        // A tool conversation travels as OpenAI messages, sent as they are.
+        let messages: Value = match split_messages(prompt).filter(|_| tools.is_some()) {
+            Some(conversation) => Value::Array(openai_messages(&conversation)),
+            None => json!(self.create_messages_from_prompt(prompt)),
+        };
         let Some(max_tokens) = self.request_max_tokens(options) else {
-            let (content, finish) = self.complete(&messages, None)?;
+            let (content, finish) = self.complete(&messages, None, tools)?;
             if finish.as_deref() == Some("length") {
                 tracing::warn!(target: LOG_TARGET, "[cloud] {} ran out of context mid-answer", self.model_name);
             }
             return Ok(content);
         };
-        let (content, finish) = self.complete(&messages, Some(max_tokens))?;
+        let (content, finish) = self.complete(&messages, Some(max_tokens), tools)?;
         if finish.as_deref() != Some("length") {
             return Ok(content);
         }
@@ -485,7 +554,7 @@ impl BaseLLM for CloudLLM {
             content.chars().count(),
             more
         );
-        let (content, finish) = self.complete(&messages, Some(more))?;
+        let (content, finish) = self.complete(&messages, Some(more), tools)?;
         if finish.as_deref() != Some("length") {
             return Ok(content);
         }

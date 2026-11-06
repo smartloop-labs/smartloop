@@ -10,7 +10,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use smartloop::llms::base_llm::{BaseLLM, CallOptions};
-use smartloop::llms::cloud_llm::{describe_provider_failure, CloudLLM};
+use smartloop::llms::cloud_llm::{describe_provider_failure, set_key_wait_unit_ms, CloudLLM};
 use smartloop::llms::cloud_session::{self, CloudSession};
 use smartloop::platform::client::{AuthHeadersFn, Headers};
 
@@ -52,6 +52,7 @@ async fn mount_sessions(platform: &MockServer, provider: &MockServer, keys: &'st
 
 fn session_body_from(provider_uri: &str, key: &str) -> Value {
     json!({
+        "session_id": format!("sess-{key}"),
         "base_url": format!("{provider_uri}/api/v1"),
         "key": key,
         "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
@@ -71,6 +72,8 @@ fn direct_llm(platform: &MockServer, name: &str) -> (CloudLLM, EnvGuard) {
     // Mock servers reuse ports, so a session cached by an earlier test
     // could otherwise answer for this one.
     cloud_session::clear();
+    // The new-key waits are seconds in the app; milliseconds here.
+    set_key_wait_unit_ms(1);
     let llm = CloudLLM::with_hooks("p1", name, &platform.uri(), Some(8192), Some(bearer("platform-token")), Some(Arc::new(|| false)));
     (llm, base)
 }
@@ -153,6 +156,48 @@ async fn test_a_refused_key_is_renewed_once() {
     let (llm, _b) = direct_llm(&platform, "kimi-k2");
     assert_eq!(drain(Arc::new(llm)).await.unwrap(), "ok");
     assert_eq!(minted.load(Ordering::SeqCst), 2);
+
+    // The second mint names the refused session, so the platform settles it
+    // instead of holding its budget until it expires.
+    let mints: Vec<Value> = platform
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/chat/session")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(mints.len(), 2);
+    assert!(mints[0].get("replaces").is_none());
+    assert_eq!(mints[1]["replaces"], "sess-sk-old");
+}
+
+/// OpenRouter refuses a key for a few seconds after it is minted ("User not
+/// found").  That is waited out with the same key: a replacement would
+/// reserve another budget and be just as new.
+#[tokio::test]
+#[serial]
+async fn test_a_new_key_refused_while_it_propagates_is_retried_not_replaced() {
+    let (platform, provider) = (MockServer::start().await, MockServer::start().await);
+    let minted = mount_sessions(&platform, &provider, &["sk-new", "sk-other"]).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/v1/chat/completions"))
+        .respond_with(move |_: &Request| {
+            if counter.fetch_add(1, Ordering::SeqCst) < 2 {
+                ResponseTemplate::new(401).set_body_json(json!({"error": {"message": "User not found.", "code": 401}}))
+            } else {
+                ResponseTemplate::new(200).set_body_string(sse(&["ok"]))
+            }
+        })
+        .mount(&provider)
+        .await;
+
+    let (llm, _b) = direct_llm(&platform, "kimi-k2");
+    assert_eq!(drain(Arc::new(llm)).await.unwrap(), "ok");
+    assert_eq!(minted.load(Ordering::SeqCst), 1, "the refused new key was not replaced");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

@@ -577,6 +577,21 @@ impl ModelHostService for ModelHostServicer {
         Ok(Response::new(pb::BoolReply { value }))
     }
 
+    async fn supports_native_tools(
+        &self,
+        request: Request<pb::SupportsThinkingRequest>,
+    ) -> Result<Response<pb::BoolReply>, Status> {
+        let request = request.into_inner();
+        let (capability, local_only) = (request.capability, request.local_only);
+        let value = self
+            .unary(request.project_id, move |client| {
+                let _scope = local_only_scope(local_only);
+                client.supports_native_tools(non_empty(&capability))
+            })
+            .await?;
+        Ok(Response::new(pb::BoolReply { value }))
+    }
+
     async fn model_name(
         &self,
         request: Request<pb::ProjectRequest>,

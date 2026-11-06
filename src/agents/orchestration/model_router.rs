@@ -125,6 +125,12 @@ pub const SKIP_REASONS: &[(&str, &str)] = &[
 /// qwen3.5-2b for thinking" tells the reader nothing about what is happening.
 pub const RESOLUTION_PURPOSE: &str = "tool resolution";
 
+/// What the user is told a model was picked for when it runs a planned step's
+/// decision (resolving a tool, extracting its arguments).  The step's
+/// capability is usually the answer tier, and "Selected sl-mini for the
+/// answer" read as though the small model had written the reply.
+pub const STEP_PURPOSE: &str = "a planned step";
+
 /// What the user is told a model was picked for when it ranks web results.
 pub const WEB_SEARCH_PURPOSE: &str = "web search";
 
@@ -299,7 +305,7 @@ impl ModelRouter {
         // nothing.  It only surfaced with two or more models selected — a
         // single selection is pinned into agent_llm upstream, so the default
         // happened to be the user's model.
-        self.decision_llm(capability, None)
+        self.decision_llm(capability, purpose.or(Some(STEP_PURPOSE)))
     }
 
     /// A model that can reason, for a call whose judgement warrants it.
@@ -348,6 +354,18 @@ impl ModelRouter {
             }
         }
         fallback
+    }
+
+    /// The model that classifies and plans a request: the best selected
+    /// model declaring `ModelCapability::Reasoning` — local or remote, the
+    /// largest first — or `fallback` (the on-device router) when none is
+    /// selected.  Not announced: routing is not work the user is waiting on.
+    pub fn route_llm(&self, fallback: Arc<dyn BaseLLM>) -> Arc<dyn BaseLLM> {
+        let reasoning = ModelCapability::Reasoning.value();
+        if !self.capability_model_exists(Some(reasoning)) {
+            return fallback;
+        }
+        self.resolve(reasoning, false, "reasoning").unwrap_or(fallback)
     }
 
     /// True when some selected model declares `capability`.
@@ -411,8 +429,12 @@ impl ModelRouter {
     /// second "Selected …" beside the first, naming one model twice under
     /// two labels — which is what a single-model workspace saw for every MCP
     /// step, since the model that reasons is also the one that answers.
+    ///
+    /// The router model is not announced either: it is what every step runs
+    /// on when nothing better is chosen, so naming it is not news — and on
+    /// the answer tier it read as the router writing the reply.
     fn announce(&self, capability: &str, llm: &Arc<dyn BaseLLM>, purpose: Option<&str>) {
-        if !same_llm(llm, &self.agent_llm) {
+        if !same_llm(llm, &self.agent_llm) && !self.is_router_model(llm) {
             self.emit_model_selected(Some(capability), llm.as_ref(), purpose);
         }
     }

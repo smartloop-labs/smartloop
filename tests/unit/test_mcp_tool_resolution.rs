@@ -639,3 +639,118 @@ fn test_a_small_context_falls_back_to_call_shapes() {
     // Every tool is still listed — names are dropped last, descriptions first.
     assert!(prompt.contains("notion-tool-41"));
 }
+
+// ------------------------------------------------------- native tool calling
+
+fn native_llm(reply: &str) -> Arc<StubLLM> {
+    let llm = llm(reply);
+    llm.set_supports_native_tools(true);
+    llm
+}
+
+/// A model that calls functions natively gets the catalog as tool
+/// definitions, schema and optional parameters included, and its own call
+/// format is read back — optional arguments it filled are kept.
+#[test]
+#[serial]
+fn test_a_native_model_resolves_through_its_own_tool_calls() {
+    let _cache = FreshCache::new();
+    let llm = native_llm(
+        "<tool_call>\n<function=create_issue>\n<parameter=title>\nLogin is broken\n</parameter>\n<parameter=teamId>\nENG\n</parameter>\n</function>\n</tool_call>",
+    );
+    let agent = agent(&llm);
+
+    let resolved = agent
+        .resolve("file an issue for team ENG: Login is broken", &[server()], None, None)
+        .expect("a native call resolves");
+
+    assert!(resolved.native);
+    assert_eq!(resolved.tool_name, "create_issue");
+    assert_eq!(resolved.arguments, obj(json!({"title": "Login is broken", "teamId": "ENG"})));
+
+    let call = llm.last_call();
+    assert_eq!(llm.call_count(), 1);
+    assert!(call.prompt.starts_with("<slp_tools>"));
+    // The whole schema goes over, optional parameters included.
+    assert!(call.prompt.contains("\"teamId\""));
+    assert!(!call.prompt.contains("[1] linear.create_issue"));
+    assert_eq!(call.thinking, Some(true));
+}
+
+/// Fabricated values are still dropped from a native call.
+#[test]
+#[serial]
+fn test_a_native_call_still_drops_cursors_and_placeholders() {
+    let _cache = FreshCache::new();
+    let llm = native_llm(
+        r#"<tool_call>{"name": "create_issue", "arguments": {"title": "Login is broken", "after": "cursor-123", "teamId": "MISSING"}}</tool_call>"#,
+    );
+    let resolved = agent(&llm).resolve("file an issue: Login is broken", &[server()], None, None).unwrap();
+    assert_eq!(resolved.arguments, obj(json!({"title": "Login is broken"})));
+}
+
+/// A native reply that names no listed tool falls back to the prompt-based
+/// resolution on the same model.
+#[test]
+#[serial]
+fn test_an_unusable_native_reply_falls_back_to_the_prompt() {
+    let _cache = FreshCache::new();
+    let llm = native_llm("");
+    llm.set_reply_fn(Arc::new(|prompt, _, _| {
+        if prompt.starts_with("<slp_tools>") {
+            "NONE".to_string()
+        } else {
+            r#"{"tool": 1, "arguments": {"title": "Login is broken"}}"#.to_string()
+        }
+    }));
+
+    let resolved = agent(&llm).resolve("file an issue: Login is broken", &[server()], None, None).unwrap();
+
+    assert_eq!(llm.call_count(), 2);
+    assert!(!resolved.native);
+    assert_eq!(resolved.arguments, obj(json!({"title": "Login is broken"})));
+}
+
+/// A model without native tool calling never sees a tools block.
+#[test]
+#[serial]
+fn test_a_model_without_native_tools_keeps_the_prompt() {
+    let _cache = FreshCache::new();
+    let llm = llm(r#"{"tool": 1, "arguments": {"title": "Login is broken"}}"#);
+    let resolved = agent(&llm).resolve("file an issue: Login is broken", &[server()], None, None).unwrap();
+    assert!(!resolved.native);
+    assert!(!llm.last_call().prompt.contains("<slp_tools>"));
+}
+
+/// The same tool name on two servers is qualified so each stays callable.
+#[test]
+#[serial]
+fn test_native_names_are_qualified_only_on_a_clash() {
+    let agent = agent(&llm(""));
+    let servers = [
+        server_with("srv-1", "linear", vec![tool(), tool_named("list_issues", "List", &[])], true),
+        server_with("srv-2", "jira", vec![tool()], true),
+    ];
+    let (_, names) = agent.native_tools(&agent.catalog(&servers));
+    assert_eq!(names, vec!["linear__create_issue", "list_issues", "jira__create_issue"]);
+}
+
+/// A native model plans "find the user, then file the issue" as two calls.
+/// The step makes the first; the rest are kept so the write is not lost.
+#[test]
+#[serial]
+fn test_a_native_multi_call_answer_keeps_the_later_calls() {
+    let _cache = FreshCache::new();
+    let llm = native_llm(concat!(
+        "<tool_call>{\"name\": \"list_users\", \"arguments\": {}}</tool_call>\n",
+        "<tool_call>{\"name\": \"create_issue\", \"arguments\": {\"title\": \"Slow pages\"}}</tool_call>",
+    ));
+    let servers = [server_tools(vec![tool_named("list_users", "Find users", &[]), tool()])];
+
+    let resolved = agent(&llm).resolve("assign an issue to Chris: slow pages", &servers, None, None).unwrap();
+
+    assert_eq!(resolved.tool_name, "list_users");
+    assert_eq!(resolved.also.len(), 1);
+    assert_eq!(resolved.also[0].tool_name, "create_issue");
+    assert_eq!(resolved.also[0].arguments, obj(json!({"title": "Slow pages"})));
+}

@@ -66,8 +66,8 @@ use crate::agents::orchestration::step_executor::{plan_step_result, StepExecutor
 use crate::agents::orchestration::tool_fanout::ToolFanout;
 use crate::agents::mcp::explorer::mcp_tool_citation;
 use crate::agents::planner::{
-    ClassifyOptions, IntentType, ModelTier, PlanStep, Planner, StepType, FETCH_SERVER_ID,
-    SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
+    promote_deferred_tool, promoted_instruction, ClassifyOptions, IntentType, ModelTier, PlanStep, Planner,
+    StepType, FETCH_SERVER_ID, SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
 };
 use crate::agents::web_search_agent::WebSearcher;
 use crate::llms::base_llm::BaseLLM;
@@ -398,7 +398,7 @@ impl PipelineBuilder {
     ) -> NodeResult {
         tracing::info!(
             target: LOG_TARGET,
-            "[models] ROUTE (classify+plan) → agent_llm: {}",
+            "[models] ROUTE (classify+plan) → best reasoning model, fallback agent_llm: {}",
             ModelRouter::model_label(&*self.agent_llm())
         );
         let matched_skills = matched_skills_from(deps.get(&skill_match_node.node_id));
@@ -563,6 +563,17 @@ impl PipelineBuilder {
         // Planning is always driven by the user prompt's own classification.
         // A matched skill only contributes guiding context (planner_skills) —
         // it does not change the control flow.
+        // The best selected reasoning model routes — the router model only
+        // guesses intent from five tool names per server, and called "create
+        // an issue on linear" a local ACTION.  The on-device router is the
+        // fallback (see `Planner::llm_classify`).
+        let route_llm = self.models.route_llm(self.agent_llm());
+        tracing::info!(
+            target: LOG_TARGET,
+            "[models] CLASSIFY → {} (fallback {})",
+            ModelRouter::model_label(&*route_llm),
+            ModelRouter::model_label(&*self.agent_llm())
+        );
         let mut classification = self.planner.classify(
             &c.user_message,
             &c.mcp_tool_contexts,
@@ -574,6 +585,7 @@ impl PipelineBuilder {
                 cwd: non_empty(&c.effective_cwd).map(str::to_string),
                 available_capabilities: Some(c.available_capabilities.clone())
                     .filter(|a| !a.is_empty()),
+                llm: Some(Arc::clone(&route_llm)),
             },
         );
         let pre_promotion_intent = classification.intent;
@@ -632,6 +644,10 @@ impl PipelineBuilder {
             );
         }
 
+        // What the collect pass resolved outranks the router's guess (see
+        // `promote_deferred_tool`).
+        let promoted = promote_deferred_tool(&mut classification, &sc.deferred_tools, &sc.consulted_tools);
+
         tracing::info!(
             target: LOG_TARGET,
             "[classify] {}: {}",
@@ -665,7 +681,7 @@ impl PipelineBuilder {
         // an OOM.
         let mut plan_llm: Option<Arc<dyn BaseLLM>> = None;
         if classification.intent == IntentType::MultiStep {
-            let llm = self.models.decision_llm(Some(ModelCapability::Reasoning.value()), None);
+            let llm = Arc::clone(&route_llm);
             tracing::info!(
                 target: LOG_TARGET,
                 "[models] PLAN (multi-step) → {}",
@@ -675,6 +691,21 @@ impl PipelineBuilder {
         }
 
         let mut plan = self.planner.create_plan(&classification, &plan_context, plan_llm.as_deref());
+        // A promoted step names its server but not the tool, and an open
+        // TOOL_CALL step names neither: the call is worked out at the step
+        // with the conversation and what collect already looked up in hand —
+        // on the reasoning model, natively where it can.  The collect pick
+        // was made from the bare message, which for a follow-up holds no
+        // title to file.
+        for step in plan.steps.iter_mut().filter(|s| s.step_type == StepType::Tool) {
+            if promoted {
+                step.tool_name = None;
+            }
+            if step.tool_name.is_none() {
+                step.instruction =
+                    promoted_instruction(&c.user_message, &enrich_ctx.history_insight, &sc.mcp_context);
+            }
+        }
         if !plan.steps.is_empty() {
             let available: Vec<Map<String, Value>> = c
                 .available_servers
@@ -819,6 +850,14 @@ impl PipelineBuilder {
                             .push(DagExtension::new(fanout_node.clone(), wrap(fanout_handler)));
                         group_nodes.push(fanout_node.clone());
                         pre_step_nodes.push(fanout_node);
+                    } else if let Some(loop_llm) = self.tool_loop_llm(step) {
+                        // The model runs its own tool loop: one node calls,
+                        // reads each result and calls again until it is done.
+                        let loop_node = ToolCallNode::new(&prev_refs);
+                        let loop_handler = self.make_tool_loop_handler(ctx, step, loop_llm);
+                        nodes_and_handlers.push(DagExtension::new(loop_node.clone(), wrap(loop_handler)));
+                        group_nodes.push(loop_node.clone());
+                        pre_step_nodes.push(loop_node);
                     } else {
                         let resolve_node = LLMDecisionNode::new(&prev_refs);
                         let resolve_handler = self.make_resolve_handler(
@@ -1357,6 +1396,90 @@ Assess whether these search results are relevant to the user's request. If relev
     ///
     /// Reads resolved arguments from the resolve node and calls the tool.  No
     /// LLM needed — just an API call.
+    /// The model for `step`'s tool loop, when the step leaves the tool open
+    /// and the model that would resolve it calls tools natively; `None` keeps
+    /// the resolve-then-execute pair.
+    fn tool_loop_llm(self: &Arc<Self>, step: &PlanStep) -> Option<Arc<dyn BaseLLM>> {
+        if step.tool_name.as_deref().is_some_and(|t| !t.is_empty()) {
+            return None;
+        }
+        let step_llm = self.models.llm_for_tier(step.model_tier, step.capability.as_deref(), None);
+        let llm = self.models.reasoning_llm(step_llm);
+        llm.supports_native_tools().then_some(llm)
+    }
+
+    /// One node that runs the model's tool loop for `step` (see
+    /// [`crate::agents::mcp::tool_loop`]).  If the loop cannot start, the step
+    /// falls back to a single resolved call, as the resolve/execute pair makes.
+    pub fn make_tool_loop_handler(
+        self: &Arc<Self>,
+        ctx: &SharedOrchestratorContext,
+        step: &PlanStep,
+        llm: Arc<dyn BaseLLM>,
+    ) -> NodeHandler {
+        tracing::info!(
+            target: LOG_TARGET,
+            "[models] TOOL LOOP → {}",
+            ModelRouter::model_label(&*llm)
+        );
+        let this = Arc::clone(self);
+        let ctx = Arc::clone(ctx);
+        let step = step.clone();
+        Arc::new(move |deps: HashMap<String, NodeResult>| {
+            let prev_results = ResponseBuilder::collect_raw_from_deps(&deps);
+            let node_id = format!("step_{}_{}_loop", step.step, step_label(&step));
+            let c = ctx.read().clone();
+            let emit = |message: &str| this.models.emit("tool", "processing", message);
+
+            let mut instruction = step.instruction.clone();
+            if !prev_results.is_empty() {
+                let prior: Vec<String> = prev_results
+                    .iter()
+                    .filter_map(|r| r.get("result").and_then(Value::as_str).map(|t| char_prefix(t, 3000).to_string()))
+                    .filter(|t| !t.trim().is_empty())
+                    .collect();
+                if !prior.is_empty() {
+                    instruction.push_str(&format!("\n\nResults of earlier steps:\n{}", prior.join("\n\n")));
+                }
+            }
+
+            emit("Working with your connected tools");
+            if let Some(outcome) =
+                this.steps.run_tool_loop(&*llm, &instruction, &c.mcp_servers, non_empty(&c.effective_cwd), &emit)
+            {
+                let mut cited = step.clone();
+                if let Some(last) = outcome.last_ok() {
+                    cited.server_id = Some(last.server_id.clone());
+                    cited.server_name = Some(last.server_name.clone());
+                    cited.tool_name = Some(last.tool_name.clone());
+                }
+                return Ok(plan_step_result(&node_id, &cited, &outcome.transcript(), None));
+            }
+
+            // The loop could not start: one resolved call, as before.
+            tracing::info!(target: LOG_TARGET, "[tool-loop] falling back to a single resolved call");
+            let mut resolve_step = step.clone();
+            let resolved = this.steps.resolve_tool_args(
+                &c,
+                &mut resolve_step,
+                if prev_results.is_empty() { None } else { Some(prev_results.as_slice()) },
+                Some(Arc::clone(&llm)),
+            );
+            let Some((server, tool_name, arguments)) = resolved else {
+                return Ok(plan_step_result(&node_id, &step, "", None));
+            };
+            emit(&format!("Calling {}", format_call(&server.name, &tool_name, &arguments)));
+            let mut cited = step.clone();
+            cited.server_id = Some(server.id.clone());
+            cited.server_name = Some(server.name.clone());
+            cited.tool_name = Some(tool_name.clone());
+            match this.steps.call_tool(&server, &tool_name, &arguments, non_empty(&c.effective_cwd)) {
+                Some((formatted, raw)) => Ok(plan_step_result(&node_id, &cited, &formatted, Some(&raw))),
+                None => Ok(plan_step_result(&node_id, &cited, "", None)),
+            }
+        })
+    }
+
     pub fn make_execute_handler(
         self: &Arc<Self>,
         ctx: &SharedOrchestratorContext,

@@ -92,6 +92,102 @@ impl<T: McpConnectionState + ?Sized> McpConnectionState for &T {
     }
 }
 
+/// How much of the recent conversation a promoted tool step carries.
+pub const PROMOTED_HISTORY_CHARS: usize = 3000;
+
+/// Make the request a TOOL_CALL on a write tool the collect pass resolved,
+/// when nothing in the message itself says otherwise.  Returns whether it
+/// did.
+///
+/// The collect pass asks the reasoning model to resolve the request over each
+/// connected server's whole catalog; a write tool it picks ("create the issue
+/// on linear" → `Linear.save_issue`) is left uncalled for a planned step.
+/// The classifier runs on the small on-device router, sees five tool names per
+/// server, and keyword-matches only when every word of a tool's name is in
+/// the message — so it can call that same request an ACTION, which plans a
+/// `file-read` with no path.  The collect pick is the better-informed of the
+/// two and wins, except where the message carries a concrete target of its
+/// own (a path, a shell block, a URL), a keyword match already chose a tool,
+/// or the classifier planned several steps.
+///
+/// A read tool the collect pass *called* (`consulted`) counts only against an
+/// ACTION with nothing to act on — no path, command, grep or write target.
+/// That plan is a `file-read` with no path, which can only fail, so the step
+/// goes to the server the request was about instead.  It is the case of a
+/// request whose first call is a lookup ("create an issue for Chris": find
+/// the user, then file the issue).  Any other intent keeps its answer: a
+/// question whose read already ran is answered from what it returned.
+pub fn promote_deferred_tool(
+    classification: &mut ClassificationResult,
+    deferred: &[MatchedTool],
+    consulted: &[MatchedTool],
+) -> bool {
+    if !classification.matched_tools.is_empty()
+        || !classification.detected_paths.is_empty()
+        || !classification.bash_commands.is_empty()
+        || !classification.detected_urls.is_empty()
+        || classification.intent == IntentType::MultiStep
+    {
+        return false;
+    }
+    let targetless_action = classification.intent == IntentType::Action
+        && !classification.has_grep_intent
+        && !classification.has_write_intent;
+    let (tool, how) = match (deferred.first(), consulted.first()) {
+        (Some(tool), _) => (tool, "resolved write tool"),
+        (None, Some(tool)) if targetless_action => (tool, "called"),
+        _ => return false,
+    };
+    let was = classification.intent;
+    classification.intent = IntentType::ToolCall;
+    classification.matched_tools = vec![tool.clone()];
+    classification.action_kind = None;
+    classification.reasoning = format!(
+        "collect {how} {}.{} (classifier said {})",
+        tool.server_name,
+        tool.tool_name,
+        was.value()
+    );
+    true
+}
+
+/// How much of what the collect pass's tools returned a promoted step carries.
+pub const PROMOTED_RESULTS_CHARS: usize = 2000;
+
+/// The instruction of a promoted tool step: the request; the tail of the
+/// conversation, because a follow-up ("create *the* issue") names its subject
+/// only in earlier turns; and what the collect pass's tools returned, so a
+/// lookup that already ran (a user search) informs the next call instead of
+/// being repeated.
+pub fn promoted_instruction(user_message: &str, history: &str, tool_results: &str) -> String {
+    let mut text = user_message.to_string();
+    let history = history.trim();
+    if !history.is_empty() {
+        text.push_str(&format!(
+            "\n\nEarlier in this conversation (what the request refers to):\n{}",
+            tail_chars(history, PROMOTED_HISTORY_CHARS)
+        ));
+    }
+    let tool_results = tool_results.trim();
+    if !tool_results.is_empty() {
+        text.push_str(&format!(
+            "\n\nAlready looked up for this request:\n{}",
+            tail_chars(tool_results, PROMOTED_RESULTS_CHARS)
+        ));
+    }
+    text
+}
+
+/// The last `limit` chars of `text`, marked when cut.
+fn tail_chars(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().skip(count - limit).collect();
+    format!("…{kept}")
+}
+
 /// Whether a registered connection can still be called at all.
 ///
 /// Three places build a list of connections to offer the model — the
@@ -382,8 +478,11 @@ pub struct PlanContext {
     pub skill_maps: Vec<Map<String, Value>>,
 }
 
+/// Output cap for the one-word classification answer.
+pub const CLASSIFY_MAX_TOKENS: usize = 16;
+
 /// Optional keyword arguments of [`Planner::classify`].
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ClassifyOptions {
     pub skills: Option<Vec<String>>,
     pub document_context: Option<String>,
@@ -393,6 +492,25 @@ pub struct ClassifyOptions {
     /// What the selected models declare (vision, reasoning, thinking);
     /// `Some` even when empty while a model is selected, `None` with none.
     pub available_capabilities: Option<Vec<String>>,
+    /// The model that classifies when the message is ambiguous: the best
+    /// selected reasoning model.  The planner's own (on-device router) model
+    /// is the fallback — used when this is `None`, fails, or answers with
+    /// something that does not parse.
+    pub llm: Option<Arc<dyn BaseLLM>>,
+}
+
+impl std::fmt::Debug for ClassifyOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassifyOptions")
+            .field("skills", &self.skills)
+            .field("document_context", &self.document_context)
+            .field("has_attachments", &self.has_attachments)
+            .field("history", &self.history)
+            .field("cwd", &self.cwd)
+            .field("available_capabilities", &self.available_capabilities)
+            .field("llm", &self.llm.as_ref().map(|l| l.model_label()))
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------- //
@@ -550,6 +668,7 @@ impl Planner {
             history,
             cwd,
             available_capabilities,
+            llm,
         } = options;
 
         let mut result = self.detect_signals(
@@ -586,6 +705,7 @@ impl Planner {
                     skills.as_deref(),
                     history.as_deref(),
                     result,
+                    llm.as_deref(),
                 );
                 tracing::info!(
                     target: "smartloop.agents.planner",
@@ -799,6 +919,10 @@ impl Planner {
     }
 
     /// Lightweight LLM call to classify ambiguous messages.
+    ///
+    /// `preferred` (the best selected reasoning model) answers first; the
+    /// planner's own on-device model is the fallback when it is absent,
+    /// fails, or answers with no intent word.
     fn llm_classify(
         &self,
         user_message: &str,
@@ -806,7 +930,54 @@ impl Planner {
         skills: Option<&[String]>,
         history: Option<&str>,
         mut result: ClassificationResult,
+        preferred: Option<&dyn BaseLLM>,
     ) -> ClassificationResult {
+        let mut tried: Vec<String> = Vec::new();
+        let candidates: Vec<&dyn BaseLLM> = match preferred {
+            Some(p) if !std::ptr::eq(p as *const dyn BaseLLM as *const (), Arc::as_ptr(&self.llm) as *const ()) => {
+                vec![p, self.llm.as_ref()]
+            }
+            _ => vec![self.llm.as_ref()],
+        };
+        for (i, llm) in candidates.iter().enumerate() {
+            match self.llm_classify_on(*llm, user_message, mcp_tools, skills, history, &result) {
+                Ok((intent, key)) => {
+                    result.intent = intent;
+                    result.reasoning = if i == 0 {
+                        format!("LLM classified as {key}")
+                    } else {
+                        format!("LLM classified as {key} (fallback model, after: {})", tried.join("; "))
+                    };
+                    return result;
+                }
+                Err(why) => {
+                    tracing::info!(
+                        target: "smartloop.agents.planner",
+                        "[classify] {} gave no intent ({why}){}",
+                        llm.model_label(),
+                        if i + 1 < candidates.len() { " — falling back to the on-device model" } else { "" }
+                    );
+                    tried.push(why);
+                }
+            }
+        }
+
+        // Could not parse → default to conversation
+        result.intent = IntentType::Conversation;
+        result.reasoning = format!("LLM response unparseable ({}), defaulting to conversation", tried.join("; "));
+        result
+    }
+
+    /// One model's classification: the intent and its word, or why not.
+    fn llm_classify_on(
+        &self,
+        llm: &dyn BaseLLM,
+        user_message: &str,
+        mcp_tools: &[MCPToolContext],
+        skills: Option<&[String]>,
+        history: Option<&str>,
+        result: &ClassificationResult,
+    ) -> Result<(IntentType, &'static str), String> {
         // Build compact skill/server list
         let mut skill_lines = String::new();
         if let Some(skills) = skills.filter(|s| !s.is_empty()) {
@@ -880,9 +1051,9 @@ impl Planner {
         // `try/except` that defaulted to CONVERSATION; the Rust `BaseLLM`
         // surface is infallible — `invoke` reports errors in its reply text —
         // so there is no failure to catch here.)
-        let max_tokens = self.llm.get_max_tokens();
+        let max_tokens = llm.get_max_tokens();
         let token_budget = (max_tokens as f64 * 0.8) as usize;
-        let prompt_tokens = self.llm.get_num_tokens(&prompt);
+        let prompt_tokens = llm.get_num_tokens(&prompt);
         if prompt_tokens > token_budget {
             // Drop skills and history to fit
             prompt = format!(
@@ -895,23 +1066,16 @@ impl Planner {
             );
         }
 
-        let response = self.llm.invoke(&prompt, None, None).trim().to_uppercase();
+        // A short cap: the answer is one word, and a reasoning model must
+        // not be left to think at length about a routing decision.
+        let response = llm.invoke(&prompt, Some(CLASSIFY_MAX_TOKENS), Some(false)).trim().to_uppercase();
         // Extract the intent word from the response
         for (key, intent) in INTENT_MAP {
             if response.contains(key) {
-                result.intent = *intent;
-                result.reasoning = format!("LLM classified as {key}");
-                return result;
+                return Ok((*intent, key));
             }
         }
-
-        // Could not parse → default to conversation
-        result.intent = IntentType::Conversation;
-        result.reasoning = format!(
-            "LLM response unparseable ({}), defaulting to conversation",
-            truncate_chars(&response, 50)
-        );
-        result
+        Err(truncate_chars(&response, 50).to_string())
     }
 
     // ------------------------------------------------------------------ //
@@ -1041,6 +1205,20 @@ impl Planner {
             let mut fetch_step = self.make_fetch_step(url, context);
             fetch_step.step = 1;
             return ExecutionPlan { steps: vec![fetch_step], reasoning: format!("fetch URL: {url}") };
+        }
+
+        // An MCP request whose tool no keyword named: one open TOOL step, so
+        // the RESOLVE node picks the call over every connected server.
+        if !context.mcp_tools.is_empty() {
+            return ExecutionPlan {
+                steps: vec![PlanStep {
+                    step: 1,
+                    step_type: StepType::Tool,
+                    instruction: context.user_message.clone(),
+                    ..Default::default()
+                }],
+                reasoning: "MCP tool: resolved at the step".to_string(),
+            };
         }
 
         ExecutionPlan { steps: Vec::new(), reasoning: "tool_call but no tool matched".to_string() }

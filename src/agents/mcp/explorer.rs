@@ -32,7 +32,7 @@ use crate::agents::mcp::server_selector::{
 };
 use crate::agents::orchestration::context::MCPExecutionResult;
 use crate::agents::planner::{
-    mcp_connection_is_usable, MCPToolContext, PlanStep, StepType, SYSTEM_TOOLS_SERVER_ID,
+    mcp_connection_is_usable, MCPToolContext, MatchedTool, PlanStep, StepType, SYSTEM_TOOLS_SERVER_ID,
 };
 use crate::agents::web_search_agent::{LlmResolver, WebSearchAgent};
 use crate::api::services::model_service::ModelService;
@@ -319,6 +319,20 @@ pub struct SearchContext {
     /// Result of an auto-run read-only MCP tool (a "collect" step).
     #[serde(default)]
     pub mcp_context: String,
+    /// Write tools the collect pass resolved for this request but left
+    /// uncalled (see [`Explorer::run_mcp_with_deferred`]).  The resolution
+    /// was made by the reasoning model over the server's whole catalog, so it
+    /// is the strongest evidence the request needs that tool — the planner
+    /// promotes it to a TOOL step rather than trusting a small classifier
+    /// that never saw the tool list.
+    #[serde(default)]
+    pub deferred_tools: Vec<MatchedTool>,
+    /// Read-only tools the collect pass called for this request, whose
+    /// results are in `mcp_context`.  A request the router misreads as a
+    /// local ACTION with nothing to act on is planned as a step on the server
+    /// these came from (see `planner::promote_deferred_tool`).
+    #[serde(default)]
+    pub consulted_tools: Vec<MatchedTool>,
     /// One citation per MCP tool whose result reached the context — the
     /// read-only call made during explore and every planned tool step — so
     /// the answer credits the connected app it came from, the way web pages
@@ -334,6 +348,22 @@ pub struct SearchContext {
     /// Document names the fan-out kept; `None` = no fan-out filtering applied.
     #[serde(default)]
     pub cited_documents: Option<Vec<String>>,
+}
+
+/// The tools the collect pass resolved, beyond the text it gathered.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CollectPicks {
+    /// Write tools resolved and left uncalled for a planned step.
+    pub deferred: Vec<MatchedTool>,
+    /// Read-only tools resolved and called.
+    pub consulted: Vec<MatchedTool>,
+}
+
+/// One server's pick: the tool, and whether it was left uncalled (a write).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectPick {
+    pub tool: MatchedTool,
+    pub deferred: bool,
 }
 
 /// Header that opens each server's section of the explore-time MCP context:
@@ -967,10 +997,25 @@ Does answering the latest message require a new web search?
         llm: Option<Arc<dyn BaseLLM>>,
         progress: Option<ProgressCallback>,
     ) -> String {
+        self.run_mcp_with_deferred(query, mcp_servers, project_dir, llm, progress).0
+    }
+
+    /// [`Self::run_mcp`], plus what it resolved on each server (one pick per
+    /// server at most): the write tools it left uncalled and the read tools
+    /// it called, for the planner.
+    pub fn run_mcp_with_deferred(
+        &self,
+        query: &str,
+        mcp_servers: Option<&[MCPServer]>,
+        project_dir: Option<&str>,
+        llm: Option<Arc<dyn BaseLLM>>,
+        progress: Option<ProgressCallback>,
+    ) -> (String, CollectPicks) {
         let _ = project_dir;
-        let Some(mcp_servers) = mcp_servers.filter(|s| !s.is_empty()) else { return String::new() };
+        let mut picks = CollectPicks::default();
+        let Some(mcp_servers) = mcp_servers.filter(|s| !s.is_empty()) else { return (String::new(), picks) };
         if self.tool_caller.is_none() {
-            return String::new();
+            return (String::new(), picks);
         }
 
         let mut servers: Vec<&MCPServer> = mcp_servers
@@ -983,7 +1028,7 @@ Does answering the latest message require a new web search?
             })
             .collect();
         if servers.is_empty() {
-            return String::new();
+            return (String::new(), picks);
         }
         if servers.len() > Self::MAX_SERVERS_PER_QUESTION {
             tracing::info!(
@@ -997,12 +1042,21 @@ Does answering the latest message require a new web search?
 
         let mut gathered = Vec::new();
         for server in servers {
-            let text = self.run_mcp_server(query, server, llm.clone(), progress.clone());
+            let (text, server_picks) = self.run_mcp_server_with_deferred(query, server, llm.clone(), progress.clone());
+            for pick in server_picks {
+                if pick.deferred {
+                    picks.deferred.push(pick.tool);
+                } else {
+                    // A read that came back empty-handed still says which
+                    // server the request is about.
+                    picks.consulted.push(pick.tool);
+                }
+            }
             if !text.is_empty() {
                 gathered.push(text);
             }
         }
-        gathered.join("\n\n")
+        (gathered.join("\n\n"), picks)
     }
 
     /// One server's answer to `query`, or `""`.
@@ -1013,15 +1067,28 @@ Does answering the latest message require a new web search?
         llm: Option<Arc<dyn BaseLLM>>,
         progress: Option<ProgressCallback>,
     ) -> String {
+        self.run_mcp_server_with_deferred(query, server, llm, progress).0
+    }
+
+    /// [`Self::run_mcp_server`], plus the tools resolution picked: the one it
+    /// called or left for a step, and a write the model planned after it.
+    pub fn run_mcp_server_with_deferred(
+        &self,
+        query: &str,
+        server: &MCPServer,
+        llm: Option<Arc<dyn BaseLLM>>,
+        progress: Option<ProgressCallback>,
+    ) -> (String, Vec<CollectPick>) {
         // The server's credentials may be refreshed by a call; the follow-up
         // fetches below must see the renewed token, as they did when Python
         // mutated the one server object in place.
         let mut working = server.clone();
+        let mut picks: Vec<CollectPick> = Vec::new();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            self.run_mcp_server_inner(query, &mut working, llm, progress.as_ref())
+            self.run_mcp_server_inner(query, &mut working, llm, progress.as_ref(), &mut picks)
         }));
         match outcome {
-            Ok(text) => text,
+            Ok(text) => (text, picks),
             Err(panic) => {
                 tracing::warn!(
                     target: LOGGER,
@@ -1029,7 +1096,7 @@ Does answering the latest message require a new web search?
                     server.name,
                     panic_message(panic.as_ref())
                 );
-                String::new()
+                (String::new(), Vec::new())
             }
         }
     }
@@ -1040,6 +1107,7 @@ Does answering the latest message require a new web search?
         server: &mut MCPServer,
         llm: Option<Arc<dyn BaseLLM>>,
         progress: Option<&ProgressCallback>,
+        picks: &mut Vec<CollectPick>,
     ) -> String {
         let server_name = if server.name.is_empty() { "the server".to_string() } else { server.name.clone() };
 
@@ -1075,6 +1143,14 @@ Does answering the latest message require a new web search?
                     "[collect] MCP tool '{}' is not read-only — leaving to a planned execute step",
                     tool_name
                 );
+                picks.push(CollectPick {
+                    tool: MatchedTool {
+                        server_id: server.id.clone(),
+                        server_name: server_name.clone(),
+                        tool_name: tool_name.clone(),
+                    },
+                    deferred: true,
+                });
                 return String::new();
             }
 
@@ -1087,6 +1163,36 @@ Does answering the latest message require a new web search?
                 "tool",
                 &format!("Calling {}", format_call(&server_name, &tool_name, &picked.arguments)),
             );
+            picks.retain(|p| p.deferred);
+            picks.push(CollectPick {
+                tool: MatchedTool {
+                    server_id: server.id.clone(),
+                    server_name: server_name.clone(),
+                    tool_name: tool_name.clone(),
+                },
+                deferred: false,
+            });
+            // A write the model planned after this read ("find the user, then
+            // file the issue") is the step the request is really for: set it
+            // aside for the planner, as a write resolved first would be.
+            if let Some(write) = picked.also.iter().find(|c| !Self::is_read_only_tool(&c.tool_name)) {
+                if !picks.iter().any(|p| p.deferred && p.tool.tool_name == write.tool_name) {
+                    tracing::info!(
+                        target: LOGGER,
+                        "[collect] model planned {} after {} — leaving it to a planned execute step",
+                        write.tool_name,
+                        tool_name
+                    );
+                    picks.push(CollectPick {
+                        tool: MatchedTool {
+                            server_id: server.id.clone(),
+                            server_name: server_name.clone(),
+                            tool_name: write.tool_name.clone(),
+                        },
+                        deferred: true,
+                    });
+                }
+            }
             raw = self.call_mcp_tool_on(server, &tool_name, &picked.arguments, query);
             if raw.is_empty() {
                 return String::new();
@@ -1481,7 +1587,7 @@ Does answering the latest message require a new web search?
                 let project_dir = project_dir.map(str::to_string);
                 let (llm, progress) = (mcp_llm.clone(), progress.clone());
                 Some(pool.submit(move || {
-                    this.run_mcp(&query, Some(&servers), project_dir.as_deref(), llm, progress)
+                    this.run_mcp_with_deferred(&query, Some(&servers), project_dir.as_deref(), llm, progress)
                 }))
             }
             _ => None,
@@ -1501,7 +1607,10 @@ Does answering the latest message require a new web search?
         }
 
         if let Some(f_mcp) = f_mcp {
-            ctx.mcp_context = join(f_mcp);
+            let (text, picks) = join(f_mcp);
+            ctx.mcp_context = text;
+            ctx.deferred_tools = picks.deferred;
+            ctx.consulted_tools = picks.consulted;
             for citation in mcp_context_citations(&ctx.mcp_context) {
                 ctx.add_tool_citation(citation);
             }

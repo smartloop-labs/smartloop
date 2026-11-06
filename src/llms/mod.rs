@@ -7,5 +7,6 @@ pub mod llama;
 pub mod llama_cpp;
 pub mod llm_factory;
 pub mod thinking;
+pub mod tool_calls;
 
 pub use base_llm::BaseLLM;

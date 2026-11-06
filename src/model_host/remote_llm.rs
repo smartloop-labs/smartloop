@@ -46,6 +46,7 @@ pub struct RemoteLLM {
     local_only: bool,
     cancelled: Mutex<Option<CancelEvent>>,
     supports_thinking: Mutex<Option<bool>>,
+    supports_native_tools: Mutex<Option<bool>>,
 }
 
 impl RemoteLLM {
@@ -64,6 +65,7 @@ impl RemoteLLM {
             local_only: local_only(),
             cancelled: Mutex::new(None),
             supports_thinking: Mutex::new(None),
+            supports_native_tools: Mutex::new(None),
         }
     }
 
@@ -244,6 +246,24 @@ impl BaseLLM for RemoteLLM {
         let value = self
             .client
             .supports_thinking(self.capability.as_deref())
+            .unwrap_or(false);
+        *cached = Some(value);
+        value
+    }
+
+    /// Asked of the host, cached per handle like [`Self::supports_thinking`];
+    /// `false` on failure, which keeps prompt-based MCP resolution.  The
+    /// tools block itself rides inside the prompt, so `call` needs nothing
+    /// more to carry it.
+    fn supports_native_tools(&self) -> bool {
+        let mut cached = self.supports_native_tools.lock();
+        if let Some(value) = *cached {
+            return value;
+        }
+        let _scope = local_only_scope(self.local_only);
+        let value = self
+            .client
+            .supports_native_tools(self.capability.as_deref())
             .unwrap_or(false);
         *cached = Some(value);
         value
