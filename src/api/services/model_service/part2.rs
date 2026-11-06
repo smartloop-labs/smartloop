@@ -2987,9 +2987,16 @@ impl ModelService {
 
     /// Every non-system server in a project, each with its provisioning
     /// state, so watching a fresh connection costs one request per poll.
+    /// A server smartloop installs itself, kept out of the user's server
+    /// lists.  The Skills server is not `system` — that flag would also hide
+    /// it from the agent, which must be able to call save-skill.
+    pub fn is_builtin_server(server: &MCPServer) -> bool {
+        server.system || server.id == crate::api::mcp::skill_server::SKILLS_SERVER_ID
+    }
+
     pub fn list_mcp_servers_with_status(&self, project_id: &str) -> anyhow::Result<Vec<Value>> {
         let project = self.project_by_id(project_id)?;
-        Ok(project.mcp_servers.iter().filter(|s| !s.system).map(Self::mcp_server_with_status).collect())
+        Ok(project.mcp_servers.iter().filter(|s| !Self::is_builtin_server(s)).map(Self::mcp_server_with_status).collect())
     }
 
     /// One server, with the provisioning state a client polls it for.
@@ -3007,7 +3014,7 @@ impl ModelService {
     /// recorded them.
     pub fn count_mcp_tools(&self, project_id: Option<&str>) -> anyhow::Result<Value> {
         let project = self.resolve_project(project_id, "No current project found", false)?;
-        let servers: Vec<&MCPServer> = project.mcp_servers.iter().filter(|s| !s.system).collect();
+        let servers: Vec<&MCPServer> = project.mcp_servers.iter().filter(|s| !Self::is_builtin_server(s)).collect();
         let mut by_server = Map::new();
         for s in &servers {
             by_server.insert(s.name.clone(), json!(s.tools.len()));
@@ -3229,7 +3236,7 @@ impl ModelService {
         let Some(project) = self.current_project_snapshot() else {
             return Ok(Vec::new());
         };
-        Ok(project.mcp_servers.iter().filter(|s| !s.system).map(Self::mcp_server_to_dict).collect())
+        Ok(project.mcp_servers.iter().filter(|s| !Self::is_builtin_server(s)).map(Self::mcp_server_to_dict).collect())
     }
 
     /// Remove an MCP server (and its definition file) from a project (by ID

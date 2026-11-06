@@ -886,7 +886,7 @@ impl StepExecutor {
         // dependency analysis further down: a chained call ("comment on the
         // design you just listed") takes its arguments from here, so the two
         // must read the same text.
-        let prior_text = match previous_results {
+        let mut prior_text = match previous_results {
             Some(prev) if !prev.is_empty() => prior_results_text(prev),
             _ => String::new(),
         };
@@ -900,6 +900,16 @@ impl StepExecutor {
                 .tool_caller
                 .find_server(mcp_servers, &step_server_id, &step_server_name)
                 .cloned();
+        }
+
+        // A call on the Skills server rewrites a skill from what it says now.
+        if let Some(srv) = server.as_ref() {
+            if let Some(skills) = crate::api::mcp::skill_server::skills_context(std::slice::from_ref(srv)) {
+                if !prior_text.is_empty() {
+                    prior_text.push_str("\n\n");
+                }
+                prior_text.push_str(&skills);
+            }
         }
 
         // Arguments the resolution below filled while picking the tool. Used
@@ -929,7 +939,22 @@ impl StepExecutor {
                 // call — the pick is the harder judgement of the two, so
                 // leaving it on the default while upgrading extraction only
                 // got the arguments right for the wrong tool.
-                let picked = self.resolve(&directive, mcp_servers, Some(&prior_text), llm.clone());
+                // A step that names its server (promoted, or opened from a
+                // skill) picks among that server's tools only — over every
+                // connected server a small model chose an unrelated tool.
+                // Nothing usable there falls back to every server.
+                let scoped: Vec<MCPServer> = match server.as_ref() {
+                    Some(srv) if !has_explicit_tool => vec![srv.clone()],
+                    _ => Vec::new(),
+                };
+                let mut picked = if scoped.is_empty() {
+                    None
+                } else {
+                    self.resolve(&directive, &scoped, Some(&prior_text), llm.clone())
+                };
+                if picked.is_none() {
+                    picked = self.resolve(&directive, mcp_servers, Some(&prior_text), llm.clone());
+                }
                 if let Some(picked) = picked {
                     server = self
                         .tool_caller

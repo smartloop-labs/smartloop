@@ -2,6 +2,7 @@
 //!
 //! In-process MCP servers exposed to the orchestrator.
 
+pub mod skill_server;
 pub mod system_server;
 
 use crate::api::config::API_SETTINGS;

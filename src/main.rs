@@ -289,6 +289,7 @@ fn run_module(module: &str, args: Vec<String>) -> anyhow::Result<()> {
     match module {
         "smartloop.api.project_agent" => project_agent::main(ProjectAgentArgs::parse_from(argv)),
         "smartloop.api.mcp.system_server" => runtime()?.block_on(smartloop::api::mcp::system_server::run_stdio()),
+        "smartloop.api.mcp.skill_server" => runtime()?.block_on(smartloop::api::mcp::skill_server::run_stdio()),
         "smartloop.model_host" | "smartloop.model_host.__main__" => entry::run(ModelHostArgs::parse_from(argv)),
         "smartloop.model_host.bench" => bench::run(BenchArgs::parse_from(argv)),
         "smartloop.api.main" => {
@@ -305,6 +306,7 @@ fn hidden_subcommand_module(name: &str) -> Option<&'static str> {
     match name {
         "__project-agent" => Some("smartloop.api.project_agent"),
         "__system-server" => Some("smartloop.api.mcp.system_server"),
+        "__skill-server" => Some("smartloop.api.mcp.skill_server"),
         "__model-host" => Some("smartloop.model_host"),
         "__model-host-bench" => Some("smartloop.model_host.bench"),
         "__api-server" => Some("smartloop.api.main"),

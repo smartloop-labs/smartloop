@@ -28,6 +28,37 @@ use crate::db::store::{apply_coverage_boost, discriminative_terms, terms_coverag
 /// Logger name of the Python module.
 const LOG_TARGET: &str = "smartloop.db.sqlite_store";
 
+/// Chunks per embedding call when indexing; small enough that a query or a
+/// citation check waiting for the model gets it within a few seconds.
+pub const INDEX_ENCODE_BATCH: usize = 16;
+
+/// [`encode_texts`] over `texts` in [`INDEX_ENCODE_BATCH`]-sized calls, rows
+/// in order; `None` if any batch fails (as one call would have).
+pub fn encode_in_batches(texts: &[String], base_dir: Option<&str>) -> Option<Array2<f32>> {
+    batched(texts, INDEX_ENCODE_BATCH, |batch| encode_texts(batch, base_dir, None))
+}
+
+/// `encode` over `texts` in `size`-sized calls, rows concatenated in order.
+fn batched(
+    texts: &[String],
+    size: usize,
+    mut encode: impl FnMut(&[String]) -> Option<Array2<f32>>,
+) -> Option<Array2<f32>> {
+    if texts.len() <= size {
+        return encode(texts);
+    }
+    let mut parts: Vec<Array2<f32>> = Vec::new();
+    for batch in texts.chunks(size) {
+        let part = encode(batch)?;
+        if part.nrows() != batch.len() {
+            return None;
+        }
+        parts.push(part);
+    }
+    let views: Vec<_> = parts.iter().map(|p| p.view()).collect();
+    ndarray::concatenate(ndarray::Axis(0), &views).ok()
+}
+
 /// The unified table name.
 pub const TABLE: &str = "indexes";
 
@@ -999,8 +1030,11 @@ impl VectorStore for IndexStore {
             });
         }
 
-        // Batch-encode all chunk texts into dense embeddings
-        let embeddings = encode_texts(&texts, self.base_dir.as_deref(), None);
+        // Encode the chunk texts in small batches: the embedding model serves
+        // one call at a time, and a whole large file in one call (a 191-chunk
+        // source file took 36s) held every interactive encode behind it — the
+        // answer's "Checking sources" step sat until indexing finished.
+        let embeddings = encode_in_batches(&texts, self.base_dir.as_deref());
 
         let mut conn = get_conn(&self.db_path)?;
         let tx = conn.transaction()?;
@@ -1299,5 +1333,43 @@ mod tests {
         // A second query needs only the query encoded.
         store.query_with_metadata("invoice", None, 0.8, None).unwrap();
         assert_eq!(encoded.lock().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod batched_encode_tests {
+    use super::*;
+
+    fn texts(n: usize) -> Vec<String> {
+        (0..n).map(|i| i.to_string()).collect()
+    }
+
+    fn row_per_text(batch: &[String]) -> Option<Array2<f32>> {
+        Some(Array2::from_shape_fn((batch.len(), 2), |(r, c)| {
+            if c == 0 { batch[r].parse::<f32>().unwrap() } else { 1.0 }
+        }))
+    }
+
+    #[test]
+    fn splits_into_calls_and_keeps_row_order() {
+        let mut sizes = Vec::new();
+        let out = batched(&texts(37), 16, |b| {
+            sizes.push(b.len());
+            row_per_text(b)
+        })
+        .unwrap();
+        assert_eq!(sizes, vec![16, 16, 5]);
+        assert_eq!(out.nrows(), 37);
+        assert!((0..37).all(|i| out[[i, 0]] == i as f32));
+    }
+
+    #[test]
+    fn a_failed_batch_fails_the_whole_encode() {
+        let mut call = 0;
+        let out = batched(&texts(40), 16, |b| {
+            call += 1;
+            if call == 2 { None } else { row_per_text(b) }
+        });
+        assert!(out.is_none());
     }
 }

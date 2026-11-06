@@ -685,7 +685,9 @@ pub const CITATION_CUTOFF_MARGIN: f64 = 0.30;
 /// RPC budget for the verification-time encode calls against the model host
 /// (seconds).  Verification is a nicety layered on top of an already-streamed
 /// answer, so it must never hold the pause hostage.
-pub const VERIFY_ENCODE_TIMEOUT_S: f64 = 30.0;
+/// Short: past it, sources are scored lexically rather than leaving the
+/// user watching "Checking sources" behind a background indexing run.
+pub const VERIFY_ENCODE_TIMEOUT_S: f64 = 8.0;
 
 /// Chunk size used to stream a mutation's synthesized content.
 pub const STREAM_CHUNK_SIZE: usize = 12;
