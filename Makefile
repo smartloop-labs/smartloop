@@ -73,8 +73,13 @@ GGML_X86_PORTABLE := GGML_NATIVE=OFF GGML_AVX2=ON
 # pins GGML_CPU_ARM_ARCH=armv8-a for non-native aarch64 Linux builds, which
 # wins over the env value; either way the result is portable.)
 GGML_ARM_PORTABLE := GGML_NATIVE=OFF GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+# On macOS, llama.cpp's vendored cpp-httplib looks for OpenSSL, which only the
+# server and tools use (both off here).  The macos-15 runner finds a partial
+# Homebrew OpenSSL and the CMake generate step fails ("links to OpenSSL::SSL
+# but the target was not found"); a user's machine has no Homebrew prefix to
+# link against anyway.  Tell CMake not to look.
 ifeq ($(PLATFORM),darwin)
-    GGML_ENV :=
+    GGML_ENV := CMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE
 else ifeq ($(RAW_ARCH),aarch64)
     GGML_ENV := $(GGML_ARM_PORTABLE)
 else
