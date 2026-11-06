@@ -706,7 +706,10 @@ impl PipelineBuilder {
                     promoted_instruction(&c.user_message, &enrich_ctx.history_insight, &sc.mcp_context);
             }
         }
-        if !plan.steps.is_empty() {
+        // A promoted step is the collect pick, made only when the message
+        // carries no URL of its own; its instruction quotes the conversation,
+        // so a link from an earlier turn must not turn it into a fetch.
+        if !plan.steps.is_empty() && !promoted {
             let available: Vec<Map<String, Value>> = c
                 .available_servers
                 .iter()
@@ -723,6 +726,9 @@ impl PipelineBuilder {
         // guides the LLM directly. Tool execution is driven by the planner /
         // intent-matched MCP tools, not by parsing skill code blocks.
         let has_skill = c.skill_context.as_deref().is_some_and(|s| !s.is_empty());
+        if has_skill {
+            self.open_skill_tool_steps(&mut plan.steps, c.skill_context.as_deref().unwrap_or(""));
+        }
 
         let detected_capability: Option<String> =
             classification.capability.clone().filter(|c| !c.is_empty());
@@ -734,7 +740,10 @@ impl PipelineBuilder {
             {
                 continue;
             }
-            if has_skill && step.step_type == StepType::Tool {
+            // A promoted step's call was already worked out on the reasoning
+            // model in collect; resolving it again on the small tier picked a
+            // different (wrong) tool.
+            if (has_skill || promoted) && step.step_type == StepType::Tool {
                 step.model_tier = ModelTier::Large;
                 step.capability = Some(
                     detected_capability
@@ -750,6 +759,73 @@ impl PipelineBuilder {
         }
 
         plan.steps
+    }
+
+    /// Leave the call of a skill-planned MCP step to the model.
+    ///
+    /// With a skill in the planner prompt, the planner names a tool for every
+    /// step (it is told to use the skill's server and exact tool names).  A
+    /// named tool skips both the native tool loop and native resolution, so a
+    /// matched skill silently downgraded every call to prompt-based argument
+    /// extraction.  The skill is guidance, not a different execution path:
+    /// the step keeps its server and the planner's pick as a hint in its
+    /// instruction, and the call is worked out at the step — natively where
+    /// the model can.
+    ///
+    /// A step stays pinned when the skill author fixed its values
+    /// (`default_args`, an ```mcp block's `inferred_args`), when it fans out
+    /// (`for_each`), when it targets the built-in system tools, or when it is
+    /// conditional — the condition is gated by the resolve node, which the
+    /// tool loop does not have.  A later step's condition is extracted from
+    /// the skill text here, with the tool name still in hand; the resolve node
+    /// reads it back from `step.condition` instead of extracting it again.
+    pub fn open_skill_tool_steps(&self, steps: &mut [PlanStep], skill_context: &str) {
+        for (i, step) in steps.iter_mut().enumerate() {
+            if step.step_type != StepType::Tool {
+                continue;
+            }
+            let Some(tool_name) = step.tool_name.clone().filter(|t| !t.is_empty()) else {
+                continue;
+            };
+            let pinned_by_author = step.default_args.as_ref().is_some_and(|a| !a.is_empty())
+                || step.inferred_args.is_some()
+                || step.for_each == Some(true);
+            let builtin = matches!(
+                step.server_id.as_deref(),
+                Some(SYSTEM_TOOLS_SERVER_ID) | Some(FETCH_SERVER_ID)
+            );
+            if pinned_by_author || builtin {
+                continue;
+            }
+            if step.condition.as_deref().is_some_and(|s| !s.is_empty()) {
+                continue;
+            }
+            if i > 0 && !skill_context.is_empty() {
+                if let Some(condition) = self.skills.extract_tool_condition(skill_context, &tool_name) {
+                    step.condition = Some(condition);
+                    continue;
+                }
+            }
+            let server = step
+                .server_name
+                .as_deref()
+                .or(step.server_id.as_deref())
+                .filter(|s| !s.is_empty());
+            step.instruction = match server {
+                Some(server) => format!(
+                    "{}\n\n(The skill suggests the `{tool_name}` tool on {server}.)",
+                    step.instruction
+                ),
+                None => format!("{}\n\n(The skill suggests the `{tool_name}` tool.)", step.instruction),
+            };
+            step.tool_name = None;
+            tracing::info!(
+                target: LOG_TARGET,
+                "[skills] step {} left open for the model (planner suggested '{}')",
+                step.step,
+                tool_name
+            );
+        }
     }
 
     /// Build DAG nodes from plan steps.
@@ -1186,18 +1262,10 @@ Assess whether these search results are relevant to the user's request. If relev
             } else {
                 skill_context.to_string()
             };
-            // Python rebuilt the step from these fields only, so everything
-            // else takes the PlanStep defaults.
-            exec_step = PlanStep {
-                step: step.step,
-                step_type: step.step_type,
-                tool_name: step.tool_name.clone(),
-                server_id: step.server_id.clone(),
-                server_name: step.server_name.clone(),
-                instruction: enriched_instruction,
-                condition: step.condition.clone(),
-                ..Default::default()
-            };
+            // Only the instruction changes: rebuilding the step from a few
+            // fields (as Python did) dropped `default_args` — the bash command
+            // or file path the classifier extracted — whenever a skill matched.
+            exec_step = PlanStep { instruction: enriched_instruction, ..step.clone() };
         }
 
         let exec_llm = self.models.llm_for_tier(step.model_tier, step.capability.as_deref(), None);
@@ -1289,12 +1357,14 @@ Assess whether these search results are relevant to the user's request. If relev
             } else {
                 None
             };
+            // An open step has no tool to look up in the skill text; its
+            // condition, if any, was extracted when the step was opened.
+            let pinned_tool = step.tool_name.as_deref().filter(|t| !t.is_empty());
             if has_upstream && condition.is_none() {
-                if let Some(skill_context) = c.skill_context.as_deref().filter(|s| !s.is_empty()) {
-                    condition = this.skills.extract_tool_condition(
-                        skill_context,
-                        step.tool_name.as_deref().unwrap_or(""),
-                    );
+                if let (Some(skill_context), Some(tool)) =
+                    (c.skill_context.as_deref().filter(|s| !s.is_empty()), pinned_tool)
+                {
+                    condition = this.skills.extract_tool_condition(skill_context, tool);
                 }
             }
             if let Some(condition) = condition.as_deref().filter(|s| !s.is_empty()) {
@@ -1432,6 +1502,11 @@ Assess whether these search results are relevant to the user's request. If relev
             let emit = |message: &str| this.models.emit("tool", "processing", message);
 
             let mut instruction = step.instruction.clone();
+            // A matched skill guides the loop the way it guides a resolved
+            // call (see `make_step_handler`).
+            if let Some(skill_context) = c.skill_context.as_deref().filter(|s| !s.is_empty()) {
+                instruction.push_str(&format!("\n\n{skill_context}"));
+            }
             if !prev_results.is_empty() {
                 let prior: Vec<String> = prev_results
                     .iter()
@@ -1443,9 +1518,14 @@ Assess whether these search results are relevant to the user's request. If relev
                 }
             }
 
+            let servers = step_servers(&step, &c.mcp_servers);
+            // A call on the Skills server rewrites a skill from what it says now.
+            if let Some(skills) = crate::api::mcp::skill_server::skills_context(&servers) {
+                instruction.push_str(&format!("\n\n{skills}"));
+            }
             emit("Working with your connected tools");
             if let Some(outcome) =
-                this.steps.run_tool_loop(&*llm, &instruction, &c.mcp_servers, non_empty(&c.effective_cwd), &emit)
+                this.steps.run_tool_loop(&*llm, &instruction, &servers, non_empty(&c.effective_cwd), &emit)
             {
                 let mut cited = step.clone();
                 if let Some(last) = outcome.last_ok() {
@@ -1738,4 +1818,17 @@ Assess whether these search results are relevant to the user's request. If relev
             Ok(NodeResult::with_data(REASON_NODE.as_str(), data).with_payload(snapshot))
         })
     }
+}
+
+/// The servers a TOOL step may call: only its own when it names one that is
+/// connected (a promoted or skill step keeps its server but not the tool),
+/// else every connected server.
+pub fn step_servers(step: &PlanStep, servers: &[crate::workspace::MCPServer]) -> Vec<crate::workspace::MCPServer> {
+    if let Some(id) = step.server_id.as_deref().filter(|s| !s.is_empty()) {
+        let own: Vec<crate::workspace::MCPServer> = servers.iter().filter(|s| s.id == id).cloned().collect();
+        if !own.is_empty() {
+            return own;
+        }
+    }
+    servers.to_vec()
 }

@@ -3096,6 +3096,59 @@ impl ModelService {
         Ok(())
     }
 
+    /// Register (or refresh) the Skills MCP server on a project.
+    ///
+    /// Unlike System Tools it is not a `system` server: the model calls
+    /// `save-skill` the way it calls any connected tool ("save this as a
+    /// skill"), which needs it in the MCP agent's catalog.  Its config carries
+    /// the project's skills directory; a refresh keeps the user's `enabled`.
+    pub fn install_skills_server(&self, project_id: &str) -> anyhow::Result<()> {
+        use crate::api::mcp::skill_server::{tool_specs, SKILLS_DIR_ENV, SKILLS_SERVER_ID, SKILLS_SERVER_NAME};
+        let project = self.get_project(project_id)?;
+        let tools: Vec<MCPToolDefinition> = tool_specs()
+            .into_iter()
+            .map(|(name, description, schema)| MCPToolDefinition {
+                name: name.to_string(),
+                description: Some(description.to_string()),
+                input_schema: schema.as_object().cloned(),
+            })
+            .collect();
+        let config = MCPServerConfig {
+            command: sys_executable(),
+            args: vec!["-m".to_string(), "smartloop.api.mcp.skill_server".to_string()],
+            env: HashMap::from([(SKILLS_DIR_ENV.to_string(), Self::skills_dir(&project))]),
+            ..Default::default()
+        };
+        let changed = self.update_project_record(project_id, |project| {
+            if let Some(existing) = project.mcp_servers.iter_mut().find(|s| s.id == SKILLS_SERVER_ID) {
+                if existing.tools == tools && existing.config.as_ref() == Some(&config) {
+                    return false;
+                }
+                existing.name = SKILLS_SERVER_NAME.to_string();
+                existing.tools = tools;
+                existing.config = Some(config);
+                return true;
+            }
+            project.mcp_servers.push(MCPServer {
+                id: SKILLS_SERVER_ID.to_string(),
+                name: SKILLS_SERVER_NAME.to_string(),
+                description: Some("Save, update and delete reusable skills from the conversation".to_string()),
+                server_type: MCPServerType::Local,
+                config: Some(config),
+                enabled: true,
+                system: false,
+                tools,
+                ..Default::default()
+            });
+            true
+        })?;
+        if changed {
+            self.persist_model()?;
+            tracing::info!(target: LOG_TARGET, "Registered Skills server on project {project_id}");
+        }
+        Ok(())
+    }
+
     /// Remove the legacy fetch MCP server — fetching is now the FetchAgent.
     ///
     /// URL fetching moved from an MCP server (`__fetch__`) to an in-process
@@ -3209,6 +3262,7 @@ impl ModelService {
     pub fn setup_project_tools(&self, project_id: &str) -> anyhow::Result<()> {
         self.migrate_servers_to_local(project_id)?;
         self.install_system_tools_server(project_id)?;
+        self.install_skills_server(project_id)?;
         self.remove_fetch_server(project_id)?;
         // Re-fetch: install_* may have replaced the model via ensure_model(),
         // so an earlier project snapshot can be stale.
@@ -3267,9 +3321,18 @@ impl ModelService {
         name: Option<&str>,
         description: Option<&str>,
     ) -> anyhow::Result<Value> {
-        static NON_SLUG: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^a-z0-9]+").expect("valid regex"));
-
         let project = self.get_project(project_id)?;
+        let mut skill = Self::build_skill(content, name, description);
+        Self::write_skill_md(&project, &skill)?;
+        skill.content = Self::render_skill_content(&skill);
+        Ok(serde_json::to_value(&skill)?)
+    }
+
+    /// A skill from authored text: the name and description come from the
+    /// arguments, else the text's frontmatter, else (name) its first heading;
+    /// the name is slugged.  Shared by `add_skill` and the Skills MCP server.
+    pub fn build_skill(content: &str, name: Option<&str>, description: Option<&str>) -> Skill {
+        static NON_SLUG: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^a-z0-9]+").expect("valid regex"));
 
         let (body, meta) = Self::parse_skill_content(content);
         let meta_str = |key: &str| meta.get(key).and_then(Value::as_str).map(str::to_string);
@@ -3293,17 +3356,13 @@ impl ModelService {
             slug
         };
 
-        let mut skill = Skill {
+        Skill {
             id: sanitized_name.clone(),
             name: sanitized_name,
             description: final_description,
             content: body,
             system: false,
-        };
-
-        Self::write_skill_md(&project, &skill)?;
-        skill.content = Self::render_skill_content(&skill);
-        Ok(serde_json::to_value(&skill)?)
+        }
     }
 
     /// Split raw SKILL.md text into `(body, frontmatter_fields)`.
@@ -3435,7 +3494,12 @@ impl ModelService {
 
     /// Write a SKILL.md file with YAML frontmatter for the given skill.
     pub fn write_skill_md(project: &Project, skill: &Skill) -> std::io::Result<()> {
-        let skill_dir = Path::new(&Self::skills_dir(project)).join(&skill.name);
+        Self::write_skill_md_in(Path::new(&Self::skills_dir(project)), skill)
+    }
+
+    /// Write `<skills_dir>/<name>/SKILL.md` for the given skill.
+    pub fn write_skill_md_in(skills_dir: &Path, skill: &Skill) -> std::io::Result<()> {
+        let skill_dir = skills_dir.join(&skill.name);
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(skill_dir.join("SKILL.md"), Self::render_skill_content(skill))
     }

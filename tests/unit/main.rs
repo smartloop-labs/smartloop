@@ -167,6 +167,7 @@ mod test_thinking_is_for_the_tool_call;
 mod test_token_refresh;
 mod test_token_refresh_is_workspace_work;
 mod test_tool_call_progress;
+mod test_skill_native_tools;
 mod test_tool_fanout;
 mod test_vector_search_grouped;
 mod test_vision_evicted_for_capability;

@@ -886,7 +886,7 @@ impl StepExecutor {
         // dependency analysis further down: a chained call ("comment on the
         // design you just listed") takes its arguments from here, so the two
         // must read the same text.
-        let prior_text = match previous_results {
+        let mut prior_text = match previous_results {
             Some(prev) if !prev.is_empty() => prior_results_text(prev),
             _ => String::new(),
         };
@@ -900,6 +900,16 @@ impl StepExecutor {
                 .tool_caller
                 .find_server(mcp_servers, &step_server_id, &step_server_name)
                 .cloned();
+        }
+
+        // A call on the Skills server rewrites a skill from what it says now.
+        if let Some(srv) = server.as_ref() {
+            if let Some(skills) = crate::api::mcp::skill_server::skills_context(std::slice::from_ref(srv)) {
+                if !prior_text.is_empty() {
+                    prior_text.push_str("\n\n");
+                }
+                prior_text.push_str(&skills);
+            }
         }
 
         // Arguments the resolution below filled while picking the tool. Used
@@ -929,7 +939,22 @@ impl StepExecutor {
                 // call — the pick is the harder judgement of the two, so
                 // leaving it on the default while upgrading extraction only
                 // got the arguments right for the wrong tool.
-                let picked = self.resolve(&directive, mcp_servers, Some(&prior_text), llm.clone());
+                // A step that names its server (promoted, or opened from a
+                // skill) picks among that server's tools only — over every
+                // connected server a small model chose an unrelated tool.
+                // Nothing usable there falls back to every server.
+                let scoped: Vec<MCPServer> = match server.as_ref() {
+                    Some(srv) if !has_explicit_tool => vec![srv.clone()],
+                    _ => Vec::new(),
+                };
+                let mut picked = if scoped.is_empty() {
+                    None
+                } else {
+                    self.resolve(&directive, &scoped, Some(&prior_text), llm.clone())
+                };
+                if picked.is_none() {
+                    picked = self.resolve(&directive, mcp_servers, Some(&prior_text), llm.clone());
+                }
                 if let Some(picked) = picked {
                     server = self
                         .tool_caller
@@ -1384,9 +1409,15 @@ impl StepExecutor {
         cwd: Option<&str>,
         emit: &dyn Fn(&str),
     ) -> Option<crate::agents::mcp::tool_loop::LoopOutcome> {
-        let call = |server: &MCPServer, tool: &str, arguments: &Map<String, Value>| {
-            self.call_tool(server, tool, arguments, cwd)
-                .map(|(formatted, raw)| if raw.trim().is_empty() { formatted } else { raw })
+        let call = |server: &MCPServer, tool: &str, arguments: &Map<String, Value>| -> Result<String, String> {
+            info!(target: LOGGER, "[execute] Calling '{}' with arguments: {}", tool, py_dict(arguments));
+            let mut server = server.clone();
+            let (result, _refreshed) =
+                self.tool_caller.call_with_refresh(&mut server, tool, Some(arguments), cwd);
+            match self.finish_call(&result, tool, "execute") {
+                Some((formatted, raw)) => Ok(if raw.trim().is_empty() { formatted } else { raw }),
+                None => Err(call_error_text(&result)),
+            }
         };
         crate::agents::mcp::tool_loop::run_tool_loop(&self.mcp_agent, llm, instruction, mcp_servers, &call, emit)
     }
@@ -1570,6 +1601,27 @@ impl StepExecutor {
         info!(target: LOGGER, "[{}] '{}' raw result: {}", tag, tool_name, head(&raw_content, 1000));
         Some((formatted_content, raw_content))
     }
+}
+
+/// Why a tool call failed, in the tool's own words where it gave any — what
+/// the tool loop shows the model so its next call can fix the arguments.
+fn call_error_text(result: &MCPToolCallResult) -> String {
+    let said = result
+        .content
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|block| match block {
+            Value::Object(o) => o.get("text").map(value_str).unwrap_or_default(),
+            other => value_str(other),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let said = said.trim();
+    if !said.is_empty() {
+        return head(said, 1000).to_string();
+    }
+    result.error.as_deref().map(str::trim).filter(|e| !e.is_empty()).unwrap_or("the tool returned nothing").to_string()
 }
 
 // ---------------------------------------------------------------------- //
