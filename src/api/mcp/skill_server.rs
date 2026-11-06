@@ -289,6 +289,26 @@ fn find_skill(skills_dir: &Path, name: &str, loose: bool) -> anyhow::Result<Stri
     anyhow::bail!("no skill named '{slug}' in this project — skills: {}", skill_names(skills_dir))
 }
 
+/// The skill an update without a `name` is about: the one whose name its new
+/// content's title matches ("# Good Morning Workout" → `good-morning-workout`),
+/// else the project's only skill.  Models often drop `name` when they rewrite
+/// a skill they were shown; refusing sent them round the same failing call.
+fn implied_skill(skills_dir: &Path, content: Option<&str>) -> anyhow::Result<String> {
+    let title = content
+        .map(|c| ModelService::parse_skill_content(c).0)
+        .and_then(|body| body.lines().find_map(|l| l.trim().strip_prefix("# ").map(|t| t.trim().to_string())));
+    if let Some(found) = title.and_then(|t| find_skill(skills_dir, &t, true).ok()) {
+        return Ok(found);
+    }
+    match list_skills(skills_dir).as_slice() {
+        [(only, _)] => Ok(only.clone()),
+        _ => anyhow::bail!(
+            "`name` is required — pass the name of the skill to change, one of: {}",
+            skill_names(skills_dir)
+        ),
+    }
+}
+
 /// The skill's current text, frontmatter included.
 pub fn read_skill(skills_dir: &Path, name: &str) -> anyhow::Result<String> {
     let found = find_skill(skills_dir, name, true)?;
@@ -348,8 +368,8 @@ pub fn skills_context(servers: &[crate::workspace::workspace::MCPServer]) -> Opt
     let dir = Path::new(dir);
     let mut text = String::from(
         "Current skills in this project (name, then its SKILL.md). This is their current text — no need to \
-         list or read them. To change one, call update-skill with the full updated content; to remove one, \
-         call delete-skill; to add one, call save-skill.\n",
+         list or read them. To change one, call update-skill with its `name` (as listed after ###) and the full \
+         updated content; to remove one, call delete-skill with its `name`; to add one, call save-skill.\n",
     );
     let skills = list_skills(dir);
     if skills.is_empty() {
@@ -383,12 +403,15 @@ pub fn call_tool_by_name(name: &str, args: &JsonObject) -> anyhow::Result<String
             let content = required_str(args, "content")?;
             save_skill(&skills_dir_from_env()?, skill_name, description, content)
         }
-        UPDATE_SKILL_TOOL => update_skill(
-            &skills_dir_from_env()?,
-            required_str(args, "name")?,
-            optional_str(args, "description")?,
-            optional_str(args, "content")?,
-        ),
+        UPDATE_SKILL_TOOL => {
+            let dir = skills_dir_from_env()?;
+            let content = optional_str(args, "content")?;
+            let name = match optional_str(args, "name")? {
+                Some(name) => name.to_string(),
+                None => implied_skill(&dir, content)?,
+            };
+            update_skill(&dir, &name, optional_str(args, "description")?, content)
+        }
         DELETE_SKILL_TOOL => delete_skill(&skills_dir_from_env()?, required_str(args, "name")?),
         READ_SKILL_TOOL => read_skill(&skills_dir_from_env()?, required_str(args, "name")?),
         LIST_SKILLS_TOOL => {
@@ -489,6 +512,23 @@ mod tests {
         assert!(written.contains("name: linear-weekly-triage"));
         assert!(written.contains("description: Triage this week's Linear issues"));
         assert!(written.contains("Pull the latest issues from Linear"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_update_without_a_name_finds_the_skill_by_its_title() {
+        let dir = tmp_dir("implied");
+        save_skill(&dir, "good-morning-workout", "d", "# Good Morning Workout\n\nold").unwrap();
+        save_skill(&dir, "cancel-issue", "d", "# Cancel Issue\n\nx").unwrap();
+        assert_eq!(implied_skill(&dir, Some("# Good Morning Workout\n\nnew")).unwrap(), "good-morning-workout");
+        // No title to go on and more than one skill: say which names exist.
+        let err = implied_skill(&dir, Some("just text")).unwrap_err().to_string();
+        assert!(err.contains("good-morning-workout") && err.contains("cancel-issue"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = tmp_dir("implied-one");
+        save_skill(&dir, "good-morning-workout", "d", "# Morning\n\nold").unwrap();
+        assert_eq!(implied_skill(&dir, Some("no title")).unwrap(), "good-morning-workout");
         std::fs::remove_dir_all(dir).ok();
     }
 

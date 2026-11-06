@@ -6,7 +6,8 @@
 //! sees each result as a `role: tool` message, and calls again — "find Chris,
 //! then file the issue assigned to him" is two turns of one conversation, the
 //! second filled from the first's result.  It stops when it answers in text
-//! (what it did, or why it could not) or at [`MAX_TURNS`].
+//! (what it did, or why it could not), when a tool fails the same way twice
+//! (the model is not correcting itself), or at [`MAX_TURNS`].
 //!
 //! The loop owns no transport: calls go through the caller's `call` function
 //! (the same `MCPToolCaller` path a planned step uses, token refresh
@@ -88,6 +89,8 @@ impl LoopOutcome {
             parts.push(format!("Outcome: {}", self.final_text.trim()));
         } else if self.turns >= MAX_TURNS {
             parts.push(format!("Outcome: stopped after {MAX_TURNS} turns without a final answer."));
+        } else if self.calls.last().is_some_and(|c| !c.ok) {
+            parts.push("Outcome: stopped — the last call kept failing with the same error.".to_string());
         }
         parts.join("\n\n")
     }
@@ -100,14 +103,15 @@ impl LoopOutcome {
 
 /// Run `llm`'s tool loop for `instruction` over `servers`.
 ///
-/// `call` runs one tool and returns its result text (`None` when the call
-/// failed); `emit` reports progress.
+/// `call` runs one tool and returns its result text, or why it failed — the
+/// model is shown the reason so it can fix its next call; `emit` reports
+/// progress.
 pub fn run_tool_loop(
     agent: &MCPAgent,
     llm: &dyn BaseLLM,
     instruction: &str,
     servers: &[MCPServer],
-    call: &dyn Fn(&MCPServer, &str, &Map<String, Value>) -> Option<String>,
+    call: &dyn Fn(&MCPServer, &str, &Map<String, Value>) -> Result<String, String>,
     emit: &dyn Fn(&str),
 ) -> Option<LoopOutcome> {
     let entries = agent.catalog(servers);
@@ -142,6 +146,9 @@ pub fn run_tool_loop(
         json!({"role": "user", "content": instruction}),
     ];
     let mut outcome = LoopOutcome::default();
+    // (tool, error) of every failed call: a second identical failure means
+    // the model is repeating itself rather than correcting the call.
+    let mut failures: Vec<(String, String)> = Vec::new();
 
     for turn in 0..MAX_TURNS {
         outcome.turns = turn + 1;
@@ -172,12 +179,26 @@ pub fn run_tool_loop(
         }
         messages.push(assistant_tool_turn(&visible, &calls));
 
+        let mut repeated = false;
         for c in &calls {
             let id = c.id.clone().unwrap_or_default();
             let made = make_call(agent, &entries, &names, servers, c, call, emit);
             let fed = take_chars(&made.result, MAX_RESULT_CHARS);
             messages.push(tool_result_turn(&id, &c.name, &fed));
+            if !made.ok {
+                let failure = (made.tool_name.clone(), made.result.clone());
+                repeated |= failures.contains(&failure);
+                failures.push(failure);
+            }
             outcome.calls.push(made);
+        }
+        if repeated {
+            tracing::warn!(
+                target: LOGGER,
+                "[tool-loop] stopped after {} turn(s): a call failed again with the same error",
+                turn + 1
+            );
+            return Some(outcome);
         }
     }
 
@@ -192,7 +213,7 @@ fn make_call(
     names: &[String],
     servers: &[MCPServer],
     c: &NativeToolCall,
-    call: &dyn Fn(&MCPServer, &str, &Map<String, Value>) -> Option<String>,
+    call: &dyn Fn(&MCPServer, &str, &Map<String, Value>) -> Result<String, String>,
     emit: &dyn Fn(&str),
 ) -> LoopCall {
     let Some(index) = MCPAgent::native_entry(&c.name, names, entries) else {
@@ -227,15 +248,16 @@ fn make_call(
         format_call(&entry.server_name, &entry.tool_name, &arguments)
     );
     match call(server, &entry.tool_name, &arguments) {
-        Some(result) if !result.trim().is_empty() => {
+        Ok(result) if !result.trim().is_empty() => {
             made.result = result;
             made.ok = true;
         }
-        Some(_) => {
+        Ok(_) => {
             made.result = "(the tool returned nothing)".to_string();
             made.ok = true;
         }
-        None => made.result = "Error: the call failed and returned no result.".to_string(),
+        Err(why) if !why.trim().is_empty() => made.result = format!("Error: {}", why.trim()),
+        Err(_) => made.result = "Error: the call failed and returned no result.".to_string(),
     }
     made
 }

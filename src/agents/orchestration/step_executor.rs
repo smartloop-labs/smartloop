@@ -1409,9 +1409,15 @@ impl StepExecutor {
         cwd: Option<&str>,
         emit: &dyn Fn(&str),
     ) -> Option<crate::agents::mcp::tool_loop::LoopOutcome> {
-        let call = |server: &MCPServer, tool: &str, arguments: &Map<String, Value>| {
-            self.call_tool(server, tool, arguments, cwd)
-                .map(|(formatted, raw)| if raw.trim().is_empty() { formatted } else { raw })
+        let call = |server: &MCPServer, tool: &str, arguments: &Map<String, Value>| -> Result<String, String> {
+            info!(target: LOGGER, "[execute] Calling '{}' with arguments: {}", tool, py_dict(arguments));
+            let mut server = server.clone();
+            let (result, _refreshed) =
+                self.tool_caller.call_with_refresh(&mut server, tool, Some(arguments), cwd);
+            match self.finish_call(&result, tool, "execute") {
+                Some((formatted, raw)) => Ok(if raw.trim().is_empty() { formatted } else { raw }),
+                None => Err(call_error_text(&result)),
+            }
         };
         crate::agents::mcp::tool_loop::run_tool_loop(&self.mcp_agent, llm, instruction, mcp_servers, &call, emit)
     }
@@ -1595,6 +1601,27 @@ impl StepExecutor {
         info!(target: LOGGER, "[{}] '{}' raw result: {}", tag, tool_name, head(&raw_content, 1000));
         Some((formatted_content, raw_content))
     }
+}
+
+/// Why a tool call failed, in the tool's own words where it gave any — what
+/// the tool loop shows the model so its next call can fix the arguments.
+fn call_error_text(result: &MCPToolCallResult) -> String {
+    let said = result
+        .content
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|block| match block {
+            Value::Object(o) => o.get("text").map(value_str).unwrap_or_default(),
+            other => value_str(other),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let said = said.trim();
+    if !said.is_empty() {
+        return head(said, 1000).to_string();
+    }
+    result.error.as_deref().map(str::trim).filter(|e| !e.is_empty()).unwrap_or("the tool returned nothing").to_string()
 }
 
 // ---------------------------------------------------------------------- //

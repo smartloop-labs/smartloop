@@ -74,7 +74,7 @@ fn test_the_model_looks_up_then_acts_on_what_it_found() {
     let seen = calls.clone();
     let call = move |_: &MCPServer, tool: &str, args: &Map<String, Value>| {
         seen.lock().push((tool.to_string(), args.clone()));
-        Some(match tool {
+        Ok(match tool {
             "list_users" => r#"{"users":[{"id":"u-42","name":"Chris Coveney"}]}"#.to_string(),
             _ => r#"{"issue":{"identifier":"ENG-7"}}"#.to_string(),
         })
@@ -110,7 +110,7 @@ fn test_the_model_looks_up_then_acts_on_what_it_found() {
 fn test_calls_without_ids_are_numbered() {
     let llm = scripted(vec!["<tool_call>\n<function=list_users>\n<parameter=query>\nChris\n</parameter>\n</function>\n</tool_call>", "ok"]);
     let agent = MCPAgent::new(llm.as_llm());
-    let call = |_: &MCPServer, _: &str, _: &Map<String, Value>| Some("[]".to_string());
+    let call = |_: &MCPServer, _: &str, _: &Map<String, Value>| Ok("[]".to_string());
     run_tool_loop(&agent, &*llm, "find chris", &[linear()], &call, &|_| {}).unwrap();
     let second = conversation(&llm, 1);
     assert_eq!(second[2]["tool_calls"][0]["id"], "call_1_1");
@@ -123,7 +123,7 @@ fn test_calls_without_ids_are_numbered() {
 fn test_an_unknown_tool_is_reported_back_to_the_model() {
     let llm = scripted(vec![r#"<tool_call>{"name": "delete_everything", "arguments": {}}</tool_call>"#, "Sorry."]);
     let agent = MCPAgent::new(llm.as_llm());
-    let call = |_: &MCPServer, _: &str, _: &Map<String, Value>| -> Option<String> { panic!("must not be called") };
+    let call = |_: &MCPServer, _: &str, _: &Map<String, Value>| -> Result<String, String> { panic!("must not be called") };
     let outcome = run_tool_loop(&agent, &*llm, "x", &[linear()], &call, &|_| {}).unwrap();
     assert!(!outcome.calls[0].ok);
     assert!(conversation(&llm, 1)[3]["content"].as_str().unwrap().contains("no tool named"));
@@ -135,7 +135,7 @@ fn test_an_unknown_tool_is_reported_back_to_the_model() {
 fn test_a_failed_first_turn_falls_back() {
     let llm = scripted(vec!["Error generating response: 429 nearly out"]);
     let agent = MCPAgent::new(llm.as_llm());
-    let call = |_: &MCPServer, _: &str, _: &Map<String, Value>| Some(String::new());
+    let call = |_: &MCPServer, _: &str, _: &Map<String, Value>| Ok(String::new());
     assert!(run_tool_loop(&agent, &*llm, "x", &[linear()], &call, &|_| {}).is_none());
 }
 
@@ -148,9 +148,30 @@ fn test_the_loop_is_bounded() {
     }));
     llm.set_supports_native_tools(true);
     let agent = MCPAgent::new(llm.as_llm());
-    let call = |_: &MCPServer, _: &str, _: &Map<String, Value>| Some("[]".to_string());
+    let call = |_: &MCPServer, _: &str, _: &Map<String, Value>| Ok("[]".to_string());
     let outcome = run_tool_loop(&agent, &*llm, "x", &[linear()], &call, &|_| {}).unwrap();
     assert_eq!(outcome.turns, MAX_TURNS);
     assert_eq!(llm.call_count(), MAX_TURNS);
     assert!(outcome.transcript().contains("stopped after"));
+}
+
+/// A failed call shows the model the tool's own error, and the same failure
+/// twice stops the loop instead of running it to the turn cap.
+#[test]
+#[serial]
+fn test_a_repeated_failure_stops_the_loop() {
+    let llm = StubLLM::with_reply_fn(Arc::new(|_, _, _| {
+        r#"<tool_call>{"name": "save_issue", "arguments": {"title": "x"}}</tool_call>"#.to_string()
+    }));
+    llm.set_supports_native_tools(true);
+    let agent = MCPAgent::new(llm.as_llm());
+    let call = |_: &MCPServer, _: &str, _: &Map<String, Value>| -> Result<String, String> {
+        Err("`team` is required".to_string())
+    };
+    let outcome = run_tool_loop(&agent, &*llm, "x", &[linear()], &call, &|_| {}).unwrap();
+    assert_eq!(outcome.turns, 2);
+    assert_eq!(outcome.calls.len(), 2);
+    assert!(outcome.calls[0].result.contains("`team` is required"));
+    assert!(conversation(&llm, 1)[3]["content"].as_str().unwrap().contains("`team` is required"));
+    assert!(outcome.transcript().contains("kept failing"));
 }
