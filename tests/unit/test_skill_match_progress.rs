@@ -127,3 +127,12 @@ fn test_an_explicitly_requested_skill_reports_that_instead() {
     assert_eq!(run.messages, vec!["Fulfilling your request with the 'good-morning' skill".to_string()]);
     assert!(run.prompts.is_empty(), "the matcher ran");
 }
+
+/// A skill the user names outright is matched without asking the model.
+#[test]
+fn test_a_named_skill_skips_the_model() {
+    let run = run(vec![skill("good-morning"), skill("fund-summary")], "run the good-morning skill", None);
+
+    assert!(run.prompts.is_empty(), "{:?}", run.prompts);
+    assert!(run.result.data.to_string().contains("good-morning"), "{}", run.result.data);
+}

@@ -584,8 +584,11 @@ impl Explorer {
             return Vec::new();
         }
 
+        // A skill the user names outright is the intent signal; asking the
+        // model as well only adds a call before the answer can start.
         let direct = Self::direct_name_matches(user_message, &matchable);
-        let llm_matched = self.llm_match_skills(user_message, &matchable, llm);
+        let llm_matched =
+            if direct.is_empty() { self.llm_match_skills(user_message, &matchable, llm) } else { Vec::new() };
 
         // Union, preserving the presentation order; dedup by skill name.
         let keep: HashSet<&str> =
