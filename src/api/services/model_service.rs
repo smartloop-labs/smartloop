@@ -29,7 +29,7 @@ use crate::agents::hybrid_executor::LLMExecutor;
 use crate::agents::orchestration::model_router::{
     CapabilitySkipReason, ModelRouter, ModelRouterOptions, ProgressCallback,
 };
-use crate::agents::planner::{FETCH_SERVER_ID, SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME};
+use crate::agents::planner::FETCH_SERVER_ID;
 use crate::api::config::api_settings;
 use crate::config::app_settings::AppSettings;
 use crate::config::model_config::ModelConfig;
@@ -205,19 +205,6 @@ impl ModelServiceError {
 /// carry different vtable pointers.
 pub fn same_llm(a: &Arc<dyn BaseLLM>, b: &Arc<dyn BaseLLM>) -> bool {
     std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
-}
-
-/// The command a built-in `-m smartloop.*` MCP server is launched with
-/// (`sys.executable`): `SLP_EXE` when set, else this binary.
-fn sys_executable() -> String {
-    if let Ok(exe) = std::env::var("SLP_EXE") {
-        if !exe.is_empty() {
-            return exe;
-        }
-    }
-    std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "slp".to_string())
 }
 
 /// Python's truthiness for an optional string: `None` and `""` are falsy.
@@ -601,12 +588,25 @@ pub struct ModelService {
 }
 
 impl ModelService {
-    /// Built-in tool skill names never exposed by `list_skills`.
-    pub const SYSTEM_SKILL_NAMES: &'static [&'static str] =
-        &["file-read", "file-write", "bash", "grep", "explore"];
+    /// Ids of the MCP servers smartloop used to install on every project:
+    /// fetch (now the in-process FetchAgent), System Tools (bash, file-read,
+    /// file-write, grep) and Skills (save-skill).  Running commands, writing
+    /// files and saving skills are the harness's job, so persisted entries
+    /// are swept on project access (see [`Self::sweep_legacy_builtins`]).
+    pub const LEGACY_BUILTIN_SERVER_IDS: &'static [&'static str] = &[FETCH_SERVER_ID, "__system_tools__", "__skills__"];
 
-    /// Legacy fetch skill directories swept from disk.
-    pub const STALE_FETCH_SKILLS: &'static [&'static str] = &["fetch-mcp", "fetch-url"];
+    /// Skills smartloop used to write into every project, swept from disk.
+    /// With a body, the skill is removed only while it still holds the body
+    /// smartloop wrote — a skill of the same name the user (or the harness)
+    /// wrote since is theirs and stays.  `None` removes it outright.
+    pub const LEGACY_BUILTIN_SKILLS: &'static [(&'static str, Option<&'static str>)] = &[
+        ("fetch-mcp", None),
+        ("fetch-url", None),
+        ("__system_mcp__", None),
+        ("file-read", Some("read the file at the given path and return its content")),
+        ("file-write", Some("write content to a file at the given path")),
+        ("bash", Some("execute the shell command on the host machine")),
+    ];
 
     /// Purpose label for response-model events.
     pub const RESPONSE_PURPOSE: &'static str = "the response";
@@ -697,74 +697,6 @@ impl ModelService {
     /// A snapshot of the current test seams.
     fn hooks(&self) -> ModelServiceHooks {
         self.hooks.read().clone()
-    }
-
-    /// The `_SYSTEM_TOOL_DEFS` registered on the System Tools MCP server.
-    pub fn system_tool_defs() -> Vec<MCPToolDefinition> {
-        fn def(name: &str, description: &str, schema: Value) -> MCPToolDefinition {
-            MCPToolDefinition {
-                name: name.to_string(),
-                description: Some(description.to_string()),
-                input_schema: schema.as_object().cloned(),
-            }
-        }
-        vec![
-            def(
-                "bash",
-                "Execute a shell command (git, echo, etc.) on the host machine",
-                json!({"type": "object", "properties": {"command": {"type": "string", "description": "Shell command to execute"}}, "required": ["command"]}),
-            ),
-            def(
-                "file-read",
-                "Read a file and return its content",
-                json!({"type": "object", "properties": {"path": {"type": "string", "description": "File path to read"}}, "required": ["path"]}),
-            ),
-            def(
-                "file-write",
-                "Write content to a file in the working directory",
-                json!({"type": "object", "properties": {"path": {"type": "string", "description": "File path to write"}, "content": {"type": "string", "description": "Content to write"}}, "required": ["path", "content"]}),
-            ),
-            def(
-                "grep",
-                "Recursively search files in the working directory for a text pattern or regex",
-                json!({"type": "object", "properties": {"pattern": {"type": "string", "description": "Text or regex to search for"}, "glob": {"type": "string", "description": "Optional filename filter, e.g. '*.py'"}}, "required": ["pattern"]}),
-            ),
-            def(
-                "explore",
-                "Explore the local project directory, read files, and produce an LLM-enriched summary of the codebase",
-                json!({"type": "object", "properties": {"query": {"type": "string", "description": "What to look for in the codebase"}}, "required": ["query"]}),
-            ),
-        ]
-    }
-
-    /// The `_DEFAULT_SKILLS` written to every project.
-    pub fn default_skills() -> Vec<Skill> {
-        fn skill(name: &str, description: &str, content: &str) -> Skill {
-            Skill {
-                id: name.to_string(),
-                name: name.to_string(),
-                description: Some(description.to_string()),
-                content: content.to_string(),
-                system: false,
-            }
-        }
-        vec![
-            skill(
-                "file-read",
-                "Use when the user wants to read, view, or inspect the contents of a file.",
-                "read the file at the given path and return its content",
-            ),
-            skill(
-                "file-write",
-                "Use when the user wants to write, save, or create a file with specific content.",
-                "write content to a file at the given path",
-            ),
-            skill(
-                "bash",
-                "Use when the user wants to run a shell command, execute a script, or perform system operations.",
-                "execute the shell command on the host machine",
-            ),
-        ]
     }
 
     // ------------------------------------------------------------ shared state
@@ -1190,44 +1122,70 @@ impl ModelService {
         if ws.read().project(project_id).is_none() {
             return Err(ModelServiceError::value(format!("Project not found: {project_id}")));
         }
-        self.sweep_legacy_fetch_server(project_id);
+        self.sweep_legacy_builtins(project_id);
         let project = ws.read().project(project_id).cloned();
         project.ok_or_else(|| ModelServiceError::value(format!("Project not found: {project_id}")))
     }
 
-    /// Drop the obsolete built-in `__fetch__` MCP server from a project.
+    /// Drop what smartloop used to install on a project itself.
     ///
-    /// URL fetching moved to the in-process FetchAgent, but projects created
-    /// before that change still carry a persisted `__fetch__` entry that shows
-    /// up in MCP listings.  Sweep on every project access so they self-heal.
-    /// Idempotent — only writes when an entry is actually removed.
-    pub fn sweep_legacy_fetch_server(&self, project_id: &str) {
+    /// The built-in MCP servers ([`Self::LEGACY_BUILTIN_SERVER_IDS`]) are
+    /// gone — fetching is the in-process FetchAgent, and running commands,
+    /// writing files and saving skills belong to the harness — but projects
+    /// created before still carry their persisted entries and the default
+    /// skills written for them ([`Self::LEGACY_BUILTIN_SKILLS`]).  Swept on
+    /// every project access so they self-heal.  Idempotent — only writes
+    /// the workspace when an entry is actually removed.
+    pub fn sweep_legacy_builtins(&self, project_id: &str) {
         let Some(ws) = self.workspace_handle() else {
             return;
         };
-        let removed = {
+        let (removed, skills_dir) = {
             let mut guard = ws.write();
-            match guard.project_mut(project_id) {
-                Some(project) if project.mcp_servers.iter().any(|s| s.id == FETCH_SERVER_ID) => {
-                    project.mcp_servers.retain(|s| s.id != FETCH_SERVER_ID);
-                    true
-                }
-                _ => false,
-            }
+            let Some(project) = guard.project_mut(project_id) else {
+                return;
+            };
+            let before = project.mcp_servers.len();
+            project.mcp_servers.retain(|s| !Self::LEGACY_BUILTIN_SERVER_IDS.contains(&s.id.as_str()));
+            (project.mcp_servers.len() != before, Self::skills_dir(project))
         };
+        Self::remove_legacy_builtin_skills(Path::new(&skills_dir), project_id);
         if !removed {
             return;
         }
         match self.persist_model() {
             Ok(()) => {
-                tracing::info!(target: LOG_TARGET, "Swept legacy fetch server from project {project_id}");
+                tracing::info!(target: LOG_TARGET, "Swept legacy built-in MCP servers from project {project_id}");
             }
             Err(e) => {
                 // Never let a persistence hiccup break project lookup.
                 tracing::warn!(
                     target: LOG_TARGET,
-                    "Failed to persist legacy fetch sweep for {project_id}: {e}"
+                    "Failed to persist legacy built-in server sweep for {project_id}: {e}"
                 );
+            }
+        }
+    }
+
+    /// Delete the skills smartloop wrote into `skills_dir` (see
+    /// [`Self::LEGACY_BUILTIN_SKILLS`]), as a `<name>/SKILL.md` directory or
+    /// a bare `<name>.md` file.
+    pub fn remove_legacy_builtin_skills(skills_dir: &Path, project_id: &str) {
+        for (name, body) in Self::LEGACY_BUILTIN_SKILLS {
+            let skill_dir = skills_dir.join(name);
+            if skill_dir.is_dir() {
+                let ours = match body {
+                    None => true,
+                    Some(body) => std::fs::read_to_string(skill_dir.join("SKILL.md"))
+                        .is_ok_and(|raw| Self::parse_skill_content(&raw).0.trim() == *body),
+                };
+                if ours && std::fs::remove_dir_all(&skill_dir).is_ok() {
+                    tracing::info!(target: LOG_TARGET, "Removed legacy skill '{name}' from project {project_id}");
+                }
+            }
+            let skill_file = skills_dir.join(format!("{name}.md"));
+            if body.is_none() && skill_file.is_file() && std::fs::remove_file(&skill_file).is_ok() {
+                tracing::info!(target: LOG_TARGET, "Removed legacy skill file '{name}.md' from project {project_id}");
             }
         }
     }
@@ -3028,168 +2986,7 @@ impl ModelService {
 
     // ------------------------------------------------------------ project tools
 
-    /// The launch config of the built-in System Tools server.
-    fn system_tools_config() -> MCPServerConfig {
-        MCPServerConfig {
-            command: sys_executable(),
-            args: vec!["-m".to_string(), "smartloop.api.mcp.system_server".to_string()],
-            ..Default::default()
-        }
-    }
-
-    /// Register (or refresh) the System Tools MCP server on a project.
-    pub fn install_system_tools_server(&self, project_id: &str) -> anyhow::Result<()> {
-        let defs = Self::system_tool_defs();
-        let wanted: Vec<String> = defs.iter().map(|t| t.name.clone()).collect();
-        // Match on the stable id, not the display name: records saved under
-        // an earlier name (e.g. "Smartloop") would otherwise never be found,
-        // so their tool list stays stale and a duplicate server with the same
-        // id gets appended.
-        enum Outcome {
-            Refreshed,
-            Current,
-            Registered,
-        }
-        let outcome = self.update_project_record(project_id, |project| {
-            if let Some(existing) = project.mcp_servers.iter_mut().find(|s| s.id == SYSTEM_TOOLS_SERVER_ID) {
-                // Refresh the advertised name/tool list so projects created
-                // before a rename or before a tool was added (e.g. grep) pick
-                // up the changes on next load.
-                let current: Vec<String> = existing.tools.iter().map(|t| t.name.clone()).collect();
-                if current != wanted || existing.name != SYSTEM_TOOLS_SERVER_NAME {
-                    existing.name = SYSTEM_TOOLS_SERVER_NAME.to_string();
-                    existing.tools = defs.clone();
-                    return Outcome::Refreshed;
-                }
-                return Outcome::Current;
-            }
-            project.mcp_servers.push(MCPServer {
-                id: SYSTEM_TOOLS_SERVER_ID.to_string(),
-                name: SYSTEM_TOOLS_SERVER_NAME.to_string(),
-                description: Some("Built-in tools for file operations, search, and shell commands".to_string()),
-                server_type: MCPServerType::Local,
-                config: Some(Self::system_tools_config()),
-                enabled: true,
-                system: true,
-                tools: defs.clone(),
-                ..Default::default()
-            });
-            Outcome::Registered
-        })?;
-        match outcome {
-            Outcome::Refreshed => {
-                self.persist_model()?;
-                tracing::info!(
-                    target: LOG_TARGET,
-                    "Refreshed System Tools server tools: {}",
-                    py_list_repr(&wanted)
-                );
-            }
-            Outcome::Current => {
-                tracing::info!(target: LOG_TARGET, "System Tools server already registered");
-            }
-            Outcome::Registered => {
-                self.persist_model()?;
-                tracing::info!(target: LOG_TARGET, "Registered System Tools server on project {project_id}");
-            }
-        }
-        Ok(())
-    }
-
-    /// Register (or refresh) the Skills MCP server on a project.
-    ///
-    /// Unlike System Tools it is not a `system` server: the model calls
-    /// `save-skill` the way it calls any connected tool ("save this as a
-    /// skill"), which needs it in the MCP agent's catalog.  Its config carries
-    /// the project's skills directory; a refresh keeps the user's `enabled`.
-    pub fn install_skills_server(&self, project_id: &str) -> anyhow::Result<()> {
-        use crate::api::mcp::skill_server::{tool_specs, SKILLS_DIR_ENV, SKILLS_SERVER_ID, SKILLS_SERVER_NAME};
-        let project = self.get_project(project_id)?;
-        let tools: Vec<MCPToolDefinition> = tool_specs()
-            .into_iter()
-            .map(|(name, description, schema)| MCPToolDefinition {
-                name: name.to_string(),
-                description: Some(description.to_string()),
-                input_schema: schema.as_object().cloned(),
-            })
-            .collect();
-        let config = MCPServerConfig {
-            command: sys_executable(),
-            args: vec!["-m".to_string(), "smartloop.api.mcp.skill_server".to_string()],
-            env: HashMap::from([(SKILLS_DIR_ENV.to_string(), Self::skills_dir(&project))]),
-            ..Default::default()
-        };
-        let changed = self.update_project_record(project_id, |project| {
-            if let Some(existing) = project.mcp_servers.iter_mut().find(|s| s.id == SKILLS_SERVER_ID) {
-                if existing.tools == tools && existing.config.as_ref() == Some(&config) {
-                    return false;
-                }
-                existing.name = SKILLS_SERVER_NAME.to_string();
-                existing.tools = tools;
-                existing.config = Some(config);
-                return true;
-            }
-            project.mcp_servers.push(MCPServer {
-                id: SKILLS_SERVER_ID.to_string(),
-                name: SKILLS_SERVER_NAME.to_string(),
-                description: Some("Save, update and delete reusable skills from the conversation".to_string()),
-                server_type: MCPServerType::Local,
-                config: Some(config),
-                enabled: true,
-                system: false,
-                tools,
-                ..Default::default()
-            });
-            true
-        })?;
-        if changed {
-            self.persist_model()?;
-            tracing::info!(target: LOG_TARGET, "Registered Skills server on project {project_id}");
-        }
-        Ok(())
-    }
-
-    /// Remove the legacy fetch MCP server — fetching is now the FetchAgent.
-    ///
-    /// URL fetching moved from an MCP server (`__fetch__`) to an in-process
-    /// agent resolved as a plan step, so any previously installed fetch
-    /// server is dropped from the project.
-    pub fn remove_fetch_server(&self, project_id: &str) -> anyhow::Result<()> {
-        let (removed, project) = self.update_project_record(project_id, |project| {
-            let before = project.mcp_servers.len();
-            project.mcp_servers.retain(|s| s.id != FETCH_SERVER_ID);
-            (project.mcp_servers.len() != before, project.clone())
-        })?;
-        if removed {
-            self.persist_model()?;
-            tracing::info!(target: LOG_TARGET, "Removed legacy fetch server from project {project_id}");
-        }
-        self.remove_stale_fetch_skills(&project);
-        Ok(())
-    }
-
-    /// Delete leftover fetch skill directories from disk.
-    ///
-    /// Projects created before the FetchAgent change may still have
-    /// `fetch-mcp`/`fetch-url` SKILL.md directories on disk.  They reference
-    /// the removed `__fetch__` server, so drop them.
-    fn remove_stale_fetch_skills(&self, project: &Project) {
-        let skills_dir = Self::skills_dir(project);
-        for name in Self::STALE_FETCH_SKILLS {
-            let skill_dir = Path::new(&skills_dir).join(name);
-            if skill_dir.is_dir() {
-                let _ = std::fs::remove_dir_all(&skill_dir);
-                tracing::info!(
-                    target: LOG_TARGET,
-                    "Removed stale fetch skill '{name}' from project {}",
-                    project.id
-                );
-            }
-        }
-    }
-
-    /// Migrate legacy REMOTE system servers to LOCAL (stdio subprocess) and fix
-    /// empty launcher args.
+    /// Fix user-registered local MCP servers saved with empty launcher args.
     pub fn migrate_servers_to_local(&self, project_id: &str) -> anyhow::Result<()> {
         // command → how that launcher takes a package name.
         fn launcher_args(command: &str, pkg: &str) -> Option<Vec<String>> {
@@ -3208,17 +3005,6 @@ impl ModelService {
         let migrated = self.update_project_record(project_id, |project| {
             let mut migrated = false;
             for server in project.mcp_servers.iter_mut() {
-                if server.id == SYSTEM_TOOLS_SERVER_ID && server.server_type == MCPServerType::Remote {
-                    server.server_type = MCPServerType::Local;
-                    server.config = Some(Self::system_tools_config());
-                    server.remote_config = None;
-                    migrated = true;
-                    tracing::info!(
-                        target: LOG_TARGET,
-                        "Migrated system tools server to LOCAL on project {}",
-                        project.id
-                    );
-                }
                 // Fix stale user-registered local servers saved with empty
                 // args (registered before args validation was enforced),
                 // recovering from the saved pkg or server name.  How a package
@@ -3253,37 +3039,17 @@ impl ModelService {
         Ok(())
     }
 
-    /// True for built-in tool skills and `__`-prefixed internal skills.
+    /// True for `__`-prefixed internal skills.
     pub fn is_system_skill(name: &str) -> bool {
-        !name.is_empty() && (Self::SYSTEM_SKILL_NAMES.contains(&name) || name.starts_with("__"))
+        name.starts_with("__")
     }
 
-    /// Install system MCP servers and register default skills.
+    /// Prepare a project for use: fix stale user server launchers and sweep
+    /// what smartloop used to install itself (built-in MCP servers and their
+    /// default skills).  Smartloop no longer installs anything on a project.
     pub fn setup_project_tools(&self, project_id: &str) -> anyhow::Result<()> {
         self.migrate_servers_to_local(project_id)?;
-        self.install_system_tools_server(project_id)?;
-        self.install_skills_server(project_id)?;
-        self.remove_fetch_server(project_id)?;
-        // Re-fetch: install_* may have replaced the model via ensure_model(),
-        // so an earlier project snapshot can be stale.
-        let project = self.get_project(project_id)?;
-        self.install_default_skills(&project)
-    }
-
-    /// Write default skill SKILL.md files if they don't already exist.
-    fn install_default_skills(&self, project: &Project) -> anyhow::Result<()> {
-        let existing: HashSet<String> = Self::read_skills_from_disk(project).into_iter().map(|s| s.name).collect();
-        for skill in Self::default_skills() {
-            if !existing.contains(&skill.name) {
-                Self::write_skill_md(project, &skill)?;
-                tracing::info!(
-                    target: LOG_TARGET,
-                    "Installed default skill '{}' on project {}",
-                    skill.name,
-                    project.id
-                );
-            }
-        }
+        self.sweep_legacy_builtins(project_id);
         Ok(())
     }
 
@@ -3592,8 +3358,7 @@ impl ModelService {
 
     /// List a project's user-created skills, read from disk.
     ///
-    /// Built-in tool skills and `__`-prefixed internal skills back the
-    /// orchestrator's routing but are never exposed here.
+    /// `__`-prefixed internal skills are never exposed here.
     pub fn list_skills(&self, project_id: &str) -> anyhow::Result<Vec<Value>> {
         let project = self.get_project(project_id)?;
         Self::read_skills_from_disk(&project)

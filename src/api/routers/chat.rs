@@ -38,7 +38,6 @@ use crate::api::services::{get_api_client, get_model_service, ModelService};
 // user's question — reused below to decide a source is about the answer, so
 // the two ends of the citation contract agree on what "related" means.
 use crate::api::services::model_service::MIN_BEST_DISTANCE;
-use crate::api::services::output_writer::WriteOutcome;
 use crate::config::app_settings::AppSettings;
 use crate::constants::{display_model_name, resolve_current_date, OPENING_TOKENS, SYSTEM_PROMPT};
 use crate::db::embeddings;
@@ -163,14 +162,6 @@ pub trait ChatService: Send + Sync {
         citations: Option<&[CitationDict]>,
         message_id: Option<&str>,
     );
-    /// `ModelService.maybe_write_output`; returns what was written.
-    fn maybe_write_output(
-        &self,
-        user_message: &str,
-        llm_response: &str,
-        cwd: Option<&str>,
-        session_id: Option<&str>,
-    ) -> WriteOutcome;
     /// `ModelService.model_client`: how this process reaches the generative model.
     fn model_client(&self) -> Arc<dyn ModelClient>;
     /// `ModelService.unload_auxiliary_models`.
@@ -338,15 +329,6 @@ impl ChatService for ModelService {
                 "Failed to append to session {}: {}", session_id, e
             );
         }
-    }
-    fn maybe_write_output(
-        &self,
-        user_message: &str,
-        llm_response: &str,
-        cwd: Option<&str>,
-        session_id: Option<&str>,
-    ) -> WriteOutcome {
-        ModelService::maybe_write_output(self, user_message, llm_response, cwd, session_id)
     }
     fn model_client(&self) -> Arc<dyn ModelClient> {
         match ModelService::model_client(self) {
@@ -863,36 +845,6 @@ fn content_delta(content: impl Into<String>) -> DeltaContent {
 /// The content of the last user message in `messages`.
 fn last_user_content(messages: &[ChatMessage]) -> Option<String> {
     messages.iter().rev().find(|m| m.role == Role::User).and_then(|m| m.content.clone())
-}
-
-/// `[name](path)` for a written file — forward slashes in the URL so the
-/// Markdown parser doesn't treat backslashes as escape characters (e.g.
-/// `\src` → `src` on Windows).
-fn file_link(written_path: &str) -> String {
-    let name = Path::new(written_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let posix =
-        if cfg!(windows) { written_path.replace('\\', "/") } else { written_path.to_string() };
-    format!("[{name}]({posix})")
-}
-
-/// What an auto-write put on disk, appended to the answer: a link per file
-/// written.
-pub fn write_summary(outcome: &WriteOutcome) -> String {
-    let mut summary = String::new();
-    match outcome.written.as_slice() {
-        [] => {}
-        [path] => summary.push_str(&format!("\n\n{}", file_link(path))),
-        paths => {
-            summary.push_str(&format!("\n\nWrote {} files:\n", paths.len()));
-            for path in paths {
-                summary.push_str(&format!("\n- {}", file_link(path)));
-            }
-        }
-    }
-    summary
 }
 
 /// The message of a caught panic payload.
@@ -3103,33 +3055,6 @@ fn stream_chunks_inner(
         let full_response = fin.parts.concat();
         let verified_citations = fin.verified.clone();
 
-        // Auto file-write: if user asked to create/generate/write, save LLM
-        // response to file
-        let out_cwd = request_cwd(&request, &*svc).filter(|c| !c.is_empty());
-        if !fin.parts.is_empty()
-            && let (Some(user_msg), Some(cwd)) =
-                (last_user_msg.as_deref().filter(|m| !m.is_empty()), out_cwd.as_deref())
-        {
-            let outcome = svc.maybe_write_output(
-                user_msg,
-                &full_response,
-                Some(cwd),
-                request.session_id.as_deref(),
-            );
-            if !outcome.is_empty() {
-                for written_path in &outcome.written {
-                    yield status_event("file-write", "completed", written_path);
-                }
-                // Surface the file paths as visible content so the user can click them
-                let summary = write_summary(&outcome);
-                yield chunk_frame(&stream_model, content_delta(summary.clone()), None);
-                // Persist the file links in session history
-                if let Some(session_id) = request.session_id.as_deref().filter(|s| !s.is_empty()) {
-                    svc.append_to_session(session_id, "assistant", &summary, None, None);
-                }
-            }
-        }
-
         // Compute and emit usage info after streaming
         if !fin.parts.is_empty() {
             let prompt_tokens = svc.count_tokens(&prompt);
@@ -3556,20 +3481,8 @@ async fn complete_body(
     } else {
         (&mut rx).await
     };
-    let mut response_text = generation
+    let response_text = generation
         .map_err(|_| anyhow::anyhow!("executor worker exited without a result"))??;
-
-    // Auto file-write: if user asked to create/generate/write, save LLM
-    // response to file
-    let out_cwd = request_cwd(request, &**svc).filter(|c| !c.is_empty());
-    if let (Some(user_msg), Some(cwd)) =
-        (last_user_msg.as_deref().filter(|m| !m.is_empty()), out_cwd.as_deref())
-        && !response_text.is_empty()
-    {
-        let outcome =
-            svc.maybe_write_output(user_msg, &response_text, Some(cwd), request.session_id.as_deref());
-        response_text.push_str(&write_summary(&outcome));
-    }
 
     // Verified once and reused for both the session record and the response.
     let mut verified: Option<Vec<CitationDict>> = None;

@@ -2989,15 +2989,6 @@ pub mod api_chat {
                 content.to_string(),
             ));
         }
-        fn maybe_write_output(
-            &self,
-            _user_message: &str,
-            _llm_response: &str,
-            _cwd: Option<&str>,
-            _session_id: Option<&str>,
-        ) -> smartloop::api::services::output_writer::WriteOutcome {
-            smartloop::api::services::output_writer::WriteOutcome::default()
-        }
         fn model_client(&self) -> Arc<dyn ModelClient> {
             Arc::new(InProcessModelClient::new(self.device.clone()))
         }

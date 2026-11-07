@@ -1,9 +1,6 @@
 //! Port of `smartloop/api/mcp/__init__.py`.
 //!
-//! In-process MCP servers exposed to the orchestrator.
-
-pub mod skill_server;
-pub mod system_server;
+//! Helpers shared by the API's MCP plumbing.
 
 use crate::api::config::API_SETTINGS;
 

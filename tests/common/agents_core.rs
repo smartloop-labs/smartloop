@@ -16,7 +16,7 @@ use smartloop::agents::agent::SharedLLM;
 use smartloop::agents::nodes::{AgentNode, NodeCategory, NodeKind};
 use smartloop::agents::orchestrator::{SLPOrchestrator, SLPOrchestratorOptions};
 use smartloop::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
-use smartloop::workspace::workspace::{MCPServer, MCPServerConfig, MCPServerType, MCPToolDefinition, RemoteMCPServerConfig};
+use smartloop::workspace::workspace::{MCPServer, MCPServerType, MCPToolDefinition, RemoteMCPServerConfig};
 
 /// What the fake answers for a prompt: `Ok(reply)`, or `Err(message)` for a
 /// failing model (Python `side_effect = RuntimeError(message)`).
@@ -267,27 +267,6 @@ pub fn fetch_server(id: &str, name: &str) -> MCPServer {
             &["url"],
         )],
     )
-}
-
-/// The local smartloop system-tools MCP server, run for real over stdio by
-/// the built `slp` binary (`slp __system-server`, Python
-/// `python -m smartloop.api.mcp.system_server`).
-pub fn system_tools_server(tools: Vec<MCPToolDefinition>) -> MCPServer {
-    MCPServer {
-        id: smartloop::agents::planner::SYSTEM_TOOLS_SERVER_ID.to_string(),
-        name: smartloop::agents::planner::SYSTEM_TOOLS_SERVER_NAME.to_string(),
-        description: Some("Built-in tools for file operations, search, and shell commands".to_string()),
-        server_type: MCPServerType::Local,
-        config: Some(MCPServerConfig {
-            command: env!("CARGO_BIN_EXE_slp").to_string(),
-            args: vec!["__system-server".to_string()],
-            ..Default::default()
-        }),
-        enabled: true,
-        system: true,
-        tools,
-        ..Default::default()
-    }
 }
 
 /// A buffer the log capture writes into.

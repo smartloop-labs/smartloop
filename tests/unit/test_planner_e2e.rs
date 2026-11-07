@@ -3,10 +3,9 @@
 //! End-to-end tests for the classify → plan → execute pipeline.
 //!
 //! Each test exercises `SLPOrchestrator::execute()` with realistic scenarios.
-//! The LLM and external MCP calls are faked; the built-in action handlers
-//! (file-read, file-write, explore) run against real temp files through the
-//! real system-tools MCP server (`slp __system-server`), so the full dispatch
-//! path is verified.
+//! The LLM and external MCP calls are faked; explore steps read real temp
+//! files in-process.  Smartloop writes no files and runs no commands: a plan
+//! step for either is dropped and the harness acts on the answer.
 
 use std::sync::Arc;
 
@@ -24,29 +23,11 @@ use smartloop::mcp::MCPToolCallResult;
 use smartloop::workspace::workspace::MCPServer;
 
 use crate::shared::agents_core::{
-    failed_result, fetch_server, orchestrator_over, system_tools_server, text_result, tool, FakeLlm,
+    failed_result, fetch_server, orchestrator_over, text_result, FakeLlm,
 };
 
-/// The local smartloop system-tools MCP server (real stdio subprocess).
-///
-/// Built-in file/grep/bash tools execute through this server, like fetch —
-/// so e2e tests register it and let `call_tool` run it for real against temp
-/// files.
-fn system_server() -> MCPServer {
-    system_tools_server(vec![
-        tool("file-read", "file-read", json!({"path": {"type": "string"}, "query": {"type": "string"}}), &["path"]),
-        tool(
-            "file-write",
-            "file-write",
-            json!({"path": {"type": "string"}, "content": {"type": "string"}}),
-            &["path", "content"],
-        ),
-        tool("grep", "grep", json!({"pattern": {"type": "string"}, "glob": {"type": "string"}}), &["pattern"]),
-    ])
-}
-
 /// `call_tool` replacement: fake the (remote) fetch tool, run everything else
-/// (the local system tools) through a real, unhooked client.
+/// through a real, unhooked client.
 fn delegating_call_tool(orchestrator: &SLPOrchestrator, llm: &Arc<FakeLlm>, fetch_result: MCPToolCallResult) {
     let real = Arc::new(MCPToolCaller::new(
         Arc::new(MCPArgumentExtractor::new(llm.shared())),
@@ -191,7 +172,8 @@ fn opts(cwd: Option<&str>) -> ExecuteOptions {
 mod classify_plan_execute_pipeline {
     use super::*;
 
-    /// File path + URL + write → MULTI_STEP → read + fetch + write steps.
+    /// File path + URL + write → MULTI_STEP → read + fetch; the write step is
+    /// dropped — the answer carries the content and the harness saves it.
     #[test]
     #[serial]
     fn test_multi_step_read_fetch_write() {
@@ -245,18 +227,19 @@ mod classify_plan_execute_pipeline {
                  https://job-boards.greenhouse.io/anthropic/jobs/123, and write out the tailored requirements \
                  to {output_path}"
             ),
-            &[make_fetch_server(), system_server()],
+            &[make_fetch_server()],
             opts(Some(&dir)),
         );
 
         assert!(result.handled);
-        assert!(result.content.is_some());
-        assert!(result.tool_names.len() >= 2);
+        assert!(result.tool_names.contains(&"explore".to_string()), "{:?}", result.tool_names);
+        assert!(result.tool_names.contains(&"fetch".to_string()), "{:?}", result.tool_names);
+        assert!(!result.tool_names.contains(&"file-write".to_string()));
+        let content = result.content.unwrap_or_default();
+        assert!(content.contains("John Doe"), "{content}");
 
-        // Verify the output file was written
-        assert!(std::path::Path::new(&output_path).is_file());
-        let written = std::fs::read_to_string(&output_path).unwrap();
-        assert!(written.contains("Tailored Requirements"));
+        // Smartloop writes no files: that is the harness's job.
+        assert!(!std::path::Path::new(&output_path).exists());
     }
 
     /// URL → deterministic TOOL_CALL via DAG: resolve → execute → reason.
@@ -299,7 +282,7 @@ mod classify_plan_execute_pipeline {
         assert!(!result.content.unwrap_or_default().contains("Unrelated indexed document"));
     }
 
-    /// File path → ACTION(read) → single read step (deterministic).
+    /// File path → EXPLORE → the file is read in-process (deterministic).
     #[test]
     #[serial]
     fn test_single_action_read() {
@@ -312,7 +295,7 @@ mod classify_plan_execute_pipeline {
 
         let result = orchestrator.execute(
             &format!("Read {resume_path} and summarize the key skills"),
-            &[system_server()],
+            &[],
             ExecuteOptions {
                 skills: Some(vec!["Be concise".to_string()]),
                 cwd: Some(dir.clone()),
@@ -321,7 +304,8 @@ mod classify_plan_execute_pipeline {
         );
 
         assert!(result.handled);
-        assert!(result.tool_names.contains(&"file-read".to_string()));
+        assert!(result.tool_names.contains(&"explore".to_string()), "{:?}", result.tool_names);
+        assert!(result.content.unwrap_or_default().contains("John Doe"));
     }
 
     /// When fetch fails, pipeline returns partial result (read step).
@@ -338,13 +322,13 @@ mod classify_plan_execute_pipeline {
 
         let result = orchestrator.execute(
             &format!("Read {resume_path} and fetch https://example.com/job"),
-            &[make_fetch_server(), system_server()],
+            &[make_fetch_server()],
             opts(Some(&dir)),
         );
 
-        // Should return partial result (just the file-read step)
+        // Should return partial result (just the explore read)
         assert!(result.handled);
-        assert!(result.tool_names.contains(&"file-read".to_string()));
+        assert!(result.tool_names.contains(&"explore".to_string()), "{:?}", result.tool_names);
         assert!(result.content.unwrap_or_default().contains("John Doe"));
     }
 

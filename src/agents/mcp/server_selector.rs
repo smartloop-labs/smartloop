@@ -19,7 +19,9 @@ use crate::llms::BaseLLM;
 /// Logger name of the Python module.
 pub const LOGGER: &str = "smartloop.agents.mcp.server_selector";
 
-// Tool name constants for built-in tools (registered via System Tools server).
+// Tool names: `explore` is the in-process explore step; bash, grep,
+// file-read and file-write name the built-in tools smartloop no longer ships
+// (the harness runs commands and writes files), kept to recognise them.
 pub const BASH_TOOL: &str = "bash";
 pub const GREP_TOOL: &str = "grep";
 pub const FILE_READ_TOOL: &str = "file-read";

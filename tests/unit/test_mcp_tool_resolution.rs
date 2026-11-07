@@ -24,7 +24,6 @@ use serial_test::serial;
 use smartloop::agents::mcp::mcp_agent::{
     clear_resolution_cache, format_call, missing_required, MCPAgent, ResolvedCall, RESOLVE_MAX_TOKENS,
 };
-use smartloop::agents::planner::SYSTEM_TOOLS_SERVER_ID;
 use smartloop::llms::llama_cpp::THINKING_MIN_BUDGET;
 use smartloop::workspace::workspace::{MCPServer, MCPToolDefinition};
 
@@ -166,12 +165,10 @@ fn test_system_and_disabled_servers_are_left_out() {
     agent.resolve(
         "anything",
         &[
-            server_with(
-                SYSTEM_TOOLS_SERVER_ID,
-                "smartloop",
-                vec![tool_named("bash", "Create an issue", &["title"])],
-                true,
-            ),
+            MCPServer {
+                system: true,
+                ..server_with("sys-1", "internal", vec![tool_named("bash", "Create an issue", &["title"])], true)
+            },
             server_with("srv-2", "off", vec![tool_named("get_page", "Create an issue", &["title"])], false),
             server(),
         ],

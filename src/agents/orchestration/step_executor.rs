@@ -26,17 +26,11 @@ use crate::agents::mcp::dependency_analyzer::MCPDependencyAnalyzer;
 use crate::agents::mcp::explorer::{Explorer, ExplorerSearchService};
 use crate::agents::mcp::mcp_agent::{missing_required, MCPAgent, ResolvedCall};
 use crate::agents::mcp::mcp_tool_caller::MCPToolCaller;
-use crate::agents::mcp::server_selector::{
-    BASH_TOOL, EXPLORE_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL,
-};
 use crate::agents::nodes::NodeResult;
 use crate::agents::orchestration::context::{OrchestratorContext, SharedOrchestratorContext};
 use crate::agents::orchestration::model_router::DECISION_MAX_TOKENS;
 use crate::agents::orchestration::response_builder::ResponseBuilder;
-use crate::agents::planner::{
-    mcp_connection_is_usable, PlanStep, StepType, SYSTEM_TOOLS_SERVER_ID,
-    SYSTEM_TOOLS_SERVER_NAME,
-};
+use crate::agents::planner::{mcp_connection_is_usable, PlanStep, StepType};
 use crate::llms::BaseLLM;
 use crate::mcp::client::MCPToolCallResult;
 use crate::paths::expand_home;
@@ -49,9 +43,6 @@ pub const LOGGER: &str = "smartloop.agents.orchestration.step_executor";
 /// The reason node's id (`AgentNodeName::Reason`), as it appears in
 /// `previous_results[*].tool_name`.
 const REASON_NODE: &str = "reason";
-
-/// Built-in tools live on the smartloop system server.
-const SYSTEM_TOOLS: [&str; 5] = [FILE_WRITE_TOOL, FILE_READ_TOOL, GREP_TOOL, BASH_TOOL, EXPLORE_TOOL];
 
 /// An instruction that refers back to earlier output depends on it.
 static DEP_RE: Lazy<Regex> = Lazy::new(|| {
@@ -403,6 +394,17 @@ impl StepExecutor {
 
         // -- EXPLORE --
         if step_type == StepType::Explore {
+            // A file the request named is read in-process, whole.
+            if let Some(path) = step
+                .default_args
+                .as_ref()
+                .and_then(|a| a.get("path"))
+                .map(|p| expand_home(p))
+                .filter(|p| std::path::Path::new(p).is_file())
+            {
+                let content = self.explorer.read_file(&path)?;
+                return Some((content.clone(), content));
+            }
             let search_service: Option<Arc<dyn ExplorerSearchService>> =
                 model_service.map(|m| m as Arc<dyn ExplorerSearchService>);
             let (content, explore_citations) = self.explorer.explore(
@@ -429,9 +431,9 @@ impl StepExecutor {
         }
 
         // -- ACTION --
-        // Only the internal `summarize` kind remains here. The built-in
-        // file/grep/bash tools now run as TOOL steps through the smartloop
-        // MCP server (resolved/executed via the resolve+execute handlers).
+        // Only the internal `summarize` kind remains here.  Smartloop runs
+        // no shell commands and writes no files: the harness acts on the
+        // final answer.
         if step_type == StepType::Action {
             let action_kind = step.action_kind.as_deref().unwrap_or("");
 
@@ -477,9 +479,6 @@ impl StepExecutor {
             // Catalogue scan: find the server that owns this tool
             let mut real_server_id: Option<String> = None;
             'scan: for srv in &available_servers {
-                if srv.get("id").and_then(Value::as_str) == Some(SYSTEM_TOOLS_SERVER_ID) {
-                    continue;
-                }
                 for t in srv.get("tools").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
                     if t.get("name").and_then(Value::as_str) == Some(tool_name.as_str()) {
                         let id = value_str(srv.get("id").unwrap_or(&Value::Null));
@@ -500,9 +499,6 @@ impl StepExecutor {
             if real_server_id.is_none() && !step_server_name.is_empty() {
                 let hint = step_server_name.to_lowercase();
                 for srv in &available_servers {
-                    if srv.get("id").and_then(Value::as_str) == Some(SYSTEM_TOOLS_SERVER_ID) {
-                        continue;
-                    }
                     let srv_name = srv.get("name").and_then(Value::as_str).unwrap_or("");
                     if srv_name.to_lowercase() == hint || srv_name.to_lowercase().contains(&hint) {
                         real_server_id = Some(value_str(srv.get("id").unwrap_or(&Value::Null)));
@@ -521,9 +517,6 @@ impl StepExecutor {
             if real_server_id.is_none() {
                 let directive_lower = directive.to_lowercase();
                 for srv in &available_servers {
-                    if srv.get("id").and_then(Value::as_str) == Some(SYSTEM_TOOLS_SERVER_ID) {
-                        continue;
-                    }
                     let srv_name = srv.get("name").and_then(Value::as_str).unwrap_or("");
                     if !srv_name.is_empty() && directive_lower.contains(&srv_name.to_lowercase()) {
                         real_server_id = Some(value_str(srv.get("id").unwrap_or(&Value::Null)));
@@ -569,13 +562,10 @@ impl StepExecutor {
                 }
             }
         }
-        // Last resort: try every non-system server for the tool
+        // Last resort: try every connected server for the tool
         if server.is_none() {
             for srv_obj in &mcp_servers {
                 if !srv_obj.enabled || srv_obj.tools.is_empty() {
-                    continue;
-                }
-                if srv_obj.id == SYSTEM_TOOLS_SERVER_ID {
                     continue;
                 }
                 // Check exact match
@@ -833,8 +823,7 @@ impl StepExecutor {
     /// Resolve tool arguments: find server, run deps, extract args.
     ///
     /// Returns `(server, tool_name, arguments)` or `None` if resolution
-    /// fails.  May re-pin a mis-assigned system tool onto the smartloop
-    /// server, which is why `step` is mutable.
+    /// fails.
     pub fn resolve_tool_args(
         &self,
         ctx: &OrchestratorContext,
@@ -865,28 +854,11 @@ impl StepExecutor {
             previous_results.map_or(0, <[serde_json::Value]>::len)
         );
 
-        // Built-in tools live on the smartloop system server. If a plan
-        // mis-assigned one to another server, pin it back to smartloop so it
-        // resolves against the local MCP server like any other tool.
-        let is_system_tool = SYSTEM_TOOLS.contains(&tool_name.as_str());
-        if is_system_tool && step.server_id.as_deref() != Some(SYSTEM_TOOLS_SERVER_ID) {
-            info!(
-                target: LOGGER,
-                "[resolve] '{}' is a system tool — pinning to the smartloop server (was '{}')",
-                tool_name,
-                py_opt(step.server_name.as_deref())
-            );
-            step.server_id = Some(SYSTEM_TOOLS_SERVER_ID.to_string());
-            step.server_name = Some(SYSTEM_TOOLS_SERVER_NAME.to_string());
-        }
-
-        let is_system = step.server_id.as_deref() == Some(SYSTEM_TOOLS_SERVER_ID) || is_system_tool;
-
         // What earlier steps returned, shared by tool resolution below and the
         // dependency analysis further down: a chained call ("comment on the
         // design you just listed") takes its arguments from here, so the two
         // must read the same text.
-        let mut prior_text = match previous_results {
+        let prior_text = match previous_results {
             Some(prev) if !prev.is_empty() => prior_results_text(prev),
             _ => String::new(),
         };
@@ -902,16 +874,6 @@ impl StepExecutor {
                 .cloned();
         }
 
-        // A call on the Skills server rewrites a skill from what it says now.
-        if let Some(srv) = server.as_ref() {
-            if let Some(skills) = crate::api::mcp::skill_server::skills_context(std::slice::from_ref(srv)) {
-                if !prior_text.is_empty() {
-                    prior_text.push_str("\n\n");
-                }
-                prior_text.push_str(&skills);
-            }
-        }
-
         // Arguments the resolution below filled while picking the tool. Used
         // instead of a second extraction pass when they cover what the tool
         // requires — one call that saw the tool list, the request and the
@@ -921,63 +883,61 @@ impl StepExecutor {
         // the whole schema and may have filled optional parameters too.
         let mut resolved_native = false;
 
-        if !is_system {
-            // External MCP tools resolve through the MCPAgent: it reasons over
-            // the tools discovery recorded for every connected server and
-            // answers with one call, required arguments filled. There is no
-            // keyword-scan fallback. An explicit, already-resolvable plan
-            // choice (server present + exact tool schema) is honoured first so
-            // a well-specified plan skips resolution.
-            let explicit_ok = match server.as_ref() {
-                Some(srv) => {
-                    has_explicit_tool && self.tool_caller.find_tool_schema(srv, &tool_name).is_some()
-                }
-                None => false,
+        // External MCP tools resolve through the MCPAgent: it reasons over
+        // the tools discovery recorded for every connected server and
+        // answers with one call, required arguments filled. There is no
+        // keyword-scan fallback. An explicit, already-resolvable plan
+        // choice (server present + exact tool schema) is honoured first so
+        // a well-specified plan skips resolution.
+        let explicit_ok = match server.as_ref() {
+            Some(srv) => {
+                has_explicit_tool && self.tool_caller.find_tool_schema(srv, &tool_name).is_some()
+            }
+            None => false,
+        };
+        if !explicit_ok {
+            // Same model that extracts the arguments below resolves the
+            // call — the pick is the harder judgement of the two, so
+            // leaving it on the default while upgrading extraction only
+            // got the arguments right for the wrong tool.
+            // A step that names its server (promoted, or opened from a
+            // skill) picks among that server's tools only — over every
+            // connected server a small model chose an unrelated tool.
+            // Nothing usable there falls back to every server.
+            let scoped: Vec<MCPServer> = match server.as_ref() {
+                Some(srv) if !has_explicit_tool => vec![srv.clone()],
+                _ => Vec::new(),
             };
-            if !explicit_ok {
-                // Same model that extracts the arguments below resolves the
-                // call — the pick is the harder judgement of the two, so
-                // leaving it on the default while upgrading extraction only
-                // got the arguments right for the wrong tool.
-                // A step that names its server (promoted, or opened from a
-                // skill) picks among that server's tools only — over every
-                // connected server a small model chose an unrelated tool.
-                // Nothing usable there falls back to every server.
-                let scoped: Vec<MCPServer> = match server.as_ref() {
-                    Some(srv) if !has_explicit_tool => vec![srv.clone()],
-                    _ => Vec::new(),
-                };
-                let mut picked = if scoped.is_empty() {
-                    None
-                } else {
-                    self.resolve(&directive, &scoped, Some(&prior_text), llm.clone())
-                };
-                if picked.is_none() {
-                    picked = self.resolve(&directive, mcp_servers, Some(&prior_text), llm.clone());
-                }
-                if let Some(picked) = picked {
-                    server = self
-                        .tool_caller
-                        .find_server(mcp_servers, &picked.server_id, &picked.server_id)
-                        .cloned();
-                    if let Some(srv) = server.as_ref() {
-                        // (Python also marked the tool explicit here; nothing
-                        // below reads that flag again.)
-                        tool_name = picked.tool_name.clone();
-                        resolved_arguments = picked.arguments.clone();
-                        resolved_native = picked.native;
-                        let mut keys: Vec<String> = resolved_arguments.keys().cloned().collect();
-                        keys.sort();
-                        info!(
-                            target: LOGGER,
-                            "[resolve] MCPAgent resolved '{}' on server '{}' (thinking={}, native={}, args={})",
-                            tool_name,
-                            srv.name,
-                            py_bool(picked.reasoned),
-                            py_bool(picked.native),
-                            py_list(&keys)
-                        );
-                    }
+            let mut picked = if scoped.is_empty() {
+                None
+            } else {
+                self.resolve(&directive, &scoped, Some(&prior_text), llm.clone())
+            };
+            if picked.is_none() {
+                picked = self.resolve(&directive, mcp_servers, Some(&prior_text), llm.clone());
+            }
+            if let Some(picked) = picked {
+                server = self
+                    .tool_caller
+                    .find_server(mcp_servers, &picked.server_id, &picked.server_id)
+                    .cloned();
+                if let Some(srv) = server.as_ref() {
+                    // (Python also marked the tool explicit here; nothing
+                    // below reads that flag again.)
+                    tool_name = picked.tool_name.clone();
+                    resolved_arguments = picked.arguments.clone();
+                    resolved_native = picked.native;
+                    let mut keys: Vec<String> = resolved_arguments.keys().cloned().collect();
+                    keys.sort();
+                    info!(
+                        target: LOGGER,
+                        "[resolve] MCPAgent resolved '{}' on server '{}' (thinking={}, native={}, args={})",
+                        tool_name,
+                        srv.name,
+                        py_bool(picked.reasoned),
+                        py_bool(picked.native),
+                        py_list(&keys)
+                    );
                 }
             }
         }
@@ -1271,37 +1231,6 @@ impl StepExecutor {
         let required_params = string_list(input_schema.get("required"));
         let properties = object_of(input_schema.get("properties"));
 
-        // Deterministically fill a missing file-write `content` from the data
-        // accumulated by upstream steps.  The content to write IS the prior
-        // step output (fetched page, generated text, analysis report) — asking
-        // a small model to regurgitate a large blob back into a JSON string is
-        // unreliable and was leaving `content` empty, so the step got skipped.
-        // Passing the accumulated data through directly is the whole point of
-        // the fetch → generate → write chain.
-        if tool_name == FILE_WRITE_TOOL
-            && required_params.iter().any(|p| p == "content")
-            && !arguments.get("content").is_some_and(is_truthy)
-            && has_prev
-        {
-            let prev = previous_results.unwrap_or(&[]);
-            let accumulated = prev
-                .iter()
-                .map(|r| field_str(r, "result").trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            if !accumulated.is_empty() {
-                info!(
-                    target: LOGGER,
-                    "[resolve] '{}' filled 'content' from {} accumulated step result(s) ({} chars)",
-                    tool_name,
-                    prev.len(),
-                    accumulated.chars().count()
-                );
-                arguments.insert("content".into(), Value::String(accumulated));
-            }
-        }
-
         let mut still_missing: Vec<String> = Vec::new();
         for param_name in &required_params {
             if is_unset(arguments.get(param_name)) {
@@ -1372,8 +1301,8 @@ impl StepExecutor {
 
     /// Call an MCP tool with pre-resolved arguments.
     ///
-    /// `cwd` is forwarded to local (stdio) servers so built-in system tools
-    /// resolve relative paths against the project work dir.
+    /// `cwd` is forwarded to local (stdio) servers so they resolve relative
+    /// paths against the project work dir.
     ///
     /// Returns `(formatted_content, raw_content)` or `None` on failure.
     pub fn call_tool(

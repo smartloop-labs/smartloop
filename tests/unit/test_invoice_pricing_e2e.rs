@@ -8,8 +8,10 @@
 //!    feature report."
 //!
 //! The planner produces a 3-step plan (explore → fetch → write) from the user
-//! prompt.  Built-in handlers run against a real copy of the invoice; the
-//! fetch MCP call is faked with the actual lovable.dev pricing data.
+//! prompt.  Smartloop drops the write step — it writes no files; the answer
+//! carries the report and the harness saves it.  Explore runs against a real
+//! copy of the invoice; the fetch is faked with the actual lovable.dev
+//! pricing data.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -30,25 +32,11 @@ use smartloop::mcp::MCPToolCallResult;
 use smartloop::workspace::workspace::MCPServer;
 
 use crate::shared::agents_core::{
-    failed_result, fetch_server, obj, orchestrator_over, system_tools_server, text_result, tool, FakeLlm,
+    failed_result, fetch_server, obj, orchestrator_over, text_result, FakeLlm,
 };
 
-/// The local smartloop system-tools MCP server (real stdio subprocess).
-fn system_server() -> MCPServer {
-    system_tools_server(vec![
-        tool(
-            "file-write",
-            "file-write",
-            json!({"path": {"type": "string"}, "content": {"type": "string"}}),
-            &["path", "content"],
-        ),
-        tool("file-read", "file-read", json!({"path": {"type": "string"}}), &["path"]),
-        tool("grep", "grep", json!({"pattern": {"type": "string"}}), &["pattern"]),
-    ])
-}
-
-/// `call_tool` replacement: fake the remote fetch tool, run the local system
-/// tools for real against temp files.
+/// `call_tool` replacement: fake the remote fetch tool, run anything else
+/// through a real, unhooked client.
 fn delegating_call_tool(orchestrator: &SLPOrchestrator, llm: &Arc<FakeLlm>, fetch_result: MCPToolCallResult) {
     let real = Arc::new(MCPToolCaller::new(
         Arc::new(MCPArgumentExtractor::new(llm.shared())),
@@ -363,8 +351,8 @@ mod invoice_pricing_pipeline {
     // Test: full explore → fetch → write pipeline                        #
     // ------------------------------------------------------------------ #
 
-    /// Complete 3-step flow driven by a user prompt: explore invoice → fetch
-    /// pricing → write report.
+    /// Flow driven by a user prompt: explore invoice → fetch pricing; the
+    /// planned write is left to the harness, so no file is written.
     #[test]
     #[serial]
     fn test_explore_fetch_write_pipeline() {
@@ -374,32 +362,19 @@ mod invoice_pricing_pipeline {
         stub_collect(&orchestrator, make_invoice_search_ctx());
         delegating_call_tool(&orchestrator, &llm, text_result(LOVABLE_PRICING_PAGE));
 
-        let result = execute(&orchestrator, &ws, &[make_fetch_server(), system_server()], None);
+        let result = execute(&orchestrator, &ws, &[make_fetch_server()], None);
 
         // Pipeline completed
         assert!(result.handled);
-        assert_eq!(result.tool_names.len(), 3);
+        assert_eq!(result.tool_names, vec!["explore".to_string(), "fetch".to_string()]);
 
-        // Step types executed in order
-        assert_eq!(result.tool_names[0], "explore"); // explore invoice
-        assert_eq!(result.tool_names[1], "fetch"); // fetch pricing
-        assert_eq!(result.tool_names[2], "file-write"); // write report
+        // Smartloop writes no files: the harness saves the report.
+        assert!(!std::path::Path::new(&ws.output_path).exists());
 
-        // Report was written to disk
-        assert!(std::path::Path::new(&ws.output_path).is_file(), "Report file was not created");
-        let report = std::fs::read_to_string(&ws.output_path).unwrap();
-
-        // Report contains invoice data
-        assert!(report.contains("1PTUKWWH-0015"));
-        assert!(report.contains("$25.00"));
-        assert!(report.contains("Pro"));
-
-        // Report contains pricing verification
-        assert!(report.contains("Match") || report.to_lowercase().contains("match"));
-
-        // Report contains Pro plan features
-        assert!(report.to_lowercase().contains("credit"));
-        assert!(report.contains("Custom domains") || report.to_lowercase().contains("custom domains"));
+        // The answer's context carries the pricing page.
+        let content = result.content.unwrap_or_default();
+        assert!(content.contains("$25"), "{content}");
+        assert!(content.to_lowercase().contains("custom domains"));
     }
 
     // ------------------------------------------------------------------ #

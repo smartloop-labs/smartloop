@@ -27,13 +27,8 @@ use crate::agents::mcp::mcp_agent::{
     ResolvedCall,
 };
 use crate::agents::mcp::mcp_tool_caller::MCPToolCaller;
-use crate::agents::mcp::server_selector::{
-    BASH_TOOL, EXPLORE_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL,
-};
-use crate::agents::orchestration::context::MCPExecutionResult;
-use crate::agents::planner::{
-    mcp_connection_is_usable, MCPToolContext, MatchedTool, PlanStep, StepType, SYSTEM_TOOLS_SERVER_ID,
-};
+use crate::agents::mcp::file_ops::FileOperations;
+use crate::agents::planner::{mcp_connection_is_usable, MCPToolContext, MatchedTool, PlanStep, StepType};
 use crate::agents::web_search_agent::{LlmResolver, WebSearchAgent};
 use crate::api::services::model_service::ModelService;
 use crate::llms::BaseLLM;
@@ -50,18 +45,9 @@ pub const LOGGER: &str = "smartloop.agents.mcp.explorer";
 pub const FETCH_TOOL_KEYWORDS: &[&str] =
     &["fetch", "browse", "scrape", "web", "http", "navigate", "get_url"];
 
-/// File extensions `explore_and_read` considers.
-pub const EXPLORE_EXTENSIONS: &[&str] = &[
-    ".yaml", ".yml", ".toml", ".json", ".cfg", ".ini", ".md", ".txt", ".rst", ".html", ".css",
-    ".sql", ".proto", ".graphql", ".sh",
-];
-/// Directory names `explore_and_read` never descends into, besides hidden ones.
-pub const EXPLORE_SKIP_DIRS: &[&str] = &[
-    ".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".mypy_cache",
-    ".pytest_cache", "dist", "build", ".eggs", "*.egg-info", ".out",
-];
-pub const MAX_EXPLORE_FILES: usize = 50;
-pub const MAX_FILE_CHARS: usize = 2000;
+/// The most of one named file an explore step reads (see
+/// [`Explorer::read_file`]).
+pub const MAX_READ_FILE_CHARS: usize = 100_000;
 
 /// How much of one fetched record body reaches the prompt.  A Notion page can
 /// be very long and three of them share the answer's context with everything
@@ -1024,10 +1010,7 @@ Does answering the latest message require a new web search?
         let mut servers: Vec<&MCPServer> = mcp_servers
             .iter()
             .filter(|s| {
-                mcp_connection_is_usable(*s)
-                    && !s.system
-                    && s.id != SYSTEM_TOOLS_SERVER_ID
-                    && !s.tools.is_empty()
+                mcp_connection_is_usable(*s) && !s.system && !s.tools.is_empty()
             })
             .collect();
         if servers.is_empty() {
@@ -1132,18 +1115,10 @@ Does answering the latest message require a new web search?
         // document.
         let mut raw = String::new();
         let mut tool_name = String::new();
-        // The Skills server's state is a few local files: shown up front, the
-        // model changes a skill directly instead of reading it here first —
-        // a read in this pass leaves no write behind for a step to make.
-        let skills = crate::api::mcp::skill_server::skills_context(std::slice::from_ref(&*server));
         for attempt in 1..=2 {
-            // The Skills server is internal: the user never connected it, so
-            // naming it on the status line is noise.
-            if server.id != crate::api::mcp::skill_server::SKILLS_SERVER_ID {
-                Self::emit(progress, "tool", &format!("Choosing a {} tool", server_name));
-            }
+            Self::emit(progress, "tool", &format!("Choosing a {} tool", server_name));
             let Some(picked) =
-                self.mcp_agent.resolve_shared(query, std::slice::from_ref(&*server), skills.as_deref(), llm.clone())
+                self.mcp_agent.resolve_shared(query, std::slice::from_ref(&*server), None, llm.clone())
             else {
                 return String::new();
             };
@@ -1420,10 +1395,9 @@ Does answering the latest message require a new web search?
     /// not user data — they must never leak into retrieved context.
     ///
     /// Covers skill files (`skills/` dirs, `SKILL.md`), MCP catalogue files
-    /// (`mcp-*`), and bundled system files whose basename is `__`-prefixed —
-    /// notably `__system_mcp__.md`, which lists the built-in tool
-    /// descriptions. Without this a fund/table prompt can sweep those tool
-    /// descriptions in as fake data rows (e.g. "Smartloop | SMTL | N/A").
+    /// (`mcp-*`), and internal files whose basename is `__`-prefixed.
+    /// Without this a fund/table prompt can sweep tool descriptions in as
+    /// fake data rows (e.g. "Smartloop | SMTL | N/A").
     pub fn is_non_data_file(fname: &str) -> bool {
         if fname.is_empty() {
             return false;
@@ -2186,116 +2160,38 @@ Does answering the latest message require a new web search?
         (raw, citations)
     }
 
-    /// Explore -> pick best file -> read -> return content.
-    pub fn explore_and_read(&self, user_message: &str, cwd: &str) -> MCPExecutionResult {
-        tracing::info!(target: LOGGER, "[explore] Running explore → read pipeline in {}", cwd);
-        let mut tool_names: Vec<String> = Vec::new();
-        let cwd_path = Path::new(cwd);
-
-        let mut candidates: Vec<String> = Vec::new();
-        // Nothing to read in the framework's own state.
-        let walk_root = if crate::paths::in_slp_home(cwd) { Path::new("") } else { cwd_path };
-        walk(walk_root, &mut |root, dirs, files| {
-            dirs.retain(|d| {
-                !d.starts_with('.') && !EXPLORE_SKIP_DIRS.contains(&d.as_str()) && !d.ends_with(".egg-info")
-            });
-            let mut sorted_files = files.to_vec();
-            sorted_files.sort();
-            for fname in sorted_files {
-                let ext = splitext_ext(&fname).to_lowercase();
-                if !EXPLORE_EXTENSIONS.contains(&ext.as_str()) {
-                    continue;
-                }
-                candidates.push(relpath(&root.join(&fname), cwd_path));
-                if candidates.len() >= MAX_EXPLORE_FILES {
-                    break;
-                }
-            }
-            candidates.len() < MAX_EXPLORE_FILES
-        });
-
-        if candidates.is_empty() {
-            tracing::info!(target: LOGGER, "[explore] No source files found");
-            return MCPExecutionResult { handled: false, ..Default::default() };
+    /// Read a file the request named, in-process: text as it is, a binary
+    /// document (PDF, DOCX, PPTX, CSV) through its parser
+    /// ([`FileOperations::parse_binary_file`]).  Returns the content under a
+    /// `--- <path> ---` header, or `None` when the file can't be read.
+    pub fn read_file(&self, path: &str) -> Option<String> {
+        let file = Path::new(path);
+        if !file.is_file() {
+            return None;
         }
-
-        tool_names.push(EXPLORE_TOOL.to_string());
-        let file_list = candidates.iter().map(|f| format!("  {}", f)).collect::<Vec<_>>().join("\n");
-        tracing::info!(target: LOGGER, "[explore] Found {} files", candidates.len());
-
-        let pick_prompt = format!(
-            "User question: {}\n\n\
-             Files in the project directory:\n{}\n\n\
-             Which files are most relevant to answer the user's question? \
-             Pick up to 3 files. Reply with ONLY the file paths, one per line.",
-            user_message, file_list
-        );
-        let pick_response = match guarded_invoke(self.llm.as_deref(), &pick_prompt, None) {
-            Ok(text) => {
-                let text = text.trim().to_string();
-                tracing::info!(target: LOGGER, "[explore] LLM picked files: {}", text);
-                text
-            }
-            Err(e) => {
-                tracing::warn!(target: LOGGER, "[explore] File pick failed: {}", e);
-                String::new()
-            }
-        };
-
-        let mut picked: Vec<String> = Vec::new();
-        for line in pick_response.split('\n') {
-            let line = line.trim().trim_start_matches(['-', ' ']).trim_matches('`');
-            if candidates.iter().any(|c| c == line) {
-                picked.push(line.to_string());
-            }
-        }
-        if picked.is_empty() {
-            if let Some(readme) = candidates.iter().find(|c| c.to_lowercase().contains("readme")) {
-                picked.push(readme.clone());
-            }
-            if picked.is_empty() {
-                picked = candidates.iter().take(1).cloned().collect();
-            }
-        }
-
-        tracing::info!(target: LOGGER, "[explore] Reading {} file(s): {}", picked.len(), py_list(picked.iter().map(String::as_str)));
-
-        let mut file_contents: Vec<String> = Vec::new();
-        for fpath in picked.iter().take(3) {
-            let full_path = cwd_path.join(fpath);
-            let content = match read_text_lossy(&full_path) {
+        let ext = splitext_ext(path).to_lowercase();
+        let content = if FileOperations::BINARY_EXTENSIONS.contains(&ext.as_str()) {
+            let Some(llm) = self.llm.clone() else {
+                tracing::warn!(target: LOGGER, "[explore] No model to parse {}", path);
+                return None;
+            };
+            FileOperations::new(llm).parse_binary_file(path)?
+        } else {
+            match read_text_lossy(file) {
                 Ok(content) => content,
                 Err(e) => {
-                    tracing::warn!(target: LOGGER, "[explore] Could not read {}: {}", fpath, e);
-                    continue;
+                    tracing::warn!(target: LOGGER, "[explore] Could not read {}: {}", path, e);
+                    return None;
                 }
-            };
-            let content = if char_len(&content) > MAX_FILE_CHARS {
-                format!("{}\n... (truncated)", take_chars(&content, MAX_FILE_CHARS))
-            } else {
-                content
-            };
-            tracing::info!(target: LOGGER, "[explore] Read {} ({} chars)", fpath, char_len(&content));
-            file_contents.push(format!("--- {} ---\n{}", fpath, content));
-        }
-        tool_names.push(FILE_READ_TOOL.to_string());
-
-        if file_contents.is_empty() {
-            return MCPExecutionResult { handled: false, ..Default::default() };
-        }
-
-        // Return raw file contents; the final streaming LLM synthesizes.
-        let combined = file_contents.join("\n\n");
-        tracing::info!(target: LOGGER, "[explore] Returning raw file contents ({} chars)", char_len(&combined));
-
-        MCPExecutionResult {
-            handled: true,
-            content: Some(combined),
-            tool_name: Some(FILE_READ_TOOL.to_string()),
-            server_name: Some(SYSTEM_TOOLS_SERVER_ID.to_string()),
-            tool_names,
-            ..Default::default()
-        }
+            }
+        };
+        let content = if char_len(&content) > MAX_READ_FILE_CHARS {
+            format!("{}\n... (truncated)", take_chars(&content, MAX_READ_FILE_CHARS))
+        } else {
+            content
+        };
+        tracing::info!(target: LOGGER, "[explore] Read {} ({} chars)", path, char_len(&content));
+        Some(format!("--- {} ---\n{}", path, content))
     }
 
     // ================================================================ fetch
@@ -2318,7 +2214,6 @@ Does answering the latest message require a new web search?
         user_message: &str,
     ) -> Vec<PlanStep> {
         let _ = available_servers;
-        const SYSTEM_TOOLS: [&str; 5] = [FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL, BASH_TOOL, EXPLORE_TOOL];
         const FETCH_INTENT_WORDS: [&str; 7] = ["fetch", "browse", "scrape", "navigate", "retrieve", "get url", "http"];
         let extract_urls = |text: &str| -> Vec<String> {
             self.arg_extractor.as_ref().map(|x| x.extract_urls_from_text(text)).unwrap_or_default()
@@ -2326,10 +2221,7 @@ Does answering the latest message require a new web search?
 
         let mut resolved = Vec::with_capacity(steps.len());
         for step in steps {
-            // Built-in system tools are explicit MCP steps — never rewrite
-            // them into a fetch step even when the request mentions a URL.
-            let is_system_tool = step.tool_name.as_deref().is_some_and(|t| SYSTEM_TOOLS.contains(&t));
-            if step.step_type == StepType::Tool && !is_system_tool {
+            if step.step_type == StepType::Tool {
                 let instr_lower = step.instruction.to_lowercase();
                 let tool_lower = step.tool_name.as_deref().unwrap_or("").to_lowercase();
                 let is_fetch_intended = FETCH_TOOL_KEYWORDS.iter().any(|kw| tool_lower.contains(kw))

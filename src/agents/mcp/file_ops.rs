@@ -14,10 +14,10 @@ pub const LOGGER: &str = "smartloop.agents.mcp.file_ops";
 
 /// Binary document parsing for the explorer.
 ///
-/// File read/write/grep/bash now run through the smartloop system-tools MCP
-/// server (see `crate::api::mcp::system_server`); the only direct helper
-/// still needed is binary parsing, which requires an LLM and so cannot live
-/// in the stdio MCP subprocess.
+/// The explorer reads a named file in-process (see
+/// `Explorer::read_file`); a binary document goes through here, since its
+/// parsers need an LLM.  Smartloop writes no files and runs no commands —
+/// the harness acts on the reply.
 pub struct FileOperations {
     pub llm: Arc<dyn BaseLLM>,
 }
