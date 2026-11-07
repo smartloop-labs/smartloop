@@ -1137,7 +1137,11 @@ Does answering the latest message require a new web search?
         // a read in this pass leaves no write behind for a step to make.
         let skills = crate::api::mcp::skill_server::skills_context(std::slice::from_ref(&*server));
         for attempt in 1..=2 {
-            Self::emit(progress, "tool", &format!("Choosing a {} tool", server_name));
+            // The Skills server is internal: the user never connected it, so
+            // naming it on the status line is noise.
+            if server.id != crate::api::mcp::skill_server::SKILLS_SERVER_ID {
+                Self::emit(progress, "tool", &format!("Choosing a {} tool", server_name));
+            }
             let Some(picked) =
                 self.mcp_agent.resolve_shared(query, std::slice::from_ref(&*server), skills.as_deref(), llm.clone())
             else {
