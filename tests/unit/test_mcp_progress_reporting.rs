@@ -64,6 +64,22 @@ fn test_the_long_resolution_leg_announces_itself() {
     assert!(message.contains("Notion"), "{message}");
 }
 
+/// The Skills server is internal, so its tool pick isn't announced.
+#[test]
+fn test_the_skills_server_pick_is_not_announced() {
+    let exp = explorer(None, "", vec![]);
+    let (sink, seen) = recording_sink();
+    let skills = MCPServer {
+        id: smartloop::api::mcp::skill_server::SKILLS_SERVER_ID.to_string(),
+        name: smartloop::api::mcp::skill_server::SKILLS_SERVER_NAME.to_string(),
+        ..Default::default()
+    };
+    exp.run_mcp_server("q", &skills, None, Some(sink));
+
+    let messages = messages(&seen);
+    assert!(!messages.iter().any(|m| m.contains("Choosing")), "{messages:?}");
+}
+
 #[test]
 fn test_the_tool_and_its_arguments_are_named() {
     // "Calling Notion" cannot tell reading a page from searching for one,

@@ -392,11 +392,13 @@ impl SkillProcessor {
             ),
         );
 
-        // Skill matching is an intent judgement the small orchestrator model is
-        // poor at (it defaults to picking the only listed skill). Prefer the
-        // 'reasoning'-capability model, but only when it is resident or fits — a
-        // memory-tight device falls back to the mini instead of risking an OOM.
-        let match_llm = self.models.decision_llm(Some(ModelCapability::Reasoning.value()), None);
+        // Matched on the model this request already runs on.  This runs before
+        // every turn in a project with skills, and routing it to the
+        // 'reasoning' model meant loading (or swapping to) a second, larger
+        // model just to emit a skill number, so the user sat on "Analyzing
+        // your request…" for longer than the answer took.  The prompt itself
+        // guards against picking the only listed skill.
+        let match_llm = self.agent_llm();
         tracing::info!(
             target: LOG_TARGET,
             "[models] SKILL_MATCH → {}",
