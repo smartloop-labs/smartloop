@@ -242,15 +242,6 @@ impl ChatService for FakeService {
             citations: citations.map(|c| c.to_vec()),
         });
     }
-    fn maybe_write_output(
-        &self,
-        _user_message: &str,
-        _llm_response: &str,
-        _cwd: Option<&str>,
-        _session_id: Option<&str>,
-    ) -> smartloop::api::services::output_writer::WriteOutcome {
-        smartloop::api::services::output_writer::WriteOutcome::default()
-    }
     fn model_client(&self) -> Arc<dyn ModelClient> {
         // Chat generates through the model client, whose default
         // implementation is the in-process one — so put the real client in

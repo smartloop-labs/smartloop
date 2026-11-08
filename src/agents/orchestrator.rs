@@ -449,9 +449,6 @@ impl SLPOrchestrator {
 
         let mut mcp_tool_contexts: Vec<MCPToolContext> = Vec::new();
         for srv in &available_servers {
-            // Include the system tools server ("smartloop") here so its
-            // built-in tools (file-read, file-write, bash, …) resolve through
-            // the same ```mcp-block path as third-party servers like fetch.
             // Execution is server-agnostic: find_server/call_tool dispatch
             // against the full mcp_servers list regardless of server type.
             let server_id = match srv.get("id") {
@@ -581,10 +578,13 @@ impl SLPOrchestrator {
             }
         }
 
-        let non_explore: Vec<String> =
-            accumulated.iter().filter(|r| tool_name_of(r) != EXPLORE_TOOL).map(content_of).collect();
-        let explore_parts: Vec<String> =
-            accumulated.iter().filter(|r| tool_name_of(r) == EXPLORE_TOOL).map(content_of).collect();
+        // An explore that read a file the user named counts with the tool
+        // output: it is the data the request asked for, not search context.
+        let is_search = |r: &Map<String, Value>| {
+            tool_name_of(r) == EXPLORE_TOOL && !r.get("is_tool_result").is_some_and(truthy)
+        };
+        let non_explore: Vec<String> = accumulated.iter().filter(|r| !is_search(r)).map(content_of).collect();
+        let explore_parts: Vec<String> = accumulated.iter().filter(|r| is_search(r)).map(content_of).collect();
         let has_explore_output = explore_parts.iter().any(|c| !c.is_empty());
 
         // Citations track which indexed documents contributed to the

@@ -72,14 +72,14 @@ fn author_pinned_steps_stay_pinned() {
 }
 
 #[test]
-fn builtin_system_steps_stay_pinned() {
+fn legacy_fetch_server_steps_stay_pinned() {
     let orch = orchestrator();
     let mut steps = vec![PlanStep {
-        server_id: Some("__system_tools__".to_string()),
-        ..linear_step(1, "bash")
+        server_id: Some(smartloop::agents::planner::FETCH_SERVER_ID.to_string()),
+        ..linear_step(1, "fetch")
     }];
     orch.pipeline().open_skill_tool_steps(&mut steps, LINEAR_SKILL);
-    assert_eq!(steps[0].tool_name.as_deref(), Some("bash"));
+    assert_eq!(steps[0].tool_name.as_deref(), Some("fetch"));
 }
 
 #[test]

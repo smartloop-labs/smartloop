@@ -25,7 +25,6 @@ use crate::agents::mcp::explorer::SearchContext;
 use crate::agents::mcp::server_selector::EXPLORE_TOOL;
 use crate::agents::nodes::NodeResult;
 use crate::agents::orchestration::context::{MCPExecutionResult, OrchestratorContext};
-use crate::agents::planner::SYSTEM_TOOLS_SERVER_NAME;
 use crate::agents::sanitize::{fence_document_content, sanitize_document_content};
 use crate::llms::BaseLLM;
 
@@ -263,7 +262,6 @@ impl ResponseBuilder {
                 content: Some(ready_context),
                 skill_instruction,
                 tool_name: all_tool_names.last().cloned(),
-                server_name: Some(SYSTEM_TOOLS_SERVER_NAME.to_string()),
                 tool_names: all_tool_names,
                 // The synthesized document was written from the web pages and
                 // tool results gathered for this turn (a skill run takes this
@@ -430,7 +428,6 @@ impl ResponseBuilder {
             content: Some(ready_context),
             skill_instruction,
             tool_name: all_tool_names.last().cloned(),
-            server_name: Some(SYSTEM_TOOLS_SERVER_NAME.to_string()),
             tool_names: all_tool_names,
             citations: doc_citations,
             ..Default::default()
@@ -791,7 +788,7 @@ mod tests {
         );
         assert!(result.handled);
         assert_eq!(result.tool_name.as_deref(), Some(EXPLORE_TOOL));
-        assert_eq!(result.server_name.as_deref(), Some(SYSTEM_TOOLS_SERVER_NAME));
+        assert_eq!(result.server_name, None);
         let content = result.content.unwrap();
         assert!(content.contains("doc text"));
         assert!(content.contains("WEB SEARCH RESULTS:\npage"));

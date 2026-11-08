@@ -67,7 +67,7 @@ use crate::agents::orchestration::tool_fanout::ToolFanout;
 use crate::agents::mcp::explorer::mcp_tool_citation;
 use crate::agents::planner::{
     promote_deferred_tool, promoted_instruction, ClassifyOptions, IntentType, ModelTier, PlanStep, Planner,
-    StepType, FETCH_SERVER_ID, SYSTEM_TOOLS_SERVER_ID, SYSTEM_TOOLS_SERVER_NAME,
+    StepType, FETCH_SERVER_ID,
 };
 use crate::agents::web_search_agent::WebSearcher;
 use crate::llms::base_llm::BaseLLM;
@@ -626,8 +626,10 @@ impl PipelineBuilder {
             // Small classifier LLM often hallucinates EXPLORE for plain
             // question queries.  If there's nothing indexed to explore,
             // treat it as conversation — otherwise we'd waste a search
-            // step and route the answer through the small model.
-            if !has_indexed_context {
+            // step and route the answer through the small model.  A file the
+            // request names is something to read, indexed or not.
+            let names_a_file = classification.detected_paths.iter().any(|p| std::path::Path::new(p).is_file());
+            if !has_indexed_context && !names_a_file {
                 classification.intent = IntentType::Conversation;
                 classification.reasoning =
                     "no indexed context to explore — treating as conversation".to_string();
@@ -774,7 +776,7 @@ impl PipelineBuilder {
     ///
     /// A step stays pinned when the skill author fixed its values
     /// (`default_args`, an ```mcp block's `inferred_args`), when it fans out
-    /// (`for_each`), when it targets the built-in system tools, or when it is
+    /// (`for_each`), when it targets a legacy built-in server, or when it is
     /// conditional — the condition is gated by the resolve node, which the
     /// tool loop does not have.  A later step's condition is extracted from
     /// the skill text here, with the tool name still in hand; the resolve node
@@ -790,10 +792,7 @@ impl PipelineBuilder {
             let pinned_by_author = step.default_args.as_ref().is_some_and(|a| !a.is_empty())
                 || step.inferred_args.is_some()
                 || step.for_each == Some(true);
-            let builtin = matches!(
-                step.server_id.as_deref(),
-                Some(SYSTEM_TOOLS_SERVER_ID) | Some(FETCH_SERVER_ID)
-            );
+            let builtin = step.server_id.as_deref() == Some(FETCH_SERVER_ID);
             if pinned_by_author || builtin {
                 continue;
             }
@@ -1135,6 +1134,23 @@ impl PipelineBuilder {
             // someone else's page in front of the user's own data.
             let sc = search_ctx.lock().clone();
             let mut parts: Vec<String> = Vec::new();
+            // A file the request named is read in-process, whole, ahead of
+            // anything the search turned up around it.
+            let named_file = step
+                .default_args
+                .as_ref()
+                .and_then(|a| a.get("path"))
+                .map(|p| crate::paths::expand_home(p))
+                .filter(|p| std::path::Path::new(p).is_file());
+            let mut read_named_file = false;
+            if let Some(path) = named_file {
+                let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned());
+                self.models.emit("explore", "processing", &format!("Reading {}", name.as_deref().unwrap_or("the file")));
+                if let Some(content) = self.explorer.read_file(&path) {
+                    parts.push(content);
+                    read_named_file = true;
+                }
+            }
             if !sc.vector_context.is_empty() {
                 parts.push(sc.vector_context.clone());
             }
@@ -1160,7 +1176,16 @@ impl PipelineBuilder {
             if !citations.is_empty() {
                 ctx.write().explore_citations = Some(citations);
             }
-            return plan_step_result(&node_id, step, &content, None);
+            let mut result = plan_step_result(&node_id, step, &content, None);
+            // The file the user named is the data the request went to get,
+            // as a tool's answer is: it skips the relevance judge and reaches
+            // the answer alongside any tool output.
+            if read_named_file {
+                if let Some(data) = result.data.as_object_mut() {
+                    data.insert("is_tool_result".into(), Value::Bool(true));
+                }
+            }
+            return result;
         }
 
         // ANALYZE: assess relevance of explore output via LLM
@@ -1519,10 +1544,6 @@ Assess whether these search results are relevant to the user's request. If relev
             }
 
             let servers = step_servers(&step, &c.mcp_servers);
-            // A call on the Skills server rewrites a skill from what it says now.
-            if let Some(skills) = crate::api::mcp::skill_server::skills_context(&servers) {
-                instruction.push_str(&format!("\n\n{skills}"));
-            }
             emit("Working with your connected tools");
             if let Some(outcome) =
                 this.steps.run_tool_loop(&*llm, &instruction, &servers, non_empty(&c.effective_cwd), &emit)
@@ -1730,14 +1751,12 @@ Assess whether these search results are relevant to the user's request. If relev
                 if is_tool || has_skill || this.judge.serves_intent(&c.user_message, label, &text) {
                     // A connected server's tool answered: credit it, the way
                     // the web pages and documents an answer drew on are.
-                    // Built-in file/shell tools and URL fetches are the
-                    // assistant's own actions, not a source.
+                    // URL fetches are the assistant's own actions, not a
+                    // source.
                     if is_tool {
                         let server_id = data_str(data, "server_id");
                         let server_name = data_str(data, "server_name");
-                        let builtin = server_id == SYSTEM_TOOLS_SERVER_ID
-                            || server_id == FETCH_SERVER_ID
-                            || server_name == SYSTEM_TOOLS_SERVER_NAME;
+                        let builtin = server_id == FETCH_SERVER_ID;
                         if !builtin && !server_name.is_empty() && !tool_name.is_empty() {
                             search_ctx
                                 .lock()
@@ -1767,8 +1786,10 @@ Assess whether these search results are relevant to the user's request. If relev
             }
 
             let entry = |name: &str, content: &str| json!({ "tool_name": name, "content": content });
-            let accumulated_json: Vec<Value> =
-                all_accumulated.iter().map(|(n, t, _)| entry(n, t)).collect();
+            let accumulated_json: Vec<Value> = all_accumulated
+                .iter()
+                .map(|(n, t, is_tool)| json!({ "tool_name": n, "content": t, "is_tool_result": is_tool }))
+                .collect();
             let tool_results: Vec<Value> = all_accumulated
                 .iter()
                 .filter(|(_, _, is_tool)| *is_tool)

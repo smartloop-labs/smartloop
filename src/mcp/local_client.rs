@@ -383,7 +383,7 @@ impl LocalMCPClient {
         if self.args.is_empty() {
             return Err(MCPLaunchError(format!(
                 "Cannot launch MCP server: command '{}' has no arguments. \
-                 Provide at least the module or package name (e.g. args=['-m', 'smartloop.api.mcp.system_server'] \
+                 Provide at least the module or package name (e.g. args=['-m', 'mcp_server_fetch'] \
                  or args=['yahoo-finance-mcp']).",
                 self.command
             ))

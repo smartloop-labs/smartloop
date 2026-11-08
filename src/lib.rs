@@ -24,7 +24,6 @@ pub mod paths;
 pub mod platform;
 pub mod search;
 pub mod server;
-pub mod skills;
 pub mod supervisor;
 pub mod tasks;
 pub mod trainer;

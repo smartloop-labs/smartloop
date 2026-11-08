@@ -1,7 +1,7 @@
 //! Second half of `smartloop/api/services/model_service.py` (from
 //! `_llm_for_response` onward): response-model routing and generation,
 //! documents, projects, model unloading, MCP server registration and
-//! provisioning, orchestration, auto-write, assets and vision Q&A.
+//! provisioning, orchestration, assets and vision Q&A.
 //!
 //! The `ModelService` struct, its fields and the first half of its methods
 //! live in the parent module (`super`).
@@ -31,7 +31,6 @@ use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::agents::mcp::server_summarizer::MCPServerSummarizer;
 use crate::agents::orchestration::model_router::ProgressCallback;
 use crate::agents::orchestrator::{ExecuteOptions, SLPOrchestrator, SLPOrchestratorOptions};
-use crate::api::services::output_writer::{self, WriteOutcome};
 use crate::llms::base_llm::{BatchPrompt, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::llms::cloud_llm::{local_only_scope, CloudLLM};
 use crate::model_host::remote_llm::RemoteLLM;
@@ -102,39 +101,6 @@ pub static IMAGE_CROSS_REF_RE: Lazy<Regex> = Lazy::new(|| {
     .expect("valid IMAGE_CROSS_REF_RE")
 });
 
-/// Inline write intent in a user message ("create", "write", "export", ...).
-pub static WRITE_INTENT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(create|generate|write|save|export|produce|make|build|draft)\b")
-        .expect("valid WRITE_INTENT_RE")
-});
-
-/// Matches bare "write" / "save" / "write it" / "save that" commands.
-pub static BARE_WRITE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^\s*(write|save|write\s+(it|that|this)|save\s+(it|that|this))\s*[.!]?\s*$")
-        .expect("valid BARE_WRITE_RE")
-});
-
-/// Conversational preamble ("Sure, here's ...") stripped before auto-write.
-pub static PREAMBLE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(concat!(
-        r"(?i)^(?:(?:sure|okay|of course|absolutely|certainly|here(?:'s| is| are| you go))",
-        r"[^\n]*\n+)+",
-    ))
-    .expect("valid PREAMBLE_RE")
-});
-
-/// Conversational postamble ("Let me know ...") stripped before auto-write.
-pub static POSTAMBLE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(concat!(
-        r"(?i)\n+(?:(?:i hope|let me know|feel free|enjoy|bon appétit|happy|hope this|",
-        r"if you (?:have|need|want)|don't hesitate|",
-        r"would you like|do you want|shall i|",
-        r"you (?:can|could|may|might) (?:also|adjust|modify|change|customize|tweak)|",
-        r"this (?:can be|could be|is just|is a) (?:adjusted|modified|customized|starting)|",
-        r"note:|please note|disclaimer|tips?:)[^\n]*\n*)+\s*$",
-    ))
-    .expect("valid POSTAMBLE_RE")
-});
 
 /// System-message steering for direct vision Q&A.
 ///
@@ -202,7 +168,6 @@ static FRIENDLY_CRASH_RE: Lazy<Regex> = Lazy::new(|| {
 static EPERM_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[Errno 1\] Operation not permitted: '([^']*)'").expect("valid regex"));
 static MCP_DOC_NAME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^a-z0-9]+").expect("valid regex"));
-static SAFE_FILENAME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^\w\-]").expect("valid regex"));
 
 // ------------------------------------------------------------------ helpers
 
@@ -2987,11 +2952,9 @@ impl ModelService {
 
     /// Every non-system server in a project, each with its provisioning
     /// state, so watching a fresh connection costs one request per poll.
-    /// A server smartloop installs itself, kept out of the user's server
-    /// lists.  The Skills server is not `system` — that flag would also hide
-    /// it from the agent, which must be able to call save-skill.
+    /// A server marked `system`, kept out of the user's server lists.
     pub fn is_builtin_server(server: &MCPServer) -> bool {
-        server.system || server.id == crate::api::mcp::skill_server::SKILLS_SERVER_ID
+        server.system
     }
 
     pub fn list_mcp_servers_with_status(&self, project_id: &str) -> anyhow::Result<Vec<Value>> {
@@ -3489,10 +3452,12 @@ impl ModelService {
             return none;
         };
 
-        // Migrate legacy REMOTE system servers to LOCAL on first access.
+        // Fix stale user server launchers and sweep the built-in servers and
+        // skills smartloop used to install, before anything reads them.
         if let Err(e) = self.migrate_servers_to_local(&current_project.id) {
-            tracing::warn!(target: LOG, "[orchestrator] system server migration failed: {e}");
+            tracing::warn!(target: LOG, "[orchestrator] MCP server migration failed: {e}");
         }
+        self.sweep_legacy_builtins(&current_project.id);
         let current_project = model.workspace.read().project(&current_project.id).cloned().unwrap_or(current_project);
 
         // Enabled servers that have tools (both local and remote).
@@ -3728,126 +3693,6 @@ impl ModelService {
         };
         tracing::warn!(target: LOG, "Tool call attempt failed: {failure}");
         (None, true, Some(format!("Tool call failed: {failure}")), None, None, false, None, false)
-    }
-
-    // --------------------------------------------------------------- auto-write
-
-    /// Write LLM output into `cwd` when the user asked to create/generate/write.
-    ///
-    /// Two modes: a bare "write"/"save" command writes the last assistant
-    /// response from session history (refine back and forth, then save); an
-    /// inline write intent writes the current `llm_response`.  The answer is
-    /// saved as one `<name>.md` under `.out/` (see [`output_writer`]); writing
-    /// an answer's files into the project is the client's job.  Returns what
-    /// was written — empty when no write was needed.
-    pub fn maybe_write_output(
-        &self,
-        user_message: &str,
-        llm_response: &str,
-        cwd: Option<&str>,
-        session_id: Option<&str>,
-    ) -> WriteOutcome {
-        let Some(cwd) = non_empty(cwd) else {
-            return WriteOutcome::default();
-        };
-        // No answer came: there's nothing of the user's to save.
-        if llm_response.trim_start().starts_with("**No response generated.**") {
-            return WriteOutcome::default();
-        }
-        let cwd = PathBuf::from(expand_home(cwd));
-        let mut content_to_write = llm_response.to_string();
-
-        if BARE_WRITE_RE.is_match(user_message) {
-            // Bare "write" command — write the last assistant response.
-            if let Some(session_id) = non_empty(session_id) {
-                match self.get_last_assistant_response(session_id) {
-                    Some(last_response) => {
-                        content_to_write = last_response;
-                        tracing::info!(
-                            target: LOG,
-                            "[auto-write] Bare write command — using last assistant response ({} chars)",
-                            content_to_write.chars().count()
-                        );
-                    }
-                    None => {
-                        tracing::info!(target: LOG, "[auto-write] Bare write command but no prior assistant response found");
-                        return WriteOutcome::default();
-                    }
-                }
-            } else if llm_response.is_empty() {
-                return WriteOutcome::default();
-            }
-        } else if llm_response.is_empty() || !WRITE_INTENT_RE.is_match(user_message) {
-            return WriteOutcome::default();
-        }
-
-        let content_to_write = Self::extract_document_content(&content_to_write);
-        if content_to_write.is_empty() {
-            return WriteOutcome::default();
-        }
-        let Some(llm) = self.resident_llm() else {
-            return WriteOutcome::default();
-        };
-
-        // Ask the LLM only for the filename — write the actual content.
-        let prompt = format!(
-            "User request: {user_message}\n\n\
-             Pick a short descriptive filename (without extension) for saving this output. \
-             Examples: \"project_summary\", \"api_notes\", \"readme_draft\".\n\n\
-             Reply with ONLY the filename, nothing else."
-        );
-        let outcome = catch_unwind(AssertUnwindSafe(|| -> anyhow::Result<Option<String>> {
-            let raw = llm.invoke(&prompt, None, None);
-            let file_name = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
-            let safe_name = SAFE_FILENAME_RE.replace_all(&file_name, "_").trim_matches('_').to_string();
-            if safe_name.is_empty() {
-                return Ok(None);
-            }
-            Ok(Some(output_writer::write_document(&cwd, &safe_name, &content_to_write)?))
-        }));
-        match outcome {
-            Ok(Ok(path)) => WriteOutcome { written: path.into_iter().collect() },
-            Ok(Err(e)) => {
-                tracing::warn!(target: LOG, "[auto-write] Failed: {e}");
-                WriteOutcome::default()
-            }
-            Err(panic) => {
-                tracing::warn!(target: LOG, "[auto-write] Failed: {}", panic_message(&panic));
-                WriteOutcome::default()
-            }
-        }
-    }
-
-    /// The last assistant message from session history.
-    pub fn get_last_assistant_response(&self, session_id: &str) -> Option<String> {
-        let history = self.get_session_history(session_id);
-        history.iter().rev().find(|m| m.role == "assistant" && !m.content.is_empty()).map(|m| m.content.clone())
-    }
-
-    /// Strip conversational preamble/postamble, keeping only the document body.
-    pub fn extract_document_content(text: &str) -> String {
-        let lines: Vec<&str> = text.split('\n').collect();
-
-        // If the response contains a markdown heading, start from the first.
-        let first_heading = lines.iter().position(|line| line.starts_with('#'));
-
-        let mut text = text.to_string();
-        match first_heading {
-            Some(index) if index > 0 => {
-                let preamble = lines[..index].join("\n");
-                if preamble.trim().chars().count() < 200 {
-                    text = lines[index..].join("\n");
-                } else {
-                    text = PREAMBLE_RE.replace_all(&text, "").into_owned();
-                }
-            }
-            _ => {
-                text = PREAMBLE_RE.replace_all(&text, "").into_owned();
-            }
-        }
-
-        let text = POSTAMBLE_RE.replace_all(&text, "");
-        text.trim().to_string()
     }
 
     // ------------------------------------------------------------------- assets

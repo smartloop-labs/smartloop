@@ -12,8 +12,7 @@ use serde_json::{json, Map, Value};
 
 use smartloop::agents::planner::{
     extract_paths, ClassificationResult, ClassifyOptions, ExecutionPlan, IntentType, MCPToolContext,
-    MatchedTool, ModelTier, PlanContext, Planner, StepType, BASH_TOOL, FILE_READ_TOOL, FILE_WRITE_TOOL, GREP_TOOL,
-    SYSTEM_TOOLS_SERVER_ID,
+    MatchedTool, ModelTier, PlanContext, Planner, StepType, BASH_TOOL, EXPLORE_TOOL, FILE_WRITE_TOOL,
 };
 use smartloop::llms::base_llm::{CallOptions, CancelEvent, ChatMessage, GenerationStream};
 use smartloop::llms::BaseLLM;
@@ -161,10 +160,10 @@ fn test_build_context() {
 }
 
 #[test]
-fn test_build_context_filters_system_tools() {
+fn test_build_context_filters_legacy_fetch_server() {
     let planner = planner();
     let servers = vec![
-        json!({"id": "__system_tools__", "name": "smartloop", "tools": [{"name": "explore"}]}),
+        json!({"id": "__fetch__", "name": "fetch", "tools": [{"name": "fetch"}]}),
         json!({"id": "ext-1", "name": "External", "tools": [{"name": "foo"}]}),
     ];
     let ctx = planner.build_context("test", &servers, None, None, None);
@@ -213,19 +212,19 @@ fn test_classify_url_no_signal() {
     assert!(result.detected_urls.contains(&"https://example.com/article".to_string()));
 }
 
-/// Bash block → ACTION(bash).
+/// Bash block → answered by the model; the harness runs it.
 #[test]
-fn test_classify_action_bash() {
+fn test_classify_bash_is_a_conversation() {
     let planner = planner();
     let result = planner.classify("Run this:\n```bash\necho hello\n```", &[], ClassifyOptions::default());
-    assert_eq!(result.intent, IntentType::Action);
-    assert_eq!(result.action_kind.as_deref(), Some("bash"));
+    assert_eq!(result.intent, IntentType::Conversation);
+    assert_eq!(result.action_kind, None);
     assert!(result.bash_commands.contains(&"echo hello".to_string()));
 }
 
-/// File path → ACTION(read).
+/// File path → EXPLORE (the file is read in-process).
 #[test]
-fn test_classify_action_read() {
+fn test_classify_file_path_explores() {
     let planner = planner();
     let tmp = tempfile::tempdir().unwrap();
     let tmp_path = tmp.path().canonicalize().unwrap();
@@ -236,8 +235,8 @@ fn test_classify_action_read() {
         &[],
         ClassifyOptions { cwd: Some(path_str(&tmp_path)), ..Default::default() },
     );
-    assert_eq!(result.intent, IntentType::Action);
-    assert_eq!(result.action_kind.as_deref(), Some("read"));
+    assert_eq!(result.intent, IntentType::Explore);
+    assert_eq!(result.action_kind, None);
 }
 
 /// Directory path → EXPLORE.
@@ -256,13 +255,13 @@ fn test_classify_explore_directory() {
     assert_eq!(result.intent, IntentType::Explore);
 }
 
-/// Grep keywords → ACTION(grep).
+/// Search keywords → EXPLORE.
 #[test]
-fn test_classify_action_grep() {
+fn test_classify_search_explores() {
     let planner = planner();
     let result = planner.classify("search for TODO in the codebase", &[], ClassifyOptions::default());
-    assert_eq!(result.intent, IntentType::Action);
-    assert_eq!(result.action_kind.as_deref(), Some("grep"));
+    assert_eq!(result.intent, IntentType::Explore);
+    assert_eq!(result.action_kind, None);
 }
 
 /// Document context available + no action signals → EXPLORE with document flag.
@@ -328,16 +327,17 @@ fn test_classify_multi_step_write_intent() {
     assert!(!result.detected_urls.is_empty());
 }
 
-/// Write intent alone (no paths/URLs) → MULTI_STEP.
+/// Write intent alone (no paths/URLs) → the model writes the content; the
+/// harness saves it.
 #[test]
-fn test_classify_multi_step_write_only() {
+fn test_classify_write_only_is_a_conversation() {
     let planner = planner();
     let result = planner.classify(
         "Write a file with a summary of the project to output.md",
         &[],
         ClassifyOptions::default(),
     );
-    assert_eq!(result.intent, IntentType::MultiStep);
+    assert_eq!(result.intent, IntentType::Conversation);
     assert!(result.has_write_intent);
 }
 
@@ -580,26 +580,37 @@ fn test_create_plan_tool_call_url_fetch() {
 }
 
 #[test]
-fn test_create_plan_action_bash() {
+fn test_create_plan_action_bash_is_answered_not_run() {
     let planner = planner();
     let classification = ClassificationResult {
         intent: IntentType::Action,
         action_kind: Some("bash".into()),
         bash_commands: vec!["echo hello".into()],
+        capability: Some(ANSWER_TIER.into()),
         ..Default::default()
     };
     let plan = planner.create_plan(&classification, &ctx("Run:\n```bash\necho hello\n```"), None);
     assert_eq!(plan.steps.len(), 1);
-    // System tools now run as TOOL steps against the smartloop MCP server.
-    assert_eq!(plan.steps[0].step_type, StepType::Tool);
-    assert_eq!(plan.steps[0].tool_name.as_deref(), Some(BASH_TOOL));
-    assert_eq!(plan.steps[0].server_id.as_deref(), Some(SYSTEM_TOOLS_SERVER_ID));
-    assert_eq!(plan.steps[0].default_args, args(&[("command", "echo hello")]));
-    assert!(plan.steps[0].instruction.contains("echo hello"));
+    assert_eq!(plan.steps[0].step_type, StepType::Conversational);
+    assert_ne!(plan.steps[0].tool_name.as_deref(), Some(BASH_TOOL));
+    assert_eq!(plan.steps[0].server_id, None);
 }
 
 #[test]
-fn test_create_plan_action_read() {
+fn test_create_plan_action_write_without_a_model_plans_nothing() {
+    let planner = planner();
+    let classification = ClassificationResult {
+        intent: IntentType::Action,
+        action_kind: Some("write".into()),
+        has_write_intent: true,
+        ..Default::default()
+    };
+    let plan = planner.create_plan(&classification, &ctx("write a file with a poem"), None);
+    assert!(plan.steps.is_empty());
+}
+
+#[test]
+fn test_create_plan_action_read_explores_the_file() {
     let planner = planner();
     let tmp = tempfile::tempdir().unwrap();
     let test_file = tmp.path().join("test.py");
@@ -618,14 +629,14 @@ fn test_create_plan_action_read() {
     };
     let plan = planner.create_plan(&classification, &ctx, None);
     assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].step_type, StepType::Tool);
-    assert_eq!(plan.steps[0].tool_name.as_deref(), Some(FILE_READ_TOOL));
-    assert_eq!(plan.steps[0].server_id.as_deref(), Some(SYSTEM_TOOLS_SERVER_ID));
+    assert_eq!(plan.steps[0].step_type, StepType::Explore);
+    assert_eq!(plan.steps[0].tool_name.as_deref(), Some(EXPLORE_TOOL));
+    assert_eq!(plan.steps[0].server_id, None);
     assert_eq!(plan.steps[0].default_args, args(&[("path", &test_file)]));
 }
 
 #[test]
-fn test_create_plan_action_grep() {
+fn test_create_plan_action_grep_explores() {
     let planner = planner();
     let classification = ClassificationResult {
         intent: IntentType::Action,
@@ -635,9 +646,7 @@ fn test_create_plan_action_grep() {
     };
     let plan = planner.create_plan(&classification, &ctx("search for TODO"), None);
     assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].step_type, StepType::Tool);
-    assert_eq!(plan.steps[0].tool_name.as_deref(), Some(GREP_TOOL));
-    assert_eq!(plan.steps[0].server_id.as_deref(), Some(SYSTEM_TOOLS_SERVER_ID));
+    assert_eq!(plan.steps[0].step_type, StepType::Explore);
 }
 
 #[test]
@@ -674,10 +683,10 @@ fn test_create_plan_multi_step_from_signals() {
     let ctx =
         planner.build_context("Fetch https://example.com and save to output.md", &sample_servers(), None, None, None);
     let plan = planner.create_plan(&classification, &ctx, None);
-    // Should have fetch + conversational + write from signal fallback
-    assert!(plan.steps.len() >= 2);
+    // Fetch, then the model writes the content; no file-write step — the
+    // harness saves the answer.
     let types: Vec<StepType> = plan.steps.iter().map(|s| s.step_type).collect();
-    assert!(types.contains(&StepType::Tool)); // fetch
+    assert_eq!(types, vec![StepType::Fetch, StepType::Conversational]);
 }
 
 /// MULTI_STEP with LLM returning valid steps.
@@ -716,11 +725,10 @@ fn test_create_plan_multi_step_from_llm() {
     let ctx =
         planner.build_context("Fetch https://example.com and save to output.md", &sample_servers(), None, None, None);
     let plan = planner.create_plan(&classification, &ctx, None);
-    assert_eq!(plan.steps.len(), 2);
+    // The file-write step is dropped: the harness writes files.
+    assert_eq!(plan.steps.len(), 1);
     assert_eq!(plan.steps[0].step_type, StepType::Tool);
-    // file-write now runs as a TOOL step against the smartloop MCP server.
-    assert_eq!(plan.steps[1].step_type, StepType::Tool);
-    assert_eq!(plan.steps[1].tool_name.as_deref(), Some(FILE_WRITE_TOOL));
+    assert!(plan.steps.iter().all(|s| s.tool_name.as_deref() != Some(FILE_WRITE_TOOL)));
 }
 
 // ------------------------------------------------------------------ //
@@ -810,24 +818,33 @@ fn test_action_step_type_corrected_to_tool_for_external_server() {
     assert_eq!(plan.steps[0].server_id.as_deref(), Some("srv-1"));
 }
 
-/// Legacy `read`/`write`/`grep`/`bash` step_types now map to TOOL
-/// steps pinned to the smartloop MCP server.
+/// Legacy `read`/`grep` steps are in-process explores; `write`/`bash` steps
+/// are dropped — the harness acts on the answer.
 #[test]
-fn test_system_tool_step_type_is_tool() {
+fn test_legacy_system_tool_steps() {
     let planner = planner();
     let plan = planner.parse_plan_response(
-        &json!([{
-            "step": 1, "step_type": "read", "tool_name": "file-read",
-            "server_id": "__system_tools__", "server_name": "smartloop",
-            "instruction": "Read main.py",
-        }])
+        &json!([
+            {
+                "step": 1, "step_type": "read", "tool_name": "file-read",
+                "server_id": "__system_tools__", "server_name": "smartloop",
+                "instruction": "Read main.py",
+            },
+            {
+                "step": 2, "step_type": "action", "action_kind": "write", "tool_name": "file-write",
+                "server_id": "__system_tools__", "instruction": "Write out.md",
+            },
+            {"step": 3, "step_type": "tool", "tool_name": "bash", "instruction": "git status"},
+            {"step": 4, "step_type": "action", "action_kind": "grep", "instruction": "find TODO"},
+        ])
         .to_string(),
         "show me main.py",
         None,
     );
-    assert_eq!(plan.steps[0].step_type, StepType::Tool);
-    assert_eq!(plan.steps[0].tool_name.as_deref(), Some(FILE_READ_TOOL));
-    assert_eq!(plan.steps[0].server_id.as_deref(), Some(SYSTEM_TOOLS_SERVER_ID));
+    let types: Vec<StepType> = plan.steps.iter().map(|s| s.step_type).collect();
+    assert_eq!(types, vec![StepType::Explore, StepType::Explore]);
+    assert!(plan.steps.iter().all(|s| s.tool_name.as_deref() == Some(EXPLORE_TOOL)));
+    assert!(plan.steps.iter().all(|s| s.server_id.is_none()));
 }
 
 // ------------------------------------------------------------------ //

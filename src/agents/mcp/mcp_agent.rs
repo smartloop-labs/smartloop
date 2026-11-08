@@ -67,7 +67,7 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 
 use crate::agents::mcp::argument_extractor::MCPArgumentExtractor;
-use crate::agents::planner::{mcp_connection_is_usable, FETCH_SERVER_ID, SYSTEM_TOOLS_SERVER_ID};
+use crate::agents::planner::{mcp_connection_is_usable, FETCH_SERVER_ID};
 use crate::constants::display_model_label;
 use crate::llms::tool_calls::{parse_tool_calls, with_tools};
 use crate::llms::BaseLLM;
@@ -853,10 +853,8 @@ Request: {directive}{context_block}
 
     /// Every callable external tool, as discovery recorded it.
     ///
-    /// The system server is left out: its tools (bash, grep, file-read/write,
-    /// explore) are resolved by the planner against their own constants, and
-    /// putting them in this list only gives the model a way to answer "read a
-    /// file" to a question about Notion.
+    /// Servers marked `system`, and a leftover legacy fetch server, are left
+    /// out.
     ///
     /// Tools discovery advertised but the account cannot actually call are
     /// left out too — see [`mark_tool_unavailable`].  Discovery lists what a
@@ -868,7 +866,7 @@ Request: {directive}{context_block}
         let mut seen: HashSet<String> = HashSet::new();
         for server in mcp_servers {
             let server_id = server.id.as_str();
-            if server_id.is_empty() || server_id == SYSTEM_TOOLS_SERVER_ID || server_id == FETCH_SERVER_ID {
+            if server_id.is_empty() || server_id == FETCH_SERVER_ID {
                 continue;
             }
             if server.system {

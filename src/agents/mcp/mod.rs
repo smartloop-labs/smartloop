@@ -13,7 +13,6 @@ pub mod mcp_tool_caller;
 pub mod result_mapper;
 pub mod server_selector;
 pub mod server_summarizer;
-pub mod servers;
 pub mod tool_loop;
 
 pub use server_summarizer::MCPServerSummarizer;
