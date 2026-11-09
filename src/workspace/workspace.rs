@@ -931,10 +931,10 @@ pub struct Project {
     #[serde(default)]
     pub sessions: Vec<String>,
     /// Pro/premium feature: when enabled, the orchestrator runs the web
-    /// search agent for latest-info queries.  On by default, so new projects —
-    /// and configs written before this flag existed — start enabled; only an
-    /// explicit `false` on disk turns it off.  Searching still no-ops without
-    /// a configured provider/token.
+    /// search agent for latest-info queries.  New projects start with it off
+    /// (`Project::default()`); configs written before this flag existed keep
+    /// it on, so only an explicit `false` on disk turns an existing project
+    /// off.  Searching still no-ops without a configured provider/token.
     #[serde(default = "default_true")]
     pub web_search_enabled: bool,
     #[serde(default)]
@@ -957,7 +957,7 @@ impl Default for Project {
             mcp_servers: Vec::new(),
             adapters: BTreeSet::new(),
             sessions: Vec::new(),
-            web_search_enabled: true,
+            web_search_enabled: false,
             model_settings: Vec::new(),
         }
     }
