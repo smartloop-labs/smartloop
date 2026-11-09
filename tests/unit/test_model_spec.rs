@@ -5,7 +5,7 @@ use smartloop::model::spec::{seed_specs, CatalogModel, ModelRegistry, ModelSpec}
 use smartloop::platform::client::JsonObject;
 use smartloop::types::{Attention, ModelCapability, ModelKind, ModelType};
 
-use ModelCapability::{Reasoning, Text, Thinking, Vision};
+use ModelCapability::{Reasoning, Text, Thinking, Tools, Vision};
 
 fn row(value: Value) -> CatalogModel {
     let Value::Object(obj) = value else { panic!("row must be an object") };
@@ -28,7 +28,7 @@ fn test_seeds_pin_every_built_in_model() {
         ("gemma4-e4b", "google/gemma-4-e4b-it", 4, 4.0, vec![Text, Vision, Thinking], Some("Gemma4ChatHandler")),
         ("qwen2-vl-2b", "Qwen/Qwen2-VL-2B-Instruct", 2, 2.0, vec![Vision], Some("Qwen25VLChatHandler")),
         ("ministral3-3b", "mistralai/Ministral-3-3B-Instruct-2512", 3, 3.0, vec![Text, Vision], Some("MTMDChatHandler")),
-        ("qwen3.5-2b", "Qwen/Qwen3.5-2B", 3, 2.0, vec![Text, Reasoning, Vision, Thinking], Some("MTMDChatHandler")),
+        ("qwen3.5-2b", "Qwen/Qwen3.5-2B", 3, 2.0, vec![Text, Reasoning, Vision, Thinking, Tools], Some("MTMDChatHandler")),
     ];
     let seeds = seed_specs();
     assert_eq!(seeds.len(), expected.len());
