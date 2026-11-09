@@ -234,7 +234,7 @@ impl CatalogModel {
 /// the catalog publishes for them, so a first run or an offline machine
 /// behaves exactly as an online one.
 pub fn seed_specs() -> Vec<ModelSpec> {
-    use ModelCapability::{Reasoning, Text, Thinking, Vision};
+    use ModelCapability::{Reasoning, Text, Thinking, Tools, Vision};
 
     let spec = |name: &str,
                 model_id: &str,
@@ -294,13 +294,14 @@ pub fn seed_specs() -> Vec<ModelSpec> {
         // so the declared handler is what makes its vision work at all.  The
         // generic MTMDChatHandler renders the model's own embedded chat
         // template (keeping <think> control); Qwen25VLChatHandler would impose
-        // a hardcoded ChatML prompt that predates Qwen3.5.
+        // a hardcoded ChatML prompt that predates Qwen3.5.  That template
+        // takes a `tools` list, so it calls tools natively.
         spec(
             "qwen3.5-2b",
             "Qwen/Qwen3.5-2B",
             3,
             2.0,
-            vec![Text, Reasoning, Vision, Thinking],
+            vec![Text, Reasoning, Vision, Thinking, Tools],
             Some("MTMDChatHandler"),
         ),
     ]

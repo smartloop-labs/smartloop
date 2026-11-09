@@ -301,7 +301,7 @@ mod enablement {
     }
 
     #[test]
-    fn test_new_project_is_enabled_by_default() {
+    fn test_new_project_is_disabled_by_default() {
         let project = Project {
             id: "p1".to_string(),
             project_dir: "/tmp/p1".to_string(),
@@ -309,7 +309,7 @@ mod enablement {
             name: Some("p1".to_string()),
             ..Default::default()
         };
-        assert!(project.web_search_enabled);
+        assert!(!project.web_search_enabled);
     }
 
     #[test]
