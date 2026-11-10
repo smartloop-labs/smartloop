@@ -191,6 +191,7 @@ mod live_context_survives_tool_output {
                 "document_id": "https://theorg.com/org/rhino",
                 "document_name": "https://theorg.com/org/rhino",
                 "url": "https://theorg.com/org/rhino",
+                "source": "web",
             })])
         );
     }
@@ -246,6 +247,7 @@ mod web_citation_extracts {
                 "document_id": "https://theorg.com/org/rhino",
                 "document_name": "https://theorg.com/org/rhino",
                 "url": "https://theorg.com/org/rhino",
+                "source": "web",
                 "_extract": "John Hobaika is VP of Engineering at Rhino AI.",
             })])
         );

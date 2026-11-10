@@ -31,6 +31,7 @@ use crate::agents::orchestration::model_router::{
 };
 use crate::agents::planner::FETCH_SERVER_ID;
 use crate::api::config::api_settings;
+use crate::api::model::CitationSource;
 use crate::config::app_settings::AppSettings;
 use crate::config::model_config::ModelConfig;
 use crate::constants::{canonical_model_name, display_model_label};
@@ -3666,6 +3667,7 @@ impl ModelService {
                     _ => chunk.metadata.get("document_name").cloned().unwrap_or(Value::Null),
                 };
                 citation.insert("document_name".to_string(), document_name);
+                citation.insert("source".to_string(), Value::String(CitationSource::Document.as_str().into()));
                 // Where the document's file is, relative to the project as
                 // the documents API gives it (`documents/invoice.pdf`), so a
                 // client on this machine can open the source.  Never absolute:

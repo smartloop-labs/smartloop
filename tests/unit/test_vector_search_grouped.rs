@@ -155,3 +155,16 @@ fn test_citations_carry_the_document_path_relative_to_the_project() {
     assert_eq!(by_name("alpha.pdf")["document_path"], "documents/alpha.pdf");
     assert!(by_name("beta.pdf").get("document_path").is_none());
 }
+
+/// A retrieved document's citation says it is one, so a client opens it as
+/// a file rather than guessing from which keys it has.
+#[test]
+fn test_citations_name_their_source_as_a_document() {
+    let svc = service_with_workspace("/tmp", vec![project("proj-1", "/tmp/proj-1", true)], vec![]);
+    svc.caches("proj-1").lock().doc_store = Some(fake_store());
+
+    let (_, citations) = svc.get_document_groups(Some("alpha beta"), None, None).expect("citations");
+
+    assert!(!citations.is_empty());
+    assert!(citations.iter().all(|c| c["source"] == "document"));
+}

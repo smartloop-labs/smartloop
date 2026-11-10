@@ -335,6 +335,39 @@ pub struct Usage {
     pub total_tokens: i64,
 }
 
+/// What kind of source a [`Citation`] names, and so what opening it does.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CitationSource {
+    /// A file on this machine, opened from `document_path` or `path`.
+    Document,
+    /// A web page, opened from `url`.
+    Web,
+    /// A connected app's tool call; nothing to open.
+    Mcp,
+}
+
+impl CitationSource {
+    /// The wire value, as a citation's `source` key carries it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Document => "document",
+            Self::Web => "web",
+            Self::Mcp => "mcp",
+        }
+    }
+
+    /// The source a wire value names; `None` for one this build doesn't know.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "document" => Some(Self::Document),
+            "web" => Some(Self::Web),
+            "mcp" => Some(Self::Mcp),
+            _ => None,
+        }
+    }
+}
+
 /// Reference to a source document used in the response.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct Citation {
