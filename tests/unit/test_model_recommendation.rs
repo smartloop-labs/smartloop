@@ -2,8 +2,9 @@
 //!
 //! The framework, not the client, decides which models to recommend.
 //!
-//! Every capable model at Low memory pressure is badged; with none at Low, the
-//! lightest model per capability that fits.
+//! Measured against free memory: per capability, the largest model at or
+//! below half of it; with none that comfortable, the lightest model per
+//! capability that fits.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -33,7 +34,7 @@ fn capable(name: &str, caps: &[&str]) -> ModelEntry {
 
 /// Run `mark_recommended` with model sizes patched to *sizes*, and
 /// return the names it badged.
-fn recommended_with(entries: &mut [ModelEntry], total_gb: Option<f64>, sizes: HashMap<String, f64>) -> BTreeSet<String> {
+fn recommended_with(entries: &mut [ModelEntry], free_gb: Option<f64>, sizes: HashMap<String, f64>) -> BTreeSet<String> {
     /// The size override, undone on drop.
     struct Patched;
     impl Drop for Patched {
@@ -44,13 +45,13 @@ fn recommended_with(entries: &mut [ModelEntry], total_gb: Option<f64>, sizes: Ha
 
     router::set_param_size_override(Some(Arc::new(move |name: &str| sizes.get(name).copied())));
     let patched = Patched;
-    mark_recommended(entries, total_gb);
+    mark_recommended(entries, free_gb);
     drop(patched);
     entries.iter().filter(|e| e.recommended).map(|e| e.name.clone()).collect()
 }
 
-fn recommended(entries: &mut [ModelEntry], total_gb: Option<f64>) -> BTreeSet<String> {
-    recommended_with(entries, total_gb, sizes())
+fn recommended(entries: &mut [ModelEntry], free_gb: Option<f64>) -> BTreeSet<String> {
+    recommended_with(entries, free_gb, sizes())
 }
 
 fn set(names: &[&str]) -> BTreeSet<String> {
@@ -67,27 +68,48 @@ fn sizes_plus(extra: &[(&str, f64)]) -> HashMap<String, f64> {
 
 #[test]
 #[serial]
-fn test_every_low_pressure_capable_model_is_recommended() {
-    let mut entries = vec![
-        capable("tiny", &["vision"]),
-        capable("small", &["general", "reasoning"]),
-        capable("mid", &["general"]),
-    ];
-    // 32GB: tiny and small are <=10% (Low); mid is 12.5% (Medium).
-    assert_eq!(recommended(&mut entries, Some(32.0)), set(&["tiny", "small"]));
+fn test_the_larger_comfortable_model_is_recommended_over_a_smaller_one() {
+    let mut entries = vec![capable("small", &["general", "vision"]), capable("mid", &["general", "vision"])];
+    // 16GB free: both are comfortable (12.5%, 25%); the 4B answers better.
+    assert_eq!(recommended(&mut entries, Some(16.0)), set(&["mid"]));
 }
 
 #[test]
 #[serial]
-fn test_without_a_low_model_the_lightest_per_capability_is_recommended() {
+fn test_the_largest_comfortable_model_per_capability_is_recommended() {
     let mut entries = vec![
-        capable("small", &["general", "dp"]),
-        capable("mid", &["general", "vision"]),
+        capable("tiny", &["vision"]),
+        capable("small", &["general", "reasoning"]),
+        capable("mid", &["general"]),
         capable("big", &["vision", "coding"]),
+    ];
+    // 16GB free: everything is comfortable (big is exactly 50%).  big covers
+    // vision and coding, mid general, small reasoning; tiny adds nothing.
+    assert_eq!(recommended(&mut entries, Some(16.0)), set(&["big", "mid", "small"]));
+}
+
+#[test]
+#[serial]
+fn test_less_free_memory_recommends_smaller_models() {
+    let mut entries = vec![capable("small", &["general", "vision"]), capable("mid", &["general", "vision"])];
+    // Same models, other apps open: 6GB free.  mid (67%) still fits but is no
+    // longer comfortable; small (33%) is.
+    assert_eq!(recommended(&mut entries, Some(6.0)), set(&["small"]));
+}
+
+#[test]
+#[serial]
+fn test_without_a_comfortable_model_the_lightest_per_capability_is_recommended() {
+    let mut entries = vec![
+        capable("big", &["general", "dp"]),
+        capable("big-2", &["general", "vision"]),
         capable("huge", &["coding"]), // won't fit
     ];
-    // 16GB: small 12.5%, mid 25%, big 50%, huge doesn't fit.
-    assert_eq!(recommended(&mut entries, Some(16.0)), set(&["small", "mid", "big"]));
+    // 12GB free: big 67%, big-2 75%, huge doesn't fit.
+    assert_eq!(
+        recommended_with(&mut entries, Some(12.0), sizes_plus(&[("big-2", 9.0)])),
+        set(&["big", "big-2"])
+    );
 }
 
 #[test]
@@ -99,29 +121,31 @@ fn test_locked_and_capability_less_models_are_never_recommended() {
 
 #[test]
 #[serial]
-fn test_unknown_ram_recommends_nothing() {
+fn test_unknown_free_memory_recommends_nothing() {
     let mut entries = vec![capable("tiny", &["general"])];
     assert_eq!(recommended(&mut entries, None), set(&[]));
 }
 
 #[test]
 #[serial]
-fn test_the_lightest_reasoning_model_is_recommended_even_above_low() {
+fn test_the_lightest_reasoning_model_is_recommended_even_when_not_comfortable() {
     let mut entries = vec![
         capable("tiny", &["general", "vision"]),
-        capable("big", &["general", "reasoning"]),
+        capable("big-r", &["general", "reasoning"]),
         capable("huge", &["reasoning"]), // won't fit
     ];
-    // 32GB: tiny is Low; big (25%) is not, but it is the only reasoning
-    // model that fits.
-    assert_eq!(recommended(&mut entries, Some(32.0)), set(&["tiny", "big"]));
+    // 16GB free: tiny is comfortable; big-r (62.5%) is not, but it is the
+    // only reasoning model that fits.
+    assert_eq!(
+        recommended_with(&mut entries, Some(16.0), sizes_plus(&[("big-r", 10.0)])),
+        set(&["tiny", "big-r"])
+    );
 }
 
 #[test]
 #[serial]
-fn test_a_reasoning_model_wins_a_size_tie_in_the_fallback() {
+fn test_a_reasoning_model_wins_a_size_tie() {
     let mut entries = vec![capable("mid", &["general"]), capable("mid-r", &["general", "reasoning"])];
-    // 16GB: both are 25%, the reasoning one covers 'general' first.
     assert_eq!(
         recommended_with(&mut entries, Some(16.0), sizes_plus(&[("mid-r", 4.0)])),
         set(&["mid-r"])
@@ -136,23 +160,23 @@ fn test_within_a_size_only_the_reasoning_model_is_recommended() {
         capable("mid", &["vision"]),
         capable("mid-r", &["general", "reasoning"]),
     ];
-    // 16GB, nothing at Low.  mid would be badged for vision, but mid-r is the
-    // same size and can reason, so it takes the badge from mid.
+    // 16GB free.  mid would be badged for vision, but mid-r is the same size
+    // and can reason, so it takes the badge from mid.
     assert_eq!(
         recommended_with(&mut entries, Some(16.0), sizes_plus(&[("mid-r", 4.0)])),
-        set(&["small", "mid-r"])
+        set(&["mid-r"])
     );
 }
 
 #[test]
 #[serial]
-fn test_the_same_holds_at_low_pressure() {
+fn test_a_capability_dropped_in_a_size_tie_falls_to_another_size() {
     let mut entries = vec![
         capable("small", &["general", "vision"]),
         capable("small-r", &["general", "reasoning"]),
         capable("tiny", &["vision"]),
     ];
-    // 64GB: all three are Low; small and small-r share a size.
+    // small-r outranks small at 2B, so vision falls to tiny.
     assert_eq!(
         recommended_with(&mut entries, Some(64.0), sizes_plus(&[("small-r", 2.0)])),
         set(&["small-r", "tiny"])

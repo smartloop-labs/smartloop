@@ -32,6 +32,11 @@ pub const LOG_TARGET: &str = "smartloop.api.routers.models";
 /// Memory-pressure bucket: at or below this share of total RAM a model is
 /// "Low" pressure.  The picker draws the same tags from these numbers.
 pub const LOW_PRESSURE_PCT: f64 = 10.0;
+/// Recommendation: at or below this share of *free* memory a model runs
+/// comfortably next to whatever else is open; the largest such model is
+/// preferred.  Below [`FITS_PCT`] of free memory it can still be recommended
+/// when nothing smaller covers its capability.
+pub const COMFORTABLE_PCT: f64 = 50.0;
 /// Memory-pressure bucket: below this share of total RAM a model fits.
 pub const FITS_PCT: f64 = 80.0;
 
@@ -676,19 +681,19 @@ pub fn list_models_with(
         kb.0.cmp(&ka.0).then(kb.1.partial_cmp(&ka.1).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    mark_recommended(&mut result, total_ram_gb());
+    mark_recommended(&mut result, free_ram_gb());
     Ok(result)
 }
 
-/// Total physical RAM in GiB, `None` when it cannot be read.
-pub fn total_ram_gb() -> Option<f64> {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let total = sys.total_memory();
-    if total == 0 {
+/// Memory free for a model right now in GiB, counting what the OS can
+/// reclaim (see [`available_memory_gb`](crate::utils::device_utils::available_memory_gb)),
+/// so other open apps shrink it.  `None` when it cannot be read.
+pub fn free_ram_gb() -> Option<f64> {
+    let (free_gb, total_gb) = crate::utils::device_utils::available_memory_gb();
+    if total_gb <= 0.0 || free_gb <= 0.0 {
         return None;
     }
-    Some(total as f64 / (1024f64 * 1024.0 * 1024.0))
+    Some(free_gb)
 }
 
 /// Approximate RAM for `entry`: ~1GB per billion parameters (Q4 weights plus
@@ -721,21 +726,25 @@ fn local_param_size_b(name: &str) -> f64 {
 
 /// Set `recommended` on the models to badge for this machine.
 ///
-/// Every capable model at Low memory pressure.  Any capable model can do its
-/// capability's work, and a light one loads sooner, answers faster and leaves
-/// room for the rest.  With nothing at Low, the lightest model per
-/// capability that fits, so a small machine still gets a recommendation.
+/// `free_gb` is the memory free right now (see [`free_ram_gb`]), not total
+/// RAM, so a machine busy with other apps is recommended smaller models.
+///
+/// Per capability, the largest model that runs comfortably (at or below
+/// [`COMFORTABLE_PCT`] of free memory): a bigger model answers better, and
+/// one that size still leaves room for the rest.  With nothing comfortable, the
+/// lightest model per capability that fits, so a small machine still gets a
+/// recommendation.
 ///
 /// Reasoning weighs more than the rest: it is the model that resolves tool
 /// calls, matches skills and plans, and without one those steps fall to the
-/// small router.  So the lightest reasoning model that fits is recommended
-/// even when it is not at Low.
+/// small router.  So when no reasoning model is comfortable, the lightest
+/// reasoning model that fits is recommended anyway.
 ///
 /// Within a size only one kind of model is recommended, so the user is not
 /// left to choose between equal-cost badges: a reasoning model first, then
 /// the one with the most capabilities.
-pub fn mark_recommended(entries: &mut [ModelEntry], total_gb: Option<f64>) {
-    let total_gb = match total_gb {
+pub fn mark_recommended(entries: &mut [ModelEntry], free_gb: Option<f64>) {
+    let free_gb = match free_gb {
         Some(gb) if gb != 0.0 => gb,
         _ => return,
     };
@@ -746,7 +755,7 @@ pub fn mark_recommended(entries: &mut [ModelEntry], total_gb: Option<f64>) {
         if !e.is_accessible || e.capabilities.is_empty() {
             continue;
         }
-        let pct = gb / total_gb * 100.0;
+        let pct = gb / free_gb * 100.0;
         if pct < FITS_PCT {
             candidates.push((pct, i));
         }
@@ -754,33 +763,33 @@ pub fn mark_recommended(entries: &mut [ModelEntry], total_gb: Option<f64>) {
 
     let reasoning = ModelCapability::Reasoning.value();
     let has_reasoning = |e: &ModelEntry| e.capabilities.iter().any(|c| c == reasoning);
+    // At equal cost, the model that can reason, then the one that does the most.
+    let merit = |e: &ModelEntry| (has_reasoning(e), e.capabilities.len());
 
-    let mut ranked = candidates;
-    // key: (pct, reasoning not in caps, -len(caps)) ascending, stable.
-    ranked.sort_by(|a, b| {
-        let (ea, eb) = (&entries[a.1], &entries[b.1]);
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then((!has_reasoning(ea)).cmp(&!has_reasoning(eb)))
-            .then(eb.capabilities.len().cmp(&ea.capabilities.len()))
-    });
-
-    if let Some(&(_, i)) = ranked.iter().find(|(_, i)| has_reasoning(&entries[*i])) {
-        entries[i].recommended = true;
-    }
-
-    let low: Vec<usize> = ranked
-        .iter()
-        .filter(|(pct, _)| *pct <= LOW_PRESSURE_PCT)
-        .map(|(_, i)| *i)
-        .collect();
-    if !low.is_empty() {
-        for i in low {
-            entries[i].recommended = true;
+    // One pick per size: drop a model when one of the same size outranks it,
+    // so the user is not left to choose between equal-cost badges.  Only exact
+    // ties on merit stay side by side.  Done before picking per capability so
+    // a capability the dropped model covered can fall to another size.
+    let mut best: Vec<(f64, (bool, usize))> = Vec::new();
+    for &(pct, i) in &candidates {
+        let m = merit(&entries[i]);
+        match best.iter_mut().find(|(p, _)| *p == pct) {
+            Some((_, b)) if m > *b => *b = m,
+            Some(_) => {}
+            None => best.push((pct, m)),
         }
-    } else {
+    }
+    let mut ranked: Vec<(f64, usize)> = candidates
+        .into_iter()
+        .filter(|&(pct, i)| best.iter().any(|&(p, b)| p == pct && b == merit(&entries[i])))
+        .collect();
+    // Lightest first, stable for ties.
+    ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Badge each model in `order` that brings a capability not yet covered.
+    let badge_per_capability = |entries: &mut [ModelEntry], order: &mut dyn Iterator<Item = usize>| {
         let mut covered: Vec<String> = Vec::new();
-        for &(_, i) in &ranked {
+        for i in order {
             let e = &mut entries[i];
             if e.capabilities.iter().any(|cap| !covered.contains(cap)) {
                 e.recommended = true;
@@ -791,33 +800,20 @@ pub fn mark_recommended(entries: &mut [ModelEntry], total_gb: Option<f64>) {
                 }
             }
         }
-    }
+    };
 
-    // One pick per size: at equal cost, the model that can reason, then the
-    // one that does the most.  Only exact ties on both share the badge.
-    let merit = |e: &ModelEntry| (has_reasoning(e), e.capabilities.len());
-
-    let mut best: Vec<(f64, (bool, usize))> = Vec::new();
-    for &(pct, i) in &ranked {
-        let m = merit(&entries[i]);
-        match best.iter_mut().find(|(p, _)| *p == pct) {
-            Some((_, b)) => {
-                if m > *b {
-                    *b = m;
-                }
-            }
-            None => best.push((pct, m)),
-        }
+    let comfortable: Vec<usize> =
+        ranked.iter().rev().filter(|(pct, _)| *pct <= COMFORTABLE_PCT).map(|(_, i)| *i).collect();
+    if comfortable.is_empty() {
+        // Nothing runs comfortably: the lightest per capability that fits.
+        badge_per_capability(entries, &mut ranked.iter().map(|(_, i)| *i));
+        return;
     }
-    let recommended_sizes: Vec<f64> = ranked
-        .iter()
-        .filter(|(_, i)| entries[*i].recommended)
-        .map(|(pct, _)| *pct)
-        .collect();
-    for &(pct, i) in &ranked {
-        if recommended_sizes.contains(&pct) {
-            let best_here = best.iter().find(|(p, _)| *p == pct).map(|(_, b)| *b);
-            entries[i].recommended = Some(merit(&entries[i])) == best_here;
+    // The largest comfortable model per capability.
+    badge_per_capability(entries, &mut comfortable.iter().copied());
+    if !comfortable.iter().any(|&i| has_reasoning(&entries[i])) {
+        if let Some(&(_, i)) = ranked.iter().find(|(_, i)| has_reasoning(&entries[*i])) {
+            entries[i].recommended = true;
         }
     }
 }
