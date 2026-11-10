@@ -33,7 +33,7 @@ use ndarray::Array2;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use serial_test::serial;
-use smartloop::api::model::{ChatCompletionRequest, CitationSource};
+use smartloop::api::model::{ChatCompletionRequest, Citation, CitationSource};
 use smartloop::api::routers::chat::{
     citation_model, complete_without_streaming, stream_chunks, ChatService, CitationDict,
     HistoryTurn, ImageAttachment, OrchestrateArgs, OrchestrateOutcome, ProgressCallback,
@@ -940,4 +940,21 @@ async fn test_streamed_and_non_streamed_citations_match() {
 
     assert_eq!(streamed, every_kind_of_citation_on_the_wire());
     assert_eq!(not_streamed, streamed);
+}
+
+/// A client reading another version's citations: one cited by name alone
+/// with no id still reads, and a kind this build doesn't know reads as none
+/// rather than failing the citation.
+#[test]
+fn test_a_citation_from_another_version_still_reads() {
+    let old: Citation = serde_json::from_value(json!({"document_name": DOC})).unwrap();
+    assert_eq!((old.document_id.as_str(), old.document_name.as_deref()), ("", Some(DOC)));
+
+    let newer: Citation =
+        serde_json::from_value(json!({"document_id": "x", "source": "image", "pages": 2})).unwrap();
+    assert_eq!(newer.source, None);
+    assert_eq!(newer.extra["pages"], 2);
+
+    let web: Citation = serde_json::from_value(json!({"document_id": "x", "source": "web"})).unwrap();
+    assert_eq!(web.source, Some(CitationSource::Web));
 }

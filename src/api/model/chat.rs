@@ -368,15 +368,27 @@ impl CitationSource {
     }
 }
 
+/// A citation's `source`, read as `None` when it names a kind this build
+/// doesn't know, as another version's agent may send.
+fn known_source<'de, D>(deserializer: D) -> Result<Option<CitationSource>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.as_deref().and_then(CitationSource::parse))
+}
+
 /// Reference to a source used in the response, the same in a streamed
 /// `chat.citations` event and a non-streamed response.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct Citation {
+    /// Absent from an older agent's citation of a document by name alone.
+    #[serde(default)]
     pub document_id: String,
     #[serde(default)]
     pub document_name: Option<String>,
     /// What kind of source this is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "known_source")]
     pub source: Option<CitationSource>,
     /// Where a web citation opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
