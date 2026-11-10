@@ -239,7 +239,7 @@ fn test_a_raising_transport_does_not_break_provisioning() {
 
 /// A service whose workspace really contains `servers`, and its save counter.
 ///
-/// `persist_mcp_server` re-finds the server in the live workspace before
+/// The `persist_mcp_*` saves re-find the server in the live workspace before
 /// saving, so a bare double would not exercise the path under test.
 fn svc_holding(servers: Vec<MCPServer>) -> (Arc<ModelService>, Arc<AtomicUsize>, ScratchConfig) {
     let config = ScratchConfig::new();
@@ -324,31 +324,27 @@ fn test_a_probe_that_finds_nothing_keeps_the_previous_label() {
 // ── TestARotatedTokenIsWrittenBack ──────────────────────────────────────
 //
 // The probe is where a refresh token most often gets spent.  It runs on every
-// connect and re-index, refreshes on a 401 through the shared read-only path —
-// and used to drop the flag saying it had.  Against a provider that rotates
-// refresh tokens single-use, that left the retired one on disk.
+// connect and re-index and refreshes on a 401 through the shared read-only
+// path, whose caller writes the rotation back as it happens.  The probe's own
+// copy of the server is stale once another caller has refreshed, so the probe
+// saves the account it found and nothing else.
 
 #[test]
 #[serial]
-fn test_a_rotation_is_saved_even_when_the_label_is_unchanged() {
-    let mut server = notion(Some("mehfuz@smartloop.ai"));
-    let (svc, saves, _config) = svc_holding(vec![server.clone()]);
+fn test_the_probe_does_not_save_credentials_from_its_copy() {
+    let mut held = notion(None);
+    held.oauth_credentials = Some(MCPOAuthCredentials { refresh_token: Some("old-rt".to_string()), ..Default::default() });
+    let mut live = held.clone();
+    live.oauth_credentials =
+        Some(MCPOAuthCredentials { refresh_token: Some("rotated-rt".to_string()), ..Default::default() });
+    let (svc, saves, _config) = svc_holding(vec![live]);
     stub_probe(&svc, Some("mehfuz@smartloop.ai"), true);
 
-    svc.probe_mcp_account(&mut server);
+    svc.probe_mcp_account(&mut held);
 
-    assert_eq!(saves.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-#[serial]
-fn test_a_rotation_is_saved_even_when_there_is_no_label() {
-    let mut server = notion(None);
-    let (svc, saves, _config) = svc_holding(vec![server.clone()]);
-    stub_probe(&svc, None, true);
-
-    svc.probe_mcp_account(&mut server);
-
+    let live = &live_servers(&svc)[0];
+    assert_eq!(live.account.as_deref(), Some("mehfuz@smartloop.ai"));
+    assert_eq!(live.oauth_credentials.as_ref().and_then(|c| c.refresh_token.as_deref()), Some("rotated-rt"));
     assert_eq!(saves.load(Ordering::SeqCst), 1);
 }
 
@@ -357,8 +353,8 @@ fn test_a_rotation_is_saved_even_when_there_is_no_label() {
 /// The Python test invoked the caller's private `_persist()` directly; the
 /// Rust caller keeps its persistence hook private, so this pins the two
 /// halves the hook joins: a caller *is* handed to the probe, and the save it
-/// persists through is the re-attaching one (not a bare save of a detached
-/// object).
+/// persists a rotation through is the re-attaching one (not a bare save of a
+/// detached object).
 #[test]
 #[serial]
 fn test_the_probe_caller_carries_the_persistence_hook() {
@@ -377,7 +373,7 @@ fn test_the_probe_caller_carries_the_persistence_hook() {
     assert_eq!(*seen.lock(), Some(true));
 
     // It persists through the re-attaching save, not through a bare one.
-    svc.persist_mcp_server(&server).expect("persist");
+    svc.persist_mcp_credentials(&server).expect("persist");
     assert_eq!(saves.load(Ordering::SeqCst), 1);
 }
 
@@ -439,7 +435,7 @@ fn test_a_rotation_is_carried_onto_the_replacement() {
     held.oauth_credentials =
         Some(MCPOAuthCredentials { refresh_token: Some("rotated-rt".to_string()), ..Default::default() });
 
-    svc.persist_mcp_server(&held).expect("persist");
+    svc.persist_mcp_credentials(&held).expect("persist");
 
     let live = &live_servers(&svc)[0];
     assert_eq!(
@@ -457,11 +453,30 @@ fn test_a_failed_connection_is_carried_too() {
     held.status = MCPServerStatus::Failed;
     held.last_error = Some("This connection's authorization has expired.".to_string());
 
-    svc.persist_mcp_server(&held).expect("persist");
+    svc.persist_mcp_status(&held).expect("persist");
 
     let live = &live_servers(&svc)[0];
     assert_eq!(live.status, MCPServerStatus::Failed);
     assert!(live.last_error.as_deref().unwrap_or_default().contains("expired"));
+}
+
+/// A failure is recorded by a caller holding a copy whose credentials may
+/// predate another caller's refresh; writing them would undo that refresh.
+#[test]
+#[serial]
+fn test_a_failure_leaves_the_live_credentials_alone() {
+    let (mut held, mut live) = pair();
+    live.oauth_credentials =
+        Some(MCPOAuthCredentials { refresh_token: Some("rotated-rt".to_string()), ..Default::default() });
+    let (svc, _saves, _config) = svc_holding(vec![live]);
+    held.status = MCPServerStatus::Failed;
+    held.last_error = Some("This connection's authorization has expired.".to_string());
+
+    svc.persist_mcp_status(&held).expect("persist");
+
+    let live = &live_servers(&svc)[0];
+    assert_eq!(live.status, MCPServerStatus::Failed);
+    assert_eq!(live.oauth_credentials.as_ref().and_then(|c| c.refresh_token.as_deref()), Some("rotated-rt"));
 }
 
 /// Re-finding by id must not resurrect what the user removed.
@@ -471,7 +486,7 @@ fn test_a_server_deleted_mid_pass_is_left_deleted() {
     let (held, _) = pair();
     let (svc, saves, _config) = svc_holding(vec![]); // the workspace no longer has it
 
-    svc.persist_mcp_server(&held).expect("persist");
+    svc.persist_mcp_credentials(&held).expect("persist");
 
     assert!(live_servers(&svc).is_empty());
     assert_eq!(saves.load(Ordering::SeqCst), 1);
@@ -486,8 +501,23 @@ fn test_the_ordinary_case_writes_through_untouched() {
     held.oauth_credentials =
         Some(MCPOAuthCredentials { refresh_token: Some("rotated-rt".to_string()), ..Default::default() });
 
-    svc.persist_mcp_server(&held).expect("persist");
+    svc.persist_mcp_credentials(&held).expect("persist");
 
     assert_eq!(live_servers(&svc)[0], held);
     assert_eq!(saves.load(Ordering::SeqCst), 1);
+}
+
+/// A refresh reads the credentials the workspace holds now, not a held copy's.
+#[test]
+#[serial]
+fn test_live_credentials_are_read_from_the_workspace() {
+    let (mut held, live) = pair();
+    let (svc, _saves, _config) = svc_holding(vec![live]);
+    held.oauth_credentials =
+        Some(MCPOAuthCredentials { refresh_token: Some("rotated-rt".to_string()), ..Default::default() });
+    svc.persist_mcp_credentials(&held).expect("persist");
+
+    let creds = svc.live_mcp_credentials("s1").expect("live credentials");
+    assert_eq!(creds.refresh_token.as_deref(), Some("rotated-rt"));
+    assert_eq!(svc.live_mcp_credentials("gone"), None);
 }

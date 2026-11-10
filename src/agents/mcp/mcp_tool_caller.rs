@@ -19,7 +19,7 @@ use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::mcp::local_client::LocalMCPClient;
 use crate::mcp::oauth::{MCPOAuthError, MCPOAuthService};
 use crate::mcp::{MCPClient, MCPToolCallResult};
-use crate::workspace::workspace::{MCPServer, MCPServerStatus, MCPServerType};
+use crate::workspace::workspace::{MCPOAuthCredentials, MCPServer, MCPServerStatus, MCPServerType};
 
 /// Logger name of the Python module.
 pub const LOGGER: &str = "smartloop.agents.mcp.mcp_tool_caller";
@@ -68,10 +68,30 @@ pub fn reset_refresh_state() {
     REFRESH_FAILURES.lock().clear();
 }
 
+/// Which part of a server a write-back carries.
+///
+/// The server handed to the persist hook is the caller's copy, current only in
+/// the part that changed; writing the rest would put stale fields back over
+/// whatever another caller saved meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerChange {
+    /// `oauth_credentials`, after a refresh.
+    Credentials,
+    /// `status` and `last_error`, after a connection fails.
+    Status,
+}
+
 /// Writes refreshed credentials / a failed status back to the workspace.
 /// (Python: `Callable[[], None]`; Rust passes the changed server since it is
 /// not shared by reference with the workspace.)
-pub type PersistFn = Arc<dyn Fn(&MCPServer) -> anyhow::Result<()> + Send + Sync>;
+pub type PersistFn = Arc<dyn Fn(&MCPServer, ServerChange) -> anyhow::Result<()> + Send + Sync>;
+
+/// Reads a server's credentials as the workspace holds them now, by server id
+/// (`None` when the workspace does not have it).
+///
+/// Callers each work on their own copy of a server, so a copy cannot see a
+/// refresh another caller just made; this is how the lock holder does.
+pub type LiveCredentialsFn = Arc<dyn Fn(&str) -> Option<MCPOAuthCredentials> + Send + Sync>;
 
 /// Test seam replacing the transport of [`MCPToolCaller::call_tool`]:
 /// `(server, tool_name, arguments, access_token, cwd) -> result`.
@@ -149,6 +169,8 @@ pub struct MCPToolCaller {
     /// them: the content crawl, which used to write them through its own
     /// `on_server_updated`, was removed with indexing.
     persist: Mutex<Option<PersistFn>>,
+    /// Reads the workspace's current credentials before a redemption.
+    live_credentials: Mutex<Option<LiveCredentialsFn>>,
     /// Replaces the real transport when set (tests).
     call_tool_hook: Mutex<Option<CallToolHook>>,
 }
@@ -164,6 +186,7 @@ impl MCPToolCaller {
             arg_extractor,
             result_mapper,
             persist: Mutex::new(persist),
+            live_credentials: Mutex::new(None),
             call_tool_hook: Mutex::new(None),
         }
     }
@@ -171,6 +194,11 @@ impl MCPToolCaller {
     /// Install the callback that writes refreshed credentials back to disk.
     pub fn set_persist(&self, persist: Option<PersistFn>) {
         *self.persist.lock() = persist;
+    }
+
+    /// Install the callback that reads a server's current credentials.
+    pub fn set_live_credentials(&self, live_credentials: Option<LiveCredentialsFn>) {
+        *self.live_credentials.lock() = live_credentials;
     }
 
     /// Replace (or restore, with `None`) the tool-call transport.
@@ -401,9 +429,12 @@ impl MCPToolCaller {
     /// restarted and then could never be renewed again.
     ///
     /// `stale_token` is the access token the caller's request failed with.
-    /// Given it, a redemption that lost the race to another thread returns
-    /// that thread's token instead of spending the refresh token a second time
-    /// — which is the thing that kills a single-use grant outright.
+    /// Given it, a redemption that lost the race to another caller returns
+    /// that caller's token instead of spending the refresh token a second time
+    /// — which is the thing that kills a single-use grant outright.  The
+    /// comparison is against the workspace's live credentials when the
+    /// live-credentials hook is installed, since `server` is only this
+    /// caller's copy.
     pub fn refresh_access_token(&self, server: &mut MCPServer, stale_token: Option<&str>) -> Option<String> {
         let lock = lock_for(&server.id);
         let _guard = lock.lock();
@@ -411,6 +442,13 @@ impl MCPToolCaller {
     }
 
     fn refresh_locked(&self, server: &mut MCPServer, stale_token: Option<&str>) -> Option<String> {
+        // Adopt what the workspace holds now: a copy taken before another
+        // caller's refresh still carries the refresh token that refresh spent.
+        let live_credentials = self.live_credentials.lock().clone();
+        if let Some(live) = live_credentials.and_then(|read| read(&server.id)) {
+            server.oauth_credentials = Some(live);
+        }
+
         if let Some(stale) = stale_token.filter(|s| !s.is_empty()) {
             if let Some(current) = server.oauth_credentials.as_ref().and_then(|c| c.access_token.as_ref()) {
                 if current != stale {
@@ -541,7 +579,7 @@ impl MCPToolCaller {
             }
         }
 
-        self.write_back(server, "Refreshed");
+        self.write_back(server, ServerChange::Credentials, "Refreshed");
         tracing::info!(
             target: LOGGER,
             "Refreshed access token for server '{}'",
@@ -566,12 +604,12 @@ impl MCPToolCaller {
     /// The state in memory is good, so whatever this change was made for
     /// should still go ahead; it is the *next* process that pays for a failed
     /// write.
-    fn write_back(&self, server: &MCPServer, what: &str) {
+    fn write_back(&self, server: &MCPServer, change: ServerChange, what: &str) {
         let persist = self.persist.lock().clone();
         let Some(persist) = persist else {
             return;
         };
-        if let Err(e) = persist(server) {
+        if let Err(e) = persist(server, change) {
             tracing::warn!(
                 target: LOGGER,
                 "{} '{}' but could not persist the change: {}",
@@ -632,7 +670,7 @@ impl MCPToolCaller {
             server.name,
             message
         );
-        self.write_back(server, "Failed");
+        self.write_back(server, ServerChange::Status, "Failed");
         true
     }
 

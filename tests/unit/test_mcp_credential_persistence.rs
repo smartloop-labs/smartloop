@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use serial_test::serial;
 use smartloop::agents::mcp::argument_extractor::MCPArgumentExtractor;
-use smartloop::agents::mcp::mcp_tool_caller::{self as module, reset_refresh_state, MCPToolCaller, PersistFn};
+use smartloop::agents::mcp::mcp_tool_caller::{self as module, reset_refresh_state, MCPToolCaller, PersistFn, ServerChange};
 use smartloop::agents::mcp::result_mapper::MCPResultMapper;
 use smartloop::workspace::workspace::{
     MCPAuthType, MCPOAuthCredentials, MCPServer, MCPServerType, RemoteMCPServerConfig,
@@ -157,10 +157,10 @@ mod test_the_refresh_is_written_back {
         let _guard = RefreshStateGuard::new();
         let endpoint = TokenEndpoint::reply(json!({"access_token": "fresh", "refresh_token": "rotated"}));
         let mut server = server_with_endpoint(&endpoint.url());
-        let saves = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let saves = Arc::new(Mutex::new(Vec::<ServerChange>::new()));
         let saves_hook = saves.clone();
-        let caller = caller(Some(Arc::new(move |_s: &MCPServer| {
-            saves_hook.lock().push(1);
+        let caller = caller(Some(Arc::new(move |_s: &MCPServer, change: ServerChange| {
+            saves_hook.lock().push(change);
             Ok(())
         })));
 
@@ -168,7 +168,7 @@ mod test_the_refresh_is_written_back {
 
         assert_eq!(creds(&server).access_token.as_deref(), Some("fresh"));
         assert_eq!(creds(&server).refresh_token.as_deref(), Some("rotated"));
-        assert_eq!(*saves.lock(), vec![1], "the rotated refresh token never reached the workspace");
+        assert_eq!(*saves.lock(), vec![ServerChange::Credentials], "the rotated refresh token never reached the workspace");
     }
 
     /// The token in memory is good — the call this refresh was for proceeds.
@@ -179,7 +179,7 @@ mod test_the_refresh_is_written_back {
         let endpoint = TokenEndpoint::reply(json!({"access_token": "fresh"}));
         let mut server = server_with_endpoint(&endpoint.url());
 
-        let caller = caller(Some(Arc::new(|_s: &MCPServer| {
+        let caller = caller(Some(Arc::new(|_s: &MCPServer, _change: ServerChange| {
             Err(anyhow::anyhow!("read-only file system"))
         })));
         assert_eq!(caller.refresh_access_token(&mut server, None).as_deref(), Some("fresh"));
@@ -194,7 +194,7 @@ mod test_the_refresh_is_written_back {
         let mut server = server_with_endpoint(&endpoint.url());
         let saves = Arc::new(Mutex::new(Vec::<i32>::new()));
         let saves_hook = saves.clone();
-        let caller = caller(Some(Arc::new(move |_s: &MCPServer| {
+        let caller = caller(Some(Arc::new(move |_s: &MCPServer, _change: ServerChange| {
             saves_hook.lock().push(1);
             Ok(())
         })));
@@ -226,7 +226,7 @@ mod test_the_refresh_is_written_back {
             server.remote_config.as_mut().unwrap().token_endpoint = None;
         }
 
-        let caller = caller(Some(Arc::new(|_s: &MCPServer| -> anyhow::Result<()> {
+        let caller = caller(Some(Arc::new(|_s: &MCPServer, _change: ServerChange| -> anyhow::Result<()> {
             panic!("no refresh happened")
         })));
         assert_eq!(caller.refresh_access_token(&mut server, None), None);
