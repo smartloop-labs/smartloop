@@ -368,12 +368,41 @@ impl CitationSource {
     }
 }
 
-/// Reference to a source document used in the response.
+/// Reference to a source used in the response, the same in a streamed
+/// `chat.citations` event and a non-streamed response.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
 pub struct Citation {
     pub document_id: String,
     #[serde(default)]
     pub document_name: Option<String>,
+    /// What kind of source this is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<CitationSource>,
+    /// Where a web citation opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// A document's file, relative to its project (`documents/invoice.pdf`),
+    /// as the documents API gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_path: Option<String>,
+    /// The pages of a document the answer drew on, in order, as the
+    /// document's index recorded them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<i64>>)]
+    pub page_numbers: Option<Vec<serde_json::Value>>,
+    /// An explored file's absolute path.  Prefer `document_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The connected app an MCP citation's tool belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// The tool an MCP citation names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Any other public key a citation carries, passed through as-is.
+    #[serde(flatten, default)]
+    #[schema(ignore)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// OpenAI-compatible non-streaming response.

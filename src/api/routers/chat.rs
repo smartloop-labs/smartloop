@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use crate::agents::orchestration::skill_processor::SkillProcessor;
 use crate::api::model::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-    ChatStatusChunk, Choice, ChunkChoice, Citation, DeltaContent, Usage,
+    ChatStatusChunk, Choice, ChunkChoice, Citation, CitationSource, DeltaContent, Usage,
 };
 use crate::api::model::chat::{ChatStatus, Role};
 use crate::api::services::{get_api_client, get_model_service, ModelService};
@@ -1504,6 +1504,70 @@ fn public_citation(citation: &CitationDict) -> CitationDict {
 /// One entry per document, with the private `_` keys stripped.
 pub fn dedupe_citations(citations: &[CitationDict]) -> Vec<CitationDict> {
     unique_citations(citations).iter().map(public_citation).collect()
+}
+
+/// The keys [`Citation`] names; any other public key rides in its `extra`.
+const CITATION_FIELDS: &[&str] = &[
+    "document_id",
+    "document_name",
+    "source",
+    "url",
+    "document_path",
+    "page_numbers",
+    "path",
+    "server_name",
+    "tool_name",
+];
+
+/// The typed form of a citation, as both the stream and the non-streamed
+/// response carry it.  `None` for a citation with neither an id nor a name,
+/// which a client has no way to show.
+pub fn citation_model(citation: &CitationDict) -> Option<Citation> {
+    let text = |key: &str| citation.get(key).and_then(Value::as_str).map(str::to_string);
+    // A document the fan-out cited by name alone has no id: go by its name,
+    // as citations are deduplicated.
+    let document_id = match citation.get("document_id") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => text("document_name")?,
+        Some(other) => other.to_string(),
+    };
+    let page_numbers = citation
+        .get("page_numbers")
+        .and_then(Value::as_array)
+        .filter(|pages| !pages.is_empty())
+        .cloned();
+    let extra = citation
+        .iter()
+        .filter(|(k, _)| !k.starts_with('_') && !CITATION_FIELDS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    Some(Citation {
+        document_id,
+        document_name: text("document_name"),
+        source: text("source").as_deref().and_then(CitationSource::parse),
+        url: text("url"),
+        document_path: text("document_path"),
+        page_numbers,
+        path: text("path"),
+        server_name: text("server_name"),
+        tool_name: text("tool_name"),
+        extra,
+    })
+}
+
+/// [`citation_model`] over a turn's verified citations, skipping any it
+/// can't name.
+pub fn citation_models(citations: &[CitationDict]) -> Vec<Citation> {
+    citations
+        .iter()
+        .filter_map(|c| {
+            let model = citation_model(c);
+            if model.is_none() {
+                tracing::warn!(target: LOG_TARGET, "[citations] Dropped a citation with no id or name");
+            }
+            model
+        })
+        .collect()
 }
 
 /// One entry per document, private keys intact, retrieval order kept.
@@ -3085,10 +3149,14 @@ fn stream_chunks_inner(
         // informed the response.  Matching is on document content, not the
         // filename: an earlier filename-based check dropped real sources whose
         // names say nothing about their contents ("sp46.pdf" for a fund).
-        if let Some(verified) = verified_citations.filter(|v| !v.is_empty()) {
+        let citations = verified_citations
+            .as_deref()
+            .map(citation_models)
+            .filter(|models| !models.is_empty());
+        if let Some(citations) = citations {
             let payload = py_json_dumps(&json!({
                 "object": "chat.citations",
-                "citations": verified,
+                "citations": citations,
             }));
             yield format!("data: {payload}\n\n");
         }
@@ -3510,20 +3578,10 @@ async fn complete_body(
 
     svc.push_token_usage(project_id.as_deref(), &request.model, prompt_tokens, completion_tokens);
 
-    let mut citation_models: Option<Vec<Citation>> = None;
-    if let Some(verified) = verified.filter(|v| !v.is_empty()) {
-        let mut models = Vec::with_capacity(verified.len());
-        for c in &verified {
-            let document_id = match c.get("document_id") {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Null) | None => anyhow::bail!("'document_id'"),
-                Some(other) => other.to_string(),
-            };
-            let document_name = c.get("document_name").and_then(Value::as_str).map(str::to_string);
-            models.push(Citation { document_id, document_name });
-        }
-        citation_models = Some(models);
-    }
+    let citations = verified
+        .as_deref()
+        .map(citation_models)
+        .filter(|models| !models.is_empty());
 
     let mut response = ChatCompletionResponse::new(
         request.model.clone(),
@@ -3543,6 +3601,6 @@ async fn complete_body(
         completion_tokens: completion_tokens as i64,
         total_tokens: (prompt_tokens + completion_tokens) as i64,
     };
-    response.citations = citation_models;
+    response.citations = citations;
     Ok(response)
 }

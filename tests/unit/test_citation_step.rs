@@ -33,10 +33,10 @@ use ndarray::Array2;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use serial_test::serial;
-use smartloop::api::model::ChatCompletionRequest;
+use smartloop::api::model::{ChatCompletionRequest, CitationSource};
 use smartloop::api::routers::chat::{
-    stream_chunks, ChatService, CitationDict, HistoryTurn, ImageAttachment, OrchestrateArgs,
-    OrchestrateOutcome, ProgressCallback,
+    citation_model, complete_without_streaming, stream_chunks, ChatService, CitationDict,
+    HistoryTurn, ImageAttachment, OrchestrateArgs, OrchestrateOutcome, ProgressCallback,
 };
 use smartloop::constants::OPENING_TOKENS;
 use smartloop::db::embeddings;
@@ -286,7 +286,7 @@ impl LocalModelService for FakeService {
         _max_tokens: Option<usize>,
         _thinking: Option<bool>,
     ) -> anyhow::Result<String> {
-        Ok(String::new())
+        (self.stream)().map(|c| c.map(|c| c.text)).collect()
     }
     fn stream_completion<'a>(
         &'a self,
@@ -828,4 +828,116 @@ mod test_the_source_encode_waits_for_the_opening {
 
         assert!(started.is_set());
     }
+}
+
+fn dict(value: Value) -> CitationDict {
+    let Value::Object(map) = value else { unreachable!() };
+    map
+}
+
+/// The non-streamed response carries what the stream does: where the
+/// document is and the pages cited, not just its id and name.
+#[test]
+fn test_a_non_streamed_citation_keeps_its_path_and_pages() {
+    let model = citation_model(&dict(json!({
+        "document_id": "9f2c", "document_name": DOC,
+        "document_path": "documents/invoice-contoso.pdf", "page_numbers": [2, 5],
+    })))
+    .unwrap();
+    assert_eq!(model.document_id, "9f2c");
+    assert_eq!(model.document_path.as_deref(), Some("documents/invoice-contoso.pdf"));
+    assert_eq!(model.page_numbers, Some(vec![json!(2), json!(5)]));
+
+    let bare = citation_model(&dict(json!({"document_id": "9f2c", "page_numbers": []}))).unwrap();
+    assert_eq!((&bare.document_path, &bare.page_numbers), (&None, &None));
+    let wire = serde_json::to_value(&bare).unwrap();
+    assert!(wire.get("document_path").is_none() && wire.get("page_numbers").is_none());
+}
+
+/// The fan-out cites a document by name alone; that names it.  One with
+/// neither an id nor a name is dropped rather than failing the answer.
+#[test]
+fn test_a_citation_without_an_id_goes_by_its_name() {
+    let model = citation_model(&dict(json!({"document_name": DOC}))).unwrap();
+    assert_eq!(model.document_id, DOC);
+    assert!(citation_model(&dict(json!({"page_numbers": [1]}))).is_none());
+}
+
+/// The non-streamed citation names its source as the stream does; a source
+/// this build doesn't know is left off rather than failing the answer.
+#[test]
+fn test_a_non_streamed_citation_keeps_its_source() {
+    let web = citation_model(&dict(json!({"document_id": "https://a", "source": "web"}))).unwrap();
+    assert_eq!(web.source, Some(CitationSource::Web));
+    assert_eq!(serde_json::to_value(&web).unwrap()["source"], "web");
+
+    let unknown = citation_model(&dict(json!({"document_id": "x", "source": "fax"}))).unwrap();
+    assert_eq!(unknown.source, None);
+    assert!(serde_json::to_value(&unknown).unwrap().get("source").is_none());
+}
+
+/// A key the model doesn't name still reaches the client, but a private one
+/// never does; pages go out as the index recorded them.
+#[test]
+fn test_a_citation_passes_unnamed_keys_through_but_not_private_ones() {
+    let model = citation_model(&dict(json!({
+        "document_id": "9f2c", "page_numbers": ["iv", 3], "sheet": "Q3",
+        "_extract": CHUNK,
+    })))
+    .unwrap();
+    let wire = serde_json::to_value(&model).unwrap();
+    assert_eq!(wire["sheet"], "Q3");
+    assert_eq!(wire["page_numbers"], json!(["iv", 3]));
+    assert!(wire.get("_extract").is_none());
+}
+
+/// The citations of one turn, every kind, as their builders make them.
+fn every_kind_of_citation() -> Vec<CitationDict> {
+    let mut document = citation();
+    document.insert("source".into(), json!("document"));
+    document.insert("document_path".into(), json!("documents/invoice-contoso.pdf"));
+    document.insert("page_numbers".into(), json!([2, 5]));
+    let tool = dict(json!({
+        "document_id": "mcp:Linear.list_issues", "document_name": "Linear · list_issues",
+        "source": "mcp", "server_name": "Linear", "tool_name": "list_issues",
+    }));
+    vec![document, tool]
+}
+
+/// What a client receives for [`every_kind_of_citation`]: each citation's
+/// public keys, exactly as they were built.
+fn every_kind_of_citation_on_the_wire() -> Value {
+    json!([
+        {
+            "document_id": DOC, "document_name": DOC, "source": "document",
+            "document_path": "documents/invoice-contoso.pdf", "page_numbers": [2, 5],
+        },
+        {
+            "document_id": "mcp:Linear.list_issues", "document_name": "Linear · list_issues",
+            "source": "mcp", "server_name": "Linear", "tool_name": "list_issues",
+        },
+    ])
+}
+
+/// The stream and the non-streamed response carry the same citations, and
+/// the stream's are its citations' public keys, unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(embeddings)]
+async fn test_streamed_and_non_streamed_citations_match() {
+    let (_enc, _spy) = encoder_spy();
+    let (_, events) = run(Some(every_kind_of_citation())).await;
+    let streamed = events
+        .iter()
+        .find(|e| object(e) == Some("chat.citations"))
+        .map(|e| e["citations"].clone())
+        .expect("a citations event");
+
+    let svc = FakeService::new(yields(vec![default_answer()]), Some(every_kind_of_citation()));
+    let mut non_streaming = request(None);
+    non_streaming.stream = false;
+    let response = complete_without_streaming(non_streaming, svc).await.expect("a response");
+    let not_streamed = serde_json::to_value(response.citations.expect("citations")).unwrap();
+
+    assert_eq!(streamed, every_kind_of_citation_on_the_wire());
+    assert_eq!(not_streamed, streamed);
 }
