@@ -11,6 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -59,6 +60,33 @@ pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub const RANGE_READ_SIZE: usize = 1024 * 1024;
 /// Files larger than this (100 MB) use chunked download.
 pub const CHUNKED_THRESHOLD: u64 = 100 * 1024 * 1024;
+/// Largest byte range one request of a chunked download fetches (256 MB).
+///
+/// The file is cut into ranges this size on a shared queue, and each of the
+/// file's connections takes the next one as it finishes.  Cutting it into
+/// one equal slice per connection instead left the end of a large download
+/// to the slowest connection alone: the others finished their slices early
+/// and sat idle, so a 16 GB model's last gigabytes came in on one or two
+/// connections.  With small ranges every connection stays busy until the
+/// last range, and the tail is at most one range long.  Each range is a
+/// request of its own, whose first byte takes a round trip; 256 MB keeps
+/// that to a few percent of a range's transfer time.
+pub const SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
+
+/// The byte ranges (inclusive) a chunked download of `size` bytes fetches
+/// over `workers` connections: [`SEGMENT_SIZE`] each, smaller for a file
+/// that would otherwise give some connection nothing to do.
+pub fn segments(size: u64, workers: u64) -> Vec<(u64, u64)> {
+    let segment = SEGMENT_SIZE.min(size.div_ceil(workers.max(1))).max(1);
+    let mut ranges = Vec::new();
+    let mut offset = 0u64;
+    while offset < size {
+        let end = (offset + segment - 1).min(size - 1);
+        ranges.push((offset, end));
+        offset = end + 1;
+    }
+    ranges
+}
 
 /// Retry policy for transient network failures during download.  A dropped
 /// connection mid-stream on a multi-GB GGUF would otherwise fail the whole
@@ -1188,9 +1216,9 @@ impl SLPArtifactDownloader {
 
             if supports_range && size >= CHUNKED_THRESHOLD {
                 let workers = self.effective_chunk_workers();
-                let chunk_size_mb = size as f64 / workers as f64 / (1024.0 * 1024.0);
+                let ranges = segments(size, workers as u64).len();
                 self.logger.info(&format!(
-                    "Downloading {flat_name} ({size_mb:.1} MB) using {workers} parallel chunks of {chunk_size_mb:.1} MB each"
+                    "Downloading {flat_name} ({size_mb:.1} MB) over {workers} connections in {ranges} ranges"
                 ));
                 self.download_file_chunked(flat_name, url, &part, size, progress_callback.clone())?;
             } else {
@@ -1381,24 +1409,25 @@ impl SLPArtifactDownloader {
             file.write_all(&[0])?;
         }
 
-        // Split the file into exactly CHUNK_WORKERS equal segments.
+        // Small ranges on a shared queue, so every connection stays busy to
+        // the end (see SEGMENT_SIZE).
         let workers = self.effective_chunk_workers() as u64;
-        let chunk_size = size.div_ceil(workers);
-        let mut chunks: Vec<(u64, u64)> = Vec::new();
-        let mut offset = 0u64;
-        while offset < size {
-            let end = (offset + chunk_size - 1).min(size - 1);
-            chunks.push((offset, end));
-            offset = end + 1;
-        }
+        let chunks = segments(size, workers);
 
         let downloaded_counter = Mutex::new(0u64); // shared across threads
         let hook = self.download_chunk_hook.lock().clone();
+        // Once a range has failed for good (its own retries spent), the
+        // download fails: the ranges still queued are skipped, rather than
+        // fetching the rest of the file before the error is reported.
+        let failed = AtomicBool::new(false);
 
         let raised = run_pool(
             workers as usize,
             chunks,
             |(start, end)| {
+                if failed.load(Ordering::SeqCst) {
+                    return ((start, end), Ok(()));
+                }
                 let result = match &hook {
                     Some(hook) => hook(start, end),
                     None => self.download_chunk(
@@ -1412,6 +1441,9 @@ impl SLPArtifactDownloader {
                         progress_callback.clone(),
                     ),
                 };
+                if result.is_err() {
+                    failed.store(true, Ordering::SeqCst);
+                }
                 ((start, end), result)
             },
             |((start, end), result)| match result {

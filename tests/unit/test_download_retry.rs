@@ -375,3 +375,64 @@ mod test_chunked_failure_keeps_its_kind {
         assert!(!err.is_connection_error());
     }
 }
+
+/// A large file is fetched in small ranges from a shared queue, so every
+/// connection stays busy to the end instead of the slowest one finishing
+/// the last slice alone.
+mod test_ranges_keep_every_connection_busy {
+    use super::*;
+    use smartloop::model::downloader::artifact_downloader::{segments, SEGMENT_SIZE};
+
+    #[test]
+    fn test_a_large_file_is_cut_into_segment_sized_ranges() {
+        let size = 16_810_714_496u64; // Qwen3.8-27B Q4_K_M
+        let ranges = segments(size, 5);
+        assert_eq!(ranges.len() as u64, size.div_ceil(SEGMENT_SIZE));
+        assert!(ranges.iter().all(|(s, e)| e - s < SEGMENT_SIZE));
+        // Contiguous and complete.
+        assert_eq!(ranges.first().unwrap().0, 0);
+        assert_eq!(ranges.last().unwrap().1, size - 1);
+        assert!(ranges.windows(2).all(|w| w[1].0 == w[0].1 + 1));
+    }
+
+    #[test]
+    fn test_a_small_file_still_gives_every_connection_a_range() {
+        let ranges = segments(120 * 1024 * 1024, 5);
+        assert_eq!(ranges.len(), 5);
+        assert_eq!(ranges.last().unwrap().1, 120 * 1024 * 1024 - 1);
+    }
+
+    #[test]
+    fn test_every_range_is_fetched_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = downloader(None, None);
+        dl.set_chunk_workers(Some(3));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        dl.set_download_chunk_hook(Some(Arc::new(move |start, end| {
+            record.lock().push((start, end));
+            Ok(())
+        })));
+        let size = 3 * SEGMENT_SIZE + 10;
+        dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), size, None).unwrap();
+        let mut seen = seen.lock().clone();
+        seen.sort();
+        assert_eq!(seen, segments(size, 3));
+    }
+
+    #[test]
+    fn test_a_failed_range_stops_the_rest_of_the_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = downloader(None, None);
+        dl.set_chunk_workers(Some(1));
+        let calls = Arc::new(Mutex::new(0usize));
+        let count = calls.clone();
+        dl.set_download_chunk_hook(Some(Arc::new(move |_start, _end| {
+            *count.lock() += 1;
+            Err(DownloadError::Value("corrupt".to_string()))
+        })));
+        let size = 10 * SEGMENT_SIZE;
+        assert!(dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), size, None).is_err());
+        assert_eq!(*calls.lock(), 1, "the other nine ranges aren't fetched");
+    }
+}
