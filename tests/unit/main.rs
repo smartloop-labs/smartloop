@@ -150,6 +150,7 @@ mod test_storage_service;
 mod test_store_factory_config;
 mod test_stream_decode_oom_retry;
 mod test_stream_interrupt_unload;
+mod test_client_tools;
 mod test_stream_opening_buffer;
 mod test_stream_waits_for_folder_index;
 mod test_stream_stall_timeout;

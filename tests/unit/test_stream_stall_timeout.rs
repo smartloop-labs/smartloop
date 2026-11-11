@@ -44,6 +44,7 @@ fn request() -> ChatCompletionRequest {
             role: Role::System,
             content: Some("be brief".to_string()),
             attachments: None,
+            ..Default::default()
         }],
         stream: true,
         ..ChatCompletionRequest::default()
