@@ -26,6 +26,7 @@ use crate::agents::mcp::server_selector::EXPLORE_TOOL;
 use crate::agents::nodes::NodeResult;
 use crate::agents::orchestration::context::{MCPExecutionResult, OrchestratorContext};
 use crate::agents::sanitize::{fence_document_content, sanitize_document_content};
+use crate::api::model::CitationSource;
 use crate::llms::BaseLLM;
 
 /// Python logger name of this module.
@@ -145,9 +146,9 @@ impl ResponseBuilder {
     }
 
     /// The live sources gathered for this turn, as citations: the web pages
-    /// (`{"url", "document_id", "document_name"}`, so a client renders them
-    /// as links) followed by the connected-app tools whose results reached
-    /// the context.
+    /// (`{"url", "document_id", "document_name", "source": "web"}`, so a
+    /// client renders them as links) followed by the connected-app tools
+    /// whose results reached the context.
     ///
     /// Each web page carries the fetched text privately, so a link is only
     /// credited when the answer actually drew on that page.  Sources whose
@@ -160,6 +161,7 @@ impl ResponseBuilder {
             web_citation.insert("document_id".into(), Value::String(u.clone()));
             web_citation.insert("document_name".into(), Value::String(u.clone()));
             web_citation.insert("url".into(), Value::String(u.clone()));
+            web_citation.insert("source".into(), Value::String(CitationSource::Web.as_str().into()));
             if let Some(web_extract) =
                 search_ctx.web_source_extracts.get(u).filter(|e| !e.is_empty())
             {
@@ -728,6 +730,7 @@ mod tests {
         let cites = result.citations.unwrap();
         assert_eq!(cites.len(), 2);
         assert_eq!(cites[0]["url"], json!("https://a"));
+        assert_eq!(cites[0]["source"], json!("web"));
         assert_eq!(cites[1]["document_id"], json!("mcp:Notion.notion-search"));
         assert_eq!(cites[1]["document_name"], json!("Notion · notion-search"));
         assert_eq!(cites[1]["source"], json!("mcp"));
@@ -796,7 +799,7 @@ mod tests {
         assert_eq!(cites.len(), 2);
         assert_eq!(
             cites[1],
-            json!({"document_id": "https://a", "document_name": "https://a", "url": "https://a", "_extract": "page text"})
+            json!({"document_id": "https://a", "document_name": "https://a", "url": "https://a", "source": "web", "_extract": "page text"})
         );
         assert_eq!(ctx.explore_citations, explore);
     }

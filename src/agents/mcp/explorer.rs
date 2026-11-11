@@ -30,6 +30,7 @@ use crate::agents::mcp::mcp_tool_caller::MCPToolCaller;
 use crate::agents::mcp::file_ops::FileOperations;
 use crate::agents::planner::{mcp_connection_is_usable, MCPToolContext, MatchedTool, PlanStep, StepType};
 use crate::agents::web_search_agent::{LlmResolver, WebSearchAgent};
+use crate::api::model::CitationSource;
 use crate::api::services::model_service::ModelService;
 use crate::llms::BaseLLM;
 use crate::parsers::DocumentChunk;
@@ -378,7 +379,7 @@ pub fn mcp_tool_citation(server_name: &str, tool_name: &str) -> Map<String, Valu
     let mut citation = Map::new();
     citation.insert("document_id".into(), Value::String(id));
     citation.insert("document_name".into(), Value::String(name));
-    citation.insert("source".into(), Value::String("mcp".into()));
+    citation.insert("source".into(), Value::String(CitationSource::Mcp.as_str().into()));
     if !server.is_empty() {
         citation.insert("server_name".into(), Value::String(server.to_string()));
     }
@@ -1460,6 +1461,7 @@ Does answering the latest message require a new web search?
                             citation.insert("document_name".into(), Value::String((*fname).clone()));
                             let path = Path::new(cwd).join(fname.as_str());
                             citation.insert("path".into(), Value::String(path.to_string_lossy().into_owned()));
+                            citation.insert("source".into(), Value::String(CitationSource::Document.as_str().into()));
                             citation.insert("_extract".into(), Value::String(extract.clone()));
                             citation.insert("_chunks".into(), Value::Array(Vec::new()));
                             citation.insert("_vectors".into(), Value::Array(Vec::new()));
