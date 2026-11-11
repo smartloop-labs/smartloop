@@ -512,7 +512,8 @@ pub struct ModelEntry {
     pub attention: Option<Attention>,
     /// A local model that can also run in the cloud: the catalog lists its
     /// name both ways, and the two rows are shown as this one entry.  `type`
-    /// says where it runs in this workspace.
+    /// says where it runs in this workspace.  False when the account's plan
+    /// doesn't include the cloud variant.
     #[serde(default)]
     pub cloud: bool,
     /// The model has a local copy to download (a `local` catalog row), so a
@@ -649,7 +650,10 @@ pub fn list_models_with(
             if entry.kind == ModelKind::Remote {
                 continue;
             }
-            entry.cloud = MODEL_SPECS.get(&entry.name).is_some_and(|spec| spec.cloud.is_some());
+            // Offered only when the account may use it: cloud models are paid.
+            entry.cloud = MODEL_SPECS
+                .get(&entry.name)
+                .is_some_and(|spec| spec.cloud.as_ref().is_some_and(|cloud| cloud.accessible));
         }
         entry.local = local_names.contains(&entry.name);
         if entry.name == bootstrap_model {
