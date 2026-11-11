@@ -847,6 +847,10 @@ fn chunk_frame(model: &str, delta: DeltaContent, finish_reason: Option<&str>) ->
 /// client's text protocol (fenced commands).  Cloud models always qualify.
 pub const CLIENT_TOOLS_MIN_LOCAL_B: f64 = 20.0;
 
+/// How often a client-tools turn, answered in one piece, says it is still
+/// waiting for the model.
+pub const TOOL_TURN_STATUS_EVERY: Duration = Duration::from_secs(5);
+
 /// Whether the model answering for `capability` gets the client's tools: it
 /// calls functions natively, and is a cloud model or a local one of at least
 /// [`CLIENT_TOOLS_MIN_LOCAL_B`].
@@ -3069,7 +3073,11 @@ fn stream_chunks_inner(
         if let Some(tools) = client_tools.clone() {
             let client = svc.model_client();
             let check = client.clone();
-            let eligible = run_blocking(move || takes_client_tools(&*check, response_capability)).await;
+            let (eligible, label) = run_blocking(move || {
+                let label = check.model_label(response_capability).unwrap_or_default();
+                (takes_client_tools(&*check, response_capability), label)
+            })
+            .await;
             tracing::info!(
                 target: LOG_TARGET,
                 "[tools] {} client tool(s), round {} → {}",
@@ -3091,9 +3099,19 @@ fn stream_chunks_inner(
                 );
                 let full = client_tool_prompt(&prompt, &tool_rounds, &tools);
                 let model = request.model.clone();
-                let generated =
-                    run_blocking(move || client.generate(&full, Some(&model), response_capability, None, Some(false)))
-                        .await;
+                // Answered in one piece, which a reasoning model in the cloud
+                // can take minutes over: say so every few seconds, so the
+                // client shows the wait rather than a turn that looks stuck.
+                let mut task = tokio::task::spawn_blocking(bind(move || {
+                    client.generate(&full, Some(&model), response_capability, None, Some(false))
+                }));
+                let waiting = if label.is_empty() { "Waiting for the model…".to_string() } else { format!("Waiting for {label}…") };
+                let generated = loop {
+                    match tokio::time::timeout(TOOL_TURN_STATUS_EVERY, &mut task).await {
+                        Ok(joined) => break joined.map_err(|e| anyhow::anyhow!(e.to_string())).and_then(|r| r),
+                        Err(_) => yield status_event("streaming", "processing", &waiting),
+                    }
+                };
                 // A local model's failure comes back as answer text.
                 let generated = generated.and_then(|reply| {
                     if reply.starts_with("Error generating response") { Err(anyhow::anyhow!(reply)) } else { Ok(reply) }

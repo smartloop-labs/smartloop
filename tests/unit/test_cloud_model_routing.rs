@@ -328,3 +328,33 @@ fn test_a_local_model_that_does_not_load_goes_to_the_cloud_by_default() {
     let llm = svc.load_workspace_llm(&model, "answer", None).expect("the cloud copy");
     assert!(ModelService::is_cloud_llm(llm.as_ref()));
 }
+
+#[test]
+#[serial]
+fn test_a_model_that_did_not_fit_is_not_checked_again_on_every_step() {
+    let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, model) = dual_local("dual-no-fit-once", tmp.path());
+    let dir = tmp.path().join("Org/dual-no-fit-once");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("dual-no-fit-once-Q4_K_M.gguf"), b"GGUF").unwrap();
+    let svc = bare_service();
+    attach_workspace(&svc, ws);
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = checks.clone();
+    svc.set_hooks(ModelServiceHooks {
+        large_model_fits: Some(Arc::new(move |_, _, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            false
+        })),
+        ..Default::default()
+    });
+
+    // Every step of a turn resolves the model; each goes to the cloud copy.
+    for _ in 0..5 {
+        let llm = svc.load_workspace_llm(&model, "answer", None).expect("the cloud copy");
+        assert!(ModelService::is_cloud_llm(llm.as_ref()));
+    }
+    let after_first = checks.load(Ordering::SeqCst);
+    assert!(after_first <= 2, "checked once (and once more after releasing models), not per step: {after_first}");
+}

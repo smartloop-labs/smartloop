@@ -15,6 +15,7 @@ mod part2;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -136,6 +137,13 @@ pub fn select_relevant_chunks(chunks: Vec<ChunkResult>, label: &str) -> Vec<Chun
     }
     kept
 }
+
+/// How long a model that didn't fit, even after releasing the other
+/// capability models, is passed over without checking again.  Every step of
+/// a turn resolves a model, and a pinned model that doesn't fit was re-checked
+/// (and the other models released for it) on each one; until this expires
+/// the step goes straight to the model's cloud copy or the next candidate.
+pub const NO_FIT_TTL: Duration = Duration::from_secs(120);
 
 /// One cached per-capability model slot (Python's dynamic `_cap_llm_<name>`
 /// attributes).  `GpuFaulted` is the `_GPU_FAULTED` sentinel: a larger response
@@ -561,6 +569,9 @@ pub struct ModelService {
     pub cap_llms: Mutex<Vec<(String, CachedLlm)>>,
     /// `_capability_skip`: why the most recent capability model could not load.
     pub capability_skip: Mutex<Option<CapabilitySkipReason>>,
+    /// Models that didn't fit even with the other models released, by name,
+    /// until when (see [`NO_FIT_TTL`]).
+    pub no_fit: Mutex<HashMap<String, Instant>>,
     /// `_last_fit_shortfall`: `(needed_gb, free_gb)` from the last failed fit check.
     pub last_fit_shortfall: Mutex<Option<(f64, f64)>>,
     /// `_llm_executor`: shared, lazily created LLM executor.
@@ -643,6 +654,7 @@ impl ModelService {
             large_model_attempted: AtomicBool::new(false),
             cap_llms: Mutex::new(Vec::new()),
             capability_skip: Mutex::new(None),
+            no_fit: Mutex::new(HashMap::new()),
             last_fit_shortfall: Mutex::new(None),
             llm_executor: Mutex::new(None),
             inference_lock: InferenceSemaphore::new(n_parallel),
@@ -1925,6 +1937,19 @@ impl ModelService {
         Some(self.cloud_llm(&cloud))
     }
 
+    /// Whether `model_name` didn't fit within the last [`NO_FIT_TTL`].
+    fn recently_did_not_fit(&self, model_name: &str) -> bool {
+        let mut no_fit = self.no_fit.lock();
+        match no_fit.get(model_name) {
+            Some(until) if Instant::now() < *until => true,
+            Some(_) => {
+                no_fit.remove(model_name);
+                false
+            }
+            None => false,
+        }
+    }
+
     /// The local half of [`Self::load_workspace_llm_with`]: the resident
     /// instance, or a fresh load that passes the fit guard.  `None` (with the
     /// reason in `capability_skip`) when the local copy can't run.
@@ -1988,6 +2013,13 @@ impl ModelService {
             }
         }
 
+        // Didn't fit a moment ago, even with the other models released: don't
+        // check (and release them) again on every step.
+        if self.recently_did_not_fit(&ws_model.model_name) {
+            self.set_capability_skip(&ws_model.model_name, "memory", None);
+            return None;
+        }
+
         let cap = AppSettings::new().llm_large_n_ctx_cap;
         let model_dir = workspace.read().model_dir_for(&ws_model.model_id);
         // find_model_ggufs excludes the mmproj/CLIP GGUF from the main pick.
@@ -2021,6 +2053,10 @@ impl ModelService {
                 );
                 let detail = self.fit_shortfall_detail();
                 self.set_capability_skip(&ws_model.model_name, "memory", detail);
+                if evict {
+                    // Releasing the others didn't make room either.
+                    self.no_fit.lock().insert(ws_model.model_name.clone(), Instant::now() + NO_FIT_TTL);
+                }
                 return None;
             }
             tracing::info!(
