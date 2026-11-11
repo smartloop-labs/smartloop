@@ -575,10 +575,15 @@ impl SLPPlatformClient {
         object_list(data)
     }
 
-    /// GET /v1/models (auth optional). Returns list of model entries.
+    /// GET /v1/models?types=all (auth optional). Returns list of model entries.
+    ///
+    /// `types=all` asks for both entries of a model listed as remote and as
+    /// local under one name (see [`ModelRegistry::hydrate`](crate::model::spec::ModelRegistry::hydrate));
+    /// without it the API sends one row per name for older clients.
     pub fn list_models(&self) -> PlatformResult<Vec<JsonObject>> {
+        let params = [("types", "all".to_string())];
         let mut resp = self
-            .authed(|h| self.send(Method::GET, MODELS, h, &[], None, TIMEOUT))
+            .authed(|h| self.send(Method::GET, MODELS, h, &params, None, TIMEOUT))
             .map_err(|e| connection_error(&e))?;
 
         if resp.status == 401 {
@@ -587,7 +592,7 @@ impl SLPPlatformClient {
             // again anonymously rather than showing an empty picker — the
             // entries come back with `is_accessible` false, which is honest.
             resp = self
-                .send(Method::GET, MODELS, &self.headers(None), &[], None, TIMEOUT)
+                .send(Method::GET, MODELS, &self.headers(None), &params, None, TIMEOUT)
                 .map_err(|e| connection_error(&e))?;
         }
 

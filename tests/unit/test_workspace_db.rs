@@ -207,7 +207,8 @@ mod test_model_persistence {
         assert_eq!(cached["capabilities"], json!(["general", "coding"]));
         assert_eq!(cached["context_length"], json!(131072));
         let local = result.iter().find(|m| m["name"] == json!("gemma3-1b")).unwrap();
-        assert_eq!(local["type"], Value::Null);
+        // Part of the cache key, so an untyped row is stored as local.
+        assert_eq!(local["type"], json!("local"));
         assert!(local.get("capabilities").is_none());
     }
 
@@ -306,6 +307,68 @@ mod test_model_persistence {
         assert!(db.list_models().unwrap().is_empty());
         db.save_models(&models()).unwrap();
         assert_eq!(db.list_models().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_name_listed_remote_and_local_keeps_both_rows() {
+        let (_tmp, db) = db();
+        let rows: Vec<JsonObject> = [
+            json!({"name": "qwen3.8-27b", "model_id": null, "type": "remote"}),
+            json!({"name": "qwen3.8-27b", "model_id": "Qwen/Qwen3.8-27B", "type": "local"}),
+            json!({"name": "gemma3-1b", "model_id": "google/gemma-3-1b-it"}),
+        ]
+        .into_iter()
+        .map(|v| v.as_object().unwrap().clone())
+        .collect();
+        db.save_models(&rows).unwrap();
+        let result = db.list_models().unwrap();
+        let kinds: Vec<_> = result.iter().map(|m| (m["name"].clone(), m["type"].clone())).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (json!("qwen3.8-27b"), json!("remote")),
+                (json!("qwen3.8-27b"), json!("local")),
+                // A row without a type is a local model's.
+                (json!("gemma3-1b"), json!("local")),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_older_clients_catalog_is_neither_read_nor_touched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE model_catalog (
+                     name TEXT PRIMARY KEY, model_id TEXT, size TEXT,
+                     description TEXT, access_level TEXT,
+                     is_accessible INTEGER NOT NULL DEFAULT 0, sha256 TEXT,
+                     type TEXT, url TEXT, capabilities TEXT, context_length INTEGER,
+                     param_size_b REAL, model_version INTEGER, thinking_default INTEGER,
+                     vision_chat_handler TEXT, param_size_estimated INTEGER,
+                     active_param_size_b REAL, attention TEXT,
+                     reasoning_budget_tokens INTEGER,
+                     fetched_at REAL NOT NULL);
+                 INSERT INTO model_catalog (model_id, name, fetched_at)
+                     VALUES ('google/gemma-3-1b-it', 'gemma3-1b', 1.0);",
+            )
+            .unwrap();
+        }
+
+        // An older client sharing the DB fetched one row per name into
+        // `model_catalog`; this client reads its own table, and leaves that
+        // one for the older client.
+        let db = WorkspaceDB::new(&path).unwrap();
+        assert!(db.list_models().unwrap().is_empty());
+        db.save_models(&models()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let old: i64 = conn.query_row("SELECT COUNT(*) FROM model_catalog", [], |r| r.get(0)).unwrap();
+        assert_eq!(old, 1);
     }
 
     #[test]

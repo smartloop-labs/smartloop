@@ -66,6 +66,11 @@ pub struct InitRequest {
     /// enablement to it.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Run the model in the cloud rather than downloading it, for a model
+    /// the catalog lists both ways (see `ModelEntry::cloud`).  Ignored for a
+    /// model that only runs one way.
+    #[serde(default)]
+    pub cloud: Option<bool>,
 }
 
 /// A stream of already-framed SSE chunks; an `Err` item is the Python
@@ -995,16 +1000,19 @@ async fn ensure_tasks(model_service: &Arc<dyn InitModelService>, workspace: &Sha
 
 /// Whether `target` names a remote model the caller may add.
 ///
-/// A model with a local spec skips the lookup.  The catalog settles
+/// A model with a local spec skips the lookup, unless `cloud` asks for the
+/// cloud variant of a model served both ways.  The catalog settles
 /// entitlement; when it can't be read, a remote model already in the
 /// workspace is re-added as it stands, and anything else falls through to the
 /// local path, which reports an unknown model.
-async fn is_remote_target(workspace: &SharedWorkspace, target: &str) -> Result<bool, HTTPException> {
-    if MODEL_SPECS.get(target).is_some_and(|spec| !spec.is_remote()) {
+async fn is_remote_target(workspace: &SharedWorkspace, target: &str, cloud: bool) -> Result<bool, HTTPException> {
+    let spec = MODEL_SPECS.get(target);
+    let wants_cloud = cloud && spec.as_ref().is_some_and(|spec| spec.cloud.is_some());
+    if !wants_cloud && spec.is_some_and(|spec| !spec.is_remote()) {
         return Ok(false);
     }
     let registered = workspace.read().get_model(Some(target));
-    if registered.as_ref().is_some_and(|m| !m.is_remote()) {
+    if !wants_cloud && registered.as_ref().is_some_and(|m| !m.is_remote()) {
         return Ok(false);
     }
     let name = target.to_string();
@@ -1145,8 +1153,21 @@ pub async fn init_with_seams(
         .filter(|name| !name.is_empty())
         .unwrap_or(default_model);
 
-    if is_remote_target(&workspace, &target).await? {
+    if is_remote_target(&workspace, &target, request.cloud.unwrap_or(false)).await? {
         return add_remote_model(request, model_service, workspace, target).await;
+    }
+
+    // A model registered to run in the cloud is being downloaded now (its
+    // catalog entry has a local copy): register it back as local, not yet
+    // downloaded, under the copy's model id — a cloud registration has none,
+    // and the download would ask the server for model ''.
+    if let Some(spec) = MODEL_SPECS.get(&target).filter(|spec| !spec.is_remote() && !spec.model_id.is_empty()) {
+        let mut ws = workspace.write();
+        if let Some(m) = ws.get_model_mut(Some(&target)).filter(|m| m.kind == ModelKind::Remote) {
+            m.kind = ModelKind::Local;
+            m.downloaded = false;
+            m.model_id = spec.model_id.clone();
+        }
     }
 
     // Register the model in the workspace if not already present

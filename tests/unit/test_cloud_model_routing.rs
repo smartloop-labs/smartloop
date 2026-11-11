@@ -222,3 +222,139 @@ fn test_a_remote_pin_is_ignored_while_orchestrating() {
     let llm = svc.llm_for_response(None).expect("the pinned model");
     assert!(ModelService::is_cloud_llm(llm.as_ref()));
 }
+
+/// A local model the catalog also serves in the cloud, registered local in a
+/// workspace whose models live under `models_dir`.
+fn dual_local(name: &str, models_dir: &std::path::Path) -> (Workspace, WorkspaceModel) {
+    let rows = [
+        json!({"name": name, "type": "remote", "url": "https://api.smartloop.ai",
+               "capabilities": ["text"], "context_length": 262144, "is_accessible": true}),
+        json!({"name": name, "type": "local", "model_id": format!("Org/{name}"),
+               "capabilities": ["text"], "param_size_b": 27.0}),
+    ]
+    .map(|v| v.as_object().unwrap().clone());
+    MODEL_SPECS.hydrate(&rows);
+    let mut ws = Workspace::new("ws");
+    ws.models_dir = models_dir.to_string_lossy().to_string();
+    ws.add_model(name, &format!("Org/{name}"), None, true);
+    ws.get_model_mut(Some(name)).unwrap().downloaded = true;
+    let model = ws.get_model(Some(name)).unwrap();
+    (ws, model)
+}
+
+#[test]
+#[serial]
+fn test_a_local_model_without_its_weights_runs_in_the_cloud() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, model) = dual_local("dual-missing", tmp.path());
+    let svc = bare_service();
+    attach_workspace(&svc, ws);
+
+    let llm = svc.load_workspace_llm(&model, "answer", None).expect("the cloud variant");
+    assert!(ModelService::is_cloud_llm(llm.as_ref()));
+    assert_eq!(llm.model_label(), "dual-missing");
+    assert_eq!(llm.get_max_tokens(), 262144);
+}
+
+#[test]
+#[serial]
+fn test_a_local_model_that_does_not_fit_runs_in_the_cloud() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, model) = dual_local("dual-tight", tmp.path());
+    let dir = tmp.path().join("Org/dual-tight");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("dual-tight-Q4_K_M.gguf"), b"GGUF").unwrap();
+    let svc = bare_service();
+    attach_workspace(&svc, ws);
+    let loaded = Arc::new(AtomicBool::new(false));
+    let loaded_in_hook = loaded.clone();
+    svc.set_hooks(ModelServiceHooks {
+        large_model_fits: Some(Arc::new(|_, _, _, _| false)),
+        load_llama_instance: Some(Arc::new(move |_, name: &str, _, _| {
+            loaded_in_hook.store(true, Ordering::SeqCst);
+            Ok(FakeLLM::named(name))
+        })),
+        ..Default::default()
+    });
+
+    let llm = svc.load_workspace_llm(&model, "answer", None).expect("the cloud variant");
+    assert!(ModelService::is_cloud_llm(llm.as_ref()));
+    assert!(!loaded.load(Ordering::SeqCst), "the local copy never loads");
+}
+
+#[test]
+#[serial]
+fn test_no_cloud_fallback_while_orchestrating() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
+    use smartloop::llms::cloud_llm::local_only_scope;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, model) = dual_local("dual-orchestrating", tmp.path());
+    let svc = bare_service();
+    attach_workspace(&svc, ws);
+    let _scope = local_only_scope(true);
+    assert!(svc.load_workspace_llm(&model, "decision", None).is_none());
+}
+
+#[test]
+#[serial]
+fn test_a_local_model_without_its_weights_stays_off_the_cloud_when_turned_off() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "false");
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, model) = dual_local("dual-paid", tmp.path());
+    let svc = bare_service();
+    attach_workspace(&svc, ws);
+    assert!(svc.load_workspace_llm(&model, "answer", None).is_none(), "degrades instead");
+}
+
+#[test]
+#[serial]
+fn test_a_local_model_that_does_not_load_goes_to_the_cloud_by_default() {
+    let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, model) = dual_local("dual-load-fails", tmp.path());
+    let dir = tmp.path().join("Org/dual-load-fails");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("dual-load-fails-Q4_K_M.gguf"), b"GGUF").unwrap();
+    let svc = bare_service();
+    attach_workspace(&svc, ws);
+    svc.set_hooks(ModelServiceHooks {
+        large_model_fits: Some(Arc::new(|_, _, _, _| true)),
+        load_llama_instance: Some(Arc::new(|_, _, _, _| Err(anyhow::anyhow!("failed to load model")))),
+        ..Default::default()
+    });
+    let llm = svc.load_workspace_llm(&model, "answer", None).expect("the cloud copy");
+    assert!(ModelService::is_cloud_llm(llm.as_ref()));
+}
+
+#[test]
+#[serial]
+fn test_a_model_that_did_not_fit_is_not_checked_again_on_every_step() {
+    let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, model) = dual_local("dual-no-fit-once", tmp.path());
+    let dir = tmp.path().join("Org/dual-no-fit-once");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("dual-no-fit-once-Q4_K_M.gguf"), b"GGUF").unwrap();
+    let svc = bare_service();
+    attach_workspace(&svc, ws);
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = checks.clone();
+    svc.set_hooks(ModelServiceHooks {
+        large_model_fits: Some(Arc::new(move |_, _, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            false
+        })),
+        ..Default::default()
+    });
+
+    // Every step of a turn resolves the model; each goes to the cloud copy.
+    for _ in 0..5 {
+        let llm = svc.load_workspace_llm(&model, "answer", None).expect("the cloud copy");
+        assert!(ModelService::is_cloud_llm(llm.as_ref()));
+    }
+    let after_first = checks.load(Ordering::SeqCst);
+    assert!(after_first <= 2, "checked once (and once more after releasing models), not per step: {after_first}");
+}

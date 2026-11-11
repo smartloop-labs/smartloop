@@ -542,3 +542,53 @@ async fn test_the_first_token_arrives_before_the_answer_ends() {
     assert_eq!(rest, "lo");
     assert!(released_in_time.load(Ordering::SeqCst), "the first token waited for the end of the answer");
 }
+
+/// A tools prompt streams: the text as it comes, then the call, put together
+/// from its pieces, in the canonical `<tool_call>` text.
+#[tokio::test]
+#[serial]
+async fn test_a_tools_prompt_streams_its_text_then_the_call() {
+    use smartloop::llms::tool_calls::{parse_tool_calls, with_tools_and_messages};
+    use smartloop::model::spec::MODEL_SPECS;
+
+    let Value::Object(row) = json!({"name": "ct-stream-tools", "type": "remote", "capabilities": ["text", "tools"]}) else {
+        unreachable!()
+    };
+    MODEL_SPECS.hydrate(&[row]);
+    let server = MockServer::start().await;
+    let call = |piece: Value| json!({"choices": [{"delta": {"tool_calls": [piece]}}]});
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(sse(&[
+                delta("Let me"),
+                delta(" look."),
+                call(json!({"index": 0, "id": "call_9", "type": "function", "function": {"name": "bash", "arguments": ""}})),
+                call(json!({"index": 0, "function": {"arguments": "{\"command\""}})),
+                call(json!({"index": 0, "function": {"arguments": ":\"ls\"}"}})),
+                json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+            ])),
+        )
+        .mount(&server)
+        .await;
+    let _env = EnvGuard::set("SLP_API_BASE", server.uri());
+    mount_session(&server, &["ct-stream-tools"]).await;
+    let llm = Arc::new(CloudLLM::with_hooks("p1", "ct-stream-tools", &server.uri(), Some(8192), Some(bearer("t")), Some(Arc::new(|| false))));
+    let bash = json!({"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}});
+    let prompt = with_tools_and_messages(&[bash], &[json!({"role": "user", "content": "list the files"})]);
+
+    let chunks: Vec<String> = tokio::task::spawn_blocking(move || llm.stream(&prompt, CallOptions::default()).map(|c| c.text).collect())
+        .await
+        .unwrap();
+    assert_eq!(chunks[..2], ["Let me", " look."], "the text streams as it comes");
+    let calls = parse_tool_calls(&chunks[2..].concat());
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "bash");
+    assert_eq!(calls[0].id.as_deref(), Some("call_9"));
+    assert_eq!(calls[0].arguments["command"], "ls");
+
+    let sent: Value = chats(&server).await[0].body_json().unwrap();
+    assert_eq!(sent["stream"], true);
+    assert_eq!(sent["tools"][0]["function"]["name"], "bash");
+    assert_eq!(sent["messages"], json!([{"role": "user", "content": "list the files"}]));
+}

@@ -158,7 +158,7 @@ fn test_date_block_requires_a_skill() {
 // --------------------------------------------------------------------------
 
 fn user(content: &str) -> ChatMessage {
-    ChatMessage { role: Role::User, content: Some(content.to_string()), attachments: None }
+    ChatMessage { role: Role::User, content: Some(content.to_string()), attachments: None, ..Default::default() }
 }
 
 #[test]

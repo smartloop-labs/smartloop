@@ -36,7 +36,7 @@ use crate::llms::cloud_session::{self, SessionModel};
 use crate::llms::tool_calls::{openai_messages, parse_tool_calls, render_tool_calls, split_messages, split_tools, NativeToolCall};
 use crate::model::spec::MODEL_SPECS;
 use crate::platform::client::{AuthHeadersFn, RefreshFn, SLPPlatformClient};
-use crate::types::ModelCapability;
+use crate::types::{ModelCapability, ModelKind};
 
 const LOG_TARGET: &str = "smartloop.llms.cloud";
 
@@ -509,7 +509,9 @@ impl BaseLLM for CloudLLM {
     /// True when the catalog declares `tools` for this model: its endpoint
     /// then takes an OpenAI `tools` list and answers with `tool_calls`.
     fn supports_native_tools(&self) -> bool {
-        MODEL_SPECS.get(&self.model_name).is_some_and(|spec| spec.supports(ModelCapability::Tools))
+        MODEL_SPECS
+            .get(&self.model_name)
+            .is_some_and(|spec| spec.for_kind(ModelKind::Remote).supports(ModelCapability::Tools))
     }
 
     /// A capped answer that runs out of tokens is retried once with twice
@@ -568,24 +570,58 @@ impl BaseLLM for CloudLLM {
     }
 
     fn stream<'a>(&'a self, prompt: &str, options: CallOptions) -> GenerationStream<'a> {
-        let messages = self.create_messages_from_prompt(prompt);
+        // A tools prompt (see `crate::llms::tool_calls`) streams too: the
+        // answer's text as it comes, then the calls it made, once complete,
+        // in the canonical `<tool_call>` text a caller parses.
+        let (rest, tools) = split_tools(prompt);
+        let tools = tools.filter(|_| self.supports_native_tools());
+        let messages: Value = match split_messages(rest).filter(|_| tools.is_some()) {
+            Some(conversation) => Value::Array(openai_messages(&conversation)),
+            None => json!(self.create_messages_from_prompt(rest)),
+        };
+        let mut body = self.body_for(messages, true, self.request_max_tokens(options));
+        if let Some(tools) = &tools {
+            body["tools"] = Value::Array(tools.clone());
+            body["tool_choice"] = json!("auto");
+        }
         let started = Instant::now();
-        let response = match self.post(&self.body(&messages, true, self.request_max_tokens(options))) {
+        let response = match self.post(&body) {
             Ok(response) => response,
             Err(message) => std::panic::panic_any(message),
         };
+        // Streamed tool calls arrive in pieces, by index: the id and name
+        // once, the arguments a fragment at a time.
+        let mut calls: std::collections::BTreeMap<u64, (Option<String>, String, String)> = Default::default();
+        let mut finished = false;
         let mut lines = BufReader::new(response).lines();
         // Characters of answer and of reasoning seen, to say where the
         // room went when the stream is cut off.
         let (mut answered, mut reasoned) = (0usize, 0usize);
         let mut timing = StreamTiming::new(started);
+        // The calls a stream made, once it has ended, as one last chunk.
+        let mut calls_chunk = move |calls: &mut std::collections::BTreeMap<u64, (Option<String>, String, String)>| {
+            if calls.is_empty() {
+                return None;
+            }
+            let made: Vec<NativeToolCall> = std::mem::take(calls)
+                .into_values()
+                .filter(|(_, name, _)| !name.is_empty())
+                .map(|(id, name, arguments)| NativeToolCall {
+                    id,
+                    name,
+                    arguments: serde_json::from_str(&arguments).unwrap_or_default(),
+                })
+                .collect();
+            (!made.is_empty()).then(|| GenerationChunk { text: format!("\n{}", render_tool_calls(&made)) })
+        };
         Box::new(std::iter::from_fn(move || loop {
-            if self.is_cancelled() {
+            if finished || self.is_cancelled() {
                 return None;
             }
             let Some(line) = lines.next() else {
                 timing.report(&self.model_name);
-                return None;
+                finished = true;
+                return calls_chunk(&mut calls);
             };
             let line = match line {
                 Ok(line) => line,
@@ -597,9 +633,25 @@ impl BaseLLM for CloudLLM {
             let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
             if data == "[DONE]" {
                 timing.report(&self.model_name);
-                return None;
+                finished = true;
+                return calls_chunk(&mut calls);
             }
             let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+            for call in chunk.pointer("/choices/0/delta/tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                let index = call["index"].as_u64().unwrap_or(0);
+                let entry = calls.entry(index).or_default();
+                if let Some(id) = call["id"].as_str().filter(|id| !id.is_empty()) {
+                    entry.0 = Some(id.to_string());
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+                    && !entry.1.ends_with(name)
+                {
+                    entry.1.push_str(name);
+                }
+                if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                    entry.2.push_str(arguments);
+                }
+            }
             if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
                 timing.usage = Some(usage.clone());
             }

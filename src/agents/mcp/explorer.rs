@@ -483,6 +483,41 @@ pub struct Explorer {
 
 /// `re.sub(r'[\s_\-]+', ' ', ...)` for skill-name matching.
 static NAME_SEPARATORS: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\s_\-]+").expect("valid regex"));
+/// Below this size (billions of parameters) a skill-matching model's pick
+/// must share a word with the skill (see [`shares_a_word`]).
+const SMALL_MATCHER_B: f64 = 3.0;
+
+/// Whether `llm` is a small model by its spec; a model without a known size
+/// is judged on intent alone, as before.
+fn is_small_matcher(llm: &dyn BaseLLM) -> bool {
+    crate::model::spec::MODEL_SPECS
+        .get(&llm.model_label())
+        .is_some_and(|spec| spec.ranking_size_b() > 0.0 && spec.ranking_size_b() < SMALL_MATCHER_B)
+}
+
+/// Whether `message` shares a meaningful word with `skill`'s name or
+/// description: a word of four letters or more, compared on its first five
+/// (so "meeting" meets "meetings"), outside a few that say nothing.
+fn shares_a_word(message: &str, skill: &SkillDict) -> bool {
+    const SAY_NOTHING: [&str; 16] = [
+        "with", "from", "this", "that", "what", "when", "your", "have", "into", "about", "show", "make", "help",
+        "please", "using", "them",
+    ];
+    let stems = |text: &str| -> HashSet<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .map(str::to_lowercase)
+            .filter(|w| w.chars().count() >= 4 && !SAY_NOTHING.contains(&w.as_str()))
+            .map(|w| w.chars().take(5).collect())
+            .collect()
+    };
+    let skill_text = format!(
+        "{} {}",
+        skill_name(skill).replace(['-', '_'], " "),
+        skill.get("description").map(String::as_str).unwrap_or("")
+    );
+    !stems(message).is_disjoint(&stems(&skill_text))
+}
+
 /// Signed integers in the skill-match reply.
 static SIGNED_INT: Lazy<Regex> = Lazy::new(|| Regex::new(r"-?\d+").expect("valid regex"));
 /// Word separators in a tool name.
@@ -688,6 +723,14 @@ impl Explorer {
                     matched.push(s.clone());
                 }
             }
+        }
+
+        // A small model picks the only skill listed whatever the request
+        // (the on-device router matched a calendar skill to "commit and
+        // push" on every turn), so its pick has to share a word with the
+        // skill too.  A larger model's judgement stands on intent alone.
+        if match_llm.is_some_and(is_small_matcher) {
+            matched.retain(|s| shares_a_word(user_message, s));
         }
 
         matched

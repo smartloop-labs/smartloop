@@ -4,7 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The role of a chat message author (`Literal["system", "user", "assistant"]`).
+/// The role of a chat message author: `system`, `user`, `assistant`, or
+/// `tool` (a client tool's result, answering an assistant's `tool_calls`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -12,6 +13,7 @@ pub enum Role {
     #[default]
     User,
     Assistant,
+    Tool,
 }
 
 impl Role {
@@ -21,6 +23,7 @@ impl Role {
             Role::System => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::Tool => "tool",
         }
     }
 }
@@ -36,6 +39,13 @@ pub struct ChatMessage {
     /// List of asset IDs to include as context in this message.
     #[serde(default)]
     pub attachments: Option<Vec<String>>,
+    /// The calls an assistant message made to the client's tools (OpenAI
+    /// shape: `{id, type: "function", function: {name, arguments}}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// The call a `tool` message answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// Client-supplied per-request context (the browser's clock/locale).
@@ -109,6 +119,15 @@ pub struct ChatCompletionRequest {
     /// date-aware answers in the user's wall clock.
     #[serde(default)]
     pub additional_message_params: Option<AdditionalMessageParams>,
+    /// Tools the client runs itself (OpenAI function definitions), e.g. a
+    /// coding client's `bash`.  Smartloop never runs them: it offers them to
+    /// a response model that uses tools well and streams back the calls it
+    /// makes; any other model answers without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// OpenAI `tool_choice`; only `"auto"` is honoured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 impl Default for ChatCompletionRequest {
@@ -128,6 +147,8 @@ impl Default for ChatCompletionRequest {
             presence_penalty: default_penalty(),
             stop: None,
             additional_message_params: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 }
@@ -208,6 +229,10 @@ pub struct DeltaContent {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    /// Calls to the client's tools, sent once complete (each with its
+    /// `index`), before a `tool_calls` finish reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 /// A single choice in a streaming chunk response.

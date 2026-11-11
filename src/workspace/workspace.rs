@@ -722,13 +722,21 @@ impl Default for WorkspaceModel {
 impl WorkspaceModel {
     /// Where this model runs: its spec's kind, else the stored one.
     ///
-    /// The spec is authoritative.  The stored `type` is only a fallback for a
-    /// model the catalog has not described yet: a build that predates remote
-    /// models drops the key on its next save.
+    /// The spec is authoritative, except that a local model with a cloud
+    /// variant runs where it was registered: the user picked local or cloud.
+    /// The stored `type` is otherwise only a fallback for a model the catalog
+    /// has not described yet: a build that predates remote models drops the
+    /// key on its next save.
     pub fn kind(&self) -> ModelKind {
-        let Some(spec) = self.spec() else {
+        let Some(spec) = MODEL_SPECS.get(&self.model_name) else {
             return self.kind;
         };
+        // Where the user picked, while that choice can run: a cloud
+        // registration whose cloud copy the account can't use (signed out,
+        // or not on the plan) runs locally.
+        if spec.cloud.as_ref().is_some_and(|cloud| cloud.accessible) {
+            return self.kind;
+        }
         if spec.kind != self.kind && KIND_MISMATCH_REPORTED.lock().insert(self.model_name.clone()) {
             tracing::error!(
                 target: LOG_TARGET,
@@ -788,9 +796,34 @@ impl WorkspaceModel {
         join(&self.bin_dir(), &format!("{}.gguf", path_name(&self.model_id)))
     }
 
-    /// This model's spec, if one is known.
+    /// Whether the model is ready to run where it runs ([`Self::kind`]).  The
+    /// stored flag, except that a cloud registration (always "downloaded":
+    /// nothing to fetch) of a model that now runs locally says nothing about
+    /// its local copy.
+    pub fn is_downloaded(&self) -> bool {
+        self.downloaded && !(self.kind == ModelKind::Remote && self.kind() == ModelKind::Local)
+    }
+
+    /// This model's spec, if one is known: the cloud variant when a model
+    /// served both ways is registered to run remotely.
     pub fn spec(&self) -> Option<Arc<ModelSpec>> {
-        MODEL_SPECS.get(&self.model_name)
+        MODEL_SPECS.get(&self.model_name).map(|spec| spec.for_kind(self.kind()))
+    }
+
+    /// This model run in the cloud instead, when it is a local model whose
+    /// catalog entry also lists a cloud variant the account may use: the
+    /// fallback for when the local copy can't run here (not downloaded, out
+    /// of memory, or failing to load), tried before a smaller local model.
+    /// `None` otherwise, and when `slp_cloud_fallback` is turned off.
+    pub fn cloud_fallback(&self) -> Option<WorkspaceModel> {
+        if self.kind() == ModelKind::Remote || !AppSettings::new().cloud_fallback {
+            return None;
+        }
+        let spec = MODEL_SPECS.get(&self.model_name)?;
+        if !spec.cloud.as_ref().is_some_and(|cloud| cloud.accessible) {
+            return None;
+        }
+        Some(WorkspaceModel { kind: ModelKind::Remote, downloaded: true, ..self.clone() })
     }
 
     /// Base URL a remote model's chat requests go to: its spec's, else the
@@ -1485,7 +1518,7 @@ impl Workspace {
     /// `models_dir` and are added or removed for every project at once — so
     /// this takes no project argument.
     pub fn effective_model_downloaded(&self, model_name: &str) -> bool {
-        self.get_model(Some(model_name)).map(|ws| ws.downloaded).unwrap_or(false)
+        self.get_model(Some(model_name)).map(|ws| ws.is_downloaded()).unwrap_or(false)
     }
 
     /// Whether `model_name` is the active selection for `project`.
@@ -1812,7 +1845,9 @@ impl Workspace {
             .iter()
             .filter(|m| {
                 self.effective_model_enabled(&m.model_name, project)
-                    && self.effective_model_downloaded(&m.model_name)
+                    // A model with a cloud variant runs there until its
+                    // download lands (see `WorkspaceModel::cloud_fallback`).
+                    && (self.effective_model_downloaded(&m.model_name) || m.cloud_fallback().is_some())
                     && (m.param_size_b() > 0.0 || m.is_remote())
                     && {
                         if answer {

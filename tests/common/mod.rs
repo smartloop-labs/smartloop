@@ -2775,6 +2775,10 @@ pub mod api_chat {
         /// `unload_auxiliary_models.side_effect`: fail with this message.
         pub unload_failure: Mutex<Option<String>>,
         pub unload_embedding_calls: Mutex<usize>,
+        /// `supports_native_tools` of the response model.
+        pub native_tools: Mutex<bool>,
+        /// `response_model_label`; `None` answers `"sl-mini"`.
+        pub label: Mutex<Option<String>>,
     }
 
     impl FakeDevice {
@@ -2824,7 +2828,11 @@ pub mod api_chat {
         }
 
         fn response_model_label(&self, _capability: Option<&str>) -> String {
-            "sl-mini".to_string()
+            self.label.lock().clone().unwrap_or_else(|| "sl-mini".to_string())
+        }
+
+        fn supports_native_tools(&self, _capability: Option<&str>) -> bool {
+            *self.native_tools.lock()
         }
 
         fn count_tokens(&self, _text: &str) -> usize {
@@ -2893,6 +2901,8 @@ pub mod api_chat {
                     unload_calls: Mutex::new(Vec::new()),
                     unload_failure: Mutex::new(None),
                     unload_embedding_calls: Mutex::new(0),
+                    native_tools: Mutex::new(false),
+                    label: Mutex::new(None),
                 }),
                 orchestrate_outcome: Mutex::new(OrchestrateOutcome::default()),
                 orchestrate_calls: Mutex::new(Vec::new()),

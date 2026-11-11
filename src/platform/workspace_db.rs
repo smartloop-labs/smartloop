@@ -16,8 +16,9 @@ use serde_json::Value;
 
 use crate::platform::client::JsonObject;
 use crate::platform::service::now;
+use crate::types::ModelKind;
 
-/// Schema.  `model_catalog` is a pure cache; [`drop_outdated_model_catalog`]
+/// Schema.  `model_catalog_v2` is a pure cache; [`drop_outdated_model_catalog`]
 /// discards one written before its current columns.
 pub const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS workspace (
@@ -38,8 +39,8 @@ CREATE TABLE IF NOT EXISTS users (
     fetched_at          REAL NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS model_catalog (
-    name           TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS model_catalog_v2 (
+    name           TEXT NOT NULL,
     model_id       TEXT,            -- NULL for a remote model
     size           TEXT,
     description    TEXT,
@@ -58,7 +59,9 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     model_version       INTEGER,
     thinking_default    INTEGER,
     vision_chat_handler TEXT,
-    fetched_at     REAL NOT NULL
+    fetched_at     REAL NOT NULL,
+    -- One name can be listed twice: a remote row and a local (GGUF) row.
+    PRIMARY KEY (name, type)
 );
 
 CREATE TABLE IF NOT EXISTS mcp_catalog (
@@ -242,17 +245,24 @@ pub fn python_json_dumps(value: &Value) -> String {
     String::from_utf8(out).expect("JSON output is UTF-8")
 }
 
-/// Drop a `model_catalog` table from before its newest column (the
-/// reasoning budget; before that, attention, the other model spec fields,
-/// and remote models and their name key).  It only
-/// caches the cloud catalog, so the next fetch refills it.
+/// The cached catalog's table.  It is `model_catalog_v2`, not `model_catalog`,
+/// because the workspace DB is shared with older clients (a docent build
+/// embedding an earlier smartloop): they fetch one row per name and write it
+/// into `model_catalog`, and a newer client reading that would never see the
+/// local entry of a model also served in the cloud.  The old table is left
+/// to them.
+const CATALOG_TABLE: &str = "model_catalog_v2";
+
+/// Drop a catalog table from before its `(name, type)` key.  It only caches
+/// the cloud catalog, so the next fetch refills it.
 fn drop_outdated_model_catalog(conn: &Connection) -> anyhow::Result<()> {
-    let columns: Vec<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('model_catalog')")?
-        .query_map([], |r| r.get::<_, String>(0))?
+    let columns: Vec<(String, i64)> = conn
+        .prepare(&format!("SELECT name, pk FROM pragma_table_info('{CATALOG_TABLE}')"))?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
         .collect::<Result<_, _>>()?;
-    if !columns.is_empty() && !columns.iter().any(|c| c == "reasoning_budget_tokens") {
-        conn.execute_batch("DROP TABLE model_catalog")?;
+    let keyed_by_type = columns.iter().any(|(name, pk)| name == "type" && *pk > 0);
+    if !columns.is_empty() && !keyed_by_type {
+        conn.execute_batch(&format!("DROP TABLE {CATALOG_TABLE}"))?;
     }
     Ok(())
 }
@@ -367,7 +377,7 @@ impl WorkspaceDB {
                     type, url, capabilities, context_length, \
                     param_size_b, model_version, thinking_default, vision_chat_handler, \
                     param_size_estimated, active_param_size_b, attention, reasoning_budget_tokens \
-             FROM model_catalog",
+             FROM model_catalog_v2 ORDER BY rowid",
         )?;
         let rows = stmt.query_map([], |r| {
             let mut m = JsonObject::new();
@@ -431,7 +441,16 @@ impl WorkspaceDB {
                         int_flag(m, "is_accessible", false)?,
                         optional(m, "sha256")?,
                     ),
-                    (optional(m, "type")?, optional(m, "url")?, capabilities, optional(m, "context_length")?),
+                    (
+                        // Part of the key: a row without a type is a local model's.
+                        match optional(m, "type")? {
+                            SqlValue::Null => SqlValue::Text(ModelKind::Local.value().to_string()),
+                            kind => kind,
+                        },
+                        optional(m, "url")?,
+                        capabilities,
+                        optional(m, "context_length")?,
+                    ),
                     (
                         optional(m, "param_size_b")?,
                         optional(m, "model_version")?,
@@ -448,10 +467,10 @@ impl WorkspaceDB {
 
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM model_catalog", [])?;
+        tx.execute("DELETE FROM model_catalog_v2", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO model_catalog
+                "INSERT INTO model_catalog_v2
                        (model_id, name, size, description, access_level, is_accessible, sha256,
                         type, url, capabilities, context_length,
                         param_size_b, model_version, thinking_default, vision_chat_handler,
@@ -505,7 +524,7 @@ impl WorkspaceDB {
 
     /// Timestamp of the last model catalog fetch (`MIN(fetched_at)`), or `None`.
     pub fn models_fetched_at(&self) -> anyhow::Result<Option<f64>> {
-        self.min_fetched_at("SELECT MIN(fetched_at) AS ts FROM model_catalog")
+        self.min_fetched_at("SELECT MIN(fetched_at) AS ts FROM model_catalog_v2")
     }
 
     fn min_fetched_at(&self, sql: &str) -> anyhow::Result<Option<f64>> {

@@ -721,7 +721,7 @@ pub fn scan_models(workspace: &Workspace, model_service: Option<&dyn StorageMode
                 "model_name".into(),
                 entry.map(|e| Value::String(e.model_name.clone())).unwrap_or(Value::Null),
             );
-            extra.insert("downloaded".into(), Value::Bool(entry.map(|e| e.downloaded).unwrap_or(false)));
+            extra.insert("downloaded".into(), Value::Bool(entry.map(|e| e.is_downloaded()).unwrap_or(false)));
             extra.insert("enabled".into(), Value::Bool(entry.map(|e| e.enabled).unwrap_or(false)));
             extra.insert("is_active".into(), Value::Bool(entry.map(|e| e.is_active).unwrap_or(false)));
             extra.insert("loaded".into(), Value::Bool(loaded));

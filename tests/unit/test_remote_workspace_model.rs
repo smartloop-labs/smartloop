@@ -9,7 +9,10 @@ use smartloop::model::spec::MODEL_SPECS;
 use smartloop::types::{ModelKind, ANSWER_TIER};
 use smartloop::workspace::workspace::{Workspace, WorkspaceModel};
 
+use serial_test::serial;
+
 use crate::shared::platform_support::obj;
+use crate::shared::workspace_support::EnvGuard;
 
 fn workspace() -> Workspace {
     let mut ws = Workspace::new("ws-remote");
@@ -206,4 +209,101 @@ fn test_the_reasoning_budget_comes_from_the_spec() {
     let mut ws = workspace();
     assert_eq!(ws.add_remote_model("remote-thinker", true).reasoning_budget_tokens(), Some(2048));
     assert_eq!(ws.add_remote_model("remote-no-budget", true).reasoning_budget_tokens(), None);
+}
+
+/// Publish a model the catalog lists both ways: a local row and a remote one.
+fn dual_spec(name: &str, accessible: bool) {
+    let local = obj(json!({
+        "name": name, "type": "local", "model_id": format!("Org/{name}"),
+        "capabilities": ["text", "thinking"], "param_size_b": 27.0,
+    }));
+    let remote = obj(json!({
+        "name": name, "type": "remote", "url": "https://api.smartloop.ai",
+        "capabilities": ["text", "tools"], "param_size_b": 27.0, "is_accessible": accessible,
+    }));
+    MODEL_SPECS.hydrate(&[remote, local]);
+}
+
+#[test]
+#[serial]
+fn test_a_model_served_both_ways_falls_back_to_its_cloud_variant() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
+    dual_spec("dual-fallback", true);
+    let mut ws = workspace();
+    let local = ws.add_model("dual-fallback", "Org/dual-fallback", None, true);
+    assert!(!local.is_remote());
+    assert_eq!(local.effective_capabilities(), caps(&["text", "thinking"]));
+
+    let cloud = local.cloud_fallback().expect("has a cloud variant");
+    assert!(cloud.is_remote());
+    assert!(cloud.downloaded);
+    assert_eq!(cloud.url().as_deref(), Some("https://api.smartloop.ai"));
+    assert_eq!(cloud.effective_capabilities(), caps(&["text", "tools"]));
+    // Already remote: nothing to fall back to.
+    assert!(cloud.cloud_fallback().is_none());
+}
+
+#[test]
+#[serial]
+fn test_no_cloud_fallback_the_plan_does_not_include() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
+    dual_spec("dual-locked", false);
+    let mut ws = workspace();
+    let local = ws.add_model("dual-locked", "Org/dual-locked", None, true);
+    assert!(local.cloud_fallback().is_none());
+    // Not downloaded and no usable cloud variant: not a candidate.
+    assert!(ranked_names(&ws, ANSWER_TIER).is_empty());
+}
+
+#[test]
+#[serial]
+fn test_a_model_with_a_cloud_variant_is_a_candidate_before_its_download_lands() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
+    dual_spec("dual-pending", true);
+    let mut ws = workspace();
+    ws.add_model("dual-pending", "Org/dual-pending", None, true);
+    assert!(!ws.get_model(Some("dual-pending")).unwrap().downloaded);
+    assert_eq!(ranked_names(&ws, ANSWER_TIER), vec!["dual-pending"]);
+}
+
+#[test]
+fn test_a_model_served_both_ways_runs_where_it_was_registered() {
+    dual_spec("dual-choice", true);
+    let mut ws = workspace();
+    let cloud = ws.add_remote_model("dual-choice", true);
+    assert!(cloud.is_remote());
+    assert_eq!(cloud.url().as_deref(), Some("https://api.smartloop.ai"));
+}
+
+#[test]
+#[serial]
+fn test_cloud_fallback_is_on_by_default_and_can_be_turned_off() {
+    dual_spec("dual-default", true);
+    let mut ws = workspace();
+    let local = ws.add_model("dual-default", "Org/dual-default", None, true);
+    {
+        let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
+        assert!(local.cloud_fallback().is_some(), "the cloud copy comes before degrading");
+    }
+    let _off = EnvGuard::set("SLP_CLOUD_FALLBACK", "false");
+    assert!(local.cloud_fallback().is_none());
+    // Off, a model whose download hasn't landed isn't a candidate either.
+    assert!(ranked_names(&ws, ANSWER_TIER).is_empty());
+}
+
+#[test]
+fn test_a_cloud_registration_runs_locally_when_the_cloud_copy_is_out_of_reach() {
+    // Signed out: the catalog still lists the cloud row, not accessible.
+    dual_spec("dual-signed-out", false);
+    let mut ws = workspace();
+    let cloud = ws.add_remote_model("dual-signed-out", true);
+    assert_eq!(cloud.kind, ModelKind::Remote, "registered in the cloud");
+    assert!(!cloud.is_remote(), "but runs locally, since the cloud copy can't be used");
+    assert!(!cloud.is_downloaded(), "and its local copy hasn't been downloaded");
+    assert!(!ws.effective_model_downloaded("dual-signed-out"));
+
+    // Signed in with the plan, the pick holds and needs no download.
+    dual_spec("dual-signed-in", true);
+    let cloud = ws.add_remote_model("dual-signed-in", true);
+    assert!(cloud.is_remote() && cloud.is_downloaded());
 }

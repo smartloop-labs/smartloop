@@ -65,6 +65,7 @@ pub fn request() -> ChatCompletionRequest {
             role: Role::User,
             content: Some("who was the invoice for?".to_string()),
             attachments: None,
+            ..Default::default()
         }],
         stream: true,
         ..ChatCompletionRequest::default()
