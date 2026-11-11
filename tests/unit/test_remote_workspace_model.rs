@@ -287,3 +287,20 @@ fn test_cloud_fallback_is_off_unless_allowed() {
     // So a model whose download hasn't landed isn't a candidate either.
     assert!(ranked_names(&ws, ANSWER_TIER).is_empty());
 }
+
+#[test]
+fn test_a_cloud_registration_runs_locally_when_the_cloud_copy_is_out_of_reach() {
+    // Signed out: the catalog still lists the cloud row, not accessible.
+    dual_spec("dual-signed-out", false);
+    let mut ws = workspace();
+    let cloud = ws.add_remote_model("dual-signed-out", true);
+    assert_eq!(cloud.kind, ModelKind::Remote, "registered in the cloud");
+    assert!(!cloud.is_remote(), "but runs locally, since the cloud copy can't be used");
+    assert!(!cloud.is_downloaded(), "and its local copy hasn't been downloaded");
+    assert!(!ws.effective_model_downloaded("dual-signed-out"));
+
+    // Signed in with the plan, the pick holds and needs no download.
+    dual_spec("dual-signed-in", true);
+    let cloud = ws.add_remote_model("dual-signed-in", true);
+    assert!(cloud.is_remote() && cloud.is_downloaded());
+}

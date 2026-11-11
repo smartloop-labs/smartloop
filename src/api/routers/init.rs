@@ -1157,13 +1157,16 @@ pub async fn init_with_seams(
         return add_remote_model(request, model_service, workspace, target).await;
     }
 
-    // A model served both ways that was running in the cloud is being
-    // downloaded now: register it back as local, not yet downloaded.
-    if MODEL_SPECS.get(&target).is_some_and(|spec| spec.cloud.is_some()) {
+    // A model registered to run in the cloud is being downloaded now (its
+    // catalog entry has a local copy): register it back as local, not yet
+    // downloaded, under the copy's model id — a cloud registration has none,
+    // and the download would ask the server for model ''.
+    if let Some(spec) = MODEL_SPECS.get(&target).filter(|spec| !spec.is_remote() && !spec.model_id.is_empty()) {
         let mut ws = workspace.write();
         if let Some(m) = ws.get_model_mut(Some(&target)).filter(|m| m.kind == ModelKind::Remote) {
             m.kind = ModelKind::Local;
             m.downloaded = false;
+            m.model_id = spec.model_id.clone();
         }
     }
 

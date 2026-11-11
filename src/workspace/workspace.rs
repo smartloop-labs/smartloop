@@ -731,7 +731,10 @@ impl WorkspaceModel {
         let Some(spec) = MODEL_SPECS.get(&self.model_name) else {
             return self.kind;
         };
-        if spec.cloud.is_some() {
+        // Where the user picked, while that choice can run: a cloud
+        // registration whose cloud copy the account can't use (signed out,
+        // or not on the plan) runs locally.
+        if spec.cloud.as_ref().is_some_and(|cloud| cloud.accessible) {
             return self.kind;
         }
         if spec.kind != self.kind && KIND_MISMATCH_REPORTED.lock().insert(self.model_name.clone()) {
@@ -791,6 +794,14 @@ impl WorkspaceModel {
             return String::new();
         }
         join(&self.bin_dir(), &format!("{}.gguf", path_name(&self.model_id)))
+    }
+
+    /// Whether the model is ready to run where it runs ([`Self::kind`]).  The
+    /// stored flag, except that a cloud registration (always "downloaded":
+    /// nothing to fetch) of a model that now runs locally says nothing about
+    /// its local copy.
+    pub fn is_downloaded(&self) -> bool {
+        self.downloaded && !(self.kind == ModelKind::Remote && self.kind() == ModelKind::Local)
     }
 
     /// This model's spec, if one is known: the cloud variant when a model
@@ -1508,7 +1519,7 @@ impl Workspace {
     /// `models_dir` and are added or removed for every project at once — so
     /// this takes no project argument.
     pub fn effective_model_downloaded(&self, model_name: &str) -> bool {
-        self.get_model(Some(model_name)).map(|ws| ws.downloaded).unwrap_or(false)
+        self.get_model(Some(model_name)).map(|ws| ws.is_downloaded()).unwrap_or(false)
     }
 
     /// Whether `model_name` is the active selection for `project`.
