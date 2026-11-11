@@ -243,7 +243,9 @@ fn dual_local(name: &str, models_dir: &std::path::Path) -> (Workspace, Workspace
 }
 
 #[test]
+#[serial]
 fn test_a_local_model_without_its_weights_runs_in_the_cloud() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
     let tmp = tempfile::tempdir().unwrap();
     let (ws, model) = dual_local("dual-missing", tmp.path());
     let svc = bare_service();
@@ -256,7 +258,9 @@ fn test_a_local_model_without_its_weights_runs_in_the_cloud() {
 }
 
 #[test]
+#[serial]
 fn test_a_local_model_that_does_not_fit_runs_in_the_cloud() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
     let tmp = tempfile::tempdir().unwrap();
     let (ws, model) = dual_local("dual-tight", tmp.path());
     let dir = tmp.path().join("Org/dual-tight");
@@ -281,7 +285,9 @@ fn test_a_local_model_that_does_not_fit_runs_in_the_cloud() {
 }
 
 #[test]
+#[serial]
 fn test_no_cloud_fallback_while_orchestrating() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
     use smartloop::llms::cloud_llm::local_only_scope;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -290,4 +296,15 @@ fn test_no_cloud_fallback_while_orchestrating() {
     attach_workspace(&svc, ws);
     let _scope = local_only_scope(true);
     assert!(svc.load_workspace_llm(&model, "decision", None).is_none());
+}
+
+#[test]
+#[serial]
+fn test_a_local_model_without_its_weights_stays_off_the_cloud_by_default() {
+    let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, model) = dual_local("dual-paid", tmp.path());
+    let svc = bare_service();
+    attach_workspace(&svc, ws);
+    assert!(svc.load_workspace_llm(&model, "answer", None).is_none(), "cloud models are paid");
 }

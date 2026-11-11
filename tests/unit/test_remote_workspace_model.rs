@@ -9,7 +9,10 @@ use smartloop::model::spec::MODEL_SPECS;
 use smartloop::types::{ModelKind, ANSWER_TIER};
 use smartloop::workspace::workspace::{Workspace, WorkspaceModel};
 
+use serial_test::serial;
+
 use crate::shared::platform_support::obj;
+use crate::shared::workspace_support::EnvGuard;
 
 fn workspace() -> Workspace {
     let mut ws = Workspace::new("ws-remote");
@@ -222,7 +225,9 @@ fn dual_spec(name: &str, accessible: bool) {
 }
 
 #[test]
+#[serial]
 fn test_a_model_served_both_ways_falls_back_to_its_cloud_variant() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
     dual_spec("dual-fallback", true);
     let mut ws = workspace();
     let local = ws.add_model("dual-fallback", "Org/dual-fallback", None, true);
@@ -239,7 +244,9 @@ fn test_a_model_served_both_ways_falls_back_to_its_cloud_variant() {
 }
 
 #[test]
+#[serial]
 fn test_no_cloud_fallback_the_plan_does_not_include() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
     dual_spec("dual-locked", false);
     let mut ws = workspace();
     let local = ws.add_model("dual-locked", "Org/dual-locked", None, true);
@@ -249,7 +256,9 @@ fn test_no_cloud_fallback_the_plan_does_not_include() {
 }
 
 #[test]
+#[serial]
 fn test_a_model_with_a_cloud_variant_is_a_candidate_before_its_download_lands() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "true");
     dual_spec("dual-pending", true);
     let mut ws = workspace();
     ws.add_model("dual-pending", "Org/dual-pending", None, true);
@@ -264,4 +273,17 @@ fn test_a_model_served_both_ways_runs_where_it_was_registered() {
     let cloud = ws.add_remote_model("dual-choice", true);
     assert!(cloud.is_remote());
     assert_eq!(cloud.url().as_deref(), Some("https://api.smartloop.ai"));
+}
+
+#[test]
+#[serial]
+fn test_cloud_fallback_is_off_unless_allowed() {
+    dual_spec("dual-default", true);
+    let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
+    let mut ws = workspace();
+    let local = ws.add_model("dual-default", "Org/dual-default", None, true);
+    // Cloud models are paid: never a silent switch.
+    assert!(local.cloud_fallback().is_none());
+    // So a model whose download hasn't landed isn't a candidate either.
+    assert!(ranked_names(&ws, ANSWER_TIER).is_empty());
 }

@@ -337,7 +337,7 @@ mod test_model_persistence {
 
     #[test]
     #[serial]
-    fn test_a_catalog_keyed_by_name_alone_is_discarded() {
+    fn test_an_older_clients_catalog_is_neither_read_nor_touched() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("workspace.db");
         {
@@ -359,8 +359,16 @@ mod test_model_persistence {
             .unwrap();
         }
 
+        // An older client sharing the DB fetched one row per name into
+        // `model_catalog`; this client reads its own table, and leaves that
+        // one for the older client.
         let db = WorkspaceDB::new(&path).unwrap();
         assert!(db.list_models().unwrap().is_empty());
+        db.save_models(&models()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let old: i64 = conn.query_row("SELECT COUNT(*) FROM model_catalog", [], |r| r.get(0)).unwrap();
+        assert_eq!(old, 1);
     }
 
     #[test]

@@ -109,6 +109,11 @@ pub struct AppSettings {
     pub embedding_gguf_base_url: String,
     /// `SLP_VISION_ENABLED`
     pub vision_enabled: bool,
+    /// `SLP_CLOUD_FALLBACK` — run a model in the cloud when its local copy
+    /// can't (not downloaded, doesn't fit, fails to load) and the catalog
+    /// also serves it there.  Off by default: cloud models are paid, so a
+    /// model runs in the cloud only when the user picked its cloud variant.
+    pub cloud_fallback: bool,
     /// `SLP_VISION_OCR_MIN_CHARS_PER_PAGE`
     pub vision_ocr_min_chars_per_page: i64,
     /// `SLP_VISION_N_CTX`
@@ -182,6 +187,7 @@ impl AppSettings {
             embedding_gguf_file: "bge-m3-Q4_K_M.gguf".to_string(),
             embedding_gguf_base_url: "https://dl.smartloop.ai/embeddings".to_string(),
             vision_enabled: true,
+            cloud_fallback: false,
             vision_ocr_min_chars_per_page: 100,
             vision_n_ctx: 8192,
             vision_clip_device: "auto".to_string(),
@@ -253,6 +259,7 @@ impl AppSettings {
             embedding_gguf_file: r.string("slp_embedding_gguf_file", d.embedding_gguf_file)?,
             embedding_gguf_base_url: r.string("slp_embedding_gguf_base_url", d.embedding_gguf_base_url)?,
             vision_enabled: r.boolean("slp_vision_enabled", d.vision_enabled)?,
+            cloud_fallback: r.boolean("slp_cloud_fallback", d.cloud_fallback)?,
             vision_ocr_min_chars_per_page: r.int("slp_vision_ocr_min_chars_per_page", d.vision_ocr_min_chars_per_page)?,
             vision_n_ctx: r.int("slp_vision_n_ctx", d.vision_n_ctx)?,
             vision_clip_device: r.string("slp_vision_clip_device", d.vision_clip_device)?,

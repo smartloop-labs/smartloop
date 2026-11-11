@@ -515,6 +515,11 @@ pub struct ModelEntry {
     /// says where it runs in this workspace.
     #[serde(default)]
     pub cloud: bool,
+    /// The model has a local copy to download (a `local` catalog row), so a
+    /// client can offer Download — also for an entry registered to run in
+    /// the cloud.  False for a cloud-only model.
+    #[serde(default)]
+    pub local: bool,
 }
 
 /// An attention type this build doesn't know reads as undeclared rather
@@ -646,6 +651,7 @@ pub fn list_models_with(
             }
             entry.cloud = MODEL_SPECS.get(&entry.name).is_some_and(|spec| spec.cloud.is_some());
         }
+        entry.local = local_names.contains(&entry.name);
         if entry.name == bootstrap_model {
             // Not an entitlement filter: the orchestrator is represented by
             // the client's "Auto" affordance, not as a model you pick.
