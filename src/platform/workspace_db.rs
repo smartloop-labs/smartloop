@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::platform::client::JsonObject;
 use crate::platform::service::now;
+use crate::types::ModelKind;
 
 /// Schema.  `model_catalog` is a pure cache; [`drop_outdated_model_catalog`]
 /// discards one written before its current columns.
@@ -39,7 +40,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS model_catalog (
-    name           TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
     model_id       TEXT,            -- NULL for a remote model
     size           TEXT,
     description    TEXT,
@@ -58,7 +59,9 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     model_version       INTEGER,
     thinking_default    INTEGER,
     vision_chat_handler TEXT,
-    fetched_at     REAL NOT NULL
+    fetched_at     REAL NOT NULL,
+    -- One name can be listed twice: a remote row and a local (GGUF) row.
+    PRIMARY KEY (name, type)
 );
 
 CREATE TABLE IF NOT EXISTS mcp_catalog (
@@ -242,16 +245,17 @@ pub fn python_json_dumps(value: &Value) -> String {
     String::from_utf8(out).expect("JSON output is UTF-8")
 }
 
-/// Drop a `model_catalog` table from before its newest column (the
-/// reasoning budget; before that, attention, the other model spec fields,
-/// and remote models and their name key).  It only
-/// caches the cloud catalog, so the next fetch refills it.
+/// Drop a `model_catalog` table from before its `(name, type)` key (before
+/// that, the reasoning budget, attention, the other model spec fields, and
+/// remote models and their name key).  It only caches the cloud catalog, so
+/// the next fetch refills it.
 fn drop_outdated_model_catalog(conn: &Connection) -> anyhow::Result<()> {
-    let columns: Vec<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('model_catalog')")?
-        .query_map([], |r| r.get::<_, String>(0))?
+    let columns: Vec<(String, i64)> = conn
+        .prepare("SELECT name, pk FROM pragma_table_info('model_catalog')")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
         .collect::<Result<_, _>>()?;
-    if !columns.is_empty() && !columns.iter().any(|c| c == "reasoning_budget_tokens") {
+    let keyed_by_type = columns.iter().any(|(name, pk)| name == "type" && *pk > 0);
+    if !columns.is_empty() && !keyed_by_type {
         conn.execute_batch("DROP TABLE model_catalog")?;
     }
     Ok(())
@@ -367,7 +371,7 @@ impl WorkspaceDB {
                     type, url, capabilities, context_length, \
                     param_size_b, model_version, thinking_default, vision_chat_handler, \
                     param_size_estimated, active_param_size_b, attention, reasoning_budget_tokens \
-             FROM model_catalog",
+             FROM model_catalog ORDER BY rowid",
         )?;
         let rows = stmt.query_map([], |r| {
             let mut m = JsonObject::new();
@@ -431,7 +435,16 @@ impl WorkspaceDB {
                         int_flag(m, "is_accessible", false)?,
                         optional(m, "sha256")?,
                     ),
-                    (optional(m, "type")?, optional(m, "url")?, capabilities, optional(m, "context_length")?),
+                    (
+                        // Part of the key: a row without a type is a local model's.
+                        match optional(m, "type")? {
+                            SqlValue::Null => SqlValue::Text(ModelKind::Local.value().to_string()),
+                            kind => kind,
+                        },
+                        optional(m, "url")?,
+                        capabilities,
+                        optional(m, "context_length")?,
+                    ),
                     (
                         optional(m, "param_size_b")?,
                         optional(m, "model_version")?,

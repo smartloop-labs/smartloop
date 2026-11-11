@@ -510,6 +510,11 @@ pub struct ModelEntry {
     pub active_param_size_b: Option<f64>,
     #[serde(default, deserialize_with = "tolerate_unknown_attention")]
     pub attention: Option<Attention>,
+    /// A local model that can also run in the cloud: the catalog lists its
+    /// name both ways, and the two rows are shown as this one entry.  `type`
+    /// says where it runs in this workspace.
+    #[serde(default)]
+    pub cloud: bool,
 }
 
 /// An attention type this build doesn't know reads as undeclared rather
@@ -608,6 +613,14 @@ pub fn list_models_with(
     let settings = AppSettings::new();
     let bootstrap_model = settings.default_model;
 
+    // Names the catalog lists as a local model; a remote row under one of
+    // them is that model's cloud variant, folded into the local entry.
+    let local_names: std::collections::HashSet<String> = models
+        .iter()
+        .filter(|m| m.get("type").and_then(Value::as_str) != Some(ModelKind::Remote.value()))
+        .filter_map(|m| m.get("name").and_then(Value::as_str).map(canonical_model_name))
+        .collect();
+
     let mut result: Vec<ModelEntry> = Vec::new();
     for m in models {
         let raw = Value::Object(m);
@@ -627,6 +640,12 @@ pub fn list_models_with(
         };
         // The cloud catalog may still publish a model under its old name.
         entry.name = canonical_model_name(&entry.name);
+        if local_names.contains(&entry.name) {
+            if entry.kind == ModelKind::Remote {
+                continue;
+            }
+            entry.cloud = MODEL_SPECS.get(&entry.name).is_some_and(|spec| spec.cloud.is_some());
+        }
         if entry.name == bootstrap_model {
             // Not an entitlement filter: the orchestrator is represented by
             // the client's "Auto" affordance, not as a model you pick.
@@ -635,6 +654,13 @@ pub fn list_models_with(
         let ws_model = ws.and_then(|ws| ws.models.iter().rev().find(|wm| wm.model_name == entry.name));
         match (ws, ws_model) {
             (Some(ws), Some(ws_model)) => {
+                if entry.cloud {
+                    entry.kind = ws_model.kind();
+                    if let Some(spec) = ws_model.spec() {
+                        entry.url = spec.url.clone();
+                        entry.context_length = spec.context_length.or(entry.context_length);
+                    }
+                }
                 entry.enabled = ws.effective_model_enabled(&entry.name, project);
                 entry.capabilities = display_capabilities(&ws_model.effective_capabilities());
                 entry.capabilities_overridden = ws_model.capabilities_override.is_some();

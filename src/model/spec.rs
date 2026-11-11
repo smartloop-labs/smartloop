@@ -59,6 +59,15 @@ pub struct ModelSpec {
     /// Output tokens a reasoning model may spend thinking before it answers,
     /// added to a capped request so the answer still fits.
     pub reasoning_budget_tokens: Option<u32>,
+    /// The cloud-served variant of a local model, when the catalog lists the
+    /// name both ways (a `local` row with GGUFs and a `remote` row).  The
+    /// local spec stays the model's identity; a workspace that registers the
+    /// model as remote runs it through this one.
+    pub cloud: Option<Arc<ModelSpec>>,
+    /// Whether the catalog says the account may use the model (its
+    /// `is_accessible`); true until a row says otherwise.  Read for a cloud
+    /// variant before falling back to it.
+    pub accessible: bool,
 }
 
 impl ModelSpec {
@@ -80,11 +89,28 @@ impl ModelSpec {
             url: None,
             context_length: None,
             reasoning_budget_tokens: None,
+            cloud: None,
+            accessible: true,
         }
     }
 
     pub fn is_remote(&self) -> bool {
         self.kind == ModelKind::Remote
+    }
+
+    /// Whether the model can run in the cloud: a remote model, or a local one
+    /// with a cloud variant.
+    pub fn has_cloud(&self) -> bool {
+        self.is_remote() || self.cloud.is_some()
+    }
+
+    /// The spec to run the model as `kind`: the cloud variant for a remote
+    /// run of a local model that has one, otherwise this spec.
+    pub fn for_kind(self: &Arc<Self>, kind: ModelKind) -> Arc<ModelSpec> {
+        match (&self.cloud, kind) {
+            (Some(cloud), ModelKind::Remote) => Arc::clone(cloud),
+            _ => Arc::clone(self),
+        }
     }
 
     /// The size models are compared on: active parameters for a
@@ -176,6 +202,9 @@ impl ModelSpec {
         if let Some(budget) = row.reasoning_budget_tokens {
             spec.reasoning_budget_tokens = Some(budget);
         }
+        if let Some(accessible) = row.is_accessible {
+            spec.accessible = accessible;
+        }
         spec
     }
 }
@@ -214,6 +243,8 @@ pub struct CatalogModel {
     pub context_length: Option<u32>,
     #[serde(default)]
     pub reasoning_budget_tokens: Option<u32>,
+    #[serde(default)]
+    pub is_accessible: Option<bool>,
 }
 
 impl CatalogModel {
@@ -369,17 +400,36 @@ impl ModelRegistry {
 
     /// Lay each catalog row over its model's seed, replacing whatever an
     /// earlier row said.  Models the catalog omits are kept: an anonymous
-    /// catalog hides some, and the seeds must survive it.  Returns how many
-    /// models were new.
+    /// catalog hides some, and the seeds must survive it.  A name listed both
+    /// as `local` and `remote` becomes one spec: the local row, carrying the
+    /// remote row as its [`cloud`](ModelSpec::cloud) variant.  Returns how
+    /// many models were new.
     pub fn hydrate(&mut self, rows: impl IntoIterator<Item = CatalogModel>) -> usize {
+        let rows: Vec<CatalogModel> = rows.into_iter().collect();
+        let is_remote = |row: &CatalogModel| row.kind == Some(ModelKind::Remote);
+        let has_local = |name: &str| {
+            rows.iter().any(|r| !is_remote(r) && canonical_model_name(&r.name) == name)
+        };
+        let mut clouds: Vec<(String, CatalogModel)> = Vec::new();
         let mut added = 0;
-        for row in rows {
+        for row in &rows {
             let name = canonical_model_name(&row.name);
+            if is_remote(row) && has_local(&name) {
+                clouds.push((name, row.clone()));
+                continue;
+            }
             if self.get(&name).is_none() {
                 added += 1;
             }
             let seed = self.seeds.iter().find(|s| s.name == name).cloned();
-            self.insert(ModelSpec::merged(seed.as_deref(), row));
+            self.insert(ModelSpec::merged(seed.as_deref(), row.clone()));
+        }
+        for (name, row) in clouds {
+            if let Some(local) = self.get(&name) {
+                let mut spec = (*local).clone();
+                spec.cloud = Some(Arc::new(ModelSpec::merged(None, row)));
+                self.insert(spec);
+            }
         }
         added
     }

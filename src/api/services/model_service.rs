@@ -1902,6 +1902,36 @@ impl ModelService {
             *self.capability_skip.lock() = None;
             return Some(self.cloud_llm(ws_model));
         }
+        if let Some(llm) = self.load_local_workspace_llm(ws_model, reason, reserve_gb, evict) {
+            return Some(llm);
+        }
+        // The local copy can't run here — no GGUF yet, doesn't fit, faulted
+        // or failed to load.  A model the catalog also serves in the cloud
+        // runs there rather than handing the step to a smaller model.
+        // Orchestration stays on device.
+        if crate::llms::cloud_llm::local_only() {
+            return None;
+        }
+        let cloud = ws_model.cloud_fallback()?;
+        tracing::info!(
+            target: LOG_TARGET,
+            "[capability-model] {} can't run locally ({reason}) — using its cloud variant",
+            ws_model.model_name
+        );
+        *self.capability_skip.lock() = None;
+        Some(self.cloud_llm(&cloud))
+    }
+
+    /// The local half of [`Self::load_workspace_llm_with`]: the resident
+    /// instance, or a fresh load that passes the fit guard.  `None` (with the
+    /// reason in `capability_skip`) when the local copy can't run.
+    fn load_local_workspace_llm(
+        &self,
+        ws_model: &WorkspaceModel,
+        reason: &str,
+        reserve_gb: Option<f64>,
+        evict: bool,
+    ) -> Option<Arc<dyn BaseLLM>> {
         let Some(workspace) = self.workspace_handle() else {
             tracing::warn!(
                 target: LOG_TARGET,

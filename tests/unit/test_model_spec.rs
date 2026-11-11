@@ -283,3 +283,63 @@ fn test_only_a_model_declared_vision_alone_is_not_a_text_model() {
     assert!(text(&registry.get("qwen3.5-2b").unwrap()));
     assert!(text(&registry.get("slp-orchestra-mini").unwrap()));
 }
+
+#[test]
+fn test_a_name_listed_both_ways_is_one_local_spec_with_a_cloud_variant() {
+    use std::sync::Arc;
+    let remote = row(json!({
+        "name": "qwen3.8-27b",
+        "model_id": null,
+        "type": "remote",
+        "url": "https://api.smartloop.ai",
+        "capabilities": ["text", "reasoning", "vision", "tools"],
+        "context_length": 262144,
+        "param_size_b": 27.0,
+    }));
+    let local = row(json!({
+        "name": "qwen3.8-27b",
+        "model_id": "Qwen/Qwen3.8-27B",
+        "type": "local",
+        "capabilities": ["text", "reasoning", "vision", "thinking", "tools"],
+        "param_size_b": 27.3,
+        "vision_chat_handler": "MTMDChatHandler",
+    }));
+    // Either order: the API lists by creation time.
+    for rows in [vec![remote.clone(), local.clone()], vec![local.clone(), remote.clone()]] {
+        let mut registry = ModelRegistry::seeded();
+        registry.hydrate(rows);
+        let spec = registry.get("qwen3.8-27b").unwrap();
+        assert!(!spec.is_remote());
+        assert!(spec.has_cloud());
+        assert_eq!(spec.model_id, "Qwen/Qwen3.8-27B");
+        assert!(spec.supports(Thinking));
+        assert_eq!(registry.specs().iter().filter(|s| s.name == "qwen3.8-27b").count(), 1);
+
+        let cloud = spec.for_kind(ModelKind::Remote);
+        assert!(cloud.is_remote());
+        assert_eq!(cloud.model_id, "");
+        assert_eq!(cloud.url.as_deref(), Some("https://api.smartloop.ai"));
+        assert!(!cloud.supports(Thinking));
+        assert!(Arc::ptr_eq(&spec.for_kind(ModelKind::Local), &spec));
+    }
+}
+
+#[test]
+fn test_a_later_catalog_without_the_remote_row_drops_the_cloud_variant() {
+    let mut registry = ModelRegistry::seeded();
+    registry.hydrate([
+        row(json!({"name": "qwen3.8-27b", "model_id": "Qwen/Qwen3.8-27B", "type": "local"})),
+        row(json!({"name": "qwen3.8-27b", "model_id": null, "type": "remote"})),
+    ]);
+    assert!(registry.get("qwen3.8-27b").unwrap().cloud.is_some());
+    registry.hydrate([row(json!({"name": "qwen3.8-27b", "model_id": "Qwen/Qwen3.8-27B", "type": "local"}))]);
+    assert!(registry.get("qwen3.8-27b").unwrap().cloud.is_none());
+}
+
+#[test]
+fn test_a_remote_only_model_has_no_cloud_variant() {
+    let mut registry = ModelRegistry::seeded();
+    registry.hydrate([row(json!({"name": "glm-5.3", "model_id": null, "type": "remote"}))]);
+    let spec = registry.get("glm-5.3").unwrap();
+    assert!(spec.is_remote() && spec.has_cloud() && spec.cloud.is_none());
+}

@@ -207,3 +207,61 @@ fn test_the_reasoning_budget_comes_from_the_spec() {
     assert_eq!(ws.add_remote_model("remote-thinker", true).reasoning_budget_tokens(), Some(2048));
     assert_eq!(ws.add_remote_model("remote-no-budget", true).reasoning_budget_tokens(), None);
 }
+
+/// Publish a model the catalog lists both ways: a local row and a remote one.
+fn dual_spec(name: &str, accessible: bool) {
+    let local = obj(json!({
+        "name": name, "type": "local", "model_id": format!("Org/{name}"),
+        "capabilities": ["text", "thinking"], "param_size_b": 27.0,
+    }));
+    let remote = obj(json!({
+        "name": name, "type": "remote", "url": "https://api.smartloop.ai",
+        "capabilities": ["text", "tools"], "param_size_b": 27.0, "is_accessible": accessible,
+    }));
+    MODEL_SPECS.hydrate(&[remote, local]);
+}
+
+#[test]
+fn test_a_model_served_both_ways_falls_back_to_its_cloud_variant() {
+    dual_spec("dual-fallback", true);
+    let mut ws = workspace();
+    let local = ws.add_model("dual-fallback", "Org/dual-fallback", None, true);
+    assert!(!local.is_remote());
+    assert_eq!(local.effective_capabilities(), caps(&["text", "thinking"]));
+
+    let cloud = local.cloud_fallback().expect("has a cloud variant");
+    assert!(cloud.is_remote());
+    assert!(cloud.downloaded);
+    assert_eq!(cloud.url().as_deref(), Some("https://api.smartloop.ai"));
+    assert_eq!(cloud.effective_capabilities(), caps(&["text", "tools"]));
+    // Already remote: nothing to fall back to.
+    assert!(cloud.cloud_fallback().is_none());
+}
+
+#[test]
+fn test_no_cloud_fallback_the_plan_does_not_include() {
+    dual_spec("dual-locked", false);
+    let mut ws = workspace();
+    let local = ws.add_model("dual-locked", "Org/dual-locked", None, true);
+    assert!(local.cloud_fallback().is_none());
+    // Not downloaded and no usable cloud variant: not a candidate.
+    assert!(ranked_names(&ws, ANSWER_TIER).is_empty());
+}
+
+#[test]
+fn test_a_model_with_a_cloud_variant_is_a_candidate_before_its_download_lands() {
+    dual_spec("dual-pending", true);
+    let mut ws = workspace();
+    ws.add_model("dual-pending", "Org/dual-pending", None, true);
+    assert!(!ws.get_model(Some("dual-pending")).unwrap().downloaded);
+    assert_eq!(ranked_names(&ws, ANSWER_TIER), vec!["dual-pending"]);
+}
+
+#[test]
+fn test_a_model_served_both_ways_runs_where_it_was_registered() {
+    dual_spec("dual-choice", true);
+    let mut ws = workspace();
+    let cloud = ws.add_remote_model("dual-choice", true);
+    assert!(cloud.is_remote());
+    assert_eq!(cloud.url().as_deref(), Some("https://api.smartloop.ai"));
+}

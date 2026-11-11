@@ -36,7 +36,7 @@ use crate::llms::cloud_session::{self, SessionModel};
 use crate::llms::tool_calls::{openai_messages, parse_tool_calls, render_tool_calls, split_messages, split_tools, NativeToolCall};
 use crate::model::spec::MODEL_SPECS;
 use crate::platform::client::{AuthHeadersFn, RefreshFn, SLPPlatformClient};
-use crate::types::ModelCapability;
+use crate::types::{ModelCapability, ModelKind};
 
 const LOG_TARGET: &str = "smartloop.llms.cloud";
 
@@ -509,7 +509,9 @@ impl BaseLLM for CloudLLM {
     /// True when the catalog declares `tools` for this model: its endpoint
     /// then takes an OpenAI `tools` list and answers with `tool_calls`.
     fn supports_native_tools(&self) -> bool {
-        MODEL_SPECS.get(&self.model_name).is_some_and(|spec| spec.supports(ModelCapability::Tools))
+        MODEL_SPECS
+            .get(&self.model_name)
+            .is_some_and(|spec| spec.for_kind(ModelKind::Remote).supports(ModelCapability::Tools))
     }
 
     /// A capped answer that runs out of tokens is retried once with twice
