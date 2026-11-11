@@ -381,6 +381,13 @@ fn test_detect_signals_coding_intent_from_the_folder_and_the_ask() {
     assert!(!smartloop::agents::planner::is_code_project(&here));
     assert!(!coding("add a greeting and call it from main"));
     assert!(coding("write a function that parses ISO dates"));
+    // Empty, a new project asked for there is coding work; not once the
+    // folder holds documents.
+    assert!(coding("create a snake game"));
+    assert!(!coding("what is a snake game?"));
+    std::fs::write(dir.join("notes.md"), "notes").unwrap();
+    assert!(!coding("create a snake game"));
+    std::fs::remove_file(dir.join("notes.md")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
     assert!(smartloop::agents::planner::is_code_project(&here));
     for msg in [
@@ -768,6 +775,24 @@ fn test_parse_plan_response_caps_at_5_steps() {
         .collect();
     let plan = planner.parse_plan_response(&Value::Array(steps_data).to_string(), "test", None);
     assert_eq!(plan.steps.len(), 5);
+}
+
+#[test]
+fn test_parse_plan_response_drops_web_search_for_coding() {
+    let planner = planner();
+    let raw = json!([
+        {"step": 1, "step_type": "web_search", "instruction": "rust cli project setup"},
+        {"step": 2, "step_type": "conversational", "instruction": "write it"},
+    ])
+    .to_string();
+    let coding = ClassificationResult { has_coding_intent: true, ..Default::default() };
+    let plan = planner.parse_plan_response(&raw, "create a new rust project for a todo cli", Some(&coding));
+    assert!(plan.steps.iter().all(|s| s.step_type != StepType::WebSearch));
+    // Asked for, or not coding, the search stays.
+    let plan = planner.parse_plan_response(&raw, "use the latest clap in my rust project", Some(&coding));
+    assert_eq!(plan.steps[0].step_type, StepType::WebSearch);
+    let plan = planner.parse_plan_response(&raw, "what happened in the news", Some(&ClassificationResult::default()));
+    assert_eq!(plan.steps[0].step_type, StepType::WebSearch);
 }
 
 #[test]

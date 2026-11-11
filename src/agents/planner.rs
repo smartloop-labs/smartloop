@@ -581,6 +581,18 @@ pub fn is_code_project(dir: &str) -> bool {
     PROJECT_MARKERS.iter().any(|marker| dir.join(marker).is_file())
 }
 
+/// Whether `dir` holds nothing yet past dotfiles: a folder a new project
+/// is about to be made in.
+pub fn is_fresh_folder(dir: &str) -> bool {
+    let dir = expand_home(dir);
+    std::fs::read_dir(&dir)
+        .is_ok_and(|mut entries| entries.all(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with('.'))))
+}
+
+/// A request to make something new: in a fresh folder, coding work.
+pub static MAKE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\b(?:create|make|build|scaffold|generate|set ?up|start|init(?:ialize)?|write)\b").unwrap());
+
 /// What makes a request coding work once the turn is in a code project:
 /// a verb that changes something, or a noun of the code itself.  Looser
 /// than [`CODING_RE`], which has to stand on its own anywhere.
@@ -616,6 +628,16 @@ pub static CODING_RE: Lazy<Regex> = Lazy::new(|| {
         r"|\b(?:rust|go|golang|node(?:\.?js)?|deno|react|vue|svelte|angular|next\.?js|django|flask|fastapi|rails|",
         r"java|kotlin|python|typescript|javascript|c\+\+|c#|elixir|haskell|zig)",
         r"\s+(?:project|app|application|crate|package|library|module|cli|service|server|api|website|starter)\b",
+    ))
+    .unwrap()
+});
+
+/// A request that asks for the web itself: to search or look something
+/// up, or for what's current.  Coding work searches the web only then.
+pub static ASKS_WEB_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"(?i)\b(?:search|google|look (?:it |this |that )?up|lookup|browse|online|on the (?:web|internet)",
+        r"|latest|newest|most recent|up[- ]to[- ]date|current (?:version|release)|docs|documentation|release notes|changelog)\b",
     ))
     .unwrap()
 });
@@ -798,9 +820,13 @@ impl Planner {
         // that happens to sit in a code project stays general.
         result.carries_files = user_message.matches("```").count() >= 4 && user_message.len() >= 4_000;
 
-        let in_project = cwd.filter(|c| !c.is_empty()).is_some_and(is_code_project);
-        result.has_coding_intent =
-            CODING_RE.is_match(user_message) || (in_project && IN_PROJECT_RE.is_match(user_message));
+        let cwd = cwd.filter(|c| !c.is_empty());
+        let in_project = cwd.is_some_and(is_code_project);
+        // A new project asked for in an empty folder is coding work too.
+        let starting = cwd.is_some_and(is_fresh_folder) && MAKE_RE.is_match(user_message);
+        result.has_coding_intent = CODING_RE.is_match(user_message)
+            || (in_project && IN_PROJECT_RE.is_match(user_message))
+            || starting;
 
         // Document context from vector search / uploads / attachments
         result.has_document_context =
@@ -1605,6 +1631,17 @@ impl Planner {
                     "[plan] Dropping '{}' step — left to the harness",
                     if t_name.is_empty() { raw_step_type.unwrap_or("") } else { t_name }
                 );
+                continue;
+            }
+
+            // Coding work is answered from the project and the model: a web
+            // search only slows it and pulls in general pages, unless the
+            // request asks for the web itself.
+            if matches!(raw_step_type, Some("web_search" | "search"))
+                && classification.is_some_and(|c| c.has_coding_intent)
+                && !ASKS_WEB_RE.is_match(user_message)
+            {
+                tracing::info!(target: "smartloop.agents.planner", "[plan] Dropping web_search step — coding work");
                 continue;
             }
 
