@@ -25,6 +25,7 @@ use crate::agents::orchestration::model_router::ModelRouter;
 use crate::agents::orchestration::replies::{is_none_extract, is_placeholder_output};
 use crate::agents::orchestration::step::{NodePair, SharedSearchContext, Step, StepNodes};
 use crate::agents::planner::ModelTier;
+use crate::api::model::CitationSource;
 use crate::config::app_settings::AppSettings;
 use crate::llms::base_llm::BatchPrompt;
 
@@ -523,6 +524,7 @@ impl DocumentFanoutStep {
                     let mut citation = by_name.get(name).cloned().unwrap_or_else(|| {
                         let mut m = Map::new();
                         m.insert("document_name".into(), Value::String(name.clone()));
+                        m.insert("source".into(), Value::String(CitationSource::Document.as_str().into()));
                         m
                     });
                     // Only fill in an extract when the citation has no source
@@ -722,6 +724,33 @@ mod tests {
         assert_eq!(cites[0]["document_id"], json!("0"));
         assert_eq!(cites[0]["_extract"], json!("Relevant extract."));
         assert!(out.payload_as::<SharedSearchContext>().is_some());
+    }
+
+    #[test]
+    fn reduce_cites_a_document_by_name_when_retrieval_did_not() {
+        let fanout = step(|p| if p.contains("body 0") { "Relevant extract.".into() } else { "NONE".into() });
+        let sc: SharedSearchContext = Arc::new(Mutex::new(SearchContext {
+            documents: docs(2),
+            ..Default::default()
+        }));
+        let ctx = ctx();
+        let parent = AgentNode::default();
+        let built = fanout.build(&ctx, Some(&sc), &parent);
+
+        let mut results = HashMap::new();
+        let mut reduce = None;
+        for (node, handler) in &built.pairs {
+            if node.is_transform() {
+                reduce = Some(handler.clone());
+            } else {
+                results.insert(node.node_id.clone(), handler(HashMap::new()).unwrap());
+            }
+        }
+        (reduce.unwrap())(results).unwrap();
+        let cites = sc.lock().citations.clone().unwrap();
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0]["document_name"], json!("doc0.pdf"));
+        assert_eq!(cites[0]["source"], json!("document"));
     }
 
     #[test]

@@ -31,6 +31,7 @@ use crate::agents::orchestration::model_router::{
 };
 use crate::agents::planner::FETCH_SERVER_ID;
 use crate::api::config::api_settings;
+use crate::api::model::CitationSource;
 use crate::config::app_settings::AppSettings;
 use crate::config::model_config::ModelConfig;
 use crate::constants::{canonical_model_name, display_model_label};
@@ -56,6 +57,7 @@ use crate::tasks::TaskQueue;
 use crate::types::ModelCapability;
 use crate::utils::log_utils::LoggerLike;
 use crate::utils::normalize_path;
+use crate::workspace::types::relative_document_path;
 use crate::workspace::workspace::SharedWorkspace;
 use crate::workspace::{
     DocumentInfo, DocumentStatus, MCPServer, MCPServerConfig, MCPServerStatus, MCPServerType,
@@ -3695,6 +3697,21 @@ impl ModelService {
                     _ => chunk.metadata.get("document_name").cloned().unwrap_or(Value::Null),
                 };
                 citation.insert("document_name".to_string(), document_name);
+                citation.insert("source".to_string(), Value::String(CitationSource::Document.as_str().into()));
+                // Where the document's file is, relative to the project as
+                // the documents API gives it (`documents/invoice.pdf`), so a
+                // client on this machine can open the source.  Never absolute:
+                // that would pin clients to one machine's layout and disclose
+                // the home directory.
+                let document_path = current_project
+                    .documents
+                    .iter()
+                    .find(|d| d.id == chunk.document_id)
+                    .and_then(|d| relative_document_path(Some(&d.path), Some(&current_project.project_dir)))
+                    .filter(|p| !p.is_empty());
+                if let Some(document_path) = document_path {
+                    citation.insert("document_path".to_string(), Value::String(document_path));
+                }
                 // Carry the exact text this document contributed to the
                 // prompt, privately (`_` keys are stripped before a citation
                 // reaches a client).  Being retrieved is not evidence a
