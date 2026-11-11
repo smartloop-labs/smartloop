@@ -847,8 +847,8 @@ fn chunk_frame(model: &str, delta: DeltaContent, finish_reason: Option<&str>) ->
 /// client's text protocol (fenced commands).  Cloud models always qualify.
 pub const CLIENT_TOOLS_MIN_LOCAL_B: f64 = 20.0;
 
-/// How often a client-tools turn, answered in one piece, says it is still
-/// waiting for the model.
+/// How long a client-tools turn may stay quiet (the model thinking, or
+/// writing out a long call) before it says it is still waiting.
 pub const TOOL_TURN_STATUS_EVERY: Duration = Duration::from_secs(5);
 
 /// Whether the model answering for `capability` gets the client's tools: it
@@ -913,6 +913,20 @@ pub fn split_tool_rounds(mut request: ChatCompletionRequest) -> (ChatCompletionR
         }
     }
     (request, rounds)
+}
+
+/// How much of a streaming client-tools `reply` can be shown: all of it, up
+/// to any tool-call markup (`<tool_call>`, `<function=`), and short of a tail
+/// that may be the start of one.
+pub fn streamable_end(reply: &str) -> usize {
+    const MARKERS: [&str; 2] = ["<tool_call>", "<function="];
+    if let Some(at) = MARKERS.iter().filter_map(|m| reply.find(m)).min() {
+        return at;
+    }
+    match reply.rfind('<') {
+        Some(at) if MARKERS.iter().any(|m| m.starts_with(&reply[at..])) => at,
+        _ => reply.len(),
+    }
 }
 
 /// The prompt for a client-tools turn: the flattened turn (system prompt,
@@ -3099,28 +3113,74 @@ fn stream_chunks_inner(
                 );
                 let full = client_tool_prompt(&prompt, &tool_rounds, &tools);
                 let model = request.model.clone();
-                // Answered in one piece, which a reasoning model in the cloud
-                // can take minutes over: say so every few seconds, so the
-                // client shows the wait rather than a turn that looks stuck.
-                let mut task = tokio::task::spawn_blocking(bind(move || {
-                    client.generate(&full, Some(&model), response_capability, None, Some(false))
+                // Streamed: the answer's text reaches the client as it's
+                // written, and the calls it made come once it's done.  The
+                // stream isn't Send, so it is drained on its own thread and
+                // handed over a channel.
+                let (text_tx, mut text_rx) = unbounded_channel::<Result<String, String>>();
+                let cancel = cancelled.clone();
+                let worker = tokio::task::spawn_blocking(bind(move || {
+                    match client.stream(&full, Some(&model), response_capability, Some(cancel), Some(false)) {
+                        Ok(stream) => {
+                            for item in stream {
+                                let sent = match item {
+                                    Ok(text) => text_tx.send(Ok(text)),
+                                    Err(e) => {
+                                        let _ = text_tx.send(Err(e.to_string()));
+                                        break;
+                                    }
+                                };
+                                if sent.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = text_tx.send(Err(e.to_string()));
+                        }
+                    }
                 }));
                 let waiting = if label.is_empty() { "Waiting for the model…".to_string() } else { format!("Waiting for {label}…") };
-                let generated = loop {
-                    match tokio::time::timeout(TOOL_TURN_STATUS_EVERY, &mut task).await {
-                        Ok(joined) => break joined.map_err(|e| anyhow::anyhow!(e.to_string())).and_then(|r| r),
+                let mut reply = String::new();
+                let mut shown = 0usize;
+                let mut failure: Option<String> = None;
+                loop {
+                    match tokio::time::timeout(TOOL_TURN_STATUS_EVERY, text_rx.recv()).await {
+                        // Quiet a while (thinking, or writing a long call):
+                        // say it is still going.
                         Err(_) => yield status_event("streaming", "processing", &waiting),
+                        Ok(None) => break,
+                        Ok(Some(Err(e))) => {
+                            failure = Some(e);
+                            break;
+                        }
+                        Ok(Some(Ok(text))) => {
+                            reply.push_str(&text);
+                            // Up to any tool-call markup, which never shows.
+                            let safe = streamable_end(&reply);
+                            if safe > shown {
+                                yield chunk_frame(&stream_model, content_delta(reply[shown..safe].to_string()), None);
+                                shown = safe;
+                            }
+                        }
                     }
-                };
+                }
+                if let Err(e) = worker.await {
+                    failure.get_or_insert_with(|| match e.try_into_panic() {
+                        Ok(payload) => panic_message(payload.as_ref()),
+                        Err(e) => e.to_string(),
+                    });
+                }
                 // A local model's failure comes back as answer text.
-                let generated = generated.and_then(|reply| {
-                    if reply.starts_with("Error generating response") { Err(anyhow::anyhow!(reply)) } else { Ok(reply) }
-                });
-                match generated {
-                    Ok(reply) => {
+                if failure.is_none() && reply.starts_with("Error generating response") {
+                    failure = Some(reply.clone());
+                }
+                match failure {
+                    None => {
                         let (text, calls) = reply_tool_calls(&reply);
-                        if !text.is_empty() {
-                            yield chunk_frame(&stream_model, content_delta(text.clone()), None);
+                        // What the model said after its calls, if anything.
+                        if text.len() > shown && text.starts_with(&reply[..shown]) {
+                            yield chunk_frame(&stream_model, content_delta(text[shown..].to_string()), None);
                         }
                         if calls.is_empty() {
                             yield chunk_frame(&stream_model, DeltaContent::default(), Some("stop"));
@@ -3139,8 +3199,7 @@ fn stream_chunks_inner(
                         let completion_tokens = svc.count_tokens(&reply);
                         svc.push_token_usage(project_id.as_deref(), &request.model, prompt_tokens, completion_tokens);
                     }
-                    Err(error) => {
-                        let error = error.to_string();
+                    Some(error) => {
                         tracing::error!(target: LOG_TARGET, "[tools] client-tools turn failed: {error}");
                         yield status_event("streaming", "error", &error);
                         yield chunk_frame(&stream_model, content_delta(error), Some("stop"));

@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use serial_test::serial;
 
 use smartloop::api::model::chat::{ChatCompletionRequest, ChatMessage, Role};
-use smartloop::api::routers::chat::{reply_tool_calls, split_tool_rounds, stream_chunks, ChatService};
+use parking_lot::Mutex;
+use smartloop::api::routers::chat::{reply_tool_calls, split_tool_rounds, stream_chunks, streamable_end, ChatService};
 use smartloop::model::spec::MODEL_SPECS;
 
 use crate::shared::api_chat::{chunk, FakeChatService};
@@ -68,14 +69,23 @@ fn second_round() -> ChatCompletionRequest {
 }
 
 /// A service whose response model is `label`, calling tools natively or not,
-/// that answers a tools turn with `reply` and a plain stream with "plain".
-fn service(label: &str, native_tools: bool, reply: &str) -> Arc<FakeChatService> {
+/// that streams a tools turn's `reply` in pieces of 7 characters (recording
+/// its prompt in `prompts`) and answers a plain turn with "plain".
+fn service(label: &str, native_tools: bool, reply: &str) -> (Arc<FakeChatService>, Arc<Mutex<Vec<String>>>) {
     publish_models();
-    let svc = Arc::new(FakeChatService::with_stream(|_, _| Box::new(vec![Ok(chunk("plain"))].into_iter())));
+    let prompts: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (seen, reply) = (prompts.clone(), reply.to_string());
+    let svc = Arc::new(FakeChatService::with_stream(move |prompt, _| {
+        if !prompt.starts_with("<slp_tools>") {
+            return Box::new(vec![Ok(chunk("plain"))].into_iter());
+        }
+        seen.lock().push(prompt.to_string());
+        let pieces: Vec<_> = reply.chars().collect::<Vec<_>>().chunks(7).map(|c| Ok(chunk(&c.iter().collect::<String>()))).collect();
+        Box::new(pieces.into_iter())
+    }));
     *svc.device.label.lock() = Some(label.to_string());
     *svc.device.native_tools.lock() = native_tools;
-    *svc.device.generate_return.lock() = reply.to_string();
-    svc
+    (svc, prompts)
 }
 
 async fn run(request: ChatCompletionRequest, svc: &Arc<FakeChatService>) -> Vec<Value> {
@@ -137,17 +147,20 @@ fn test_a_reply_splits_into_text_and_openai_calls() {
 #[tokio::test]
 #[serial]
 async fn test_a_cloud_model_gets_the_tools_and_its_calls_stream_back() {
-    let svc = service("ct-cloud", true,
+    let (svc, prompts) = service("ct-cloud", true,
         "Let me look.\n<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\", \"id\": 1}}</tool_call>");
     let events = run(first_turn(), &svc).await;
 
-    assert_eq!(text(&events), "Let me look.");
+    // Streamed in pieces, the markup never shown.
+    assert!(deltas(&events).iter().filter(|d| d["content"].is_string()).count() > 1, "streamed, not in one piece");
+    assert_eq!(text(&events).trim_end(), "Let me look.");
+    assert!(!text(&events).contains('<'));
     let calls = tool_calls(&events);
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["function"]["name"], "bash");
     assert_eq!(finish(&events).as_deref(), Some("tool_calls"));
 
-    let prompts = svc.device.generate_prompts.lock().clone();
+    let prompts = prompts.lock().clone();
     assert!(prompts[0].starts_with("<slp_tools>"), "the tools ride with the prompt");
     assert_eq!(svc.orchestrate_calls.lock().len(), 1, "the first round is planned as usual");
     // The turn isn't over: only the user's message is stored so far.
@@ -158,7 +171,7 @@ async fn test_a_cloud_model_gets_the_tools_and_its_calls_stream_back() {
 #[tokio::test]
 #[serial]
 async fn test_a_tool_result_continues_the_turn_without_replanning() {
-    let svc = service("ct-large", true, "There are two entries: Cargo.toml and src.");
+    let (svc, prompts) = service("ct-large", true, "There are two entries: Cargo.toml and src.");
     let events = run(second_round(), &svc).await;
 
     assert_eq!(text(&events), "There are two entries: Cargo.toml and src.");
@@ -166,7 +179,7 @@ async fn test_a_tool_result_continues_the_turn_without_replanning() {
     assert_eq!(finish(&events).as_deref(), Some("stop"));
     assert!(svc.orchestrate_calls.lock().is_empty(), "a tool round isn't re-planned");
 
-    let prompt = svc.device.generate_prompts.lock()[0].clone();
+    let prompt = prompts.lock()[0].clone();
     assert!(prompt.contains("\"tool_call_id\":\"call_0\""), "the result reaches the model");
     // The answer completes the turn; the user's message was stored with
     // the first round.
@@ -177,21 +190,30 @@ async fn test_a_tool_result_continues_the_turn_without_replanning() {
 #[tokio::test]
 #[serial]
 async fn test_a_small_local_model_answers_without_the_tools() {
-    let svc = service("ct-small", true, "unused");
+    let (svc, prompts) = service("ct-small", true, "unused");
     let events = run(first_turn(), &svc).await;
 
     assert_eq!(text(&events), "plain");
     assert!(tool_calls(&events).is_empty());
     assert_eq!(finish(&events).as_deref(), Some("stop"));
-    assert!(svc.device.generate_prompts.lock().is_empty(), "streamed as usual");
+    assert!(prompts.lock().is_empty(), "no tools offered");
 }
 
 #[tokio::test]
 #[serial]
 async fn test_a_model_without_native_tools_answers_without_them() {
-    let svc = service("ct-cloud", false, "unused");
+    let (svc, _) = service("ct-cloud", false, "unused");
     let events = run(first_turn(), &svc).await;
 
     assert_eq!(text(&events), "plain");
     assert!(tool_calls(&events).is_empty());
+}
+
+#[test]
+fn test_markup_and_a_tail_that_may_start_it_are_held_back() {
+    assert_eq!(streamable_end("Let me look."), 12);
+    assert_eq!(streamable_end("Let me look.\n<tool_call>{"), 13);
+    assert_eq!(streamable_end("Let me look.\n<too"), 13, "may be the start of <tool_call>");
+    assert_eq!(streamable_end("a < b"), 5, "a plain < is shown");
+    assert_eq!(streamable_end("x<function=bash>"), 1);
 }

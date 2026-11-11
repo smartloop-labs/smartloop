@@ -670,6 +670,16 @@ impl BaseLLM for LlamaCpp {
     }
 
     fn stream<'a>(&'a self, prompt: &str, options: CallOptions) -> GenerationStream<'a> {
+        // A tools prompt is answered in one piece through `call`, which hands
+        // the tools and the conversation to the chat template; the reply,
+        // calls and all, comes back as one chunk.
+        if split_tools(prompt).1.is_some() {
+            let text = match self.call(prompt, None, options) {
+                Ok(text) => text,
+                Err(e) => std::panic::panic_any(e.to_string()),
+            };
+            return Box::new(std::iter::once(GenerationChunk { text }));
+        }
         let guard = self.context_lock().lock();
 
         // create_chat_completion with stream=true applies the model's chat
