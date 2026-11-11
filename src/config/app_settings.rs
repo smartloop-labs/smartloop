@@ -111,8 +111,10 @@ pub struct AppSettings {
     pub vision_enabled: bool,
     /// `SLP_CLOUD_FALLBACK` — run a model in the cloud when its local copy
     /// can't (not downloaded, doesn't fit, fails to load) and the catalog
-    /// also serves it there.  Off by default: cloud models are paid, so a
-    /// model runs in the cloud only when the user picked its cloud variant.
+    /// also serves it there, before falling back to a smaller local model.
+    /// On by default; only a cloud copy the account may use (signed in, on a
+    /// plan that includes it) is ever taken.  `false` degrades straight to
+    /// the next local model.
     pub cloud_fallback: bool,
     /// `SLP_VISION_OCR_MIN_CHARS_PER_PAGE`
     pub vision_ocr_min_chars_per_page: i64,
@@ -187,7 +189,7 @@ impl AppSettings {
             embedding_gguf_file: "bge-m3-Q4_K_M.gguf".to_string(),
             embedding_gguf_base_url: "https://dl.smartloop.ai/embeddings".to_string(),
             vision_enabled: true,
-            cloud_fallback: false,
+            cloud_fallback: true,
             vision_ocr_min_chars_per_page: 100,
             vision_n_ctx: 8192,
             vision_clip_device: "auto".to_string(),

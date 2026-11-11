@@ -813,9 +813,8 @@ impl WorkspaceModel {
     /// This model run in the cloud instead, when it is a local model whose
     /// catalog entry also lists a cloud variant the account may use: the
     /// fallback for when the local copy can't run here (not downloaded, out
-    /// of memory, or failing to load).  `None` otherwise, and always unless
-    /// `slp_cloud_fallback` is on: cloud models are paid, so the switch is
-    /// the user's to allow.
+    /// of memory, or failing to load), tried before a smaller local model.
+    /// `None` otherwise, and when `slp_cloud_fallback` is turned off.
     pub fn cloud_fallback(&self) -> Option<WorkspaceModel> {
         if self.kind() == ModelKind::Remote || !AppSettings::new().cloud_fallback {
             return None;

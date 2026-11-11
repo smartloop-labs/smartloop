@@ -277,14 +277,17 @@ fn test_a_model_served_both_ways_runs_where_it_was_registered() {
 
 #[test]
 #[serial]
-fn test_cloud_fallback_is_off_unless_allowed() {
+fn test_cloud_fallback_is_on_by_default_and_can_be_turned_off() {
     dual_spec("dual-default", true);
-    let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
     let mut ws = workspace();
     let local = ws.add_model("dual-default", "Org/dual-default", None, true);
-    // Cloud models are paid: never a silent switch.
+    {
+        let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
+        assert!(local.cloud_fallback().is_some(), "the cloud copy comes before degrading");
+    }
+    let _off = EnvGuard::set("SLP_CLOUD_FALLBACK", "false");
     assert!(local.cloud_fallback().is_none());
-    // So a model whose download hasn't landed isn't a candidate either.
+    // Off, a model whose download hasn't landed isn't a candidate either.
     assert!(ranked_names(&ws, ANSWER_TIER).is_empty());
 }
 

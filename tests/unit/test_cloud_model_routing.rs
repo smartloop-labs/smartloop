@@ -300,11 +300,31 @@ fn test_no_cloud_fallback_while_orchestrating() {
 
 #[test]
 #[serial]
-fn test_a_local_model_without_its_weights_stays_off_the_cloud_by_default() {
-    let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
+fn test_a_local_model_without_its_weights_stays_off_the_cloud_when_turned_off() {
+    let _fallback = EnvGuard::set("SLP_CLOUD_FALLBACK", "false");
     let tmp = tempfile::tempdir().unwrap();
     let (ws, model) = dual_local("dual-paid", tmp.path());
     let svc = bare_service();
     attach_workspace(&svc, ws);
-    assert!(svc.load_workspace_llm(&model, "answer", None).is_none(), "cloud models are paid");
+    assert!(svc.load_workspace_llm(&model, "answer", None).is_none(), "degrades instead");
+}
+
+#[test]
+#[serial]
+fn test_a_local_model_that_does_not_load_goes_to_the_cloud_by_default() {
+    let _fallback = EnvGuard::remove("SLP_CLOUD_FALLBACK");
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, model) = dual_local("dual-load-fails", tmp.path());
+    let dir = tmp.path().join("Org/dual-load-fails");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("dual-load-fails-Q4_K_M.gguf"), b"GGUF").unwrap();
+    let svc = bare_service();
+    attach_workspace(&svc, ws);
+    svc.set_hooks(ModelServiceHooks {
+        large_model_fits: Some(Arc::new(|_, _, _, _| true)),
+        load_llama_instance: Some(Arc::new(|_, _, _, _| Err(anyhow::anyhow!("failed to load model")))),
+        ..Default::default()
+    });
+    let llm = svc.load_workspace_llm(&model, "answer", None).expect("the cloud copy");
+    assert!(ModelService::is_cloud_llm(llm.as_ref()));
 }

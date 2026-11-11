@@ -1908,9 +1908,10 @@ impl ModelService {
             return Some(llm);
         }
         // The local copy can't run here — no GGUF yet, doesn't fit, faulted
-        // or failed to load.  A model the catalog also serves in the cloud
-        // runs there rather than handing the step to a smaller model.
-        // Orchestration stays on device.
+        // or failed to load.  Its cloud copy comes first, when the account
+        // may use one; only without it does the step degrade to the next
+        // (smaller) candidate, which the caller walks to.  Orchestration
+        // stays on device.
         if crate::llms::cloud_llm::local_only() {
             return None;
         }
