@@ -42,6 +42,8 @@ use crate::config::app_settings::AppSettings;
 use crate::constants::{display_model_name, resolve_current_date, OPENING_TOKENS, SYSTEM_PROMPT};
 use crate::db::embeddings;
 use crate::llms::base_llm::CancelEvent;
+use crate::llms::tool_calls::{parse_tool_calls, strip_tool_calls, with_tools_and_messages};
+use crate::model::spec::MODEL_SPECS;
 use crate::model_host::client::{ModelClient, ModelHostError, TextStream};
 use crate::tasks::IndexerTask;
 use crate::types::ANSWER_TIER;
@@ -838,8 +840,112 @@ fn chunk_frame(model: &str, delta: DeltaContent, finish_reason: Option<&str>) ->
     )
 }
 
+/// A local model this size or larger (billions of parameters, active ones
+/// for a mixture of experts) is offered the client's tools; a smaller one
+/// answers without them.  Small models handle a multi-round tool
+/// conversation poorly — looping, malformed calls — and do better with the
+/// client's text protocol (fenced commands).  Cloud models always qualify.
+pub const CLIENT_TOOLS_MIN_LOCAL_B: f64 = 20.0;
+
+/// Whether the model answering for `capability` gets the client's tools: it
+/// calls functions natively, and is a cloud model or a local one of at least
+/// [`CLIENT_TOOLS_MIN_LOCAL_B`].
+pub fn takes_client_tools(client: &dyn ModelClient, capability: Option<&str>) -> bool {
+    if !client.supports_native_tools(capability).unwrap_or(false) {
+        return false;
+    }
+    let label = client.model_label(capability).unwrap_or_default();
+    MODEL_SPECS
+        .get(&label)
+        .is_some_and(|spec| spec.is_remote() || spec.ranking_size_b() >= CLIENT_TOOLS_MIN_LOCAL_B)
+}
+
+/// `request` without the client tool rounds that follow its last user
+/// message, and those rounds as OpenAI messages: each assistant turn that
+/// called the client's tools, and each `tool` result.  Arguments become
+/// objects (what a local chat template iterates; a cloud request turns them
+/// back into strings) and each result carries its tool's name.  A request
+/// with no tool round is returned whole.
+pub fn split_tool_rounds(mut request: ChatCompletionRequest) -> (ChatCompletionRequest, Vec<Value>) {
+    let Some(last_user) = request.messages.iter().rposition(|m| m.role == Role::User) else {
+        return (request, Vec::new());
+    };
+    let is_round = |m: &ChatMessage| m.role == Role::Tool || m.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+    if !request.messages[last_user + 1..].iter().any(is_round) {
+        return (request, Vec::new());
+    }
+    let tail = request.messages.split_off(last_user + 1);
+    let mut names: HashMap<String, String> = HashMap::new();
+    let mut rounds = Vec::new();
+    for m in tail {
+        match m.role {
+            Role::Assistant => {
+                let calls: Vec<Value> = m
+                    .tool_calls
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|mut call| {
+                        if let Some(args) = call.pointer_mut("/function/arguments")
+                            && let Some(text) = args.as_str()
+                        {
+                            *args = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
+                        }
+                        if let (Some(id), Some(name)) =
+                            (call["id"].as_str(), call.pointer("/function/name").and_then(Value::as_str))
+                        {
+                            names.insert(id.to_string(), name.to_string());
+                        }
+                        call
+                    })
+                    .collect();
+                rounds.push(json!({"role": "assistant", "content": m.content.unwrap_or_default(), "tool_calls": calls}));
+            }
+            Role::Tool => {
+                let id = m.tool_call_id.unwrap_or_default();
+                let name = names.get(&id).cloned().unwrap_or_default();
+                rounds.push(json!({"role": "tool", "tool_call_id": id, "name": name, "content": m.content.unwrap_or_default()}));
+            }
+            Role::System | Role::User => {}
+        }
+    }
+    (request, rounds)
+}
+
+/// The prompt for a client-tools turn: the flattened turn (system prompt,
+/// history, context, the user's message) as one user message, then the tool
+/// rounds so far, with `tools` offered.
+pub fn client_tool_prompt(prompt: &str, rounds: &[Value], tools: &[Value]) -> String {
+    let mut conversation = vec![json!({"role": "user", "content": prompt})];
+    conversation.extend(rounds.iter().cloned());
+    with_tools_and_messages(tools, &conversation)
+}
+
+/// A client-tools reply split into what the model said and the calls it
+/// made, the calls in OpenAI's streamed shape (`index`, `id`, `type`,
+/// `function.name`, `function.arguments` as a JSON string).  A call without
+/// an id gets `call_<n>`, so the client's result can answer it.
+pub fn reply_tool_calls(reply: &str) -> (String, Vec<Value>) {
+    let calls = parse_tool_calls(reply);
+    if calls.is_empty() {
+        return (reply.trim().to_string(), Vec::new());
+    }
+    let calls = calls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            json!({
+                "index": i,
+                "id": c.id.clone().filter(|id| !id.is_empty()).unwrap_or_else(|| format!("call_{i}")),
+                "type": "function",
+                "function": {"name": c.name, "arguments": Value::Object(c.arguments.clone()).to_string()},
+            })
+        })
+        .collect();
+    (strip_tool_calls(reply), calls)
+}
+
 fn content_delta(content: impl Into<String>) -> DeltaContent {
-    DeltaContent { role: None, content: Some(content.into()) }
+    DeltaContent { role: None, content: Some(content.into()), ..Default::default() }
 }
 
 /// The content of the last user message in `messages`.
@@ -1041,7 +1147,9 @@ pub fn format_messages_to_prompt(
 
     for (i, msg) in messages.iter().enumerate() {
         match msg.role {
-            Role::System => continue,
+            // A client tool round never reaches the flattened prompt: it
+            // travels as OpenAI messages (see `split_tool_rounds`).
+            Role::System | Role::Tool => continue,
             Role::Assistant => {
                 prompt_parts.push(format!(
                     "<assistant>{}</assistant>",
@@ -1884,7 +1992,7 @@ pub fn resolve_message_attachments(
                         .filter(|s| !s.is_empty())
                         .collect::<Vec<_>>()
                         .join("\n\n");
-                    return ChatMessage { role: msg.role, content: Some(combined), attachments: None };
+                    return ChatMessage { role: msg.role, content: Some(combined), attachments: None, ..Default::default() };
                 }
             }
             msg
@@ -1973,7 +2081,7 @@ pub fn compact_messages(
                     .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n");
-                *prev = ChatMessage { role: msg.role, content: Some(content), attachments: None };
+                *prev = ChatMessage { role: msg.role, content: Some(content), attachments: None, ..Default::default() };
             }
             _ => merged.push(msg),
         }
@@ -2018,7 +2126,7 @@ pub fn build_messages_with_history(
                     );
                     Role::User
                 });
-            ChatMessage { role, content: h.get("content").cloned(), attachments: None }
+            ChatMessage { role, content: h.get("content").cloned(), attachments: None, ..Default::default() }
         })
         .collect();
     out.extend(request.messages.iter().cloned());
@@ -2515,6 +2623,15 @@ fn stream_chunks_inner(
         // internal id it was requested with.
         let stream_model = display_model_name(&request.model);
 
+        // A client that runs its own tools (docent's `bash`) sends them with
+        // the turn, and answers the calls the model made with `tool` results
+        // on the same turn.  Those rounds travel to the model as OpenAI
+        // messages, not through the flattened prompt; a round that answers
+        // calls continues the turn, so it is not re-planned.
+        let (request, tool_rounds) = split_tool_rounds(request);
+        let client_tools: Option<Vec<Value>> = request.tools.clone().filter(|t| !t.is_empty());
+        let continuing = !tool_rounds.is_empty();
+
         // Load the session's recent history ONCE and share it between the
         // prompt (prepended prior turns) and the orchestrator.
         let req_last_user = last_user_content(&request.messages);
@@ -2643,10 +2760,11 @@ fn stream_chunks_inner(
 
         // Orchestrator handles vector search, MCP tools, and explore in one step
         let mut orchestrator_context: Option<String> = None;
-        let mut classified_coding = false;
+        // Only a coding client sends tool rounds.
+        let mut classified_coding = continuing;
         let mut citations: Option<Vec<CitationDict>> = None;
         let mut is_mutation = false;
-        if truthy(&last_user_msg) {
+        if truthy(&last_user_msg) && !continuing {
             yield status_event("tools", "processing", "Processing...");
 
             // Bridge orchestrator step activity into the SSE stream.  The
@@ -2729,6 +2847,7 @@ fn stream_chunks_inner(
                     DeltaContent {
                         role: Some("assistant".to_string()),
                         content: Some(ORCHESTRATION_TIMEOUT_CONTENT.to_string()),
+                        ..Default::default()
                     },
                     Some("stop"),
                 );
@@ -2786,7 +2905,7 @@ fn stream_chunks_inner(
             yield status_event("streaming", "processing", "Generating response...");
             yield chunk_frame(
                 &stream_model,
-                DeltaContent { role: Some("assistant".to_string()), content: None },
+                DeltaContent { role: Some("assistant".to_string()), content: None, ..Default::default() },
                 None,
             );
             yield format!(
@@ -2928,9 +3047,11 @@ fn stream_chunks_inner(
 
         yield status_event("preparing", "completed", "Preparing response...");
 
-        // Store the user message in session history
+        // Store the user message in session history (once: a tool round
+        // continues the turn it was stored with)
         if let Some(session_id) = request.session_id.as_deref().filter(|s| !s.is_empty())
             && truthy(&last_user_msg)
+            && !continuing
         {
             svc.append_to_session(
                 session_id,
@@ -2939,6 +3060,77 @@ fn stream_chunks_inner(
                 None,
                 None,
             );
+        }
+
+        // Client tools: offered to a response model that uses tools well,
+        // answered in one piece (text, then the calls it made, if any).  Any
+        // other model answers below without them, and the client falls back
+        // to its text protocol.
+        if let Some(tools) = client_tools.clone() {
+            let client = svc.model_client();
+            let check = client.clone();
+            let eligible = run_blocking(move || takes_client_tools(&*check, response_capability)).await;
+            tracing::info!(
+                target: LOG_TARGET,
+                "[tools] {} client tool(s), round {} → {}",
+                tools.len(),
+                tool_rounds.iter().filter(|m| m["role"] == "tool").count(),
+                if eligible { "offered" } else { "not offered (model doesn't take them)" }
+            );
+            if eligible {
+                yield status_event("streaming", "processing", "Generating response...");
+                let message_id = message_id_for(&request);
+                yield chunk_frame(
+                    &stream_model,
+                    DeltaContent { role: Some("assistant".to_string()), ..Default::default() },
+                    None,
+                );
+                yield format!(
+                    "data: {}\n\n",
+                    py_json_dumps(&json!({"object": "chat.message_id", "message_id": message_id}))
+                );
+                let full = client_tool_prompt(&prompt, &tool_rounds, &tools);
+                let model = request.model.clone();
+                let generated =
+                    run_blocking(move || client.generate(&full, Some(&model), response_capability, None, Some(false)))
+                        .await;
+                // A local model's failure comes back as answer text.
+                let generated = generated.and_then(|reply| {
+                    if reply.starts_with("Error generating response") { Err(anyhow::anyhow!(reply)) } else { Ok(reply) }
+                });
+                match generated {
+                    Ok(reply) => {
+                        let (text, calls) = reply_tool_calls(&reply);
+                        if !text.is_empty() {
+                            yield chunk_frame(&stream_model, content_delta(text.clone()), None);
+                        }
+                        if calls.is_empty() {
+                            yield chunk_frame(&stream_model, DeltaContent::default(), Some("stop"));
+                            if let Some(session_id) = request.session_id.as_deref().filter(|s| !s.is_empty()) {
+                                svc.append_to_session(session_id, "assistant", &text, None, Some(&message_id));
+                            }
+                        } else {
+                            yield chunk_frame(
+                                &stream_model,
+                                DeltaContent { tool_calls: Some(calls), ..Default::default() },
+                                None,
+                            );
+                            yield chunk_frame(&stream_model, DeltaContent::default(), Some("tool_calls"));
+                        }
+                        let prompt_tokens = svc.count_tokens(&prompt);
+                        let completion_tokens = svc.count_tokens(&reply);
+                        svc.push_token_usage(project_id.as_deref(), &request.model, prompt_tokens, completion_tokens);
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        tracing::error!(target: LOG_TARGET, "[tools] client-tools turn failed: {error}");
+                        yield status_event("streaming", "error", &error);
+                        yield chunk_frame(&stream_model, content_delta(error), Some("stop"));
+                    }
+                }
+                yield "data: [DONE]\n\n".to_string();
+                return;
+            }
         }
 
         // `cancelled` is created earlier (before orchestration) and reused here
@@ -2978,7 +3170,7 @@ fn stream_chunks_inner(
         let message_id = message_id_for(&request);
         yield chunk_frame(
             &stream_model,
-            DeltaContent { role: Some("assistant".to_string()), content: None },
+            DeltaContent { role: Some("assistant".to_string()), content: None, ..Default::default() },
             None,
         );
 
@@ -3444,7 +3636,7 @@ async fn complete_body(
             request.model.clone(),
             vec![Choice {
                 index: 0,
-                message: ChatMessage { role: Role::Assistant, content: Some(error), attachments: None },
+                message: ChatMessage { role: Role::Assistant, content: Some(error), attachments: None, ..Default::default() },
                 finish_reason: "stop".to_string(),
             }],
         );
@@ -3461,6 +3653,7 @@ async fn complete_body(
                     role: Role::Assistant,
                     content: orchestrator_context.clone(),
                     attachments: None,
+                    ..Default::default()
                 },
                 finish_reason: "stop".to_string(),
             }],
@@ -3591,6 +3784,7 @@ async fn complete_body(
                 role: Role::Assistant,
                 content: Some(response_text),
                 attachments: None,
+                ..Default::default()
             },
             finish_reason: "stop".to_string(),
         }],

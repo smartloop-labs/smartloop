@@ -158,6 +158,15 @@ pub fn template_renders_tools(template: &str) -> bool {
     USES_TOOLS.is_match(template)
 }
 
+/// `text` without its `<tool_call>…</tool_call>` blocks (and a bare
+/// `<function=…>` call): what the model said around the calls it made.
+pub fn strip_tool_calls(text: &str) -> String {
+    static CALLS: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?s)<tool_call>.*?(?:</tool_call>|$)|<function=[^>\s]+>.*?(?:</function>|$)").expect("valid regex")
+    });
+    CALLS.replace_all(text, "").trim().to_string()
+}
+
 /// Every tool call in a model's reply, in order; empty when it made none.
 ///
 /// Reads, in this order:

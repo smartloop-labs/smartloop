@@ -24,7 +24,7 @@ const CONTEXT: &str = concat!(
 
 fn prompt(context: Option<&str>) -> String {
     format_messages_to_prompt(
-        &[ChatMessage { role: Role::User, content: Some(QUESTION.to_string()), attachments: None }],
+        &[ChatMessage { role: Role::User, content: Some(QUESTION.to_string()), attachments: None, ..Default::default() }],
         context,
         Some("/Users/me/src"),
         None,
