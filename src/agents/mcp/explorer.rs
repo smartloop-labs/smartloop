@@ -35,7 +35,7 @@ use crate::api::services::model_service::ModelService;
 use crate::llms::BaseLLM;
 use crate::parsers::DocumentChunk;
 use crate::workspace::context::{PoolFuture, ProjectBoundExecutor};
-use crate::workspace::workspace::MCPServer;
+use crate::workspace::workspace::{MCPServer, MCPToolDefinition};
 
 /// Logger name used by the Python module.
 pub const LOGGER: &str = "smartloop.agents.mcp.explorer";
@@ -85,14 +85,94 @@ pub const QUERY_STOP_WORDS: &[&str] = &[
 /// Verbs that mark a tool as read-only (safe to auto-run during collect).
 pub const READ_ONLY_VERBS: &[&str] = &[
     "get", "list", "search", "read", "fetch", "find", "describe", "view", "show", "query",
-    "lookup", "retrieve", "count", "check", "status", "browse", "scrape",
+    "lookup", "retrieve", "count", "check", "status", "browse", "scrape", "download",
 ];
 /// Verbs that mark a tool as side-effecting (never auto-run in collect).
 pub const WRITE_VERBS: &[&str] = &[
     "create", "update", "delete", "send", "post", "write", "remove", "set", "add", "edit",
     "modify", "put", "patch", "insert", "cancel", "pay", "deploy", "merge", "close", "assign",
-    "run", "execute", "trigger",
+    "run", "execute", "trigger", "save", "retire", "restore", "share", "unshare", "mark",
+    "submit", "resolve", "move", "duplicate", "upload", "prepare", "spawn", "stop",
 ];
+
+/// What calling a tool does, as far as collect can tell.
+///
+/// Only [`ToolAccess::Read`] runs unprompted during collect; every other
+/// variant, `Unknown` included, is treated as a write and left to a planned
+/// step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAccess {
+    Read,
+    Write,
+    Destructive,
+    Unknown,
+}
+
+impl ToolAccess {
+    /// A tool's access: the server's annotation when it gives one, otherwise
+    /// the verbs in its name.
+    ///
+    /// A server that says a tool is not read-only is believed even when the
+    /// name reads like a lookup.  Following the spec, such a tool is
+    /// destructive unless the server says `destructiveHint: false`.
+    pub fn of(tool: &MCPToolDefinition) -> Self {
+        if let Some(hints) = tool.annotations {
+            match (hints.read_only_hint, hints.destructive_hint) {
+                (Some(true), _) => return Self::Read,
+                (Some(false), Some(false)) => return Self::Write,
+                (Some(false), _) | (None, Some(true)) => return Self::Destructive,
+                (None, _) => {}
+            }
+        }
+        Self::from_name(&tool.name)
+    }
+
+    /// A tool's access judged from the verbs in its name alone.
+    ///
+    /// Every word in the name is considered, not just the first.  Servers
+    /// name tools after the product as often as after the verb —
+    /// `notion-search`, `API-get-users`, `trelloReadCard` — so a leading-verb
+    /// rule would read "notion" as an unknown verb.  Any write word anywhere
+    /// wins: `notion-create-pages` is a write however it is spelled.  A name
+    /// with no recognised verb is `Unknown`.
+    pub fn from_name(tool_name: &str) -> Self {
+        // camelCase is a word boundary too: `trelloReadCard` is three words.
+        let mut spaced = String::with_capacity(tool_name.len() + 4);
+        let mut previous: Option<char> = None;
+        for c in tool_name.trim().chars() {
+            if let Some(p) = previous {
+                if (p.is_ascii_lowercase() || p.is_ascii_digit()) && c.is_ascii_uppercase() {
+                    spaced.push(' ');
+                }
+            }
+            spaced.push(c);
+            previous = Some(c);
+        }
+        let lowered = spaced.to_lowercase();
+        let words: HashSet<&str> = TOOL_NAME_SEPARATORS.split(&lowered).collect();
+        if words.iter().any(|w| WRITE_VERBS.contains(w)) {
+            Self::Write
+        } else if words.iter().any(|w| READ_ONLY_VERBS.contains(w)) {
+            Self::Read
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// The access of `tool_name` on `server`, judged by name alone when the
+    /// server's saved tool list does not have it.
+    pub fn on(server: &MCPServer, tool_name: &str) -> Self {
+        match server.tools.iter().find(|t| t.name == tool_name) {
+            Some(tool) => Self::of(tool),
+            None => Self::from_name(tool_name),
+        }
+    }
+
+    /// True only for a read; an unknown tool counts as a write.
+    pub fn is_read(self) -> bool {
+        self == Self::Read
+    }
+}
 
 // ------------------------------------------------------------------ seams
 
@@ -954,43 +1034,6 @@ Does answering the latest message require a new web search?
         }
     }
 
-    /// True only when a tool name clearly reads (no side effects).
-    ///
-    /// Every word in the name is considered, not just the first.  Servers
-    /// name tools after the product as often as after the verb —
-    /// `notion-search`, `API-get-users`, `trelloReadCard` — and a
-    /// leading-verb rule read "notion" as an unknown verb and refused to run
-    /// the one tool the question was about.  Any write word anywhere still
-    /// vetoes: `notion-create-pages` is a write however it is spelled.
-    ///
-    /// Conservative in both directions: a name with no recognised verb is not
-    /// read-only, so a side-effecting tool is never auto-run during collect —
-    /// it stays a planned execute step.  (MCP annotations aren't persisted,
-    /// so this is a heuristic over the name.)
-    pub fn is_read_only_tool(tool_name: &str) -> bool {
-        if tool_name.is_empty() {
-            return false;
-        }
-        // camelCase is a word boundary too: `trelloReadCard` is three words.
-        let mut spaced = String::with_capacity(tool_name.len() + 4);
-        let mut previous: Option<char> = None;
-        for c in tool_name.trim().chars() {
-            if let Some(p) = previous {
-                if (p.is_ascii_lowercase() || p.is_ascii_digit()) && c.is_ascii_uppercase() {
-                    spaced.push(' ');
-                }
-            }
-            spaced.push(c);
-            previous = Some(c);
-        }
-        let lowered = spaced.to_lowercase();
-        let words: HashSet<&str> = TOOL_NAME_SEPARATORS.split(&lowered).collect();
-        if words.iter().any(|w| WRITE_VERBS.contains(w)) {
-            return false;
-        }
-        words.iter().any(|w| READ_ONLY_VERBS.contains(w))
-    }
-
     /// Report one step to the client, never failing the work over it.
     ///
     /// A progress callback crosses a thread boundary into the request's event
@@ -1167,7 +1210,7 @@ Does answering the latest message require a new web search?
                 return String::new();
             };
             tool_name = picked.tool_name.clone();
-            if !Self::is_read_only_tool(&tool_name) {
+            if !ToolAccess::on(server, &tool_name).is_read() {
                 tracing::info!(
                     target: LOGGER,
                     "[collect] MCP tool '{}' is not read-only — leaving to a planned execute step",
@@ -1205,7 +1248,7 @@ Does answering the latest message require a new web search?
             // A write the model planned after this read ("find the user, then
             // file the issue") is the step the request is really for: set it
             // aside for the planner, as a write resolved first would be.
-            if let Some(write) = picked.also.iter().find(|c| !Self::is_read_only_tool(&c.tool_name)) {
+            if let Some(write) = picked.also.iter().find(|c| !ToolAccess::on(server, &c.tool_name).is_read()) {
                 if !picks.iter().any(|p| p.deferred && p.tool.tool_name == write.tool_name) {
                     tracing::info!(
                         target: LOGGER,

@@ -96,6 +96,7 @@ mod test_mcp_resolution_fills_arguments;
 mod test_mcp_retry_reverifies;
 mod test_mcp_sandbox_discovery;
 mod test_mcp_static_token_auth;
+mod test_mcp_tool_access;
 mod test_mcp_tool_annotations;
 mod test_mcp_tool_loop;
 mod test_mcp_tool_resolution;
