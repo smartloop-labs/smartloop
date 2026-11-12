@@ -1181,6 +1181,25 @@ impl ModelService {
         }
     }
 
+    /// Whether a skill body is the one smartloop wrote: `expected`, optionally
+    /// followed by the ```` ```mcp ```` block naming its tool call
+    /// (`smartloop.bash(command)`) that the default skills carried on disk.
+    /// Anything else means the user changed it, and it stays.
+    pub fn is_legacy_skill_body(body: &str, expected: &str) -> bool {
+        let Some(rest) = body.trim().strip_prefix(expected) else {
+            return false;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return true;
+        }
+        let Some(inner) = rest.strip_prefix("```mcp").and_then(|r| r.strip_suffix("```")) else {
+            return false;
+        };
+        let call = inner.trim();
+        !call.contains('\n') && call.starts_with("smartloop.")
+    }
+
     /// Delete the skills smartloop wrote into `skills_dir` (see
     /// [`Self::LEGACY_BUILTIN_SKILLS`]), as a `<name>/SKILL.md` directory or
     /// a bare `<name>.md` file.
@@ -1191,7 +1210,7 @@ impl ModelService {
                 let ours = match body {
                     None => true,
                     Some(body) => std::fs::read_to_string(skill_dir.join("SKILL.md"))
-                        .is_ok_and(|raw| Self::parse_skill_content(&raw).0.trim() == *body),
+                        .is_ok_and(|raw| Self::is_legacy_skill_body(&Self::parse_skill_content(&raw).0, body)),
                 };
                 if ours && std::fs::remove_dir_all(&skill_dir).is_ok() {
                     tracing::info!(target: LOG_TARGET, "Removed legacy skill '{name}' from project {project_id}");
