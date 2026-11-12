@@ -166,6 +166,47 @@ fn test_sweep_removes_the_default_skills_smartloop_wrote() {
 }
 
 #[test]
+fn test_sweep_removes_default_skills_as_written_with_their_mcp_block() {
+    // The default skills on disk end with the tool call they named, not just
+    // the one-line body: this is the SKILL.md a real install carries.
+    let (svc, _saves, dir) = svc(vec![]);
+    let written = [
+        ("bash", "execute the shell command on the host machine", "smartloop.bash(command)"),
+        ("file-read", "read the file at the given path and return its content", "smartloop.file-read(path)"),
+        ("file-write", "write content to a file at the given path", "smartloop.file-write(path, content)"),
+    ];
+    for (name, body, call) in written {
+        let skill = skills_dir(&dir).join(name);
+        std::fs::create_dir_all(&skill).expect("mkdir");
+        let raw = format!("---\nname: {name}\ndescription: Use when ...\n---\n\n{body}\n\n```mcp\n{call}\n```");
+        std::fs::write(skill.join("SKILL.md"), raw).expect("write");
+    }
+    write_skill(&dir, "good-morning", "say good morning");
+
+    svc.sweep_legacy_builtins("p1");
+
+    let left: Vec<String> = std::fs::read_dir(skills_dir(&dir))
+        .expect("skills dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec!["good-morning".to_string()]);
+}
+
+#[test]
+fn test_sweep_keeps_a_default_skill_the_user_extended() {
+    let (svc, _saves, dir) = svc(vec![]);
+    write_skill(
+        &dir,
+        "bash",
+        "execute the shell command on the host machine\n\nAlways run `make lint` first.",
+    );
+
+    svc.sweep_legacy_builtins("p1");
+
+    assert!(Path::new(&skills_dir(&dir).join("bash").join("SKILL.md")).is_file());
+}
+
+#[test]
 fn test_sweep_keeps_a_user_skill_that_reuses_a_default_name() {
     let (svc, _saves, dir) = svc(vec![]);
     // The harness (or the user) wrote its own `bash` skill: not ours to delete.
