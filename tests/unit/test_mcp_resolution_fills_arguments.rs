@@ -76,6 +76,7 @@ fn wired() -> Wired {
             name: "create_issue".into(),
             description: Some("Create an issue".into()),
             input_schema: Some(schema()),
+            ..Default::default()
         }],
         ..Default::default()
     };

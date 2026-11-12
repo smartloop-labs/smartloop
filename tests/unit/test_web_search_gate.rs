@@ -299,7 +299,7 @@ mod web_search_still_gated {
         let server = MCPServer {
             id: "issues".to_string(),
             name: "issues".to_string(),
-            tools: vec![MCPToolDefinition { name: "list_issues".to_string(), description: None, input_schema: None }],
+            tools: vec![MCPToolDefinition { name: "list_issues".to_string(), description: None, input_schema: None, ..Default::default() }],
             ..MCPServer::default()
         };
         let servers = [server];

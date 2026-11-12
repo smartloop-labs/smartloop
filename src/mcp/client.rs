@@ -20,7 +20,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::workspace::MCPToolDefinition;
+use crate::workspace::{MCPToolAnnotations, MCPToolDefinition};
 
 /// Python logger name of this module.
 const LOGGER: &str = "smartloop.mcp.client";
@@ -368,13 +368,35 @@ pub(crate) fn tools_from(tools_result: &Map<String, Value>) -> Result<Vec<MCPToo
                 ))
             }
         };
+        let annotations = tool.get("annotations").and_then(Value::as_object);
         tools.push(MCPToolDefinition {
             name,
             description: opt_string(tool, "description"),
             input_schema: tool.get("inputSchema").and_then(|v| v.as_object().cloned()),
+            title: non_empty_str(tool, "title").or_else(|| annotations.and_then(|a| non_empty_str(a, "title"))),
+            annotations: annotations.and_then(annotations_from),
         });
     }
     Ok(tools)
+}
+
+/// A string field, or `None` when it is missing, not a string, or blank.
+fn non_empty_str(obj: &Map<String, Value>, key: &str) -> Option<String> {
+    obj.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// The behaviour hints of a tool's `annotations`, or `None` when it carries none.
+///
+/// A hint that is not a boolean is treated as absent.
+fn annotations_from(raw: &Map<String, Value>) -> Option<MCPToolAnnotations> {
+    let hint = |key: &str| raw.get(key).and_then(Value::as_bool);
+    let annotations = MCPToolAnnotations {
+        read_only_hint: hint("readOnlyHint"),
+        destructive_hint: hint("destructiveHint"),
+        idempotent_hint: hint("idempotentHint"),
+        open_world_hint: hint("openWorldHint"),
+    };
+    (annotations != MCPToolAnnotations::default()).then_some(annotations)
 }
 
 /// The `content` / `isError` pair of a `tools/call` result.

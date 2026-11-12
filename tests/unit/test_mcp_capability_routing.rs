@@ -153,6 +153,7 @@ fn agent_with_two_tools(default_llm: &Arc<StubLLM>) -> (MCPAgent, Vec<MCPServer>
                 name: "list_issues".to_string(),
                 description: Some("List issues".to_string()),
                 input_schema: Some(obj(json!({"type": "object", "properties": {}}))),
+                ..Default::default()
             },
             MCPToolDefinition {
                 name: "create_issue".to_string(),
@@ -162,6 +163,7 @@ fn agent_with_two_tools(default_llm: &Arc<StubLLM>) -> (MCPAgent, Vec<MCPServer>
                     "properties": {"title": {"type": "string", "description": "The issue title"}},
                     "required": ["title"],
                 }))),
+                ..Default::default()
             },
         ],
         ..Default::default()

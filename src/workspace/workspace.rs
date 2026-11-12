@@ -33,7 +33,7 @@ use serde_json::{Map, Value, json};
 use crate::config::{AppSettings, ModelConfig};
 use crate::constants::canonical_model_name;
 use crate::llms::llm_factory::LlmFactory;
-use crate::model::spec::{ModelSpec, MODEL_SPECS};
+use crate::model::spec::{MODEL_SPECS, ModelSpec};
 use crate::paths::{expand_home, real_home};
 use crate::types::{ModelCapability, ModelKind};
 use crate::workspace::context::{
@@ -63,8 +63,14 @@ pub const WORKSPACE_OWNED_PROJECT_FIELDS: &[&str] = &["current"];
 /// The thin per-project record kept in `config.json`.  Enough to list and
 /// route projects without opening any of them; everything else lives in the
 /// project's own file.
-pub const PROJECT_INDEX_FIELDS: &[&str] =
-    &["id", "name", "description", "project_dir", "current", "system"];
+pub const PROJECT_INDEX_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "description",
+    "project_dir",
+    "current",
+    "system",
+];
 
 /// Computed/runtime keys stripped from a persisted workspace record before it
 /// is validated (and from the record before it is written).
@@ -90,7 +96,8 @@ static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Models whose stored kind has already been reported as disagreeing with
 /// their spec, so the error is logged once per model rather than per lookup.
-static KIND_MISMATCH_REPORTED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+static KIND_MISMATCH_REPORTED: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// Override the import-time settings home (Python tests patch
 /// `workspace._settings`).  `None` restores `AppSettings::new().home_dir`.
@@ -162,7 +169,9 @@ struct PythonJsonFormatter {
 
 impl PythonJsonFormatter {
     fn new() -> Self {
-        Self { inner: serde_json::ser::PrettyFormatter::with_indent(b"    ") }
+        Self {
+            inner: serde_json::ser::PrettyFormatter::with_indent(b"    "),
+        }
     }
 }
 
@@ -183,7 +192,10 @@ impl serde_json::ser::Formatter for PythonJsonFormatter {
         self.inner.begin_array_value(writer, first)
     }
 
-    fn end_array_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+    fn end_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
         self.inner.end_array_value(writer)
     }
 
@@ -203,11 +215,17 @@ impl serde_json::ser::Formatter for PythonJsonFormatter {
         self.inner.begin_object_key(writer, first)
     }
 
-    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
         self.inner.begin_object_value(writer)
     }
 
-    fn end_object_value<W: ?Sized + std::io::Write>(&mut self, writer: &mut W) -> std::io::Result<()> {
+    fn end_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
         self.inner.end_object_value(writer)
     }
 
@@ -237,8 +255,10 @@ impl serde_json::ser::Formatter for PythonJsonFormatter {
 /// Serialize `data` the way Python's `json.dump(data, fh, indent=4)` does.
 pub fn python_json_dumps(data: &Value) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut out, PythonJsonFormatter::new());
-    data.serialize(&mut serializer).map_err(std::io::Error::other)?;
+    let mut serializer =
+        serde_json::Serializer::with_formatter(&mut out, PythonJsonFormatter::new());
+    data.serialize(&mut serializer)
+        .map_err(std::io::Error::other)?;
     Ok(out)
 }
 
@@ -400,6 +420,30 @@ pub struct MCPToolDefinition {
     pub description: Option<String>,
     #[serde(default)]
     pub input_schema: Option<Map<String, Value>>,
+    /// Display name the server gives the tool: its `title`, else
+    /// `annotations.title`.  The spec defines both and ranks them in that
+    /// order; some servers send only one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Behaviour hints the server sends with the tool; `None` when it sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<MCPToolAnnotations>,
+}
+
+/// MCP tool annotations: hints a server gives about what a tool does.
+///
+/// A hint the server leaves out stays `None` rather than taking the spec's
+/// default, so a reader can tell "not said" from "said false".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MCPToolAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
 }
 
 /// Configuration for launching a local MCP server process.
@@ -646,7 +690,10 @@ impl ProjectModel {
     /// A new entry for `model_name` (canonicalized), with defaults
     /// (enabled, inactive, no thinking override, empty settings).
     pub fn new(model_name: &str) -> Self {
-        Self { model_name: canonical_model_name(model_name), ..Default::default() }
+        Self {
+            model_name: canonical_model_name(model_name),
+            ..Default::default()
+        }
     }
 }
 
@@ -737,7 +784,11 @@ impl WorkspaceModel {
         if spec.cloud.as_ref().is_some_and(|cloud| cloud.accessible) {
             return self.kind;
         }
-        if spec.kind != self.kind && KIND_MISMATCH_REPORTED.lock().insert(self.model_name.clone()) {
+        if spec.kind != self.kind
+            && KIND_MISMATCH_REPORTED
+                .lock()
+                .insert(self.model_name.clone())
+        {
             tracing::error!(
                 target: LOG_TARGET,
                 "[workspace] {} is registered as {} but its spec says {} — using the spec",
@@ -793,7 +844,10 @@ impl WorkspaceModel {
         if self.has_no_weights_path() {
             return String::new();
         }
-        join(&self.bin_dir(), &format!("{}.gguf", path_name(&self.model_id)))
+        join(
+            &self.bin_dir(),
+            &format!("{}.gguf", path_name(&self.model_id)),
+        )
     }
 
     /// Whether the model is ready to run where it runs ([`Self::kind`]).  The
@@ -807,7 +861,9 @@ impl WorkspaceModel {
     /// This model's spec, if one is known: the cloud variant when a model
     /// served both ways is registered to run remotely.
     pub fn spec(&self) -> Option<Arc<ModelSpec>> {
-        MODEL_SPECS.get(&self.model_name).map(|spec| spec.for_kind(self.kind()))
+        MODEL_SPECS
+            .get(&self.model_name)
+            .map(|spec| spec.for_kind(self.kind()))
     }
 
     /// This model run in the cloud instead, when it is a local model whose
@@ -823,7 +879,11 @@ impl WorkspaceModel {
         if !spec.cloud.as_ref().is_some_and(|cloud| cloud.accessible) {
             return None;
         }
-        Some(WorkspaceModel { kind: ModelKind::Remote, downloaded: true, ..self.clone() })
+        Some(WorkspaceModel {
+            kind: ModelKind::Remote,
+            downloaded: true,
+            ..self.clone()
+        })
     }
 
     /// Base URL a remote model's chat requests go to: its spec's, else the
@@ -832,7 +892,10 @@ impl WorkspaceModel {
         if !self.is_remote() {
             return None;
         }
-        let url = self.spec().and_then(|spec| spec.url.clone()).filter(|u| !u.is_empty());
+        let url = self
+            .spec()
+            .and_then(|spec| spec.url.clone())
+            .filter(|u| !u.is_empty());
         Some(url.unwrap_or_else(|| AppSettings::new().slp_api_base))
     }
 
@@ -918,7 +981,10 @@ impl WorkspaceModel {
         // (e.g. Qwen2.5-VL).  gemma-3-4b is NOT inferred as vision: llama-cpp
         // has no Gemma3 vision handler, so tagging it vision only produces a
         // model that's considered for OCR and then skipped every time.
-        if ["vision", "vlm", "vl"].iter().any(|kw| combined.contains(kw)) {
+        if ["vision", "vlm", "vl"]
+            .iter()
+            .any(|kw| combined.contains(kw))
+        {
             caps.push(ModelCapability::Vision.value().to_string());
         }
 
@@ -1134,7 +1200,10 @@ impl Project {
 
     /// Per-project GGUF file path (produced by build).
     pub fn model_gguf_path(&self, model_id: &str) -> String {
-        join(&join(&self.project_dir, "model"), &format!("{}.gguf", path_name(model_id)))
+        join(
+            &join(&self.project_dir, "model"),
+            &format!("{}.gguf", path_name(model_id)),
+        )
     }
 
     /// Copy `source` onto this project, merging the id-keyed record lists
@@ -1258,11 +1327,17 @@ fn sync_models_into(models: &[WorkspaceModel], project: &mut Project) {
     let bootstrap = bootstrap_model_name();
     let is_bootstrap = |name: &str| canonical_model_name(name) == bootstrap;
 
-    project.model_settings.retain(|m| !is_bootstrap(&m.model_name));
-    let existing: HashSet<String> =
-        project.model_settings.iter().map(|m| canonical_model_name(&m.model_name)).collect();
+    project
+        .model_settings
+        .retain(|m| !is_bootstrap(&m.model_name));
+    let existing: HashSet<String> = project
+        .model_settings
+        .iter()
+        .map(|m| canonical_model_name(&m.model_name))
+        .collect();
     for wm in models {
-        if existing.contains(&canonical_model_name(&wm.model_name)) || is_bootstrap(&wm.model_name) {
+        if existing.contains(&canonical_model_name(&wm.model_name)) || is_bootstrap(&wm.model_name)
+        {
             continue;
         }
         project.model_settings.push(ProjectModel {
@@ -1308,7 +1383,10 @@ pub struct Workspace {
 impl Workspace {
     /// A workspace with `id` and every other field defaulted.
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), ..Default::default() }
+        Self {
+            id: id.into(),
+            ..Default::default()
+        }
     }
 
     /// Builder: set `projects`.
@@ -1370,7 +1448,11 @@ impl Workspace {
     }
 
     /// Enable or disable a model.  Errors if not found.
-    pub fn set_model_enabled(&mut self, model_name: &str, enabled: bool) -> Result<(), WorkspaceError> {
+    pub fn set_model_enabled(
+        &mut self,
+        model_name: &str,
+        enabled: bool,
+    ) -> Result<(), WorkspaceError> {
         let target = canonical_model_name(model_name);
         for m in &mut self.models {
             if canonical_model_name(&m.model_name) == target {
@@ -1410,7 +1492,9 @@ impl Workspace {
     /// existing workspaces heal on next access.  Returns false when no project
     /// has `project_id`.
     pub fn sync_project_models(&mut self, project_id: &str) -> bool {
-        let Workspace { projects, models, .. } = self;
+        let Workspace {
+            projects, models, ..
+        } = self;
         match projects.iter_mut().find(|p| p.id == project_id) {
             Some(project) => {
                 sync_models_into(models, project);
@@ -1430,10 +1514,17 @@ impl Workspace {
     ///
     /// No fallback to the workspace default here — callers that want the
     /// merged view use the `effective_*` accessors.
-    pub fn project_model<'a>(&self, project: Option<&'a Project>, model_name: &str) -> Option<&'a ProjectModel> {
+    pub fn project_model<'a>(
+        &self,
+        project: Option<&'a Project>,
+        model_name: &str,
+    ) -> Option<&'a ProjectModel> {
         let project = project?;
         let target = canonical_model_name(model_name);
-        project.model_settings.iter().find(|m| canonical_model_name(&m.model_name) == target)
+        project
+            .model_settings
+            .iter()
+            .find(|m| canonical_model_name(&m.model_name) == target)
     }
 
     /// Whether `model_name` is enabled for `project` (or the workspace default).
@@ -1443,7 +1534,9 @@ impl Workspace {
         if let Some(pm) = self.project_model(project, model_name) {
             return pm.enabled;
         }
-        self.get_model(Some(model_name)).map(|ws| ws.enabled).unwrap_or(true)
+        self.get_model(Some(model_name))
+            .map(|ws| ws.enabled)
+            .unwrap_or(true)
     }
 
     /// Whether `model_name` declares `ModelCapability::Thinking`.
@@ -1468,11 +1561,18 @@ impl Workspace {
     /// Returns `None` for a model that does not declare thinking, which means
     /// "bind nothing": its chat template never reads `enable_thinking`, so a
     /// stored preference for it would be a setting that silently does nothing.
-    pub fn effective_model_thinking(&self, model_name: &str, project: Option<&Project>) -> Option<bool> {
+    pub fn effective_model_thinking(
+        &self,
+        model_name: &str,
+        project: Option<&Project>,
+    ) -> Option<bool> {
         if !self.supports_thinking(model_name) {
             return None;
         }
-        if let Some(thinking) = self.project_model(project, model_name).and_then(|pm| pm.thinking) {
+        if let Some(thinking) = self
+            .project_model(project, model_name)
+            .and_then(|pm| pm.thinking)
+        {
             return Some(thinking);
         }
         if let Some(thinking) = self.get_model(Some(model_name)).and_then(|ws| ws.thinking) {
@@ -1499,13 +1599,20 @@ impl Workspace {
         }
         let target = canonical_model_name(model_name);
         let project = self.project_mut(project_id)?;
-        match project.model_settings.iter_mut().find(|m| canonical_model_name(&m.model_name) == target) {
+        match project
+            .model_settings
+            .iter_mut()
+            .find(|m| canonical_model_name(&m.model_name) == target)
+        {
             Some(pm) => {
                 pm.thinking = thinking;
                 Some(pm.clone())
             }
             None => {
-                let pm = ProjectModel { thinking, ..ProjectModel::new(model_name) };
+                let pm = ProjectModel {
+                    thinking,
+                    ..ProjectModel::new(model_name)
+                };
                 project.model_settings.push(pm.clone());
                 Some(pm)
             }
@@ -1518,7 +1625,9 @@ impl Workspace {
     /// `models_dir` and are added or removed for every project at once — so
     /// this takes no project argument.
     pub fn effective_model_downloaded(&self, model_name: &str) -> bool {
-        self.get_model(Some(model_name)).map(|ws| ws.is_downloaded()).unwrap_or(false)
+        self.get_model(Some(model_name))
+            .map(|ws| ws.is_downloaded())
+            .unwrap_or(false)
     }
 
     /// Whether `model_name` is the active selection for `project`.
@@ -1526,7 +1635,9 @@ impl Workspace {
         if let Some(pm) = self.project_model(project, model_name) {
             return pm.is_active;
         }
-        self.get_model(Some(model_name)).map(|ws| ws.is_active).unwrap_or(false)
+        self.get_model(Some(model_name))
+            .map(|ws| ws.is_active)
+            .unwrap_or(false)
     }
 
     /// Freeze what `model_name` currently resolves to, per project.
@@ -1637,13 +1748,20 @@ impl Workspace {
         }
         let target = canonical_model_name(model_name);
         let project = self.project_mut(project_id)?;
-        match project.model_settings.iter_mut().find(|m| canonical_model_name(&m.model_name) == target) {
+        match project
+            .model_settings
+            .iter_mut()
+            .find(|m| canonical_model_name(&m.model_name) == target)
+        {
             Some(pm) => {
                 pm.enabled = enabled;
                 Some(pm.clone())
             }
             None => {
-                let pm = ProjectModel { enabled, ..ProjectModel::new(model_name) };
+                let pm = ProjectModel {
+                    enabled,
+                    ..ProjectModel::new(model_name)
+                };
                 project.model_settings.push(pm.clone());
                 Some(pm)
             }
@@ -1673,9 +1791,10 @@ impl Workspace {
         {
             Some(index) => index,
             None => {
-                project
-                    .model_settings
-                    .push(ProjectModel { is_active: active, ..ProjectModel::new(model_name) });
+                project.model_settings.push(ProjectModel {
+                    is_active: active,
+                    ..ProjectModel::new(model_name)
+                });
                 project.model_settings.len() - 1
             }
         };
@@ -1698,7 +1817,9 @@ impl Workspace {
         };
         // Canonical names, so a legacy name matches its current one.
         let target = canonical_model_name(&model_name);
-        self.models.iter().position(|m| canonical_model_name(&m.model_name) == target)
+        self.models
+            .iter()
+            .position(|m| canonical_model_name(&m.model_name) == target)
     }
 
     /// Look up a registered model by its short name (alias-aware); `None`
@@ -1753,7 +1874,11 @@ impl Workspace {
         let has_active = self.models.iter().any(|m| m.is_active);
         // The bootstrap model gets no per-project entry, so its always-on state
         // resolves through this record — never register it disabled.
-        let enabled = if self.is_bootstrap_model(&model_name) { true } else { enabled };
+        let enabled = if self.is_bootstrap_model(&model_name) {
+            true
+        } else {
+            enabled
+        };
         let entry = WorkspaceModel {
             model_name,
             model_id: model_id.to_string(),
@@ -1796,9 +1921,11 @@ impl Workspace {
     /// order), and stamp their `models_dir`.
     fn rank_candidates(&self, mut candidates: Vec<WorkspaceModel>) -> Vec<WorkspaceModel> {
         candidates.sort_by(|a, b| {
-            a.is_remote()
-                .cmp(&b.is_remote())
-                .then(b.rank().partial_cmp(&a.rank()).unwrap_or(std::cmp::Ordering::Equal))
+            a.is_remote().cmp(&b.is_remote()).then(
+                b.rank()
+                    .partial_cmp(&a.rank())
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         });
         for m in &mut candidates {
             m.models_dir = self.models_dir.clone();
@@ -1836,7 +1963,11 @@ impl Workspace {
     /// the largest doesn't fit in memory, rather than dropping straight to the
     /// tiny default.  Empty when no downloaded model declares the capability.
     /// Per-project settings (`project`) override the workspace defaults.
-    pub fn ranked_models_for(&self, capability: &str, project: Option<&Project>) -> Vec<WorkspaceModel> {
+    pub fn ranked_models_for(
+        &self,
+        capability: &str,
+        project: Option<&Project>,
+    ) -> Vec<WorkspaceModel> {
         let cap = capability.to_lowercase();
         // The answer tier is every text model, not a declared capability.
         let answer = cap == crate::types::ANSWER_TIER;
@@ -1868,7 +1999,11 @@ impl Workspace {
     ///
     /// Memory is NOT considered here; callers that must fit the model in VRAM
     /// use [`Workspace::ranked_models_for`] and walk down to a smaller one.
-    pub fn best_model_for(&self, capability: &str, project: Option<&Project>) -> Option<WorkspaceModel> {
+    pub fn best_model_for(
+        &self,
+        capability: &str,
+        project: Option<&Project>,
+    ) -> Option<WorkspaceModel> {
         let ranked = self.ranked_models_for(capability, project);
         if let Some(best) = ranked.into_iter().next() {
             return Some(best);
@@ -1883,7 +2018,10 @@ impl Workspace {
 
     /// The workspace-level GGUF file path for a given `model_id`.
     pub fn model_path_for(&self, model_id: &str) -> String {
-        join(&join(&self.models_dir, model_id), &format!("{}.gguf", path_name(model_id)))
+        join(
+            &join(&self.models_dir, model_id),
+            &format!("{}.gguf", path_name(model_id)),
+        )
     }
 
     /// Cascade: quantize-matched bin GGUF → first bin GGUF → exact workspace
@@ -1920,7 +2058,10 @@ impl Workspace {
                     .unwrap_or_default();
                 if !quantize.is_empty() {
                     let suffix = format!("-{quantize}.GGUF");
-                    if let Some(f) = gguf_files.iter().find(|f| f.to_uppercase().ends_with(&suffix)) {
+                    if let Some(f) = gguf_files
+                        .iter()
+                        .find(|f| f.to_uppercase().ends_with(&suffix))
+                    {
                         return join(&bin_dir, f);
                     }
                 }
@@ -1990,10 +2131,11 @@ impl Workspace {
     pub fn save(&self) -> std::io::Result<()> {
         let _guard = SAVE_LOCK.lock();
         if legacy_layout() {
-            let projects = match serde_json::to_value(&self.projects).map_err(std::io::Error::other)? {
-                Value::Array(projects) => projects,
-                _ => Vec::new(),
-            };
+            let projects =
+                match serde_json::to_value(&self.projects).map_err(std::io::Error::other)? {
+                    Value::Array(projects) => projects,
+                    _ => Vec::new(),
+                };
             return atomic_write_json(&Self::config_file(), &self.workspace_record(projects));
         }
 
@@ -2014,7 +2156,11 @@ impl Workspace {
         for project in self.writable_projects() {
             project.save_state()?;
         }
-        let index: Vec<Value> = self.projects.iter().map(|p| Value::Object(p.to_index())).collect();
+        let index: Vec<Value> = self
+            .projects
+            .iter()
+            .map(|p| Value::Object(p.to_index()))
+            .collect();
         atomic_write_json(&Self::config_file(), &self.workspace_record(index))
     }
 
@@ -2046,7 +2192,11 @@ impl Workspace {
             return ws_data;
         }
 
-        let workspace_id = ws_data.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let workspace_id = ws_data
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let workspace_dir = join(&home_dir(), &workspace_id);
         let entries = match ws_data.get("projects") {
             Some(Value::Array(entries)) => entries.clone(),
@@ -2064,7 +2214,8 @@ impl Workspace {
                 hydrated.push(entry);
                 continue;
             };
-            let Some(state) = read_project_state(&join(&workspace_dir, &project_id)).filter(|s| !s.is_empty())
+            let Some(state) =
+                read_project_state(&join(&workspace_dir, &project_id)).filter(|s| !s.is_empty())
             else {
                 hydrated.push(entry);
                 continue;
@@ -2086,7 +2237,10 @@ impl Workspace {
         // `ws_data["projects"] = hydrated`, where a missing or null list
         // hydrates to an empty one; anything else is left for validation to
         // reject.
-        if matches!(ws_data.get("projects"), None | Some(Value::Null) | Some(Value::Array(_))) {
+        if matches!(
+            ws_data.get("projects"),
+            None | Some(Value::Null) | Some(Value::Array(_))
+        ) {
             ws_data.insert("projects".to_string(), Value::Array(hydrated));
         }
         ws_data
@@ -2128,7 +2282,9 @@ impl Workspace {
             tracing::warn!(target: LOG_TARGET, "Workspace.init: could not create {}: {}", models_dir, err);
         }
 
-        Workspace::new(workspace_id).with_workspace_dir(workspace_dir).with_models_dir(models_dir)
+        Workspace::new(workspace_id)
+            .with_workspace_dir(workspace_dir)
+            .with_models_dir(models_dir)
     }
 
     /// Load the workspace singleton from `config.json` on disk.
@@ -2277,7 +2433,10 @@ impl Workspace {
         let Some(mut state) = state.filter(|s| !s.is_empty()) else {
             return false;
         };
-        state.insert("id".to_string(), Value::String(self.projects[index].id.clone()));
+        state.insert(
+            "id".to_string(),
+            Value::String(self.projects[index].id.clone()),
+        );
         state.insert("project_dir".to_string(), Value::String(project_dir));
         let fresh: Project = match serde_json::from_value(Value::Object(state)) {
             Ok(fresh) => fresh,
@@ -2334,8 +2493,10 @@ impl Workspace {
         else {
             return false;
         };
-        let fresh: Result<Vec<WorkspaceModel>, _> =
-            models.iter().map(|m| serde_json::from_value::<WorkspaceModel>(m.clone())).collect();
+        let fresh: Result<Vec<WorkspaceModel>, _> = models
+            .iter()
+            .map(|m| serde_json::from_value::<WorkspaceModel>(m.clone()))
+            .collect();
         let Ok(mut fresh) = fresh else {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -2402,7 +2563,8 @@ impl Workspace {
     /// different projects each resolve their own.  The `current` flag remains
     /// the fallback, and means only "the project the UI has selected".
     pub fn current_project(&self) -> Option<&Project> {
-        self.current_project_index().map(|index| &self.projects[index])
+        self.current_project_index()
+            .map(|index| &self.projects[index])
     }
 
     /// Mutable form of [`Workspace::current_project`].

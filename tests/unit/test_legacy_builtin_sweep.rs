@@ -75,6 +75,7 @@ fn server(server_id: &str, name: &str, tool_names: &[&str]) -> MCPServer {
                 name: n.to_string(),
                 description: Some(n.to_string()),
                 input_schema: json!({"type": "object"}).as_object().cloned(),
+                ..Default::default()
             })
             .collect(),
         ..Default::default()

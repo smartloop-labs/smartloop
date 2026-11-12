@@ -30,7 +30,7 @@ use smartloop::workspace::{MCPOAuthCredentials, MCPServer, MCPServerStatus, MCPT
 use crate::shared::model_service_a::{FakeLLM, ScratchConfig, attach_workspace, bare_service};
 
 fn tool(name: &str) -> MCPToolDefinition {
-    MCPToolDefinition { name: name.to_string(), description: Some(name.to_string()), input_schema: Some(Map::new()) }
+    MCPToolDefinition { name: name.to_string(), description: Some(name.to_string()), input_schema: Some(Map::new()), ..Default::default() }
 }
 
 fn server(tools: Vec<MCPToolDefinition>) -> MCPServer {

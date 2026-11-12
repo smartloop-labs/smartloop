@@ -56,6 +56,7 @@ fn server_with(status: MCPServerStatus, enabled: bool, server_id: &str) -> MCPSe
             name: "search".to_string(),
             description: Some("Search pages".to_string()),
             input_schema: Some(Map::new()),
+            ..Default::default()
         }],
         ..Default::default()
     }

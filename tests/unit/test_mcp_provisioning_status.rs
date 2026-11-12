@@ -25,6 +25,7 @@ fn server() -> MCPServer {
             name: "search".into(),
             description: Some("d".into()),
             input_schema: Some(Map::new()),
+            ..Default::default()
         }],
         ..MCPServer::default()
     }
