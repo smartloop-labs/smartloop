@@ -2000,6 +2000,14 @@ impl ModelService {
         // two selected models in and out on every step.  A step that needs
         // a model that does not fit still evicts them (see
         // `get_llm_for_capability`), and deselecting a model unloads it.
+        //
+        // In a project agent the weights live in the host, so the host runs
+        // the same release — which is also what arms its idle timer.
+        if let Some(remote) = self.remote_device() {
+            if let Err(e) = remote.unload_auxiliary_models(include_embedding) {
+                tracing::warn!(target: LOG, "[models] host unload failed: {e}");
+            }
+        }
         let mut unloads: Vec<(&str, Box<dyn Fn() + '_>)> = vec![
             ("vision", Box::new(|| self.unload_vision_model())),
             ("large", Box::new(|| self.unload_large_model())),

@@ -167,8 +167,9 @@ impl ModelClient for FakeClient {
         Ok(Some("sl-mini".into()))
     }
 
-    fn unload_auxiliary_models(&self, _include_embedding: bool) -> anyhow::Result<()> {
-        Ok(())
+    fn unload_auxiliary_models(&self, include_embedding: bool) -> anyhow::Result<()> {
+        self.record("unload_auxiliary_models", &include_embedding.to_string(), None);
+        self.fail()
     }
 
     fn unload_embedding_model(&self) -> anyhow::Result<()> {
@@ -484,6 +485,27 @@ fn test_it_recognises_a_remote_device() {
     let svc = service(&client);
     let device = svc.remote_device().expect("a remote device");
     assert!(device.as_any().is::<FakeClient>());
+}
+
+#[test]
+fn test_unloading_auxiliary_models_releases_them_on_the_host() {
+    let client = client();
+    let svc = service(&client);
+
+    svc.unload_auxiliary_models(false);
+
+    assert!(client.called("unload_auxiliary_models", "false", None));
+}
+
+#[test]
+fn test_a_failed_host_unload_does_not_fail_the_response() {
+    let client = client();
+    let svc = service(&client);
+    *client.fail_with.write() = Some("host gone".into());
+
+    svc.unload_auxiliary_models(true);
+
+    assert!(client.called("unload_auxiliary_models", "true", None));
 }
 
 #[test]
