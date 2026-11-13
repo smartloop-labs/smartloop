@@ -2867,6 +2867,9 @@ pub mod api_chat {
         fn unload_embedding_model(&self) {
             *self.unload_embedding_calls.lock() += 1;
         }
+        fn unload_model_by_name(&self, _model_name: &str) -> bool {
+            false
+        }
     }
 
     /// The `MagicMock` `ModelService` of the chat tests.

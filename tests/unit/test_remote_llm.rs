@@ -176,6 +176,12 @@ impl ModelClient for FakeClient {
         Ok(())
     }
 
+    fn unload_model_by_name(&self, model_name: &str) -> anyhow::Result<bool> {
+        self.record("unload_model_by_name", model_name, None);
+        self.fail()?;
+        Ok(true)
+    }
+
     fn as_remote(&self) -> Option<&RemoteModelClient> {
         Some(&self.remote)
     }
@@ -506,6 +512,27 @@ fn test_a_failed_host_unload_does_not_fail_the_response() {
     svc.unload_auxiliary_models(true);
 
     assert!(client.called("unload_auxiliary_models", "true", None));
+}
+
+#[test]
+fn test_deselecting_a_model_releases_it_on_the_host() {
+    let client = client();
+    let svc = service(&client);
+
+    assert!(svc.unload_model_by_name("qwen3.5-2b"));
+
+    assert!(client.called("unload_model_by_name", "qwen3.5-2b", None));
+}
+
+#[test]
+fn test_a_failed_host_deselect_unload_is_not_an_error() {
+    let client = client();
+    let svc = service(&client);
+    *client.fail_with.write() = Some("host gone".into());
+
+    assert!(!svc.unload_model_by_name("qwen3.5-2b"));
+
+    assert!(client.called("unload_model_by_name", "qwen3.5-2b", None));
 }
 
 #[test]

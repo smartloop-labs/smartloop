@@ -45,6 +45,7 @@ enum Call {
     LoadModel,
     UnloadAuxiliaryModels(bool),
     UnloadEmbeddingModel,
+    UnloadModelByName(String),
 }
 
 type LabelFn = Box<dyn Fn(Option<&str>) -> String + Send + Sync>;
@@ -253,6 +254,11 @@ impl ModelClient for Device {
         Ok(())
     }
 
+    fn unload_model_by_name(&self, model_name: &str) -> anyhow::Result<bool> {
+        self.calls.lock().push(Call::UnloadModelByName(model_name.to_string()));
+        Ok(true)
+    }
+
     fn refresh_project(&self, project_id: Option<&str>) -> anyhow::Result<bool> {
         match self.refresh.lock().as_ref() {
             Some(refresh) => refresh(project_id),
@@ -451,6 +457,7 @@ enum ServiceCall {
     LoadModel,
     UnloadAuxiliaryModels(bool),
     UnloadEmbeddingModel,
+    UnloadModelByName(String),
     Refresh(Option<String>),
 }
 
@@ -554,6 +561,11 @@ impl LocalModelService for FakeService {
 
     fn unload_embedding_model(&self) {
         self.calls.lock().push(ServiceCall::UnloadEmbeddingModel);
+    }
+
+    fn unload_model_by_name(&self, model_name: &str) -> bool {
+        self.calls.lock().push(ServiceCall::UnloadModelByName(model_name.to_string()));
+        true
     }
 }
 
@@ -709,9 +721,21 @@ fn test_lifecycle_calls_reach_the_device() {
     assert_eq!(hosted.client.load_model().unwrap().as_deref(), Some("sl-mini"));
     hosted.client.unload_auxiliary_models(false).unwrap();
     hosted.client.unload_embedding_model().unwrap();
+    assert!(hosted.client.unload_model_by_name("qwen3.5-2b").unwrap());
     let calls = hosted.device.calls();
     assert!(calls.contains(&Call::UnloadAuxiliaryModels(false)));
     assert!(calls.contains(&Call::UnloadEmbeddingModel));
+    assert!(calls.contains(&Call::UnloadModelByName("qwen3.5-2b".into())));
+}
+
+#[test]
+#[serial]
+fn test_a_call_from_inside_an_executor_reaches_the_device() {
+    let hosted = Hosted::new();
+    // A route runs its body under `futures::executor::block_on`.
+    let unloaded = futures::executor::block_on(async { hosted.client.unload_model_by_name("qwen3.5-2b") });
+    assert!(unloaded.unwrap());
+    assert!(hosted.device.calls().contains(&Call::UnloadModelByName("qwen3.5-2b".into())));
 }
 
 #[test]

@@ -2091,8 +2091,17 @@ impl ModelService {
     /// caches and any per-capability cache — then reclaims the GPU.
     /// Idempotent; returns true if anything was unloaded.
     pub fn unload_model_by_name(&self, model_name: &str) -> bool {
+        // In a project agent the weights live in the host, so deselecting
+        // here has to release them there too.
+        let mut unloaded = false;
+        if let Some(remote) = self.remote_device() {
+            match remote.unload_model_by_name(model_name) {
+                Ok(freed) => unloaded = freed,
+                Err(e) => tracing::warn!(target: LOG, "[models] host unload of {model_name} failed: {e}"),
+            }
+        }
         let _slot = self.inference_slot();
-        self.unload_model_by_name_unlocked(model_name)
+        self.unload_model_by_name_unlocked(model_name) || unloaded
     }
 
     /// [`Self::unload_model_by_name`] without taking an inference slot.

@@ -242,6 +242,10 @@ impl ModelClient for RecordingClient {
         Ok(())
     }
 
+    fn unload_model_by_name(&self, _model_name: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

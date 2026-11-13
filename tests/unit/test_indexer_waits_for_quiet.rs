@@ -293,6 +293,13 @@ mod test_the_idle_reading_comes_from_the_right_process {
         ) -> Result<Response<pb::Empty>, Status> {
             unimplemented()
         }
+
+        async fn unload_model(
+            &self,
+            _: Request<pb::UnloadModelRequest>,
+        ) -> Result<Response<pb::BoolReply>, Status> {
+            unimplemented()
+        }
     }
 
     /// Serve an [`IdleHost`] on a loopback port; returns `host:port` and the

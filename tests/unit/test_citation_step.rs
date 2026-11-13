@@ -331,6 +331,9 @@ impl LocalModelService for FakeService {
     fn unload_embedding_model(&self) {
         self.unload_embedding.fetch_add(1, Ordering::SeqCst);
     }
+    fn unload_model_by_name(&self, _model_name: &str) -> bool {
+        false
+    }
 }
 
 /// Clears the `encode_texts` override however the test ends.

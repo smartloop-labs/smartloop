@@ -237,6 +237,9 @@ pub trait ModelClient: Send + Sync {
     /// Free the embedding model.
     fn unload_embedding_model(&self) -> anyhow::Result<()>;
 
+    /// Free every slot backed by `model_name`; true if anything was unloaded.
+    fn unload_model_by_name(&self, model_name: &str) -> anyhow::Result<bool>;
+
     /// Release any transport this client holds. In-process: nothing.
     fn close(&self) {}
 
@@ -361,6 +364,9 @@ pub trait LocalModelService: Send + Sync {
 
     /// `ModelService.unload_embedding_model`.
     fn unload_embedding_model(&self);
+
+    /// `ModelService.unload_model_by_name`.
+    fn unload_model_by_name(&self, model_name: &str) -> bool;
 }
 
 impl LocalModelService for ModelService {
@@ -450,6 +456,10 @@ impl LocalModelService for ModelService {
 
     fn unload_embedding_model(&self) {
         ModelService::unload_embedding_model(self)
+    }
+
+    fn unload_model_by_name(&self, model_name: &str) -> bool {
+        ModelService::unload_model_by_name(self, model_name)
     }
 }
 
@@ -581,6 +591,10 @@ impl ModelClient for InProcessModelClient {
         Ok(())
     }
 
+    fn unload_model_by_name(&self, model_name: &str) -> anyhow::Result<bool> {
+        Ok(self.service.unload_model_by_name(model_name))
+    }
+
     /// The workspace is right here, so a child's write is one read away.
     fn refresh_project(&self, project_id: Option<&str>) -> anyhow::Result<bool> {
         self.service.refresh_project_state(project_id)
@@ -639,9 +653,13 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let handle = CLIENT_RUNTIME.spawn(fut);
-    futures::executor::block_on(handle)
-        .map_err(|exc| Status::unknown(format!("model host call did not complete: {exc}")))
+    // Wait on a plain channel, not an executor: a caller can already be inside
+    // one (a route's `futures::executor::block_on`), and nesting them panics.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    CLIENT_RUNTIME.spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv().map_err(|_| Status::unknown("model host call did not complete: the task panicked"))
 }
 
 /// A per-call deadline from seconds; `None` for no deadline.
@@ -1201,6 +1219,17 @@ impl ModelClient for RemoteModelClient {
             stub.unload_embedding_model(request).await
         })?;
         Ok(())
+    }
+
+    fn unload_model_by_name(&self, model_name: &str) -> anyhow::Result<bool> {
+        let request = pb::UnloadModelRequest {
+            model_name: model_name.to_string(),
+            project_id: pinned_project_id().unwrap_or_default(),
+        };
+        let reply = self.unary(request, None, |mut stub, request| async move {
+            stub.unload_model(request).await
+        })?;
+        Ok(reply.value)
     }
 
     fn close(&self) {
