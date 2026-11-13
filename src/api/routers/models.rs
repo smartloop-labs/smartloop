@@ -521,6 +521,12 @@ pub struct ModelEntry {
     /// the cloud.  False for a cloud-only model.
     #[serde(default)]
     pub local: bool,
+    /// A local model that can also run in the cloud, but whose cloud copy
+    /// the account may not use yet (signed out, or a plan without it): a
+    /// client shows it locked, as it does other cloud models, rather than
+    /// as absent.  Never set together with `cloud`.
+    #[serde(default)]
+    pub cloud_locked: bool,
 }
 
 /// An attention type this build doesn't know reads as undeclared rather
@@ -651,9 +657,9 @@ pub fn list_models_with(
                 continue;
             }
             // Offered only when the account may use it: cloud models are paid.
-            entry.cloud = MODEL_SPECS
-                .get(&entry.name)
-                .is_some_and(|spec| spec.cloud.as_ref().is_some_and(|cloud| cloud.accessible));
+            let cloud = MODEL_SPECS.get(&entry.name).and_then(|spec| spec.cloud.as_ref().map(|cloud| cloud.accessible));
+            entry.cloud = cloud == Some(true);
+            entry.cloud_locked = cloud == Some(false);
         }
         entry.local = local_names.contains(&entry.name);
         if entry.name == bootstrap_model {

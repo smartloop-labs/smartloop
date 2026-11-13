@@ -376,4 +376,32 @@ mod test_list_models {
         assert_eq!(resp.status_code, 502);
         assert_eq!(resp.json()["detail"], "Platform API unavailable");
     }
+
+    /// A model served both ways is offered in the cloud when the account may
+    /// use that copy, and shown locked when it may not (signed out, or a plan
+    /// without it) -- never as if it had no cloud copy at all.
+    #[tokio::test]
+    #[serial]
+    async fn test_a_cloud_copy_the_account_may_not_use_is_locked() {
+        let client = TestClient::new();
+        let catalog = |accessible: bool| {
+            json!([
+                {"name": "dual-a", "type": "local", "model_id": "Org/dual-a", "is_accessible": true},
+                {"name": "dual-a", "type": "remote", "model_id": null, "is_accessible": accessible},
+                {"name": "solo-b", "type": "local", "model_id": "Org/solo-b", "is_accessible": true},
+            ])
+        };
+        for (accessible, cloud, locked) in [(true, true, false), (false, false, true)] {
+            let rows = catalog(accessible);
+            let objects: Vec<_> = rows.as_array().unwrap().iter().map(|r| r.as_object().unwrap().clone()).collect();
+            smartloop::model::spec::MODEL_SPECS.hydrate(&objects);
+            client.platform().set_list_models(rows);
+            let body = client.get("/v1/models").await.json();
+            let row = |name: &str| body.as_array().unwrap().iter().find(|m| m["name"] == name).unwrap().clone();
+            assert_eq!(row("dual-a")["cloud"], cloud, "accessible={accessible}");
+            assert_eq!(row("dual-a")["cloud_locked"], locked, "accessible={accessible}");
+            assert_eq!(row("solo-b")["cloud"], false);
+            assert_eq!(row("solo-b")["cloud_locked"], false, "no cloud copy, nothing to lock");
+        }
+    }
 }
