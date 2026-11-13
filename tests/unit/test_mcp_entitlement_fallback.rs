@@ -167,6 +167,7 @@ fn tool(name: &str, description: &str) -> MCPToolDefinition {
         name: name.to_string(),
         description: Some(description.to_string()),
         input_schema: Some(Map::new()),
+        ..Default::default()
     }
 }
 

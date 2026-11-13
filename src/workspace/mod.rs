@@ -12,5 +12,5 @@ pub use context::{
 pub use types::{Document, DocumentInfo, DocumentStatus, Skill};
 pub use workspace::{
     MCPAuthType, MCPOAuthCredentials, MCPServer, MCPServerConfig, MCPServerStatus, MCPServerType,
-    MCPToolDefinition, Project, RemoteMCPServerConfig, Workspace, WorkspaceModel,
+    MCPToolAnnotations, MCPToolDefinition, Project, RemoteMCPServerConfig, Workspace, WorkspaceModel,
 };

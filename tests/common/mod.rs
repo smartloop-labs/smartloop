@@ -756,6 +756,7 @@ pub mod mcp {
             name: name.to_string(),
             description: Some(String::new()),
             input_schema: schema.and_then(|s| s.as_object().cloned()),
+            ..Default::default()
         }
     }
 

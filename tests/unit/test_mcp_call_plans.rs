@@ -30,6 +30,7 @@ fn search_tool() -> MCPToolDefinition {
         name: "notion-search".into(),
         description: None,
         input_schema: Some(obj(json!({"type": "object", "properties": {"query": {"type": "string"}}}))),
+        ..Default::default()
     }
 }
 
@@ -45,6 +46,7 @@ fn fetch_tool() -> MCPToolDefinition {
             },
             "required": ["id"],
         }))),
+        ..Default::default()
     }
 }
 
@@ -156,6 +158,7 @@ fn test_a_fixed_argument_the_tool_rejects_is_dropped() {
             "properties": {"id": {"type": "string"}},
             "required": ["id"],
         }))),
+        ..Default::default()
     };
     let calls = follow_up_calls(&server_with("Notion", Some("notion"), vec![search_tool(), plain]), "notion-search", HITS);
     assert_eq!(calls[0], call("notion-fetch", json!({"id": "abc-123"})));

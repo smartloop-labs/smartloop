@@ -2192,6 +2192,7 @@ impl ModelService {
                 name: name.to_string(),
                 description: t.get("description").and_then(Value::as_str).map(str::to_string),
                 input_schema: t.get("input_schema").and_then(Value::as_object).cloned(),
+                ..Default::default()
             });
         }
 

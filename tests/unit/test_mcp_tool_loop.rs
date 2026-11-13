@@ -24,6 +24,7 @@ fn tool(name: &str, properties: Value, required: &[&str]) -> MCPToolDefinition {
         name: name.into(),
         description: Some(format!("{name} in Linear")),
         input_schema: Some(obj(json!({"type": "object", "properties": properties, "required": required}))),
+        ..Default::default()
     }
 }
 

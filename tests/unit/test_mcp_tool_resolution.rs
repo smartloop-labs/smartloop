@@ -85,6 +85,7 @@ fn tool_named(name: &str, description: &str, required: &[&str]) -> MCPToolDefini
             },
             "required": required,
         }))),
+        ..Default::default()
     }
 }
 

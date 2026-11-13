@@ -236,6 +236,7 @@ pub fn tool(name: &str, description: &str, properties: Value, required: &[&str])
             "properties": properties,
             "required": required,
         }))),
+        ..Default::default()
     }
 }
 

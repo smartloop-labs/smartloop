@@ -71,6 +71,7 @@ fn time_tools() -> Vec<MCPToolDefinition> {
             name: name.to_string(),
             description: Some("time".to_string()),
             input_schema: json!({"type": "object"}).as_object().cloned(),
+            ..Default::default()
         })
         .collect()
 }

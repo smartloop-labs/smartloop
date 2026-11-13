@@ -39,6 +39,7 @@ fn tools() -> Vec<MCPToolDefinition> {
         name: "search".to_string(),
         description: Some("d".to_string()),
         input_schema: json!({"type": "object"}).as_object().cloned(),
+        ..Default::default()
     }]
 }
 

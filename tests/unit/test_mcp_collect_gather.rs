@@ -22,7 +22,7 @@ use smartloop::agents::mcp::explorer::{
 use smartloop::agents::mcp::mcp_agent::{clear_resolution_cache, ResolvedCall};
 use smartloop::mcp::client::MCPToolCallResult;
 use smartloop::parsers::DocumentChunk;
-use smartloop::workspace::MCPServer;
+use smartloop::workspace::{MCPServer, MCPToolAnnotations};
 
 use crate::shared::mcp::{explorer, stub_transport, tool, tool_caller, FakeResolver, SeenCall};
 
@@ -226,6 +226,53 @@ fn test_a_read_tool_is_reported_as_consulted() {
     // the request was about.
     assert_eq!(picks.consulted.len(), 1);
     assert_eq!(picks.consulted[0].tool_name, "list_issues");
+}
+
+/// `server(name, tool_name)` with the server's own read-only hint on the tool.
+fn annotated_server(name: &str, tool_name: &str, read_only: bool) -> MCPServer {
+    let mut s = server(name, tool_name);
+    s.tools[0].annotations = Some(MCPToolAnnotations { read_only_hint: Some(read_only), ..Default::default() });
+    s
+}
+
+/// Clera's `whoami` names no verb, so the name alone would leave it to a
+/// planned step; the server says it reads, so collect runs it.
+#[test]
+#[serial(mcp_global)]
+fn test_a_tool_the_server_marks_read_only_is_called() {
+    let servers = [annotated_server("Clera", "whoami", true)];
+    let fx = explorer_with(
+        vec![(("Clera", "whoami"), "Chris Coveney, admin")],
+        |s| first_tool(s, json!({})),
+        follow_ups(vec![]),
+        None,
+    );
+
+    let (text, picks) = fx.ex.run_mcp_with_deferred("who am I on Clera", Some(&servers), None, None, None);
+
+    assert!(text.contains("Chris Coveney"));
+    assert!(picks.deferred.is_empty());
+    assert_eq!(picks.consulted[0].tool_name, "whoami");
+}
+
+/// Clera's `getMoreTools` records feedback; its name reads like a lookup,
+/// but the server says it is not read-only, so collect does not run it.
+#[test]
+#[serial(mcp_global)]
+fn test_a_tool_the_server_marks_not_read_only_is_left_to_a_step() {
+    let servers = [annotated_server("Clera", "getMoreTools", false)];
+    let fx = explorer_with(
+        vec![(("Clera", "getMoreTools"), "We have noted your feedback")],
+        |s| first_tool(s, json!({})),
+        follow_ups(vec![]),
+        None,
+    );
+
+    let (text, picks) = fx.ex.run_mcp_with_deferred("who am I on Clera", Some(&servers), None, None, None);
+
+    assert_eq!(text, "");
+    assert!(fx.calls.lock().is_empty(), "a tool the server marks as a write was called during collect");
+    assert_eq!(picks.deferred[0].tool_name, "getMoreTools");
 }
 
 #[test]

@@ -60,6 +60,7 @@ fn server_with(refresh_token: Option<&str>, token: Option<&str>, token_endpoint:
             name: "get_board".into(),
             description: Some(String::new()),
             input_schema: Some(serde_json::Map::new()),
+            ..Default::default()
         }],
         ..Default::default()
     }

@@ -34,6 +34,7 @@ fn tools() -> Vec<MCPToolDefinition> {
         name: "get_weather".to_string(),
         description: Some("d".to_string()),
         input_schema: Some(schema),
+        ..Default::default()
     }]
 }
 

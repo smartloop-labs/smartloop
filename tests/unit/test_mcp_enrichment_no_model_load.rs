@@ -28,6 +28,7 @@ fn tools() -> Vec<MCPToolDefinition> {
         name: "get_weather".into(),
         description: Some("d".into()),
         input_schema: json!({"type": "object"}).as_object().cloned(),
+        ..Default::default()
     }]
 }
 
