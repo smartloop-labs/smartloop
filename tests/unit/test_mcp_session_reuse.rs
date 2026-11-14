@@ -4,6 +4,7 @@
 //! `Mcp-Session-Id` were re-initialized before every request.  These drive
 //! `MCPToolCaller::call_tool` against a scripted server and count handshakes.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -246,4 +247,116 @@ fn test_concurrent_calls_handshake_once() {
     assert_eq!(count(&fake, "initialize"), 1);
     assert_eq!(count(&fake, "tools/call"), 4);
     reset_mcp_sessions();
+}
+
+// ------------------------------------------------------- a session the server lost
+
+/// A server that numbers its sessions and answers the next `refusals`
+/// `tools/call` requests with `refusal`.
+struct ExpiringServer {
+    fake: Arc<FakeHttp>,
+    refusals: Arc<AtomicUsize>,
+}
+
+impl ExpiringServer {
+    fn install(refusal: HttpResponse) -> (Self, HttpTransportOverride) {
+        let sessions = Arc::new(AtomicUsize::new(0));
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let (n, left) = (sessions.clone(), refusals.clone());
+        let fake = FakeHttp::new(move |_, _, body| {
+            Ok(match rpc_method(body).as_str() {
+                "initialize" => {
+                    let id = n.fetch_add(1, Ordering::SeqCst) + 1;
+                    HttpResponse::json(200, &json!({"jsonrpc": "2.0", "id": "1", "result": {
+                        "protocolVersion": "2024-11-05",
+                        "serverInfo": {"name": "example", "version": "1"},
+                    }}))
+                    .with_header("mcp-session-id", format!("sess-{id}"))
+                }
+                "tools/call" if left.load(Ordering::SeqCst) > 0 => {
+                    left.fetch_sub(1, Ordering::SeqCst);
+                    refusal.clone()
+                }
+                "tools/call" => HttpResponse::json(
+                    200,
+                    &json!({"jsonrpc": "2.0", "id": "2", "result": {"content": [{"type": "text", "text": "ok"}]}}),
+                ),
+                _ => HttpResponse::new(202, ""),
+            })
+        });
+        let guard = HttpTransportOverride::install(fake.clone());
+        (Self { fake, refusals }, guard)
+    }
+
+    fn refuse_next(&self, times: usize) {
+        self.refusals.store(times, Ordering::SeqCst);
+    }
+}
+
+#[test]
+#[serial(mcp_global)]
+fn test_an_expired_session_is_replaced_and_the_call_retried() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let (srv, _guard) = ExpiringServer::install(HttpResponse::new(404, ""));
+    let s1 = server("s1");
+
+    call(&s1, Some("tok"));
+    srv.refuse_next(1);
+    call(&s1, Some("tok"));
+    call(&s1, Some("tok"));
+
+    assert_eq!(count(&srv.fake, "initialize"), 2);
+    assert_eq!(
+        call_session_ids(&srv.fake),
+        vec![Some("sess-1".into()), Some("sess-1".into()), Some("sess-2".into()), Some("sess-2".into())],
+        "the refused call is retried on the new session, and later calls keep it"
+    );
+}
+
+#[test]
+#[serial(mcp_global)]
+fn test_a_400_naming_the_session_is_a_lost_session_too() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let (srv, _guard) = ExpiringServer::install(HttpResponse::new(400, "Bad Request: Session not found"));
+    let s1 = server("s1");
+
+    call(&s1, Some("tok"));
+    srv.refuse_next(1);
+    call(&s1, Some("tok"));
+
+    assert_eq!(count(&srv.fake, "initialize"), 2);
+}
+
+#[test]
+#[serial(mcp_global)]
+fn test_a_second_refusal_fails_without_looping() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let (srv, _guard) = ExpiringServer::install(HttpResponse::new(404, ""));
+    let s1 = server("s1");
+
+    call(&s1, Some("tok"));
+    srv.refuse_next(usize::MAX);
+    let result = tool_caller().call_tool(&s1, "search", None, Some("tok"), None);
+
+    assert!(!result.success);
+    assert_eq!(count(&srv.fake, "tools/call"), 3, "one call, then exactly one retry");
+}
+
+#[test]
+#[serial(mcp_global)]
+fn test_a_404_without_a_session_is_not_retried() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let fake = FakeHttp::new(|_, _, body| {
+        Ok(match rpc_method(body).as_str() {
+            "initialize" => HttpResponse::json(200, &json!({"jsonrpc": "2.0", "id": "1", "result": {}})),
+            "tools/call" => HttpResponse::new(404, ""),
+            _ => HttpResponse::new(202, ""),
+        })
+    });
+    let _guard = HttpTransportOverride::install(fake.clone());
+
+    let result = tool_caller().call_tool(&server("s1"), "search", None, Some("tok"), None);
+
+    assert!(!result.success);
+    assert_eq!(count(&fake, "tools/call"), 1);
 }

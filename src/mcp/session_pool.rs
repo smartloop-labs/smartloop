@@ -66,6 +66,15 @@ impl PooledSession {
         self.request_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Forget the handshake if `session_id` is still the session held, so the
+    /// next caller initializes again; a caller that already replaced it wins.
+    pub(crate) fn forget(&self, session_id: Option<&str>) {
+        let mut state = self.state.lock();
+        if state.session_id.as_deref() == session_id {
+            *state = SessionState::default();
+        }
+    }
+
     /// Mark the session as used now.
     pub(crate) fn touch(&self) {
         *self.last_used.lock() = Instant::now();

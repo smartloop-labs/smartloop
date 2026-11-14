@@ -940,18 +940,29 @@ impl MCPClient {
         access_token: Option<&str>,
         token_type: &str,
     ) -> MCPToolCallResult {
-        let outcome = self.ensure_session(server_url, access_token, token_type).and_then(|_| {
-            self.send_request(
-                server_url,
-                "tools/call",
-                Some(serde_json::json!({
-                    "name": tool_name,
-                    "arguments": Value::Object(arguments.cloned().unwrap_or_default()),
-                })),
-                access_token,
-                token_type,
-            )
+        let params = serde_json::json!({
+            "name": tool_name,
+            "arguments": Value::Object(arguments.cloned().unwrap_or_default()),
         });
+        let mut outcome = self.ensure_session(server_url, access_token, token_type).and_then(|_| {
+            self.send_request(server_url, "tools/call", Some(params.clone()), access_token, token_type)
+        });
+        // The server never ran the call under a session it no longer knows, so
+        // one retry on a fresh session is safe.
+        if matches!(&outcome, Err(e) if e.is_session_lost()) {
+            tracing::info!(
+                target: LOGGER,
+                "[mcp-remote] Session on {} expired; initializing a new one",
+                server_url
+            );
+            if let Some(pooled) = &self.pooled {
+                pooled.forget(self.session_id.as_deref());
+            }
+            self.session_id = None;
+            outcome = self.ensure_session(server_url, access_token, token_type).and_then(|_| {
+                self.send_request(server_url, "tools/call", Some(params), access_token, token_type)
+            });
+        }
         match outcome {
             Ok(result) => {
                 let (content, is_error) = call_result_parts(&result);
