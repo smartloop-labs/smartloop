@@ -468,3 +468,16 @@ mod test_workspace_persistence {
         assert!(second["updated_at"].as_f64().unwrap() > first["updated_at"].as_f64().unwrap());
     }
 }
+
+mod test_connection_settings {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_the_file_is_in_wal_mode() {
+        let (tmp, _db) = db();
+        let conn = rusqlite::Connection::open(tmp.path().join("workspace.db")).unwrap();
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+    }
+}

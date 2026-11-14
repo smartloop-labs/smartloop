@@ -7,6 +7,7 @@
 //! platform is unreachable.  Lives at `<home_dir>/<workspace_id>/workspace.db`.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rusqlite::types::Value as SqlValue;
@@ -253,6 +254,29 @@ pub fn python_json_dumps(value: &Value) -> String {
 /// to them.
 const CATALOG_TABLE: &str = "model_catalog_v2";
 
+/// How long a connection waits on another process's lock before giving up
+/// with `SQLITE_BUSY`.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Settings every connection needs; SQLite keeps these per connection.
+fn configure(conn: &Connection) -> anyhow::Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    Ok(())
+}
+
+/// Put the file in WAL mode, so readers in any process run alongside one
+/// writer.  The mode is stored in the file; a filesystem that can't do WAL
+/// keeps its rollback journal, which is slower but still correct.
+fn enable_wal(conn: &Connection) -> anyhow::Result<()> {
+    let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        tracing::warn!(target: "smartloop.platform", "workspace DB stays in {mode} journal mode");
+    }
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(())
+}
+
 /// Drop a catalog table from before its `(name, type)` key.  It only caches
 /// the cloud catalog, so the next fetch refills it.
 fn drop_outdated_model_catalog(conn: &Connection) -> anyhow::Result<()> {
@@ -277,6 +301,8 @@ impl WorkspaceDB {
             }
         }
         let conn = Connection::open(&db_path)?;
+        configure(&conn)?;
+        enable_wal(&conn)?;
         drop_outdated_model_catalog(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { db_path, conn: Mutex::new(conn) })
