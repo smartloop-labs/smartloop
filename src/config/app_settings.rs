@@ -97,6 +97,11 @@ pub struct AppSettings {
     /// too).  `0` unloads them as soon as a response completes; a negative
     /// value keeps them loaded until they are deselected or evicted for room.
     pub model_keep_alive: i64,
+    /// `SLP_MCP_KEEP_ALIVE` — how long an idle MCP HTTP session is reused
+    /// before the next call starts a fresh one, in seconds (`"30s"`, `"5m"`
+    /// and `"1h"` are accepted too).  `0` initializes every call; a negative
+    /// value never expires a session.
+    pub mcp_keep_alive: i64,
     /// `SLP_DOC_EXTRACT_MAX_CHARS` — hard cap on fan-out extraction chars; 0 = derive.
     pub doc_extract_max_chars: i64,
     /// `SLP_EMBEDDING_DEVICE` — `"auto"` (GPU offload) or `"cpu"`.
@@ -183,6 +188,7 @@ impl AppSettings {
             llm_batch_slots: 0,
             llm_batch_reserve_gb: 3.0,
             model_keep_alive: 300,
+            mcp_keep_alive: 300,
             doc_extract_max_chars: 0,
             embedding_device: "auto".to_string(),
             embedding_gguf_repo: "gpustack/bge-m3-GGUF".to_string(),
@@ -255,6 +261,7 @@ impl AppSettings {
             llm_batch_slots: r.int("slp_llm_batch_slots", d.llm_batch_slots)?,
             llm_batch_reserve_gb: r.float("slp_llm_batch_reserve_gb", d.llm_batch_reserve_gb)?,
             model_keep_alive: r.duration_secs("slp_model_keep_alive", d.model_keep_alive)?,
+            mcp_keep_alive: r.duration_secs("slp_mcp_keep_alive", d.mcp_keep_alive)?,
             doc_extract_max_chars: r.int("slp_doc_extract_max_chars", d.doc_extract_max_chars)?,
             embedding_device: r.string("slp_embedding_device", d.embedding_device)?,
             embedding_gguf_repo: r.string("slp_embedding_gguf_repo", d.embedding_gguf_repo)?,

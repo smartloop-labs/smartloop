@@ -20,6 +20,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::mcp::session_pool::PooledSession;
 use crate::workspace::{MCPToolAnnotations, MCPToolDefinition};
 
 /// Python logger name of this module.
@@ -273,8 +274,10 @@ static TRANSPORT_OVERRIDE: Lazy<RwLock<Option<Arc<dyn HttpTransport>>>> = Lazy::
 /// Returns the previous override.
 ///
 /// The analogue of `patch("httpx.Client", return_value=fake)`: process-wide,
-/// so tests that use it must be serialized.
+/// so tests that use it must be serialized.  Pooled sessions are dropped, since
+/// they were opened over the transport being replaced.
 pub fn set_http_transport_override(transport: Option<Arc<dyn HttpTransport>>) -> Option<Arc<dyn HttpTransport>> {
+    crate::mcp::session_pool::reset_mcp_sessions();
     std::mem::replace(&mut *TRANSPORT_OVERRIDE.write(), transport)
 }
 
@@ -513,6 +516,8 @@ pub struct MCPClient {
     client: Option<Arc<dyn HttpTransport>>,
     request_id: u64,
     session_id: Option<String>,
+    /// The shared session [`Self::enter_pooled`] attached, if any.
+    pooled: Option<Arc<PooledSession>>,
 }
 
 impl fmt::Debug for MCPClient {
@@ -521,6 +526,7 @@ impl fmt::Debug for MCPClient {
             .field("open", &self.client.is_some())
             .field("request_id", &self.request_id)
             .field("session_id", &self.session_id)
+            .field("pooled", &self.pooled.is_some())
             .finish()
     }
 }
@@ -536,7 +542,7 @@ impl MCPClient {
 
     /// A client already holding `transport` (the tests' `client._client = fake`).
     pub fn with_transport(transport: Arc<dyn HttpTransport>) -> Self {
-        Self { client: Some(transport), request_id: 0, session_id: None }
+        Self { client: Some(transport), request_id: 0, session_id: None, pooled: None }
     }
 
     /// Replace the HTTP transport in place.
@@ -558,10 +564,22 @@ impl MCPClient {
         self
     }
 
-    /// Close the HTTP client and forget the session (`__exit__`).
+    /// Open the HTTP client on a session shared with other calls, so the
+    /// handshake runs only when the session has not been initialized yet.
+    pub fn enter_pooled(&mut self, session: Arc<PooledSession>) -> &mut Self {
+        self.client = Some(shared_http_transport());
+        self.pooled = Some(session);
+        self
+    }
+
+    /// Close the HTTP client and forget the session (`__exit__`).  A pooled
+    /// session stays in the pool for the next call.
     pub fn exit(&mut self) {
         self.client = None;
         self.session_id = None;
+        if let Some(pooled) = self.pooled.take() {
+            pooled.touch();
+        }
     }
 
     /// The current `Mcp-Session-Id`, if the server issued one.
@@ -570,6 +588,9 @@ impl MCPClient {
     }
 
     fn next_request_id(&mut self) -> String {
+        if let Some(pooled) = &self.pooled {
+            return pooled.next_request_id().to_string();
+        }
         self.request_id += 1;
         self.request_id.to_string()
     }
@@ -864,16 +885,13 @@ impl MCPClient {
         }
     }
 
-    /// Perform the MCP initialize handshake if no session exists yet.
-    fn ensure_session(
+    /// Send `initialize` then `notifications/initialized`.
+    fn initialize(
         &mut self,
         server_url: &str,
         access_token: Option<&str>,
         token_type: &str,
     ) -> Result<(), MCPClientError> {
-        if self.session_id.is_some() {
-            return Ok(());
-        }
         self.send_request(server_url, "initialize", Some(Self::initialize_params()), access_token, token_type)?;
         self.send_notification(
             server_url,
@@ -883,6 +901,34 @@ impl MCPClient {
             token_type,
         );
         Ok(())
+    }
+
+    /// Perform the MCP initialize handshake if no session exists yet.
+    ///
+    /// A pooled session is initialized once and then reused, whether or not
+    /// the server issues a session id.
+    fn ensure_session(
+        &mut self,
+        server_url: &str,
+        access_token: Option<&str>,
+        token_type: &str,
+    ) -> Result<(), MCPClientError> {
+        if let Some(pooled) = self.pooled.clone() {
+            let mut state = pooled.state();
+            if !state.initialized {
+                self.session_id = None;
+                self.initialize(server_url, access_token, token_type)?;
+                state.session_id = self.session_id.clone();
+                state.initialized = true;
+            } else {
+                self.session_id = state.session_id.clone();
+            }
+            return Ok(());
+        }
+        if self.session_id.is_some() {
+            return Ok(());
+        }
+        self.initialize(server_url, access_token, token_type)
     }
 
     /// Call one tool (`tools/call`).
@@ -971,5 +1017,6 @@ impl Drop for MCPClient {
     fn drop(&mut self) {
         self.client = None;
         self.session_id = None;
+        self.pooled = None;
     }
 }
