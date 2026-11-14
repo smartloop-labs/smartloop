@@ -480,4 +480,64 @@ mod test_connection_settings {
         let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
         assert_eq!(mode, "wal");
     }
+
+    #[test]
+    #[serial]
+    fn test_foreign_keys_are_enforced() {
+        let (_tmp, db) = db();
+        let err = db
+            .write(|tx| {
+                tx.execute_batch(
+                    "CREATE TABLE parent (id TEXT PRIMARY KEY);
+                     CREATE TABLE child (parent_id TEXT REFERENCES parent(id));
+                     INSERT INTO child VALUES ('missing');",
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
+    }
+}
+
+mod test_writes {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_a_failed_write_leaves_nothing_behind() {
+        let (_tmp, db) = db();
+        let result: anyhow::Result<()> = db.write(|tx| {
+            tx.execute("INSERT INTO workspace (id, created_at, updated_at) VALUES ('ws', 1, 1)", [])?;
+            anyhow::bail!("stop")
+        });
+        assert!(result.is_err());
+        assert!(db.get_workspace().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_two_processes_write_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.db");
+        // Two handles on one file stand in for the supervisor and a child.
+        let handles: Vec<_> = (0..2).map(|_| std::sync::Arc::new(WorkspaceDB::new(&path).unwrap())).collect();
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let db = handles[i % 2].clone();
+                std::thread::spawn(move || {
+                    for n in 0..25 {
+                        let release = obj(json!({"version": format!("{i}.{n}")}));
+                        db.save_release(&format!("channel-{i}"), Some(&release)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        for i in 0..8 {
+            let release = handles[0].get_release(&format!("channel-{i}")).unwrap().unwrap();
+            assert_eq!(release["version"], json!(format!("{i}.24")));
+        }
+    }
 }

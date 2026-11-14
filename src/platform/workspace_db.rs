@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -78,8 +78,8 @@ CREATE TABLE IF NOT EXISTS release_cache (
 );
 ";
 
-/// Simple SQLite store for workspace-level cached data.  Thread-safe: the
-/// connection is guarded by a mutex (Python `check_same_thread=False` + lock).
+/// SQLite store for workspace-level data.  Thread-safe: the connection is
+/// guarded by a mutex, and every write goes through [`WorkspaceDB::write`].
 pub struct WorkspaceDB {
     db_path: PathBuf,
     conn: Mutex<Connection>,
@@ -313,6 +313,20 @@ impl WorkspaceDB {
         &self.db_path
     }
 
+    /// Run *f* in a transaction and commit it.
+    ///
+    /// The transaction opens with `BEGIN IMMEDIATE`, taking the write lock up
+    /// front where the busy wait covers it; a deferred transaction that later
+    /// needs to write fails at once if another process holds the lock.  An
+    /// error from *f* rolls the transaction back.
+    pub fn write<T>(&self, f: impl FnOnce(&Transaction) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     // -- Users -----------------------------------------------------------
 
     /// Return the cached user profile (`email, name, is_premium, is_paid,
@@ -363,25 +377,26 @@ impl WorkspaceDB {
         let memory = int_flag(data, "default_memory", true)?;
         let fetched_at = now();
 
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO users
-                   (id, email, name, is_premium, is_paid, tokens_processed,
-                    default_temperature, default_memory, fetched_at)
-               VALUES ('me', ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET
-                   email = excluded.email,
-                   name = excluded.name,
-                   is_premium = excluded.is_premium,
-                   is_paid = excluded.is_paid,
-                   tokens_processed = excluded.tokens_processed,
-                   default_temperature = excluded.default_temperature,
-                   default_memory = excluded.default_memory,
-                   fetched_at = excluded.fetched_at
-            ",
-            params![email, name, is_premium, is_paid, tokens, temperature, memory, fetched_at],
-        )?;
-        Ok(())
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO users
+                       (id, email, name, is_premium, is_paid, tokens_processed,
+                        default_temperature, default_memory, fetched_at)
+                   VALUES ('me', ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       email = excluded.email,
+                       name = excluded.name,
+                       is_premium = excluded.is_premium,
+                       is_paid = excluded.is_paid,
+                       tokens_processed = excluded.tokens_processed,
+                       default_temperature = excluded.default_temperature,
+                       default_memory = excluded.default_memory,
+                       fetched_at = excluded.fetched_at
+                ",
+                params![email, name, is_premium, is_paid, tokens, temperature, memory, fetched_at],
+            )?;
+            Ok(())
+        })
     }
 
     /// Timestamp of the last successful cloud fetch, or `None`.
@@ -491,61 +506,60 @@ impl WorkspaceDB {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM model_catalog_v2", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO model_catalog_v2
-                       (model_id, name, size, description, access_level, is_accessible, sha256,
-                        type, url, capabilities, context_length,
-                        param_size_b, model_version, thinking_default, vision_chat_handler,
-                        param_size_estimated, active_param_size_b, attention,
-                        reasoning_budget_tokens, fetched_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ",
-            )?;
-            for (
-                (model_id, name, size, description, access_level, is_accessible, sha256),
-                (kind, url, capabilities, context_length),
-                (
-                    param_size_b,
-                    model_version,
-                    thinking_default,
-                    vision_chat_handler,
-                    param_size_estimated,
-                    active_param_size_b,
-                    attention,
-                    reasoning_budget_tokens,
-                ),
-            ) in rows
+        self.write(|tx| {
+            tx.execute("DELETE FROM model_catalog_v2", [])?;
             {
-                stmt.execute(params![
-                    model_id,
-                    name,
-                    size,
-                    description,
-                    access_level,
-                    is_accessible,
-                    sha256,
-                    kind,
-                    url,
-                    capabilities,
-                    context_length,
-                    param_size_b,
-                    model_version,
-                    thinking_default,
-                    vision_chat_handler,
-                    param_size_estimated,
-                    active_param_size_b,
-                    attention,
-                    reasoning_budget_tokens,
-                    fetched_at
-                ])?;
+                let mut stmt = tx.prepare(
+                    "INSERT INTO model_catalog_v2
+                           (model_id, name, size, description, access_level, is_accessible, sha256,
+                            type, url, capabilities, context_length,
+                            param_size_b, model_version, thinking_default, vision_chat_handler,
+                            param_size_estimated, active_param_size_b, attention,
+                            reasoning_budget_tokens, fetched_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ",
+                )?;
+                for (
+                    (model_id, name, size, description, access_level, is_accessible, sha256),
+                    (kind, url, capabilities, context_length),
+                    (
+                        param_size_b,
+                        model_version,
+                        thinking_default,
+                        vision_chat_handler,
+                        param_size_estimated,
+                        active_param_size_b,
+                        attention,
+                        reasoning_budget_tokens,
+                    ),
+                ) in &rows
+                {
+                    stmt.execute(params![
+                        model_id,
+                        name,
+                        size,
+                        description,
+                        access_level,
+                        is_accessible,
+                        sha256,
+                        kind,
+                        url,
+                        capabilities,
+                        context_length,
+                        param_size_b,
+                        model_version,
+                        thinking_default,
+                        vision_chat_handler,
+                        param_size_estimated,
+                        active_param_size_b,
+                        attention,
+                        reasoning_budget_tokens,
+                        fetched_at
+                    ])?;
+                }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Timestamp of the last model catalog fetch (`MIN(fetched_at)`), or `None`.
@@ -587,21 +601,20 @@ impl WorkspaceDB {
             .map(|e| Ok((required(e, "slug")?, python_json_dumps(&Value::Object(e.clone())))))
             .collect::<anyhow::Result<Vec<(SqlValue, String)>>>()?;
 
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM mcp_catalog", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO mcp_catalog (slug, entry, fetched_at)
-                   VALUES (?, ?, ?)
-                ",
-            )?;
-            for (slug, entry) in rows {
-                stmt.execute(params![slug, entry, fetched_at])?;
+        self.write(|tx| {
+            tx.execute("DELETE FROM mcp_catalog", [])?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO mcp_catalog (slug, entry, fetched_at)
+                       VALUES (?, ?, ?)
+                    ",
+                )?;
+                for (slug, entry) in &rows {
+                    stmt.execute(params![slug, entry, fetched_at])?;
+                }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Timestamp of the last catalog fetch, or `None`.
@@ -642,17 +655,18 @@ impl WorkspaceDB {
     pub fn save_release(&self, channel: &str, release: Option<&JsonObject>) -> anyhow::Result<()> {
         let blob = release.map(|r| python_json_dumps(&Value::Object(r.clone())));
         let fetched_at = now();
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO release_cache (channel, release, fetched_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(channel) DO UPDATE SET
-                   release = excluded.release,
-                   fetched_at = excluded.fetched_at
-            ",
-            params![channel, blob, fetched_at],
-        )?;
-        Ok(())
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO release_cache (channel, release, fetched_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(channel) DO UPDATE SET
+                       release = excluded.release,
+                       fetched_at = excluded.fetched_at
+                ",
+                params![channel, blob, fetched_at],
+            )?;
+            Ok(())
+        })
     }
 
     /// Timestamp of the last release fetch for *channel*, or `None`.
@@ -674,16 +688,17 @@ impl WorkspaceDB {
     /// on subsequent calls.
     pub fn save_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
         let ts = now();
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO workspace (id, created_at, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET
-                   updated_at = excluded.updated_at
-            ",
-            params![workspace_id, ts, ts],
-        )?;
-        Ok(())
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO workspace (id, created_at, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       updated_at = excluded.updated_at
+                ",
+                params![workspace_id, ts, ts],
+            )?;
+            Ok(())
+        })
     }
 
     /// The workspace row `{id, created_at, updated_at}`, or `None` if no
