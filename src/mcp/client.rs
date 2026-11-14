@@ -201,6 +201,18 @@ impl ReqwestTransport {
         Self { client }
     }
 
+    /// A client whose idle connections stay open for `idle_secs`, for reuse
+    /// across calls.
+    pub fn pooled(timeout_secs: f64, idle_secs: u64) -> Self {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs_f64(timeout_secs))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_idle_timeout(Duration::from_secs(idle_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        Self { client }
+    }
+
     /// Wrap an existing client as-is.
     pub fn from_client(client: reqwest::blocking::Client) -> Self {
         Self { client }
@@ -265,6 +277,19 @@ pub fn default_http_transport(timeout_secs: f64) -> Arc<dyn HttpTransport> {
         return t;
     }
     Arc::new(ReqwestTransport::new(timeout_secs))
+}
+
+/// The process-wide MCP client, so tool calls reuse TCP/TLS connections.
+/// Auth travels per request, so one client serves every server.
+static SHARED_TRANSPORT: Lazy<Arc<dyn HttpTransport>> = Lazy::new(|| Arc::new(ReqwestTransport::pooled(60.0, 300)));
+
+/// The transport [`MCPClient::enter`] uses: the override when one is set,
+/// else the shared pooled client.
+pub fn shared_http_transport() -> Arc<dyn HttpTransport> {
+    if let Some(t) = TRANSPORT_OVERRIDE.read().clone() {
+        return t;
+    }
+    SHARED_TRANSPORT.clone()
 }
 
 /// RAII guard installing a transport override for its lifetime.
@@ -521,7 +546,7 @@ impl MCPClient {
 
     /// Open the HTTP client (`__enter__`).
     pub fn enter(&mut self) -> &mut Self {
-        self.client = Some(default_http_transport(60.0));
+        self.client = Some(shared_http_transport());
         self
     }
 
