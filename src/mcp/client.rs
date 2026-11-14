@@ -27,19 +27,21 @@ const LOGGER: &str = "smartloop.mcp.client";
 
 // ------------------------------------------------------------------ errors
 
-/// Connection-level failure (HTTP status, transport).  Carries the
-/// `WWW-Authenticate` header and status on a 401/403.
+/// Connection-level failure (HTTP status, transport).  Carries the HTTP
+/// status, and the `WWW-Authenticate` header on a 401.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("{message}")]
 pub struct MCPConnectionError {
     pub message: String,
     pub www_authenticate: Option<String>,
     pub status_code: Option<u16>,
+    /// The server no longer knows the `Mcp-Session-Id` the request carried.
+    pub session_lost: bool,
 }
 
 impl MCPConnectionError {
     pub fn new(message: impl Into<String>, www_authenticate: Option<String>, status_code: Option<u16>) -> Self {
-        Self { message: message.into(), www_authenticate, status_code }
+        Self { message: message.into(), www_authenticate, status_code, session_lost: false }
     }
 }
 
@@ -101,6 +103,12 @@ impl MCPClientError {
             Self::Connection(e) => e.status_code,
             _ => None,
         }
+    }
+
+    /// True when the server refused the request's session as unknown or
+    /// expired, so a fresh `initialize` can recover it.
+    pub fn is_session_lost(&self) -> bool {
+        matches!(self, Self::Connection(e) if e.session_lost)
     }
 }
 
@@ -721,7 +729,11 @@ impl MCPClient {
             .into());
         }
         if !response.is_success() {
-            return Err(MCPConnectionError::new(format!("HTTP error: {}", response.status), None, None).into());
+            let sent_session = headers.iter().any(|(k, _)| k == "Mcp-Session-Id");
+            let mut error =
+                MCPConnectionError::new(format!("HTTP error: {}", response.status), None, Some(response.status));
+            error.session_lost = sent_session && session_refused(response.status, &response.body);
+            return Err(error.into());
         }
 
         if let Some(session_id) = response.header("mcp-session-id").filter(|s| !s.is_empty()) {
@@ -925,6 +937,20 @@ impl MCPClient {
                 }
             }
         }
+    }
+}
+
+/// A non-2xx answer to a request carrying `Mcp-Session-Id` that means the
+/// session is gone: a 404 (the MCP spec's signal), or a 400 saying so.
+fn session_refused(status: u16, body: &str) -> bool {
+    match status {
+        404 => true,
+        400 => {
+            let body = body.to_ascii_lowercase();
+            body.contains("session")
+                && (body.contains("not found") || body.contains("expired") || body.contains("invalid"))
+        }
+        _ => false,
     }
 }
 
