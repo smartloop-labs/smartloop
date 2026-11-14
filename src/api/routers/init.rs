@@ -532,8 +532,7 @@ pub fn seed_model_catalog() {
             return;
         }
     };
-    let svc = get_platform_service();
-    let future = handle.spawn_blocking(move || svc.list_models(false).map(|_| ()));
+    let future = handle.spawn_blocking(move || get_platform_service().list_models(false).map(|_| ()));
     handle.spawn(async move {
         match future.await {
             Ok(Ok(())) => {}
