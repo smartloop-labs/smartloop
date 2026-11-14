@@ -708,6 +708,18 @@ impl ModelHostService for ModelHostServicer {
             .await?;
         Ok(Response::new(pb::Empty {}))
     }
+
+    async fn unload_model(
+        &self,
+        request: Request<pb::UnloadModelRequest>,
+    ) -> Result<Response<pb::BoolReply>, Status> {
+        let request = request.into_inner();
+        let model_name = request.model_name;
+        let value = self
+            .unary(request.project_id, move |client| client.unload_model_by_name(&model_name))
+            .await?;
+        Ok(Response::new(pb::BoolReply { value }))
+    }
 }
 
 /// Drive one streamed generation into `sender`, on a blocking worker with the

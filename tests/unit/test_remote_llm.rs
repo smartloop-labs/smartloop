@@ -167,12 +167,19 @@ impl ModelClient for FakeClient {
         Ok(Some("sl-mini".into()))
     }
 
-    fn unload_auxiliary_models(&self, _include_embedding: bool) -> anyhow::Result<()> {
-        Ok(())
+    fn unload_auxiliary_models(&self, include_embedding: bool) -> anyhow::Result<()> {
+        self.record("unload_auxiliary_models", &include_embedding.to_string(), None);
+        self.fail()
     }
 
     fn unload_embedding_model(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn unload_model_by_name(&self, model_name: &str) -> anyhow::Result<bool> {
+        self.record("unload_model_by_name", model_name, None);
+        self.fail()?;
+        Ok(true)
     }
 
     fn as_remote(&self) -> Option<&RemoteModelClient> {
@@ -484,6 +491,48 @@ fn test_it_recognises_a_remote_device() {
     let svc = service(&client);
     let device = svc.remote_device().expect("a remote device");
     assert!(device.as_any().is::<FakeClient>());
+}
+
+#[test]
+fn test_unloading_auxiliary_models_releases_them_on_the_host() {
+    let client = client();
+    let svc = service(&client);
+
+    svc.unload_auxiliary_models(false);
+
+    assert!(client.called("unload_auxiliary_models", "false", None));
+}
+
+#[test]
+fn test_a_failed_host_unload_does_not_fail_the_response() {
+    let client = client();
+    let svc = service(&client);
+    *client.fail_with.write() = Some("host gone".into());
+
+    svc.unload_auxiliary_models(true);
+
+    assert!(client.called("unload_auxiliary_models", "true", None));
+}
+
+#[test]
+fn test_deselecting_a_model_releases_it_on_the_host() {
+    let client = client();
+    let svc = service(&client);
+
+    assert!(svc.unload_model_by_name("qwen3.5-2b"));
+
+    assert!(client.called("unload_model_by_name", "qwen3.5-2b", None));
+}
+
+#[test]
+fn test_a_failed_host_deselect_unload_is_not_an_error() {
+    let client = client();
+    let svc = service(&client);
+    *client.fail_with.write() = Some("host gone".into());
+
+    assert!(!svc.unload_model_by_name("qwen3.5-2b"));
+
+    assert!(client.called("unload_model_by_name", "qwen3.5-2b", None));
 }
 
 #[test]

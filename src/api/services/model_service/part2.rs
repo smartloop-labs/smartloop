@@ -2000,6 +2000,14 @@ impl ModelService {
         // two selected models in and out on every step.  A step that needs
         // a model that does not fit still evicts them (see
         // `get_llm_for_capability`), and deselecting a model unloads it.
+        //
+        // In a project agent the weights live in the host, so the host runs
+        // the same release — which is also what arms its idle timer.
+        if let Some(remote) = self.remote_device() {
+            if let Err(e) = remote.unload_auxiliary_models(include_embedding) {
+                tracing::warn!(target: LOG, "[models] host unload failed: {e}");
+            }
+        }
         let mut unloads: Vec<(&str, Box<dyn Fn() + '_>)> = vec![
             ("vision", Box::new(|| self.unload_vision_model())),
             ("large", Box::new(|| self.unload_large_model())),
@@ -2083,8 +2091,17 @@ impl ModelService {
     /// caches and any per-capability cache — then reclaims the GPU.
     /// Idempotent; returns true if anything was unloaded.
     pub fn unload_model_by_name(&self, model_name: &str) -> bool {
+        // In a project agent the weights live in the host, so deselecting
+        // here has to release them there too.
+        let mut unloaded = false;
+        if let Some(remote) = self.remote_device() {
+            match remote.unload_model_by_name(model_name) {
+                Ok(freed) => unloaded = freed,
+                Err(e) => tracing::warn!(target: LOG, "[models] host unload of {model_name} failed: {e}"),
+            }
+        }
         let _slot = self.inference_slot();
-        self.unload_model_by_name_unlocked(model_name)
+        self.unload_model_by_name_unlocked(model_name) || unloaded
     }
 
     /// [`Self::unload_model_by_name`] without taking an inference slot.

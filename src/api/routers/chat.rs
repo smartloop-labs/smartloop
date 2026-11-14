@@ -473,6 +473,9 @@ impl ModelClient for UnavailableModelClient {
     fn unload_embedding_model(&self) -> anyhow::Result<()> {
         self.err()
     }
+    fn unload_model_by_name(&self, _model_name: &str) -> anyhow::Result<bool> {
+        self.err()
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

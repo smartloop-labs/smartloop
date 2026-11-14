@@ -47,6 +47,8 @@ service ModelHost {
   rpc LoadModel(ProjectRequest) returns (StringReply);
   rpc UnloadAuxiliaryModels(UnloadAuxiliaryRequest) returns (Empty);
   rpc UnloadEmbeddingModel(ProjectRequest) returns (Empty);
+  // Free every slot backed by a model, e.g. when a project deselects it.
+  rpc UnloadModel(UnloadModelRequest) returns (BoolReply);
 }
 
 message Empty {}
@@ -143,6 +145,11 @@ message HasCapabilityRequest {
 
 message UnloadAuxiliaryRequest {
   bool include_embedding = 1;
+  string project_id = 2;
+}
+
+message UnloadModelRequest {
+  string model_name = 1;
   string project_id = 2;
 }
 
