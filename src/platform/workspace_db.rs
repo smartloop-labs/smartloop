@@ -19,8 +19,12 @@ use crate::platform::client::JsonObject;
 use crate::platform::service::now;
 use crate::types::ModelKind;
 
-/// Schema.  `model_catalog_v2` is a pure cache; [`drop_outdated_model_catalog`]
-/// discards one written before its current columns.
+/// Cache tables: copies of cloud data that the next fetch refills, so one can
+/// be dropped and recreated freely.  A cache whose shape changes gets a new
+/// table name (as `model_catalog_v2` did) rather than a migration.  State
+/// that can't be refetched goes in [`MIGRATIONS`] instead.
+/// [`drop_outdated_model_catalog`] discards a catalog table written before
+/// its current columns.
 pub const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS workspace (
     id         TEXT PRIMARY KEY,
@@ -280,6 +284,47 @@ fn enable_wal(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Schema steps for durable state, applied in order by [`apply_migrations`].
+/// Step *n* takes `PRAGMA user_version` from *n* to *n + 1*; [`SCHEMA`] is
+/// version 0.
+///
+/// Older builds (docent, an earlier Studio) keep reading and writing the
+/// file after a newer build has migrated it, and dev builds share the same
+/// home.  So:
+///
+/// - A step is append-only and never edited once merged.
+/// - A step only adds: tables, indexes, and columns that are nullable or
+///   have a default.  No drops, renames, type changes or table rebuilds; a
+///   breaking change is a new table plus a step that copies into it.
+/// - A step runs inside a transaction, so nothing that can't (`VACUUM`,
+///   `PRAGMA journal_mode`, `PRAGMA foreign_keys`).
+/// - Older builds don't enable foreign keys, so a cascade can't be relied
+///   on to clean up after them.
+/// - Importing data from outside the DB (a JSON file) is runtime code
+///   guarded by a flag column, not a step here.
+const MIGRATIONS: &[&str] = &[];
+
+/// Apply the *steps* this file hasn't had yet, in one write transaction, so
+/// two processes opening the file together apply each step once.  A file
+/// already past the last step (written by a newer client) is left alone.
+pub fn apply_migrations(conn: &mut Connection, steps: &[&str]) -> anyhow::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > steps.len() as i64 {
+        tracing::info!(
+            target: "smartloop.platform",
+            "workspace DB is at schema version {version}, newer than this build's {}",
+            steps.len()
+        );
+    }
+    for (index, step) in steps.iter().enumerate().skip(version.max(0) as usize) {
+        tx.execute_batch(step)?;
+        tx.pragma_update(None, "user_version", index as i64 + 1)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Read-only connections kept open for reuse; more open while busy and close
 /// when done.
 const IDLE_READERS: usize = 4;
@@ -307,11 +352,12 @@ impl WorkspaceDB {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let conn = Connection::open(&db_path)?;
+        let mut conn = Connection::open(&db_path)?;
         configure(&conn)?;
         enable_wal(&conn)?;
         drop_outdated_model_catalog(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        apply_migrations(&mut conn, MIGRATIONS)?;
         Ok(Self { db_path, writer: Mutex::new(conn), readers: Mutex::new(Vec::new()) })
     }
 

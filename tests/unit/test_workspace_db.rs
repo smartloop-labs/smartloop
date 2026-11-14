@@ -622,3 +622,61 @@ mod test_shared_handle {
         assert_eq!(db.get_workspace().unwrap().unwrap()["id"], json!("ws-1"));
     }
 }
+
+mod test_migrations {
+    use super::*;
+    use rusqlite::Connection;
+    use smartloop::platform::workspace_db::apply_migrations;
+
+    const STEPS: &[&str] = &["CREATE TABLE one (id TEXT)", "CREATE TABLE two (id TEXT)"];
+
+    fn version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    }
+
+    fn tables(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('one', 'two', 'three') ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn test_a_new_workspace_db_is_at_the_base_schema() {
+        let (tmp, _db) = db();
+        let conn = Connection::open(tmp.path().join("workspace.db")).unwrap();
+        assert_eq!(version(&conn), 0);
+    }
+
+    #[test]
+    fn test_steps_apply_once_in_order() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn, STEPS).unwrap();
+        assert_eq!(version(&conn), 2);
+        assert_eq!(tables(&conn), ["one", "two"]);
+
+        // The steps aren't IF NOT EXISTS, so running one twice would fail.
+        apply_migrations(&mut conn, STEPS).unwrap();
+        let more = [STEPS[0], STEPS[1], "CREATE TABLE three (id TEXT)"];
+        apply_migrations(&mut conn, &more).unwrap();
+        assert_eq!(version(&conn), 3);
+        assert_eq!(tables(&conn), ["one", "three", "two"]);
+    }
+
+    #[test]
+    fn test_a_failing_step_applies_nothing() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert!(apply_migrations(&mut conn, &[STEPS[0], "NOT SQL"]).is_err());
+        assert_eq!(version(&conn), 0);
+        assert!(tables(&conn).is_empty());
+    }
+
+    #[test]
+    fn test_a_file_from_a_newer_client_is_left_alone() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        apply_migrations(&mut conn, STEPS).unwrap();
+        assert_eq!(version(&conn), 5);
+        assert!(tables(&conn).is_empty());
+    }
+}
