@@ -541,3 +541,48 @@ mod test_writes {
         }
     }
 }
+
+mod test_reads {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    #[serial]
+    fn test_a_read_does_not_wait_on_an_open_write() {
+        let (_tmp, db) = db();
+        let db = Arc::new(db);
+        db.save_workspace("before").unwrap();
+        let (started, wait_for_start) = mpsc::channel();
+        let writer = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                db.write(|tx| {
+                    tx.execute("UPDATE workspace SET id = 'during'", [])?;
+                    started.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(500));
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        wait_for_start.recv().unwrap();
+        let begun = Instant::now();
+        let ws = db.get_workspace().unwrap().unwrap();
+        assert!(begun.elapsed() < Duration::from_millis(250), "read waited {:?}", begun.elapsed());
+        assert_eq!(ws["id"], json!("before"));
+        writer.join().unwrap();
+        assert_eq!(db.get_workspace().unwrap().unwrap()["id"], json!("during"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_read_sees_another_handles_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.db");
+        let reader = WorkspaceDB::new(&path).unwrap();
+        assert!(reader.get_workspace().unwrap().is_none());
+        WorkspaceDB::new(&path).unwrap().save_workspace("ws-1").unwrap();
+        assert_eq!(reader.get_workspace().unwrap().unwrap()["id"], json!("ws-1"));
+    }
+}
