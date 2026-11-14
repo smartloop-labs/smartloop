@@ -586,3 +586,39 @@ mod test_reads {
         assert_eq!(reader.get_workspace().unwrap().unwrap()["id"], json!("ws-1"));
     }
 }
+
+mod test_shared_handle {
+    use super::*;
+    use smartloop::platform::{get_platform_service, workspace_db_at};
+    use smartloop::workspace::workspace::Workspace;
+
+    use crate::shared::workspace_support::TempHome;
+
+    #[test]
+    #[serial]
+    fn test_one_handle_per_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("a").join("workspace.db");
+        let second = tmp.path().join("b").join("workspace.db");
+        let a = workspace_db_at(&first).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &workspace_db_at(&first).unwrap()));
+        let b = workspace_db_at(&second).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&a, &b));
+        assert_eq!(b.db_path(), second.as_path());
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_platform_service_binds_the_stored_workspace() {
+        let home = TempHome::new();
+        let ws_dir = home.join("ws-1");
+        Workspace::new("ws-1").with_workspace_dir(ws_dir.clone()).save().unwrap();
+
+        let service = get_platform_service();
+        let db = service.db().expect("bound to the workspace DB");
+        let path = std::path::Path::new(&ws_dir).join("workspace.db");
+        assert_eq!(db.db_path(), path.as_path());
+        assert!(std::sync::Arc::ptr_eq(&db, &workspace_db_at(&path).unwrap()));
+        assert_eq!(db.get_workspace().unwrap().unwrap()["id"], json!("ws-1"));
+    }
+}

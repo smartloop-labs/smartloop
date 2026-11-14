@@ -8,7 +8,7 @@ pub mod service;
 pub mod token_agent;
 pub mod workspace_db;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use once_cell::sync::Lazy;
@@ -30,6 +30,27 @@ struct PlatformServiceSlot {
 
 static PLATFORM_SERVICE: Lazy<Mutex<PlatformServiceSlot>> =
     Lazy::new(|| Mutex::new(PlatformServiceSlot { service: None, db_path: None }));
+
+/// This process's handle on the workspace DB.  One connection set per
+/// process, shared by the platform service and everything else that keeps
+/// state in the file; reopened only when the workspace moves.
+static WORKSPACE_DB: Lazy<Mutex<Option<Arc<WorkspaceDB>>>> = Lazy::new(|| Mutex::new(None));
+
+/// The shared handle on the workspace DB at *path*, opened on first use.
+pub fn workspace_db_at(path: &Path) -> anyhow::Result<Arc<WorkspaceDB>> {
+    let mut slot = WORKSPACE_DB.lock();
+    if let Some(db) = slot.as_ref().filter(|db| db.db_path() == path) {
+        return Ok(db.clone());
+    }
+    let db = Arc::new(WorkspaceDB::new(path)?);
+    *slot = Some(db.clone());
+    Ok(db)
+}
+
+/// The stored workspace's id and the path of its DB.
+fn stored_workspace_db() -> Option<(String, PathBuf)> {
+    Workspace::stored_location().map(|(id, dir)| (id, PathBuf::from(dir).join("workspace.db")))
+}
 
 /// Test seam replacing `get_platform_service` (Python tests monkeypatch it).
 static PLATFORM_SERVICE_OVERRIDE: Lazy<Mutex<Option<Arc<PlatformService>>>> =
@@ -54,12 +75,8 @@ pub fn get_platform_service() -> Arc<PlatformService> {
         return service;
     }
 
-    let settings = AppSettings::new();
-    let ws = Workspace::load();
-    let db_path = ws
-        .as_ref()
-        .filter(|ws| !ws.workspace_dir.is_empty())
-        .map(|ws| PathBuf::from(&ws.workspace_dir).join("workspace.db"));
+    let stored = stored_workspace_db();
+    let db_path = stored.as_ref().map(|(_, path)| path.clone());
 
     // The slot's mutex covers both the fast path (already bound to the right
     // DB) and creation, so concurrent callers never open two SQLite
@@ -71,11 +88,11 @@ pub fn get_platform_service() -> Arc<PlatformService> {
         }
     }
 
-    let client = SLPPlatformClient::new(&settings.slp_api_base);
+    let client = SLPPlatformClient::new(&AppSettings::new().slp_api_base);
     let mut bound_path = db_path.clone();
     let db = match &db_path {
-        Some(path) => match WorkspaceDB::new(path) {
-            Ok(db) => Some(Arc::new(db)),
+        Some(path) => match workspace_db_at(path) {
+            Ok(db) => Some(db),
             Err(e) => {
                 // Serve as a pure proxy rather than failing the request, and
                 // leave the slot unbound so the next call tries the DB again.
@@ -91,9 +108,9 @@ pub fn get_platform_service() -> Arc<PlatformService> {
         },
         None => None,
     };
-    if let (Some(db), Some(ws)) = (&db, &ws) {
-        if let Err(e) = db.save_workspace(&ws.id) {
-            tracing::warn!(target: "smartloop.platform", "Failed to record workspace {}: {:#}", ws.id, e);
+    if let (Some(db), Some((id, _))) = (&db, &stored) {
+        if let Err(e) = db.save_workspace(id) {
+            tracing::warn!(target: "smartloop.platform", "Failed to record workspace {}: {:#}", id, e);
         }
     }
     let service = Arc::new(PlatformService::new(Arc::new(client), db));
@@ -109,14 +126,13 @@ pub fn cached_model_catalog() -> Vec<JsonObject> {
     if let Some(service) = PLATFORM_SERVICE_OVERRIDE.lock().clone() {
         return service.db().and_then(|db| db.list_models().ok()).unwrap_or_default();
     }
-    let Some(ws) = Workspace::load().filter(|ws| !ws.workspace_dir.is_empty()) else {
+    let Some((_, path)) = stored_workspace_db() else {
         return Vec::new();
     };
-    let path = PathBuf::from(&ws.workspace_dir).join("workspace.db");
     if !path.exists() {
         return Vec::new();
     }
-    match WorkspaceDB::new(&path).and_then(|db| db.list_models()) {
+    match workspace_db_at(&path).and_then(|db| db.list_models()) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(target: "smartloop.platform", "Could not read the cached model catalog: {:#}", e);
