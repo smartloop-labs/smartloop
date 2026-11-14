@@ -566,6 +566,8 @@ impl MCPToolCaller {
         };
 
         REFRESH_FAILURES.lock().remove(&server.id);
+        // Sessions opened under the old token are not reused.
+        session_pool::invalidate_mcp_sessions(&server.id);
         if let Some(creds) = server.oauth_credentials.as_mut() {
             creds.access_token = Some(tokens.access_token.clone());
             if let Some(new_refresh) = tokens.refresh_token.as_ref().filter(|t| !t.is_empty()) {

@@ -11,13 +11,15 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use serial_test::serial;
 
-use smartloop::mcp::client::{HttpBody, HttpResponse, HttpTransportOverride};
-use smartloop::mcp::session_pool::{backdate_mcp_sessions, reset_mcp_sessions};
+use smartloop::agents::mcp::mcp_tool_caller::reset_refresh_state;
+use smartloop::mcp::client::{HttpBody, HttpResponse, HttpTransport, HttpTransportOverride};
+use smartloop::mcp::session_pool::{backdate_mcp_sessions, invalidate_mcp_sessions, reset_mcp_sessions};
 use smartloop::workspace::MCPServer;
 
-use crate::shared::mcp::{oauth_server, tool_caller, EnvGuard, FakeHttp};
+use crate::shared::mcp::{ok_json, oauth_server, tool_caller, EnvGuard, FakeHttp, ServiceEnv};
 
 const URL: &str = "https://mcp.example.com/mcp";
+const TOKEN_ENDPOINT: &str = "https://auth.example.com/token";
 
 fn server(id: &str) -> MCPServer {
     oauth_server(id, "example", URL, None, Some("tok"), None)
@@ -225,7 +227,6 @@ fn test_concurrent_calls_handshake_once() {
         if rpc_method(body) == "initialize" {
             std::thread::sleep(Duration::from_millis(100));
         }
-        use smartloop::mcp::client::HttpTransport;
         match (method, body) {
             ("POST", Some(b)) => slow.post(url, b, &[]),
             _ => slow.get(url),
@@ -359,4 +360,83 @@ fn test_a_404_without_a_session_is_not_retried() {
 
     assert!(!result.success);
     assert_eq!(count(&fake, "tools/call"), 1);
+}
+
+// ------------------------------------------------------------- invalidation
+
+#[test]
+#[serial(mcp_global)]
+fn test_invalidating_a_server_forces_a_new_handshake() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let fake = mcp_server(Some("sess-1"));
+    let _guard = HttpTransportOverride::install(fake.clone());
+
+    call(&server("s1"), Some("tok"));
+    call(&server("s2"), Some("tok"));
+    invalidate_mcp_sessions("s1");
+    call(&server("s1"), Some("tok"));
+    call(&server("s2"), Some("tok"));
+
+    assert_eq!(count(&fake, "initialize"), 3, "only s1 handshakes again");
+}
+
+#[test]
+#[serial(mcp_global)]
+fn test_a_refresh_drops_the_old_session() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let inner = mcp_server(Some("sess-1"));
+    let fake = FakeHttp::new(move |method, url, body| {
+        if url == TOKEN_ENDPOINT {
+            return Ok(ok_json(json!({"access_token": "fresh", "token_type": "Bearer", "expires_in": 3600})));
+        }
+        match (method, body) {
+            ("POST", Some(b)) => inner.post(url, b, &[]),
+            _ => inner.get(url),
+        }
+    });
+    let _guard = HttpTransportOverride::install(fake.clone());
+    reset_refresh_state();
+    let mut srv = oauth_server("s1", "example", URL, Some(TOKEN_ENDPOINT), Some("tok"), Some("rt"));
+
+    call(&srv, Some("tok"));
+    assert_eq!(tool_caller().refresh_access_token(&mut srv, Some("tok")).as_deref(), Some("fresh"));
+    call(&srv, Some("tok"));
+
+    assert_eq!(count(&fake, "initialize"), 2);
+    reset_refresh_state();
+}
+
+#[test]
+#[serial]
+#[serial(mcp_global)]
+fn test_deleting_a_server_drops_its_session() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let env = ServiceEnv::new("p1");
+    env.add_server(server("s1"));
+    let fake = mcp_server(Some("sess-1"));
+    let _guard = HttpTransportOverride::install(fake.clone());
+
+    call(&server("s1"), Some("tok"));
+    env.model_service.delete_mcp_server("s1", Some("p1")).expect("deleted");
+    call(&server("s1"), Some("tok"));
+
+    assert_eq!(count(&fake, "initialize"), 2);
+}
+
+#[test]
+#[serial]
+#[serial(mcp_global)]
+fn test_reconnecting_a_server_drops_its_session() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let env = ServiceEnv::new("p1");
+    env.add_server(server("s1"));
+    env.record_provisioning();
+    let fake = mcp_server(Some("sess-1"));
+    let _guard = HttpTransportOverride::install(fake.clone());
+
+    call(&server("s1"), Some("tok"));
+    env.model_service.retry_mcp_server("s1", Some("p1")).expect("retried");
+    call(&server("s1"), Some("tok"));
+
+    assert_eq!(count(&fake, "initialize"), 2);
 }
