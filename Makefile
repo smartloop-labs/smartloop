@@ -231,7 +231,7 @@ run:
 	$(CARGO_RUN) agent start
 
 run-debug:
-	LOG_LEVEL=DEBUG $(CARGO_RUN) agent start
+	LOG_LEVEL=DEBUG $(CARGO_ENV) $(CARGO) run --profile dev-run $(CARGO_FEATURE_ARGS) --bin slp -- agent start
 
 # `run` and `run-debug` are supervised: one process per project behind :38540,
 # sharing one model host.  Children inherit LOG_LEVEL and write to

@@ -18,7 +18,7 @@ use crate::agents::mcp::mcp_agent::{py_repr, py_str};
 use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::mcp::local_client::LocalMCPClient;
 use crate::mcp::oauth::{MCPOAuthError, MCPOAuthService};
-use crate::mcp::{MCPClient, MCPToolCallResult};
+use crate::mcp::{session_pool, MCPClient, MCPToolCallResult};
 use crate::workspace::workspace::{MCPOAuthCredentials, MCPServer, MCPServerStatus, MCPServerType};
 
 /// Logger name of the Python module.
@@ -251,10 +251,14 @@ impl MCPToolCaller {
             result
         } else {
             let server_url = Self::get_server_url(server);
+            let url = server_url.as_deref().unwrap_or("");
             let mut client = MCPClient::new();
-            client.enter();
+            match session_pool::session_for(&server.id, url, access_token) {
+                Some(session) => client.enter_pooled(session),
+                None => client.enter(),
+            };
             let result = client.call_tool(
-                server_url.as_deref().unwrap_or(""),
+                url,
                 tool_name,
                 arguments,
                 access_token,
@@ -562,6 +566,8 @@ impl MCPToolCaller {
         };
 
         REFRESH_FAILURES.lock().remove(&server.id);
+        // Sessions opened under the old token are not reused.
+        session_pool::invalidate_mcp_sessions(&server.id);
         if let Some(creds) = server.oauth_credentials.as_mut() {
             creds.access_token = Some(tokens.access_token.clone());
             if let Some(new_refresh) = tokens.refresh_token.as_ref().filter(|t| !t.is_empty()) {

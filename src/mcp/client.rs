@@ -12,7 +12,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -20,6 +20,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::mcp::session_pool::PooledSession;
 use crate::workspace::{MCPToolAnnotations, MCPToolDefinition};
 
 /// Python logger name of this module.
@@ -27,19 +28,21 @@ const LOGGER: &str = "smartloop.mcp.client";
 
 // ------------------------------------------------------------------ errors
 
-/// Connection-level failure (HTTP status, transport).  Carries the
-/// `WWW-Authenticate` header and status on a 401/403.
+/// Connection-level failure (HTTP status, transport).  Carries the HTTP
+/// status, and the `WWW-Authenticate` header on a 401.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("{message}")]
 pub struct MCPConnectionError {
     pub message: String,
     pub www_authenticate: Option<String>,
     pub status_code: Option<u16>,
+    /// The server no longer knows the `Mcp-Session-Id` the request carried.
+    pub session_lost: bool,
 }
 
 impl MCPConnectionError {
     pub fn new(message: impl Into<String>, www_authenticate: Option<String>, status_code: Option<u16>) -> Self {
-        Self { message: message.into(), www_authenticate, status_code }
+        Self { message: message.into(), www_authenticate, status_code, session_lost: false }
     }
 }
 
@@ -101,6 +104,12 @@ impl MCPClientError {
             Self::Connection(e) => e.status_code,
             _ => None,
         }
+    }
+
+    /// True when the server refused the request's session as unknown or
+    /// expired, so a fresh `initialize` can recover it.
+    pub fn is_session_lost(&self) -> bool {
+        matches!(self, Self::Connection(e) if e.session_lost)
     }
 }
 
@@ -201,6 +210,18 @@ impl ReqwestTransport {
         Self { client }
     }
 
+    /// A client whose idle connections stay open for `idle_secs`, for reuse
+    /// across calls.
+    pub fn pooled(timeout_secs: f64, idle_secs: u64) -> Self {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs_f64(timeout_secs))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_idle_timeout(Duration::from_secs(idle_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        Self { client }
+    }
+
     /// Wrap an existing client as-is.
     pub fn from_client(client: reqwest::blocking::Client) -> Self {
         Self { client }
@@ -253,8 +274,10 @@ static TRANSPORT_OVERRIDE: Lazy<RwLock<Option<Arc<dyn HttpTransport>>>> = Lazy::
 /// Returns the previous override.
 ///
 /// The analogue of `patch("httpx.Client", return_value=fake)`: process-wide,
-/// so tests that use it must be serialized.
+/// so tests that use it must be serialized.  Pooled sessions are dropped, since
+/// they were opened over the transport being replaced.
 pub fn set_http_transport_override(transport: Option<Arc<dyn HttpTransport>>) -> Option<Arc<dyn HttpTransport>> {
+    crate::mcp::session_pool::reset_mcp_sessions();
     std::mem::replace(&mut *TRANSPORT_OVERRIDE.write(), transport)
 }
 
@@ -265,6 +288,19 @@ pub fn default_http_transport(timeout_secs: f64) -> Arc<dyn HttpTransport> {
         return t;
     }
     Arc::new(ReqwestTransport::new(timeout_secs))
+}
+
+/// The process-wide MCP client, so tool calls reuse TCP/TLS connections.
+/// Auth travels per request, so one client serves every server.
+static SHARED_TRANSPORT: Lazy<Arc<dyn HttpTransport>> = Lazy::new(|| Arc::new(ReqwestTransport::pooled(60.0, 300)));
+
+/// The transport [`MCPClient::enter`] uses: the override when one is set,
+/// else the shared pooled client.
+pub fn shared_http_transport() -> Arc<dyn HttpTransport> {
+    if let Some(t) = TRANSPORT_OVERRIDE.read().clone() {
+        return t;
+    }
+    SHARED_TRANSPORT.clone()
 }
 
 /// RAII guard installing a transport override for its lifetime.
@@ -480,6 +516,12 @@ pub struct MCPClient {
     client: Option<Arc<dyn HttpTransport>>,
     request_id: u64,
     session_id: Option<String>,
+    /// The shared session [`Self::enter_pooled`] attached, if any.
+    pooled: Option<Arc<PooledSession>>,
+    /// Time spent on `initialize` during the current call, if it ran.
+    handshake: Option<Duration>,
+    /// Time spent waiting for another caller's handshake on a pooled session.
+    session_wait: Duration,
 }
 
 impl fmt::Debug for MCPClient {
@@ -488,6 +530,7 @@ impl fmt::Debug for MCPClient {
             .field("open", &self.client.is_some())
             .field("request_id", &self.request_id)
             .field("session_id", &self.session_id)
+            .field("pooled", &self.pooled.is_some())
             .finish()
     }
 }
@@ -503,7 +546,9 @@ impl MCPClient {
 
     /// A client already holding `transport` (the tests' `client._client = fake`).
     pub fn with_transport(transport: Arc<dyn HttpTransport>) -> Self {
-        Self { client: Some(transport), request_id: 0, session_id: None }
+        let mut client = Self::default();
+        client.client = Some(transport);
+        client
     }
 
     /// Replace the HTTP transport in place.
@@ -521,14 +566,26 @@ impl MCPClient {
 
     /// Open the HTTP client (`__enter__`).
     pub fn enter(&mut self) -> &mut Self {
-        self.client = Some(default_http_transport(60.0));
+        self.client = Some(shared_http_transport());
         self
     }
 
-    /// Close the HTTP client and forget the session (`__exit__`).
+    /// Open the HTTP client on a session shared with other calls, so the
+    /// handshake runs only when the session has not been initialized yet.
+    pub fn enter_pooled(&mut self, session: Arc<PooledSession>) -> &mut Self {
+        self.client = Some(shared_http_transport());
+        self.pooled = Some(session);
+        self
+    }
+
+    /// Close the HTTP client and forget the session (`__exit__`).  A pooled
+    /// session stays in the pool for the next call.
     pub fn exit(&mut self) {
         self.client = None;
         self.session_id = None;
+        if let Some(pooled) = self.pooled.take() {
+            pooled.touch();
+        }
     }
 
     /// The current `Mcp-Session-Id`, if the server issued one.
@@ -537,6 +594,9 @@ impl MCPClient {
     }
 
     fn next_request_id(&mut self) -> String {
+        if let Some(pooled) = &self.pooled {
+            return pooled.next_request_id().to_string();
+        }
         self.request_id += 1;
         self.request_id.to_string()
     }
@@ -696,7 +756,11 @@ impl MCPClient {
             .into());
         }
         if !response.is_success() {
-            return Err(MCPConnectionError::new(format!("HTTP error: {}", response.status), None, None).into());
+            let sent_session = headers.iter().any(|(k, _)| k == "Mcp-Session-Id");
+            let mut error =
+                MCPConnectionError::new(format!("HTTP error: {}", response.status), None, Some(response.status));
+            error.session_lost = sent_session && session_refused(response.status, &response.body);
+            return Err(error.into());
         }
 
         if let Some(session_id) = response.header("mcp-session-id").filter(|s| !s.is_empty()) {
@@ -827,16 +891,13 @@ impl MCPClient {
         }
     }
 
-    /// Perform the MCP initialize handshake if no session exists yet.
-    fn ensure_session(
+    /// Send `initialize` then `notifications/initialized`.
+    fn initialize(
         &mut self,
         server_url: &str,
         access_token: Option<&str>,
         token_type: &str,
     ) -> Result<(), MCPClientError> {
-        if self.session_id.is_some() {
-            return Ok(());
-        }
         self.send_request(server_url, "initialize", Some(Self::initialize_params()), access_token, token_type)?;
         self.send_notification(
             server_url,
@@ -848,6 +909,66 @@ impl MCPClient {
         Ok(())
     }
 
+    /// Perform the MCP initialize handshake if no session exists yet.
+    ///
+    /// A pooled session is initialized once and then reused, whether or not
+    /// the server issues a session id.
+    fn ensure_session(
+        &mut self,
+        server_url: &str,
+        access_token: Option<&str>,
+        token_type: &str,
+    ) -> Result<(), MCPClientError> {
+        if let Some(pooled) = self.pooled.clone() {
+            let waiting = Instant::now();
+            let mut state = pooled.state();
+            self.session_wait += waiting.elapsed();
+            if !state.initialized {
+                self.session_id = None;
+                self.timed_initialize(server_url, access_token, token_type)?;
+                state.session_id = self.session_id.clone();
+                state.initialized = true;
+            } else {
+                self.session_id = state.session_id.clone();
+            }
+            return Ok(());
+        }
+        if self.session_id.is_some() {
+            return Ok(());
+        }
+        self.timed_initialize(server_url, access_token, token_type)
+    }
+
+    /// [`Self::initialize`], adding its duration to `handshake`.
+    fn timed_initialize(
+        &mut self,
+        server_url: &str,
+        access_token: Option<&str>,
+        token_type: &str,
+    ) -> Result<(), MCPClientError> {
+        let started = Instant::now();
+        let result = self.initialize(server_url, access_token, token_type);
+        self.handshake = Some(self.handshake.unwrap_or_default() + started.elapsed());
+        result
+    }
+
+    /// How the last call got its session, for the timing log.
+    fn session_note(&self, retried: bool) -> String {
+        let mut note = match (self.pooled.is_some(), self.handshake) {
+            (true, None) => "reused session".to_string(),
+            (true, Some(h)) => format!("new session, handshake {} ms", h.as_millis()),
+            (false, Some(h)) => format!("unpooled, handshake {} ms", h.as_millis()),
+            (false, None) => "unpooled".to_string(),
+        };
+        if self.session_wait >= Duration::from_millis(10) {
+            note.push_str(&format!(", waited {} ms on another call's handshake", self.session_wait.as_millis()));
+        }
+        if retried {
+            note.push_str(", after the server lost the previous session");
+        }
+        note
+    }
+
     /// Call one tool (`tools/call`).
     pub fn call_tool(
         &mut self,
@@ -857,18 +978,42 @@ impl MCPClient {
         access_token: Option<&str>,
         token_type: &str,
     ) -> MCPToolCallResult {
-        let outcome = self.ensure_session(server_url, access_token, token_type).and_then(|_| {
-            self.send_request(
-                server_url,
-                "tools/call",
-                Some(serde_json::json!({
-                    "name": tool_name,
-                    "arguments": Value::Object(arguments.cloned().unwrap_or_default()),
-                })),
-                access_token,
-                token_type,
-            )
+        let started = Instant::now();
+        self.handshake = None;
+        self.session_wait = Duration::ZERO;
+        let params = serde_json::json!({
+            "name": tool_name,
+            "arguments": Value::Object(arguments.cloned().unwrap_or_default()),
         });
+        let mut retried = false;
+        let mut outcome = self.ensure_session(server_url, access_token, token_type).and_then(|_| {
+            self.send_request(server_url, "tools/call", Some(params.clone()), access_token, token_type)
+        });
+        // The server never ran the call under a session it no longer knows, so
+        // one retry on a fresh session is safe.
+        if matches!(&outcome, Err(e) if e.is_session_lost()) {
+            tracing::info!(
+                target: LOGGER,
+                "[mcp-remote] Session on {} expired; initializing a new one",
+                server_url
+            );
+            if let Some(pooled) = &self.pooled {
+                pooled.forget(self.session_id.as_deref());
+            }
+            self.session_id = None;
+            retried = true;
+            outcome = self.ensure_session(server_url, access_token, token_type).and_then(|_| {
+                self.send_request(server_url, "tools/call", Some(params), access_token, token_type)
+            });
+        }
+        tracing::info!(
+            target: LOGGER,
+            "[mcp-remote] {} on {} took {} ms ({})",
+            tool_name,
+            server_url,
+            started.elapsed().as_millis(),
+            self.session_note(retried)
+        );
         match outcome {
             Ok(result) => {
                 let (content, is_error) = call_result_parts(&result);
@@ -903,6 +1048,20 @@ impl MCPClient {
     }
 }
 
+/// A non-2xx answer to a request carrying `Mcp-Session-Id` that means the
+/// session is gone: a 404 (the MCP spec's signal), or a 400 saying so.
+fn session_refused(status: u16, body: &str) -> bool {
+    match status {
+        404 => true,
+        400 => {
+            let body = body.to_ascii_lowercase();
+            body.contains("session")
+                && (body.contains("not found") || body.contains("expired") || body.contains("invalid"))
+        }
+        _ => false,
+    }
+}
+
 /// Python's type name for a JSON value, for error messages.
 pub(crate) fn json_type_name(value: &Value) -> &'static str {
     match value {
@@ -920,5 +1079,6 @@ impl Drop for MCPClient {
     fn drop(&mut self) {
         self.client = None;
         self.session_id = None;
+        self.pooled = None;
     }
 }

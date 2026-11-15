@@ -44,6 +44,7 @@ use crate::mcp::definition_loader::{USER_DEFINITIONS_DIR, reload_definitions};
 use crate::mcp::definitions::{definition_for, split_command_line};
 use crate::mcp::local_client::LocalMCPClient;
 use crate::mcp::read_only_calls::ReadOnlyToolCaller;
+use crate::mcp::session_pool;
 use crate::model::downloader::SLPArtifactDownloader;
 use crate::model::downloader::slp_downloader::ProgressCallback as DownloadProgressCallback;
 use crate::model::slp_model::{DocumentProgressCallback, DocumentSource};
@@ -1745,8 +1746,11 @@ impl ModelService {
                 }
             }
 
-            // Release the deleted project's store handles.
+            // Release the deleted project's store handles and MCP sessions.
             self.drop_caches(Some(project_id));
+            for server in &project.mcp_servers {
+                session_pool::invalidate_mcp_sessions(&server.id);
+            }
 
             // Claim the project being removed: under supervision this process
             // writes only the workspace record, and the claim says this one
@@ -2973,6 +2977,8 @@ impl ModelService {
             }
         };
         self.save_model()?;
+        // A reconnect starts from a fresh handshake.
+        session_pool::invalidate_mcp_sessions(server_id);
         self.queue_mcp_provisioning(&project, &server);
         Ok(Self::mcp_server_to_dict(&server))
     }
@@ -3277,6 +3283,7 @@ impl ModelService {
 
         self.with_project_mut(&project.id, |p| p.mcp_servers.retain(|s| s.id != server_id))?;
         self.save_model()?;
+        session_pool::invalidate_mcp_sessions(server_id);
         self.remove_mcp_definition_file(&server);
 
         Ok(json!({"id": server_id, "deleted": true, "message": "MCP server deleted successfully"}))
