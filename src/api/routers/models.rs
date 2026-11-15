@@ -573,8 +573,7 @@ pub struct ListModelsQuery {
 )]
 pub async fn list_models(Query(query): Query<ListModelsQuery>) -> Result<Json<Vec<ModelEntry>>, HTTPException> {
     let model_service = get_model_service();
-    let svc = get_platform_service();
-    run_blocking(move || list_models_with(&model_service, &svc, query.project_id.as_deref()))
+    run_blocking(move || list_models_with(&model_service, &get_platform_service(), query.project_id.as_deref()))
         .await
         .map(Json)
 }

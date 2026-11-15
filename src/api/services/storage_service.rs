@@ -82,11 +82,12 @@ pub const ORPHAN_MIN_AGE_S: u64 = 7 * 24 * 60 * 60;
 
 /// Never removed, whatever category is being swept: credentials, the
 /// workspace record itself, liveness markers, install markers, and the
-/// desktop app's own DB.
+/// desktop app's own DB.  The workspace DB's WAL sidecars hold committed
+/// writes, so they count as the DB.
 pub const NEVER_DELETE: &[&str] = &[
     "config.json", ".credentials", ".key", ".installed-version", ".archive-etag",
     ".binary-hash", "server.pid", "server.port", "version", "installed",
-    "studio.db", "workspace.db", "token_usage.jsonl",
+    "studio.db", "workspace.db", "workspace.db-wal", "workspace.db-shm", "token_usage.jsonl",
 ];
 
 /// Windows can refuse to unlink a GGUF a worker still has mapped, so give the

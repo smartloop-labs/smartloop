@@ -343,7 +343,9 @@ fn env(test_name: &str) -> Env {
     write(&workspace_dir.join(&fresh_orphan_id).join("documents").join("live.txt"), "live");
     // A non-uuid directory is not a project shape and must be left alone.
     write(&workspace_dir.join("not-a-project").join("keep.txt"), "keep");
-    write(&workspace_dir.join("workspace.db"), "db");
+    for name in ["workspace.db", "workspace.db-wal", "workspace.db-shm"] {
+        write(&workspace_dir.join(name), "db");
+    }
 
     for name in PROTECTED_FILES {
         write(&home_dir.join(name), "protected");
@@ -1332,7 +1334,9 @@ fn test_protected_files_survive_every_category() {
     for name in PROTECTED_FILES {
         assert!(isfile(&join(&env.home_dir, name)), "{name}");
     }
-    assert!(isfile(&join(&env.workspace_dir, "workspace.db")));
+    for name in ["workspace.db", "workspace.db-wal", "workspace.db-shm"] {
+        assert!(isfile(&join(&env.workspace_dir, name)), "{name}");
+    }
     assert!(isfile(&join(&env.outside, "precious.txt")));
 }
 

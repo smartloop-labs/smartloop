@@ -2396,6 +2396,19 @@ impl Workspace {
         Self::parse_record(content).ok()
     }
 
+    /// The stored workspace's id and directory, read from `config.json`
+    /// without loading its projects.  `None` when there is no workspace on
+    /// disk.
+    pub fn stored_location() -> Option<(String, String)> {
+        let content = std::fs::read_to_string(Self::config_file()).ok()?;
+        let data: Value = serde_json::from_str(content.trim()).ok()?;
+        let id = data.get("workspace")?.get("id")?.as_str()?;
+        if id.is_empty() {
+            return None;
+        }
+        Some((id.to_string(), join(&home_dir(), id)))
+    }
+
     /// Re-read one project's own file if someone has written it since.
     ///
     /// Under supervision a project's own state belongs to the child pinned to

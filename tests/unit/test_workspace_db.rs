@@ -468,3 +468,215 @@ mod test_workspace_persistence {
         assert!(second["updated_at"].as_f64().unwrap() > first["updated_at"].as_f64().unwrap());
     }
 }
+
+mod test_connection_settings {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_the_file_is_in_wal_mode() {
+        let (tmp, _db) = db();
+        let conn = rusqlite::Connection::open(tmp.path().join("workspace.db")).unwrap();
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    #[serial]
+    fn test_foreign_keys_are_enforced() {
+        let (_tmp, db) = db();
+        let err = db
+            .write(|tx| {
+                tx.execute_batch(
+                    "CREATE TABLE parent (id TEXT PRIMARY KEY);
+                     CREATE TABLE child (parent_id TEXT REFERENCES parent(id));
+                     INSERT INTO child VALUES ('missing');",
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
+    }
+}
+
+mod test_writes {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_a_failed_write_leaves_nothing_behind() {
+        let (_tmp, db) = db();
+        let result: anyhow::Result<()> = db.write(|tx| {
+            tx.execute("INSERT INTO workspace (id, created_at, updated_at) VALUES ('ws', 1, 1)", [])?;
+            anyhow::bail!("stop")
+        });
+        assert!(result.is_err());
+        assert!(db.get_workspace().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_two_processes_write_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.db");
+        // Two handles on one file stand in for the supervisor and a child.
+        let handles: Vec<_> = (0..2).map(|_| std::sync::Arc::new(WorkspaceDB::new(&path).unwrap())).collect();
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let db = handles[i % 2].clone();
+                std::thread::spawn(move || {
+                    for n in 0..25 {
+                        let release = obj(json!({"version": format!("{i}.{n}")}));
+                        db.save_release(&format!("channel-{i}"), Some(&release)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        for i in 0..8 {
+            let release = handles[0].get_release(&format!("channel-{i}")).unwrap().unwrap();
+            assert_eq!(release["version"], json!(format!("{i}.24")));
+        }
+    }
+}
+
+mod test_reads {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    #[serial]
+    fn test_a_read_does_not_wait_on_an_open_write() {
+        let (_tmp, db) = db();
+        let db = Arc::new(db);
+        db.save_workspace("before").unwrap();
+        let (started, wait_for_start) = mpsc::channel();
+        let writer = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                db.write(|tx| {
+                    tx.execute("UPDATE workspace SET id = 'during'", [])?;
+                    started.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(500));
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        wait_for_start.recv().unwrap();
+        let begun = Instant::now();
+        let ws = db.get_workspace().unwrap().unwrap();
+        assert!(begun.elapsed() < Duration::from_millis(250), "read waited {:?}", begun.elapsed());
+        assert_eq!(ws["id"], json!("before"));
+        writer.join().unwrap();
+        assert_eq!(db.get_workspace().unwrap().unwrap()["id"], json!("during"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_read_sees_another_handles_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.db");
+        let reader = WorkspaceDB::new(&path).unwrap();
+        assert!(reader.get_workspace().unwrap().is_none());
+        WorkspaceDB::new(&path).unwrap().save_workspace("ws-1").unwrap();
+        assert_eq!(reader.get_workspace().unwrap().unwrap()["id"], json!("ws-1"));
+    }
+}
+
+mod test_shared_handle {
+    use super::*;
+    use smartloop::platform::{get_platform_service, workspace_db_at};
+    use smartloop::workspace::workspace::Workspace;
+
+    use crate::shared::workspace_support::TempHome;
+
+    #[test]
+    #[serial]
+    fn test_one_handle_per_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("a").join("workspace.db");
+        let second = tmp.path().join("b").join("workspace.db");
+        let a = workspace_db_at(&first).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &workspace_db_at(&first).unwrap()));
+        let b = workspace_db_at(&second).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&a, &b));
+        assert_eq!(b.db_path(), second.as_path());
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_platform_service_binds_the_stored_workspace() {
+        let home = TempHome::new();
+        let ws_dir = home.join("ws-1");
+        Workspace::new("ws-1").with_workspace_dir(ws_dir.clone()).save().unwrap();
+
+        let service = get_platform_service();
+        let db = service.db().expect("bound to the workspace DB");
+        let path = std::path::Path::new(&ws_dir).join("workspace.db");
+        assert_eq!(db.db_path(), path.as_path());
+        assert!(std::sync::Arc::ptr_eq(&db, &workspace_db_at(&path).unwrap()));
+        assert_eq!(db.get_workspace().unwrap().unwrap()["id"], json!("ws-1"));
+    }
+}
+
+mod test_migrations {
+    use super::*;
+    use rusqlite::Connection;
+    use smartloop::platform::workspace_db::apply_migrations;
+
+    const STEPS: &[&str] = &["CREATE TABLE one (id TEXT)", "CREATE TABLE two (id TEXT)"];
+
+    fn version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    }
+
+    fn tables(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('one', 'two', 'three') ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn test_a_new_workspace_db_is_at_the_base_schema() {
+        let (tmp, _db) = db();
+        let conn = Connection::open(tmp.path().join("workspace.db")).unwrap();
+        assert_eq!(version(&conn), 0);
+    }
+
+    #[test]
+    fn test_steps_apply_once_in_order() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut conn, STEPS).unwrap();
+        assert_eq!(version(&conn), 2);
+        assert_eq!(tables(&conn), ["one", "two"]);
+
+        // The steps aren't IF NOT EXISTS, so running one twice would fail.
+        apply_migrations(&mut conn, STEPS).unwrap();
+        let more = [STEPS[0], STEPS[1], "CREATE TABLE three (id TEXT)"];
+        apply_migrations(&mut conn, &more).unwrap();
+        assert_eq!(version(&conn), 3);
+        assert_eq!(tables(&conn), ["one", "three", "two"]);
+    }
+
+    #[test]
+    fn test_a_failing_step_applies_nothing() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert!(apply_migrations(&mut conn, &[STEPS[0], "NOT SQL"]).is_err());
+        assert_eq!(version(&conn), 0);
+        assert!(tables(&conn).is_empty());
+    }
+
+    #[test]
+    fn test_a_file_from_a_newer_client_is_left_alone() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        apply_migrations(&mut conn, STEPS).unwrap();
+        assert_eq!(version(&conn), 5);
+        assert!(tables(&conn).is_empty());
+    }
+}
