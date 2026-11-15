@@ -2303,6 +2303,7 @@ impl Workspace {
         }
 
         let config_file = Self::config_file();
+        let mut loaded = false;
         let workspace = if !Path::new(&config_file).exists() {
             Self::create_new_workspace(config)
         } else {
@@ -2326,6 +2327,7 @@ impl Workspace {
                                 None => config.clone(),
                             });
                         }
+                        loaded = true;
                         workspace
                     }
                     Err(err) => {
@@ -2342,7 +2344,27 @@ impl Workspace {
 
         let shared = Arc::new(RwLock::new(workspace));
         *instance = Some(Arc::clone(&shared));
+        drop(instance);
+        if loaded {
+            Self::record_projects(&shared.read());
+        }
         shared
+    }
+
+    /// Give each project in config.json its row in the workspace DB, for
+    /// projects made before the table existed or by a build without it.
+    /// Rows for projects config.json no longer lists are kept.  A failure is
+    /// logged and never stops the workspace loading.
+    fn record_projects(workspace: &Workspace) {
+        if workspace.id.is_empty() || workspace.workspace_dir.is_empty() {
+            return;
+        }
+        let ids = workspace.projects.iter().map(|p| p.id.as_str()).filter(|id| !id.is_empty());
+        match crate::platform::workspace_db_for(workspace).and_then(|db| db.projects().backfill(&workspace.id, ids)) {
+            Ok(0) => {}
+            Ok(added) => tracing::info!(target: LOG_TARGET, "Recorded {added} project(s) in the workspace DB"),
+            Err(err) => tracing::warn!(target: LOG_TARGET, "Could not record projects in the workspace DB: {err:#}"),
+        }
     }
 
     /// Re-anchor every persisted absolute path onto the current home.

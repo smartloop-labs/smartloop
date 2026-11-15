@@ -1,5 +1,5 @@
 //! Each project in config.json has a row in the workspace DB's `projects`
-//! table: written on create, deleted on delete.
+//! table: written on create, deleted on delete, backfilled on load.
 
 use std::sync::Arc;
 
@@ -83,4 +83,46 @@ fn test_the_system_project_keeps_its_row() {
     let system = f.svc.create_project("general_chat", None, true, None, None, None).unwrap();
     assert!(f.svc.delete_project(&created_id(&system)).is_err());
     assert_eq!(recorded(&f.svc), [created_id(&system)]);
+}
+
+mod test_backfill_on_load {
+    use super::*;
+    use smartloop::config::ModelConfig;
+
+    use crate::shared::model_service_b::project;
+    use crate::shared::workspace_support::TempHome;
+
+    /// Save a workspace listing *ids* and load it back as the singleton.
+    fn load(home: &TempHome, ids: &[&str]) -> Workspace {
+        let ws_dir = home.join("ws-1");
+        let projects = ids.iter().map(|id| project(id, &format!("{ws_dir}/{id}"), false)).collect();
+        Workspace::new("ws-1").with_workspace_dir(ws_dir).with_projects(projects).save().unwrap();
+        Workspace::reset();
+        let loaded = Workspace::init(&ModelConfig::new("m")).read().clone();
+        loaded
+    }
+
+    fn recorded_in(workspace: &Workspace) -> Vec<String> {
+        let mut ids = workspace_db_for(workspace).unwrap().projects().ids(&workspace.id).unwrap();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    #[serial]
+    fn test_loading_records_every_listed_project() {
+        let home = TempHome::new();
+        let workspace = load(&home, &["p1", "p2"]);
+        assert_eq!(recorded_in(&workspace), ["p1", "p2"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_loading_keeps_rows_for_unlisted_projects() {
+        let home = TempHome::new();
+        let workspace = load(&home, &["p1"]);
+        workspace_db_for(&workspace).unwrap().projects().add("ws-1", "elsewhere").unwrap();
+        let workspace = load(&home, &["p1", "p2"]);
+        assert_eq!(recorded_in(&workspace), ["elsewhere", "p1", "p2"]);
+    }
 }
