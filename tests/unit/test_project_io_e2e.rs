@@ -318,6 +318,10 @@ fn test_import_creates_project() {
     let ws = &config["workspace"];
     assert!(ws["projects"].as_array().unwrap().iter().any(|p| p["id"] == new_id));
 
+    // The new project is recorded in the workspace DB.
+    let db = smartloop::platform::workspace_db_for(&env.workspace).unwrap();
+    assert!(db.projects().ids(&env.workspace.id).unwrap().iter().any(|id| id == new_id));
+
     fs::remove_file(&zip_path).unwrap();
 }
 

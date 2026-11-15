@@ -47,6 +47,13 @@ pub fn workspace_db_at(path: &Path) -> anyhow::Result<Arc<WorkspaceDB>> {
     Ok(db)
 }
 
+/// The shared handle on *workspace*'s own DB.  Taken from the instance, not
+/// the stored record: a new workspace's first project is created before
+/// anything reads config.json back.
+pub fn workspace_db_for(workspace: &Workspace) -> anyhow::Result<Arc<WorkspaceDB>> {
+    workspace_db_at(&Path::new(&workspace.workspace_dir).join("workspace.db"))
+}
+
 /// The stored workspace's id and the path of its DB.
 fn stored_workspace_db() -> Option<(String, PathBuf)> {
     Workspace::stored_location().map(|(id, dir)| (id, PathBuf::from(dir).join("workspace.db")))

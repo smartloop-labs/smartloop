@@ -128,6 +128,7 @@ mod test_platform_client;
 mod test_platform_service;
 mod test_project_context;
 mod test_project_delete;
+mod test_project_db_rows;
 mod test_project_io_e2e;
 mod test_project_scope_middleware;
 mod test_project_services_are_project_work;

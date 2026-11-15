@@ -17,6 +17,7 @@ use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
 
 use crate::config::app_settings::AppSettings;
+use crate::platform::workspace_db_for;
 use crate::workspace::context::own_project;
 use crate::workspace::workspace::{Document, MCPServer, Project, Skill, Workspace};
 
@@ -554,6 +555,7 @@ pub fn import_project(
         let _owned = own_project(Some(&new_id));
         workspace.save()?;
     }
+    workspace_db_for(workspace)?.projects().add(&workspace.id, &new_id)?;
     Workspace::reset();
 
     let new_project = workspace

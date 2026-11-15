@@ -51,6 +51,7 @@ use crate::model::slp_model::{DocumentProgressCallback, DocumentSource};
 use crate::parsers::base_parser::ParserError;
 use crate::parsers::parser_factory::ParserFactory;
 use crate::paths::{SANDBOX_HOME_MARKER, expand_home};
+use crate::platform::workspace_db_for;
 use crate::tasks::base_task::{TaskLogger, TaskOptions, TaskStatus};
 use crate::tasks::{BaseTask, DownloaderTask, DocumentsManifest, IndexerTask, MCPTask};
 use crate::utils::logging_setup::get_logger;
@@ -1567,6 +1568,11 @@ impl ModelService {
             let _claim = own_project(Some(&project_id));
             model.save()?;
         }
+        let (db, workspace_id) = {
+            let ws = workspace.read();
+            (workspace_db_for(&ws)?, ws.id.clone())
+        };
+        db.projects().add(&workspace_id, &project_id)?;
 
         // A caller-supplied `cwd` is recorded for reference only — nothing is
         // ever located through it.  Skills, documents, MCP docs and the
