@@ -38,8 +38,8 @@ pub const LOG_TARGET: &str = "smartloop.timing";
 /// processes.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// The log file under `<slp_home>/logs`.
-pub const LOG_FILE: &str = "slp-timing.jsonl";
+/// The log file, relative to `<slp_home>`.
+pub const LOG_PATH: &str = "logs/slp-timing.jsonl";
 
 enum Sink {
     File(File),
@@ -62,7 +62,7 @@ static PROCESS: RwLock<String> = RwLock::new(String::new());
 fn path_for(setting: &str, home: &Path) -> Option<PathBuf> {
     match setting.trim() {
         "" | "0" | "false" | "off" => None,
-        "1" | "true" | "on" => Some(home.join("logs").join(LOG_FILE)),
+        "1" | "true" | "on" => Some(home.join(LOG_PATH)),
         file => Some(PathBuf::from(file)),
     }
 }

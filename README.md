@@ -55,6 +55,8 @@ cargo install --path . --features metal   # install slp into ~/.cargo/bin
 ```bash
 make run          # start the agent from source (cargo run --release -- agent start)
 make run-debug    # same, with LOG_LEVEL=DEBUG
+SLP_TIMING=1 make run   # also time each chat turn into ~/.smartloop/logs/slp-timing.jsonl
+scripts/timing-summary.sh  # tabulate that log per turn
 cargo test        # full test suite (CPU build; model/network tests are #[ignore]d)
 make test-unit    # unit tests only (lib + tests/unit)
 make test-api     # HTTP API tests only (tests/api)
