@@ -5,6 +5,13 @@
 //! Stores user profile, model catalog, the curated MCP catalog and the latest
 //! release per channel locally so the API can serve responses when the cloud
 //! platform is unreachable.  Lives at `<home_dir>/<workspace_id>/workspace.db`.
+//!
+//! Durable state (the tables in [`MIGRATIONS`]) is read and written only
+//! through one module per table group below, so every query lives in one
+//! place.
+
+pub mod projects;
+mod workspaces;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -302,7 +309,41 @@ fn enable_wal(conn: &Connection) -> anyhow::Result<()> {
 ///   on to clean up after them.
 /// - Importing data from outside the DB (a JSON file) is runtime code
 ///   guarded by a flag column, not a step here.
-const MIGRATIONS: &[&str] = &[];
+const MIGRATIONS: &[&str] = &[
+    // Workspaces, the accounts that belong to them, and their projects.
+    // Locally whoever runs the framework is the user, so no account or
+    // membership is recorded yet.  `projects` mirrors config.json's project
+    // list only as an anchor for per-project tables to cascade from.
+    "\
+CREATE TABLE workspaces (
+    id         TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE accounts (
+    id               TEXT PRIMARY KEY,
+    platform_user_id TEXT UNIQUE,      -- the slp-api user id, once linked
+    created_at       INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE workspace_members (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    role         TEXT NOT NULL,      -- checked in code, so roles can be added
+    created_at   INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, account_id)
+) STRICT;
+CREATE INDEX workspace_members_account_id ON workspace_members(account_id);
+
+CREATE TABLE projects (
+    id           TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    created_at   INTEGER NOT NULL,
+    mcp_migrated INTEGER NOT NULL DEFAULT 0   -- project.json's MCP state imported
+) STRICT;
+CREATE INDEX projects_workspace_id ON projects(workspace_id);
+",
+];
 
 /// Apply the *steps* this file hasn't had yet, in one write transaction, so
 /// two processes opening the file together apply each step once.  A file

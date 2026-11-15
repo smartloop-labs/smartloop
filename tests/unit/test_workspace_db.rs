@@ -642,10 +642,28 @@ mod test_migrations {
     }
 
     #[test]
-    fn test_a_new_workspace_db_is_at_the_base_schema() {
+    fn test_a_new_workspace_db_has_every_step() {
         let (tmp, _db) = db();
         let conn = Connection::open(tmp.path().join("workspace.db")).unwrap();
-        assert_eq!(version(&conn), 0);
+        assert_eq!(version(&conn), 1);
+        let durable: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_list WHERE strict = 1 AND schema = 'main' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(durable, ["accounts", "projects", "workspace_members", "workspaces"]);
+    }
+
+    #[test]
+    fn test_reopening_a_migrated_file_keeps_its_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.db");
+        WorkspaceDB::new(&path).unwrap().projects().add("ws", "p1").unwrap();
+        let db = WorkspaceDB::new(&path).unwrap();
+        assert_eq!(db.projects().ids("ws").unwrap(), ["p1"]);
+        assert_eq!(version(&Connection::open(&path).unwrap()), 1);
     }
 
     #[test]
@@ -678,5 +696,184 @@ mod test_migrations {
         apply_migrations(&mut conn, STEPS).unwrap();
         assert_eq!(version(&conn), 5);
         assert!(tables(&conn).is_empty());
+    }
+}
+
+mod test_projects {
+    use super::*;
+    use smartloop::platform::service::set_clock;
+
+    /// Restores the real clock when dropped.
+    struct RealClock;
+
+    impl Drop for RealClock {
+        fn drop(&mut self) {
+            set_clock(None);
+        }
+    }
+
+    /// Stop the platform clock at *seconds*.
+    fn clock_at(seconds: f64) -> RealClock {
+        set_clock(Some(std::sync::Arc::new(move || seconds)));
+        RealClock
+    }
+
+    fn created_at(db: &WorkspaceDB, project_id: &str) -> i64 {
+        db.read(|conn| {
+            Ok(conn.query_row("SELECT created_at FROM projects WHERE id = ?", [project_id], |r| r.get(0))?)
+        })
+        .unwrap()
+    }
+
+    fn count(db: &WorkspaceDB, table: &str) -> i64 {
+        db.read(|conn| Ok(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?))
+            .unwrap()
+    }
+
+    fn sorted(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_records_the_project_and_its_workspace() {
+        let (_tmp, db) = db();
+        db.projects().add("ws", "p1").unwrap();
+        assert_eq!(db.projects().ids("ws").unwrap(), ["p1"]);
+        assert_eq!(count(&db, "workspaces"), 1);
+        let migrated: i64 = db
+            .read(|conn| Ok(conn.query_row("SELECT mcp_migrated FROM projects WHERE id = 'p1'", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(migrated, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_account_is_assigned() {
+        let (_tmp, db) = db();
+        db.projects().add("ws", "p1").unwrap();
+        assert_eq!(count(&db, "accounts"), 0);
+        assert_eq!(count(&db, "workspace_members"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_adding_twice_keeps_the_first_row() {
+        let (_tmp, db) = db();
+        let _clock = clock_at(1000.0);
+        db.projects().add("ws", "p1").unwrap();
+        let _clock = clock_at(2000.0);
+        db.projects().add("ws", "p1").unwrap();
+        assert_eq!(db.projects().ids("ws").unwrap(), ["p1"]);
+        assert_eq!(created_at(&db, "p1"), 1000);
+    }
+
+    #[test]
+    #[serial]
+    fn test_ids_are_per_workspace() {
+        let (_tmp, db) = db();
+        db.projects().add("ws-a", "p1").unwrap();
+        db.projects().add("ws-b", "p2").unwrap();
+        assert_eq!(db.projects().ids("ws-a").unwrap(), ["p1"]);
+        assert_eq!(db.projects().ids("ws-b").unwrap(), ["p2"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_deletes_only_that_project() {
+        let (_tmp, db) = db();
+        db.projects().add("ws", "p1").unwrap();
+        db.projects().add("ws", "p2").unwrap();
+        assert!(db.projects().remove("p1").unwrap());
+        assert!(!db.projects().remove("p1").unwrap());
+        assert_eq!(db.projects().ids("ws").unwrap(), ["p2"]);
+        assert_eq!(count(&db, "workspaces"), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_cascades_to_rows_keyed_on_the_project() {
+        let (_tmp, db) = db();
+        db.projects().add("ws", "p1").unwrap();
+        db.write(|tx| {
+            tx.execute_batch(
+                "CREATE TABLE child (project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE);
+                 INSERT INTO child VALUES ('p1');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        db.projects().remove("p1").unwrap();
+        assert_eq!(count(&db, "child"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_wrongly_typed_value_is_rejected() {
+        let (_tmp, db) = db();
+        let err = db
+            .write(|tx| {
+                tx.execute("INSERT INTO workspaces (id, created_at) VALUES ('ws', 'yesterday')", [])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot store TEXT value in INTEGER column"), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_backfill_adds_only_missing_projects() {
+        let (_tmp, db) = db();
+        let _clock = clock_at(1000.0);
+        db.projects().add("ws", "p1").unwrap();
+        let _clock = clock_at(2000.0);
+        let added = db.projects().backfill("ws", ["p1", "p2", "p3", "p2"]).unwrap();
+        assert_eq!(added, 2);
+        assert_eq!(sorted(db.projects().ids("ws").unwrap()), ["p1", "p2", "p3"]);
+        assert_eq!(created_at(&db, "p1"), 1000);
+    }
+
+    #[test]
+    #[serial]
+    fn test_backfill_never_prunes() {
+        let (_tmp, db) = db();
+        db.projects().add("ws", "gone").unwrap();
+        db.projects().backfill("ws", ["p1"]).unwrap();
+        assert_eq!(sorted(db.projects().ids("ws").unwrap()), ["gone", "p1"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_backfill_with_nothing_missing_does_not_write() {
+        let (_tmp, db) = db();
+        db.projects().add("ws", "p1").unwrap();
+        // A write would wait on this one and fail its busy timeout.
+        let held = WorkspaceDB::new(db.db_path()).unwrap();
+        let (locked, wait_for_lock) = std::sync::mpsc::channel();
+        let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            held.write(|_| {
+                locked.send(()).unwrap();
+                wait_for_release.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        wait_for_lock.recv().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(db.projects().backfill("ws", ["p1"]).unwrap(), 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        release.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_backfill_of_a_new_workspace_records_it() {
+        let (_tmp, db) = db();
+        assert_eq!(db.projects().backfill("ws", ["p1"]).unwrap(), 1);
+        assert_eq!(count(&db, "workspaces"), 1);
+        assert_eq!(db.projects().backfill("ws", std::iter::empty()).unwrap(), 0);
     }
 }
