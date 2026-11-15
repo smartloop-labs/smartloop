@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -47,6 +47,7 @@ use crate::model::spec::MODEL_SPECS;
 use crate::model_host::client::{ModelClient, ModelHostError, TextStream};
 use crate::tasks::IndexerTask;
 use crate::types::ANSWER_TIER;
+use crate::utils::timing;
 use crate::workspace::context::{
     active_project_id, bind, scope_project, set_active_project, use_project, ProjectBoundExecutor,
 };
@@ -2294,6 +2295,7 @@ impl Producer {
         // verification wants it.  Freeing it here would mean reloading the
         // GGUF seconds later, exactly where the user is waiting for
         // citations.  The consumer frees it once it is done.
+        let _unload = timing::phase("chat.unload");
         self.svc.unload_auxiliary_models(self.include_embedding);
     }
 
@@ -2306,6 +2308,7 @@ impl Producer {
     /// the tool decision is made and its results are in the context, so a
     /// `<think>` block here only withholds the stream while it is produced.
     fn run(&self, prompt: &str, st: &mut StreamState) -> anyhow::Result<()> {
+        let _caller = timing::caller("chat.answer");
         let client = self.svc.model_client();
         let stream = client.stream(
             prompt,
@@ -2576,6 +2579,7 @@ impl Drop for StreamFinally {
 /// while nothing leaks into other tasks sharing the runtime thread.
 struct BoundStream<S> {
     binding: Option<String>,
+    timing: Option<Arc<timing::Request>>,
     inner: Option<Pin<Box<S>>>,
 }
 
@@ -2585,6 +2589,7 @@ impl<S: Stream> Stream for BoundStream<S> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let _guard = use_project(this.binding.as_deref());
+        let _timing = timing::enter(this.timing.clone());
         match this.inner.as_mut() {
             Some(inner) => inner.as_mut().poll_next(cx),
             None => Poll::Ready(None),
@@ -2595,6 +2600,7 @@ impl<S: Stream> Stream for BoundStream<S> {
 impl<S> Drop for BoundStream<S> {
     fn drop(&mut self) {
         let _guard = use_project(self.binding.as_deref());
+        let _timing = timing::enter(self.timing.clone());
         drop(self.inner.take());
     }
 }
@@ -2633,7 +2639,7 @@ pub fn stream_chunks(request: ChatCompletionRequest, model_service: Arc<dyn Chat
     // any future caller that skips the endpoint.
     let binding = request_project(&request, &*model_service).or_else(active_project_id);
     let inner = stream_chunks_inner(request, model_service);
-    Box::pin(BoundStream { binding, inner: Some(Box::pin(inner)) })
+    Box::pin(BoundStream { binding, timing: timing::current(), inner: Some(Box::pin(inner)) })
 }
 
 fn stream_chunks_inner(
@@ -2673,7 +2679,9 @@ fn stream_chunks_inner(
         if has_attachments {
             yield status_event("attachments", "processing", "Resolving attachments...");
         }
+        let attachments = timing::timer("chat.attachments");
         messages = resolve_message_attachments(messages, &*svc);
+        drop(attachments);
         if has_attachments {
             yield status_event("attachments", "completed", "Attachments resolved");
         }
@@ -2686,6 +2694,7 @@ fn stream_chunks_inner(
         let _ = request_cwd(&request, &*svc);
         if let Some(folder) = svc.current_work_dir() {
             yield status_event("index", "processing", &format!("Checking documents in {folder}"));
+            let _index_wait = timing::timer("chat.index_wait");
             let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<bool>();
             let worker = svc.clone();
             std::thread::spawn(bind(move || {
@@ -2823,6 +2832,7 @@ fn stream_chunks_inner(
             // hop does not copy the binding, and everything the orchestrator
             // resolves — documents, skills, MCP servers — hangs off it.
             let orchestrate_svc = svc.clone();
+            let orchestrate_timer = timing::timer("chat.orchestrate");
             let orchestrate_task =
                 tokio::task::spawn_blocking(bind(move || orchestrate_svc.orchestrate(args)));
 
@@ -2908,6 +2918,7 @@ fn stream_chunks_inner(
                     return;
                 }
             };
+            drop(orchestrate_timer);
             orchestrator_context = outcome.context;
             classified_coding = outcome.coding;
             citations = outcome.citations;
@@ -3012,23 +3023,28 @@ fn stream_chunks_inner(
         })));
 
         let announce_svc = svc.clone();
+        let announce = timing::timer("chat.announce_model");
         run_blocking(move || announce_svc.announce_response_model(response_capability)).await;
+        drop(announce);
         let drained: Vec<(String, String, String)> = std::mem::take(&mut *model_events.lock());
         for (step, status, message) in drained {
             yield status_event(&step, &status, &message);
         }
 
         let max_ctx_svc = svc.clone();
+        let max_context = timing::timer("chat.max_context");
         let max_ctx = run_blocking(move || {
             max_ctx_svc.get_response_max_context_tokens(response_capability)
         })
         .await;
+        drop(max_context);
 
         let drained: Vec<(String, String, String)> = std::mem::take(&mut *model_events.lock());
         for (step, status, message) in drained {
             yield status_event(&step, &status, &message);
         }
 
+        let preparing = timing::timer("chat.preparing");
         let current_date = request_current_date(&request);
         if let Some(context) = orchestrator_context.as_mut().filter(|c| !c.is_empty())
             && max_ctx > 0
@@ -3072,6 +3088,9 @@ fn stream_chunks_inner(
             project_info.as_deref(),
             Some(&current_date),
         );
+        let mut preparing = preparing;
+        preparing.field("prompt_chars", prompt.len());
+        drop(preparing);
 
         yield status_event("preparing", "completed", "Preparing response...");
 
@@ -3129,7 +3148,9 @@ fn stream_chunks_inner(
                 // handed over a channel.
                 let (text_tx, mut text_rx) = unbounded_channel::<Result<String, String>>();
                 let cancel = cancelled.clone();
+                let client_tools_timer = timing::timer("chat.client_tools");
                 let worker = tokio::task::spawn_blocking(bind(move || {
+                    let _caller = timing::caller("chat.answer");
                     match client.stream(&full, Some(&model), response_capability, Some(cancel), Some(false)) {
                         Ok(stream) => {
                             for item in stream {
@@ -3165,6 +3186,9 @@ fn stream_chunks_inner(
                             break;
                         }
                         Ok(Some(Ok(text))) => {
+                            if reply.is_empty() {
+                                timing::mark("first_token");
+                            }
                             reply.push_str(&text);
                             // Up to any tool-call markup, which never shows.
                             let safe = streamable_end(&reply);
@@ -3175,7 +3199,9 @@ fn stream_chunks_inner(
                         }
                     }
                 }
-                if let Err(e) = worker.await {
+                let worker_result = worker.await;
+                drop(client_tools_timer);
+                if let Err(e) = worker_result {
                     failure.get_or_insert_with(|| match e.try_into_panic() {
                         Ok(payload) => panic_message(payload.as_ref()),
                         Err(e) => e.to_string(),
@@ -3240,6 +3266,7 @@ fn stream_chunks_inner(
         };
         // Start the sync stream on the single-worker pool, carrying the
         // request's project binding into the worker.
+        let streaming = timing::timer("chat.streaming");
         drop(EXECUTOR.submit(move || producer.run_sync_stream()));
 
         // Load the embedding model and encode the sources alongside generation
@@ -3350,6 +3377,9 @@ fn stream_chunks_inner(
                     break;
                 }
                 Some(QueueItem::Text(text)) => {
+                    if fin.parts.is_empty() {
+                        timing::mark("first_token");
+                    }
                     fin.parts.push(text.clone());
                     if fin.parts.len() == PREP_SOURCES_AFTER_CHUNKS {
                         start_source_prep(&mut prepared_sources, &citations, &svc);
@@ -3358,6 +3388,8 @@ fn stream_chunks_inner(
                 }
             }
         }
+
+        drop(streaming);
 
         // The answer is complete, so the sources can finally be checked against
         // it.  Announced as a step rather than done silently: this embeds the
@@ -3372,6 +3404,7 @@ fn stream_chunks_inner(
             // nothing left to overlap with.
             start_source_prep(&mut prepared_sources, &citations, &svc);
             yield status_event("citations", "processing", "Checking sources...");
+            let citations_timer = timing::timer("chat.citations");
             let verified = verified_citations_async(
                 shared,
                 fin.parts.concat(),
@@ -3379,6 +3412,7 @@ fn stream_chunks_inner(
                 prepared_sources.take(),
             )
             .await;
+            drop(citations_timer);
             fin.verified = Some(verified.clone());
             // Verification held the last reference to the embedding model —
             // the producer skipped it on the way out.  Free it now, without
@@ -3545,13 +3579,21 @@ pub fn parse_chat_request(body: &[u8]) -> Result<ChatCompletionRequest, Response
     description = "OpenAI-compatible. Set `stream: true` to receive Server-Sent Events: `chat.completion.chunk` frames, `chat.status` progress frames, then `data: [DONE]`. A slow generation is never cut off.",
     responses((status = 200, description = "A completion, or with `stream: true` an SSE stream of chunks ending in `data: [DONE]`", content((crate::api::model::chat::ChatCompletionResponse = "application/json"), (crate::api::model::chat::ChatCompletionChunk = "text/event-stream"))), (status = 400, description = "Invalid request"), (status = 500, description = "Server error"))
 )]
-pub async fn create_chat_completion(body: Bytes) -> Response {
+pub async fn create_chat_completion(headers: HeaderMap, body: Bytes) -> Response {
     let request = match parse_chat_request(&body) {
         Ok(request) => request,
         Err(response) => return response,
     };
+    // Under SLP_TIMING the turn is timed under the id the caller (the
+    // supervisor, or docent) sent, so their lines join this process's.
+    let request_id = headers.get(timing::REQUEST_ID_HEADER).and_then(|v| v.to_str().ok());
+    let timed = timing::begin(
+        request_id,
+        "chat",
+        json!({"model": request.model, "stream": request.stream, "session": request.session_id}),
+    );
     let model_service: Arc<dyn ChatService> = get_model_service();
-    match create_chat_completion_with(request, model_service).await {
+    match timing::scope(timed, create_chat_completion_with(request, model_service)).await {
         Ok(response) => response,
         Err(e) => e.into_response(),
     }
@@ -3709,7 +3751,9 @@ async fn complete_body(
             ..OrchestrateArgs::default()
         };
         let orchestrate_svc = svc.clone();
+        let orchestrate_timer = timing::timer("chat.orchestrate");
         let outcome = run_on_executor(move || orchestrate_svc.orchestrate(args)).await??;
+        drop(orchestrate_timer);
         orchestrator_context = outcome.context;
         classified_coding = outcome.coding;
         tool_error = outcome.error;
@@ -3802,8 +3846,10 @@ async fn complete_body(
     let generate_svc = svc.clone();
     let generate_prompt = prompt.clone();
     let generate_model = request.model.clone();
+    let generating = timing::timer("chat.generate");
     drop(EXECUTOR.submit(move || {
         // No reasoning on the answer — see the streaming path.
+        let _caller = timing::caller("chat.answer");
         let result = generate_svc.model_client().generate(
             &generate_prompt,
             Some(&generate_model),
@@ -3829,6 +3875,7 @@ async fn complete_body(
     } else {
         (&mut rx).await
     };
+    drop(generating);
     let response_text = generation
         .map_err(|_| anyhow::anyhow!("executor worker exited without a result"))??;
 
