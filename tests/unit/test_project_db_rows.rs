@@ -65,3 +65,22 @@ fn test_the_system_project_is_recorded() {
     let created = f.svc.create_project("general_chat", None, true, None, None, None).unwrap();
     assert_eq!(recorded(&f.svc), [created_id(&created)]);
 }
+
+#[test]
+#[serial]
+fn test_a_deleted_project_loses_its_row() {
+    let f = fixture();
+    let kept = f.svc.create_project("alpha", None, false, None, None, None).unwrap();
+    let deleted = f.svc.create_project("beta", None, false, None, None, None).unwrap();
+    f.svc.delete_project(&created_id(&deleted)).unwrap();
+    assert_eq!(recorded(&f.svc), [created_id(&kept)]);
+}
+
+#[test]
+#[serial]
+fn test_the_system_project_keeps_its_row() {
+    let f = fixture();
+    let system = f.svc.create_project("general_chat", None, true, None, None, None).unwrap();
+    assert!(f.svc.delete_project(&created_id(&system)).is_err());
+    assert_eq!(recorded(&f.svc), [created_id(&system)]);
+}

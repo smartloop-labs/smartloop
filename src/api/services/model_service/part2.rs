@@ -1738,6 +1738,10 @@ impl ModelService {
 
         let was_current = project.current;
 
+        // First, so a failure leaves the project whole; the rows keyed on it
+        // go with it.
+        workspace_db_for(&workspace.read())?.projects().remove(project_id)?;
+
         // Remove internal project directory.
         if !project.project_dir.is_empty() && Path::new(&project.project_dir).exists() {
             std::fs::remove_dir_all(&project.project_dir)?;
