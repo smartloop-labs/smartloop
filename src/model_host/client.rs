@@ -29,6 +29,7 @@ use crate::api::services::model_service::ModelService;
 use crate::config::AppSettings;
 use crate::llms::base_llm::{BatchPrompt, CancelEvent, GenerationChunk};
 use crate::model_host::pb;
+use crate::utils::timing;
 use crate::workspace::context::pinned_project_id;
 
 /// Logger name used by the Python module.
@@ -102,6 +103,11 @@ impl ModelHostError {
 /// Streamed text as produced by [`ModelClient::stream`].  A failure part-way
 /// through surfaces as an `Err` item.
 pub type TextStream<'a> = Box<dyn Iterator<Item = anyhow::Result<String>> + 'a>;
+
+/// The characters across a batch's prompts, for timing.
+fn batch_chars(prompts: &[BatchPrompt]) -> usize {
+    prompts.iter().map(|p| p.prompt.len()).sum()
+}
 
 /// Everything a project agent needs from whoever owns the device.
 ///
@@ -493,6 +499,7 @@ impl ModelClient for InProcessModelClient {
         max_tokens: Option<usize>,
         thinking: Option<bool>,
     ) -> anyhow::Result<String> {
+        let _t = timing::llm_call("generate", capability, model_name, prompt.len());
         self.service
             .generate_completion(prompt, model_name, capability, max_tokens, thinking)
     }
@@ -504,6 +511,8 @@ impl ModelClient for InProcessModelClient {
         capability: Option<&str>,
         cancelled: Option<CancelEvent>,
     ) -> anyhow::Result<Vec<String>> {
+        let mut t = timing::llm_call("generate_batch", capability, model_name, batch_chars(prompts));
+        t.field("batch", prompts.len());
         self.service.generate_batch_completion(prompts, model_name, capability, cancelled)
     }
 
@@ -518,10 +527,11 @@ impl ModelClient for InProcessModelClient {
         cancelled: Option<CancelEvent>,
         thinking: Option<bool>,
     ) -> anyhow::Result<TextStream<'a>> {
+        let t = timing::llm_call("stream", capability, model_name, prompt.len());
         let chunks = self
             .service
             .stream_completion(prompt, model_name, cancelled, capability, thinking)?;
-        Ok(Box::new(chunks.map(|chunk| chunk.map(|c| c.text))))
+        Ok(timing::timed_stream(Box::new(chunks.map(|chunk| chunk.map(|c| c.text))), t))
     }
 
     /// `encode_local`, not `encode_texts`: this process owns the embedder, and
@@ -982,6 +992,7 @@ impl ModelClient for RemoteModelClient {
         max_tokens: Option<usize>,
         thinking: Option<bool>,
     ) -> anyhow::Result<String> {
+        let _t = timing::llm_call("generate", capability, model_name, prompt.len());
         let request = pb::GenerateRequest {
             prompt: prompt.to_string(),
             model_name: model_name.unwrap_or_default().to_string(),
@@ -1005,6 +1016,8 @@ impl ModelClient for RemoteModelClient {
         capability: Option<&str>,
         cancelled: Option<CancelEvent>,
     ) -> anyhow::Result<Vec<String>> {
+        let mut t = timing::llm_call("generate_batch", capability, model_name, batch_chars(prompts));
+        t.field("batch", prompts.len());
         let request = pb::GenerateBatchRequest {
             prompts: prompts
                 .iter()
@@ -1052,6 +1065,7 @@ impl ModelClient for RemoteModelClient {
         cancelled: Option<CancelEvent>,
         thinking: Option<bool>,
     ) -> anyhow::Result<TextStream<'a>> {
+        let t = timing::llm_call("stream", capability, model_name, prompt.len());
         let request = pb::StreamRequest {
             prompt: prompt.to_string(),
             model_name: model_name.unwrap_or_default().to_string(),
@@ -1087,7 +1101,7 @@ impl ModelClient for RemoteModelClient {
                 }
             }
         });
-        Ok(Box::new(RemoteTextStream { client: self, receiver, task, cancelled, done: false }))
+        Ok(timing::timed_stream(Box::new(RemoteTextStream { client: self, receiver, task, cancelled, done: false }), t))
     }
 
     fn encode_texts(

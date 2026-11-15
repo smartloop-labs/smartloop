@@ -462,6 +462,46 @@ pub fn timer(name: &str) -> Phase {
     Phase::start(name, json!({}), false)
 }
 
+/// Time one LLM call: a phase named `llm.<capability>`, logged with the
+/// phase that made it, the model and the prompt size.
+pub fn llm_call(call: &str, capability: Option<&str>, model: Option<&str>, prompt_chars: usize) -> Phase {
+    if !on() {
+        return Phase { inner: None };
+    }
+    let capability = capability.filter(|c| !c.is_empty());
+    let name = format!("llm.{}", capability.unwrap_or("default"));
+    let fields = json!({
+        "call": call,
+        "caller": current_caller(),
+        "capability": capability,
+        "model": model.filter(|m| !m.is_empty()),
+        "prompt_chars": prompt_chars,
+    });
+    Phase::start(&name, fields, false)
+}
+
+/// Wrap a stream so `phase` logs when its first item came and how many
+/// followed; the phase ends when the stream is dropped.
+pub fn timed_stream<'a, T: 'a>(
+    stream: Box<dyn Iterator<Item = T> + 'a>,
+    phase: Phase,
+) -> Box<dyn Iterator<Item = T> + 'a> {
+    if phase.inner.is_none() {
+        return stream;
+    }
+    let mut phase = phase;
+    let mut chunks: u64 = 0;
+    Box::new(stream.inspect(move |_| {
+        chunks += 1;
+        if chunks == 1
+            && let Some(first) = phase.elapsed()
+        {
+            phase.field("first_token_ms", ms(first));
+        }
+        phase.field("chunks", chunks);
+    }))
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -562,6 +602,26 @@ mod tests {
         })
         .await;
         assert_eq!(seen.as_deref(), Some("req-scoped"));
+    }
+
+    #[test]
+    fn llm_stream_logs_its_caller_and_first_token() {
+        capture();
+        let request = begin(None, "chat", json!({})).unwrap();
+        let id = request.id().to_string();
+        {
+            let _entered = enter(Some(request));
+            let _caller = caller("chat.answer");
+            let stream = timed_stream(Box::new(vec![1, 2, 3].into_iter()), llm_call("stream", Some("coding"), None, 10));
+            assert_eq!(stream.count(), 3);
+        }
+        let call = events(&id)
+            .into_iter()
+            .find(|e| e["ev"] == "phase" && e["name"] == "llm.coding")
+            .expect("llm phase");
+        assert_eq!(call["caller"], "chat.answer");
+        assert_eq!(call["chunks"], 3);
+        assert!(call["first_token_ms"].is_number());
     }
 
     #[test]

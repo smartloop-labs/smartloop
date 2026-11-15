@@ -449,6 +449,16 @@ impl StreamTiming {
         }
         let ms = |d: Duration| d.as_millis();
         let total = self.started.elapsed();
+        crate::utils::timing::event(
+            "cloud.stream",
+            json!({
+                "model": model,
+                "ms": crate::utils::timing::ms(total),
+                "first_token_ms": self.first.map(|f| crate::utils::timing::ms(f - self.started)),
+                "chunks": self.chunks,
+                "usage": self.usage,
+            }),
+        );
         let Some(first) = self.first else {
             tracing::info!(target: LOG_TARGET, "[cloud] {model} streamed no text in {} ms", ms(total));
             return;
@@ -519,6 +529,10 @@ impl BaseLLM for CloudLLM {
     /// an empty reply as unusable, where a truncated one would pass as
     /// complete.
     fn call(&self, prompt: &str, _stop: Option<&[String]>, options: CallOptions) -> anyhow::Result<String> {
+        let _t = crate::utils::timing::phase_with(
+            "cloud.http",
+            json!({"model": self.model_name, "prompt_chars": prompt.len()}),
+        );
         let (prompt, tools) = split_tools(prompt);
         let tools = tools.filter(|_| self.supports_native_tools());
         let tools = tools.as_deref();
