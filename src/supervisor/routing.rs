@@ -54,6 +54,7 @@ use regex::Regex;
 
 use crate::api::middleware;
 use crate::supervisor::registry::AgentRecord;
+use crate::utils::timing;
 
 /// Logger name of this module.
 const LOGGER: &str = "smartloop.supervisor.routing";
@@ -335,7 +336,7 @@ impl ProjectRoutingMiddleware {
         };
 
         let (parts, body) = request.into_parts();
-        let scope = RequestScope::from_parts(&parts);
+        let mut scope = RequestScope::from_parts(&parts);
         let mut project_id = project_to_proxy(&scope);
         let mut read: Option<Bytes> = None;
         let mut body = Some(body);
@@ -353,13 +354,34 @@ impl ProjectRoutingMiddleware {
             return next.run(Request::from_parts(parts, body)).await;
         };
 
+        let timed = begin_forward(&mut scope, &project_id);
+        timing::scope(timed, self.forward(pool, scope, project_id, read, body)).await
+    }
+
+    /// Start `project_id`'s agent if it is not running, then proxy the
+    /// request to it.
+    async fn forward(
+        &self,
+        pool: Arc<dyn AgentPool>,
+        scope: RequestScope,
+        project_id: String,
+        read: Option<Bytes>,
+        mut body: Option<Body>,
+    ) -> Response {
         // `ensure` is blocking and, for a cold project, can wait for minutes
         // on a child's port and health check.  Run it off the async workers —
         // otherwise that wait freezes the whole supervisor, including every
         // other project's already-running requests, for as long as the cold
         // start takes.
         let wanted = project_id.clone();
-        let ensured = tokio::task::spawn_blocking(move || pool.ensure(&wanted)).await;
+        let ensure_timer = timing::timer("supervisor.ensure");
+        let carried = timing::carry();
+        let ensured = tokio::task::spawn_blocking(move || {
+            let _timing = carried.enter();
+            pool.ensure(&wanted)
+        })
+        .await;
+        drop(ensure_timer);
         let record = match ensured {
             Ok(Ok(record)) => record,
             Ok(Err(exc)) => {
@@ -381,7 +403,12 @@ impl ProjectRoutingMiddleware {
             }
         }
 
-        match proxy(&scope, forwarded, &record.base_url(), &self.client()).await {
+        // Until the child's response headers are back; a streamed body
+        // goes on after.
+        let proxy_timer = timing::timer("supervisor.proxy");
+        let proxied = proxy(&scope, forwarded, &record.base_url(), &self.client()).await;
+        drop(proxy_timer);
+        match proxied {
             Ok(response) => response,
             Err(exc) => {
                 tracing::warn!(target: LOGGER, "[supervisor] project {}: proxy failed: {}", project_id, exc);
@@ -404,6 +431,25 @@ impl ProjectRoutingMiddleware {
             },
         ))
     }
+}
+
+/// Under `SLP_TIMING`, time a forwarded chat turn here, under the id its
+/// caller sent or a fresh one, and pass that id on so the child's timing
+/// joins it.
+fn begin_forward(scope: &mut RequestScope, project_id: &str) -> Option<Arc<timing::Request>> {
+    if !timing::on() || !scope.path.ends_with("/chat/completions") {
+        return None;
+    }
+    let sent = scope
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(timing::REQUEST_ID_HEADER.as_bytes()))
+        .map(|(_, value)| latin1(value));
+    let timed = timing::begin(sent.as_deref(), "forward", serde_json::json!({"project": project_id}))?;
+    if sent.is_none() {
+        scope.headers.push((timing::REQUEST_ID_HEADER.as_bytes().to_vec(), timed.id().as_bytes().to_vec()));
+    }
+    Some(timed)
 }
 
 /// Whether a request asks to switch to the WebSocket protocol.
