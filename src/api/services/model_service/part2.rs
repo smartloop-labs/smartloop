@@ -54,6 +54,7 @@ use crate::paths::{SANDBOX_HOME_MARKER, expand_home};
 use crate::tasks::base_task::{TaskLogger, TaskOptions, TaskStatus};
 use crate::tasks::{BaseTask, DownloaderTask, DocumentsManifest, IndexerTask, MCPTask};
 use crate::utils::logging_setup::get_logger;
+use crate::utils::timing;
 use crate::workspace::context::{own_project, projects_delegated, unbind_project};
 use crate::workspace::Document;
 use crate::workspace::workspace::{MCPAuthType, MCPOAuthCredentials, SharedWorkspace};
@@ -3425,6 +3426,7 @@ impl ModelService {
                 Self::emit_progress(progress.as_ref(), "model", "processing", &format!("Processing image with {name}"));
             });
             let perceived = catch_unwind(AssertUnwindSafe(|| {
+                let _t = timing::phase("orchestrate.vision");
                 self.vision_perceive(&user_message, images, 512, Some(on_vision_model))
             }));
             match perceived {
@@ -3502,7 +3504,9 @@ impl ModelService {
 
         // Reload workspace from disk to pick up changes made by background
         // indexers or project setup since the last request.
+        let reload = timing::phase("orchestrate.workspace_reload");
         model.workspace.write().reload();
+        drop(reload);
 
         let Some(current_project) = model.workspace.read().current_project().cloned() else {
             if let Some(perception) = image_perception.clone() {
@@ -3515,10 +3519,12 @@ impl ModelService {
 
         // Fix stale user server launchers and sweep the built-in servers and
         // skills smartloop used to install, before anything reads them.
+        let sweep = timing::phase("orchestrate.mcp_sweep");
         if let Err(e) = self.migrate_servers_to_local(&current_project.id) {
             tracing::warn!(target: LOG, "[orchestrator] MCP server migration failed: {e}");
         }
         self.sweep_legacy_builtins(&current_project.id);
+        drop(sweep);
         let current_project = model.workspace.read().project(&current_project.id).cloned().unwrap_or(current_project);
 
         // Enabled servers that have tools (both local and remote).
