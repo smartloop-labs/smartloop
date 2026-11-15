@@ -45,6 +45,7 @@ use crate::feedback_store::{ConversationTurn, FeedbackEntry, FeedbackStore, Rati
 use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationStream};
 use crate::llms::cloud_llm::CloudLLM;
 use crate::llms::llm_factory::{LlamaInstanceOptions, LlmFactory};
+use crate::utils::timing;
 use crate::llms::thinking::strip_thinking;
 use crate::mcp::client::{MCPClientError, MCPConnectResult};
 use crate::mcp::read_only_calls::ReadOnlyToolCaller;
@@ -1041,7 +1042,10 @@ impl ModelService {
         let model_config = Self::default_model_config(&default);
 
         tracing::info!(target: LOG_TARGET, "[_ensure_model] loading default model {default}");
-        let model = ModelFactory::get_model(&model_config)?;
+        let model = {
+            let _t = timing::phase_with("model.load", json!({"model": default, "slot": "default"}));
+            ModelFactory::get_model(&model_config)?
+        };
         *self.model.write() = Some(Arc::new(model));
         *self.model_name.write() = Some(default);
         Ok(())
@@ -1360,7 +1364,10 @@ impl ModelService {
             return;
         }
         tracing::info!(target: LOG_TARGET, "[decision-model] Loading decision model: {model_name}");
-        let loaded = ModelFactory::get_model(&ModelConfig::new(model_name)).and_then(|m| m.get_instance());
+        let loaded = {
+            let _t = timing::phase_with("model.load", json!({"model": model_name, "slot": "decision"}));
+            ModelFactory::get_model(&ModelConfig::new(model_name)).and_then(|m| m.get_instance())
+        };
         match loaded {
             Ok(llm) => {
                 *self.decision_llm.write() = Some(llm);
@@ -1476,6 +1483,7 @@ impl ModelService {
             return hook(gguf_path, model_name, cap, thinking);
         }
         let project_id = self.get_project_id().unwrap_or_default();
+        let _t = timing::phase_with("model.load", json!({"model": model_name, "slot": "llama"}));
         let llm = LlmFactory::get_llama_cpp_instance(
             gguf_path,
             &project_id,
@@ -1653,6 +1661,7 @@ impl ModelService {
             if let Some(cb) = on_model_selected {
                 cb(&ws_model.model_name);
             }
+            let load_timer = timing::phase_with("model.load", json!({"model": ws_model.model_name, "slot": "vision"}));
             let loaded = LlmFactory::get_llama_cpp_instance(
                 &gguf_path,
                 &self.get_project_id().unwrap_or_default(),
@@ -1671,6 +1680,7 @@ impl ModelService {
                     ..Default::default()
                 },
             );
+            drop(load_timer);
             match loaded {
                 Ok(llm) => {
                     let llm: Arc<dyn BaseLLM> = Arc::new(llm);

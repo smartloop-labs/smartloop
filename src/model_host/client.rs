@@ -104,6 +104,13 @@ impl ModelHostError {
 /// through surfaces as an `Err` item.
 pub type TextStream<'a> = Box<dyn Iterator<Item = anyhow::Result<String>> + 'a>;
 
+/// Send the timed request's id along, so the host's timing lines join it.
+fn tag_request<T>(request: &mut tonic::Request<T>, request_id: Option<String>) {
+    if let Some(value) = request_id.and_then(|id| id.parse().ok()) {
+        request.metadata_mut().insert(timing::REQUEST_ID_HEADER, value);
+    }
+}
+
 /// The characters across a batch's prompts, for timing.
 fn batch_chars(prompts: &[BatchPrompt]) -> usize {
     prompts.iter().map(|p| p.prompt.len()).sum()
@@ -785,8 +792,10 @@ impl RemoteModelClient {
     {
         let stub = self.connect()?;
         let limit = deadline(timeout.unwrap_or(self.timeout));
+        let request_id = timing::current_id();
         let outcome = run_on_client_runtime(async move {
             let mut request = tonic::Request::new(request);
+            tag_request(&mut request, request_id);
             if let Some(limit) = limit {
                 request.set_timeout(limit);
             }
@@ -1076,9 +1085,11 @@ impl ModelClient for RemoteModelClient {
         };
         let mut stub = self.connect()?;
         let (sender, receiver) = tokio::sync::mpsc::channel::<Result<String, Status>>(16);
+        let mut request = tonic::Request::new(request);
+        tag_request(&mut request, timing::current_id());
         // No deadline: a long answer is not a hung host.
         let task = CLIENT_RUNTIME.spawn(async move {
-            match stub.stream(tonic::Request::new(request)).await {
+            match stub.stream(request).await {
                 Err(status) => {
                     let _ = sender.send(Err(status)).await;
                 }

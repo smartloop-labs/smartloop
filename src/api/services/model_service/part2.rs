@@ -1859,11 +1859,13 @@ impl ModelService {
             return;
         };
         let project_name = self.get_current_project_name().unwrap_or_else(|| "default".to_string());
+        let model_name = self.model_name.read().clone();
         tracing::info!(
             target: LOG,
             "Unloading model: {} (project: {project_name})",
-            self.model_name.read().clone().unwrap_or_else(|| "None".into())
+            model_name.clone().unwrap_or_else(|| "None".into())
         );
+        let _t = timing::phase_with("model.unload", json!({"model": model_name, "slot": "default"}));
         self.free_llm(llm);
         *self.llm.write() = None;
         *self.model_name.write() = None;
@@ -1892,11 +1894,13 @@ impl ModelService {
         let Some(vision) = self.vision_llm.read().clone() else {
             return;
         };
+        let model_name = self.vision_model_name.read().clone().filter(|n| !n.is_empty());
         tracing::info!(
             target: LOG,
             "[vision] Unloading vision model {} — freeing VRAM",
-            self.vision_model_name.read().clone().filter(|n| !n.is_empty()).unwrap_or_else(|| "?".into())
+            model_name.clone().unwrap_or_else(|| "?".into())
         );
+        let _t = timing::phase_with("model.unload", json!({"model": model_name, "slot": "vision"}));
         self.free_llm(vision);
         *self.vision_llm.write() = None;
         *self.vision_model_name.write() = None;
@@ -1914,6 +1918,7 @@ impl ModelService {
             return;
         };
         tracing::info!(target: LOG, "[large-model] Unloading large agent model — freeing VRAM");
+        let _t = timing::phase_with("model.unload", json!({"model": *self.large_model_name.read(), "slot": "large"}));
         self.free_llm(large);
         *self.large_llm.write() = None;
         self.large_model_attempted.store(false, Ordering::SeqCst);
@@ -1944,6 +1949,7 @@ impl ModelService {
         };
         for (name, cached) in victims {
             tracing::info!(target: LOG, "[mem] Evicting prior-step capability model {name} to free VRAM");
+            let _t = timing::phase_with("model.unload", json!({"model": name, "slot": "capability", "evict": true}));
             self.free_llm(cached);
             self.cap_llms.lock().retain(|(slot_name, _)| slot_name != &name);
             freed = true;
@@ -1954,6 +1960,7 @@ impl ModelService {
             && self.large_model_name.read().as_deref() != keep_model_name
         {
             tracing::info!(target: LOG, "[mem] Evicting on-demand large model to free VRAM");
+            let _t = timing::phase_with("model.unload", json!({"model": *self.large_model_name.read(), "slot": "large", "evict": true}));
             self.free_llm(large);
             *self.large_llm.write() = None;
             *self.large_model_name.write() = None;

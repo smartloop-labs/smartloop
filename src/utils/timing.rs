@@ -159,6 +159,9 @@ pub struct Request {
     kind: String,
     started: Instant,
     tally: Mutex<Tally>,
+    /// False for a request adopted from another process, which writes the
+    /// summary itself.
+    summarize: bool,
 }
 
 impl Request {
@@ -224,6 +227,9 @@ impl Request {
 
 impl Drop for Request {
     fn drop(&mut self) {
+        if !self.summarize {
+            return;
+        }
         let (fields, text) = self.summary();
         emit(Some(&self.id), "request.end", fields);
         tracing::info!(target: LOG_TARGET, "{}", text);
@@ -259,6 +265,7 @@ pub fn begin(id: Option<&str>, kind: &str, fields: Value) -> Option<Arc<Request>
         kind: kind.to_string(),
         started: Instant::now(),
         tally: Mutex::new(Tally::default()),
+        summarize: true,
     });
     let mut fields = fields;
     if let Value::Object(map) = &mut fields {
@@ -266,6 +273,19 @@ pub fn begin(id: Option<&str>, kind: &str, fields: Value) -> Option<Arc<Request>
     }
     emit(Some(&request.id), "request.begin", fields);
     Some(request)
+}
+
+/// Join request `id`, begun in another process: events carry its id, and
+/// that process totals it.
+pub fn adopt(id: Option<&str>) -> Option<Arc<Request>> {
+    let id = id.filter(|id| !id.is_empty() && on())?;
+    Some(Arc::new(Request {
+        id: id.to_string(),
+        kind: String::new(),
+        started: Instant::now(),
+        tally: Mutex::new(Tally::default()),
+        summarize: false,
+    }))
 }
 
 /// The request this work belongs to, if any.
