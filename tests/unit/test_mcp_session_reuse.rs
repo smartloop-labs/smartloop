@@ -4,7 +4,7 @@
 //! `Mcp-Session-Id` were re-initialized before every request.  These drive
 //! `MCPToolCaller::call_tool` against a scripted server and count handshakes.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 use serial_test::serial;
 
 use smartloop::agents::mcp::mcp_tool_caller::reset_refresh_state;
-use smartloop::mcp::client::{HttpBody, HttpResponse, HttpTransport, HttpTransportOverride};
+use smartloop::mcp::client::{
+    set_http_transport_override, shared_http_transport, HttpBody, HttpResponse, HttpTransport, HttpTransportOverride,
+};
 use smartloop::mcp::session_pool::{backdate_mcp_sessions, invalidate_mcp_sessions, reset_mcp_sessions};
 use smartloop::workspace::MCPServer;
 
@@ -479,4 +481,222 @@ fn test_expiry_is_logged() {
     let (_, logged) = capture_logs(tracing::Level::INFO, || call(&server("s1"), Some("tok")));
 
     assert!(logged.contains("Dropped 1 session(s) idle past the 300s keep-alive"), "{logged}");
+}
+
+// ------------------------------------------------- servers that read headers
+
+/// A request as [`HeaderServer`] saw it.
+#[derive(Clone, Debug)]
+struct Seen {
+    method: String,
+    token: Option<String>,
+    session: Option<String>,
+}
+
+type HeaderHandler = dyn Fn(&str, &str, &Seen) -> HttpResponse + Send + Sync;
+
+/// A server whose answers can depend on the bearer token and session id a
+/// request carried, which `FakeHttp`'s handler is not shown.
+struct HeaderServer {
+    handler: Box<HeaderHandler>,
+    seen: parking_lot::Mutex<Vec<Seen>>,
+}
+
+impl HeaderServer {
+    fn install(
+        handler: impl Fn(&str, &str, &Seen) -> HttpResponse + Send + Sync + 'static,
+    ) -> (Arc<Self>, HttpTransportOverride) {
+        let server = Arc::new(Self { handler: Box::new(handler), seen: parking_lot::Mutex::new(Vec::new()) });
+        let guard = HttpTransportOverride::install(server.clone());
+        (server, guard)
+    }
+
+    fn count(&self, method: &str) -> usize {
+        self.seen.lock().iter().filter(|s| s.method == method).count()
+    }
+}
+
+impl HttpTransport for HeaderServer {
+    fn get(&self, _url: &str) -> Result<HttpResponse, String> {
+        Ok(HttpResponse::new(405, ""))
+    }
+
+    fn post(&self, url: &str, body: &HttpBody, headers: &[(String, String)]) -> Result<HttpResponse, String> {
+        let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone());
+        let seen = Seen {
+            method: rpc_method(Some(body)),
+            token: header("Authorization").and_then(|v| v.strip_prefix("Bearer ").map(str::to_string)),
+            session: header("Mcp-Session-Id"),
+        };
+        self.seen.lock().push(seen.clone());
+        Ok((self.handler)(url, &seen.method, &seen))
+    }
+}
+
+fn initialized(session_id: &str) -> HttpResponse {
+    HttpResponse::json(200, &json!({"jsonrpc": "2.0", "id": "1", "result": {
+        "protocolVersion": "2024-11-05",
+        "serverInfo": {"name": "example", "version": "1"},
+    }}))
+    .with_header("mcp-session-id", session_id)
+}
+
+fn tool_ok() -> HttpResponse {
+    HttpResponse::json(
+        200,
+        &json!({"jsonrpc": "2.0", "id": "2", "result": {"content": [{"type": "text", "text": "ok"}]}}),
+    )
+}
+
+// ------------------------------------------------- a failed handshake
+
+#[test]
+#[serial(mcp_global)]
+fn test_a_failed_handshake_is_tried_again_next_call() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let failures = Arc::new(AtomicUsize::new(1));
+    let left = failures.clone();
+    let (srv, _guard) = HeaderServer::install(move |_, method, _| match method {
+        "initialize" if left.load(Ordering::SeqCst) > 0 => {
+            left.fetch_sub(1, Ordering::SeqCst);
+            HttpResponse::new(503, "unavailable")
+        }
+        "initialize" => initialized("sess-1"),
+        "tools/call" => tool_ok(),
+        _ => HttpResponse::new(202, ""),
+    });
+    let s1 = server("s1");
+
+    let first = tool_caller().call_tool(&s1, "search", None, Some("tok"), None);
+    assert!(!first.success);
+    call(&s1, Some("tok"));
+    call(&s1, Some("tok"));
+
+    assert_eq!(srv.count("initialize"), 2, "one failed, one that then serves both calls");
+    assert_eq!(srv.count("tools/call"), 2, "nothing is called on a session that never opened");
+}
+
+#[test]
+#[serial(mcp_global)]
+fn test_a_401_on_the_handshake_still_reads_as_expired_auth() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let (_srv, _guard) = HeaderServer::install(|_, _, _| HttpResponse::new(401, ""));
+
+    let result = tool_caller().call_tool(&server("s1"), "search", None, Some("tok"), None);
+
+    assert!(!result.success);
+    assert!(result.auth_expired);
+}
+
+// ------------------------------------------------- refresh through call_with_refresh
+
+#[test]
+#[serial(mcp_global)]
+fn test_a_refreshed_call_runs_on_a_session_opened_with_the_new_token() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    reset_refresh_state();
+    let (srv, _guard) = HeaderServer::install(|url, method, seen| {
+        if url == TOKEN_ENDPOINT {
+            return ok_json(json!({"access_token": "fresh", "token_type": "Bearer", "expires_in": 3600}));
+        }
+        match (method, seen.token.as_deref()) {
+            ("initialize", Some("fresh")) => initialized("sess-fresh"),
+            ("initialize", _) => initialized("sess-stale"),
+            ("tools/call", Some("fresh")) => tool_ok(),
+            ("tools/call", _) => HttpResponse::new(401, ""),
+            _ => HttpResponse::new(202, ""),
+        }
+    });
+    let mut s1 = oauth_server("s1", "example", URL, Some(TOKEN_ENDPOINT), Some("tok"), Some("rt"));
+
+    let (result, refreshed) = tool_caller().call_with_refresh(&mut s1, "search", None, None);
+    assert!(result.success, "{:?}", result.error);
+    assert!(refreshed);
+    call(&s1, Some("fresh"));
+
+    let calls: Vec<Seen> = srv.seen.lock().iter().filter(|s| s.method == "tools/call").cloned().collect();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[1].token.as_deref(), Some("fresh"));
+    assert_eq!(calls[1].session.as_deref(), Some("sess-fresh"), "not the session opened under the old token");
+    assert_eq!(calls[2].session.as_deref(), Some("sess-fresh"), "and later calls reuse it");
+    assert_eq!(srv.count("initialize"), 2);
+    reset_refresh_state();
+}
+
+// ------------------------------------------------- two calls lose the session at once
+
+#[test]
+#[serial(mcp_global)]
+fn test_callers_that_lose_the_session_together_open_one_new_one() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let sessions = Arc::new(AtomicUsize::new(0));
+    let stale = Arc::new(AtomicBool::new(false));
+    let stale_arrivals = Arc::new(AtomicUsize::new(0));
+    let (n, refusing, arrivals) = (sessions.clone(), stale.clone(), stale_arrivals.clone());
+    let (srv, _guard) = HeaderServer::install(move |_, method, seen| match method {
+        "initialize" => {
+            let id = n.fetch_add(1, Ordering::SeqCst) + 1;
+            // A slow handshake, so the other caller acts while it runs.
+            std::thread::sleep(Duration::from_millis(50));
+            initialized(&format!("sess-{id}"))
+        }
+        "tools/call" if refusing.load(Ordering::SeqCst) && seen.session.as_deref() == Some("sess-1") => {
+            // Hold each stale request until both have arrived, then answer
+            // the second while the first caller's new handshake is running,
+            // so its caller drops the session it lost mid-replacement.
+            let arrived = arrivals.fetch_add(1, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while arrivals.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if arrived == 1 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            HttpResponse::new(404, "")
+        }
+        "tools/call" => tool_ok(),
+        _ => HttpResponse::new(202, ""),
+    });
+    call(&server("s1"), Some("tok"));
+    stale.store(true, Ordering::SeqCst);
+
+    let threads: Vec<_> = (0..2).map(|_| std::thread::spawn(|| call(&server("s1"), Some("tok")))).collect();
+    for t in threads {
+        t.join().expect("a caller panicked");
+    }
+
+    assert_eq!(stale_arrivals.load(Ordering::SeqCst), 2);
+    assert_eq!(srv.count("initialize"), 2, "the second caller adopts the first one's new session");
+}
+
+// ------------------------------------------------- the shared client
+
+#[test]
+#[serial(mcp_global)]
+fn test_clients_share_one_http_client() {
+    let previous = set_http_transport_override(None);
+
+    let (a, b) = (shared_http_transport(), shared_http_transport());
+
+    set_http_transport_override(previous);
+    assert!(Arc::ptr_eq(&a, &b));
+}
+
+#[test]
+#[serial]
+#[serial(mcp_global)]
+fn test_deleting_a_project_drops_its_servers_sessions() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let env = ServiceEnv::new("p1");
+    env.add_server(server("s1"));
+    let fake = mcp_server(Some("sess-1"));
+    let _guard = HttpTransportOverride::install(fake.clone());
+
+    call(&server("s1"), Some("tok"));
+    call(&server("other"), Some("tok"));
+    env.model_service.delete_project("p1").expect("deleted");
+    call(&server("s1"), Some("tok"));
+    call(&server("other"), Some("tok"));
+
+    assert_eq!(count(&fake, "initialize"), 3, "only the deleted project's server handshakes again");
 }
