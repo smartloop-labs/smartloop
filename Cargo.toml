@@ -124,3 +124,12 @@ debug = false
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# `make run-debug`: release optimisation, but without the link-time and
+# single-unit codegen that make every release rebuild take minutes.  Shipped
+# binaries still come from `release` (`make build-binary`).
+[profile.dev-run]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
