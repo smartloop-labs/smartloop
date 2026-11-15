@@ -24,6 +24,7 @@ use crate::db::embeddings::{
     try_cosine_distances,
 };
 use crate::db::store::{apply_coverage_boost, discriminative_terms, terms_coverage_boost, Chunk, ChunkResult, VectorStore};
+use crate::utils::timing;
 
 /// Logger name of the Python module.
 const LOG_TARGET: &str = "smartloop.db.sqlite_store";
@@ -559,7 +560,9 @@ impl IndexStore {
         where_: Option<&Map<String, Value>>,
         where_document: Option<&Map<String, Value>>,
     ) -> anyhow::Result<Vec<ChunkResult>> {
+        let fetch = timing::phase("retrieval.fetch_rows");
         let rows = self.fetch_rows(where_, where_document)?;
+        drop(fetch);
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -569,7 +572,9 @@ impl IndexStore {
         // embedding model is unavailable.  The keyword-coverage boost in the
         // dense path plus the downstream per-document relevance filter
         // suppress the clustering noise dense search can otherwise introduce.
+        let embed = timing::phase("retrieval.embed");
         let query_vecs = encode_texts(&[query_text.to_string()], self.base_dir.as_deref(), None);
+        drop(embed);
         if let Some(query_vecs) = query_vecs {
             if query_vecs.nrows() > 0 {
                 return self.query_by_embedding(

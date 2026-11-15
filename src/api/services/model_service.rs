@@ -3564,6 +3564,7 @@ impl ModelService {
             return None;
         };
 
+        let _t = timing::phase("retrieval.search");
         match self.vector_search_grouped_inner(&workspace, query, conversation_history) {
             Ok(result) => result,
             Err(e) => {
