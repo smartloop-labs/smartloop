@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::mcp::session_pool::PooledSession;
+use crate::utils::timing;
 use crate::workspace::{MCPToolAnnotations, MCPToolDefinition};
 
 /// Python logger name of this module.
@@ -867,6 +868,7 @@ impl MCPClient {
         access_token: Option<&str>,
         token_type: &str,
     ) -> MCPConnectResult {
+        let _t = timing::phase_with("mcp.list_tools", serde_json::json!({"url": server_url}));
         match self.discover(server_url, access_token, token_type) {
             Ok(result) => result,
             Err(MCPClientError::Connection(e)) => {
@@ -946,6 +948,7 @@ impl MCPClient {
         access_token: Option<&str>,
         token_type: &str,
     ) -> Result<(), MCPClientError> {
+        let _t = timing::phase_with("mcp.connect", serde_json::json!({"url": server_url}));
         let started = Instant::now();
         let result = self.initialize(server_url, access_token, token_type);
         self.handshake = Some(self.handshake.unwrap_or_default() + started.elapsed());
@@ -1014,6 +1017,13 @@ impl MCPClient {
             started.elapsed().as_millis(),
             self.session_note(retried)
         );
+        if self.session_wait >= Duration::from_millis(10) {
+            timing::count("mcp.session_wait");
+            timing::event(
+                "mcp.session_wait",
+                serde_json::json!({"url": server_url, "ms": timing::ms(self.session_wait)}),
+            );
+        }
         match outcome {
             Ok(result) => {
                 let (content, is_error) = call_result_parts(&result);
