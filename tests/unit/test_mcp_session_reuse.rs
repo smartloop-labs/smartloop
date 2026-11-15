@@ -16,7 +16,7 @@ use smartloop::mcp::client::{HttpBody, HttpResponse, HttpTransport, HttpTranspor
 use smartloop::mcp::session_pool::{backdate_mcp_sessions, invalidate_mcp_sessions, reset_mcp_sessions};
 use smartloop::workspace::MCPServer;
 
-use crate::shared::mcp::{ok_json, oauth_server, tool_caller, EnvGuard, FakeHttp, ServiceEnv};
+use crate::shared::mcp::{capture_logs, ok_json, oauth_server, tool_caller, EnvGuard, FakeHttp, ServiceEnv};
 
 const URL: &str = "https://mcp.example.com/mcp";
 const TOKEN_ENDPOINT: &str = "https://auth.example.com/token";
@@ -439,4 +439,44 @@ fn test_reconnecting_a_server_drops_its_session() {
     call(&server("s1"), Some("tok"));
 
     assert_eq!(count(&fake, "initialize"), 2);
+}
+
+// ------------------------------------------------------------------ logging
+
+#[test]
+#[serial(mcp_global)]
+fn test_each_call_logs_its_time_and_how_it_got_a_session() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", None)]);
+    let (srv, _guard) = ExpiringServer::install(HttpResponse::new(404, ""));
+    let s1 = server("s1");
+
+    let (_, logged) = capture_logs(tracing::Level::INFO, || {
+        call(&s1, Some("tok"));
+        call(&s1, Some("tok"));
+        srv.refuse_next(1);
+        call(&s1, Some("tok"));
+        invalidate_mcp_sessions("s1");
+    });
+
+    let lines: Vec<&str> = logged.lines().filter(|l| l.contains("[mcp-remote] search on")).collect();
+    assert_eq!(lines.len(), 3, "{logged}");
+    assert!(lines[0].contains("new session, handshake"), "{}", lines[0]);
+    assert!(lines[1].contains("(reused session)"), "{}", lines[1]);
+    assert!(lines[2].contains("after the server lost the previous session"), "{}", lines[2]);
+    assert!(logged.contains("[mcp-session] Dropped 1 session(s) for server s1"), "{logged}");
+    assert!(!logged.contains("sess-"), "session ids stay out of the log");
+}
+
+#[test]
+#[serial(mcp_global)]
+fn test_expiry_is_logged() {
+    let _env = EnvGuard::set(&[("SLP_MCP_KEEP_ALIVE", Some("5m"))]);
+    let fake = mcp_server(Some("sess-1"));
+    let _guard = HttpTransportOverride::install(fake.clone());
+
+    call(&server("s1"), Some("tok"));
+    backdate_mcp_sessions(Duration::from_secs(301));
+    let (_, logged) = capture_logs(tracing::Level::INFO, || call(&server("s1"), Some("tok")));
+
+    assert!(logged.contains("Dropped 1 session(s) idle past the 300s keep-alive"), "{logged}");
 }

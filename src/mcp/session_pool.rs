@@ -22,6 +22,8 @@ use parking_lot::{Mutex, MutexGuard};
 
 use crate::config::app_settings::AppSettings;
 
+const LOGGER: &str = "smartloop.mcp.session_pool";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SessionKey {
     server_id: String,
@@ -110,7 +112,17 @@ pub fn session_for(server_id: &str, url: &str, access_token: Option<&str>) -> Op
     let mut sessions = SESSIONS.lock();
     if keep_alive > 0 {
         let limit = Duration::from_secs(keep_alive as u64);
+        let before = sessions.len();
         sessions.retain(|_, s| s.idle_for() < limit);
+        let dropped = before - sessions.len();
+        if dropped > 0 {
+            tracing::info!(
+                target: LOGGER,
+                "[mcp-session] Dropped {} session(s) idle past the {}s keep-alive",
+                dropped,
+                keep_alive
+            );
+        }
     }
     let session = sessions.entry(key).or_insert_with(|| Arc::new(PooledSession::new())).clone();
     session.touch();
@@ -120,7 +132,13 @@ pub fn session_for(server_id: &str, url: &str, access_token: Option<&str>) -> Op
 /// Drop every session held for `server_id`, so its next call initializes
 /// again (the server was removed, reconnected or re-provisioned).
 pub fn invalidate_mcp_sessions(server_id: &str) {
-    SESSIONS.lock().retain(|k, _| k.server_id != server_id);
+    let mut sessions = SESSIONS.lock();
+    let before = sessions.len();
+    sessions.retain(|k, _| k.server_id != server_id);
+    let dropped = before - sessions.len();
+    if dropped > 0 {
+        tracing::info!(target: LOGGER, "[mcp-session] Dropped {} session(s) for server {}", dropped, server_id);
+    }
 }
 
 /// Drop every session (tests, and a transport override).

@@ -12,7 +12,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -518,6 +518,10 @@ pub struct MCPClient {
     session_id: Option<String>,
     /// The shared session [`Self::enter_pooled`] attached, if any.
     pooled: Option<Arc<PooledSession>>,
+    /// Time spent on `initialize` during the current call, if it ran.
+    handshake: Option<Duration>,
+    /// Time spent waiting for another caller's handshake on a pooled session.
+    session_wait: Duration,
 }
 
 impl fmt::Debug for MCPClient {
@@ -542,7 +546,9 @@ impl MCPClient {
 
     /// A client already holding `transport` (the tests' `client._client = fake`).
     pub fn with_transport(transport: Arc<dyn HttpTransport>) -> Self {
-        Self { client: Some(transport), request_id: 0, session_id: None, pooled: None }
+        let mut client = Self::default();
+        client.client = Some(transport);
+        client
     }
 
     /// Replace the HTTP transport in place.
@@ -914,10 +920,12 @@ impl MCPClient {
         token_type: &str,
     ) -> Result<(), MCPClientError> {
         if let Some(pooled) = self.pooled.clone() {
+            let waiting = Instant::now();
             let mut state = pooled.state();
+            self.session_wait += waiting.elapsed();
             if !state.initialized {
                 self.session_id = None;
-                self.initialize(server_url, access_token, token_type)?;
+                self.timed_initialize(server_url, access_token, token_type)?;
                 state.session_id = self.session_id.clone();
                 state.initialized = true;
             } else {
@@ -928,7 +936,37 @@ impl MCPClient {
         if self.session_id.is_some() {
             return Ok(());
         }
-        self.initialize(server_url, access_token, token_type)
+        self.timed_initialize(server_url, access_token, token_type)
+    }
+
+    /// [`Self::initialize`], adding its duration to `handshake`.
+    fn timed_initialize(
+        &mut self,
+        server_url: &str,
+        access_token: Option<&str>,
+        token_type: &str,
+    ) -> Result<(), MCPClientError> {
+        let started = Instant::now();
+        let result = self.initialize(server_url, access_token, token_type);
+        self.handshake = Some(self.handshake.unwrap_or_default() + started.elapsed());
+        result
+    }
+
+    /// How the last call got its session, for the timing log.
+    fn session_note(&self, retried: bool) -> String {
+        let mut note = match (self.pooled.is_some(), self.handshake) {
+            (true, None) => "reused session".to_string(),
+            (true, Some(h)) => format!("new session, handshake {} ms", h.as_millis()),
+            (false, Some(h)) => format!("unpooled, handshake {} ms", h.as_millis()),
+            (false, None) => "unpooled".to_string(),
+        };
+        if self.session_wait >= Duration::from_millis(10) {
+            note.push_str(&format!(", waited {} ms on another call's handshake", self.session_wait.as_millis()));
+        }
+        if retried {
+            note.push_str(", after the server lost the previous session");
+        }
+        note
     }
 
     /// Call one tool (`tools/call`).
@@ -940,10 +978,14 @@ impl MCPClient {
         access_token: Option<&str>,
         token_type: &str,
     ) -> MCPToolCallResult {
+        let started = Instant::now();
+        self.handshake = None;
+        self.session_wait = Duration::ZERO;
         let params = serde_json::json!({
             "name": tool_name,
             "arguments": Value::Object(arguments.cloned().unwrap_or_default()),
         });
+        let mut retried = false;
         let mut outcome = self.ensure_session(server_url, access_token, token_type).and_then(|_| {
             self.send_request(server_url, "tools/call", Some(params.clone()), access_token, token_type)
         });
@@ -959,10 +1001,19 @@ impl MCPClient {
                 pooled.forget(self.session_id.as_deref());
             }
             self.session_id = None;
+            retried = true;
             outcome = self.ensure_session(server_url, access_token, token_type).and_then(|_| {
                 self.send_request(server_url, "tools/call", Some(params), access_token, token_type)
             });
         }
+        tracing::info!(
+            target: LOGGER,
+            "[mcp-remote] {} on {} took {} ms ({})",
+            tool_name,
+            server_url,
+            started.elapsed().as_millis(),
+            self.session_note(retried)
+        );
         match outcome {
             Ok(result) => {
                 let (content, is_error) = call_result_parts(&result);
