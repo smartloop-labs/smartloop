@@ -392,14 +392,18 @@ pub fn reset_active_project(token: Option<ActiveProjectToken>) {
 /// inside the worker (even when it is `None`, so the worker resolves exactly
 /// as the submitter did).  Use for any hop into a thread that will resolve a
 /// project — `spawn_blocking`, `std::thread::spawn`, a pool `submit`.
+/// The request being timed, if any, goes along too (see
+/// [`crate::utils::timing`]).
 pub fn bind<F, R>(f: F) -> impl FnOnce() -> R + Send + 'static
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
     let project_id = active_project_id();
+    let timing = crate::utils::timing::carry();
     move || {
         let _guard = ProjectBinding::enter(BindingKind::Active, project_id);
+        let _timing = timing.enter();
         f()
     }
 }

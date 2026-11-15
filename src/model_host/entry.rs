@@ -29,6 +29,7 @@ pub struct ModelHostArgs {
 /// Configure logging at `args.log_level` and serve until stopped.
 pub fn run(args: ModelHostArgs) -> anyhow::Result<()> {
     init_logging(&args.log_level);
+    crate::utils::timing::set_process("host");
     serve(args.address.as_deref(), None)?;
     Ok(())
 }

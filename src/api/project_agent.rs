@@ -33,7 +33,7 @@ use crate::utils::logging_setup::{
     get_logger, install_tracing_bridge, make_log_queue, setup_root_logging, start_listener, ListenerOptions,
     QueueListener,
 };
-use crate::workspace::context::pin_project;
+use crate::workspace::context::{pin_project, pinned_project_id};
 use crate::workspace::Workspace;
 
 /// Logger name of this module.
@@ -115,6 +115,8 @@ pub fn install_project_logging(project_dir: &str, log_level: &str) -> Option<Arc
     if level == "DEBUG" {
         get_logger("smartloop").set_level("DEBUG");
     }
+    let process = format!("agent:{}", pinned_project_id().unwrap_or_default());
+    crate::api::main::open_timing_log(&process);
     let mut options = ListenerOptions::new(project_dir);
     options.file_level = level.as_str().into();
     options.console_level = level.as_str().into();
