@@ -306,6 +306,33 @@ mod test_list_models {
 
     #[tokio::test]
     #[serial]
+    async fn test_a_cloud_copy_the_plan_does_not_cover_is_still_reported() {
+        let client = TestClient::new();
+        // Listed both ways, the cloud copy locked: it's `cloud_variant`, so a
+        // client can show it as there but locked, though not `cloud`.
+        client.platform().set_list_models(json!([
+            {"name": "qwen3.8-27b", "model_id": "Qwen/Qwen3.8-27B", "type": "local",
+             "access_level": "free", "is_accessible": true},
+            {"name": "qwen3.8-27b", "model_id": null, "type": "remote", "url": "https://edge.smartloop.ai",
+             "access_level": "pro", "is_accessible": false},
+            {"name": "gemma3-4b", "model_id": "google/gemma-3-4b-it", "type": "local",
+             "access_level": "free", "is_accessible": true},
+        ]));
+        let resp = client.get("/v1/models").await;
+
+        assert_eq!(resp.status_code, 200);
+        let body = resp.json();
+        let rows = body.as_array().unwrap();
+        let row = |name: &str| rows.iter().find(|m| m["name"] == name).cloned().unwrap();
+        assert_eq!(rows.iter().filter(|m| m["name"] == "qwen3.8-27b").count(), 1, "one entry: {body}");
+        let qwen = row("qwen3.8-27b");
+        assert_eq!(qwen["cloud_variant"], true, "{qwen}");
+        assert_eq!(qwen["cloud"], false, "{qwen}");
+        assert_eq!(row("gemma3-4b")["cloud_variant"], false);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_keeps_unclassified_models() {
         let client = TestClient::new();
         // No access_level from the cloud — treat as free, not as gated.
