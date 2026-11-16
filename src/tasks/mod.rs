@@ -12,6 +12,7 @@ pub mod downloader_task;
 pub mod indexer_task;
 pub mod mcp_task;
 pub mod task_queue;
+pub mod turn_gate;
 
 pub use base_task::{BaseTask, TaskResult, TaskStatus};
 pub use documents_manifest::DocumentsManifest;
