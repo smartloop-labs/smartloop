@@ -516,6 +516,11 @@ pub struct ModelEntry {
     /// doesn't include the cloud variant.
     #[serde(default)]
     pub cloud: bool,
+    /// A local model the catalog also lists to run in the cloud, whether or
+    /// not the account's plan covers it (that's [`cloud`](Self::cloud)), so
+    /// a client can show the cloud copy as there but locked.
+    #[serde(default)]
+    pub cloud_variant: bool,
     /// The model has a local copy to download (a `local` catalog row), so a
     /// client can offer Download — also for an entry registered to run in
     /// the cloud.  False for a cloud-only model.
@@ -625,6 +630,12 @@ pub fn list_models_with(
         .filter(|m| m.get("type").and_then(Value::as_str) != Some(ModelKind::Remote.value()))
         .filter_map(|m| m.get("name").and_then(Value::as_str).map(canonical_model_name))
         .collect();
+    // Names the catalog lists as a remote model, whatever the account may use.
+    let remote_names: std::collections::HashSet<String> = models
+        .iter()
+        .filter(|m| m.get("type").and_then(Value::as_str) == Some(ModelKind::Remote.value()))
+        .filter_map(|m| m.get("name").and_then(Value::as_str).map(canonical_model_name))
+        .collect();
 
     let mut result: Vec<ModelEntry> = Vec::new();
     for m in models {
@@ -649,6 +660,7 @@ pub fn list_models_with(
             if entry.kind == ModelKind::Remote {
                 continue;
             }
+            entry.cloud_variant = remote_names.contains(&entry.name);
             // Offered only when the account may use it: cloud models are paid.
             entry.cloud = MODEL_SPECS
                 .get(&entry.name)
