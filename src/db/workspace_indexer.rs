@@ -356,6 +356,12 @@ impl WorkspaceIndexer {
                 continue;
             }
 
+            // A file to embed: not while a turn is answered, which would
+            // share the device with it; picked up once the turn is done.
+            if crate::tasks::turn_gate::wait_for_turns() {
+                tracing::debug!(target: LOG_TARGET, "[workspace-index] Resumed after a turn at {rel_path}");
+            }
+
             let read = match &self.converter {
                 Some(convert) if document => {
                     tracing::info!(target: LOG_TARGET, "[workspace-index] Parsing {rel_path}");

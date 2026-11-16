@@ -114,6 +114,7 @@ mod test_model_name_aliases;
 mod test_model_pin_is_workspace_work;
 mod test_model_recommendation;
 mod test_model_spec;
+mod test_turn_gate;
 mod test_model_thinking_api;
 mod test_openapi_docs;
 mod test_model_thinking_setting;

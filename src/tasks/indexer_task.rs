@@ -439,6 +439,9 @@ impl IndexerTask {
         // Bind the task's project for the whole pass, so anything the parser
         // or model service resolves downstream agrees with the project this
         // document actually belongs to.  A no-op when the task is unscoped.
+        // Not while a turn is answered: embedding would share the device
+        // with the reply. It's picked up once the turn is done.
+        crate::tasks::turn_gate::wait_for_turns();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let _binding = use_project(self.project_id.as_deref());
             self.process_document_by_id(doc_id)

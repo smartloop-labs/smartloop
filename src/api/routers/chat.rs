@@ -532,8 +532,10 @@ fn try_status_event(step: &str, status: &str, message: &str) -> Option<String> {
 }
 
 /// How long a turn waits for its project's folder to be indexed before it
-/// answers from what is ready.
-const INDEX_WAIT: Duration = Duration::from_secs(180);
+/// answers from what is ready. Short: a large first index (a folder of
+/// repositories) took minutes, all of it before the answer began, and what
+/// is still to do carries on after the turn, paused while it's answered.
+const INDEX_WAIT: Duration = Duration::from_secs(20);
 
 /// Single-worker pool for running sync LLM operations (`_executor`).
 pub static EXECUTOR: Lazy<ProjectBoundExecutor> =
@@ -2715,6 +2717,11 @@ fn stream_chunks_inner(
                 }
             }
         }
+
+        // From here the turn is being answered: indexing, the pass the wait
+        // above left running included, pauses between files until the
+        // stream ends, as it would otherwise share the device with the reply.
+        let _answering = crate::tasks::turn_gate::begin_turn();
 
         // Image attachments on the current turn are handed to the orchestrator
         // so a vision-capable model reads the pixels + the user's own question,
