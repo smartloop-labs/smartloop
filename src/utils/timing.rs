@@ -248,6 +248,8 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<Request>>> = const { RefCell::new(None) };
     /// The open phases on this thread, innermost last: who is making a call.
     static CALLERS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// The model serving the LLM call under way on this thread.
+    static SERVED_BY: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 tokio::task_local! {
@@ -441,6 +443,21 @@ impl Phase {
     pub fn elapsed(&self) -> Option<Duration> {
         self.inner.as_ref().map(|i| i.started.elapsed())
     }
+
+    /// Log the model [`served_by`] named for this call, if one did.
+    pub fn note_served_by(&mut self) {
+        if let Some(model) = SERVED_BY.with(|s| s.borrow_mut().take()) {
+            self.field("model", model);
+        }
+    }
+}
+
+/// Name the model serving the LLM call under way on this thread, for the
+/// client timing it to log (see [`Phase::note_served_by`]).
+pub fn served_by(model: impl FnOnce() -> String) {
+    if on() {
+        SERVED_BY.with(|s| *s.borrow_mut() = Some(model()));
+    }
 }
 
 impl Drop for Phase {
@@ -488,6 +505,7 @@ pub fn llm_call(call: &str, capability: Option<&str>, model: Option<&str>, promp
     if !on() {
         return Phase { inner: None };
     }
+    SERVED_BY.with(|s| s.borrow_mut().take());
     let capability = capability.filter(|c| !c.is_empty());
     let name = format!("llm.{}", capability.unwrap_or("default"));
     let fields = json!({
@@ -660,6 +678,27 @@ mod tests {
         assert_eq!(call["caller"], "chat.answer");
         assert_eq!(call["chunks"], 3);
         assert!(call["first_token_ms"].is_number());
+    }
+
+    #[test]
+    fn an_llm_call_logs_the_model_that_served_it() {
+        capture();
+        let request = begin(None, "chat", json!({})).unwrap();
+        let id = request.id().to_string();
+        {
+            let _entered = enter(Some(request));
+            served_by(|| "left over".into());
+            let mut call = llm_call("generate", Some("answer"), None, 10);
+            served_by(|| "qwen3.5-4b".into());
+            call.note_served_by();
+            let mut unserved = llm_call("generate", Some("reasoning"), None, 10);
+            unserved.note_served_by();
+        }
+        let model = |name: &str| {
+            events(&id).into_iter().find(|e| e["name"] == name).expect("llm phase")["model"].clone()
+        };
+        assert_eq!(model("llm.answer"), "qwen3.5-4b");
+        assert_eq!(model("llm.reasoning"), Value::Null, "nothing left over from an earlier call");
     }
 
     #[test]

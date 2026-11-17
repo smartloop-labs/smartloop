@@ -1004,6 +1004,7 @@ impl ModelService {
         let llm = self
             .llm_for_response(capability)
             .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
+        timing::served_by(|| Self::model_label(llm.as_ref()));
 
         tracing::info!(
             target: LOG,
@@ -1043,6 +1044,7 @@ impl ModelService {
         let llm = self
             .llm_for_response(capability)
             .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
+        timing::served_by(|| Self::model_label(llm.as_ref()));
 
         if ModelService::is_cloud_llm(llm.as_ref()) {
             // `invoke` would turn a refusal into answer text; keep it an error.
@@ -1063,6 +1065,7 @@ impl ModelService {
                     "[response] Response model failed during generation ({ex}) — falling back to the default model"
                 );
                 self.evict_response_llm(&llm);
+                timing::served_by(|| Self::model_label(fallback.as_ref()));
                 catch_unwind(AssertUnwindSafe(|| fallback.invoke(prompt, None, None)))
                     .map_err(|panic| anyhow::anyhow!(panic_message(&panic)))
             }
@@ -1085,6 +1088,7 @@ impl ModelService {
         let llm = self
             .llm_for_response(capability)
             .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
+        timing::served_by(|| Self::model_label(llm.as_ref()));
 
         let _slot = self.inference_slot();
         match catch_unwind(AssertUnwindSafe(|| llm.invoke_batch(prompts, cancelled.clone()))) {
@@ -1100,6 +1104,7 @@ impl ModelService {
                     "[response] Response model failed during batch generation ({ex}) — falling back to the default model"
                 );
                 self.evict_response_llm(&llm);
+                timing::served_by(|| Self::model_label(fallback.as_ref()));
                 catch_unwind(AssertUnwindSafe(|| fallback.invoke_batch(prompts, cancelled)))
                     .map_err(|panic| anyhow::anyhow!(panic_message(&panic)))
             }

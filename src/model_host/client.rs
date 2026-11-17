@@ -506,9 +506,12 @@ impl ModelClient for InProcessModelClient {
         max_tokens: Option<usize>,
         thinking: Option<bool>,
     ) -> anyhow::Result<String> {
-        let _t = timing::llm_call("generate", capability, model_name, prompt.len());
-        self.service
-            .generate_completion(prompt, model_name, capability, max_tokens, thinking)
+        let mut t = timing::llm_call("generate", capability, model_name, prompt.len());
+        let text = self
+            .service
+            .generate_completion(prompt, model_name, capability, max_tokens, thinking);
+        t.note_served_by();
+        text
     }
 
     fn generate_batch(
@@ -520,7 +523,9 @@ impl ModelClient for InProcessModelClient {
     ) -> anyhow::Result<Vec<String>> {
         let mut t = timing::llm_call("generate_batch", capability, model_name, batch_chars(prompts));
         t.field("batch", prompts.len());
-        self.service.generate_batch_completion(prompts, model_name, capability, cancelled)
+        let texts = self.service.generate_batch_completion(prompts, model_name, capability, cancelled);
+        t.note_served_by();
+        texts
     }
 
     /// `GenerationChunk` in, plain text out — the wire carries text, so the
@@ -534,10 +539,11 @@ impl ModelClient for InProcessModelClient {
         cancelled: Option<CancelEvent>,
         thinking: Option<bool>,
     ) -> anyhow::Result<TextStream<'a>> {
-        let t = timing::llm_call("stream", capability, model_name, prompt.len());
+        let mut t = timing::llm_call("stream", capability, model_name, prompt.len());
         let chunks = self
             .service
             .stream_completion(prompt, model_name, cancelled, capability, thinking)?;
+        t.note_served_by();
         Ok(timing::timed_stream(Box::new(chunks.map(|chunk| chunk.map(|c| c.text))), t))
     }
 
