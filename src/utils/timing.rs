@@ -613,6 +613,24 @@ mod tests {
         assert_eq!(end["phases"]["orchestrator.plan"]["n"], 1);
     }
 
+    #[test]
+    fn bind_untimed_lets_the_request_end_while_the_worker_runs() {
+        capture();
+        let request = begin(None, "chat", json!({})).unwrap();
+        let id = request.id().to_string();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let _entered = enter(Some(request));
+            std::thread::spawn(crate::workspace::context::bind_untimed(move || {
+                let _ = wait.recv();
+                current_id()
+            }))
+        };
+        assert!(events(&id).iter().any(|e| e["ev"] == "request.end"), "ended before the worker");
+        go.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), None);
+    }
+
     #[tokio::test]
     async fn scope_reaches_spawn_blocking_through_bind() {
         capture();

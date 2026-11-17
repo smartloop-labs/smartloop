@@ -49,7 +49,8 @@ use crate::tasks::IndexerTask;
 use crate::types::ANSWER_TIER;
 use crate::utils::timing;
 use crate::workspace::context::{
-    active_project_id, bind, scope_project, set_active_project, use_project, ProjectBoundExecutor,
+    active_project_id, bind, bind_untimed, scope_project, set_active_project, use_project,
+    ProjectBoundExecutor,
 };
 use crate::workspace::types::Skill;
 
@@ -2697,7 +2698,8 @@ fn stream_chunks_inner(
             let mut index_wait = timing::timer("chat.index_wait");
             let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<bool>();
             let worker = svc.clone();
-            std::thread::spawn(bind(move || {
+            // The pass can outlive the wait, so it runs untimed.
+            std::thread::spawn(bind_untimed(move || {
                 let _ = done_tx.send(worker.index_work_dir());
             }));
             let started = Instant::now();

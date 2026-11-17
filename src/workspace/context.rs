@@ -399,11 +399,24 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let project_id = active_project_id();
     let timing = crate::utils::timing::carry();
+    bind_untimed(move || {
+        let _timing = timing.enter();
+        f()
+    })
+}
+
+/// [`bind`] without the request being timed: for work that can outlive the
+/// request, such as an index pass a turn stops waiting for, which would
+/// otherwise hold the request open and its summary back until it ends.
+pub fn bind_untimed<F, R>(f: F) -> impl FnOnce() -> R + Send + 'static
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let project_id = active_project_id();
     move || {
         let _guard = ProjectBinding::enter(BindingKind::Active, project_id);
-        let _timing = timing.enter();
         f()
     }
 }
