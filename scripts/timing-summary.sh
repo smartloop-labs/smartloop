@@ -34,7 +34,9 @@ jq -rs '
          (.phases["mcp.call"].n // 0), ($loads[.req] // 0)]
       | map(tostring) | @tsv)
 ' "$FILE" | column -t -s $'\t'
-echo "* the index wait hit its cap; the pass carried on after"
+if jq -e 'select(.ev == "request.end" and .counts["index.capped"])' "$FILE" >/dev/null; then
+  echo "* the index wait hit its cap; the pass carried on after"
+fi
 
 echo
 echo "Models loaded more than once:"
@@ -43,7 +45,8 @@ jq -rs '
   | group_by(.model // .slot)
   | map(select(length > 1))
   | if length == 0 then "  none" else
-      .[] | "  \(.[0].model // .[0].slot)  \(length) loads in \(map(.req) | unique | length) request(s), \((map(.ms) | add / 1000 * 10 | round) / 10)s in all"
+      .[] | (map(select(.req == null)) | length) as $outside
+        | "  \(.[0].model // .[0].slot)  \(length) loads in \(map(.req | select(. != null)) | unique | length) request(s)\(if $outside > 0 then ", \($outside) outside one" else "" end), \((map(.ms) | add / 1000 * 10 | round) / 10)s in all"
     end
 ' "$FILE"
 
