@@ -239,6 +239,10 @@ pub struct AgentNode {
     /// Concrete pipeline class.
     #[serde(skip)]
     pub kind: NodeKind,
+    /// What the node does (`judge`, `step2.resolve`), for timing and logs;
+    /// a UUID id says nothing.
+    #[serde(skip)]
+    pub label: Option<String>,
 }
 
 impl Default for AgentNode {
@@ -262,7 +266,19 @@ impl AgentNode {
             decision_type: None,
             category,
             kind,
+            label: None,
         }
+    }
+
+    /// Set the label (builder style).
+    pub fn labelled(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// The label, or the id when there is none.
+    pub fn name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.node_id)
     }
 
     /// Set the decision type (builder style).

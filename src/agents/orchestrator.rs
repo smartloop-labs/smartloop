@@ -515,13 +515,13 @@ impl SLPOrchestrator {
     pub fn plan(&self, ctx: &SharedOrchestratorContext) -> (DAG, HashMap<String, NodeHandler>) {
         let mut dag = DAG::new();
 
-        let skill_match_node = SkillMatchNode::new(&[]);
+        let skill_match_node = SkillMatchNode::new(&[]).labelled("skill_match");
         dag.add_node(skill_match_node.clone());
 
-        let collect_node = CollectNode::new(&[&skill_match_node]);
+        let collect_node = CollectNode::new(&[&skill_match_node]).labelled("collect");
         dag.add_node(collect_node.clone());
 
-        let route_node = RouteNode::new(&[&skill_match_node, &collect_node]);
+        let route_node = RouteNode::new(&[&skill_match_node, &collect_node]).labelled("route");
         dag.add_node(route_node.clone());
 
         let handlers = self.build_handlers(ctx, &skill_match_node, &collect_node, &route_node);

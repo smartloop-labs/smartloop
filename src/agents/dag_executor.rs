@@ -152,12 +152,12 @@ impl DAGExecutor {
                 let wrapped = self.wrap_handler(&node, handler);
                 let index = submitted.len();
                 let tx = done_tx.clone();
-                let node_id = node.node_id.clone();
+                let node_name = node.name().to_string();
                 let queued = Instant::now();
                 let future = self.pool.submit(move || {
                     let queue_ms = timing::ms(queued.elapsed());
-                    let _t = timing::phase_with("dag.node", json!({"node": node_id, "queue_ms": queue_ms}));
-                    let _caller = timing::caller(&format!("dag.{node_id}"));
+                    let _t = timing::phase_with("dag.node", json!({"node": node_name, "queue_ms": queue_ms}));
+                    let _caller = timing::caller(&format!("dag.{node_name}"));
                     let outcome: HandlerOutcome =
                         std::panic::catch_unwind(AssertUnwindSafe(|| wrapped(dep_results)));
                     let _ = tx.send(index);

@@ -863,7 +863,7 @@ impl PipelineBuilder {
             // shared search context.  Built here against the shared context so
             // the sources it clears are cleared for every later reader.
             let deps: Vec<&AgentNode> = parent.iter().collect();
-            let node = LLMDecisionNode::new(&deps);
+            let node = LLMDecisionNode::new(&deps).labelled("judge");
             let handler = self.make_judge_handler(ctx, search_ctx);
             nodes_and_handlers.push(DagExtension::new(
                 node.clone(),
@@ -919,7 +919,7 @@ impl PipelineBuilder {
             for step in group {
                 if step.step_type == StepType::Tool {
                     if step.for_each == Some(true) {
-                        let fanout_node = LLMDecisionNode::new(&prev_refs);
+                        let fanout_node = LLMDecisionNode::new(&prev_refs).labelled(format!("step{}.fanout", step.step));
                         let fanout_handler = self.tool_fanout.make_handler(ctx, step, search_ctx);
                         nodes_and_handlers
                             .push(DagExtension::new(fanout_node.clone(), wrap(fanout_handler)));
@@ -928,13 +928,13 @@ impl PipelineBuilder {
                     } else if let Some(loop_llm) = self.tool_loop_llm(step) {
                         // The model runs its own tool loop: one node calls,
                         // reads each result and calls again until it is done.
-                        let loop_node = ToolCallNode::new(&prev_refs);
+                        let loop_node = ToolCallNode::new(&prev_refs).labelled(format!("step{}.tool_loop", step.step));
                         let loop_handler = self.make_tool_loop_handler(ctx, step, loop_llm);
                         nodes_and_handlers.push(DagExtension::new(loop_node.clone(), wrap(loop_handler)));
                         group_nodes.push(loop_node.clone());
                         pre_step_nodes.push(loop_node);
                     } else {
-                        let resolve_node = LLMDecisionNode::new(&prev_refs);
+                        let resolve_node = LLMDecisionNode::new(&prev_refs).labelled(format!("step{}.resolve", step.step));
                         let resolve_handler = self.make_resolve_handler(
                             ctx,
                             step,
@@ -944,7 +944,8 @@ impl PipelineBuilder {
                         nodes_and_handlers
                             .push(DagExtension::new(resolve_node.clone(), wrap(resolve_handler)));
 
-                        let execute_node = ToolCallNode::new(&[&resolve_node]);
+                        let execute_node =
+                            ToolCallNode::new(&[&resolve_node]).labelled(format!("step{}.execute", step.step));
                         let execute_handler = self.make_execute_handler(ctx, step);
                         nodes_and_handlers
                             .push(DagExtension::new(execute_node.clone(), execute_handler));
@@ -957,7 +958,8 @@ impl PipelineBuilder {
                         StepType::Explore => SearchNode::new(&prev_refs),
                         StepType::Analyze => LLMDecisionNode::new(&prev_refs),
                         _ => ToolCallNode::new(&prev_refs),
-                    };
+                    }
+                    .labelled(format!("step{}.{}", step.step, step.step_type.value()));
 
                     let handler =
                         self.make_step_handler_ordered(ctx, step, search_ctx, prev_ids.clone());
