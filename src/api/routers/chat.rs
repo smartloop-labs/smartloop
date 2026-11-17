@@ -2717,6 +2717,8 @@ fn stream_chunks_inner(
                     Err(_) if started.elapsed() >= INDEX_WAIT => {
                         yield status_event("index", "completed", "Still indexing; answering from what's ready");
                         index_wait.field("capped", true);
+                        index_wait.field("still", svc.indexing_activity());
+                        timing::count("index.capped");
                         break;
                     }
                     Err(_) => {
@@ -2734,6 +2736,7 @@ fn stream_chunks_inner(
         // above left running included, pauses between files until the
         // stream ends, as it would otherwise share the device with the reply.
         let _answering = crate::tasks::turn_gate::begin_turn();
+        timing::mark("answering");
 
         // Image attachments on the current turn are handed to the orchestrator
         // so a vision-capable model reads the pixels + the user's own question,
