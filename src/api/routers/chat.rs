@@ -2694,7 +2694,7 @@ fn stream_chunks_inner(
         let _ = request_cwd(&request, &*svc);
         if let Some(folder) = svc.current_work_dir() {
             yield status_event("index", "processing", &format!("Checking documents in {folder}"));
-            let _index_wait = timing::timer("chat.index_wait");
+            let mut index_wait = timing::timer("chat.index_wait");
             let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<bool>();
             let worker = svc.clone();
             std::thread::spawn(bind(move || {
@@ -2714,6 +2714,7 @@ fn stream_chunks_inner(
                     }
                     Err(_) if started.elapsed() >= INDEX_WAIT => {
                         yield status_event("index", "completed", "Still indexing; answering from what's ready");
+                        index_wait.field("capped", true);
                         break;
                     }
                     Err(_) => {
