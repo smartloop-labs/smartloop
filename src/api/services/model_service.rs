@@ -1042,10 +1042,7 @@ impl ModelService {
         let model_config = Self::default_model_config(&default);
 
         tracing::info!(target: LOG_TARGET, "[_ensure_model] loading default model {default}");
-        let model = {
-            let _t = timing::phase_with("model.load", json!({"model": default, "slot": "default"}));
-            ModelFactory::get_model(&model_config)?
-        };
+        let model = ModelFactory::get_model(&model_config)?;
         *self.model.write() = Some(Arc::new(model));
         *self.model_name.write() = Some(default);
         Ok(())
