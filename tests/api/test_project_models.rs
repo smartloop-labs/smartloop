@@ -181,7 +181,7 @@ mod test_list_project_models {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn test_lists_models_with_workspace_defaults() {
+    async fn test_lists_models_switched_off() {
         let _ws = isolated_workspace();
         let client = TestClient::new();
 
@@ -191,11 +191,12 @@ mod test_list_project_models {
         let data = by_name(resp.json());
         let names: HashSet<&str> = data.keys().map(String::as_str).collect();
         assert_eq!(names, HashSet::from(["gemma3-4b", "qwen2-vl-2b"]));
-        assert_eq!(data["gemma3-4b"]["enabled"], true);
+        // Enabled or active on the workspace, but nothing selected here.
+        assert_eq!(data["gemma3-4b"]["enabled"], false);
         assert_eq!(data["gemma3-4b"]["downloaded"], true);
         assert_eq!(data["qwen2-vl-2b"]["enabled"], false);
         assert_eq!(data["qwen2-vl-2b"]["downloaded"], true);
-        assert_eq!(data["qwen2-vl-2b"]["is_active"], true);
+        assert_eq!(data["qwen2-vl-2b"]["is_active"], false);
         assert_eq!(data["gemma3-4b"]["type"], "local");
         assert_eq!(data["gemma3-4b"]["url"], Value::Null);
     }
@@ -225,7 +226,7 @@ mod test_list_project_models {
         let p2 = project_models(&client, "p2").await;
 
         assert_eq!(p1["qwen2-vl-2b"]["enabled"], true);
-        // p2 was never touched — still the workspace default.
+        // p2 was never touched — still off.
         assert_eq!(p2["qwen2-vl-2b"]["enabled"], false);
     }
 }

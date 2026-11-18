@@ -1154,7 +1154,7 @@ pub async fn update_workspace_model<H: WorkspaceModelHost + ?Sized>(
 // Per-project model settings.
 //
 // Model settings are scoped to a project (the project sidebar owns them),
-// seeded from the workspace (app-default) registry at project creation.  The
+// seeded switched off for every registered model, so the user picks them.  The
 // legacy `/v1/models/workspace` endpoints above remain as thin workspace-level
 // (app-default) accessors and are deprecated in favor of these.
 // ---------------------------------------------------------------------------

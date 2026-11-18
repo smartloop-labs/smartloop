@@ -1556,8 +1556,8 @@ impl ModelService {
                 skills: skills.clone().unwrap_or_default(),
                 ..Project::default()
             };
-            // Seed the project's model settings from the workspace
-            // (app-default) model registry.
+            // Seed every registered model switched off, so the user picks
+            // the project's models.
             ws.sync_detached_project_models(&mut project);
             ws.projects.push(project);
         }

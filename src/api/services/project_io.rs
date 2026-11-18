@@ -544,9 +544,9 @@ pub fn import_project(
     }
 
     workspace.projects.push(new_project);
-    // Snapshot the workspace model defaults, same as create_project does — an
-    // archive carries no model_settings, so without this the project's
-    // defaults would be decided lazily at its first models read.
+    // Seed every model switched off, same as create_project does — an archive
+    // carries no model_settings, so without this the project would read
+    // through to the workspace record until its first models read.
     workspace.sync_project_models(&new_id);
     // Nothing is serving this project yet, so its first ``project.json`` is
     // ours to write even where per-project files belong to the children.
