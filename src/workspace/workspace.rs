@@ -658,9 +658,9 @@ impl Default for MCPServer {
 
 /// A model's settings scoped to a single project.
 ///
-/// Seeded from the workspace defaults (the app-default template) when the
-/// project is created (see [`Workspace::sync_project_models`]), then diverges
-/// independently per project.  `settings` is a catch-all map for
+/// Seeded switched off for every registered model (see
+/// [`Workspace::sync_project_models`]), so the user picks the project's
+/// models themselves.  `settings` is a catch-all map for
 /// project-level inference defaults (temperature, top_p, top_k, …).
 ///
 /// Download state deliberately lives only on [`WorkspaceModel`]: weights are
@@ -1341,8 +1341,8 @@ fn sync_models_into(models: &[WorkspaceModel], project: &mut Project) {
             continue;
         }
         project.model_settings.push(ProjectModel {
-            enabled: wm.enabled,
-            is_active: wm.is_active,
+            enabled: false,
+            is_active: false,
             ..ProjectModel::new(&wm.model_name)
         });
     }
@@ -1478,11 +1478,13 @@ impl Workspace {
         canonical_model_name(model_name) == bootstrap_model_name()
     }
 
-    /// Seed the project's `model_settings` from the workspace defaults.
+    /// Seed the project's `model_settings` with every registered model.
     ///
-    /// Adds a [`ProjectModel`] for every registered workspace model the project
-    /// doesn't already have, copying the workspace-level (app-default)
-    /// enabled/active state.  Existing entries are left untouched so
+    /// Adds a disabled, inactive [`ProjectModel`] for every registered
+    /// workspace model the project doesn't already have, whatever the
+    /// workspace-level state says, so nothing is selected until the user picks
+    /// it.  The entry is explicit because a missing one would read through to
+    /// the workspace record.  Existing entries are left untouched so
     /// per-project overrides survive.  Called at project creation and lazily
     /// before reads/writes so models added to the catalog after a project was
     /// created show up too.
@@ -1644,9 +1646,9 @@ impl Workspace {
     ///
     /// A project with no `ProjectModel` entry reads through to the workspace
     /// app-default, so changing that default would retroactively change the
-    /// project.  Writing today's answer down first means the new default only
-    /// reaches projects created after.  Only this model is pinned: a blanket
-    /// sync would also detach every unrelated model from future defaults.
+    /// project.  Writing today's answer down first keeps the new default from
+    /// reaching it.  Only this model is pinned: a blanket sync would also
+    /// detach every unrelated model from the workspace record.
     ///
     /// Does nothing in a per-project agent child: writing every *sibling*
     /// project's settings is precisely what a pinned process may not do — its
@@ -1699,8 +1701,10 @@ impl Workspace {
         }
     }
 
-    /// Make `model_name` an app-default for projects created from now on.
+    /// Mark `model_name` enabled on the workspace record.
     ///
+    /// New projects do not inherit it — they seed every model off — so this
+    /// only reaches reads that fall through to the workspace record.
     /// Called when a model is *downloaded* (`/v1/init`), not when one is
     /// switched on: fetching a model is the act that says it belongs to this
     /// workspace.  One-way — nothing demotes a model.  Existing projects are
@@ -1851,8 +1855,8 @@ impl Workspace {
     ///
     /// The record is stored under the canonical name, so a legacy name coming
     /// from the cloud catalog is not written back into `config.json`.
-    /// `enabled` seeds the app-default that `sync_project_models` copies into
-    /// every project, so a caller registering a model on one project's behalf
+    /// `enabled` sets the workspace record a project with no entry reads
+    /// through to, so a caller registering a model on one project's behalf
     /// should pass `false` and enable it on that project itself.
     pub fn add_model(
         &mut self,

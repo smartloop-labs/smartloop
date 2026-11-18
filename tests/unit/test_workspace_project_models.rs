@@ -67,7 +67,7 @@ mod sync_project_models {
 
     #[test]
     #[serial]
-    fn test_seeds_project_settings_from_workspace_defaults() {
+    fn test_seeds_every_model_switched_off() {
         let _reset = ProcessScopeReset::new();
         let mut ws = make_workspace();
 
@@ -80,11 +80,9 @@ mod sync_project_models {
             entries.keys().copied().collect::<BTreeSet<_>>(),
             BTreeSet::from(["gemma3-4b", "qwen2-vl-2b"])
         );
-        // Workspace (app-default) state is copied across: disabled stays
-        // disabled, active stays active.  Download state is workspace-wide.
-        assert!(entries["gemma3-4b"].enabled);
-        assert!(!entries["qwen2-vl-2b"].enabled);
-        assert!(entries["qwen2-vl-2b"].is_active);
+        // Workspace state is not copied: gemma3-4b is enabled and qwen2-vl-2b
+        // active there, yet the project starts with nothing selected.
+        assert!(entries.values().all(|m| !m.enabled && !m.is_active));
     }
 
     #[test]
@@ -279,7 +277,7 @@ mod promote_to_workspace_default {
 
     #[test]
     #[serial]
-    fn test_project_created_after_promotion_inherits_it() {
+    fn test_project_created_after_promotion_starts_with_it_off() {
         let _reset = ProcessScopeReset::new();
         let mut ws = make_workspace();
         ws.promote_model_to_workspace_default("qwen2-vl-2b");
@@ -287,7 +285,7 @@ mod promote_to_workspace_default {
         ws.projects.push(project("p3", false));
         ws.sync_project_models("p3");
 
-        assert!(ws.effective_model_enabled("qwen2-vl-2b", ws.project("p3")));
+        assert!(!ws.effective_model_enabled("qwen2-vl-2b", ws.project("p3")));
     }
 
     /// Pinning one model must not detach the rest from future defaults.
@@ -351,7 +349,8 @@ mod project_aware_selection {
         let _reset = ProcessScopeReset::new();
         let mut ws = make_workspace();
         ws.sync_project_models("p1");
-        // Workspace default: gemma3-4b (larger, enabled) wins.
+        // Project enables gemma3-4b (larger) → it wins.
+        ws.set_project_model_enabled("p1", "gemma3-4b", true);
         assert_eq!(ws.largest_downloaded_model(ws.project("p1")).unwrap().model_name, "gemma3-4b");
 
         // Project disables gemma3-4b → qwen2-vl-2b (the only downloaded one) wins.
