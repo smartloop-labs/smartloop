@@ -492,92 +492,161 @@ pub async fn lifespan_shutdown(state: LifespanState) {
     shutdown_logging(listener.as_ref());
 }
 
-// ------------------------------------------------------------------ CORS
+// ------------------------------------------------------------------ Request guard
 
 /// Every method Starlette's CORS middleware expands `allow_methods=["*"]` to.
 const CORS_ALL_METHODS: &str = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT";
 /// `Access-Control-Max-Age` (Starlette's default, 600 s).
 const CORS_MAX_AGE: &str = "600";
+/// Names of this machine's loopback, which a request's `Host` and a local
+/// page's origin may give.
+const LOOPBACK_HOSTS: [&str; 4] = ["localhost", "127.0.0.1", "::1", "[::1]"];
+/// The one route a page of the platform's (its sign-in hand-off, served by
+/// the API or the web app) calls from the user's browser.
+const PLATFORM_ROUTE: &str = "/v1/auth/callback";
 
-/// Starlette's `CORSMiddleware` as configured by the Python app:
-/// `allow_origins` from `cors_origins` (comma-separated, or `*`),
-/// `allow_credentials=True`, every method and every header allowed.
+/// Who may call the API, checked before anything else sees a request.
+///
+/// The API has no authentication: whatever reaches it is trusted. So a
+/// request must name this machine as its `Host`, which turns away DNS
+/// rebinding (a site pointing its own name at 127.0.0.1); and a browser's
+/// request must come from a page of this machine's, from an origin listed
+/// in `cors_origins`, or be the platform's sign-in hand-off. Clients that
+/// aren't browsers send no `Origin` and pass, as does the desktop app's
+/// renderer, which sends none either.
+///
+/// Allowed origins get Starlette's CORS answers, as configured by the
+/// Python app: `allow_credentials=True`, every method and header allowed.
 #[derive(Debug, Clone)]
-struct Cors {
+struct Guard {
+    /// Origins listed in `cors_origins`.
     origins: Vec<String>,
     allow_all_origins: bool,
+    /// The platform's origin, allowed on `PLATFORM_ROUTE` only.
+    platform_origin: Option<String>,
+    /// Hosts listed in `allowed_hosts`, lower-case.
+    hosts: Vec<String>,
+    allow_all_hosts: bool,
 }
 
-impl Cors {
-    fn from_settings(cors_origins: &str) -> Self {
-        let origins: Vec<String> = if cors_origins != "*" {
-            cors_origins.split(',').map(str::to_string).collect()
-        } else {
-            vec!["*".to_string()]
-        };
-        let allow_all_origins = origins.iter().any(|o| o == "*");
-        Cors { origins, allow_all_origins }
+/// The comma-separated entries of `list`, trimmed, without empty ones.
+fn listed(list: &str) -> Vec<String> {
+    list.split(',').map(str::trim).filter(|e| !e.is_empty()).map(str::to_string).collect()
+}
+
+/// `name`, a host without its port, is this machine's loopback.
+fn is_loopback(name: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    LOOPBACK_HOSTS.contains(&name.as_str()) || name.ends_with(".localhost")
+}
+
+/// The host of a `Host` header value, without its port: `[::1]:80` is
+/// `[::1]`, `localhost:3000` is `localhost`.
+fn host_name(host: &str) -> &str {
+    if host.starts_with('[') {
+        return host.find(']').map_or(host, |end| &host[..=end]);
+    }
+    host.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(name, _)| name)
+}
+
+/// `scheme://host[:port]` of `url`, as browsers send it in `Origin`.
+fn origin_of(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let origin = url.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+impl Guard {
+    fn from_settings(cors_origins: &str, allowed_hosts: &str, platform_base: &str) -> Self {
+        let origins = listed(cors_origins);
+        let hosts: Vec<String> = listed(allowed_hosts).into_iter().map(|h| h.to_ascii_lowercase()).collect();
+        Guard {
+            allow_all_origins: origins.iter().any(|o| o == "*"),
+            origins,
+            platform_origin: origin_of(platform_base),
+            allow_all_hosts: hosts.iter().any(|h| h == "*"),
+            hosts,
+        }
     }
 
-    fn is_allowed_origin(&self, origin: &str) -> bool {
-        self.allow_all_origins || self.origins.iter().any(|o| o == origin)
+    /// The request names this machine, or a host listed, or none at all,
+    /// as only a client that isn't a browser can send.
+    fn is_allowed_host(&self, headers: &HeaderMap) -> bool {
+        let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) else { return true };
+        let name = host_name(host.trim());
+        self.allow_all_hosts || is_loopback(name) || self.hosts.iter().any(|h| h.eq_ignore_ascii_case(name))
+    }
+
+    /// A browser at `origin` may make a `method` request of `path`: a page
+    /// of this machine's, one listed, or the platform's sign-in hand-off.
+    fn is_allowed_origin(&self, origin: &str, path: &str, method: &str) -> bool {
+        let local = url::Url::parse(origin)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+            .and_then(|u| u.host_str().map(is_loopback))
+            .unwrap_or(false);
+        let platform = self.platform_origin.as_deref() == Some(origin) && path == PLATFORM_ROUTE && method == "POST";
+        self.allow_all_origins || local || platform || self.origins.iter().any(|o| o == origin)
+    }
+
+    /// A browser's request from another site that sent no `Origin`, as an
+    /// `<img>`, a link or a form's GET makes: one a page couldn't make in
+    /// `cors` mode, where `Origin` is always sent. Only following the
+    /// platform's sign-in hand-off as a link is let through (the fallback
+    /// for engines that block its POST). The desktop app's renderer sends
+    /// `cors`-mode requests with no `Origin`, so it isn't one.
+    fn is_cross_site_without_origin(headers: &HeaderMap, path: &str, method: &Method) -> bool {
+        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default();
+        let (site, mode) = (header("sec-fetch-site"), header("sec-fetch-mode"));
+        if site != "cross-site" || mode == "cors" {
+            return false;
+        }
+        !(mode == "navigate" && method == Method::GET && path == PLATFORM_ROUTE)
     }
 
     /// The answer to a preflight (`OPTIONS` with
-    /// `Access-Control-Request-Method`).
-    fn preflight(&self, headers: &HeaderMap) -> Response {
-        let requested_origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    /// `Access-Control-Request-Method`) from an allowed `origin`.
+    fn preflight(&self, origin: &str, headers: &HeaderMap) -> Response {
         let requested_method =
             headers.get("access-control-request-method").and_then(|v| v.to_str().ok()).unwrap_or_default();
         let requested_headers = headers.get("access-control-request-headers").cloned();
 
         let mut out = HeaderMap::new();
         // allow_credentials=True makes the allowed origin explicit, so the
-        // origin is set below rather than as "*".
+        // origin is set rather than "*".
         out.insert("vary", HeaderValue::from_static("Origin"));
         out.insert("access-control-allow-methods", HeaderValue::from_static(CORS_ALL_METHODS));
         out.insert("access-control-max-age", HeaderValue::from_static(CORS_MAX_AGE));
         out.insert("access-control-allow-credentials", HeaderValue::from_static("true"));
-
-        let mut failures: Vec<&str> = Vec::new();
-        if self.is_allowed_origin(requested_origin) {
-            if let Ok(value) = HeaderValue::from_str(requested_origin) {
-                out.insert("access-control-allow-origin", value);
-            }
-        } else {
-            failures.push("origin");
-        }
-        if !CORS_ALL_METHODS.split(", ").any(|m| m == requested_method) {
-            failures.push("method");
+        if let Ok(value) = HeaderValue::from_str(origin) {
+            out.insert("access-control-allow-origin", value);
         }
         // Every header is allowed, so any requested ones are mirrored back.
         if let Some(requested_headers) = requested_headers {
             out.insert("access-control-allow-headers", requested_headers);
         }
 
-        let (status, text) = if failures.is_empty() {
+        let (status, text) = if CORS_ALL_METHODS.split(", ").any(|m| m == requested_method) {
             (StatusCode::OK, "OK".to_string())
         } else {
-            (StatusCode::BAD_REQUEST, format!("Disallowed CORS {}", failures.join(", ")))
+            (StatusCode::BAD_REQUEST, "Disallowed CORS method".to_string())
         };
         let mut response = (status, text).into_response();
         response.headers_mut().extend(out);
         response
     }
 
-    /// Decorate a simple (non-preflight) response.
+    /// Decorate a simple (non-preflight) response to an allowed `origin`.
     fn simple(&self, origin: &str, has_cookie: bool, response: &mut Response) {
         let headers = response.headers_mut();
-        if self.allow_all_origins {
-            headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
-        }
         headers.insert("access-control-allow-credentials", HeaderValue::from_static("true"));
-        // If the request includes any cookie headers, the specific origin has
-        // to be answered instead of '*'; with specific origins only, an
-        // allowed one is mirrored back.
-        let explicit = (self.allow_all_origins && has_cookie)
-            || (!self.allow_all_origins && self.is_allowed_origin(origin));
-        if explicit && let Ok(value) = HeaderValue::from_str(origin) {
+        // `*` only when any origin is allowed and no cookie came; else the
+        // origin itself, which credentials need.
+        if self.allow_all_origins && !has_cookie {
+            headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+            return;
+        }
+        if let Ok(value) = HeaderValue::from_str(origin) {
             headers.insert("access-control-allow-origin", value);
             let vary = match headers.get("vary").and_then(|v| v.to_str().ok()) {
                 Some(existing) => format!("{existing}, Origin"),
@@ -590,26 +659,49 @@ impl Cors {
     }
 
     async fn call(self: Arc<Self>, request: Request, next: Next) -> Response {
-        let Some(origin) = request.headers().get("origin").and_then(|v| v.to_str().ok()).map(str::to_string)
-        else {
+        let headers = request.headers();
+        let path = request.uri().path().to_string();
+        if !self.is_allowed_host(headers) {
+            let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or_default();
+            return refuse(&format!("Host {host:?} is not allowed; set SLP_API_ALLOWED_HOSTS to allow it"));
+        }
+        let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()).map(str::to_string) else {
+            if Self::is_cross_site_without_origin(headers, &path, request.method()) {
+                return refuse("Requests from another site are not allowed");
+            }
             return next.run(request).await;
         };
-        if request.method() == Method::OPTIONS && request.headers().contains_key("access-control-request-method") {
-            return self.preflight(request.headers());
+        let preflight = request.method() == Method::OPTIONS && headers.contains_key("access-control-request-method");
+        let method = match preflight {
+            true => headers.get("access-control-request-method").and_then(|v| v.to_str().ok()).unwrap_or_default(),
+            false => request.method().as_str(),
+        };
+        if !self.is_allowed_origin(&origin, &path, method) {
+            return refuse(&format!("Origin {origin:?} is not allowed; set SLP_API_CORS_ORIGINS to allow it"));
         }
-        let has_cookie = request.headers().contains_key("cookie");
+        if preflight {
+            return self.preflight(&origin, headers);
+        }
+        let has_cookie = headers.contains_key("cookie");
         let mut response = next.run(request).await;
         self.simple(&origin, has_cookie, &mut response);
         response
     }
 }
 
-/// Wrap `router` (outermost) in the CORS middleware.
-fn with_cors(router: Router) -> Router {
-    let cors = Arc::new(Cors::from_settings(&api_settings().cors_origins));
+/// A request the guard turns away: 403, with why, logged.
+fn refuse(why: &str) -> Response {
+    tracing::warn!(target: LogTarget::SERVER, "Refused a request: {}", why);
+    (StatusCode::FORBIDDEN, Json(json!({ "detail": why }))).into_response()
+}
+
+/// Wrap `router` (outermost) in the request guard.
+fn with_guard(router: Router) -> Router {
+    let settings = api_settings();
+    let guard = Arc::new(Guard::from_settings(&settings.cors_origins, &settings.allowed_hosts, &settings.slp_api_base));
     Router::new().fallback_service(router).layer(axum::middleware::from_fn(move |request: Request, next: Next| {
-        let cors = Arc::clone(&cors);
-        async move { cors.call(request, next).await }
+        let guard = Arc::clone(&guard);
+        async move { guard.call(request, next).await }
     }))
 }
 
@@ -619,8 +711,8 @@ fn pool_provider() -> PoolProvider {
 }
 
 /// Build the application router: every API router plus `/health`, `/agents`
-/// and `/`, wrapped (outermost first) in CORS → project routing → project
-/// binding.  Lifespan is not run here; see [`serve`].
+/// and `/`, wrapped (outermost first) in the request guard → project
+/// routing → project binding.  Lifespan is not run here; see [`serve`].
 pub fn app() -> Router {
     let routes = Router::new()
         .merge(routers::auth_router())
@@ -651,7 +743,7 @@ pub fn app() -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed);
 
-    // The stack below ends up CORS → project routing → project binding →
+    // The stack below ends up guard → project routing → project binding →
     // routers.
     //
     // Bind each request to the project it addresses before anything resolves
@@ -660,14 +752,14 @@ pub fn app() -> Router {
     let routes = ProjectScopeMiddleware::layer(routes);
 
     // A project-scoped request is forwarded to the child that owns the
-    // project instead of reaching this app's routers at all.  Inside CORS
-    // deliberately: a preflight is answered there without a handler, and
+    // project instead of reaching this app's routers at all.  Inside the
+    // guard deliberately: a preflight is answered there without a handler, and
     // routing it would cold-start a project agent to answer an OPTIONS.
     // Falls straight through when there is no pool — in a child, and under
     // the --no-supervised fallback.
     let routes = with_project_routing(routes, pool_provider());
 
-    with_cors(routes)
+    with_guard(routes)
 }
 
 /// Fill the `LlamaCpp`-specific fields of the health report.  `None` stops
@@ -1346,19 +1438,47 @@ mod tests {
     }
 
     #[test]
-    fn cors_preflight_mirrors_an_allowed_origin() {
-        let cors = Cors::from_settings("*");
+    fn hosts_are_read_without_their_port() {
+        assert_eq!(host_name("localhost:3000"), "localhost");
+        assert_eq!(host_name("[::1]:80"), "[::1]");
+        assert_eq!(host_name("127.0.0.1"), "127.0.0.1");
+        assert!(is_loopback("LOCALHOST.") && is_loopback("app.localhost") && !is_loopback("localhost.evil.example"));
+    }
+
+    #[test]
+    fn the_guard_takes_its_lists_from_the_settings() {
+        let guard = Guard::from_settings("", "", "https://api.smartloop.ai/v1");
+        assert_eq!(guard.platform_origin.as_deref(), Some("https://api.smartloop.ai"));
+        let host = |h: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", HeaderValue::from_str(h).unwrap());
+            headers
+        };
+        assert!(guard.is_allowed_host(&host("127.0.0.1:1")) && !guard.is_allowed_host(&host("box.lan:1")));
+        assert!(guard.is_allowed_origin("http://127.0.0.1:5000", "/v1/projects", "POST"));
+        assert!(guard.is_allowed_origin("https://api.smartloop.ai", "/v1/auth/callback", "POST"));
+        assert!(!guard.is_allowed_origin("https://api.smartloop.ai", "/v1/auth/callback", "GET"));
+        assert!(!guard.is_allowed_origin("null", "/v1/projects", "GET"));
+        assert!(!guard.is_allowed_origin("file://", "/v1/projects", "GET"));
+
+        let opened = Guard::from_settings(" https://a.example , ", "box.lan, *", "https://api.smartloop.ai");
+        assert!(opened.is_allowed_origin("https://a.example", "/v1/projects", "GET"));
+        assert!(!opened.is_allowed_origin("https://b.example", "/v1/projects", "GET"));
+        assert!(opened.is_allowed_host(&host("anything:1")));
+        assert!(Guard::from_settings("*", "", "").is_allowed_origin("https://b.example", "/", "GET"));
+    }
+
+    #[test]
+    fn a_preflight_mirrors_its_origin_and_requested_headers() {
+        let guard = Guard::from_settings("", "", "https://api.smartloop.ai");
         let mut headers = HeaderMap::new();
-        headers.insert("origin", HeaderValue::from_static("http://a"));
         headers.insert("access-control-request-method", HeaderValue::from_static("POST"));
         headers.insert("access-control-request-headers", HeaderValue::from_static("content-type"));
-        let response = cors.preflight(&headers);
+        let response = guard.preflight("https://api.smartloop.ai", &headers);
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["access-control-allow-origin"], "http://a");
+        assert_eq!(response.headers()["access-control-allow-origin"], "https://api.smartloop.ai");
         assert_eq!(response.headers()["access-control-allow-headers"], "content-type");
-
-        let restricted = Cors::from_settings("http://b");
-        let response = restricted.preflight(&headers);
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        headers.insert("access-control-request-method", HeaderValue::from_static("TRACE"));
+        assert_eq!(guard.preflight("https://api.smartloop.ai", &headers).status(), StatusCode::BAD_REQUEST);
     }
 }

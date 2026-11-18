@@ -17,5 +17,6 @@ mod test_models_load_errors;
 mod test_payments;
 mod test_project_models;
 mod test_releases;
+mod test_request_guard;
 mod test_storage;
 mod test_users;
