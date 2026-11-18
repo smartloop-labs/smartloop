@@ -1,4 +1,4 @@
-.PHONY: help install build run run-debug run-single run-debug-single run-local test test-unit test-api test-cov build-binary check-apple-symbols sign notarize archive archive-zip clean clean-server clean-actions
+.PHONY: help install build run run-debug run-timing timing-summary run-single run-debug-single run-local test test-unit test-api test-cov build-binary check-apple-symbols sign notarize archive archive-zip clean clean-server clean-actions
 
 UNAME_S := $(shell uname -s)
 DIST_DIR := dist/slp
@@ -197,6 +197,8 @@ help:
 	@echo "  build           - Release build of slp with GPU support (features: $(CARGO_FEATURES))"
 	@echo "  run             - Start the agent (one process per project) with INFO logging"
 	@echo "  run-debug       - Same, with LOG_LEVEL=DEBUG (verbose orchestrator/DAG/MCP logs)"
+	@echo "  run-timing      - Same as run, timing each chat turn into $(TIMING_LOG)"
+	@echo "  timing-summary  - Tabulate the timing log per turn; REQ=<id> lists one request"
 	@echo "  run-single      - Start with one shared process for every project"
 	@echo "  run-debug-single - run-single with LOG_LEVEL=DEBUG"
 	@echo "  run-local       - Start the agent against the local API (http://localhost:8888)"
@@ -232,6 +234,16 @@ run:
 
 run-debug:
 	LOG_LEVEL=DEBUG $(CARGO_ENV) $(CARGO) run --profile dev-run $(CARGO_FEATURE_ARGS) --bin slp -- agent start
+
+# Timing goes to one JSONL file shared by the supervisor, model host and
+# project agents; see "Request timing" in the README.
+TIMING_LOG ?= $(or $(SLP_HOME),$(HOME)/.smartloop)/logs/slp-timing.jsonl
+
+run-timing:
+	SLP_TIMING=1 $(CARGO_RUN) agent start
+
+timing-summary:
+	scripts/timing-summary.sh "$(TIMING_LOG)" $(REQ)
 
 # `run` and `run-debug` are supervised: one process per project behind :38540,
 # sharing one model host.  Children inherit LOG_LEVEL and write to
