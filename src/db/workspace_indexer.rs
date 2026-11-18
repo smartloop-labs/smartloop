@@ -361,6 +361,7 @@ impl WorkspaceIndexer {
             if crate::tasks::turn_gate::wait_for_turns() {
                 tracing::debug!(target: LOG_TARGET, "[workspace-index] Resumed after a turn at {rel_path}");
             }
+            let _work = crate::tasks::turn_gate::index_work("workspace", rel_path);
 
             let read = match &self.converter {
                 Some(convert) if document => {

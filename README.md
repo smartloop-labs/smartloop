@@ -55,11 +55,28 @@ cargo install --path . --features metal   # install slp into ~/.cargo/bin
 ```bash
 make run          # start the agent from source (cargo run --release -- agent start)
 make run-debug    # same, with LOG_LEVEL=DEBUG
+make run-timing   # same as run, timing each chat turn (see below)
 cargo test        # full test suite (CPU build; model/network tests are #[ignore]d)
 make test-unit    # unit tests only (lib + tests/unit)
 make test-api     # HTTP API tests only (tests/api)
 make build-binary # release build staged in dist/slp, as shipped by the installers
 ```
+
+**Request timing:**
+
+Set `SLP_TIMING` to see where a chat turn's time goes. `1`, `true` or `on` writes JSON lines to `~/.smartloop/logs/slp-timing.jsonl`; any other value is taken as the file path. Unset, nothing is timed or written. The supervisor, model host and project agents all append to the same file, and each turn also ends with a `[timing]` line in its `agent.log`.
+
+```bash
+make run-timing                  # SLP_TIMING=1 make run
+make timing-summary              # one row per turn: phases, first token, LLM calls, model loads
+make timing-summary REQ=req-1a2b3c4d   # every line of one turn, from every process
+```
+
+The packaged Studio picks it up too: `launchctl setenv SLP_TIMING 1`, then relaunch the app (`launchctl unsetenv SLP_TIMING` to stop).
+
+Each turn has a request id that follows it from the supervisor to the project agent and the model host. A client can send its own as `X-Request-Id` to line its logs up with these; otherwise the supervisor makes one up.
+
+In the summary, a `*` on the index column means the turn stopped waiting for indexing at the 20s cap and answered while the pass carried on; `idx overlap` is how long indexing ran alongside the answer before pausing. Below the table come models loaded more than once (reload churn between turns) and how long indexing paused for turns. Clearing logs from Studio's storage screen empties the file too.
 
 ### Using as a Rust crate
 

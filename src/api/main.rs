@@ -984,12 +984,22 @@ pub fn install_centralized_logging() {
     if log_level == "DEBUG" {
         get_logger("smartloop").set_level("DEBUG");
     }
+    open_timing_log("server");
     let home_dir = APP_SETTINGS.read().home_dir();
     let mut options = ListenerOptions::new(home_dir);
     options.file_level = log_level.as_str().into();
     match start_listener(&queue, options) {
         Ok(listener) => *LOG_LISTENER.lock() = Some(listener),
         Err(e) => eprintln!("Could not start the log listener: {e}"),
+    }
+}
+
+/// Under `SLP_TIMING`, name this process in the timing log and let each
+/// request's timing summary through the `smartloop` gag.
+pub fn open_timing_log(process: &str) {
+    if crate::utils::timing::on() {
+        crate::utils::timing::set_process(process);
+        get_logger(crate::utils::timing::LOG_TARGET).set_level("INFO");
     }
 }
 

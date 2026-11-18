@@ -405,7 +405,7 @@ impl Step for JudgeStep {
         search_ctx: Option<&SharedSearchContext>,
         parent: &AgentNode,
     ) -> StepNodes {
-        let node = LLMDecisionNode::new(&[parent]);
+        let node = LLMDecisionNode::new(&[parent]).labelled("judge");
         // With no search context there is nothing to judge; the node still
         // runs so the graph keeps the shape the caller asked for.
         let search_ctx = search_ctx.cloned().unwrap_or_default();

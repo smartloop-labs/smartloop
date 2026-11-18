@@ -46,6 +46,7 @@ use crate::api::services::model_service::ModelService;
 use crate::config::app_settings::AppSettings;
 use crate::model::downloader::inflight;
 use crate::utils::logging_setup::{truncate_log_file, DEFAULT_BACKUP_COUNT};
+use crate::utils::timing;
 use crate::workspace::workspace::{is_mmproj_gguf, Project, SharedWorkspace, Workspace, WorkspaceModel};
 
 /// Logger name used by the Python module (tests capture it).
@@ -784,7 +785,7 @@ pub fn scan_versions() -> Vec<Row> {
     rows
 }
 
-/// The server log and its rotated backups.
+/// The server log, its rotated backups and the `SLP_TIMING` log.
 pub fn scan_logs() -> Vec<Row> {
     let home = home();
     let mut rows = Vec::new();
@@ -804,6 +805,14 @@ pub fn scan_logs() -> Vec<Row> {
             extra.insert("action".into(), Value::String("delete".into()));
             rows.push(row(&backup, true, None, extra));
         }
+    }
+
+    // Emptied in place too: every running process appends to it.
+    let timing_log = join(&home, timing::LOG_PATH);
+    if isfile(&timing_log) {
+        let mut extra = Row::new();
+        extra.insert("action".into(), Value::String("truncate".into()));
+        rows.push(row(&timing_log, true, None, extra));
     }
 
     rows
@@ -999,7 +1008,8 @@ pub fn validate(path: &str, shape: &str, workspace: &Workspace) -> Result<String
                 .and_then(|c| c[1].parse::<u64>().ok())
                 .map(|n| (1..=u64::from(DEFAULT_BACKUP_COUNT)).contains(&n))
                 .unwrap_or(false);
-            if name != "server.log" && !kept_backup {
+            let timing_log = Path::new(&name) == Path::new(timing::LOG_PATH);
+            if name != "server.log" && !timing_log && !kept_backup {
                 return Err(StorageError::ValueError(format!("Not a server log file: {path}")));
             }
         }
@@ -1063,7 +1073,9 @@ impl TruncateOutcome for std::io::Result<u64> {
 pub fn remove(path: &str, truncate: bool) -> (bool, Option<String>) {
     let mut last_error: Option<String> = None;
     for attempt in 0..DELETE_ATTEMPTS {
-        let result: std::io::Result<()> = if truncate {
+        let result: std::io::Result<()> = if truncate && Path::new(path).ends_with(timing::LOG_PATH) {
+            std::fs::OpenOptions::new().write(true).open(path).and_then(|f| f.set_len(0))
+        } else if truncate {
             truncate_log_file(&dirname(path)).into_io_result().map(|_| ())
         } else if isdir(path) {
             rmtree(path)

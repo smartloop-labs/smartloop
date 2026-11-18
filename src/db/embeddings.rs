@@ -182,6 +182,7 @@ fn get_model(base_dir: Option<&str>) -> Option<Arc<dyn EmbeddingModel>> {
         cache_dir = Some(dir.to_string_lossy().into_owned());
     }
 
+    let load_timer = crate::utils::timing::phase_with("model.load", serde_json::json!({"slot": "embedding"}));
     let model = load_embedder(
         cache_dir.as_deref(),
         &settings.embedding_gguf_repo,
@@ -190,6 +191,7 @@ fn get_model(base_dir: Option<&str>) -> Option<Arc<dyn EmbeddingModel>> {
         &settings.embedding_gguf_base_url,
     )
     .map(|m| Arc::new(m) as Arc<dyn EmbeddingModel>);
+    drop(load_timer);
     MODEL.lock().model = model.clone();
     model
 }
@@ -255,6 +257,7 @@ pub fn unload() {
     let Some(model) = model else {
         return;
     };
+    let _t = crate::utils::timing::phase_with("model.unload", serde_json::json!({"slot": "embedding"}));
     match model.close() {
         Ok(()) => tracing::info!(target: LOG_TARGET, "[embeddings] model unloaded"),
         Err(e) => tracing::warn!(target: LOG_TARGET, "[embeddings] unload failed: {e}"),

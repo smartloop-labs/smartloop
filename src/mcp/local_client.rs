@@ -24,6 +24,7 @@ use crate::mcp::client::{
 };
 use crate::mcp::read_only_calls::python_json_dumps;
 use crate::paths::expand_home;
+use crate::utils::timing;
 
 /// Python logger name of this module.
 const LOGGER: &str = "smartloop.mcp.local_client";
@@ -755,6 +756,7 @@ impl LocalMCPClient {
         if self.initialized {
             return Ok(());
         }
+        let _t = timing::phase("mcp.connect");
         self.request("initialize", Some(Self::initialize_params()))?;
         self.notify("notifications/initialized", Some(Value::Object(Map::new())))?;
         self.initialized = true;
@@ -777,6 +779,7 @@ impl LocalMCPClient {
     /// Launch errors propagate; protocol and other errors become an
     /// unsuccessful result.
     pub fn connect_and_discover_tools(&mut self) -> Result<MCPConnectResult, MCPClientError> {
+        let _t = timing::phase("mcp.list_tools");
         match self.discover() {
             Ok(result) => Ok(result),
             Err(e @ MCPClientError::Launch(_)) => Err(e),

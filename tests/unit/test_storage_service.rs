@@ -812,6 +812,27 @@ fn test_log_and_backups_are_reported_with_actions() {
 
 #[test]
 #[serial]
+fn test_timing_log_is_reported_and_emptied_in_place() {
+    let env = env("test_timing_log_is_reported_and_emptied_in_place");
+    let target = join(&env.home_dir, "logs/slp-timing.jsonl");
+    std::fs::create_dir_all(Path::new(&target).parent().unwrap()).unwrap();
+    write_s(&target, "{}\n");
+
+    let rows = items(&env.usage(), "logs");
+    let row = rows
+        .iter()
+        .find(|r| r["path"].as_str().is_some_and(|p| p.ends_with("logs/slp-timing.jsonl")))
+        .expect("timing log row");
+    assert_eq!(row["action"], "truncate");
+
+    let ws = env.workspace.read().clone();
+    assert_eq!(storage_service::validate(&target, "logs", &ws).unwrap(), realpath(&target));
+    assert_eq!(storage_service::remove(&target, true), (true, None));
+    assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+}
+
+#[test]
+#[serial]
 fn test_orphan_project_is_found_live_one_is_not() {
     let env = env("test_orphan_project_is_found_live_one_is_not");
     let rows = items(&env.usage(), "orphan_projects");

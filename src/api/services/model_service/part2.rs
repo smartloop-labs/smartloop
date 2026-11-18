@@ -54,6 +54,7 @@ use crate::paths::{SANDBOX_HOME_MARKER, expand_home};
 use crate::tasks::base_task::{TaskLogger, TaskOptions, TaskStatus};
 use crate::tasks::{BaseTask, DownloaderTask, DocumentsManifest, IndexerTask, MCPTask};
 use crate::utils::logging_setup::get_logger;
+use crate::utils::timing;
 use crate::workspace::context::{own_project, projects_delegated, unbind_project};
 use crate::workspace::Document;
 use crate::workspace::workspace::{MCPAuthType, MCPOAuthCredentials, SharedWorkspace};
@@ -1003,6 +1004,7 @@ impl ModelService {
         let llm = self
             .llm_for_response(capability)
             .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
+        timing::served_by(|| Self::model_label(llm.as_ref()));
 
         tracing::info!(
             target: LOG,
@@ -1042,6 +1044,7 @@ impl ModelService {
         let llm = self
             .llm_for_response(capability)
             .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
+        timing::served_by(|| Self::model_label(llm.as_ref()));
 
         if ModelService::is_cloud_llm(llm.as_ref()) {
             // `invoke` would turn a refusal into answer text; keep it an error.
@@ -1062,6 +1065,7 @@ impl ModelService {
                     "[response] Response model failed during generation ({ex}) — falling back to the default model"
                 );
                 self.evict_response_llm(&llm);
+                timing::served_by(|| Self::model_label(fallback.as_ref()));
                 catch_unwind(AssertUnwindSafe(|| fallback.invoke(prompt, None, None)))
                     .map_err(|panic| anyhow::anyhow!(panic_message(&panic)))
             }
@@ -1084,6 +1088,7 @@ impl ModelService {
         let llm = self
             .llm_for_response(capability)
             .ok_or_else(|| runtime_err("Model not loaded. Call load_model() first."))?;
+        timing::served_by(|| Self::model_label(llm.as_ref()));
 
         let _slot = self.inference_slot();
         match catch_unwind(AssertUnwindSafe(|| llm.invoke_batch(prompts, cancelled.clone()))) {
@@ -1099,6 +1104,7 @@ impl ModelService {
                     "[response] Response model failed during batch generation ({ex}) — falling back to the default model"
                 );
                 self.evict_response_llm(&llm);
+                timing::served_by(|| Self::model_label(fallback.as_ref()));
                 catch_unwind(AssertUnwindSafe(|| fallback.invoke_batch(prompts, cancelled)))
                     .map_err(|panic| anyhow::anyhow!(panic_message(&panic)))
             }
@@ -1858,11 +1864,13 @@ impl ModelService {
             return;
         };
         let project_name = self.get_current_project_name().unwrap_or_else(|| "default".to_string());
+        let model_name = self.model_name.read().clone();
         tracing::info!(
             target: LOG,
             "Unloading model: {} (project: {project_name})",
-            self.model_name.read().clone().unwrap_or_else(|| "None".into())
+            model_name.clone().unwrap_or_else(|| "None".into())
         );
+        let _t = timing::phase_with("model.unload", json!({"model": model_name, "slot": "default"}));
         self.free_llm(llm);
         *self.llm.write() = None;
         *self.model_name.write() = None;
@@ -1891,11 +1899,13 @@ impl ModelService {
         let Some(vision) = self.vision_llm.read().clone() else {
             return;
         };
+        let model_name = self.vision_model_name.read().clone().filter(|n| !n.is_empty());
         tracing::info!(
             target: LOG,
             "[vision] Unloading vision model {} — freeing VRAM",
-            self.vision_model_name.read().clone().filter(|n| !n.is_empty()).unwrap_or_else(|| "?".into())
+            model_name.clone().unwrap_or_else(|| "?".into())
         );
+        let _t = timing::phase_with("model.unload", json!({"model": model_name, "slot": "vision"}));
         self.free_llm(vision);
         *self.vision_llm.write() = None;
         *self.vision_model_name.write() = None;
@@ -1913,6 +1923,7 @@ impl ModelService {
             return;
         };
         tracing::info!(target: LOG, "[large-model] Unloading large agent model — freeing VRAM");
+        let _t = timing::phase_with("model.unload", json!({"model": *self.large_model_name.read(), "slot": "large"}));
         self.free_llm(large);
         *self.large_llm.write() = None;
         self.large_model_attempted.store(false, Ordering::SeqCst);
@@ -1943,6 +1954,7 @@ impl ModelService {
         };
         for (name, cached) in victims {
             tracing::info!(target: LOG, "[mem] Evicting prior-step capability model {name} to free VRAM");
+            let _t = timing::phase_with("model.unload", json!({"model": name, "slot": "capability", "evict": true}));
             self.free_llm(cached);
             self.cap_llms.lock().retain(|(slot_name, _)| slot_name != &name);
             freed = true;
@@ -1953,6 +1965,7 @@ impl ModelService {
             && self.large_model_name.read().as_deref() != keep_model_name
         {
             tracing::info!(target: LOG, "[mem] Evicting on-demand large model to free VRAM");
+            let _t = timing::phase_with("model.unload", json!({"model": *self.large_model_name.read(), "slot": "large", "evict": true}));
             self.free_llm(large);
             *self.large_llm.write() = None;
             *self.large_model_name.write() = None;
@@ -3425,6 +3438,7 @@ impl ModelService {
                 Self::emit_progress(progress.as_ref(), "model", "processing", &format!("Processing image with {name}"));
             });
             let perceived = catch_unwind(AssertUnwindSafe(|| {
+                let _t = timing::phase("orchestrate.vision");
                 self.vision_perceive(&user_message, images, 512, Some(on_vision_model))
             }));
             match perceived {
@@ -3502,7 +3516,9 @@ impl ModelService {
 
         // Reload workspace from disk to pick up changes made by background
         // indexers or project setup since the last request.
+        let reload = timing::phase("orchestrate.workspace_reload");
         model.workspace.write().reload();
+        drop(reload);
 
         let Some(current_project) = model.workspace.read().current_project().cloned() else {
             if let Some(perception) = image_perception.clone() {
@@ -3515,10 +3531,12 @@ impl ModelService {
 
         // Fix stale user server launchers and sweep the built-in servers and
         // skills smartloop used to install, before anything reads them.
+        let sweep = timing::phase("orchestrate.mcp_sweep");
         if let Err(e) = self.migrate_servers_to_local(&current_project.id) {
             tracing::warn!(target: LOG, "[orchestrator] MCP server migration failed: {e}");
         }
         self.sweep_legacy_builtins(&current_project.id);
+        drop(sweep);
         let current_project = model.workspace.read().project(&current_project.id).cloned().unwrap_or(current_project);
 
         // Enabled servers that have tools (both local and remote).

@@ -71,6 +71,7 @@ use crate::agents::planner::{mcp_connection_is_usable, FETCH_SERVER_ID};
 use crate::constants::display_model_label;
 use crate::llms::tool_calls::{parse_tool_calls, with_tools};
 use crate::llms::BaseLLM;
+use crate::utils::timing;
 use crate::workspace::workspace::MCPServer;
 
 /// Logger name of the Python module.
@@ -523,6 +524,7 @@ impl MCPAgent {
         if directive.is_empty() {
             return None;
         }
+        let _t = timing::phase_with("mcp.resolve", json!({"servers": mcp_servers.len()}));
 
         let entries = self.catalog(mcp_servers);
         if entries.is_empty() {

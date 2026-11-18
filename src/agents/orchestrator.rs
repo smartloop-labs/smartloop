@@ -53,6 +53,7 @@ use crate::agents::web_search_agent::{LlmResolver, ProgressCallback, WebSearchAg
 use crate::api::services::model_service::ModelService;
 use crate::paths::expand_home;
 use crate::utils::mcp_result_formatter::ResultFormatter;
+use crate::utils::timing;
 use crate::workspace::workspace::MCPServer;
 
 /// Python logger name.
@@ -402,10 +403,22 @@ impl SLPOrchestrator {
         );
 
         let attempt = || -> anyhow::Result<MCPExecutionResult> {
-            let ctx = self.build_context(user_message, mcp_servers, &options)?;
-            let (mut dag, mut handlers) = self.plan(&ctx);
-            let results = self.run(&ctx, &mut dag, &mut handlers);
-            let mut result = self.reason(&ctx, &results);
+            let ctx = {
+                let _t = timing::phase("orchestrator.build_context");
+                self.build_context(user_message, mcp_servers, &options)?
+            };
+            let (mut dag, mut handlers) = {
+                let _t = timing::phase("orchestrator.plan");
+                self.plan(&ctx)
+            };
+            let results = {
+                let _t = timing::phase("orchestrator.run");
+                self.run(&ctx, &mut dag, &mut handlers)
+            };
+            let mut result = {
+                let _t = timing::phase("orchestrator.reason");
+                self.reason(&ctx, &results)
+            };
             result.capability = ctx.read().request_capability.clone();
             result.coding = ctx.read().request_coding;
             Ok(result)
@@ -472,7 +485,10 @@ impl SLPOrchestrator {
 
         let server_maps: Vec<Map<String, Value>> =
             available_servers.iter().filter_map(|s| s.as_object().cloned()).collect();
-        let enriched = self.explorer.enrich(Some(&server_maps), options.conversation_history.as_deref());
+        let enriched = {
+            let _t = timing::phase("explorer.enrich");
+            self.explorer.enrich(Some(&server_maps), options.conversation_history.as_deref())
+        };
 
         let mut ctx = OrchestratorContext::new(
             user_message,
@@ -499,13 +515,13 @@ impl SLPOrchestrator {
     pub fn plan(&self, ctx: &SharedOrchestratorContext) -> (DAG, HashMap<String, NodeHandler>) {
         let mut dag = DAG::new();
 
-        let skill_match_node = SkillMatchNode::new(&[]);
+        let skill_match_node = SkillMatchNode::new(&[]).labelled("skill_match");
         dag.add_node(skill_match_node.clone());
 
-        let collect_node = CollectNode::new(&[&skill_match_node]);
+        let collect_node = CollectNode::new(&[&skill_match_node]).labelled("collect");
         dag.add_node(collect_node.clone());
 
-        let route_node = RouteNode::new(&[&skill_match_node, &collect_node]);
+        let route_node = RouteNode::new(&[&skill_match_node, &collect_node]).labelled("route");
         dag.add_node(route_node.clone());
 
         let handlers = self.build_handlers(ctx, &skill_match_node, &collect_node, &route_node);

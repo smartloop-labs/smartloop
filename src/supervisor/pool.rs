@@ -35,6 +35,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use crate::supervisor::parent_watch::{join_with_timeout, parent_environment, process_started_at, StopEvent};
 use crate::supervisor::registry::{now_epoch, process_alive, read_project_agent, with_process, AgentRecord, AgentRegistry};
 use crate::supervisor::spawn::{popen_detached_devnull, ChildProcess, WaitError};
+use crate::utils::timing;
 
 /// Logger name of this module.
 const LOGGER: &str = "smartloop.supervisor.pool";
@@ -370,6 +371,7 @@ impl ProjectAgentPool {
         };
         let env = self.environment(project_id);
         tracing::info!(target: LOGGER, "[supervisor] starting project agent for {}", project_id);
+        let _cold_start = timing::phase_with("supervisor.cold_start", serde_json::json!({"project": project_id}));
 
         // Detach from our console/process group so a Ctrl-C in the terminal
         // reaches the supervisor only — it then stops the children itself, in
@@ -393,8 +395,12 @@ impl ProjectAgentPool {
 
         let project_dir = (self.project_dir_for)(project_id);
         let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<AgentRecord, ChildStartError> {
-            let (real_pid, port) = self.await_port(project_id, &process, project_dir.as_deref())?;
+            let (real_pid, port) = {
+                let _t = timing::phase("supervisor.await_port");
+                self.await_port(project_id, &process, project_dir.as_deref())?
+            };
             let record = AgentRecord::new(project_id, real_pid, port);
+            let _t = timing::phase("supervisor.await_health");
             match &self.await_health_hook {
                 Some(hook) => hook(project_id, &process, &record)?,
                 None => self.await_health(project_id, &process, &record)?,

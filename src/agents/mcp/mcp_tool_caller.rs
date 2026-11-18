@@ -19,6 +19,7 @@ use crate::agents::mcp::result_mapper::MCPResultMapper;
 use crate::mcp::local_client::LocalMCPClient;
 use crate::mcp::oauth::{MCPOAuthError, MCPOAuthService};
 use crate::mcp::{session_pool, MCPClient, MCPToolCallResult};
+use crate::utils::timing;
 use crate::workspace::workspace::{MCPOAuthCredentials, MCPServer, MCPServerStatus, MCPServerType};
 
 /// Logger name of the Python module.
@@ -222,13 +223,17 @@ impl MCPToolCaller {
         if let Some(hook) = hook {
             return hook(server, tool_name, arguments, access_token, cwd);
         }
+        let _t = timing::phase_with("mcp.call", serde_json::json!({"server": server.name, "tool": tool_name}));
 
         if let (MCPServerType::Local, Some(config)) = (server.server_type, server.config.as_ref()) {
             let effective_cwd = cwd.filter(|c| !c.is_empty()).or(config.cwd.as_deref());
             let mut client = LocalMCPClient::new(config.command.clone(), config.args.clone())
                 .with_env(Some(config.env.clone()))
                 .with_cwd(effective_cwd);
-            let result = match client.enter() {
+            let launch = timing::phase_with("mcp.launch", serde_json::json!({"server": server.name}));
+            let entered = client.enter();
+            drop(launch);
+            let result = match entered {
                 Ok(()) => {
                     let result = client.call_tool(tool_name, arguments);
                     client.exit();
@@ -440,6 +445,7 @@ impl MCPToolCaller {
     /// live-credentials hook is installed, since `server` is only this
     /// caller's copy.
     pub fn refresh_access_token(&self, server: &mut MCPServer, stale_token: Option<&str>) -> Option<String> {
+        let _t = timing::phase_with("mcp.refresh", serde_json::json!({"server": server.name}));
         let lock = lock_for(&server.id);
         let _guard = lock.lock();
         self.refresh_locked(server, stale_token)

@@ -614,8 +614,8 @@ impl Step for DocumentFanoutStep {
 
         let mut nodes_and_handlers: Vec<NodePair> = Vec::new();
         let mut batch_nodes: Vec<AgentNode> = Vec::new();
-        for batch in batches {
-            let node = LLMDecisionNode::new(&[parent]);
+        for (i, batch) in batches.into_iter().enumerate() {
+            let node = LLMDecisionNode::new(&[parent]).labelled(format!("doc_batch{}", i + 1));
             let handler =
                 self.make_batch_handler(ctx, &node.node_id, batch, skill_instruction.clone());
             nodes_and_handlers.push((node.clone(), handler));
@@ -624,7 +624,7 @@ impl Step for DocumentFanoutStep {
 
         let batch_node_ids: Vec<String> = batch_nodes.iter().map(|n| n.node_id.clone()).collect();
         let batch_refs: Vec<&AgentNode> = batch_nodes.iter().collect();
-        let reduce_node = TransformNode::new(&batch_refs);
+        let reduce_node = TransformNode::new(&batch_refs).labelled("doc_reduce");
         let reduce_handler = self.make_reduce_handler(ctx, search_ctx.clone(), batch_node_ids);
         nodes_and_handlers.push((reduce_node.clone(), reduce_handler));
 

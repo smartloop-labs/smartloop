@@ -36,6 +36,7 @@ use crate::llms::base_llm::{BatchPrompt, CancelEvent};
 use crate::model_host::pb;
 use crate::model_host::pb::model_host_server::{ModelHost as ModelHostService, ModelHostServer};
 use crate::llms::cloud_llm::local_only_scope;
+use crate::utils::timing;
 use crate::workspace::context::use_project;
 
 /// Logger name used by the Python module.
@@ -223,6 +224,7 @@ impl ModelHost {
                     };
                     runtime.spawn(async move {
                         let served = tonic::transport::Server::builder()
+                            .layer(TimingLayer)
                             .add_service(service)
                             .serve_with_incoming(incoming)
                             .await;
@@ -244,6 +246,7 @@ impl ModelHost {
                     };
                     runtime.spawn(async move {
                         let served = tonic::transport::Server::builder()
+                            .layer(TimingLayer)
                             .add_service(service)
                             .serve_with_incoming(incoming)
                             .await;
@@ -395,8 +398,12 @@ impl ModelHostServicer {
         F: FnOnce(&dyn ModelClient) -> R + Send + 'static,
     {
         let client = self.client.clone();
-        tokio::task::spawn_blocking(move || bind_project(client.as_ref(), &project_id, op))
-            .await
+        let timing = timing::carry();
+        tokio::task::spawn_blocking(move || {
+            let _timing = timing.enter();
+            bind_project(client.as_ref(), &project_id, op)
+        })
+        .await
             .map_err(|exc| {
                 let message = if exc.is_panic() {
                     panic_message(&*exc.into_panic())
@@ -417,6 +424,43 @@ impl ModelHostServicer {
         self.blocking(project_id, op)
             .await?
             .map_err(|exc| application_error(&exc.to_string()))
+    }
+}
+
+/// Runs each RPC under the request id its caller sent, so the host's
+/// timing lines (model loads and unloads among them) join that request.
+#[derive(Clone, Copy)]
+struct TimingLayer;
+
+impl<S> tower::Layer<S> for TimingLayer {
+    type Service = TimingService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TimingService(inner)
+    }
+}
+
+#[derive(Clone)]
+struct TimingService<S>(S);
+
+impl<S, B> tower::Service<http::Request<B>> for TimingService<S>
+where
+    S: tower::Service<http::Request<B>>,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        let adopted = timing::adopt(
+            request.headers().get(timing::REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()),
+        );
+        Box::pin(timing::scope(adopted, self.0.call(request)))
     }
 }
 
@@ -510,7 +554,9 @@ impl ModelHostService for ModelHostServicer {
         // next chunk only once the last one was taken.
         let (sender, receiver) = tokio::sync::mpsc::channel::<Result<pb::StreamChunk, Status>>(1);
 
+        let timing = timing::carry();
         tokio::task::spawn_blocking(move || {
+            let _timing = timing.enter();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 bind_project(client.as_ref(), &request.project_id, |client| {
                     let _scope = local_only_scope(request.local_only);

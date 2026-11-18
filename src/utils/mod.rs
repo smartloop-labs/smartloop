@@ -10,6 +10,7 @@ pub mod metadata_utils;
 pub mod path_utils;
 pub mod py_compat;
 pub mod runtime_env;
+pub mod timing;
 
 pub use chunk_converter::convert_chunks_to_document_chunks;
 pub use device_utils::{get_device_config, is_apple_silicon, DeviceConfig};

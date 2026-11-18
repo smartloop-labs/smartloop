@@ -442,6 +442,7 @@ impl IndexerTask {
         // Not while a turn is answered: embedding would share the device
         // with the reply. It's picked up once the turn is done.
         crate::tasks::turn_gate::wait_for_turns();
+        let _work = crate::tasks::turn_gate::index_work("documents", doc_id);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let _binding = use_project(self.project_id.as_deref());
             self.process_document_by_id(doc_id)
