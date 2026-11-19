@@ -43,6 +43,9 @@ pub struct AppSettings {
     pub log_level: String,
     /// `SLP_API_BASE` — Smartloop Platform API.
     pub slp_api_base: String,
+    /// `SLP_APP_URL` — the Smartloop web app, which signs the user in and
+    /// hands the session to this API.
+    pub slp_app_url: String,
     /// `SLP_DEVELOPER_TOKEN`; resolved from the credential store when unset.
     pub developer_token: Option<String>,
     /// `SLP_RELEASE_CHANNELS` (comma-separated); first entry is the default.
@@ -53,7 +56,9 @@ pub struct AppSettings {
     pub slp_home: Option<String>,
 
     // API Server Configuration
-    /// `SLP_API_HOST`
+    /// `SLP_API_HOST` — the address the API listens on. Loopback by default:
+    /// the API has no authentication, so listening wider is an explicit
+    /// choice, made together with `SLP_API_ALLOWED_HOSTS`.
     pub api_host: String,
     /// `SLP_API_PORT`
     pub api_port: u16,
@@ -63,8 +68,16 @@ pub struct AppSettings {
     pub default_model: String,
     /// `SLP_API_DEBUG_MODE`
     pub debug_mode: bool,
-    /// `SLP_API_CORS_ORIGINS`
+    /// `SLP_API_CORS_ORIGINS` — browser origins allowed besides this
+    /// machine's own (`http://localhost:*` and the like), comma-separated;
+    /// `*` allows any. The platform's and the web app's origins (from
+    /// `slp_api_base` and `slp_app_url`) are allowed for the sign-in hand-off
+    /// only, without being listed.
     pub cors_origins: String,
+    /// `SLP_API_ALLOWED_HOSTS` — `Host` names a request may give besides
+    /// loopback ones, comma-separated; `*` allows any. Turns away DNS
+    /// rebinding: a site that points its own name at 127.0.0.1.
+    pub allowed_hosts: String,
     /// `SLP_N_PARALLEL` — parallel inference slots (llama.cpp n_parallel).
     pub n_parallel: i64,
     /// `SLP_LLM_N_BATCH` — llama.cpp n_batch; 0 = choose from the device.
@@ -169,16 +182,18 @@ impl AppSettings {
             section_token_size: 2048,
             log_level: "INFO".to_string(),
             slp_api_base: "https://api.smartloop.ai".to_string(),
+            slp_app_url: "https://app.smartloop.ai".to_string(),
             developer_token: None,
             release_channels_raw: "stable,beta".to_string(),
             version: None,
             slp_home: None,
-            api_host: "0.0.0.0".to_string(),
+            api_host: "127.0.0.1".to_string(),
             api_port: 38540,
             preload_model: true,
             default_model: BOOTSTRAP_MODEL.to_string(),
             debug_mode: false,
-            cors_origins: "*".to_string(),
+            cors_origins: String::new(),
+            allowed_hosts: String::new(),
             n_parallel: 1,
             llm_n_batch: 0,
             llm_n_threads: 0,
@@ -242,6 +257,7 @@ impl AppSettings {
             section_token_size: r.int("slp_section_token_size", d.section_token_size)?,
             log_level: r.string("log_level", d.log_level)?,
             slp_api_base: r.string("slp_api_base", d.slp_api_base)?,
+            slp_app_url: r.string("slp_app_url", d.slp_app_url)?,
             developer_token: r.opt_string("slp_developer_token", d.developer_token)?,
             release_channels_raw: r.string("slp_release_channels", d.release_channels_raw)?,
             version: r.opt_string("version", d.version)?,
@@ -252,6 +268,7 @@ impl AppSettings {
             default_model: r.string("slp_api_base_model_name", d.default_model)?,
             debug_mode: r.boolean("slp_api_debug_mode", d.debug_mode)?,
             cors_origins: r.string("slp_api_cors_origins", d.cors_origins)?,
+            allowed_hosts: r.string("slp_api_allowed_hosts", d.allowed_hosts)?,
             n_parallel: r.int("slp_n_parallel", d.n_parallel)?,
             llm_n_batch: r.int("slp_llm_n_batch", d.llm_n_batch)?,
             llm_n_threads: r.int("slp_llm_n_threads", d.llm_n_threads)?,

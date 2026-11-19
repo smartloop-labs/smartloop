@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::auth::credential_store;
+use crate::config::AppSettings;
 use crate::platform::client::{JsonObject, PlatformResult};
 use crate::platform::PlatformService;
 use crate::search::providers;
@@ -192,12 +193,8 @@ fn resolve_user_for_status() -> Option<UserInfo> {
 
 // -- endpoints ----------------------------------------------------------------
 
-/// Webapp base URL the Safari fallback redirects to.
-///
-/// `AppSettings` has no `slp_app_url` field, so this is always the hosted
-/// webapp — the Python `hasattr(AppSettings(), "slp_app_url")` check never
-/// succeeds.
-pub static APP_URL: Lazy<String> = Lazy::new(|| "https://app.smartloop.ai".to_string());
+/// Webapp base URL the Safari fallback redirects to (`slp_app_url`).
+pub static APP_URL: Lazy<String> = Lazy::new(|| AppSettings::new().slp_app_url.trim_end_matches('/').to_string());
 
 /// The credential value the platform cache was last refreshed for (dedupe).
 static LAST_REFRESHED_TOKEN: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
