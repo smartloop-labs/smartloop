@@ -70,7 +70,7 @@ async fn the_platform_and_web_app_may_hand_over_a_sign_in_and_nothing_else() {
 }
 
 #[tokio::test]
-async fn another_sites_request_without_an_origin_is_refused_but_the_sign_in_link() {
+async fn another_sites_request_without_an_origin_is_refused_but_sign_in_redirects() {
     let host = ("host", "127.0.0.1:38540");
     let cross = ("sec-fetch-site", "cross-site");
     // An <img> or a link from another site.
@@ -79,6 +79,11 @@ async fn another_sites_request_without_an_origin_is_refused_but_the_sign_in_link
     // The sign-in hand-off's fallback, followed as a link, reaches its route.
     let followed = send(Method::GET, "/v1/auth/callback", &[host, cross, ("sec-fetch-mode", "navigate")]).await.0;
     assert_ne!(followed, StatusCode::FORBIDDEN);
+    // An MCP server's OAuth sign-in redirecting back.
+    for path in ["/v1/projects/p1/mcp/oauth/callback", "/v1/mcp/oauth/callback"] {
+        let followed = send(Method::GET, path, &[host, cross, ("sec-fetch-mode", "navigate")]).await.0;
+        assert_ne!(followed, StatusCode::FORBIDDEN, "{path}");
+    }
     // The desktop app's renderer: cors mode, no Origin.
     assert_eq!(send(Method::GET, "/", &[host, cross, ("sec-fetch-mode", "cors")]).await.0, StatusCode::OK);
     // Typed into the address bar.

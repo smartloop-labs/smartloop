@@ -504,6 +504,9 @@ const LOOPBACK_HOSTS: [&str; 4] = ["localhost", "127.0.0.1", "::1", "[::1]"];
 /// The one route a page of the platform's (its sign-in hand-off, served by
 /// the API or the web app) calls from the user's browser.
 const PLATFORM_ROUTE: &str = "/v1/auth/callback";
+/// Where an MCP server's OAuth sign-in redirects the browser back to; the
+/// project-scoped form is `/v1/projects/{id}/mcp/oauth/callback`.
+const MCP_OAUTH_ROUTE: &str = "/v1/mcp/oauth/callback";
 
 /// Who may call the API, checked before anything else sees a request.
 ///
@@ -557,6 +560,16 @@ fn origin_of(url: &str) -> Option<String> {
     origin.is_tuple().then(|| origin.ascii_serialization())
 }
 
+/// `path` is where another site's sign-in sends the browser back to: the
+/// platform's hand-off, or an MCP server's OAuth redirect.
+fn is_redirect_target(path: &str) -> bool {
+    let project_scoped = path
+        .strip_prefix("/v1/projects/")
+        .and_then(|rest| rest.strip_suffix(MCP_OAUTH_ROUTE.trim_start_matches("/v1")))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'));
+    path == PLATFORM_ROUTE || path == MCP_OAUTH_ROUTE || project_scoped
+}
+
 impl Guard {
     fn from_settings(cors_origins: &str, allowed_hosts: &str, platform_urls: &[&str]) -> Self {
         let origins = listed(cors_origins);
@@ -594,9 +607,10 @@ impl Guard {
 
     /// A browser's request from another site that sent no `Origin`, as an
     /// `<img>`, a link or a form's GET makes: one a page couldn't make in
-    /// `cors` mode, where `Origin` is always sent. Only following the
-    /// platform's sign-in hand-off as a link is let through (the fallback
-    /// for engines that block its POST). The desktop app's renderer sends
+    /// `cors` mode, where `Origin` is always sent. Only a sign-in sending
+    /// the browser back is let through: the platform's hand-off as a link
+    /// (the fallback for engines that block its POST), or an MCP server's
+    /// OAuth redirect. The desktop app's renderer sends
     /// `cors`-mode requests with no `Origin`, so it isn't one.
     fn is_cross_site_without_origin(headers: &HeaderMap, path: &str, method: &Method) -> bool {
         let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default();
@@ -604,7 +618,7 @@ impl Guard {
         if site != "cross-site" || mode == "cors" {
             return false;
         }
-        !(mode == "navigate" && method == Method::GET && path == PLATFORM_ROUTE)
+        !(mode == "navigate" && method == Method::GET && is_redirect_target(path))
     }
 
     /// The answer to a preflight (`OPTIONS` with
@@ -1447,6 +1461,15 @@ mod tests {
         assert_eq!(host_name("[::1]:80"), "[::1]");
         assert_eq!(host_name("127.0.0.1"), "127.0.0.1");
         assert!(is_loopback("LOCALHOST.") && is_loopback("app.localhost") && !is_loopback("localhost.evil.example"));
+    }
+
+    #[test]
+    fn sign_ins_may_send_the_browser_back_to_their_callbacks() {
+        assert!(is_redirect_target("/v1/auth/callback") && is_redirect_target("/v1/mcp/oauth/callback"));
+        assert!(is_redirect_target("/v1/projects/p1/mcp/oauth/callback"));
+        assert!(!is_redirect_target("/v1/projects//mcp/oauth/callback"));
+        assert!(!is_redirect_target("/v1/projects/p1/x/mcp/oauth/callback"));
+        assert!(!is_redirect_target("/v1/projects/p1/mcp/oauth/refresh"));
     }
 
     #[test]
