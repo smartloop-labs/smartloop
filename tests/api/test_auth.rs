@@ -512,3 +512,205 @@ mod test_signing_in_clears_the_search_gate {
         assert!(status_cache_is_empty());
     }
 }
+
+mod test_device_login {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    use parking_lot::Mutex;
+    use smartloop::platform::client::DevicePoll;
+
+    /// The platform's side of a device code sign-in: the code it hands out,
+    /// then one scripted answer per poll (pending once the script runs out).
+    struct DeviceFake {
+        code: PlatformResult<JsonObject>,
+        polls: Mutex<VecDeque<PlatformResult<DevicePoll>>>,
+    }
+
+    impl DeviceFake {
+        fn install(polls: Vec<PlatformResult<DevicePoll>>) -> Arc<Self> {
+            Self::install_with(Ok(code_reply()), polls)
+        }
+
+        fn install_with(code: PlatformResult<JsonObject>, polls: Vec<PlatformResult<DevicePoll>>) -> Arc<Self> {
+            let fake = Arc::new(DeviceFake { code, polls: Mutex::new(polls.into()) });
+            auth::set_platform_service_override(Some(fake.clone()));
+            fake
+        }
+
+        fn then(&self, poll: PlatformResult<DevicePoll>) {
+            self.polls.lock().push_back(poll);
+        }
+    }
+
+    impl AuthPlatformService for DeviceFake {
+        fn get_current_user(&self, _force: bool) -> PlatformResult<JsonObject> {
+            Ok(JsonObject::new())
+        }
+
+        fn list_models(&self, _force: bool) -> PlatformResult<Vec<JsonObject>> {
+            Ok(Vec::new())
+        }
+
+        fn request_device_code(&self, _client_id: &str) -> PlatformResult<JsonObject> {
+            self.code.clone()
+        }
+
+        fn poll_device_token(&self, _device_code: &str, _client_id: &str) -> PlatformResult<DevicePoll> {
+            // The fake answers at once; keep a pending poller from spinning.
+            std::thread::sleep(Duration::from_millis(5));
+            self.polls.lock().pop_front().unwrap_or(Ok(DevicePoll::Pending))
+        }
+    }
+
+    /// What the platform answers a device code request with, polling at once.
+    fn code_reply() -> JsonObject {
+        let value = json!({
+            "device_code": "secret-device-code",
+            "user_code": "BCDF-GHJK",
+            "verification_uri": "https://app.smartloop.ai/device",
+            "verification_uri_complete": "https://app.smartloop.ai/device?code=BCDF-GHJK",
+            "expires_in": 600,
+            "interval": 0,
+        });
+        value.as_object().unwrap().clone()
+    }
+
+    fn tokens() -> DevicePoll {
+        let value = json!({"access_token": "jwt-from-device", "refresh_token": "rt-from-device"});
+        DevicePoll::Tokens(value.as_object().unwrap().clone())
+    }
+
+    /// The device sign-in fixture: auth isolation, and no poller outliving the test.
+    struct DeviceFixture {
+        _auth: AuthFixture,
+    }
+
+    impl DeviceFixture {
+        fn new() -> Self {
+            DeviceFixture { _auth: AuthFixture::new() }
+        }
+    }
+
+    impl Drop for DeviceFixture {
+        fn drop(&mut self) {
+            auth::cancel_device_login();
+        }
+    }
+
+    async fn start() -> Value {
+        let resp = post_json(&client(), "/v1/auth/device", &json!({"client_id": "docent-code"})).await;
+        assert_eq!(resp.status, 200);
+        resp.json().clone()
+    }
+
+    /// `GET /v1/auth/device` once it stops being pending.
+    async fn settled() -> Value {
+        let started = Instant::now();
+        loop {
+            let data = get(&client(), "/v1/auth/device").await.json().clone();
+            if data["status"] != json!("pending") || started.elapsed() > Duration::from_secs(5) {
+                return data;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_approval_stores_the_tokens() {
+        let _fx = DeviceFixture::new();
+        DeviceFake::install(vec![Ok(DevicePoll::Pending), Ok(tokens())]);
+
+        let data = start().await;
+        assert_eq!(data["status"], json!("pending"));
+        assert_eq!(data["user_code"], json!("BCDF-GHJK"));
+        assert_eq!(data["verification_uri_complete"], json!("https://app.smartloop.ai/device?code=BCDF-GHJK"));
+        assert!(!data.to_string().contains("secret-device-code"), "the device code stays in the agent");
+
+        assert_eq!(settled().await["status"], json!("approved"));
+        assert_eq!(credential_store::get_access_token().as_deref(), Some("jwt-from-device"));
+        assert_eq!(credential_store::get_refresh_token().as_deref(), Some("rt-from-device"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_platform_blip_keeps_polling() {
+        let _fx = DeviceFixture::new();
+        DeviceFake::install(vec![Err(PlatformError::connection("down")), Ok(tokens())]);
+
+        start().await;
+        assert_eq!(settled().await["status"], json!("approved"));
+        assert_eq!(credential_store::get_access_token().as_deref(), Some("jwt-from-device"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_denied_and_expired_store_nothing() {
+        let _fx = DeviceFixture::new();
+
+        DeviceFake::install(vec![Ok(DevicePoll::Denied)]);
+        start().await;
+        assert_eq!(settled().await["status"], json!("denied"));
+
+        DeviceFake::install(vec![Ok(DevicePoll::Expired)]);
+        start().await;
+        assert_eq!(settled().await["status"], json!("expired"));
+
+        assert_eq!(credential_store::get_access_token(), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_refused_poll_fails_with_the_reason() {
+        let _fx = DeviceFixture::new();
+        DeviceFake::install(vec![Err(PlatformError::Permission {
+            message: "Unknown device_code.".to_string(),
+            status_code: Some(400),
+        })]);
+
+        start().await;
+        let data = settled().await;
+        assert_eq!(data["status"], json!("failed"));
+        assert_eq!(data["message"], json!("Unknown device_code."));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_unknown_client_is_refused() {
+        let _fx = DeviceFixture::new();
+        DeviceFake::install_with(
+            Err(PlatformError::Permission { message: "Unknown client_id.".to_string(), status_code: Some(401) }),
+            vec![],
+        );
+
+        let resp = post_json(&client(), "/v1/auth/device", &json!({"client_id": "nobody"})).await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(get(&client(), "/v1/auth/device").await.json()["status"], json!("none"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_signing_out_cancels_a_pending_sign_in() {
+        let _fx = DeviceFixture::new();
+        let fake = DeviceFake::install(vec![]);
+
+        start().await;
+        delete(&client(), "/v1/auth/token").await;
+        assert_eq!(get(&client(), "/v1/auth/device").await.json()["status"], json!("none"));
+
+        // Approved after the sign-out: the cancelled poller must not store it.
+        fake.then(Ok(tokens()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(credential_store::get_access_token(), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_missing_client_id_returns_422() {
+        let _fx = DeviceFixture::new();
+        let resp = post_json(&client(), "/v1/auth/device", &json!({})).await;
+        assert_eq!(resp.status, 422);
+    }
+}
