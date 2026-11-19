@@ -48,7 +48,7 @@ async fn a_page_of_another_site_is_refused() {
 }
 
 #[tokio::test]
-async fn the_platform_may_hand_over_a_sign_in_and_nothing_else() {
+async fn the_platform_and_web_app_may_hand_over_a_sign_in_and_nothing_else() {
     let host = ("host", "127.0.0.1:38540");
     let platform = ("origin", PLATFORM);
     let preflight = |method| [host, platform, ("access-control-request-method", method)];
@@ -57,9 +57,15 @@ async fn the_platform_may_hand_over_a_sign_in_and_nothing_else() {
     assert_eq!(send(Method::OPTIONS, "/v1/auth/callback", &preflight("DELETE")).await.0, StatusCode::FORBIDDEN);
     assert_eq!(send(Method::OPTIONS, "/v1/projects", &preflight("POST")).await.0, StatusCode::FORBIDDEN);
     assert_eq!(send(Method::GET, "/v1/auth/status", &[host, platform]).await.0, StatusCode::FORBIDDEN);
-    // The web app's origin isn't the platform's.
+    // The web app hands the sign-in over too, and nothing else.
     let web = ("origin", "https://app.smartloop.ai");
     let preflight = [host, web, ("access-control-request-method", "POST")];
+    let (status, allowed) = send(Method::OPTIONS, "/v1/auth/callback", &preflight).await;
+    assert_eq!((status, allowed.as_deref()), (StatusCode::OK, Some("https://app.smartloop.ai")));
+    assert_eq!(send(Method::GET, "/v1/auth/status", &[host, web]).await.0, StatusCode::FORBIDDEN);
+    // Another site's isn't either.
+    let other = ("origin", "https://smartloop.ai.evil.example");
+    let preflight = [host, other, ("access-control-request-method", "POST")];
     assert_eq!(send(Method::OPTIONS, "/v1/auth/callback", &preflight).await.0, StatusCode::FORBIDDEN);
 }
 

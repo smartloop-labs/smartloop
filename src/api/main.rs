@@ -511,7 +511,7 @@ const PLATFORM_ROUTE: &str = "/v1/auth/callback";
 /// request must name this machine as its `Host`, which turns away DNS
 /// rebinding (a site pointing its own name at 127.0.0.1); and a browser's
 /// request must come from a page of this machine's, from an origin listed
-/// in `cors_origins`, or be the platform's sign-in hand-off. Clients that
+/// in `cors_origins`, or be the sign-in hand-off of the platform or web app. Clients that
 /// aren't browsers send no `Origin` and pass, as does the desktop app's
 /// renderer, which sends none either.
 ///
@@ -522,8 +522,9 @@ struct Guard {
     /// Origins listed in `cors_origins`.
     origins: Vec<String>,
     allow_all_origins: bool,
-    /// The platform's origin, allowed on `PLATFORM_ROUTE` only.
-    platform_origin: Option<String>,
+    /// The platform's and web app's origins, allowed on `PLATFORM_ROUTE`
+    /// only.
+    platform_origins: Vec<String>,
     /// Hosts listed in `allowed_hosts`, lower-case.
     hosts: Vec<String>,
     allow_all_hosts: bool,
@@ -557,13 +558,13 @@ fn origin_of(url: &str) -> Option<String> {
 }
 
 impl Guard {
-    fn from_settings(cors_origins: &str, allowed_hosts: &str, platform_base: &str) -> Self {
+    fn from_settings(cors_origins: &str, allowed_hosts: &str, platform_urls: &[&str]) -> Self {
         let origins = listed(cors_origins);
         let hosts: Vec<String> = listed(allowed_hosts).into_iter().map(|h| h.to_ascii_lowercase()).collect();
         Guard {
             allow_all_origins: origins.iter().any(|o| o == "*"),
             origins,
-            platform_origin: origin_of(platform_base),
+            platform_origins: platform_urls.iter().filter_map(|url| origin_of(url)).collect(),
             allow_all_hosts: hosts.iter().any(|h| h == "*"),
             hosts,
         }
@@ -578,14 +579,16 @@ impl Guard {
     }
 
     /// A browser at `origin` may make a `method` request of `path`: a page
-    /// of this machine's, one listed, or the platform's sign-in hand-off.
+    /// of this machine's, one listed, or the sign-in hand-off of the
+    /// platform or web app.
     fn is_allowed_origin(&self, origin: &str, path: &str, method: &str) -> bool {
         let local = url::Url::parse(origin)
             .ok()
             .filter(|u| matches!(u.scheme(), "http" | "https"))
             .and_then(|u| u.host_str().map(is_loopback))
             .unwrap_or(false);
-        let platform = self.platform_origin.as_deref() == Some(origin) && path == PLATFORM_ROUTE && method == "POST";
+        let platform =
+            self.platform_origins.iter().any(|o| o == origin) && path == PLATFORM_ROUTE && method == "POST";
         self.allow_all_origins || local || platform || self.origins.iter().any(|o| o == origin)
     }
 
@@ -698,7 +701,8 @@ fn refuse(why: &str) -> Response {
 /// Wrap `router` (outermost) in the request guard.
 fn with_guard(router: Router) -> Router {
     let settings = api_settings();
-    let guard = Arc::new(Guard::from_settings(&settings.cors_origins, &settings.allowed_hosts, &settings.slp_api_base));
+    let platform_urls = [settings.slp_api_base.as_str(), settings.slp_app_url.as_str()];
+    let guard = Arc::new(Guard::from_settings(&settings.cors_origins, &settings.allowed_hosts, &platform_urls));
     Router::new().fallback_service(router).layer(axum::middleware::from_fn(move |request: Request, next: Next| {
         let guard = Arc::clone(&guard);
         async move { guard.call(request, next).await }
@@ -1447,8 +1451,8 @@ mod tests {
 
     #[test]
     fn the_guard_takes_its_lists_from_the_settings() {
-        let guard = Guard::from_settings("", "", "https://api.smartloop.ai/v1");
-        assert_eq!(guard.platform_origin.as_deref(), Some("https://api.smartloop.ai"));
+        let guard = Guard::from_settings("", "", &["https://api.smartloop.ai/v1", "https://app.smartloop.ai/"]);
+        assert_eq!(guard.platform_origins, ["https://api.smartloop.ai", "https://app.smartloop.ai"]);
         let host = |h: &str| {
             let mut headers = HeaderMap::new();
             headers.insert("host", HeaderValue::from_str(h).unwrap());
@@ -1458,19 +1462,21 @@ mod tests {
         assert!(guard.is_allowed_origin("http://127.0.0.1:5000", "/v1/projects", "POST"));
         assert!(guard.is_allowed_origin("https://api.smartloop.ai", "/v1/auth/callback", "POST"));
         assert!(!guard.is_allowed_origin("https://api.smartloop.ai", "/v1/auth/callback", "GET"));
+        assert!(guard.is_allowed_origin("https://app.smartloop.ai", "/v1/auth/callback", "POST"));
+        assert!(!guard.is_allowed_origin("https://app.smartloop.ai", "/v1/projects", "POST"));
         assert!(!guard.is_allowed_origin("null", "/v1/projects", "GET"));
         assert!(!guard.is_allowed_origin("file://", "/v1/projects", "GET"));
 
-        let opened = Guard::from_settings(" https://a.example , ", "box.lan, *", "https://api.smartloop.ai");
+        let opened = Guard::from_settings(" https://a.example , ", "box.lan, *", &["https://api.smartloop.ai"]);
         assert!(opened.is_allowed_origin("https://a.example", "/v1/projects", "GET"));
         assert!(!opened.is_allowed_origin("https://b.example", "/v1/projects", "GET"));
         assert!(opened.is_allowed_host(&host("anything:1")));
-        assert!(Guard::from_settings("*", "", "").is_allowed_origin("https://b.example", "/", "GET"));
+        assert!(Guard::from_settings("*", "", &[]).is_allowed_origin("https://b.example", "/", "GET"));
     }
 
     #[test]
     fn a_preflight_mirrors_its_origin_and_requested_headers() {
-        let guard = Guard::from_settings("", "", "https://api.smartloop.ai");
+        let guard = Guard::from_settings("", "", &["https://api.smartloop.ai"]);
         let mut headers = HeaderMap::new();
         headers.insert("access-control-request-method", HeaderValue::from_static("POST"));
         headers.insert("access-control-request-headers", HeaderValue::from_static("content-type"));
