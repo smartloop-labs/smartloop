@@ -235,6 +235,10 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: make notarize
 
+      - name: Smoke test project-agent cold start
+        timeout-minutes: 3
+        run: python3 scripts/smoke-project-agent.py dist/slp/slp
+
       - name: Archive
         run: make archive
 
