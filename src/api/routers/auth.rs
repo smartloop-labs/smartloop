@@ -571,7 +571,11 @@ static DEVICE_LOGIN: Lazy<Mutex<DeviceLogin>> = Lazy::new(|| Mutex::new(DeviceLo
 
 /// The platform's refusal to start a sign-in, as this router's status.
 fn device_platform_error(e: PlatformError) -> HTTPException {
-    if e.is_permission() {
+    // The platform's limit on new codes, not an outage: say so, or the user
+    // is told the platform is down and retries into the same wall.
+    if e.status_code() == Some(429) {
+        HTTPException::new(429, "Too many sign-in attempts from this network; try again later")
+    } else if e.is_permission() {
         HTTPException::new(400, e.message())
     } else if e.is_connection() {
         HTTPException::new(502, "Platform API unavailable")

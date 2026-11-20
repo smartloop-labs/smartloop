@@ -690,6 +690,25 @@ mod test_device_login {
         assert_eq!(get(&client(), "/v1/auth/device").await.json()["status"], json!("none"));
     }
 
+    /// The platform's limit on new codes reads as a limit, not an outage.
+    #[tokio::test]
+    #[serial]
+    async fn test_a_rate_limited_start_says_so() {
+        let _fx = DeviceFixture::new();
+        DeviceFake::install_with(
+            Err(PlatformError::Connection { message: "API error (429)".to_string(), status_code: Some(429) }),
+            vec![],
+        );
+
+        let resp = post_json(&client(), "/v1/auth/device", &json!({"client_id": "docent-code"})).await;
+        assert_eq!(resp.status, 429);
+        assert!(resp.json()["detail"].as_str().unwrap().contains("try again later"));
+
+        DeviceFake::install_with(Err(PlatformError::connection("down")), vec![]);
+        let resp = post_json(&client(), "/v1/auth/device", &json!({"client_id": "docent-code"})).await;
+        assert_eq!(resp.status, 502, "an outage is still an outage");
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_signing_out_cancels_a_pending_sign_in() {
