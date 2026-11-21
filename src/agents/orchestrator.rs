@@ -109,6 +109,9 @@ pub type CollectOverride = Arc<dyn Fn(&OrchestratorContext) -> SharedSearchConte
 pub struct SLPOrchestratorOptions {
     /// Decision model; defaults to the orchestrator model.
     pub agent_llm: Option<Arc<dyn BaseLLM>>,
+    /// `agent_llm` runs every text node of the request (see
+    /// [`ModelRouterOptions::pinned`]).
+    pub pinned: bool,
     pub large_llm: Option<Arc<dyn BaseLLM>>,
     pub large_llm_provider: Option<LargeLlmProvider>,
     pub capability_llm_provider: Option<CapabilityLlmProvider>,
@@ -190,6 +193,7 @@ impl SLPOrchestrator {
                 capability_llm_provider: options.capability_llm_provider.clone(),
                 capability_available: options.capability_available.clone(),
                 capability_skip_reason: options.capability_skip_reason.clone(),
+                pinned: options.pinned,
             },
         ));
 

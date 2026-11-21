@@ -107,7 +107,7 @@ fn test_a_remote_model_without_a_spec_declares_nothing() {
 }
 
 #[test]
-fn test_a_remote_model_ranks_on_its_active_params() {
+fn test_a_remote_model_ranks_on_its_total_params() {
     remote_spec(
         "remote-sized",
         json!({"capabilities": ["general"], "param_size_b": 428.0, "active_param_size_b": 23.0}),
@@ -116,17 +116,18 @@ fn test_a_remote_model_ranks_on_its_active_params() {
     let added = ws.add_remote_model("remote-sized", true);
 
     assert_eq!(added.param_size_b(), 428.0);
-    assert_eq!(added.rank(), (23.0, 0));
+    assert_eq!(added.rank(), (428.0, 0));
 }
 
 #[test]
-fn test_remote_models_rank_among_themselves_by_active_params() {
+fn test_remote_models_rank_among_themselves_by_total_params() {
     remote_spec("remote-light", json!({"capabilities": ["general"], "param_size_b": 900.0, "active_param_size_b": 23.0}));
     remote_spec("remote-heavy", json!({"capabilities": ["general"], "param_size_b": 753.0, "active_param_size_b": 40.0}));
     let mut ws = workspace();
     ws.add_remote_model("remote-light", true);
     ws.add_remote_model("remote-heavy", true);
-    assert_eq!(ranked_names(&ws, ANSWER_TIER), vec!["remote-heavy", "remote-light"]);
+    // The bigger model ranks first, whatever share of it is active per token.
+    assert_eq!(ranked_names(&ws, ANSWER_TIER), vec!["remote-light", "remote-heavy"]);
 }
 
 #[test]

@@ -18,11 +18,11 @@ use crate::shared::model_service_a::{attach_workspace, bare_service};
 use crate::shared::workspace_support::EnvGuard;
 
 /// Register a remote vision model under a name only these tests use.
-fn publish_cloud_vision(name: &str, active_b: f64) {
+fn publish_cloud_vision(name: &str, total_b: f64) {
     let Value::Object(row) = json!({
         "name": name, "type": "remote", "url": "https://api.smartloop.ai",
         "capabilities": ["general", "dp", "vision"], "context_length": 65536,
-        "param_size_b": active_b * 10.0, "active_param_size_b": active_b,
+        "param_size_b": total_b, "active_param_size_b": total_b / 10.0,
     }) else {
         unreachable!()
     };
@@ -84,7 +84,7 @@ async fn test_a_cloud_model_receives_the_image_parts() {
 #[test]
 #[serial]
 fn test_ocr_falls_back_to_a_remote_vision_model() {
-    publish_cloud_vision("vision-cloud-only", 23.0);
+    publish_cloud_vision("vision-cloud-only", 230.0);
     let svc = svc_with(None, "vision-cloud-only");
     let picked = std::sync::Mutex::new(Vec::new());
     let on_selected = |name: &str| picked.lock().unwrap().push(name.to_string());
@@ -101,7 +101,7 @@ fn test_ocr_falls_back_to_a_remote_vision_model() {
 #[test]
 #[serial]
 fn test_a_much_larger_remote_model_answers_image_questions() {
-    publish_cloud_vision("vision-cloud-large", 23.0);
+    publish_cloud_vision("vision-cloud-large", 230.0);
     let svc = svc_with(Some("qwen3.5-2b"), "vision-cloud-large");
 
     let llm = svc.get_vision_answer_llm(None).expect("a vision model");
@@ -115,7 +115,7 @@ fn test_a_much_larger_remote_model_answers_image_questions() {
 #[test]
 #[serial]
 fn test_a_local_only_resolution_never_reaches_a_remote_vision_model() {
-    publish_cloud_vision("vision-cloud-only", 23.0);
+    publish_cloud_vision("vision-cloud-only", 230.0);
     let svc = svc_with(None, "vision-cloud-only");
     let _scope = smartloop::llms::cloud_llm::local_only_scope(true);
 

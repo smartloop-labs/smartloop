@@ -113,11 +113,14 @@ impl ModelSpec {
         }
     }
 
-    /// The size models are compared on: active parameters for a
-    /// mixture-of-experts model (what sets its speed and per-token ability),
-    /// otherwise the parameter count.
+    /// The size models are compared on: the total parameter count — how big
+    /// the model is — for a dense and a mixture-of-experts model alike.  A
+    /// 30B-A3B model holds 30B parameters' worth of knowledge and needs the
+    /// memory of one, so it ranks (and is fitted) as a 30B model; its active
+    /// count only says how fast it decodes, which is a reason to prefer it,
+    /// not to rank it beside a dense 3B.
     pub fn ranking_size_b(&self) -> f64 {
-        self.active_param_size_b.unwrap_or(self.param_size_b)
+        self.param_size_b
     }
 
     /// Whether the model declares `capability`.

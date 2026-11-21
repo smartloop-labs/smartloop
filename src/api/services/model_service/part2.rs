@@ -116,13 +116,29 @@ is not visible, say so plainly instead of guessing. Do not invent \
 people, text, or details that are not there.";
 
 /// Perception prompt for the orchestrator's image path; `{request}` is
-/// replaced with the user's message.  Asks the vision model only to describe
-/// what it sees, scoped to the request, because the perception is fed back
-/// into the text pipeline which does the actual answering.
-pub const VISION_PERCEPTION_PROMPT: &str = "Describe what is visible in this image, focusing on the details that \
-are relevant to the following request. Be concrete and specific about \
-colors, objects, and any visible text. Describe only what is visible; \
-do not answer the request or make recommendations.\n\nRequest: {request}";
+/// replaced with the user's message.  Asks the vision model only to turn the
+/// image into text, scoped to the request, because the perception is fed back
+/// into the text pipeline and a (usually larger, text-only) model does the
+/// actual answering.  A screenshot of a spec, a design or an error is mostly
+/// text and structure, so the prompt asks for a faithful transcription of it
+/// first and a description of what is not text second — the answering model
+/// never sees the pixels, so whatever is left out here is lost.
+pub const VISION_PERCEPTION_PROMPT: &str = "Convert this image into text for another model that cannot see it \
+and will use your output to fulfil the request below.\n\
+1. Transcribe ALL visible text verbatim, in reading order: headings, \
+paragraphs, labels, lists, code, numbers and units. Render tables as \
+Markdown tables and keep the hierarchy of sections and bullet points.\n\
+2. Then describe the layout and any non-text content that matters for the \
+request: UI components and their arrangement, diagrams and the arrows \
+between their parts, charts, colors, icons and states.\n\
+Report only what is visible. Do not answer the request, write code, or make \
+recommendations.\n\nRequest: {request}";
+
+/// Output budget for [`VISION_PERCEPTION_PROMPT`]: a full page of spec text
+/// plus a layout description.  Matches the document-OCR page budget — a cut
+/// transcription is worse than a slow one, since the answering model cannot
+/// look again.
+pub const VISION_PERCEPTION_MAX_TOKENS: usize = 2048;
 
 // --------------------------------------------------------------- MCP regexes
 
@@ -3430,6 +3446,12 @@ impl ModelService {
         // to orchestrate over, the perception is streamed back directly.
         let mut image_perception: Option<String> = None;
         let mut image_sole_source = false;
+        // Whether the planner should still treat this turn as image work.
+        // Once the image has been read into text, it is not: the answer is
+        // text work for the answer tier's model (a text-only coding model,
+        // say), and routing it to `vision` would hand the whole answer to the
+        // vision model that only transcribed the image.
+        let mut has_attachments = has_attachments;
         if let Some(images) = images.as_ref().filter(|images| !images.is_empty()) {
             // Surface the vision model on the SSE stream, naming the model
             // actually picked, right before the (heavy) load.
@@ -3439,7 +3461,7 @@ impl ModelService {
             });
             let perceived = catch_unwind(AssertUnwindSafe(|| {
                 let _t = timing::phase("orchestrate.vision");
-                self.vision_perceive(&user_message, images, 512, Some(on_vision_model))
+                self.vision_perceive(&user_message, images, VISION_PERCEPTION_MAX_TOKENS, Some(on_vision_model))
             }));
             match perceived {
                 Ok(Ok(perception)) => image_perception = Some(perception),
@@ -3466,6 +3488,7 @@ impl ModelService {
                     image_sole_source = !IMAGE_CROSS_REF_RE.is_match(&user_message);
                     tracing::info!(target: LOG, "[orchestrator] image sole-source={}", py_bool(image_sole_source));
                     user_message = format!("{user_message}\n\n[Image context: {perception}]");
+                    has_attachments = false;
                 }
                 None => {
                     image_perception = None;
@@ -3569,19 +3592,23 @@ impl ModelService {
         // tools and scans stay self-contained.
         let orchestrator_cwd = current_project.project_dir.clone();
 
-        // With exactly one model selected, it runs the routing and decision
-        // nodes too.  Asked without a capability, so a vision-only selection
+        // One model runs the whole graph — routing, decisions, tool
+        // resolution and the answer — so the request streams at that model's
+        // tokens/s with no switch between models.  Another model is consulted
+        // only for a capability this one lacks (vision: see the image
+        // perception above and `ModelRouter::llm_for_tier`).
+        //
+        // With exactly one model selected, that is the model, local or
+        // remote.  Asked without a capability, so a vision-only selection
         // declines these text-only nodes and they stay on the default model.
-        // Orchestration runs on device: a remote pin writes what the user
-        // reads, so the routing and decision models resolve local-only.
-        let pinned_llm = {
-            let _scope = local_only_scope(true);
-            self.pinned_llm_seam(None)
-        };
+        // With several selected, it is the answer tier's model — the one
+        // that would write the reply anyway — unless that is the router
+        // model, which only routes.
+        let pinned_llm = self.pinned_llm_seam(None).or_else(|| self.primary_llm_for_request());
         if let Some(pinned) = pinned_llm.as_ref() {
             tracing::info!(
                 target: LOG,
-                "[models] Single selected model pinned for the whole request: {}",
+                "[models] One model pinned for the whole request: {}",
                 Self::model_label(pinned.as_ref())
             );
         }
@@ -3601,6 +3628,7 @@ impl ModelService {
             // the options field they are stored in.
             let mut options = SLPOrchestratorOptions::default();
             options.agent_llm = Some(ProviderOutput::from_value(agent_llm));
+            options.pinned = pinned_llm.is_some();
             options.large_llm = None;
             // Not local-only: these write step output the user reads.  The
             // router resolves its decision nodes inside a local-only scope.
@@ -4008,6 +4036,26 @@ impl ModelService {
         images
     }
 
+    /// The answer tier's model, to run every node of a request when the
+    /// selection holds more than one model (see `orchestrate`).  `None` with
+    /// nothing selected, when nothing on the answer tier resolves, or when
+    /// it resolves to the router model: that one only routes, and pinning it
+    /// would keep the request off the larger model that answers.
+    fn primary_llm_for_request(&self) -> Option<Arc<dyn BaseLLM>> {
+        if self.selected_models().is_empty() {
+            return None;
+        }
+        let primary = self.llm_for_capability_seam(crate::types::ANSWER_TIER)?;
+        let router = self.resident_llm();
+        let router_label = router.as_ref().map(|r| Self::model_label(r.as_ref())).unwrap_or_default();
+        let is_router = router.as_ref().is_some_and(|r| same_llm(r, &primary))
+            || self.decision_llm.read().as_ref().is_some_and(|d| same_llm(d, &primary))
+            || (!router_label.is_empty() && Self::model_label(primary.as_ref()) == router_label)
+            || canonical_model_name(&Self::model_label(primary.as_ref()))
+                == canonical_model_name(&api_settings().default_model);
+        (!is_router).then_some(primary)
+    }
+
     /// A concrete description of `images` scoped to `user_message` — the
     /// orchestrator's image entry point.  Reuses `vision_answer`'s inference
     /// path (and its GPU-clip recovery) with a description-only prompt.
@@ -4088,7 +4136,7 @@ impl ModelService {
                 );
                 self.vision_clip_cpu.store(true, Ordering::SeqCst);
                 self.unload_vision_model();
-                let Some(llm) = self.get_vision_llm(None) else {
+                let Some(llm) = self.get_vision_llm_for(None, true) else {
                     return Err(e);
                 };
                 catch_unwind(AssertUnwindSafe(|| self.ask_vision(&llm, &messages, max_tokens)))
