@@ -141,6 +141,11 @@ pub trait ChatService: Send + Sync {
     fn get_asset_images(&self, asset_ids: &[String]) -> Vec<ImageAttachment>;
     /// `ModelService.resolve_attachment_context`.
     fn resolve_attachment_context(&self, asset_ids: &[String]) -> String;
+    /// `ModelService.image_context_for_round`: what an attached image says,
+    /// for a tool round that skips orchestration.
+    fn image_context_for_round(&self, _user_message: &str, _images: &[ImageAttachment]) -> Option<String> {
+        None
+    }
     /// `ModelService.orchestrate`.
     fn orchestrate(&self, args: OrchestrateArgs) -> anyhow::Result<OrchestrateOutcome>;
     /// `ModelService.get_project_id`.
@@ -250,6 +255,9 @@ impl ChatService for ModelService {
     }
     fn resolve_attachment_context(&self, asset_ids: &[String]) -> String {
         ModelService::resolve_attachment_context(self, asset_ids)
+    }
+    fn image_context_for_round(&self, user_message: &str, images: &[ImageAttachment]) -> Option<String> {
+        ModelService::image_context_for_round(self, user_message, images)
     }
     fn orchestrate(&self, args: OrchestrateArgs) -> anyhow::Result<OrchestrateOutcome> {
         let history: Vec<Value> = args
@@ -2807,6 +2815,18 @@ fn stream_chunks_inner(
         let mut classified_coding = continuing;
         let mut citations: Option<Vec<CitationDict>> = None;
         let mut is_mutation = false;
+        // A tool round continues the turn without re-orchestrating, but the
+        // client resends the turn's attachment with it.  The answer model is
+        // usually text-only, so it gets the image as text on every round —
+        // the reading the first round made — or it loses the request it is
+        // carrying out and starts exploring from scratch.
+        if continuing && !image_attachments.is_empty() {
+            let round_svc = svc.clone();
+            let round_msg = last_user_msg.clone().unwrap_or_default();
+            let round_images = image_attachments.clone();
+            orchestrator_context =
+                run_blocking(move || round_svc.image_context_for_round(&round_msg, &round_images)).await;
+        }
         if truthy(&last_user_msg) && !continuing {
             yield status_event("tools", "processing", "Processing...");
 

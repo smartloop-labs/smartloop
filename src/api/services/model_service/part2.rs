@@ -134,6 +134,30 @@ between their parts, charts, colors, icons and states.\n\
 Report only what is visible. Do not answer the request, write code, or make \
 recommendations.\n\nRequest: {request}";
 
+/// How many image readings [`ModelService::image_perceptions`] keeps; the
+/// oldest is dropped past this.  A turn needs one; the rest only spare a
+/// re-read when an earlier image comes back.
+pub const IMAGE_PERCEPTION_CACHE: usize = 32;
+
+/// The context block that hands a text-only answer model what an attached
+/// image contains, phrased as an instruction so it answers from it instead
+/// of replying that it cannot see images.  `sole_source` is a bare
+/// read/implement of the image; otherwise retrieved material may help.
+pub fn image_context_block(perception: &str, sole_source: bool) -> String {
+    let authority = if sole_source {
+        "the SOLE source for answering this request"
+    } else {
+        "an authoritative source for this request"
+    };
+    format!(
+        "The user attached an image. A vision model has already analyzed \
+         it — treat the description below as the actual contents of that \
+         image and {authority}. Answer the user's request directly; do \
+         NOT say you cannot see or view the image.\n\n\
+         Image contents: {perception}"
+    )
+}
+
 /// Output budget for [`VISION_PERCEPTION_PROMPT`]: a full page of spec text
 /// plus a layout description.  Matches the document-OCR page budget — a cut
 /// transcription is worse than a slow one, since the answering model cannot
@@ -3486,6 +3510,7 @@ impl ModelService {
                     // to compare, validate, or answer using indexed content
                     // keeps them for cross-validation.
                     image_sole_source = !IMAGE_CROSS_REF_RE.is_match(&user_message);
+                    self.remember_image_perception(images, perception);
                     tracing::info!(target: LOG, "[orchestrator] image sole-source={}", py_bool(image_sole_source));
                     user_message = format!("{user_message}\n\n[Image context: {perception}]");
                     has_attachments = false;
@@ -3506,18 +3531,7 @@ impl ModelService {
             let Some(perception) = image_perception.as_deref() else {
                 return ctx;
             };
-            let authority = if image_sole_source {
-                "the SOLE source for answering this request"
-            } else {
-                "an authoritative source for this request"
-            };
-            let block = format!(
-                "The user attached an image. A vision model has already analyzed \
-                 it — treat the description below as the actual contents of that \
-                 image and {authority}. Answer the user's request directly; do \
-                 NOT say you cannot see or view the image.\n\n\
-                 Image contents: {perception}"
-            );
+            let block = image_context_block(perception, image_sole_source);
             match ctx.filter(|c| !c.is_empty()) {
                 None => Some(block),
                 // Cross-validation intent — the image is authoritative but the
@@ -4054,6 +4068,74 @@ impl ModelService {
             || canonical_model_name(&Self::model_label(primary.as_ref()))
                 == canonical_model_name(&api_settings().default_model);
         (!is_router).then_some(primary)
+    }
+
+    /// Cache key for a set of images: a digest of their bytes, so the same
+    /// attachment resent on a later request finds its reading.
+    fn image_key(images: &[(Vec<u8>, String)]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for (data, mime) in images {
+            hasher.update(mime.as_bytes());
+            hasher.update((data.len() as u64).to_le_bytes());
+            hasher.update(data);
+        }
+        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Keep what the vision model read from `images` for the turn's later
+    /// rounds (see [`ModelService::image_perceptions`]).
+    pub fn remember_image_perception(&self, images: &[(Vec<u8>, String)], perception: &str) {
+        if images.is_empty() || perception.trim().is_empty() {
+            return;
+        }
+        let mut cache = self.image_perceptions.lock();
+        cache.shift_remove(&Self::image_key(images));
+        cache.insert(Self::image_key(images), perception.to_string());
+        while cache.len() > IMAGE_PERCEPTION_CACHE {
+            cache.shift_remove_index(0);
+        }
+    }
+
+    /// The image context for a request that continues a turn (a client tool
+    /// round) and so skips orchestration: what the vision model read from
+    /// `images` on the turn's first round, or — when that reading is gone
+    /// (a restart) — a fresh one.  `None` without images or when no vision
+    /// model can read them.
+    pub fn image_context_for_round(&self, user_message: &str, images: &[(Vec<u8>, String)]) -> Option<String> {
+        if images.is_empty() {
+            return None;
+        }
+        let cached = self.image_perceptions.lock().get(&Self::image_key(images)).cloned();
+        let perception = match cached {
+            Some(perception) => perception,
+            None => {
+                let read = catch_unwind(AssertUnwindSafe(|| {
+                    self.vision_perceive(user_message, images, VISION_PERCEPTION_MAX_TOKENS, None)
+                }));
+                self.unload_vision_model();
+                let perception = match read {
+                    Ok(Ok(p)) if !p.trim().is_empty() => p,
+                    Ok(Ok(_)) => return None,
+                    Ok(Err(e)) => {
+                        tracing::warn!(target: LOG, "[orchestrator] tool-round image read failed: {e}");
+                        return None;
+                    }
+                    Err(panic) => {
+                        tracing::warn!(target: LOG, "[orchestrator] tool-round image read failed: {}", panic_message(&panic));
+                        return None;
+                    }
+                };
+                self.remember_image_perception(images, &perception);
+                perception
+            }
+        };
+        tracing::info!(
+            target: LOG,
+            "[orchestrator] tool round carries the image context ({} chars)",
+            perception.chars().count()
+        );
+        Some(image_context_block(&perception, !IMAGE_CROSS_REF_RE.is_match(user_message)))
     }
 
     /// A concrete description of `images` scoped to `user_message` — the

@@ -564,6 +564,13 @@ pub struct ModelService {
     pub vision_unavailable: AtomicBool,
     /// `_vision_clip_cpu`: latched after a GPU clip encode crashes.
     pub vision_clip_cpu: AtomicBool,
+    /// What the vision model read from a chat image, keyed by the image
+    /// bytes (see `ModelService::image_key`).  A coding client continues a
+    /// turn over several tool rounds, each a request that resends the same
+    /// attachment but skips orchestration; this is how every round — not
+    /// only the first — hands the text-only answer model what the image says,
+    /// without running the vision model again.
+    pub image_perceptions: Mutex<IndexMap<String, String>>,
     /// `_large_model_attempted`: the large model has been considered.
     pub large_model_attempted: AtomicBool,
     /// `_cap_llm_<model_name>` slots, in insertion order.
@@ -652,6 +659,7 @@ impl ModelService {
             vision_model_name: RwLock::new(None),
             vision_unavailable: AtomicBool::new(false),
             vision_clip_cpu: AtomicBool::new(false),
+            image_perceptions: Mutex::new(IndexMap::new()),
             large_model_attempted: AtomicBool::new(false),
             cap_llms: Mutex::new(Vec::new()),
             capability_skip: Mutex::new(None),
