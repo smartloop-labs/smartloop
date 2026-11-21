@@ -9,13 +9,17 @@
 //! ## Contract
 //!
 //! `POST {SLP_API_BASE}/v1/chat/session` (platform auth), body
-//! `{"project_id": "...", "replaces": "<session_id>"}` (`replaces` only when
-//! the previous session's key was refused, so the server settles it at once
-//! instead of holding its budget until it expires), answers:
+//! `{"project_id": "...", "model": "<name>", "replaces": "<session_id>"}`
+//! (`model` is the model about to be called, and the session comes from its
+//! provider; `replaces` only when the previous session's key was refused, so
+//! the server settles it at once instead of holding its budget until it
+//! expires), answers:
 //!
 //! ```json
 //! {
 //!   "session_id": "...",
+//!   "provider": "openrouter",
+//!   "renew_statuses": [401, 402, 403],
 //!   "base_url": "https://openrouter.ai/api/v1",
 //!   "key": "sk-or-...",
 //!   "expires_at": "2026-11-02T18:30:00Z",
@@ -30,6 +34,11 @@
 //!
 //! `models[].body` is merged into each request for that model, so the server
 //! keeps deciding provider routing and price caps without a client release.
+//!
+//! Cloud models come from more than one provider (OpenRouter, Respan), and a
+//! session holds one provider's key, so one session per provider is kept.
+//! `renew_statuses` are the provider's answers that mean the key itself is
+//! spent or dead (Respan refuses a spent key with 429, not 402).
 //! A 401, 403 or 429 is reported the way the chat endpoint reported it.
 //!
 //! The key lives in memory only.  It is never written to disk, logged, or
@@ -86,6 +95,12 @@ pub struct CloudSession {
     /// refused.  Absent from an older server.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Whose key this is.  An older server names none: OpenRouter.
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// Provider statuses after which the session is traded for a new one.
+    #[serde(default = "default_renew_statuses")]
+    pub renew_statuses: Vec<u16>,
     /// When this process received the session.
     #[serde(skip, default = "Instant::now")]
     minted_at: Instant,
@@ -98,9 +113,18 @@ pub struct CloudSession {
     pub models: Vec<SessionModel>,
 }
 
+fn default_provider() -> String {
+    "openrouter".to_string()
+}
+
+fn default_renew_statuses() -> Vec<u16> {
+    vec![401, 402, 403]
+}
+
 impl std::fmt::Debug for CloudSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CloudSession")
+            .field("provider", &self.provider)
             .field("base_url", &self.base_url)
             .field("key", &"<redacted>")
             .field("expires_at", &self.expires_at)
@@ -133,6 +157,12 @@ impl CloudSession {
         headers
     }
 
+    /// Whether the provider answering `status` means this session's key is
+    /// spent, expired or revoked, so a new session is needed.
+    pub fn renews_on(&self, status: u16) -> bool {
+        self.renew_statuses.contains(&status)
+    }
+
     /// Whether the key is young enough that a refusal may only mean the
     /// provider has not caught up with it yet.
     pub fn is_new(&self) -> bool {
@@ -160,29 +190,37 @@ impl CloudSession {
     }
 }
 
-/// Sessions by platform API base.
-static SESSIONS: Lazy<Mutex<HashMap<String, Arc<CloudSession>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// Sessions by platform API base, one per provider.
+static SESSIONS: Lazy<Mutex<HashMap<String, Vec<Arc<CloudSession>>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// The current session for `client`'s platform, minting one when there is
-/// none or it is about to expire.  `model` names the model in errors.
+/// Put `fresh` in place of any session of the same provider.
+fn keep(sessions: &mut Vec<Arc<CloudSession>>, fresh: &Arc<CloudSession>) {
+    sessions.retain(|s| s.provider != fresh.provider);
+    sessions.push(fresh.clone());
+}
+
+/// The current session that may call `model` on `client`'s platform,
+/// minting one from the model's provider when there is none or it is about
+/// to expire.
 ///
 /// The lock is held through a fetch, so requests that find the session stale
 /// together wait for one mint instead of each making their own.
 pub fn session(client: &SLPPlatformClient, project_id: &str, model: &str) -> Result<Arc<CloudSession>, String> {
-    let mut sessions = SESSIONS.lock();
-    if let Some(current) = sessions.get(client.base_url())
-        && current.is_fresh(Utc::now())
-    {
+    let mut all = SESSIONS.lock();
+    let sessions = all.entry(client.base_url().to_string()).or_default();
+    let now = Utc::now();
+    if let Some(current) = sessions.iter().find(|s| s.is_fresh(now) && s.model(model).is_some()) {
         return Ok(current.clone());
     }
     let fresh = Arc::new(fetch(client, project_id, model, None)?);
     tracing::info!(
         target: LOG_TARGET,
-        "[session] new cloud session for {} models, expires {}",
+        "[session] new {} cloud session for {} models, expires {}",
+        fresh.provider,
         fresh.models.len(),
         fresh.expires_at
     );
-    sessions.insert(client.base_url().to_string(), fresh.clone());
+    keep(sessions, &fresh);
     Ok(fresh)
 }
 
@@ -197,31 +235,33 @@ pub fn replace(
     project_id: &str,
     model: &str,
 ) -> Result<Arc<CloudSession>, String> {
-    let mut sessions = SESSIONS.lock();
-    if let Some(current) = sessions.get(client.base_url())
-        && !Arc::ptr_eq(current, stale)
-        && current.is_fresh(Utc::now())
+    let mut all = SESSIONS.lock();
+    let sessions = all.entry(client.base_url().to_string()).or_default();
+    let now = Utc::now();
+    if let Some(current) = sessions
+        .iter()
+        .find(|s| s.provider == stale.provider && !Arc::ptr_eq(s, stale) && s.is_fresh(now) && s.model(model).is_some())
     {
         return Ok(current.clone());
     }
-    sessions.remove(client.base_url());
+    sessions.retain(|s| !Arc::ptr_eq(s, stale));
     let fresh = Arc::new(fetch(client, project_id, model, stale.session_id.as_deref())?);
     tracing::info!(
         target: LOG_TARGET,
-        "[session] replaced a refused cloud session ({} models, expires {})",
+        "[session] replaced a refused {} cloud session ({} models, expires {})",
+        fresh.provider,
         fresh.models.len(),
         fresh.expires_at
     );
-    sessions.insert(client.base_url().to_string(), fresh.clone());
+    keep(sessions, &fresh);
     Ok(fresh)
 }
 
 /// Drop `stale` once its key was refused.  A session another request has
 /// already put in its place is kept.
 pub fn invalidate(client: &SLPPlatformClient, stale: &Arc<CloudSession>) {
-    let mut sessions = SESSIONS.lock();
-    if sessions.get(client.base_url()).is_some_and(|current| Arc::ptr_eq(current, stale)) {
-        sessions.remove(client.base_url());
+    if let Some(sessions) = SESSIONS.lock().get_mut(client.base_url()) {
+        sessions.retain(|s| !Arc::ptr_eq(s, stale));
     }
 }
 
@@ -243,7 +283,7 @@ fn fetch(
         .build()
         .map_err(|e| format!("Could not reach {model}: {e}"))?;
     let url = format!("{}{CHAT_SESSION}", client.base_url());
-    let mut body = json!({ "project_id": project_id });
+    let mut body = json!({ "project_id": project_id, "model": model });
     if let Some(replaces) = replaces {
         body["replaces"] = json!(replaces);
     }
