@@ -92,6 +92,8 @@ pub struct DocumentUpload {
         crate::api::routers::auth::clear_token_handler,
         crate::api::routers::auth::oauth_callback_handler,
         crate::api::routers::auth::oauth_callback_get_handler,
+        crate::api::routers::auth::start_device_login_handler,
+        crate::api::routers::auth::device_login_status_handler,
         crate::api::routers::users::get_me_handler,
         crate::api::routers::users::update_me_handler,
         crate::api::routers::users::delete_me_handler,

@@ -8,8 +8,11 @@
 //!     GET    /v1/auth/callback  – receive tokens via query params (Safari fallback)
 //!     POST   /v1/auth/token     – manually set a token (developer_token or access_token)
 //!     DELETE /v1/auth/token     – clear stored credentials
+//!     POST   /v1/auth/device    – start a device code sign-in (RFC 8628)
+//!     GET    /v1/auth/device    – where the device code sign-in stands
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::http::header::LOCATION;
 use axum::http::StatusCode;
@@ -23,12 +26,14 @@ use serde_json::{json, Value};
 
 use crate::auth::credential_store;
 use crate::config::AppSettings;
-use crate::platform::client::{JsonObject, PlatformResult};
-use crate::platform::PlatformService;
+use crate::platform::client::{DevicePoll, JsonObject, PlatformResult};
+use crate::platform::{PlatformError, PlatformService};
 use crate::search::providers;
 use crate::workspace::context::{owns_workspace, pinned_project_id};
 
-use super::_errors::{run_blocking, validation_error, HTTPException, ValidatedJson, ValidatedQuery};
+use super::_errors::{
+    run_blocking, unhandled_error, validation_error, HTTPException, ValidatedJson, ValidatedQuery,
+};
 
 /// Logger name used by this router.
 pub const LOGGER: &str = "smartloop.api.routers.auth";
@@ -129,6 +134,56 @@ pub struct OAuthCallbackQuery {
     pub refresh_token: Option<String>,
 }
 
+/// Body of `POST /v1/auth/device`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
+pub struct DeviceLoginRequest {
+    /// Which app is signing in, as the platform knows it (e.g. `docent-code`).
+    /// The approval page names it to the user.
+    pub client_id: String,
+}
+
+/// Where a device code sign-in stands.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceLoginState {
+    /// None started, or cancelled by a sign-out.
+    #[default]
+    None,
+    /// Waiting for the user to approve the code.
+    Pending,
+    /// Approved; the tokens are stored.
+    Approved,
+    /// The user declined.
+    Denied,
+    /// Nobody approved it in time.
+    Expired,
+    /// The platform ended it for another reason; see `message`.
+    Failed,
+}
+
+/// The device code sign-in: what to show the user, and how it stands.
+///
+/// Never carries the device code or any token — those stay in this process.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
+pub struct DeviceLoginStatus {
+    pub status: DeviceLoginState,
+    /// The code to show the user, e.g. `BCDF-GHJK`.
+    #[serde(default)]
+    pub user_code: Option<String>,
+    /// The page to enter the code on.
+    #[serde(default)]
+    pub verification_uri: Option<String>,
+    /// The same page with the code filled in.
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    /// Seconds left to approve, while pending.
+    #[serde(default)]
+    pub expires_in: Option<u64>,
+    /// Why it failed, for `failed`.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 // -- platform seam --------------------------------------------------------------
 
 /// The two platform-service calls this router makes.
@@ -142,6 +197,16 @@ pub trait AuthPlatformService: Send + Sync {
     fn get_current_user(&self, force: bool) -> PlatformResult<JsonObject>;
     /// `PlatformService.list_models(force=...)`.
     fn list_models(&self, force: bool) -> PlatformResult<Vec<JsonObject>>;
+    /// Start a device code sign-in on the platform.
+    fn request_device_code(&self, client_id: &str) -> PlatformResult<JsonObject> {
+        let _ = client_id;
+        Err(PlatformError::Other("request_device_code is not supported".to_string()))
+    }
+    /// Poll a device code sign-in once.
+    fn poll_device_token(&self, device_code: &str, client_id: &str) -> PlatformResult<DevicePoll> {
+        let _ = (device_code, client_id);
+        Err(PlatformError::Other("poll_device_token is not supported".to_string()))
+    }
 }
 
 impl AuthPlatformService for PlatformService {
@@ -151,6 +216,14 @@ impl AuthPlatformService for PlatformService {
 
     fn list_models(&self, force: bool) -> PlatformResult<Vec<JsonObject>> {
         PlatformService::list_models(self, force)
+    }
+
+    fn request_device_code(&self, client_id: &str) -> PlatformResult<JsonObject> {
+        self.client().request_device_code(client_id)
+    }
+
+    fn poll_device_token(&self, device_code: &str, client_id: &str) -> PlatformResult<DevicePoll> {
+        self.client().poll_device_token(device_code, client_id)
     }
 }
 
@@ -205,6 +278,7 @@ pub fn router() -> Router {
         .route("/v1/auth/status", get(auth_status_handler))
         .route("/v1/auth/token", post(set_token_handler).delete(clear_token_handler))
         .route("/v1/auth/callback", post(oauth_callback_handler).get(oauth_callback_get_handler))
+        .route("/v1/auth/device", post(start_device_login_handler).get(device_login_status_handler))
 }
 
 /// Force-refresh the cached model catalog (and optionally the user) on an
@@ -396,6 +470,10 @@ pub fn set_token(request: TokenSetRequest) -> AuthStatusResponse {
 /// By default clears everything (logout).  Pass `?type=developer_token` or
 /// `?type=access_token` to clear only one credential type.
 pub fn clear_token(type_: ClearScope) -> AuthStatusResponse {
+    // A sign-in still waiting for approval would otherwise store tokens after
+    // the user signed out.
+    cancel_device_login();
+
     if matches!(type_, ClearScope::All | ClearScope::DeveloperToken) {
         credential_store::clear_token();
         tracing::info!(target: LOGGER, "Developer token cleared via /v1/auth/token");
@@ -466,6 +544,201 @@ pub fn oauth_callback_get(access_token: &str, refresh_token: Option<&str>) -> St
     log_token_received("GET", access_token, refresh_token);
     refresh_platform_cache(true);
     format!("{}/redirect/?mode=desktop", *APP_URL)
+}
+
+// -- device code sign-in (RFC 8628) -------------------------------------------
+//
+// For clients with no browser on this machine (Docent Code over SSH).  This
+// process asks the platform for a code, hands the client only what to show
+// the user, and polls the platform itself; the tokens land in the credential
+// store exactly as `/v1/auth/callback` puts them there.  The client never
+// talks to the platform or sees a token — it polls `GET /v1/auth/device`.
+
+/// Seconds a `slow_down` adds to the poll interval (RFC 8628 §3.5).
+const SLOW_DOWN_SECONDS: u64 = 5;
+
+/// The sign-in in flight.  `generation` goes up with every start and every
+/// cancel; a poller whose generation is no longer current stops, and never
+/// stores what it got.
+#[derive(Default)]
+struct DeviceLogin {
+    generation: u64,
+    status: DeviceLoginStatus,
+    deadline: Option<Instant>,
+}
+
+static DEVICE_LOGIN: Lazy<Mutex<DeviceLogin>> = Lazy::new(|| Mutex::new(DeviceLogin::default()));
+
+/// The platform's refusal to start a sign-in, as this router's status.
+fn device_platform_error(e: PlatformError) -> HTTPException {
+    // The platform's limit on new codes, not an outage: say so, or the user
+    // is told the platform is down and retries into the same wall.
+    if e.status_code() == Some(429) {
+        HTTPException::new(429, "Too many sign-in attempts from this network; try again later")
+    } else if e.is_permission() {
+        HTTPException::new(400, e.message())
+    } else if e.is_connection() {
+        HTTPException::new(502, "Platform API unavailable")
+    } else {
+        tracing::error!(target: LOGGER, "Unhandled platform error: {}", e);
+        unhandled_error()
+    }
+}
+
+/// Start a device code sign-in, replacing any in flight, and poll for it in
+/// the background.  Returns what to show the user.
+pub fn start_device_login(request: DeviceLoginRequest) -> Result<DeviceLoginStatus, HTTPException> {
+    let data = get_platform_service()
+        .request_device_code(&request.client_id)
+        .map_err(device_platform_error)?;
+    let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_string);
+    let Some(device_code) = text("device_code") else {
+        tracing::error!(target: LOGGER, "Device code response missing device_code");
+        return Err(HTTPException::new(502, "Platform API returned no device code"));
+    };
+    let interval = data.get("interval").and_then(Value::as_u64).unwrap_or(5);
+    let expires_in = data.get("expires_in").and_then(Value::as_u64).unwrap_or(600);
+    let deadline = Instant::now() + Duration::from_secs(expires_in);
+
+    let status = DeviceLoginStatus {
+        status: DeviceLoginState::Pending,
+        user_code: text("user_code"),
+        verification_uri: text("verification_uri"),
+        verification_uri_complete: text("verification_uri_complete"),
+        expires_in: Some(expires_in),
+        message: None,
+    };
+    let generation = {
+        let mut slot = DEVICE_LOGIN.lock();
+        slot.generation += 1;
+        slot.status = status.clone();
+        slot.deadline = Some(deadline);
+        slot.generation
+    };
+    tracing::info!(target: LOGGER, "Device code sign-in started for {}", request.client_id);
+
+    let client_id = request.client_id;
+    std::thread::Builder::new()
+        .name("device-login".to_string())
+        .spawn(move || poll_device_login(generation, &device_code, &client_id, interval, deadline))
+        .map_err(|e| HTTPException::new(500, format!("Could not start the sign-in poller: {e}")))?;
+    Ok(status)
+}
+
+/// Where the device code sign-in stands.
+pub fn device_login_status() -> DeviceLoginStatus {
+    let slot = DEVICE_LOGIN.lock();
+    let mut status = slot.status.clone();
+    if status.status == DeviceLoginState::Pending {
+        status.expires_in = slot.deadline.map(|d| d.saturating_duration_since(Instant::now()).as_secs());
+    }
+    status
+}
+
+/// Stop any device code sign-in in flight; it will store nothing.
+pub fn cancel_device_login() {
+    let mut slot = DEVICE_LOGIN.lock();
+    slot.generation += 1;
+    slot.status = DeviceLoginStatus::default();
+    slot.deadline = None;
+}
+
+/// Record how sign-in *generation* ended, unless it has been replaced.
+fn finish_device_login(generation: u64, state: DeviceLoginState, message: Option<String>) {
+    let mut slot = DEVICE_LOGIN.lock();
+    if slot.generation != generation {
+        return;
+    }
+    slot.status.status = state;
+    slot.status.expires_in = None;
+    slot.status.message = message;
+    slot.deadline = None;
+}
+
+/// Poll the platform every *interval* seconds until the sign-in ends, is
+/// replaced, or runs past *deadline*.
+fn poll_device_login(generation: u64, device_code: &str, client_id: &str, mut interval: u64, deadline: Instant) {
+    loop {
+        std::thread::sleep(Duration::from_secs(interval));
+        if DEVICE_LOGIN.lock().generation != generation {
+            return;
+        }
+        if Instant::now() >= deadline {
+            finish_device_login(generation, DeviceLoginState::Expired, None);
+            return;
+        }
+        match get_platform_service().poll_device_token(device_code, client_id) {
+            Ok(DevicePoll::Pending) => {}
+            Ok(DevicePoll::SlowDown) => interval += SLOW_DOWN_SECONDS,
+            Ok(DevicePoll::Denied) => {
+                finish_device_login(generation, DeviceLoginState::Denied, None);
+                return;
+            }
+            Ok(DevicePoll::Expired) => {
+                finish_device_login(generation, DeviceLoginState::Expired, None);
+                return;
+            }
+            Ok(DevicePoll::Tokens(data)) => {
+                let access = data.get("access_token").and_then(Value::as_str).unwrap_or_default();
+                let refresh = data.get("refresh_token").and_then(Value::as_str);
+                {
+                    // Under the lock, so a sign-out between the poll and here wins.
+                    let slot = DEVICE_LOGIN.lock();
+                    if slot.generation != generation {
+                        return;
+                    }
+                    credential_store::set_tokens(access, refresh);
+                }
+                tracing::info!(
+                    target: LOGGER,
+                    "OAuth tokens stored via device code sign-in access={} refresh={}",
+                    redact(access),
+                    refresh.map(redact).unwrap_or_else(|| "none".to_string())
+                );
+                refresh_platform_cache(true);
+                finish_device_login(generation, DeviceLoginState::Approved, None);
+                return;
+            }
+            // A platform blip is not the end of the sign-in; the deadline is.
+            Err(e) if e.is_connection() => {
+                tracing::warn!(target: LOGGER, "Device code poll failed, retrying: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!(target: LOGGER, "Device code sign-in failed: {}", e);
+                finish_device_login(generation, DeviceLoginState::Failed, Some(e.message()));
+                return;
+            }
+        }
+    }
+}
+
+/// `POST /v1/auth/device`.
+#[utoipa::path(
+    post,
+    path = "/v1/auth/device",
+    tag = "auth",
+    request_body = DeviceLoginRequest,
+    summary = "Start a device code sign-in",
+    description = "For a client with no browser on this machine. Show the user `user_code` and `verification_uri`, then poll GET /v1/auth/device until it is no longer pending. Replaces any sign-in already in flight.",
+    responses((status = 200, description = "Started", body = DeviceLoginStatus), (status = 400, description = "The platform refused the client"), (status = 502, description = "Platform API unavailable"))
+)]
+async fn start_device_login_handler(
+    ValidatedJson(request): ValidatedJson<DeviceLoginRequest>,
+) -> Result<Json<DeviceLoginStatus>, HTTPException> {
+    run_blocking(move || start_device_login(request)).await?.map(Json)
+}
+
+/// `GET /v1/auth/device`.
+#[utoipa::path(
+    get,
+    path = "/v1/auth/device",
+    tag = "auth",
+    summary = "Get device code sign-in status",
+    description = "Once `approved`, the tokens are stored and GET /v1/auth/status names the user.",
+    responses((status = 200, description = "OK", body = DeviceLoginStatus))
+)]
+async fn device_login_status_handler() -> Json<DeviceLoginStatus> {
+    Json(device_login_status())
 }
 
 /// `GET /v1/auth/status`.

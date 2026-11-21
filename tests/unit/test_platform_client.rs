@@ -1262,3 +1262,94 @@ mod test_create_checkout_session {
         assert_permission(&err, "expired or invalid");
     }
 }
+
+/// The device code sign-in calls: unauthenticated, and answering in the OAuth
+/// error shape rather than `detail`.
+mod test_device_code {
+    use super::*;
+    use smartloop::platform::client::{DevicePoll, DEVICE_GRANT_TYPE};
+
+    const CODE: &str = "/v1/auth/device/code";
+    const TOKEN: &str = "/v1/auth/device/token";
+
+    #[test]
+    #[serial]
+    fn test_requesting_a_code_is_unauthenticated() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(CODE, 200, json!({"device_code": "dc", "user_code": "BCDF-GHJK"}));
+
+        let client = client_with_auth(server.base_url(), &[("Authorization", "Bearer someone")]);
+        let data = client.request_device_code("docent-code").unwrap();
+
+        assert_eq!(data["user_code"], json!("BCDF-GHJK"));
+        let sent = &server.requests()[0];
+        assert_eq!(sent.json(), json!({"client_id": "docent-code"}));
+        assert!(sent.header("Authorization").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_unknown_client_is_refused_with_the_reason() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(CODE, 401, json!({"error": "invalid_client", "error_description": "Unknown client_id."}));
+
+        let err = client_with_auth(server.base_url(), &[]).request_device_code("nobody").unwrap_err();
+        assert_permission(&err, "Unknown client_id.");
+    }
+
+    fn poll(status: u16, body: Value) -> Result<DevicePoll, PlatformError> {
+        let server = StubServer::start();
+        server.route(TOKEN, status, body);
+        client_with_auth(server.base_url(), &[]).poll_device_token("dc", "docent-code")
+    }
+
+    #[test]
+    #[serial]
+    fn test_polling_sends_the_device_grant() {
+        let _c = autouse();
+        let server = StubServer::start();
+        server.route(TOKEN, 400, json!({"error": "authorization_pending"}));
+
+        client_with_auth(server.base_url(), &[]).poll_device_token("dc", "docent-code").unwrap();
+        assert_eq!(
+            server.requests()[0].json(),
+            json!({"grant_type": DEVICE_GRANT_TYPE, "device_code": "dc", "client_id": "docent-code"})
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_flow_states_are_answers_not_errors() {
+        let _c = autouse();
+        assert_eq!(poll(400, json!({"error": "authorization_pending"})).unwrap(), DevicePoll::Pending);
+        assert_eq!(poll(400, json!({"error": "slow_down"})).unwrap(), DevicePoll::SlowDown);
+        assert_eq!(poll(400, json!({"error": "access_denied"})).unwrap(), DevicePoll::Denied);
+        assert_eq!(poll(400, json!({"error": "expired_token"})).unwrap(), DevicePoll::Expired);
+    }
+
+    #[test]
+    #[serial]
+    fn test_approval_returns_the_tokens() {
+        let _c = autouse();
+        let tokens = json!({"access_token": "a", "refresh_token": "r", "token_type": "bearer"});
+        assert_eq!(poll(200, tokens.clone()).unwrap(), DevicePoll::Tokens(obj(tokens)));
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_unknown_code_is_a_refusal() {
+        let _c = autouse();
+        let err = poll(400, json!({"error": "invalid_grant", "error_description": "Unknown device_code."})).unwrap_err();
+        assert_permission(&err, "Unknown device_code.");
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_outage_is_worth_polling_through() {
+        let _c = autouse();
+        assert!(poll(503, json!({"detail": "down"})).unwrap_err().is_connection());
+        assert!(poll(429, json!({"detail": "slow"})).unwrap_err().is_connection());
+    }
+}
