@@ -289,3 +289,102 @@ fn test_provider_failures_read_as_plain_messages() {
     assert_eq!(describe_provider_failure(400, r#"{"error":{"message":"prompt too long"}}"#, "m"), "prompt too long");
     assert_eq!(describe_provider_failure(503, "", "m"), "m did not answer (HTTP 503).");
 }
+
+/// Cloud models come from two providers: each model's session comes from
+/// its own provider, sessions are kept side by side, and a Respan key spent
+/// (429, one of its `renew_statuses`) is renewed like a dead OpenRouter key.
+#[tokio::test]
+#[serial]
+async fn test_each_provider_gets_its_own_session() {
+    let platform = MockServer::start().await;
+    let (openrouter, respan) = (MockServer::start().await, MockServer::start().await);
+    let (openrouter_uri, respan_uri) = (openrouter.uri(), respan.uri());
+    let respan_mints = Arc::new(AtomicUsize::new(0));
+    let counter = respan_mints.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/session"))
+        .respond_with(move |req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            if body["model"] == "qwen4-max" {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "session_id": format!("rs-sess-{n}"),
+                    "provider": "respan",
+                    "renew_statuses": [401, 402, 403, 429],
+                    "base_url": format!("{respan_uri}/v1"),
+                    "key": format!("rs-{n}"),
+                    "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+                    "headers": {},
+                    "models": [{"name": "qwen4-max", "provider_model": "qwen4-max", "max_tokens": 1000, "body": {}}]
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(session_body_from(&openrouter_uri, "sk-or"))
+            }
+        })
+        .mount(&platform)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/chat/completions"))
+        .and(header("Authorization", "Bearer sk-or"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sse(&["kimi"])))
+        .mount(&openrouter)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("Authorization", "Bearer rs-1"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({"detail": "Spending limit reached"})))
+        .mount(&respan)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("Authorization", "Bearer rs-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sse(&["qwen"])))
+        .mount(&respan)
+        .await;
+
+    let (kimi, _b) = direct_llm(&platform, "kimi-k2");
+    let kimi = Arc::new(kimi);
+    let qwen = Arc::new(CloudLLM::with_hooks(
+        "p1",
+        "qwen4-max",
+        &platform.uri(),
+        Some(8192),
+        Some(bearer("platform-token")),
+        Some(Arc::new(|| false)),
+    ));
+    assert_eq!(drain(kimi.clone()).await.unwrap(), "kimi");
+    assert_eq!(drain(qwen.clone()).await.unwrap(), "qwen");
+    assert_eq!(drain(kimi).await.unwrap(), "kimi");
+    assert_eq!(drain(qwen).await.unwrap(), "qwen");
+
+    let mints: Vec<Value> = platform
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    let named: Vec<&str> = mints.iter().map(|m| m["model"].as_str().unwrap()).collect();
+    // One OpenRouter session serves both kimi chats; Respan's spent key was
+    // replaced once, naming the session it replaces, and the replacement
+    // served the second qwen chat without disturbing OpenRouter's.
+    assert_eq!(named, ["kimi-k2", "qwen4-max", "qwen4-max"]);
+    assert_eq!(mints[2]["replaces"], "rs-sess-1");
+    let sent: Value = serde_json::from_slice(&respan.received_requests().await.unwrap()[1].body).unwrap();
+    assert_eq!(sent["model"], "qwen4-max");
+    assert!(sent.get("provider").is_none(), "no OpenRouter routing fields go to Respan");
+}
+
+#[test]
+fn test_an_older_session_is_openrouter_renewed_on_401_402_403() {
+    let session: CloudSession = serde_json::from_value(json!({
+        "base_url": "https://openrouter.ai/api/v1",
+        "key": "sk-or-secret",
+        "expires_at": "2030-01-01T00:00:00Z",
+        "models": []
+    }))
+    .unwrap();
+    assert_eq!(session.provider, "openrouter");
+    assert!(session.renews_on(401) && session.renews_on(402) && session.renews_on(403));
+    assert!(!session.renews_on(429), "OpenRouter's 429 is a busy upstream, not a spent key");
+}

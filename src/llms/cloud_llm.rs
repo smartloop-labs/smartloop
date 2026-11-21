@@ -333,8 +333,8 @@ impl CloudLLM {
     }
 
     /// POST to the provider with the session's key.  A key the provider
-    /// refuses (expired, revoked, or out of allowance) is traded for a new
-    /// session once.
+    /// refuses (expired, revoked, or out of allowance: the session's
+    /// `renew_statuses`) is traded for a new session once.
     fn post_direct(
         &self,
         http: &reqwest::blocking::Client,
@@ -381,7 +381,7 @@ impl CloudLLM {
                 std::thread::sleep(wait);
                 continue;
             }
-            if matches!(status, 401 | 402 | 403) && !renewed {
+            if session.renews_on(status) && !renewed {
                 renewed = true;
                 session = cloud_session::replace(platform, &session, &self.project_id, &self.model_name)?;
                 continue;
