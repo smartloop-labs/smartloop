@@ -107,6 +107,8 @@ mod test_cloud_llm;
 mod test_cloud_model_routing;
 mod test_cloud_session;
 mod test_cloud_vision;
+mod test_image_tool_rounds;
+mod test_turn_compaction;
 mod test_model_display_name;
 mod test_model_host;
 mod test_model_label_naming;

@@ -221,12 +221,12 @@ fn sized_remote(name: &str, total_b: f64, active_b: f64) -> WorkspaceModel {
     remote_model(name)
 }
 
-/// With two remote models selected, the one with more active parameters
-/// does the step — not whichever registered first, and not by total size.
+/// With two remote models selected, the one with more total parameters
+/// does the step — not whichever registered first, and not by active size.
 #[test]
-fn test_the_remote_model_with_more_active_params_is_used() {
-    let light = sized_remote("walk-moe-light", 900.0, 23.0);
-    let heavy = sized_remote("walk-moe-heavy", 753.0, 40.0);
+fn test_the_remote_model_with_more_total_params_is_used() {
+    let light = sized_remote("walk-moe-light", 753.0, 40.0);
+    let heavy = sized_remote("walk-moe-heavy", 900.0, 23.0);
     let heavy_llm = FakeLLM::named("heavy");
     let mut loads = HashMap::new();
     loads.insert("walk-moe-light", (FakeLLM::named("light"), Fit::AsIs));
@@ -251,10 +251,10 @@ fn test_a_much_larger_remote_model_ranks_before_a_local_one() {
 }
 
 /// Between similar models — the remote one within the local margin — the
-/// local one goes first: a 4B on device over a 4.5B-active cloud model.
+/// local one goes first: a 4B on device over a 4.5B cloud model.
 #[test]
 fn test_a_similar_remote_model_ranks_after_a_local_one() {
-    let remote = sized_remote("walk-moe-similar", 30.0, 4.5);
+    let remote = sized_remote("walk-moe-similar", 4.5, 1.0);
     let big = FakeLLM::named("big");
     let mut loads = HashMap::new();
     loads.insert(BIG, (big.clone(), Fit::AsIs));

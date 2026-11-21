@@ -149,7 +149,7 @@ fn test_a_remote_model_carries_size_and_endpoint() {
 }
 
 #[test]
-fn test_a_mixture_of_experts_model_ranks_on_active_params() {
+fn test_a_mixture_of_experts_model_ranks_on_total_params() {
     let mut registry = ModelRegistry::default();
     registry.hydrate([row(json!({
         "name": "moe", "type": "remote", "param_size_b": 428.0, "active_param_size_b": 23.0,
@@ -158,7 +158,8 @@ fn test_a_mixture_of_experts_model_ranks_on_active_params() {
     let spec = registry.get("moe").unwrap();
     assert_eq!(spec.param_size_b, 428.0);
     assert_eq!(spec.active_param_size_b, Some(23.0));
-    assert_eq!(spec.ranking_size_b(), 23.0);
+    // Ranked on how big it is, not on the share active per token.
+    assert_eq!(spec.ranking_size_b(), 428.0);
     assert_eq!(spec.attention, Some(Attention::Hybrid));
 
     // A dense model ranks on its parameter count.

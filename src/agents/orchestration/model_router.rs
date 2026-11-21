@@ -95,6 +95,11 @@ pub struct ModelRouterOptions {
     pub capability_llm_provider: Option<CapabilityLlmProvider>,
     pub capability_available: Option<CapabilityAvailable>,
     pub capability_skip_reason: Option<CapabilitySkipReasonFn>,
+    /// `agent_llm` is the request's one model: it runs every text node —
+    /// routing, decisions, tool resolution, light tasks — local or remote.
+    /// Another model is consulted only for a capability step it does not
+    /// cover (see [`ModelRouter::llm_for_tier`]).
+    pub pinned: bool,
 }
 
 /// Client-facing labels for routing keys: the capabilities, and the answer
@@ -158,6 +163,8 @@ pub struct ModelRouter {
     /// Answers "why did the last capability model not load?", so a fallback
     /// can say what went wrong.
     capability_skip_reason: Option<CapabilitySkipReasonFn>,
+    /// The whole graph runs on `agent_llm` (see [`ModelRouterOptions::pinned`]).
+    pinned: bool,
     /// Per-request state, reset by [`ModelRouter::begin_request`].
     progress_callback: Mutex<Option<ProgressCallback>>,
     emitted_model_events: Mutex<HashSet<String>>,
@@ -178,9 +185,21 @@ impl ModelRouter {
             capability_llm_provider: options.capability_llm_provider,
             capability_available: options.capability_available,
             capability_skip_reason: options.capability_skip_reason,
+            pinned: options.pinned,
             progress_callback: Mutex::new(None),
             emitted_model_events: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// True for a capability that adds an input modality rather than text
+    /// work: the one reason a pinned request consults another model.
+    fn augments_modality(capability: &str) -> bool {
+        capability.eq_ignore_ascii_case(ModelCapability::Vision.value())
+    }
+
+    /// True when every text node runs on the request's one model.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
     }
 
     /// True when a generic large model can still be loaded on demand.
@@ -220,6 +239,13 @@ impl ModelRouter {
         purpose: Option<&str>,
     ) -> Arc<dyn BaseLLM> {
         let capability = capability.filter(|c| !c.is_empty());
+        // One model for the request: every text step — the answer tier,
+        // reasoning, a planned step — stays on it at any tier.  Only a
+        // capability that adds an input modality the text model may lack
+        // (vision) is resolved separately.
+        if self.pinned && !capability.is_some_and(Self::augments_modality) {
+            return self.agent_llm.clone();
+        }
         if tier == ModelTier::Large {
             if let (Some(cap), Some(provider)) = (capability, self.capability_llm_provider.as_ref()) {
                 // Don't cache the capability LLM here — the provider
@@ -326,7 +352,10 @@ impl ModelRouter {
     /// announced only once it is accepted, so a thinking lookup that lands on
     /// a model that cannot think never names it as the pick.
     pub fn reasoning_llm(&self, fallback: Arc<dyn BaseLLM>) -> Arc<dyn BaseLLM> {
-        if fallback.supports_thinking() {
+        // One model for the request: switching to another for a judgement
+        // call costs a load (or a second provider) and the tokens/s of the
+        // model already warm.
+        if self.pinned || fallback.supports_thinking() {
             return fallback;
         }
         let reasoning = ModelCapability::Reasoning.value();
@@ -361,6 +390,9 @@ impl ModelRouter {
     /// largest first — or `fallback` (the on-device router) when none is
     /// selected.  Not announced: routing is not work the user is waiting on.
     pub fn route_llm(&self, fallback: Arc<dyn BaseLLM>) -> Arc<dyn BaseLLM> {
+        if self.pinned {
+            return self.agent_llm.clone();
+        }
         let reasoning = ModelCapability::Reasoning.value();
         if !self.capability_model_exists(Some(reasoning)) {
             return fallback;
@@ -457,6 +489,9 @@ impl ModelRouter {
         capability: Option<&str>,
         purpose: Option<&str>,
     ) -> Arc<dyn BaseLLM> {
+        if self.pinned {
+            return self.agent_llm.clone();
+        }
         if let Some(cap) = capability.filter(|c| !c.is_empty()) {
             if let Some(llm) = self.resolve(cap, true, "decision") {
                 self.announce(cap, &llm, purpose);
@@ -477,6 +512,9 @@ impl ModelRouter {
     /// [`Self::llm_for_tier`] a miss never forces the generic large-model
     /// load — it lands on `agent_llm`.
     pub fn light_llm(&self, capability: Option<&str>, purpose: Option<&str>) -> Arc<dyn BaseLLM> {
+        if self.pinned {
+            return self.agent_llm.clone();
+        }
         let cap = capability.filter(|c| !c.is_empty()).unwrap_or(crate::types::ANSWER_TIER);
         let picked = self
             .resolve(cap, true, "light")
@@ -938,6 +976,43 @@ mod tests {
         let got = router.light_llm(Some("coding"), None);
         assert!(same_llm(&got, &agent));
         assert_eq!(*large_loads.lock(), 0);
+    }
+
+    /// A pinned request runs every text node on its one model — routing,
+    /// decisions, tool resolution, light tasks and the answer tier — and
+    /// asks the provider only for vision, a modality the model may lack.
+    #[test]
+    fn a_pinned_request_stays_on_one_model_except_for_vision() {
+        let router_model: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "r".into());
+        let pinned: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "p".into());
+        let vision: Arc<dyn BaseLLM> = ScriptedLlm::new(|_| "v".into());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let (seen, vision_for_provider) = (asked.clone(), vision.clone());
+        let router = ModelRouter::new(
+            router_model,
+            pinned.clone(),
+            ModelRouterOptions {
+                capability_llm_provider: Some(Arc::new(move |c: &str| {
+                    seen.lock().push(c.to_string());
+                    Ok(Some(vision_for_provider.clone()))
+                })),
+                capability_available: Some(Arc::new(|_c: &str| Ok(true))),
+                pinned: true,
+                ..Default::default()
+            },
+        );
+        assert!(router.is_pinned());
+        let answer = crate::types::ANSWER_TIER;
+        assert!(same_llm(&router.route_llm(pinned.clone()), &pinned));
+        assert!(same_llm(&router.decision_llm(Some("reasoning"), None), &pinned));
+        assert!(same_llm(&router.light_llm(None, Some(WEB_SEARCH_PURPOSE)), &pinned));
+        assert!(same_llm(&router.reasoning_llm(pinned.clone()), &pinned));
+        assert!(same_llm(&router.llm_for_tier(ModelTier::Large, Some(answer), None), &pinned));
+        assert!(same_llm(&router.llm_for_tier(ModelTier::Small, Some("reasoning"), None), &pinned));
+        assert!(asked.lock().is_empty(), "no text node consults another model");
+
+        assert!(same_llm(&router.llm_for_tier(ModelTier::Large, Some("vision"), None), &vision));
+        assert_eq!(*asked.lock(), vec!["vision".to_string()]);
     }
 
     #[test]

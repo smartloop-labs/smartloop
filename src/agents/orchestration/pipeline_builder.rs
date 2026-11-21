@@ -1750,7 +1750,16 @@ Assess whether these search results are relevant to the user's request. If relev
                     continue;
                 }
                 let label = if tool_name.is_empty() { "step output" } else { tool_name.as_str() };
-                if is_tool || has_skill || this.judge.serves_intent(&c.user_message, label, &text) {
+                // A conversation step's output is the request's own context
+                // (history, the image reading), not a search that may have
+                // drifted: there is nothing to judge, and a reject was kept
+                // anyway — the verdict only cost a model round trip.
+                let is_conversation = tool_name == "conversation";
+                if is_tool
+                    || has_skill
+                    || is_conversation
+                    || this.judge.serves_intent(&c.user_message, label, &text)
+                {
                     // A connected server's tool answered: credit it, the way
                     // the web pages and documents an answer drew on are.
                     // URL fetches are the assistant's own actions, not a

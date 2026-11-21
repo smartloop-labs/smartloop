@@ -343,7 +343,7 @@ pub trait RankedModel {
 
 /// How much larger a remote model must be before it outranks a local one
 /// for the same capability: a local model counts as this many times its
-/// active size, so a remote model up to ~25% larger still loses to it.
+/// total size, so a remote model up to ~25% larger still loses to it.
 /// Within that margin the models are similar and the one on device wins.
 pub const LOCAL_SIZE_MARGIN: f64 = 1.25;
 
@@ -564,6 +564,17 @@ pub struct ModelService {
     pub vision_unavailable: AtomicBool,
     /// `_vision_clip_cpu`: latched after a GPU clip encode crashes.
     pub vision_clip_cpu: AtomicBool,
+    /// What the vision model read from a chat image, keyed by the image
+    /// bytes (see `ModelService::image_key`).  A coding client continues a
+    /// turn over several tool rounds, each a request that resends the same
+    /// attachment but skips orchestration; this is how every round — not
+    /// only the first — hands the text-only answer model what the image says,
+    /// without running the vision model again.
+    pub image_perceptions: Mutex<IndexMap<String, String>>,
+    /// Summaries of conversation turns compaction dropped, keyed by a digest
+    /// of the dropped transcript.  A turn's tool rounds resend the same
+    /// history, so the summary is written once per turn, not once per round.
+    pub history_summaries: Mutex<IndexMap<String, String>>,
     /// `_large_model_attempted`: the large model has been considered.
     pub large_model_attempted: AtomicBool,
     /// `_cap_llm_<model_name>` slots, in insertion order.
@@ -652,6 +663,8 @@ impl ModelService {
             vision_model_name: RwLock::new(None),
             vision_unavailable: AtomicBool::new(false),
             vision_clip_cpu: AtomicBool::new(false),
+            image_perceptions: Mutex::new(IndexMap::new()),
+            history_summaries: Mutex::new(IndexMap::new()),
             large_model_attempted: AtomicBool::new(false),
             cap_llms: Mutex::new(Vec::new()),
             capability_skip: Mutex::new(None),
@@ -1498,21 +1511,36 @@ impl ModelService {
     /// Enabled, downloaded models declaring vision: the local ones
     /// (`remote == false`) or the remote ones, in workspace order.
     fn vision_candidates(&self, remote: bool) -> Vec<WorkspaceModel> {
+        self.vision_candidates_with(remote, false)
+    }
+
+    /// Downloaded models declaring vision.  With `allow_unselected`, a local
+    /// vision model the user has downloaded but not selected stands in when
+    /// no selected one does: reading an image for a text-only model is a
+    /// capability the selection lacks, not a model the user picked to answer,
+    /// so any vision model on disk may supply it.  Remote models are never
+    /// borrowed this way — an unselected cloud model is not the user's to call.
+    fn vision_candidates_with(&self, remote: bool, allow_unselected: bool) -> Vec<WorkspaceModel> {
         let Some(workspace) = self.workspace_handle() else {
             return Vec::new();
         };
         let ws = workspace.read();
         let project = ws.current_project();
-        ws.models
+        let is_vision = |m: &WorkspaceModel| {
+            m.is_remote() == remote
+                && ws.effective_model_downloaded(&m.model_name)
+                && m.effective_capabilities().iter().any(|c| c == ModelCapability::Vision.value())
+        };
+        let selected: Vec<WorkspaceModel> = ws
+            .models
             .iter()
-            .filter(|m| {
-                m.is_remote() == remote
-                    && ws.effective_model_enabled(&m.model_name, project)
-                    && ws.effective_model_downloaded(&m.model_name)
-                    && m.effective_capabilities().iter().any(|c| c == ModelCapability::Vision.value())
-            })
+            .filter(|m| is_vision(m) && ws.effective_model_enabled(&m.model_name, project))
             .cloned()
-            .collect()
+            .collect();
+        if !selected.is_empty() || !allow_unselected || remote {
+            return selected;
+        }
+        ws.models.iter().filter(|m| is_vision(m)).cloned().collect()
     }
 
     /// The best selected remote vision model (largest first), unless this
@@ -1551,7 +1579,7 @@ impl ModelService {
                 return Some(self.cloud_llm(&remote));
             }
         }
-        self.get_vision_llm(on_model_selected)
+        self.get_vision_llm_for(on_model_selected, true)
     }
 
     /// Return a loaded *multimodal* vision LLM, or `None` when unavailable.
@@ -1565,6 +1593,18 @@ impl ModelService {
     /// stays on device and a remote vision model reads the pages only when
     /// no local one can run.
     pub fn get_vision_llm(&self, on_model_selected: Option<&dyn Fn(&str)>) -> Option<Arc<dyn BaseLLM>> {
+        self.get_vision_llm_for(on_model_selected, false)
+    }
+
+    /// [`Self::get_vision_llm`], optionally borrowing a downloaded but
+    /// unselected local vision model (see [`Self::vision_candidates_with`]).
+    /// Document OCR keeps to the selection; reading a chat image for a
+    /// text-only answer model may borrow.
+    pub fn get_vision_llm_for(
+        &self,
+        on_model_selected: Option<&dyn Fn(&str)>,
+        allow_unselected: bool,
+    ) -> Option<Arc<dyn BaseLLM>> {
         let app = AppSettings::new();
         if !app.vision_enabled {
             return None;
@@ -1572,7 +1612,7 @@ impl ModelService {
         let cached = self.vision_llm.read().clone();
         if let Some(llm) = cached {
             let name = self.vision_model_name.read().clone().filter(|n| !n.is_empty());
-            if name.as_deref().is_none_or(|n| self.still_selected(n)) {
+            if allow_unselected || name.as_deref().is_none_or(|n| self.still_selected(n)) {
                 if let (Some(cb), Some(name)) = (on_model_selected, name) {
                     cb(&name);
                 }
@@ -1587,7 +1627,7 @@ impl ModelService {
         }
         let workspace = self.workspace_handle()?;
 
-        let candidates = self.vision_candidates(false);
+        let candidates = self.vision_candidates_with(false, allow_unselected);
         // Smallest first: lowest latency OCR; same-size ties broken by cap
         // overlap then version.
         let candidates = Self::ranked_candidates(candidates, &[ModelCapability::Vision.value()], false);
@@ -2334,9 +2374,9 @@ impl ModelService {
         // then the newer version.
         //
         // Quality first, local among similar models: a bigger model (by
-        // active size) does the step whether it runs here or in the cloud,
+        // total size) does the step whether it runs here or in the cloud,
         // but a local model within LOCAL_SIZE_MARGIN of a remote one wins —
-        // a 3B on device over the same 3B remote, but a 23B-active cloud
+        // a 3B on device over the same 3B remote, but a 230B cloud
         // model over a 2B local one.  Every candidate declares the step's
         // capability, so size is what separates them.  A local model that
         // does not fit is passed over for the next one down.  The bootstrap
@@ -3606,11 +3646,6 @@ impl ModelService {
             }
         };
 
-        let search_query = match conversation_history {
-            Some(history) if !history.is_empty() => self.build_history_search_query(query, history),
-            _ => query.to_string(),
-        };
-
         // Semantic discovery: find which documents are relevant.  The goal is
         // document-level recall — with multi-chunk documents a small
         // n_results can be dominated by chunks from 1-2 documents, hiding the
@@ -3621,6 +3656,15 @@ impl ModelService {
             .iter()
             .filter(|d| matches!(d.status, DocumentStatus::Indexed | DocumentStatus::Pending))
             .count();
+
+        // With no document indexed the rewrite is a model call that cannot
+        // improve a search over nothing: query with the message as it is.
+        let search_query = match conversation_history {
+            Some(history) if !history.is_empty() && indexed_doc_count > 0 => {
+                self.build_history_search_query(query, history)
+            }
+            _ => query.to_string(),
+        };
         let n_results = (indexed_doc_count * 5).max(20);
 
         tracing::info!(
@@ -3889,8 +3933,16 @@ impl ModelService {
     }
 
     /// `result.strip().strip('"\'')`.
+    /// A model that echoes the prompt's `Search query:` label puts it in
+    /// the query itself; it is dropped too.
     fn clean_rewrite(result: &str) -> String {
-        result.trim().trim_matches(|c| c == '"' || c == '\'').to_string()
+        let quotes = |c: char| c == '"' || c == '\'';
+        let trimmed = result.trim().trim_matches(quotes).trim();
+        let unlabelled = match trimmed.get(..13) {
+            Some(head) if head.eq_ignore_ascii_case("search query:") => &trimmed[13..],
+            _ => trimmed,
+        };
+        unlabelled.trim().trim_matches(quotes).trim().to_string()
     }
 
     /// Use the LLM to synthesize a vector-search query from the user message
