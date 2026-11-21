@@ -25,6 +25,10 @@ pub const MODEL_DOWNLOAD: &str = "/v1/models/{}/download";
 pub const USAGE_TOKENS: &str = "/v1/usage/tokens";
 pub const USERS_ME: &str = "/v1/users/me";
 pub const JWT_REFRESH: &str = "/v1/auth/jwt/refresh";
+pub const DEVICE_CODE: &str = "/v1/auth/device/code";
+pub const DEVICE_TOKEN: &str = "/v1/auth/device/token";
+/// RFC 8628's grant type for polling with a device code.
+pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// `{}` is replaced with the model name.
 pub const MODEL_UPLOAD: &str = "/v1/models/{}/upload";
 pub const MODELS: &str = "/v1/models";
@@ -179,6 +183,23 @@ impl PlatformError {
 /// Result alias for platform calls.
 pub type PlatformResult<T> = Result<T, PlatformError>;
 
+/// One poll of a device code sign-in (RFC 8628 §3.5): either the token pair,
+/// or where the sign-in stands.  Failures that end it for another reason
+/// (an unknown code) are errors.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DevicePoll {
+    /// Approved: the token pair, as every other sign-in returns it.
+    Tokens(JsonObject),
+    /// Not approved yet; poll again after the interval.
+    Pending,
+    /// Polled too soon; add 5 seconds to the interval.
+    SlowDown,
+    /// The user declined.
+    Denied,
+    /// Nobody approved it in time.
+    Expired,
+}
+
 /// Whether *status_code* says "try again" rather than "this caller may not".
 ///
 /// A 429 is a rate limit and a 5xx is the platform having a bad moment.
@@ -299,6 +320,14 @@ pub trait PlatformApi: Send + Sync {
     fn create_checkout_session(&self) -> PlatformResult<JsonObject> {
         Err(unsupported("create_checkout_session"))
     }
+    fn request_device_code(&self, client_id: &str) -> PlatformResult<JsonObject> {
+        let _ = client_id;
+        Err(unsupported("request_device_code"))
+    }
+    fn poll_device_token(&self, device_code: &str, client_id: &str) -> PlatformResult<DevicePoll> {
+        let _ = (device_code, client_id);
+        Err(unsupported("poll_device_token"))
+    }
 }
 
 fn unsupported(op: &str) -> PlatformError {
@@ -380,6 +409,20 @@ pub fn error_detail(body: &[u8]) -> Option<String> {
         Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
         _ => None,
     }
+}
+
+/// The `error` and `error_description` of an OAuth error body (RFC 6749
+/// §5.2), which the device sign-in endpoints answer with instead of `detail`.
+fn oauth_error(body: &[u8]) -> Option<(String, String)> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let error = value.get("error")?.as_str()?.to_string();
+    let description = value
+        .get("error_description")
+        .and_then(Value::as_str)
+        .filter(|d| !d.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| error.clone());
+    Some((error, description))
 }
 
 /// Thin HTTP client for Smartloop platform API calls.
@@ -777,6 +820,64 @@ impl SLPPlatformClient {
         Ok(data)
     }
 
+    /// POST /v1/auth/device/code (no auth): start a device code sign-in.
+    ///
+    /// Returns `device_code`, `user_code`, `verification_uri`,
+    /// `verification_uri_complete`, `expires_in` and `interval`.  An unknown
+    /// *client_id* is a `PermissionError` carrying the platform's
+    /// `error_description`.
+    pub fn request_device_code(&self, client_id: &str) -> PlatformResult<JsonObject> {
+        let body = serde_json::json!({ "client_id": client_id });
+        let resp = self
+            .send(Method::POST, DEVICE_CODE, &self.headers(None), &[], Some(&body), TIMEOUT)
+            .map_err(|e| connection_error(&e))?;
+
+        if !is_transient(resp.status) && !(200..300).contains(&resp.status) {
+            if let Some((_, description)) = oauth_error(&resp.body) {
+                return Err(PlatformError::Permission { message: description, status_code: Some(resp.status) });
+            }
+        }
+        raise_for_status(resp.status, &[], ErrorClass::Permission)?;
+        object(resp.json()?)
+    }
+
+    /// POST /v1/auth/device/token (no auth): one poll of a device code sign-in.
+    ///
+    /// The platform answers every state short of approval with a 400 and an
+    /// OAuth `error`; the four that are part of the flow come back as
+    /// [`DevicePoll`] values.  Any other 400 (an unknown or used code) is a
+    /// `PermissionError` with the platform's `error_description`, and a 429 or
+    /// 5xx is a `ConnectionError` as everywhere else — worth polling through.
+    pub fn poll_device_token(&self, device_code: &str, client_id: &str) -> PlatformResult<DevicePoll> {
+        let body = serde_json::json!({
+            "grant_type": DEVICE_GRANT_TYPE,
+            "device_code": device_code,
+            "client_id": client_id,
+        });
+        let resp = self
+            .send(Method::POST, DEVICE_TOKEN, &self.headers(None), &[], Some(&body), REFRESH_TIMEOUT)
+            .map_err(|e| connection_error(&e))?;
+
+        if resp.status == 400 {
+            if let Some((error, description)) = oauth_error(&resp.body) {
+                return match error.as_str() {
+                    "authorization_pending" => Ok(DevicePoll::Pending),
+                    "slow_down" => Ok(DevicePoll::SlowDown),
+                    "access_denied" => Ok(DevicePoll::Denied),
+                    "expired_token" => Ok(DevicePoll::Expired),
+                    _ => Err(PlatformError::Permission { message: description, status_code: Some(400) }),
+                };
+            }
+        }
+        raise_for_status(resp.status, &[], ErrorClass::Permission)?;
+
+        let data = object(resp.json()?)?;
+        if !data.get("access_token").map(truthy).unwrap_or(false) {
+            return Err(PlatformError::Value("Device token response missing access_token".to_string()));
+        }
+        Ok(DevicePoll::Tokens(data))
+    }
+
     /// POST /v1/models/{name}/upload (auth required). Returns `{url, blob_path, expires_at}`.
     pub fn get_model_upload_url(&self, model_name: &str, filename: &str) -> PlatformResult<JsonObject> {
         let path = MODEL_UPLOAD.replacen("{}", model_name, 1);
@@ -1030,5 +1131,11 @@ impl PlatformApi for SLPPlatformClient {
     }
     fn create_checkout_session(&self) -> PlatformResult<JsonObject> {
         SLPPlatformClient::create_checkout_session(self)
+    }
+    fn request_device_code(&self, client_id: &str) -> PlatformResult<JsonObject> {
+        SLPPlatformClient::request_device_code(self, client_id)
+    }
+    fn poll_device_token(&self, device_code: &str, client_id: &str) -> PlatformResult<DevicePoll> {
+        SLPPlatformClient::poll_device_token(self, device_code, client_id)
     }
 }
