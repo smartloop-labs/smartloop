@@ -134,6 +134,20 @@ between their parts, charts, colors, icons and states.\n\
 Report only what is visible. Do not answer the request, write code, or make \
 recommendations.\n\nRequest: {request}";
 
+/// Prompt for [`ModelService::summarize_history`]; `{transcript}` is the
+/// dropped turns.
+pub const HISTORY_SUMMARY_PROMPT: &str = "Summarize the earlier part of this conversation for the assistant that \
+continues it. Keep: what the user asked for, decisions and constraints, \
+files, commands and names that were mentioned, what has been done and what \
+is still open. Be concise — bullet points, no preamble.\n\n\
+Conversation:\n{transcript}\n\nSummary:";
+
+/// Output cap for a history summary.
+pub const HISTORY_SUMMARY_MAX_TOKENS: usize = 512;
+
+/// How many history summaries are kept.
+pub const HISTORY_SUMMARY_CACHE: usize = 16;
+
 /// How many image readings [`ModelService::image_perceptions`] keeps; the
 /// oldest is dropped past this.  A turn needs one; the rest only spare a
 /// re-read when an earlier image comes back.
@@ -4068,6 +4082,53 @@ impl ModelService {
             || canonical_model_name(&Self::model_label(primary.as_ref()))
                 == canonical_model_name(&api_settings().default_model);
         (!is_router).then_some(primary)
+    }
+
+    /// A short summary of conversation turns that compaction dropped, written
+    /// by the answer tier's model — the request's one model, so summarizing
+    /// switches nothing.  Cached by transcript, so a turn's tool rounds reuse
+    /// it.  `None` when the transcript is empty or the model fails; the turns
+    /// are then dropped unsummarized, as before.
+    pub fn summarize_history(&self, transcript: &str) -> Option<String> {
+        if transcript.trim().is_empty() {
+            return None;
+        }
+        let key = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(transcript.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        if let Some(summary) = self.history_summaries.lock().get(&key).cloned() {
+            return Some(summary);
+        }
+        let prompt = HISTORY_SUMMARY_PROMPT.replace("{transcript}", transcript);
+        let summary = match catch_unwind(AssertUnwindSafe(|| {
+            self.generate_completion(
+                &prompt,
+                None,
+                Some(crate::types::ANSWER_TIER),
+                Some(HISTORY_SUMMARY_MAX_TOKENS),
+                Some(false),
+            )
+        })) {
+            Ok(Ok(summary)) => strip_thinking(&summary).trim().to_string(),
+            Ok(Err(e)) => {
+                tracing::warn!(target: LOG, "[compact] history summary failed: {e}");
+                return None;
+            }
+            Err(panic) => {
+                tracing::warn!(target: LOG, "[compact] history summary failed: {}", panic_message(&panic));
+                return None;
+            }
+        };
+        if summary.is_empty() {
+            return None;
+        }
+        let mut cache = self.history_summaries.lock();
+        cache.insert(key, summary.clone());
+        while cache.len() > HISTORY_SUMMARY_CACHE {
+            cache.shift_remove_index(0);
+        }
+        Some(summary)
     }
 
     /// Cache key for a set of images: a digest of their bytes, so the same

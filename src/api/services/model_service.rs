@@ -571,6 +571,10 @@ pub struct ModelService {
     /// only the first — hands the text-only answer model what the image says,
     /// without running the vision model again.
     pub image_perceptions: Mutex<IndexMap<String, String>>,
+    /// Summaries of conversation turns compaction dropped, keyed by a digest
+    /// of the dropped transcript.  A turn's tool rounds resend the same
+    /// history, so the summary is written once per turn, not once per round.
+    pub history_summaries: Mutex<IndexMap<String, String>>,
     /// `_large_model_attempted`: the large model has been considered.
     pub large_model_attempted: AtomicBool,
     /// `_cap_llm_<model_name>` slots, in insertion order.
@@ -660,6 +664,7 @@ impl ModelService {
             vision_unavailable: AtomicBool::new(false),
             vision_clip_cpu: AtomicBool::new(false),
             image_perceptions: Mutex::new(IndexMap::new()),
+            history_summaries: Mutex::new(IndexMap::new()),
             large_model_attempted: AtomicBool::new(false),
             cap_llms: Mutex::new(Vec::new()),
             capability_skip: Mutex::new(None),
@@ -3641,11 +3646,6 @@ impl ModelService {
             }
         };
 
-        let search_query = match conversation_history {
-            Some(history) if !history.is_empty() => self.build_history_search_query(query, history),
-            _ => query.to_string(),
-        };
-
         // Semantic discovery: find which documents are relevant.  The goal is
         // document-level recall — with multi-chunk documents a small
         // n_results can be dominated by chunks from 1-2 documents, hiding the
@@ -3656,6 +3656,15 @@ impl ModelService {
             .iter()
             .filter(|d| matches!(d.status, DocumentStatus::Indexed | DocumentStatus::Pending))
             .count();
+
+        // With no document indexed the rewrite is a model call that cannot
+        // improve a search over nothing: query with the message as it is.
+        let search_query = match conversation_history {
+            Some(history) if !history.is_empty() && indexed_doc_count > 0 => {
+                self.build_history_search_query(query, history)
+            }
+            _ => query.to_string(),
+        };
         let n_results = (indexed_doc_count * 5).max(20);
 
         tracing::info!(
@@ -3924,8 +3933,16 @@ impl ModelService {
     }
 
     /// `result.strip().strip('"\'')`.
+    /// A model that echoes the prompt's `Search query:` label puts it in
+    /// the query itself; it is dropped too.
     fn clean_rewrite(result: &str) -> String {
-        result.trim().trim_matches(|c| c == '"' || c == '\'').to_string()
+        let quotes = |c: char| c == '"' || c == '\'';
+        let trimmed = result.trim().trim_matches(quotes).trim();
+        let unlabelled = match trimmed.get(..13) {
+            Some(head) if head.eq_ignore_ascii_case("search query:") => &trimmed[13..],
+            _ => trimmed,
+        };
+        unlabelled.trim().trim_matches(quotes).trim().to_string()
     }
 
     /// Use the LLM to synthesize a vector-search query from the user message

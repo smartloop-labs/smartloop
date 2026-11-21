@@ -141,6 +141,12 @@ pub trait ChatService: Send + Sync {
     fn get_asset_images(&self, asset_ids: &[String]) -> Vec<ImageAttachment>;
     /// `ModelService.resolve_attachment_context`.
     fn resolve_attachment_context(&self, asset_ids: &[String]) -> String;
+    /// `ModelService.summarize_history`: a short summary of conversation
+    /// turns compaction drops, so the answer keeps what was decided and done.
+    /// `None` leaves them dropped.
+    fn summarize_history(&self, _transcript: &str) -> Option<String> {
+        None
+    }
     /// `ModelService.image_context_for_round`: what an attached image says,
     /// for a tool round that skips orchestration.
     fn image_context_for_round(&self, _user_message: &str, _images: &[ImageAttachment]) -> Option<String> {
@@ -258,6 +264,9 @@ impl ChatService for ModelService {
     }
     fn image_context_for_round(&self, user_message: &str, images: &[ImageAttachment]) -> Option<String> {
         ModelService::image_context_for_round(self, user_message, images)
+    }
+    fn summarize_history(&self, transcript: &str) -> Option<String> {
+        ModelService::summarize_history(self, transcript)
     }
     fn orchestrate(&self, args: OrchestrateArgs) -> anyhow::Result<OrchestrateOutcome> {
         let history: Vec<Value> = args
@@ -2059,14 +2068,26 @@ pub fn compact_messages(
     context_tokens: usize,
     max_context: Option<usize>,
 ) -> Vec<ChatMessage> {
+    compact_messages_dropping(messages, model_service, reserved_tokens, context_tokens, max_context).0
+}
+
+/// [`compact_messages`], also returning the messages it dropped (oldest
+/// first), so a caller can summarize them instead of losing them.
+pub fn compact_messages_dropping(
+    messages: Vec<ChatMessage>,
+    model_service: &dyn ChatService,
+    reserved_tokens: usize,
+    context_tokens: usize,
+    max_context: Option<usize>,
+) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
     let max_context = max_context.unwrap_or_else(|| model_service.get_max_context_tokens());
     if max_context == 0 {
-        return messages;
+        return (messages, Vec::new());
     }
 
     let budget = max_context as i64 - reserved_tokens as i64 - context_tokens as i64;
     if budget <= 0 {
-        return messages;
+        return (messages, Vec::new());
     }
 
     // Quick check — if we're already within budget, return as-is
@@ -2078,22 +2099,23 @@ pub fn compact_messages(
             "Context window: {}/{} tokens used ({} budget, {} reserved) — no compaction needed",
             used_tokens, max_context, budget, reserved_tokens
         );
-        return messages;
+        return (messages, Vec::new());
     }
 
     let original_count = messages.len();
 
     // Build a mutable copy
     let mut compacted = messages;
+    let mut dropped: Vec<ChatMessage> = Vec::new();
 
     // Remove oldest turns in pairs (assistant+user or user+assistant) starting
     // from index 1 so that roles keep alternating.  Index 0 (first user message
     // with context) and the last message are always kept.
     while compacted.len() > 2 {
         // Pop two messages at index 1 to remove a full turn pair
-        compacted.remove(1);
+        dropped.push(compacted.remove(1));
         if compacted.len() > 2 {
-            compacted.remove(1);
+            dropped.push(compacted.remove(1));
         }
 
         if model_service.count_tokens(&joined_content(&compacted)) as i64 <= budget {
@@ -2129,7 +2151,170 @@ pub fn compact_messages(
         used_tokens, max_context, budget, removed, compacted_tokens, max_context
     );
 
-    compacted
+    (compacted, dropped)
+}
+
+/// Tool results this recent are always kept whole: the model is acting on
+/// them right now.
+pub const KEEP_RECENT_TOOL_RESULTS: usize = 2;
+
+/// A tool result shorter than this is left as it is — a stub would save
+/// nothing.
+pub const TOOL_STUB_MIN_CHARS: usize = 400;
+
+/// The window a turn's prompt is compacted to: the working budget
+/// (`history_compact_tokens`), or the model's window when that is smaller.
+/// A budget of 0 or less means the model's window alone.
+pub fn compaction_window(model_window: usize, working_budget: i64) -> usize {
+    if working_budget <= 0 {
+        return model_window;
+    }
+    let working = working_budget as usize;
+    if model_window == 0 { working } else { model_window.min(working) }
+}
+
+/// Tokens the client tool rounds add to the prompt.
+fn tool_round_tokens(rounds: &[Value], model_service: &dyn ChatService) -> usize {
+    rounds.iter().map(|r| model_service.count_tokens(&r.to_string())).sum()
+}
+
+/// The text of a tool result, whether a string or a list of text parts.
+fn tool_result_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Shrink older client tool results until the rounds fit in `budget` tokens.
+///
+/// Oldest first, and only the results — every call the model made stays,
+/// so it still knows what it has done.  The last
+/// [`KEEP_RECENT_TOOL_RESULTS`] results are kept whole, and so is any result
+/// too short to be worth a stub.  A stub names what the result held: its size
+/// and first line.
+pub fn compact_tool_rounds(mut rounds: Vec<Value>, model_service: &dyn ChatService, budget: usize) -> Vec<Value> {
+    let tool_indices: Vec<usize> =
+        rounds.iter().enumerate().filter(|(_, m)| m["role"] == "tool").map(|(i, _)| i).collect();
+    let stubbable = tool_indices.len().saturating_sub(KEEP_RECENT_TOOL_RESULTS);
+    let mut used = tool_round_tokens(&rounds, model_service);
+    let mut stubbed = 0usize;
+    for &i in &tool_indices[..stubbable] {
+        if used <= budget {
+            break;
+        }
+        let text = tool_result_text(&rounds[i]["content"]);
+        if text.chars().count() < TOOL_STUB_MIN_CHARS {
+            continue;
+        }
+        let first: String = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(120).collect();
+        let before = model_service.count_tokens(&rounds[i].to_string());
+        rounds[i]["content"] = Value::String(format!(
+            "[earlier tool output trimmed to save context: {} chars; it began: {}]",
+            text.chars().count(),
+            first.trim()
+        ));
+        let after = model_service.count_tokens(&rounds[i].to_string());
+        used = used.saturating_sub(before.saturating_sub(after));
+        stubbed += 1;
+    }
+    if stubbed > 0 {
+        tracing::info!(
+            target: LOG_TARGET,
+            "[compact] trimmed {stubbed} earlier tool result(s) — tool rounds now {used} tokens (budget {budget})"
+        );
+    }
+    rounds
+}
+
+/// Most of the dropped transcript handed to the summarizer, in characters.
+/// A long session can drop far more than a small local model can read; the
+/// opening (what was asked) and the most recent part (what was being done)
+/// are what the summary needs.
+pub const SUMMARY_INPUT_MAX_CHARS: usize = 48_000;
+
+/// `transcript`, cut to [`SUMMARY_INPUT_MAX_CHARS`] by keeping its head and
+/// tail.
+fn summary_input(transcript: &str) -> String {
+    let chars: Vec<char> = transcript.chars().collect();
+    if chars.len() <= SUMMARY_INPUT_MAX_CHARS {
+        return transcript.to_string();
+    }
+    let head = SUMMARY_INPUT_MAX_CHARS / 6;
+    let tail = SUMMARY_INPUT_MAX_CHARS - head;
+    format!(
+        "{}\n\n[… middle of the conversation omitted …]\n\n{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
+}
+
+/// Compact a turn's prompt — the conversation and the client tool rounds —
+/// to `window` tokens, keeping `reserved_tokens` for the answer and room for
+/// `context_tokens` of gathered context.
+///
+/// Older tool output goes first: in a coding session it is most of the
+/// prompt (file reads, command output) and the least needed once acted on.
+/// Only if the conversation itself is still over budget are its oldest turns
+/// dropped — and those are replaced by a short summary, when one can be
+/// written, so what was asked and done survives the cut.  The current user
+/// message and the first one are always kept.
+pub fn compact_turn(
+    messages: Vec<ChatMessage>,
+    rounds: Vec<Value>,
+    model_service: &dyn ChatService,
+    reserved_tokens: usize,
+    context_tokens: usize,
+    window: usize,
+) -> (Vec<ChatMessage>, Vec<Value>) {
+    if window == 0 {
+        return (messages, rounds);
+    }
+    let budget = window.saturating_sub(reserved_tokens + context_tokens);
+    let message_tokens = model_service.count_tokens(&joined_content(&messages));
+    let rounds = if !rounds.is_empty() && message_tokens + tool_round_tokens(&rounds, model_service) > budget {
+        compact_tool_rounds(rounds, model_service, budget.saturating_sub(message_tokens))
+    } else {
+        rounds
+    };
+    let round_tokens = tool_round_tokens(&rounds, model_service);
+
+    let (mut messages, dropped) = compact_messages_dropping(
+        messages,
+        model_service,
+        reserved_tokens,
+        context_tokens,
+        Some(window.saturating_sub(round_tokens).max(1)),
+    );
+    if !dropped.is_empty() && !messages.is_empty() {
+        let transcript = dropped
+            .iter()
+            .filter_map(|m| {
+                let content = m.content.as_deref().filter(|c| !c.trim().is_empty())?;
+                let role = serde_json::to_value(&m.role).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+                Some(format!("{role}: {content}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let transcript = summary_input(&transcript);
+        if let Some(summary) = model_service.summarize_history(&transcript).filter(|s| !s.trim().is_empty()) {
+            let first = &mut messages[0];
+            let content = first.content.clone().unwrap_or_default();
+            first.content = Some(format!("{content}\n\n[Summary of the earlier conversation, compacted to save context]:\n{}", summary.trim()));
+            tracing::info!(
+                target: LOG_TARGET,
+                "[compact] {} dropped message(s) replaced by a {}-char summary",
+                dropped.len(),
+                summary.chars().count()
+            );
+        }
+    }
+    (messages, rounds)
 }
 
 /// Prepend already-loaded conversation `history` to the request messages.
@@ -2666,7 +2851,7 @@ fn stream_chunks_inner(
         // on the same turn.  Those rounds travel to the model as OpenAI
         // messages, not through the flattened prompt; a round that answers
         // calls continues the turn, so it is not re-planned.
-        let (request, tool_rounds) = split_tool_rounds(request);
+        let (request, mut tool_rounds) = split_tool_rounds(request);
         let client_tools: Option<Vec<Value>> = request.tools.clone().filter(|t| !t.is_empty());
         let continuing = !tool_rounds.is_empty();
 
@@ -3105,7 +3290,22 @@ fn stream_chunks_inner(
         }
 
         let context_tokens = svc.count_tokens(orchestrator_context.as_deref().unwrap_or(""));
-        messages = compact_messages(messages, &*svc, 2048, context_tokens, Some(max_ctx));
+        // Compacted for speed, not only to fit: every tool round resends the
+        // whole prompt, so a long session is trimmed to a working budget well
+        // inside the model's window.  Off the async workers: a summary of
+        // dropped turns is a model call.
+        {
+            let compact_svc = svc.clone();
+            let window = compaction_window(max_ctx, AppSettings::new().history_compact_tokens);
+            let turn_messages = std::mem::take(&mut messages);
+            let turn_rounds = std::mem::take(&mut tool_rounds);
+            let compacting = timing::timer("chat.compact");
+            (messages, tool_rounds) = run_blocking(move || {
+                compact_turn(turn_messages, turn_rounds, &*compact_svc, 2048, context_tokens, window)
+            })
+            .await;
+            drop(compacting);
+        }
 
         let prompt = format_messages_to_prompt(
             &messages,
@@ -3823,7 +4023,8 @@ async fn complete_body(
     let project_info = svc.get_project_info();
 
     let context_tokens = svc.count_tokens(orchestrator_context.as_deref().unwrap_or(""));
-    let messages = compact_messages(messages, &**svc, 2048, context_tokens, None);
+    let window = compaction_window(svc.get_max_context_tokens(), AppSettings::new().history_compact_tokens);
+    let messages = compact_messages(messages, &**svc, 2048, context_tokens, Some(window));
 
     let prompt = format_messages_to_prompt(
         &messages,

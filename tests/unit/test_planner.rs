@@ -1080,3 +1080,33 @@ fn test_an_unmatched_tool_call_plans_an_open_tool_step() {
     let none = planner.create_plan(&classification, &ctx("create the issue on linear"), None);
     assert!(none.steps.is_empty(), "no connected servers, nothing to call");
 }
+
+/// With no MCP tool, skill or document to route to, every intent but
+/// CONVERSATION is impossible: the planner answers without a model call,
+/// which on a cloud model was seconds of "Planning the response…".
+#[test]
+fn test_classify_with_nothing_to_route_to_skips_the_llm() {
+    let llm = mock_llm();
+    llm.set_invoke_return("TOOL_CALL");
+    let result = planner_with(&llm).classify(
+        "covert this shell script to configure kitty",
+        &[],
+        ClassifyOptions::default(),
+    );
+    assert_eq!(result.intent, IntentType::Conversation);
+    assert!(!llm.invoke_called(), "no model call when nothing can be routed to");
+}
+
+/// A skill to follow is something to route to: the model still classifies.
+#[test]
+fn test_classify_with_a_skill_still_asks_the_llm() {
+    let llm = mock_llm();
+    llm.set_invoke_return("MULTI_STEP");
+    let result = planner_with(&llm).classify(
+        "covert this shell script to configure kitty",
+        &[],
+        ClassifyOptions { skills: Some(vec!["---\nname: kitty\n---\nConfigure kitty".into()]), ..Default::default() },
+    );
+    assert!(llm.invoke_called());
+    assert_eq!(result.intent, IntentType::MultiStep);
+}

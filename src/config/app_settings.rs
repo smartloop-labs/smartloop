@@ -138,6 +138,12 @@ pub struct AppSettings {
     pub vision_ocr_min_chars_per_page: i64,
     /// `SLP_VISION_N_CTX`
     pub vision_n_ctx: i64,
+    /// `SLP_HISTORY_COMPACT_TOKENS` — the working budget a turn's prompt is
+    /// compacted to (history plus client tool rounds), or the answer model's
+    /// window when that is smaller.  Every tool round resends the whole
+    /// prompt, so it is sized for speed, not for what fits; 0 compacts only
+    /// to the model's window.
+    pub history_compact_tokens: i64,
     /// `SLP_VISION_CLIP_DEVICE` — `"auto"`, `"gpu"` or `"cpu"`.
     pub vision_clip_device: String,
     /// `SLP_THINKING_ENABLED` — override reasoning models' `<think>` block.
@@ -213,6 +219,7 @@ impl AppSettings {
             cloud_fallback: true,
             vision_ocr_min_chars_per_page: 100,
             vision_n_ctx: 8192,
+            history_compact_tokens: 32768,
             vision_clip_device: "auto".to_string(),
             thinking_enabled: None,
             decision_model: None,
@@ -288,6 +295,7 @@ impl AppSettings {
             cloud_fallback: r.boolean("slp_cloud_fallback", d.cloud_fallback)?,
             vision_ocr_min_chars_per_page: r.int("slp_vision_ocr_min_chars_per_page", d.vision_ocr_min_chars_per_page)?,
             vision_n_ctx: r.int("slp_vision_n_ctx", d.vision_n_ctx)?,
+            history_compact_tokens: r.int("slp_history_compact_tokens", d.history_compact_tokens)?,
             vision_clip_device: r.string("slp_vision_clip_device", d.vision_clip_device)?,
             thinking_enabled: r.opt_boolean("slp_thinking_enabled", d.thinking_enabled)?,
             decision_model: r.opt_string("slp_decision_model", d.decision_model)?,

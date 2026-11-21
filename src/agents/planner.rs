@@ -702,6 +702,22 @@ impl Planner {
                     result.bash_commands.len(),
                 );
             }
+            // Nothing to route to: no MCP tool to call, no skill to follow,
+            // no document to explore.  Every intent but CONVERSATION needs
+            // one of those, so the answer is known — asking a model to pick
+            // only puts a full round trip (seconds on a cloud model) in
+            // front of the reply.
+            None if mcp_tools.is_empty()
+                && skills.as_deref().is_none_or(|s| s.is_empty())
+                && !result.has_document_context =>
+            {
+                result.intent = IntentType::Conversation;
+                result.reasoning = "nothing to route to (no tools, skills or documents)".to_string();
+                tracing::info!(
+                    target: "smartloop.agents.planner",
+                    "[classify] no tools, skills or documents → conversation (no LLM)"
+                );
+            }
             None => {
                 // Tier 2: LLM fallback
                 result = self.llm_classify(
