@@ -11,11 +11,9 @@ pub mod orchestrator;
 pub mod planner;
 pub mod prompt_agent;
 pub mod sanitize;
-pub mod summarizer_agent;
 pub mod web_search_agent;
 
 pub use prompt_agent::{DocumentInput, PromptAgent, PromptResponse};
-pub use summarizer_agent::{SummarizerAgent, SummarizerResponse};
 pub use planner::Planner;
 pub use orchestrator::SLPOrchestrator;
 /// Python alias `MCPToolOrchestrator` → [`SLPOrchestrator`].
