@@ -145,6 +145,20 @@ Conversation:\n{transcript}\n\nSummary:";
 /// Output cap for a history summary.
 pub const HISTORY_SUMMARY_MAX_TOKENS: usize = 512;
 
+/// Prompt for [`ModelService::summarize_task`]; `{record}` is what the
+/// client saw the task do.
+pub const TASK_SUMMARY_PROMPT: &str = "Summarize the finished coding task in the record below for the user. \
+Write at most 3 bullets, each one short line of at most 15 words, in the \
+past tense with no subject, like \"- Added a --verbose flag to src/main.rs\". \
+Say which files changed and what for, then whether the checks passed or \
+failed. Mention a command only when it changed something or failed; skip \
+searches and lookups. Use only what the record shows. Never mention the \
+assistant, the user or the task itself, and no code, next steps or preamble.\n\n\
+Record:\n{record}\n\nSummary:";
+
+/// Output cap for a task summary.
+pub const TASK_SUMMARY_MAX_TOKENS: usize = 160;
+
 /// How many history summaries are kept.
 pub const HISTORY_SUMMARY_CACHE: usize = 16;
 
@@ -4101,34 +4115,45 @@ impl ModelService {
             return Some(summary);
         }
         let prompt = HISTORY_SUMMARY_PROMPT.replace("{transcript}", transcript);
-        let summary = match catch_unwind(AssertUnwindSafe(|| {
-            self.generate_completion(
-                &prompt,
-                None,
-                Some(crate::types::ANSWER_TIER),
-                Some(HISTORY_SUMMARY_MAX_TOKENS),
-                Some(false),
-            )
-        })) {
-            Ok(Ok(summary)) => strip_thinking(&summary).trim().to_string(),
-            Ok(Err(e)) => {
-                tracing::warn!(target: LOG, "[compact] history summary failed: {e}");
-                return None;
-            }
-            Err(panic) => {
-                tracing::warn!(target: LOG, "[compact] history summary failed: {}", panic_message(&panic));
-                return None;
-            }
-        };
-        if summary.is_empty() {
-            return None;
-        }
+        let summary = self.short_completion(&prompt, HISTORY_SUMMARY_MAX_TOKENS, "[compact] history summary")?;
         let mut cache = self.history_summaries.lock();
         cache.insert(key, summary.clone());
         while cache.len() > HISTORY_SUMMARY_CACHE {
             cache.shift_remove_index(0);
         }
         Some(summary)
+    }
+
+    /// A few lines on what a finished client task did — files changed,
+    /// commands and checks run, and how it ended — written by the answer
+    /// tier's model.  `None` when the record is empty or the model fails;
+    /// the client then says it its own way.
+    pub fn summarize_task(&self, record: &str) -> Option<String> {
+        if record.trim().is_empty() {
+            return None;
+        }
+        let prompt = TASK_SUMMARY_PROMPT.replace("{record}", record);
+        self.short_completion(&prompt, TASK_SUMMARY_MAX_TOKENS, "[task] summary")
+    }
+
+    /// One answer-tier completion of at most `max_tokens`, without its
+    /// thinking.  `None` when it fails, panics or comes back empty; `what`
+    /// labels it in the log.
+    fn short_completion(&self, prompt: &str, max_tokens: usize, what: &str) -> Option<String> {
+        let text = match catch_unwind(AssertUnwindSafe(|| {
+            self.generate_completion(prompt, None, Some(crate::types::ANSWER_TIER), Some(max_tokens), Some(false))
+        })) {
+            Ok(Ok(text)) => strip_thinking(&text).trim().to_string(),
+            Ok(Err(e)) => {
+                tracing::warn!(target: LOG, "{what} failed: {e}");
+                return None;
+            }
+            Err(panic) => {
+                tracing::warn!(target: LOG, "{what} failed: {}", panic_message(&panic));
+                return None;
+            }
+        };
+        (!text.is_empty()).then_some(text)
     }
 
     /// Cache key for a set of images: a digest of their bytes, so the same
