@@ -622,6 +622,65 @@ pub struct FeedbackResponse {
     pub indexed: bool,
 }
 
+/// What a client saw a finished task do, for `POST /v1/chat/summary`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
+pub struct TaskSummaryRequest {
+    /// Project the task ran in; its models write the summary.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// What the user asked for.
+    pub request: String,
+    /// The model's last reply in the task.
+    #[serde(default)]
+    pub reply: String,
+    /// Files the task created, changed or deleted.
+    #[serde(default)]
+    pub files: Vec<TaskFile>,
+    /// Commands the task ran, in order.
+    #[serde(default)]
+    pub commands: Vec<TaskCommand>,
+    /// Builds, tests and other checks run on the result.
+    #[serde(default)]
+    pub checks: Vec<TaskCheck>,
+}
+
+/// A file a task touched.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
+pub struct TaskFile {
+    pub path: String,
+    /// `created`, `updated` or `deleted`.
+    pub change: String,
+    #[serde(default)]
+    pub added: usize,
+    #[serde(default)]
+    pub removed: usize,
+}
+
+/// A command a task ran.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
+pub struct TaskCommand {
+    pub command: String,
+    /// `None` when it was stopped or never finished.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// The end of its output.
+    #[serde(default)]
+    pub output: String,
+}
+
+/// A check run on a task's result.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
+pub struct TaskCheck {
+    pub command: String,
+    pub passed: bool,
+}
+
+/// The summary of a finished task; `null` when none could be written.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, utoipa::ToSchema)]
+pub struct TaskSummaryResponse {
+    pub summary: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -232,6 +232,7 @@ mod test_reading_the_project_from_a_body {
     #[test]
     fn test_chat_is_routed_by_its_body() {
         assert!(routes_by_body(&path_scope("/v1/chat/completions")));
+        assert!(routes_by_body(&path_scope("/v1/chat/summary")));
     }
 
     /// Its POST names the project in the body; its GET/DELETE in the query.

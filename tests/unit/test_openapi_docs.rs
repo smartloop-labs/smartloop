@@ -24,11 +24,11 @@ async fn serves_the_openapi_document() {
     assert_eq!(doc["info"]["version"], smartloop::VERSION);
     assert_eq!(doc["servers"][0]["url"], "http://127.0.0.1:8001");
     let paths = doc["paths"].as_object().unwrap();
-    for path in ["/v1/chat/completions", "/v1/projects", "/v1/projects/{project_id}/mcp/{server_id}", "/health"] {
+    for path in ["/v1/chat/completions", "/v1/chat/summary", "/v1/projects", "/v1/projects/{project_id}/mcp/{server_id}", "/health"] {
         assert!(paths.contains_key(path), "{path} missing from the OpenAPI document");
     }
     let operations: usize = paths.values().map(|item| item.as_object().unwrap().len()).sum();
-    assert_eq!(operations, 66, "every route's handler should be listed in ApiDoc");
+    assert_eq!(operations, 67, "every route's handler should be listed in ApiDoc");
 }
 
 #[tokio::test]
