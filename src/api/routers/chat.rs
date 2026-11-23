@@ -147,6 +147,12 @@ pub trait ChatService: Send + Sync {
     fn summarize_history(&self, _transcript: &str) -> Option<String> {
         None
     }
+    /// `ModelService.summarize_task`: a few lines on what a finished client
+    /// task did, from the record the client kept.  `None` lets the client
+    /// say it its own way.
+    fn summarize_task(&self, _record: &str) -> Option<String> {
+        None
+    }
     /// `ModelService.image_context_for_round`: what an attached image says,
     /// for a tool round that skips orchestration.
     fn image_context_for_round(&self, _user_message: &str, _images: &[ImageAttachment]) -> Option<String> {
@@ -267,6 +273,9 @@ impl ChatService for ModelService {
     }
     fn summarize_history(&self, transcript: &str) -> Option<String> {
         ModelService::summarize_history(self, transcript)
+    }
+    fn summarize_task(&self, record: &str) -> Option<String> {
+        ModelService::summarize_task(self, record)
     }
     fn orchestrate(&self, args: OrchestrateArgs) -> anyhow::Result<OrchestrateOutcome> {
         let history: Vec<Value> = args
@@ -1041,7 +1050,7 @@ where
 }
 
 /// Run `f` on the single-worker [`EXECUTOR`] and await its result.
-async fn run_on_executor<R, F>(f: F) -> anyhow::Result<R>
+pub(crate) async fn run_on_executor<R, F>(f: F) -> anyhow::Result<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -1938,7 +1947,13 @@ pub fn request_project(
     request: &ChatCompletionRequest,
     model_service: &dyn ChatService,
 ) -> Option<String> {
-    let project_id = request.project_id.as_deref().filter(|p| !p.is_empty())?;
+    known_project(request.project_id.as_deref(), model_service)
+}
+
+/// `project_id` when the workspace holds it; logs (and returns `None`) when
+/// it does not.
+pub fn known_project(project_id: Option<&str>, model_service: &dyn ChatService) -> Option<String> {
+    let project_id = project_id.filter(|p| !p.is_empty())?;
     if let Some(ids) = model_service.workspace_project_ids()
         && !ids.iter().any(|id| id == project_id)
     {

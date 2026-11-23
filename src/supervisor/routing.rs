@@ -81,7 +81,8 @@ pub const HOP_BY_HOP: &[&str] = &[
 /// `/v1/feedback` is here because its POST carries `project_id` in the body
 /// while its GET and DELETE carry it in the query string — so without this the
 /// three halves of one endpoint were answered by two different processes.
-pub const BODY_ROUTED_PATHS: &[&str] = &["/v1/chat/completions", "/v1/feedback"];
+/// `/v1/chat/summary` is summarized by the project's own answer model.
+pub const BODY_ROUTED_PATHS: &[&str] = &["/v1/chat/completions", "/v1/chat/summary", "/v1/feedback"];
 
 /// `/v1/projects/<id>` — the project record itself, with or without a
 /// sub-resource after it.

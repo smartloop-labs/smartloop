@@ -11,7 +11,8 @@ pub use chat::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     ChatStatus, ChatStatusChunk, Choice, ChunkChoice, Citation, CitationSource,
     DeleteAssetResponse, DeleteDocumentResponse, DeltaContent, DocumentListResponse,
-    DocumentResponse, FeedbackRequest, FeedbackResponse, Rating, Role, Usage,
+    DocumentResponse, FeedbackRequest, FeedbackResponse, Rating, Role, TaskCheck, TaskCommand,
+    TaskFile, TaskSummaryRequest, TaskSummaryResponse, Usage,
 };
 pub use mcp::{
     DeleteMCPServerResponse, MCPDefinitionRequest, MCPOAuthCallbackRequest,
