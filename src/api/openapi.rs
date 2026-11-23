@@ -44,6 +44,7 @@ pub struct DocumentUpload {
     info(title = "Smartloop", description = "Smartloop local LLM inference framework - OpenAI-compatible API server"),
     paths(
         crate::api::routers::chat::create_chat_completion,
+        crate::api::routers::chat_summary::summarize_task,
         crate::api::routers::projects::create_project,
         crate::api::routers::projects::list_projects,
         crate::api::routers::projects::update_project,

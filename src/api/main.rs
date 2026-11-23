@@ -735,6 +735,7 @@ pub fn app() -> Router {
     let routes = Router::new()
         .merge(routers::auth_router())
         .merge(routers::chat_router())
+        .merge(routers::chat_summary_router())
         .merge(routers::documents_router())
         .merge(routers::projects_router())
         .merge(routers::assets_router())

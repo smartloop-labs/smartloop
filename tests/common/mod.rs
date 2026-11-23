@@ -2893,6 +2893,10 @@ pub mod api_chat {
         pub index_activity: Mutex<Vec<String>>,
         pub index_now: Mutex<Option<String>>,
         pub index_hold: Mutex<Duration>,
+        /// What `summarize_task` answers.
+        pub task_summary: Mutex<Option<String>>,
+        /// Records `summarize_task` was called with.
+        pub task_records: Mutex<Vec<String>>,
     }
 
     impl Default for FakeChatService {
@@ -2918,6 +2922,8 @@ pub mod api_chat {
                 index_activity: Mutex::new(Vec::new()),
                 index_now: Mutex::new(None),
                 index_hold: Mutex::new(Duration::ZERO),
+                task_summary: Mutex::new(None),
+                task_records: Mutex::new(Vec::new()),
             }
         }
     }
@@ -3017,6 +3023,10 @@ pub mod api_chat {
         }
         fn workspace_project_ids(&self) -> Option<Vec<String>> {
             None
+        }
+        fn summarize_task(&self, record: &str) -> Option<String> {
+            self.task_records.lock().push(record.to_string());
+            self.task_summary.lock().clone()
         }
         fn current_project_dir(&self) -> Option<String> {
             self.project_dir.lock().clone()
