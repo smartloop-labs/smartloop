@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use crate::config::app_settings::AppSettings;
 use crate::llms::base_llm::{BaseLLM, CallOptions, CancelEvent, ChatMessage, GenerationChunk, GenerationStream};
 use crate::llms::cloud_session::{self, SessionModel};
+use crate::llms::thinking::{strip_thinking, ThinkingFilter};
 use crate::llms::tool_calls::{openai_messages, parse_tool_calls, render_tool_calls, split_messages, split_tools, NativeToolCall};
 use crate::model::spec::MODEL_SPECS;
 use crate::platform::client::{AuthHeadersFn, RefreshFn, SLPPlatformClient};
@@ -298,7 +299,9 @@ impl CloudLLM {
         if !calls.is_empty() {
             return Ok((render_tool_calls(&calls), finish.map(str::to_string)));
         }
-        Ok((content.to_string(), finish.map(str::to_string)))
+        // Some providers (MiniMax) put the reasoning inline in `content` as
+        // a `<think>` block rather than in `reasoning_content`.
+        Ok((strip_thinking(content), finish.map(str::to_string)))
     }
 
     /// One non-streaming completion over OpenAI-shaped `messages`, whose
@@ -612,10 +615,23 @@ impl BaseLLM for CloudLLM {
         // room went when the stream is cut off.
         let (mut answered, mut reasoned) = (0usize, 0usize);
         let mut timing = StreamTiming::new(started);
-        // The calls a stream made, once it has ended, as one last chunk.
-        let mut calls_chunk = move |calls: &mut std::collections::BTreeMap<u64, (Option<String>, String, String)>| {
+        // Reasoning some providers (MiniMax) stream inline in `content` as a
+        // `<think>` block, withheld the way a local model's is.
+        let mut thinking = ThinkingFilter::new();
+        // What the stream still holds once it has ended — the filter's tail,
+        // then the calls it made — as one last chunk.
+        let model_name = self.model_name.clone();
+        let calls_chunk = move |thinking: &mut ThinkingFilter,
+                                    calls: &mut std::collections::BTreeMap<u64, (Option<String>, String, String)>| {
+            if thinking.unterminated() {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "[cloud] {model_name} ended inside a <think> block — the reply was never reached"
+                );
+            }
+            let tail = thinking.flush();
             if calls.is_empty() {
-                return None;
+                return (!tail.is_empty()).then_some(GenerationChunk { text: tail });
             }
             let made: Vec<NativeToolCall> = std::mem::take(calls)
                 .into_values()
@@ -626,7 +642,10 @@ impl BaseLLM for CloudLLM {
                     arguments: serde_json::from_str(&arguments).unwrap_or_default(),
                 })
                 .collect();
-            (!made.is_empty()).then(|| GenerationChunk { text: format!("\n{}", render_tool_calls(&made)) })
+            if made.is_empty() {
+                return (!tail.is_empty()).then_some(GenerationChunk { text: tail });
+            }
+            Some(GenerationChunk { text: format!("{tail}\n{}", render_tool_calls(&made)) })
         };
         Box::new(std::iter::from_fn(move || loop {
             if finished || self.is_cancelled() {
@@ -635,7 +654,7 @@ impl BaseLLM for CloudLLM {
             let Some(line) = lines.next() else {
                 timing.report(&self.model_name);
                 finished = true;
-                return calls_chunk(&mut calls);
+                return calls_chunk(&mut thinking, &mut calls);
             };
             let line = match line {
                 Ok(line) => line,
@@ -648,7 +667,7 @@ impl BaseLLM for CloudLLM {
             if data == "[DONE]" {
                 timing.report(&self.model_name);
                 finished = true;
-                return calls_chunk(&mut calls);
+                return calls_chunk(&mut thinking, &mut calls);
             }
             let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
             for call in chunk.pointer("/choices/0/delta/tool_calls").and_then(Value::as_array).into_iter().flatten() {
@@ -687,7 +706,11 @@ impl BaseLLM for CloudLLM {
                 Ok(Some(text)) => {
                     answered += text.chars().count();
                     timing.chunk();
-                    return Some(GenerationChunk { text });
+                    let visible = thinking.feed(&text);
+                    if visible.is_empty() {
+                        continue;
+                    }
+                    return Some(GenerationChunk { text: visible });
                 }
                 Ok(None) => continue,
                 Err(message) => std::panic::panic_any(message),
