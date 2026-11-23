@@ -136,6 +136,53 @@ async fn test_streams_the_answer_from_the_provider() {
 
 #[tokio::test]
 #[serial]
+async fn test_inline_think_block_never_reaches_the_stream() {
+    // MiniMax streams its reasoning inside `content`, split anywhere.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(sse(&[
+                delta("<thi"),
+                delta("nk>The user said hi"),
+                delta(", greet back.</th"),
+                delta("ink>\n\nHel"),
+                delta("lo"),
+            ])),
+        )
+        .mount(&server)
+        .await;
+    let (llm, _env) = llm(&server, Some(bearer("t"))).await;
+
+    assert_eq!(drain(Arc::new(llm)).await.unwrap().trim(), "Hello");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_inline_think_block_is_stripped_from_a_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "<think>plan it</think>\n\nHello!"}}],
+        })))
+        .mount(&server)
+        .await;
+    let (llm, _env) = llm(&server, Some(bearer("t"))).await;
+    let llm = Arc::new(llm);
+
+    let answer = tokio::task::spawn_blocking(move || {
+        llm.call(PROMPT, None, CallOptions { max_tokens: Some(64), thinking: None })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(answer.trim(), "Hello!");
+}
+
+#[tokio::test]
+#[serial]
 async fn test_call_returns_the_whole_answer() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
