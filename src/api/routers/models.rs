@@ -498,6 +498,12 @@ pub struct ModelEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub context_length: Option<u32>,
+    /// The window this machine runs a downloaded local model with, which can
+    /// be narrower than `context_length`: what fits in memory alongside the
+    /// other models.  What a client sizes its prompts to.  `None` for a
+    /// cloud model or when unknown.
+    #[serde(default)]
+    pub n_ctx: Option<u32>,
     /// Parameter count in billions, local or remote; `None` when unknown.
     #[serde(default)]
     pub param_size_b: Option<f64>,
@@ -686,6 +692,13 @@ pub fn list_models_with(
                 entry.capabilities = display_capabilities(&ws_model.effective_capabilities());
                 entry.capabilities_overridden = ws_model.capabilities_override.is_some();
                 entry.thinking = ws.effective_model_thinking(&entry.name, project);
+                if entry.local && entry.kind != ModelKind::Remote && ws.effective_model_downloaded(&entry.name) {
+                    entry.n_ctx = model_service.serving_ctx(
+                        &entry.name,
+                        &ws.model_dir_for(&ws_model.model_id),
+                        ws_model.context_length().or(entry.context_length),
+                    );
+                }
             }
             _ => {
                 if let Some(spec) = MODEL_SPECS.get(&entry.name) {

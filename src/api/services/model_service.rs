@@ -76,6 +76,32 @@ pub fn settings() -> &'static AppSettings {
     &SETTINGS
 }
 
+/// KV cache the fit check counts per 4096 tokens of window.
+const KV_GB_PER_4K: f64 = 0.5;
+/// Per-process overhead the fit check counts on top of the weights.
+const LOAD_OVERHEAD_GB: f64 = 0.7;
+
+/// The window for a model of `model_gb` declaring `context_length`, with
+/// `free_gb` of `total_gb` free and `reserve_gb` kept back: the widest
+/// multiple of 4096 that fits, no wider than the model declares nor than an
+/// auto-sized load is ever given, and never below `base_cap`.
+pub fn widened_ctx_cap(
+    base_cap: i64,
+    context_length: Option<u32>,
+    free_gb: f64,
+    total_gb: f64,
+    model_gb: f64,
+    reserve_gb: f64,
+) -> i64 {
+    let Some(declared) = context_length.filter(|n| *n > 0) else {
+        return base_cap;
+    };
+    let spare_gb = free_gb - reserve_gb - model_gb - LOAD_OVERHEAD_GB;
+    let fits = if spare_gb > 0.0 { (spare_gb / KV_GB_PER_4K).floor() as i64 * 4096 } else { 0 };
+    let ceiling = LlmFactory::auto_ctx_ceiling(total_gb) as i64;
+    fits.min(i64::from(declared)).min(ceiling).max(base_cap)
+}
+
 /// How to describe an `llm_large_n_ctx_cap` value in a log line.
 ///
 /// `0` is the sentinel for *no cap* — the factory auto-sizes the context from
@@ -2132,7 +2158,16 @@ impl ModelService {
             );
         }
         let thinking = self.thinking_for(&ws_model.model_name);
-        match self.load_llama(&gguf_path, &ws_model.model_name, cap, thinking) {
+        let n_ctx = self.large_ctx_cap(&gguf_path, cap, ws_model.context_length(), reserve_gb, &ws_model.model_name);
+        if n_ctx != cap {
+            tracing::info!(
+                target: LOG_TARGET,
+                "[capability-model] {} gets a {n_ctx}-token window (declares {:?}, floor {cap})",
+                ws_model.model_name,
+                ws_model.context_length()
+            );
+        }
+        match self.load_llama(&gguf_path, &ws_model.model_name, n_ctx, thinking) {
             Ok(llm) => {
                 self.set_cap_llm(&ws_model.model_name, Some(CachedLlm::Loaded(llm.clone())));
                 tracing::info!(
@@ -2476,8 +2511,8 @@ impl ModelService {
         // cache.  (Estimating it at the device bound instead over-counts and
         // rejects every capable model on a tight box.)
         let est_ctx = if cap > 0 { cap } else { 0 };
-        let kv_gb = 0.5 * (est_ctx as f64 / 4096.0);
-        let footprint_gb = model_gb + kv_gb + 0.7;
+        let kv_gb = Self::kv_gb(est_ctx as usize);
+        let footprint_gb = model_gb + kv_gb + LOAD_OVERHEAD_GB;
         if footprint_gb + reserve_gb > free_gb {
             // Only suggest the cap when there is a cap to lower.  Uncapped,
             // the KV cache is already estimated at zero and the window
@@ -2507,6 +2542,85 @@ impl ModelService {
         }
         *self.last_fit_shortfall.lock() = None;
         true
+    }
+
+    /// The context window to load a large or capability model with.
+    ///
+    /// `base_cap` (`llm_large_n_ctx_cap`) is a floor, not the window: a model
+    /// is given as much of its declared `context_length` as free memory holds
+    /// after its weights, the reserve and the KV caches the other resident
+    /// models already claimed (counted here, since an allocated but untouched
+    /// cache doesn't show as used memory yet; leaving it out is how two models
+    /// loaded back to back once each sized for the whole device).  A model
+    /// whose window isn't declared, or a device whose memory can't be read,
+    /// keeps `base_cap`; 0 (no cap) stays uncapped.
+    pub fn large_ctx_cap(
+        &self,
+        gguf_path: &str,
+        base_cap: i64,
+        context_length: Option<u32>,
+        reserve_gb: Option<f64>,
+        model_name: &str,
+    ) -> i64 {
+        if base_cap <= 0 {
+            return base_cap;
+        }
+        let Some((free_gb, total_gb)) = self.device_free_total_gb() else {
+            return base_cap;
+        };
+        let Ok(meta) = std::fs::metadata(gguf_path) else {
+            return base_cap;
+        };
+        let model_gb = meta.len() as f64 / 1024f64.powi(3);
+        let reserve_gb = reserve_gb.unwrap_or_else(|| AppSettings::new().llm_large_fit_reserve_gb);
+        let claimed_gb = Self::kv_gb(self.resident_ctx_tokens(model_name));
+        widened_ctx_cap(base_cap, context_length, free_gb - claimed_gb, total_gb, model_gb, reserve_gb)
+    }
+
+    /// Estimated KV-cache size of a `tokens` window, as the fit check counts it.
+    fn kv_gb(tokens: usize) -> f64 {
+        KV_GB_PER_4K * (tokens as f64 / 4096.0)
+    }
+
+    /// Context tokens held by the resident large and capability models other
+    /// than `model_name`.
+    fn resident_ctx_tokens(&self, model_name: &str) -> usize {
+        let canonical = canonical_model_name(model_name);
+        let mut tokens = 0;
+        if let (Some(llm), Some(name)) = (self.large_llm.read().clone(), self.large_model_name.read().clone()) {
+            if canonical_model_name(&name) != canonical {
+                tokens += llm.get_max_tokens();
+            }
+        }
+        for (name, slot) in self.cap_llms.lock().iter() {
+            if let CachedLlm::Loaded(llm) = slot {
+                let same_as_large = self.large_llm.read().as_ref().is_some_and(|large| Arc::ptr_eq(large, llm));
+                if canonical_model_name(name) != canonical && !same_as_large {
+                    tokens += llm.get_max_tokens();
+                }
+            }
+        }
+        tokens
+    }
+
+    /// The window a local model runs with on this machine: the resident
+    /// instance's when it's loaded, otherwise the one it would load with now.
+    /// `None` when that's unknown (not downloaded, or uncapped and sized by
+    /// the load itself).
+    pub fn serving_ctx(&self, model_name: &str, model_dir: &str, context_length: Option<u32>) -> Option<u32> {
+        let canonical = canonical_model_name(model_name);
+        if let (Some(llm), Some(name)) = (self.large_llm.read().clone(), self.large_model_name.read().clone()) {
+            if canonical_model_name(&name) == canonical {
+                return u32::try_from(llm.get_max_tokens()).ok().filter(|n| *n > 0);
+            }
+        }
+        if let Some(CachedLlm::Loaded(llm)) = self.cap_llm(model_name) {
+            return u32::try_from(llm.get_max_tokens()).ok().filter(|n| *n > 0);
+        }
+        let (gguf_path, _) = self.find_ggufs(model_dir);
+        let cap = self.large_ctx_cap(&gguf_path?, AppSettings::new().llm_large_n_ctx_cap, context_length, None, model_name);
+        let cap = u32::try_from(cap).ok().filter(|n| *n > 0)?;
+        Some(context_length.map_or(cap, |declared| cap.min(declared)))
     }
 
     /// Decide whether the vision CLIP/mmproj encoder must run on CPU.
@@ -2658,7 +2772,16 @@ impl ModelService {
                 gguf_path
             );
             let thinking = self.thinking_for(&largest.model_name);
-            let llm = self.load_llama(&gguf_path, &largest.model_name, cap, thinking)?;
+            let n_ctx = self.large_ctx_cap(&gguf_path, cap, largest.context_length(), None, &largest.model_name);
+            if n_ctx != cap {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    "[large-model] {} gets a {n_ctx}-token window (declares {:?}, floor {cap})",
+                    largest.model_name,
+                    largest.context_length()
+                );
+            }
+            let llm = self.load_llama(&gguf_path, &largest.model_name, n_ctx, thinking)?;
             *self.large_llm.write() = Some(llm);
             *self.large_model_name.write() = Some(largest.model_name.clone());
             tracing::info!(
