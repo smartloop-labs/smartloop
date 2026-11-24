@@ -4153,7 +4153,13 @@ impl ModelService {
                 return None;
             }
         };
-        (!text.is_empty()).then_some(text)
+        if text.is_empty() {
+            // The model layer turns a failed generation into empty text,
+            // having logged why; say which request it was.
+            tracing::warn!(target: LOG, "{what} came back empty");
+            return None;
+        }
+        Some(text)
     }
 
     /// Cache key for a set of images: a digest of their bytes, so the same
