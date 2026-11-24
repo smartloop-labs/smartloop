@@ -42,7 +42,7 @@ use crate::config::app_settings::AppSettings;
 use crate::constants::{display_model_name, resolve_current_date, OPENING_TOKENS, SYSTEM_PROMPT};
 use crate::db::embeddings;
 use crate::llms::base_llm::CancelEvent;
-use crate::llms::tool_calls::{parse_tool_calls, strip_tool_calls, with_tools_and_messages};
+use crate::llms::tool_calls::{call_markers, parse_tool_calls, strip_tool_calls, with_tools_and_messages};
 use crate::model_host::client::{ModelClient, ModelHostError, TextStream};
 use crate::tasks::IndexerTask;
 use crate::types::ANSWER_TIER;
@@ -939,14 +939,25 @@ pub fn split_tool_rounds(mut request: ChatCompletionRequest) -> (ChatCompletionR
 /// to any tool-call markup (`<tool_call>`, `<function=`), and short of a tail
 /// that may be the start of one.
 pub fn streamable_end(reply: &str) -> usize {
-    const MARKERS: [&str; 2] = ["<tool_call>", "<function="];
-    if let Some(at) = MARKERS.iter().filter_map(|m| reply.find(m)).min() {
+    if let Some(at) = call_markers().filter_map(|m| reply.find(m)).min() {
         return at;
     }
     match reply.rfind('<') {
-        Some(at) if MARKERS.iter().any(|m| m.starts_with(&reply[at..])) => at,
+        Some(at) if call_markers().any(|m| m.starts_with(&reply[at..])) => at,
         _ => reply.len(),
     }
+}
+
+/// What's left to send of a reply once it is complete, `shown` bytes of it
+/// already streamed, and the calls it wrote: the text after its calls, or the
+/// held-back tail when what looked like the start of a call wasn't one.
+pub fn held_back_tail(reply: &str, shown: usize) -> (String, Vec<Value>) {
+    let (text, calls) = reply_tool_calls(reply);
+    if calls.is_empty() {
+        return (reply[shown..].to_string(), calls);
+    }
+    let rest = if text.len() > shown && text.starts_with(&reply[..shown]) { text[shown..].to_string() } else { String::new() };
+    (rest, calls)
 }
 
 /// The prompt for a client-tools turn: the flattened turn (system prompt,
@@ -3441,11 +3452,12 @@ fn stream_chunks_inner(
                 }
                 match failure {
                     None => {
-                        let (text, calls) = reply_tool_calls(&reply);
                         // What the model said after its calls, if anything.
-                        if text.len() > shown && text.starts_with(&reply[..shown]) {
-                            yield chunk_frame(&stream_model, content_delta(text[shown..].to_string()), None);
+                        let (rest, calls) = held_back_tail(&reply, shown);
+                        if !rest.is_empty() {
+                            yield chunk_frame(&stream_model, content_delta(rest), None);
                         }
+                        let text = strip_tool_calls(&reply);
                         if calls.is_empty() {
                             yield chunk_frame(&stream_model, DeltaContent::default(), Some("stop"));
                             if let Some(session_id) = request.session_id.as_deref().filter(|s| !s.is_empty()) {
@@ -3536,6 +3548,11 @@ fn stream_chunks_inner(
         };
         // Silence budget for the producer thread — see stream_stall_timeout_s.
         let stall_timeout = AppSettings::new().stream_stall_timeout_s;
+        // A model not offered tools may still write a call in its own markup.
+        // That never shows: it is held back as it streams and, when the client
+        // runs tools, sent as `tool_calls` like any other turn's.
+        let mut streamed = String::new();
+        let mut shown = 0usize;
         loop {
             let item = if stall_timeout > 0.0 {
                 match tokio::time::timeout(
@@ -3612,10 +3629,20 @@ fn stream_chunks_inner(
                     if fin.parts.len() == PREP_SOURCES_AFTER_CHUNKS {
                         start_source_prep(&mut prepared_sources, &citations, &svc);
                     }
-                    yield chunk_frame(&stream_model, content_delta(text), None);
+                    streamed.push_str(&text);
+                    let safe = streamable_end(&streamed);
+                    if safe > shown {
+                        yield chunk_frame(&stream_model, content_delta(streamed[shown..safe].to_string()), None);
+                        shown = safe;
+                    }
                 }
             }
         }
+        let (rest, written_calls) = held_back_tail(&streamed, shown);
+        if !rest.is_empty() {
+            yield chunk_frame(&stream_model, content_delta(rest), None);
+        }
+        let written_calls = if client_tools.is_some() { written_calls } else { Vec::new() };
 
         drop(streaming);
 
@@ -3705,7 +3732,16 @@ fn stream_chunks_inner(
         yield status_event("streaming", "completed", "Response complete");
 
         // Final chunk with finish_reason (OpenAI-compatible raw data format)
-        yield chunk_frame(&stream_model, DeltaContent::default(), Some("stop"));
+        if written_calls.is_empty() {
+            yield chunk_frame(&stream_model, DeltaContent::default(), Some("stop"));
+        } else {
+            yield chunk_frame(
+                &stream_model,
+                DeltaContent { tool_calls: Some(written_calls), ..Default::default() },
+                None,
+            );
+            yield chunk_frame(&stream_model, DeltaContent::default(), Some("tool_calls"));
+        }
         yield "data: [DONE]\n\n".to_string();
     }
 }

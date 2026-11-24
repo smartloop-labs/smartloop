@@ -213,3 +213,39 @@ fn test_markup_and_a_tail_that_may_start_it_are_held_back() {
     assert_eq!(streamable_end("a < b"), 5, "a plain < is shown");
     assert_eq!(streamable_end("x<function=bash>"), 1);
 }
+
+/// A model answering without the tools that writes a call in its own markup
+/// anyway: the client gets it as `tool_calls`, never the markup.
+async fn written_call(reply: &'static str) -> Vec<Value> {
+    publish_models();
+    let svc = Arc::new(FakeChatService::with_stream(move |_, _| {
+        let pieces: Vec<_> = reply.chars().collect::<Vec<_>>().chunks(5).map(|c| Ok(chunk(&c.iter().collect::<String>()))).collect();
+        Box::new(pieces.into_iter())
+    }));
+    *svc.device.label.lock() = Some("ct-cloud".to_string());
+    *svc.device.native_tools.lock() = false;
+    run(first_turn(), &svc).await
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_gemma_call_written_without_tools_comes_back_as_tool_calls() {
+    let events = written_call("Let me look.\n<|tool_call>call:bash{command:<|\"|>git status<|\"|>}<tool_call|>").await;
+
+    assert_eq!(text(&events).trim(), "Let me look.");
+    let calls = tool_calls(&events);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "bash");
+    assert_eq!(calls[0]["function"]["arguments"], r#"{"command":"git status"}"#);
+    assert_eq!(finish(&events).as_deref(), Some("tool_calls"));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_text_that_only_looks_like_a_call_still_shows() {
+    let events = written_call("Use the <function= syntax.").await;
+
+    assert_eq!(text(&events), "Use the <function= syntax.");
+    assert!(tool_calls(&events).is_empty());
+    assert_eq!(finish(&events).as_deref(), Some("stop"));
+}
