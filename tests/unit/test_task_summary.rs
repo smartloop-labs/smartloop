@@ -23,6 +23,37 @@ fn finished_task() -> TaskSummaryRequest {
     }
 }
 
+/// The request as docent sends it: docent's tests hold the same file and
+/// check its request body against it, so a field renamed on either side
+/// fails a test rather than every summary.  Fields here default when
+/// missing, so the request is read back out too: a field this side doesn't
+/// know would otherwise be dropped without a word.
+const CONTRACT: &str = include_str!("../fixtures/task-summary-request.json");
+
+#[test]
+fn test_the_request_keeps_to_the_docent_contract() {
+    let request: TaskSummaryRequest = serde_json::from_str(CONTRACT).expect("the contract parses");
+    assert_eq!(
+        request,
+        TaskSummaryRequest {
+            project_id: Some("p1".to_string()),
+            request: "add a --verbose flag".to_string(),
+            reply: "Done.".to_string(),
+            files: vec![
+                TaskFile { path: "src/main.rs".to_string(), change: "updated".to_string(), added: 12, removed: 3 },
+                TaskFile { path: "src/cli.rs".to_string(), change: "created".to_string(), added: 40, removed: 0 },
+            ],
+            commands: vec![
+                TaskCommand { command: "cargo build".to_string(), exit_code: Some(0), output: "Finished".to_string() },
+                TaskCommand { command: "cargo run".to_string(), exit_code: None, output: String::new() },
+            ],
+            checks: vec![TaskCheck { command: "cargo test".to_string(), passed: true }],
+        }
+    );
+    let contract: serde_json::Value = serde_json::from_str(CONTRACT).unwrap();
+    assert_eq!(serde_json::to_value(&request).unwrap(), contract, "every field docent sends is read");
+}
+
 #[test]
 fn test_the_record_lists_what_the_task_did() {
     let record = task_record(&finished_task());
