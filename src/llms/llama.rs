@@ -1412,6 +1412,10 @@ fn chat_template_env(source: &str, transformers_compat: bool) -> anyhow::Result<
     env.add_function("raise_exception", |message: String| -> Result<String, minijinja::Error> {
         Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message))
     });
+    // Jinja2 doesn't treat None as iterable, but minijinja does; without
+    // this, `tools is iterable and tools | length > 0` (Qwen3-Coder) fails
+    // on `length` of none whenever a request carries no tools.
+    env.add_test("iterable", |value: minijinja::Value| !value.is_none() && value.try_iter().is_ok());
     env.add_function("strftime_now", |format: String| -> String { chrono::Local::now().format(&format).to_string() });
     env.add_template_owned("chat_template", source)?;
     Ok(env)
@@ -2317,6 +2321,16 @@ mod tests {
             .render(minijinja::context! { x => json!({"a": [1, 2], "b": {}}) })
             .unwrap();
         assert_eq!(out, "{\"a\": [1, 2], \"b\": {}}|{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": {}\n}|\"a<b\"");
+    }
+
+    #[test]
+    fn none_tools_are_not_iterable() {
+        let template = "{% if tools is iterable and tools | length > 0 %}tools{% else %}none{% endif %}|{{ messages is iterable }}|{{ 'ab' is iterable }}";
+        let f = Jinja2ChatFormatter::new(template, "", "", true, None).unwrap();
+        assert_eq!(f.render(&[], &Map::new()).unwrap(), "none|True|True");
+        let mut kwargs = Map::new();
+        kwargs.insert("tools".into(), json!([{"type": "function"}]));
+        assert_eq!(f.render(&[], &kwargs).unwrap(), "tools|True|True");
     }
 
     #[test]
