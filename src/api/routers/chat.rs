@@ -43,7 +43,6 @@ use crate::constants::{display_model_name, resolve_current_date, OPENING_TOKENS,
 use crate::db::embeddings;
 use crate::llms::base_llm::CancelEvent;
 use crate::llms::tool_calls::{parse_tool_calls, strip_tool_calls, with_tools_and_messages};
-use crate::model::spec::MODEL_SPECS;
 use crate::model_host::client::{ModelClient, ModelHostError, TextStream};
 use crate::tasks::IndexerTask;
 use crate::types::ANSWER_TIER;
@@ -873,28 +872,16 @@ fn chunk_frame(model: &str, delta: DeltaContent, finish_reason: Option<&str>) ->
     )
 }
 
-/// A local model this size or larger (billions of parameters, active ones
-/// for a mixture of experts) is offered the client's tools; a smaller one
-/// answers without them.  Small models handle a multi-round tool
-/// conversation poorly — looping, malformed calls — and do better with the
-/// client's text protocol (fenced commands).  Cloud models always qualify.
-pub const CLIENT_TOOLS_MIN_LOCAL_B: f64 = 20.0;
-
 /// How long a client-tools turn may stay quiet (the model thinking, or
 /// writing out a long call) before it says it is still waiting.
 pub const TOOL_TURN_STATUS_EVERY: Duration = Duration::from_secs(5);
 
 /// Whether the model answering for `capability` gets the client's tools: it
-/// calls functions natively, and is a cloud model or a local one of at least
-/// [`CLIENT_TOOLS_MIN_LOCAL_B`].
+/// calls functions natively (declares `tools` and its chat template renders
+/// them), whatever its size.  Any other model answers without them, and the
+/// client falls back to its text protocol (fenced commands).
 pub fn takes_client_tools(client: &dyn ModelClient, capability: Option<&str>) -> bool {
-    if !client.supports_native_tools(capability).unwrap_or(false) {
-        return false;
-    }
-    let label = client.model_label(capability).unwrap_or_default();
-    MODEL_SPECS
-        .get(&label)
-        .is_some_and(|spec| spec.is_remote() || spec.ranking_size_b() >= CLIENT_TOOLS_MIN_LOCAL_B)
+    client.supports_native_tools(capability).unwrap_or(false)
 }
 
 /// `request` without the client tool rounds that follow its last user

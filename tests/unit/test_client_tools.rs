@@ -1,7 +1,6 @@
 //! Client tools: a coding client (docent) sends its own `bash` with the turn
-//! and runs the calls itself.  Smartloop offers the tools only to a response
-//! model that uses them well (cloud, or local of at least
-//! `CLIENT_TOOLS_MIN_LOCAL_B`), streams back the calls it makes, and takes
+//! and runs the calls itself.  Smartloop offers the tools to any response
+//! model that calls functions natively, streams back the calls it makes, and takes
 //! the results on the same turn without re-planning it.
 
 use std::sync::Arc;
@@ -189,14 +188,11 @@ async fn test_a_tool_result_continues_the_turn_without_replanning() {
 
 #[tokio::test]
 #[serial]
-async fn test_a_small_local_model_answers_without_the_tools() {
+async fn test_a_small_local_model_that_calls_tools_is_offered_them() {
     let (svc, prompts) = service("ct-small", true, "unused");
-    let events = run(first_turn(), &svc).await;
+    run(first_turn(), &svc).await;
 
-    assert_eq!(text(&events), "plain");
-    assert!(tool_calls(&events).is_empty());
-    assert_eq!(finish(&events).as_deref(), Some("stop"));
-    assert!(prompts.lock().is_empty(), "no tools offered");
+    assert_eq!(prompts.lock().len(), 1, "tools offered to a 4B model that takes them");
 }
 
 #[tokio::test]
