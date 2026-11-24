@@ -271,6 +271,18 @@ impl Default for LlamaInstanceOptions {
 pub struct LlmFactory;
 
 impl LlmFactory {
+    /// Widest window an auto-sized Apple Silicon load is given on a machine
+    /// with `total_mem_gb` of unified memory, however much is free.
+    pub fn auto_ctx_ceiling(total_mem_gb: f64) -> usize {
+        if total_mem_gb >= 32.0 {
+            131072
+        } else if total_mem_gb >= 16.0 {
+            65536
+        } else {
+            32768
+        }
+    }
+
     /// Map a model's GGUF `general.architecture` to the vision chat handler
     /// that knows its image-token / prompt format.  Using the WRONG handler
     /// (or none) for a model crashes the native clip code, so an arch without
@@ -649,14 +661,7 @@ impl LlmFactory {
                     2.0
                 };
                 let estimated_ctx = ((available_for_kv / kv_per_8k) * 8192.0) as i64;
-                // Apple Silicon can handle larger contexts with unified memory.
-                let max_ctx: i64 = if total_mem_gb >= 32.0 {
-                    131072
-                } else if total_mem_gb >= 16.0 {
-                    65536
-                } else {
-                    32768
-                };
+                let max_ctx = Self::auto_ctx_ceiling(total_mem_gb) as i64;
                 n_ctx = estimated_ctx.min(max_ctx).max(4096) as usize;
             } else {
                 n_ctx = 4096;

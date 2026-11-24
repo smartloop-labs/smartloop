@@ -95,6 +95,11 @@ impl LlamaCpp {
     pub const CTX_OVERHEAD: usize = 64;
     /// Output tokens to keep free when a prompt has to be truncated to fit.
     pub const MIN_OUTPUT_RESERVE: usize = 512;
+    /// Output tokens to keep free when a reasoning call's prompt has to be
+    /// truncated: a `<think>` block plus the answer after it.  With only
+    /// [`Self::MIN_OUTPUT_RESERVE`] left, the reasoning used it all and the
+    /// reply came back empty.  Bounded to a quarter of the window.
+    pub const THINKING_OUTPUT_RESERVE: usize = 4096;
 
     /// Wrap a loaded model.
     pub fn new(model: Arc<dyn LlamaModel>, project_id: impl Into<String>, is_training: bool, model_name: Option<String>) -> Self {
@@ -165,7 +170,27 @@ impl LlamaCpp {
     /// usually last) are kept and the middle bulk (retrieved context / web
     /// results) dropped, with a marker so the model knows content was elided.
     pub fn fit_prompt(&self, prompt: &str) -> String {
-        match self.try_fit_prompt(prompt) {
+        self.fit_prompt_reserving(prompt, Self::MIN_OUTPUT_RESERVE)
+    }
+
+    /// [`Self::fit_prompt`] for a call that does or doesn't reason: one that
+    /// does keeps room for its `<think>` block as well as the answer.
+    pub fn fit_prompt_for(&self, prompt: &str, options: &CallOptions) -> String {
+        self.fit_prompt_reserving(prompt, self.output_reserve(options))
+    }
+
+    /// Output tokens a call keeps free when its prompt is cut to fit.
+    pub fn output_reserve(&self, options: &CallOptions) -> usize {
+        // The flag only takes effect on a model with a bound thinking switch.
+        let reasons = Self::requested_thinking(options) && self.model.state().thinking().is_some();
+        if !reasons {
+            return Self::MIN_OUTPUT_RESERVE;
+        }
+        Self::THINKING_OUTPUT_RESERVE.min(self.get_max_tokens() / 4).max(Self::MIN_OUTPUT_RESERVE)
+    }
+
+    fn fit_prompt_reserving(&self, prompt: &str, reserve: usize) -> String {
+        match self.try_fit_prompt(prompt, reserve) {
             Ok(fitted) => fitted,
             Err(e) => {
                 tracing::warn!(target: LOG_TARGET, "[llm] prompt-fit guard failed: {e}");
@@ -174,9 +199,9 @@ impl LlamaCpp {
         }
     }
 
-    fn try_fit_prompt(&self, prompt: &str) -> anyhow::Result<String> {
+    fn try_fit_prompt(&self, prompt: &str, reserve: usize) -> anyhow::Result<String> {
         let n_ctx = self.get_max_tokens() as i64;
-        let budget = n_ctx - Self::MIN_OUTPUT_RESERVE as i64 - Self::CTX_OVERHEAD as i64;
+        let budget = n_ctx - reserve as i64 - Self::CTX_OVERHEAD as i64;
         if budget <= 0 {
             return Ok(prompt.to_string());
         }
@@ -355,7 +380,7 @@ impl LlamaCpp {
         // A tool conversation is rendered by the template as it is; it is
         // never truncated, since a cut would break its JSON.
         let conversation = split_messages(prompt).filter(|_| tools.is_some());
-        let prompt = if conversation.is_some() { prompt.to_string() } else { self.fit_prompt(prompt) };
+        let prompt = if conversation.is_some() { prompt.to_string() } else { self.fit_prompt_for(prompt, &options) };
         let prompt_tokens = self.num_tokens(&prompt)?;
         tracing::info!(
             target: LOG_TARGET,
@@ -634,10 +659,10 @@ impl BaseLLM for LlamaCpp {
         let _guard = self.context_lock().lock();
         let mut items = Vec::with_capacity(prompts.len());
         for p in prompts {
-            let prompt = self.fit_prompt(&p.prompt);
+            let options = CallOptions { max_tokens: p.max_tokens, thinking: p.thinking };
+            let prompt = self.fit_prompt_for(&p.prompt, &options);
             let messages = self.create_messages_from_prompt(&prompt);
             let max_tokens = p.max_tokens.unwrap_or_else(|| self.get_available_tokens(&prompt));
-            let options = CallOptions { max_tokens: p.max_tokens, thinking: p.thinking };
             let (_, item) = capture_prompt(|| {
                 let _override = self.thinking_override(Some(Self::requested_thinking(&options)));
                 let _budget = self.thinking_for_budget(Some(max_tokens));
@@ -684,7 +709,7 @@ impl BaseLLM for LlamaCpp {
 
         // create_chat_completion with stream=true applies the model's chat
         // template.
-        let prompt = self.fit_prompt(prompt);
+        let prompt = self.fit_prompt_for(prompt, &options);
         let messages = self.create_messages_from_prompt(&prompt);
         let available_tokens = self.get_available_tokens(&prompt);
 

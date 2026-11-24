@@ -44,6 +44,7 @@ mod test_embedding_memory;
 mod test_explorer_token_refresh;
 mod test_feedback_project_scope;
 mod test_fit_guard_logging;
+mod test_large_model_context_window;
 mod test_generation_rate;
 mod test_history_search_query;
 mod test_indexer_is_project_work;
