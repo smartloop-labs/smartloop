@@ -1,0 +1,16 @@
+{
+  "project_id": "p1",
+  "request": "add a --verbose flag",
+  "reply": "Done.",
+  "files": [
+    { "path": "src/main.rs", "change": "updated", "added": 12, "removed": 3 },
+    { "path": "src/cli.rs", "change": "created", "added": 40, "removed": 0 }
+  ],
+  "commands": [
+    { "command": "cargo build", "exit_code": 0, "output": "Finished" },
+    { "command": "cargo run", "exit_code": null, "output": "" }
+  ],
+  "checks": [
+    { "command": "cargo test", "passed": true }
+  ]
+}
