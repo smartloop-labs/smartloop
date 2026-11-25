@@ -142,7 +142,7 @@ fn is_connection_error(exc: &(dyn StdError + 'static)) -> bool {
     }
     if let Some(e) = as_download_error(exc) {
         return match e {
-            DownloadError::Connection { .. } | DownloadError::StaleUrl(_) => true,
+            DownloadError::Connection { .. } | DownloadError::StaleUrl(_) | DownloadError::SourceChanged(_) => true,
             DownloadError::Io(io_err) => is_io_connection_error(io_err),
             DownloadError::Source(inner) => is_connection_error(inner.as_ref()),
             _ => false,
@@ -316,7 +316,9 @@ pub fn py_error_kind(err: &anyhow::Error) -> PyErrorKind {
         return match e {
             DownloadError::Value(_) => PyErrorKind::Value,
             DownloadError::Runtime { .. } => PyErrorKind::Runtime,
-            DownloadError::Connection { .. } | DownloadError::StaleUrl(_) => PyErrorKind::Connection,
+            DownloadError::Connection { .. } | DownloadError::StaleUrl(_) | DownloadError::SourceChanged(_) => {
+                PyErrorKind::Connection
+            }
             DownloadError::Io(io_err) => io_kind(io_err),
             DownloadError::Source(inner) => py_error_kind(inner),
             _ => PyErrorKind::Other,

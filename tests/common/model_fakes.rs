@@ -81,6 +81,7 @@ pub struct FakeResp {
     index: usize,
     on_chunk: Option<ChunkHook>,
     closed: Arc<AtomicBool>,
+    headers: Headers,
 }
 
 impl FakeResp {
@@ -94,7 +95,20 @@ impl FakeResp {
             index: 0,
             on_chunk: None,
             closed: Arc::new(AtomicBool::new(false)),
+            headers: Headers::new(),
         }
+    }
+
+    /// Replace the status code.
+    pub fn with_status(mut self, status_code: u16) -> Self {
+        self.status_code = status_code;
+        self
+    }
+
+    /// Add a response header.
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.insert(name.to_string(), value.to_string());
+        self
     }
 
     /// Fail with `exc` when chunk `raise_at` would be yielded.
@@ -156,6 +170,10 @@ impl StreamResponse for FakeResp {
             hook(index);
         }
         Ok(Some(chunk))
+    }
+
+    fn header(&self, name: &str) -> Option<String> {
+        smartloop::model::downloader::artifact_downloader::header_get(&self.headers, name).map(str::to_string)
     }
 }
 

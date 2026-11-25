@@ -241,7 +241,7 @@ mod test_the_chunked_path {
         let dest = tmp.path().join("w.part");
         std::fs::write(&dest, [0u8; 24]).unwrap();
 
-        let resp = FakeResp::cancelling(&[&[b'a'; 8], &[b'b'; 8], &[b'c'; 8]], &token, 1);
+        let resp = FakeResp::cancelling(&[&[b'a'; 8], &[b'b'; 8], &[b'c'; 8]], &token, 1).with_status(206);
         let dl = downloader(Some(token.clone()), Some(ScriptedHttp::new(vec![resp])));
 
         let counter = Mutex::new(0u64);

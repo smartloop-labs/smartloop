@@ -266,6 +266,119 @@ mod test_chunk_resume {
     }
 }
 
+/// A range response is used only when it is exactly the bytes asked for.
+mod test_range_responses_are_checked {
+    use super::*;
+    use smartloop::model::downloader::artifact_downloader::{SourceChanged, is_transient_error, parse_content_range};
+
+    fn preallocated(dir: &std::path::Path) -> std::path::PathBuf {
+        let dest = dir.join("big.bin");
+        std::fs::write(&dest, [0u8; 8]).unwrap();
+        dest
+    }
+
+    fn fetch(dest: &std::path::Path, responses: Vec<FakeResp>) -> (Arc<ScriptedHttp>, Result<(), DownloadError>) {
+        let http = ScriptedHttp::new(responses);
+        let dl = downloader(None, Some(Arc::clone(&http)));
+        let counter = Mutex::new(0u64);
+        let result = dl.download_chunk("http://x/file", dest, 0, 7, "big.bin", 8, &counter, None);
+        (http, result)
+    }
+
+    #[test]
+    fn test_a_whole_object_answer_is_rejected_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let (http, result) = fetch(&dest, vec![FakeResp::new(200, &[b"ABCDEFGH"])]);
+        let err = result.unwrap_err();
+        assert!(matches!(err, DownloadError::SourceChanged(SourceChanged(_))));
+        assert!(is_transient_error(&err));
+        assert_eq!(http.calls(), 1, "not retried in place");
+        assert_eq!(std::fs::read(&dest).unwrap(), [0u8; 8]);
+    }
+
+    #[test]
+    fn test_a_content_range_for_other_bytes_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let resp = FakeResp::new(206, &[b"ABCDEFGH"]).with_header("Content-Range", "bytes 8-15/16");
+        let (_http, result) = fetch(&dest, vec![resp]);
+        assert!(matches!(result.unwrap_err(), DownloadError::SourceChanged(_)));
+        assert_eq!(std::fs::read(&dest).unwrap(), [0u8; 8]);
+    }
+
+    #[test]
+    fn test_a_content_range_for_a_different_size_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let resp = FakeResp::new(206, &[b"ABCDEFGH"]).with_header("Content-Range", "bytes 0-7/9");
+        let (_http, result) = fetch(&dest, vec![resp]);
+        assert!(matches!(result.unwrap_err(), DownloadError::SourceChanged(_)));
+    }
+
+    #[test]
+    fn test_a_matching_content_range_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let resp = FakeResp::new(206, &[b"ABCDEFGH"]).with_header("content-range", "bytes 0-7/8");
+        let (_http, result) = fetch(&dest, vec![resp]);
+        result.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ABCDEFGH");
+    }
+
+    #[test]
+    fn test_a_short_body_resumes_where_it_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let (http, result) =
+            fetch(&dest, vec![FakeResp::new(206, &[b"ABCD"]), FakeResp::new(206, &[b"EFGH"])]);
+        result.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ABCDEFGH");
+        let calls = http.header_calls.lock();
+        assert_eq!(calls[1], range_header("bytes=4-7"));
+    }
+
+    #[test]
+    fn test_a_short_body_that_never_completes_fails_retryably() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let short: Vec<FakeResp> = (0..MAX_DOWNLOAD_ATTEMPTS).map(|_| FakeResp::new(206, &[])).collect();
+        let (_http, result) = fetch(&dest, short);
+        assert!(is_retryable_error(&result.unwrap_err()));
+    }
+
+    #[test]
+    fn test_bytes_past_the_range_are_not_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("big.bin");
+        std::fs::write(&dest, [0u8; 12]).unwrap();
+        let http = ScriptedHttp::new(vec![FakeResp::new(206, &[b"ABCDEFGHIJKL"])]);
+        let dl = downloader(None, Some(http));
+        let counter = Mutex::new(0u64);
+        dl.download_chunk("http://x/file", &dest, 0, 7, "big.bin", 12, &counter, None).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ABCDEFGH\0\0\0\0");
+    }
+
+    #[test]
+    fn test_a_simple_download_that_ends_short_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
+        let http = ScriptedHttp::new(vec![FakeResp::new(200, &[b"ABCD"]), FakeResp::new(206, &[b"EFGH"])]);
+        let dl = downloader(None, Some(Arc::clone(&http)));
+        dl.download_file_simple("file.bin", "http://x/file", &dest, 8, None, true).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ABCDEFGH");
+        assert_eq!(http.header_calls.lock()[1], range_header("bytes=4-"));
+    }
+
+    #[test]
+    fn test_content_range_parsing() {
+        assert_eq!(parse_content_range("bytes 0-7/8"), Some((0, 7, Some(8))));
+        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, 9, None)));
+        assert_eq!(parse_content_range("bytes */8"), None);
+        assert_eq!(parse_content_range("bytes 9-5/10"), None);
+    }
+}
+
 // ------------------- MD5 verification + atomic (.part) publish, via download_file
 
 /// `TestVerifyAndAtomicPublish`

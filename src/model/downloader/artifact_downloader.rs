@@ -242,6 +242,14 @@ impl HttpError {
     }
 }
 
+/// The server answered a Range request with something other than that range:
+/// a 200 with the whole object, or a `Content-Range` for different bytes.  The
+/// object changed, or the server does not honour Range, so bytes already on
+/// disk cannot be joined with the response.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct SourceChanged(pub String);
+
 /// A signed URL was rejected mid-transfer, so a fresh one may well work.
 ///
 /// A connection-class error (not a permission error) because that is the
@@ -272,6 +280,9 @@ pub enum DownloadError {
     /// A stale signed URL (`StaleDownloadURLError`, a `ConnectionError`).
     #[error(transparent)]
     StaleUrl(#[from] StaleDownloadURLError),
+    /// The response did not match the requested range (see [`SourceChanged`]).
+    #[error(transparent)]
+    SourceChanged(#[from] SourceChanged),
     /// A classified transient failure (`ConnectionError`).
     #[error("{message}")]
     Connection {
@@ -355,7 +366,7 @@ impl DownloadError {
     /// `ConnectionError`s.
     pub fn is_connection_error(&self) -> bool {
         match self {
-            DownloadError::Connection { .. } | DownloadError::StaleUrl(_) => true,
+            DownloadError::Connection { .. } | DownloadError::StaleUrl(_) | DownloadError::SourceChanged(_) => true,
             DownloadError::Io(err) => is_connection_io(err),
             DownloadError::Source(err) => err.chain().any(|cause| {
                 cause.downcast_ref::<PlatformError>().is_some_and(PlatformError::is_connection)
@@ -541,6 +552,10 @@ pub fn is_transient_error(exc: &DownloadError) -> bool {
     if is_retryable_error(exc) {
         return true;
     }
+    if matches!(exc, DownloadError::SourceChanged(_)) {
+        // Fetching the file again from the start works.
+        return true;
+    }
     if let DownloadError::Http(HttpError::Status { status_code, .. }) = exc {
         return STALE_URL_STATUS.contains(status_code);
     }
@@ -626,6 +641,59 @@ pub trait StreamResponse: Send {
     fn raise_for_status(&self) -> Result<(), HttpError>;
     /// Next body chunk of up to `chunk_size` bytes; `Ok(None)` at end of body.
     fn next_chunk(&mut self, chunk_size: usize) -> Result<Option<Vec<u8>>, HttpError>;
+    /// A response header, looked up case-insensitively.
+    fn header(&self, _name: &str) -> Option<String> {
+        None
+    }
+}
+
+/// `Content-Range: bytes <first>-<last>/<total>` as `(first, last, total)`;
+/// `total` is `None` for `*`.
+pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (span, total) = rest.split_once('/')?;
+    let (first, last) = span.trim().split_once('-')?;
+    let first = first.trim().parse().ok()?;
+    let last = last.trim().parse().ok()?;
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse().ok()?),
+    };
+    (first <= last).then_some((first, last, total))
+}
+
+/// Check that a response to `Range: bytes=<start>-<end>` carries exactly that
+/// range of a `total_size`-byte object.
+fn check_range_response(resp: &dyn StreamResponse, start: u64, end: u64, total_size: u64) -> DownloadResult<()> {
+    if resp.status_code() != 206 {
+        return Err(SourceChanged(format!(
+            "asked for bytes {start}-{end} and got status {} instead of 206",
+            resp.status_code()
+        ))
+        .into());
+    }
+    if let Some(value) = resp.header("Content-Range") {
+        let matches = parse_content_range(&value).is_some_and(|(first, last, total)| {
+            first == start && last == end && total.is_none_or(|t| total_size == 0 || t == total_size)
+        });
+        if !matches {
+            return Err(SourceChanged(format!(
+                "asked for bytes {start}-{end} of {total_size} and got Content-Range '{value}'"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// A body that ended before the bytes it promised.  Retryable: the next
+/// attempt resumes from what arrived.
+fn short_body(what: &str, got: u64, expected: u64) -> DownloadError {
+    HttpError::transport(
+        TransportErrorKind::RemoteProtocol,
+        format!("{what}: body ended after {got} of {expected} bytes"),
+    )
+    .into()
 }
 
 /// The HTTP operations the downloader performs — a seam so tests can script
@@ -716,6 +784,10 @@ impl StreamResponse for ReqwestStream {
         }
         buf.truncate(filled);
         Ok(Some(buf))
+    }
+
+    fn header(&self, name: &str) -> Option<String> {
+        self.response.headers().get(name).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
     }
 }
 
@@ -1320,6 +1392,12 @@ impl SLPArtifactDownloader {
                     callback(DownloadProgress::new(flat_name, downloaded, size, "downloading"));
                 }
             }
+            if size > 0 && downloaded < size {
+                return Err(short_body(flat_name, downloaded, size));
+            }
+            if size > 0 && downloaded > size {
+                return Err(SourceChanged(format!("{flat_name}: got {downloaded} bytes, expected {size}")).into());
+            }
             Ok(())
         };
 
@@ -1364,10 +1442,14 @@ impl SLPArtifactDownloader {
                 return Err(StaleDownloadURLError(UNAUTHORIZED_MSG.to_string()).into());
             }
             resp.raise_for_status()?;
+            check_range_response(resp.as_ref(), cur_start, end, total_size)?;
             let mut file = OpenOptions::new().read(true).write(true).open(dest)?;
             file.seek(SeekFrom::Start(cur_start))?;
-            while let Some(chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
+            while let Some(mut chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
                 self.cancel_token().check(flat_name)?;
+                // Never write past the range, whatever the server sends.
+                let room = end + 1 - (start + written);
+                chunk.truncate(usize::try_from(room).unwrap_or(usize::MAX));
                 file.write_all(&chunk)?;
                 written += chunk.len() as u64;
                 if let Some(callback) = &progress_callback {
@@ -1378,6 +1460,12 @@ impl SLPArtifactDownloader {
                     };
                     callback(DownloadProgress::new(flat_name, current, total_size, "downloading"));
                 }
+                if start + written > end {
+                    break;
+                }
+            }
+            if start + written <= end {
+                return Err(short_body(&format!("bytes {start}-{end} of {flat_name}"), written, end + 1 - start));
             }
             Ok(())
         };
