@@ -27,6 +27,7 @@ use crate::model::downloader::artifact_source::{
 };
 use crate::model::downloader::cancellation::{CancelToken, DownloadCancelled};
 use crate::model::downloader::inflight::downloading;
+use crate::model::downloader::resume::{IntervalSet, Journal, ResumeState};
 use crate::model::downloader::slp_downloader::{
     AggregateProgress, DownloadProgress, DownloadStubCall, ProgressCallback, SLPDownloader, SharedLogger,
     SharedWorkspace, download_stubs,
@@ -77,13 +78,22 @@ pub const SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 /// over `workers` connections: [`SEGMENT_SIZE`] each, smaller for a file
 /// that would otherwise give some connection nothing to do.
 pub fn segments(size: u64, workers: u64) -> Vec<(u64, u64)> {
-    let segment = SEGMENT_SIZE.min(size.div_ceil(workers.max(1))).max(1);
+    segments_of(&[(0, size)], workers)
+}
+
+/// [`segments`] over the half-open `gaps` still to fetch, sized by the bytes
+/// remaining in all of them together.
+pub fn segments_of(gaps: &[(u64, u64)], workers: u64) -> Vec<(u64, u64)> {
+    let remaining: u64 = gaps.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    let segment = SEGMENT_SIZE.min(remaining.div_ceil(workers.max(1))).max(1);
     let mut ranges = Vec::new();
-    let mut offset = 0u64;
-    while offset < size {
-        let end = (offset + segment - 1).min(size - 1);
-        ranges.push((offset, end));
-        offset = end + 1;
+    for &(start, end) in gaps {
+        let mut offset = start;
+        while offset < end {
+            let last = (offset + segment - 1).min(end - 1);
+            ranges.push((offset, last));
+            offset = last + 1;
+        }
     }
     ranges
 }
@@ -648,6 +658,11 @@ pub struct RemoteFileInfo {
 }
 
 impl RemoteFileInfo {
+    /// A Range-capable file of `size` bytes with no digest or validators.
+    pub fn sized(size: u64) -> Self {
+        Self { size, accept_ranges: true, ..Self::default() }
+    }
+
     /// Read the validators, digest and Range support from probe headers,
     /// with `content_length` as the size.
     fn from_headers(headers: &Headers, content_length: Option<&str>) -> DownloadResult<Self> {
@@ -939,6 +954,7 @@ pub struct SLPArtifactDownloader {
     makedirs_hook: Mutex<Option<MakedirsHook>>,
     download_chunk_hook: Mutex<Option<DownloadChunkHook>>,
     chunk_workers_override: Mutex<Option<usize>>,
+    chunked_threshold_override: Mutex<Option<u64>>,
 }
 
 impl SLPArtifactDownloader {
@@ -967,6 +983,7 @@ impl SLPArtifactDownloader {
             makedirs_hook: Mutex::new(None),
             download_chunk_hook: Mutex::new(None),
             chunk_workers_override: Mutex::new(None),
+            chunked_threshold_override: Mutex::new(None),
         }
     }
 
@@ -987,6 +1004,7 @@ impl SLPArtifactDownloader {
             makedirs_hook: Mutex::new(None),
             download_chunk_hook: Mutex::new(None),
             chunk_workers_override: Mutex::new(None),
+            chunked_threshold_override: Mutex::new(None),
         }
     }
 
@@ -1042,6 +1060,11 @@ impl SLPArtifactDownloader {
     /// Tests only: override `CHUNK_WORKERS` (`None` restores the default).
     pub fn set_chunk_workers(&self, workers: Option<usize>) {
         *self.chunk_workers_override.lock() = workers;
+    }
+
+    /// Tests only: override `CHUNKED_THRESHOLD` (`None` restores the default).
+    pub fn set_chunked_threshold(&self, bytes: Option<u64>) {
+        *self.chunked_threshold_override.lock() = bytes;
     }
 
     /// The workspace's models directory (or the test override).
@@ -1198,9 +1221,7 @@ impl SLPArtifactDownloader {
         struct Pending {
             filename: String,
             url: String,
-            size: u64,
-            supports_range: bool,
-            remote_md5: Option<String>,
+            info: RemoteFileInfo,
         }
         let mut pending: Vec<Pending> = Vec::new();
         let mut skipped = 0usize;
@@ -1210,10 +1231,10 @@ impl SLPArtifactDownloader {
             let flat_name = basename(filename);
             let local_path = local_dir.join(flat_name);
             let info = self.get_remote_file_info(url)?;
-            let (size, remote_md5, accept_ranges) = (info.size, info.md5, info.accept_ranges);
+            let size = info.size;
 
             if local_path.is_file() {
-                if let Some(remote) = &remote_md5 {
+                if let Some(remote) = &info.md5 {
                     let local_md5 = Self::compute_local_md5(&local_path, None)?;
                     if &local_md5 == remote {
                         skipped += 1;
@@ -1225,13 +1246,7 @@ impl SLPArtifactDownloader {
                 }
             }
 
-            pending.push(Pending {
-                filename: filename.clone(),
-                url: url.clone(),
-                size,
-                supports_range: accept_ranges,
-                remote_md5,
-            });
+            pending.push(Pending { filename: filename.clone(), url: url.clone(), info });
         }
 
         if skipped > 0 {
@@ -1243,7 +1258,7 @@ impl SLPArtifactDownloader {
             return Ok(local_dir.to_path_buf());
         }
 
-        let total_bytes: u64 = pending.iter().map(|p| p.size).filter(|s| *s > 0).sum();
+        let total_bytes: u64 = pending.iter().map(|p| p.info.size).sum();
         let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
         self.logger.info(&format!("Downloading {} file(s), {total_mb:.1} MB total", pending.len()));
 
@@ -1253,21 +1268,12 @@ impl SLPArtifactDownloader {
         let aggregate_callback = aggregate.as_callback();
 
         let mut failed: Vec<(String, DownloadError)> = Vec::new();
-        let jobs: Vec<(usize, Pending)> = pending.into_iter().enumerate().collect();
         let raised = run_pool(
             max_workers(),
-            jobs,
-            |(position, p)| {
-                let result = self.download_file(
-                    &p.filename,
-                    &p.url,
-                    local_dir,
-                    p.size,
-                    position,
-                    Some(aggregate_callback.clone()),
-                    p.supports_range,
-                    p.remote_md5.as_deref(),
-                );
+            pending,
+            |p| {
+                let result =
+                    self.download_file(&p.filename, &p.url, local_dir, &p.info, Some(aggregate_callback.clone()));
                 (p.filename, result)
             },
             |(filename, result)| match result {
@@ -1311,24 +1317,22 @@ impl SLPArtifactDownloader {
     ///
     /// Bytes are written to a `.part` sidecar so the final path only ever
     /// appears once the download is complete (and MD5-verified, when the
-    /// server provides a digest).  A corrupt download — bytes that finished
-    /// without a network error but don't match the expected MD5 — is
-    /// re-downloaded from scratch up to [`MAX_VERIFY_ATTEMPTS`] times before
-    /// failing with `"<name>: MD5 verification failed after 3 attempts"`.
-    #[allow(clippy::too_many_arguments)]
+    /// server provides a digest).  A chunked download resumes from whatever
+    /// its `.part.state` journal says is already on disk.  A corrupt download
+    /// — bytes that finished without a network error but don't match the
+    /// expected MD5 — is re-downloaded from scratch up to
+    /// [`MAX_VERIFY_ATTEMPTS`] times before failing with
+    /// `"<name>: MD5 verification failed after 3 attempts"`.
     pub fn download_file(
         &self,
         filename: &str,
         url: &str,
         local_dir: &Path,
-        size: u64,
-        position: usize,
+        info: &RemoteFileInfo,
         progress_callback: Option<ProgressCallback>,
-        supports_range: bool,
-        remote_md5: Option<&str>,
     ) -> DownloadResult<String> {
-        let _ = position;
         let flat_name = basename(filename);
+        let size = info.size;
 
         // On entry, so a worker the pool starts after the flag was raised
         // exits before opening a socket.
@@ -1337,31 +1341,28 @@ impl SLPArtifactDownloader {
         let dest = local_dir.join(flat_name);
         let part = PathBuf::from(format!("{}.part", dest.display()));
         let size_mb = size as f64 / (1024.0 * 1024.0);
+        let threshold = self.chunked_threshold_override.lock().unwrap_or(CHUNKED_THRESHOLD);
+        let chunked = info.accept_ranges && size >= threshold;
 
         for verify_attempt in 1..=MAX_VERIFY_ATTEMPTS {
             self.cancel_token().check(flat_name)?;
-            // Start each verification attempt from a clean slate so we never
-            // resume onto bytes a previous corrupt attempt wrote.
-            if part.exists() {
-                std::fs::remove_file(&part)?;
+            // A failed verification restarts from nothing; only the first
+            // attempt may resume onto bytes already on disk.
+            if verify_attempt > 1 || !chunked {
+                discard_part(&part)?;
             }
 
-            if supports_range && size >= CHUNKED_THRESHOLD {
-                let workers = self.effective_chunk_workers();
-                let ranges = segments(size, workers as u64).len();
-                self.logger.info(&format!(
-                    "Downloading {flat_name} ({size_mb:.1} MB) over {workers} connections in {ranges} ranges"
-                ));
-                self.download_file_chunked(flat_name, url, &part, size, progress_callback.clone())?;
+            if chunked {
+                self.download_file_chunked(flat_name, url, &part, info, progress_callback.clone())?;
             } else {
-                let reason = if !supports_range { "no Range support" } else { "below threshold" };
+                let reason = if !info.accept_ranges { "no Range support" } else { "below threshold" };
                 self.logger.info(&format!("Downloading {flat_name} ({size_mb:.1} MB) single-stream ({reason})"));
-                self.download_file_simple(flat_name, url, &part, size, progress_callback.clone(), supports_range)?;
+                self.download_file_simple(flat_name, url, &part, size, progress_callback.clone(), info.accept_ranges)?;
             }
 
             // No server-provided digest → can't verify; the atomic rename
             // below still guarantees we never publish a truncated file.
-            let Some(expected) = remote_md5 else {
+            let Some(expected) = info.md5.as_deref() else {
                 break;
             };
 
@@ -1375,9 +1376,7 @@ impl SLPArtifactDownloader {
                  expected {expected}, got {local_md5}"
             ));
             if verify_attempt == MAX_VERIFY_ATTEMPTS {
-                if part.exists() {
-                    std::fs::remove_file(&part)?;
-                }
+                discard_part(&part)?;
                 return Err(DownloadError::runtime(
                     format!("{flat_name}: MD5 verification failed after {MAX_VERIFY_ATTEMPTS} attempts"),
                     None,
@@ -1387,6 +1386,7 @@ impl SLPArtifactDownloader {
 
         // Atomically publish: the final path appears only now, fully written.
         std::fs::rename(&part, &dest)?;
+        ResumeState::remove(&part)?;
 
         if let Some(callback) = &progress_callback {
             callback(DownloadProgress::new(flat_name, size, size, "completed"));
@@ -1483,6 +1483,21 @@ impl SLPArtifactDownloader {
         downloaded_counter: &Mutex<u64>,
         progress_callback: Option<ProgressCallback>,
     ) -> DownloadResult<()> {
+        let file = ChunkedFile {
+            url,
+            dest,
+            flat_name,
+            size: total_size,
+            counter: downloaded_counter,
+            progress: progress_callback,
+            journal: None,
+        };
+        self.fetch_range(&file, start, end)
+    }
+
+    /// One range of `file`, `start..=end`, with retries.
+    fn fetch_range(&self, file: &ChunkedFile<'_>, start: u64, end: u64) -> DownloadResult<()> {
+        let ChunkedFile { url, dest, flat_name, size: total_size, .. } = *file;
         let mut written = 0u64; // bytes of THIS chunk already flushed to disk
 
         // On entry, so a range the pool starts after the flag was raised exits
@@ -1503,18 +1518,23 @@ impl SLPArtifactDownloader {
             }
             resp.raise_for_status()?;
             check_range_response(resp.as_ref(), cur_start, end, total_size)?;
-            let mut file = OpenOptions::new().read(true).write(true).open(dest)?;
-            file.seek(SeekFrom::Start(cur_start))?;
+            let mut out = OpenOptions::new().read(true).write(true).open(dest)?;
+            out.seek(SeekFrom::Start(cur_start))?;
             while let Some(mut chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
                 self.cancel_token().check(flat_name)?;
                 // Never write past the range, whatever the server sends.
-                let room = end + 1 - (start + written);
+                let offset = start + written;
+                let room = end + 1 - offset;
                 chunk.truncate(usize::try_from(room).unwrap_or(usize::MAX));
-                file.write_all(&chunk)?;
+                out.write_all(&chunk)?;
                 written += chunk.len() as u64;
-                if let Some(callback) = &progress_callback {
+                if let Some(journal) = &file.journal {
+                    journal.record(offset, offset + chunk.len() as u64);
+                    journal.maybe_flush()?;
+                }
+                if let Some(callback) = &file.progress {
                     let current = {
-                        let mut counter = downloaded_counter.lock();
+                        let mut counter = file.counter.lock();
                         *counter += chunk.len() as u64;
                         *counter
                     };
@@ -1538,31 +1558,80 @@ impl SLPArtifactDownloader {
         self.chunk_workers_override.lock().unwrap_or_else(chunk_workers).max(1)
     }
 
-    /// Download a large file using parallel Range requests.
+    /// Download a large file using parallel Range requests into `dest`.
+    ///
+    /// Picks up from `dest`'s `.part.state` journal when it describes this
+    /// same object (size and validators) and `dest` is still the right
+    /// length; otherwise starts over on a freshly allocated file.  Progress
+    /// is journalled as it lands and flushed once more when the transfer
+    /// stops, so a failed or interrupted download resumes next time.
     pub fn download_file_chunked(
         &self,
         flat_name: &str,
         url: &str,
         dest: &Path,
-        size: u64,
+        info: &RemoteFileInfo,
         progress_callback: Option<ProgressCallback>,
     ) -> DownloadResult<()> {
-        // Pre-allocate the file.
-        {
-            let mut file = File::create(dest)?;
-            if size == 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
-            }
-            file.seek(SeekFrom::Start(size - 1))?;
-            file.write_all(&[0])?;
+        let size = info.size;
+        if size == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
         }
+        let fresh = ResumeState::new(size, info.etag.clone(), info.last_modified.clone());
+        let resumable = fresh.resumable();
+
+        let saved = ResumeState::load(dest).filter(|saved| {
+            resumable
+                && saved.same_object(size, info.etag.as_deref(), info.last_modified.as_deref())
+                && std::fs::metadata(dest).is_ok_and(|m| m.len() == size)
+        });
+        let done = match &saved {
+            Some(saved) => saved.done_set(),
+            None => {
+                ResumeState::remove(dest)?;
+                preallocate(dest, size)?;
+                IntervalSet::new()
+            }
+        };
+        let journal = resumable.then(|| {
+            let mut state = fresh;
+            state.set_done(&done);
+            Journal::new(dest, state)
+        });
 
         // Small ranges on a shared queue, so every connection stays busy to
         // the end (see SEGMENT_SIZE).
         let workers = self.effective_chunk_workers() as u64;
-        let chunks = segments(size, workers);
+        let chunks = segments_of(&done.missing(size), workers);
+        let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        if done.is_empty() {
+            self.logger.info(&format!(
+                "Downloading {flat_name} ({:.1} MB) over {workers} connections in {} ranges",
+                mb(size),
+                chunks.len()
+            ));
+        } else {
+            self.logger.info(&format!(
+                "Resuming {flat_name}: {:.1} of {:.1} MB already on disk, {} ranges left over {workers} connections",
+                mb(done.len_bytes()),
+                mb(size),
+                chunks.len()
+            ));
+        }
 
-        let downloaded_counter = Mutex::new(0u64); // shared across threads
+        let downloaded_counter = Mutex::new(done.len_bytes()); // shared across threads
+        if let (Some(callback), false) = (&progress_callback, done.is_empty()) {
+            callback(DownloadProgress::new(flat_name, done.len_bytes(), size, "downloading"));
+        }
+        let file = ChunkedFile {
+            url,
+            dest,
+            flat_name,
+            size,
+            counter: &downloaded_counter,
+            progress: progress_callback,
+            journal,
+        };
         let hook = self.download_chunk_hook.lock().clone();
         // Once a range has failed for good (its own retries spent), the
         // download fails: the ranges still queued are skipped, rather than
@@ -1578,16 +1647,7 @@ impl SLPArtifactDownloader {
                 }
                 let result = match &hook {
                     Some(hook) => hook(start, end),
-                    None => self.download_chunk(
-                        url,
-                        dest,
-                        start,
-                        end,
-                        flat_name,
-                        size,
-                        &downloaded_counter,
-                        progress_callback.clone(),
-                    ),
+                    None => self.fetch_range(&file, start, end),
                 };
                 if result.is_err() {
                     failed.store(true, Ordering::SeqCst);
@@ -1616,6 +1676,16 @@ impl SLPArtifactDownloader {
                 }
             },
         );
+
+        // A cancel discards the whole tree, so a final flush would only
+        // delay it; anything else keeps what arrived for the next attempt.
+        if let Some(journal) = &file.journal {
+            if !raised.as_ref().is_some_and(DownloadError::is_cancelled) {
+                if let Err(e) = journal.flush() {
+                    self.logger.warning(&format!("[resume] could not save progress of {flat_name}: {e}"));
+                }
+            }
+        }
         match raised {
             Some(err) => Err(err),
             None => Ok(()),
@@ -1833,6 +1903,33 @@ impl SLPArtifactDownloader {
 
         self.run_download_artifacts(&artifacts, &local_dir, progress_callback, "Model", &display_model_name(&model_name))
     }
+}
+
+/// What every range of one chunked file shares.
+struct ChunkedFile<'a> {
+    url: &'a str,
+    dest: &'a Path,
+    flat_name: &'a str,
+    size: u64,
+    counter: &'a Mutex<u64>,
+    progress: Option<ProgressCallback>,
+    journal: Option<Journal>,
+}
+
+/// Create `dest` as a `size`-byte file to write ranges into.
+fn preallocate(dest: &Path, size: u64) -> std::io::Result<()> {
+    let mut file = File::create(dest)?;
+    file.seek(SeekFrom::Start(size - 1))?;
+    file.write_all(&[0])
+}
+
+/// Remove a `.part` and its journal.
+fn discard_part(part: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(part) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    ResumeState::remove(part)
 }
 
 /// Whether Python's `int(s, 16)` accepts `s`: optional surrounding

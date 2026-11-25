@@ -16,6 +16,8 @@ use smartloop::model::downloader::artifact_downloader::{
 };
 use smartloop::model::downloader::slp_downloader::ProgressCallback;
 
+use smartloop::model::downloader::artifact_downloader::RemoteFileInfo;
+
 use crate::shared::model_fakes::{
     FakeResp, ScriptedHttp, connect_error, downloader, range_header, read_error, read_timeout, remote_protocol_error,
     status_error,
@@ -383,7 +385,7 @@ mod test_range_responses_are_checked {
 /// ranged GET when HEAD is refused.
 mod test_the_probe {
     use super::*;
-    use smartloop::model::downloader::artifact_downloader::{HeadResponse, Headers, RemoteFileInfo};
+    use smartloop::model::downloader::artifact_downloader::{HeadResponse, Headers};
 
     fn head_with(status_code: u16, pairs: &[(&str, &str)]) -> HeadResponse {
         let mut headers = Headers::new();
@@ -481,7 +483,8 @@ mod test_verify_and_atomic_publish {
         let dl = downloader(None, Some(Arc::clone(&http)));
         // size below CHUNKED_THRESHOLD + supports_range=false -> simple path,
         // one stream call per verification attempt.
-        let result = dl.download_file("model.gguf", "http://x/f", dir, 8, 0, None, false, remote_md5);
+        let info = RemoteFileInfo { size: 8, md5: remote_md5.map(str::to_string), ..RemoteFileInfo::default() };
+        let result = dl.download_file("model.gguf", "http://x/f", dir, &info, None);
         (http, result)
     }
 
@@ -555,7 +558,7 @@ mod test_chunked_failure_keeps_its_kind {
         let dl = downloader(None, None);
         dl.set_chunk_workers(Some(1));
         dl.set_download_chunk_hook(Some(Arc::new(move |_start, _end| Err(exc()))));
-        dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), 1024, None)
+        dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), &RemoteFileInfo::sized(1024), None)
             .unwrap_err()
     }
 
@@ -618,7 +621,7 @@ mod test_ranges_keep_every_connection_busy {
             Ok(())
         })));
         let size = 3 * SEGMENT_SIZE + 10;
-        dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), size, None).unwrap();
+        dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), &RemoteFileInfo::sized(size), None).unwrap();
         let mut seen = seen.lock().clone();
         seen.sort();
         assert_eq!(seen, segments(size, 3));
@@ -636,7 +639,7 @@ mod test_ranges_keep_every_connection_busy {
             Err(DownloadError::Value("corrupt".to_string()))
         })));
         let size = 10 * SEGMENT_SIZE;
-        assert!(dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), size, None).is_err());
+        assert!(dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), &RemoteFileInfo::sized(size), None).is_err());
         assert_eq!(*calls.lock(), 1, "the other nine ranges aren't fetched");
     }
 }

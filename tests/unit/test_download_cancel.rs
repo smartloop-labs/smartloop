@@ -274,7 +274,7 @@ mod test_the_chunked_path {
         let tmp = tempfile::tempdir().unwrap();
         let dl = downloader(Some(cancelled_token()), Some(ScriptedHttp::new(Vec::new())));
 
-        let err = dl.download_file_chunked("w.gguf", "https://x/f", &tmp.path().join("w.part"), 64, None).unwrap_err();
+        let err = dl.download_file_chunked("w.gguf", "https://x/f", &tmp.path().join("w.part"), &ad::RemoteFileInfo::sized(64), None).unwrap_err();
         assert!(matches!(err, DownloadError::Cancelled(_)));
     }
 }
@@ -283,13 +283,17 @@ mod test_the_chunked_path {
 mod test_the_file_level {
     use super::*;
 
+    fn simple_info(size: u64) -> ad::RemoteFileInfo {
+        ad::RemoteFileInfo { size, ..ad::RemoteFileInfo::default() }
+    }
+
     #[test]
     fn test_a_queued_file_never_opens_a_socket() {
         let tmp = tempfile::tempdir().unwrap();
         let stream = ScriptedHttp::new(Vec::new());
         let dl = downloader(Some(cancelled_token()), Some(Arc::clone(&stream)));
 
-        let err = dl.download_file("a/weights.gguf", "https://x/f", tmp.path(), 8, 0, None, false, None).unwrap_err();
+        let err = dl.download_file("a/weights.gguf", "https://x/f", tmp.path(), &simple_info(8), None).unwrap_err();
         assert!(err.is_cancelled());
         assert_eq!(stream.calls(), 0);
     }
@@ -301,7 +305,7 @@ mod test_the_file_level {
         let resp = FakeResp::cancelling(&[&[b'a'; 8], &[b'b'; 8]], &token, 1);
         let dl = downloader(Some(token.clone()), Some(ScriptedHttp::new(vec![resp])));
 
-        let err = dl.download_file("a/weights.gguf", "https://x/f", tmp.path(), 16, 0, None, false, None).unwrap_err();
+        let err = dl.download_file("a/weights.gguf", "https://x/f", tmp.path(), &simple_info(16), None).unwrap_err();
         assert!(err.is_cancelled());
 
         assert!(!tmp.path().join("weights.gguf").exists());

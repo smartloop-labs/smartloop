@@ -263,3 +263,86 @@ pub fn downloader(cancel: Option<CancelToken>, http: Option<Arc<ScriptedHttp>>) 
         None => dl,
     }
 }
+
+/// A server for one object that answers `Range` requests from its bytes, so
+/// tests can run concurrent ranges without scripting their order.
+pub struct RangeServer {
+    pub data: Vec<u8>,
+    pub etag: Mutex<String>,
+    /// Bytes at or past this offset are unreachable: a body stops just
+    /// before it and a request starting there fails to connect.
+    pub cut_at: Mutex<Option<u64>>,
+    /// Body chunk size.
+    pub piece: usize,
+    /// Every `Range` (and `If-Range`) asked for, in order.
+    pub requests: Mutex<Vec<(String, Option<String>)>>,
+}
+
+impl RangeServer {
+    /// Serve `data` with a strong ETag.
+    pub fn new(data: Vec<u8>) -> Arc<Self> {
+        Arc::new(RangeServer {
+            data,
+            etag: Mutex::new("\"v1\"".to_string()),
+            cut_at: Mutex::new(None),
+            piece: 4,
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The `Range` headers requested, in order.
+    pub fn ranges(&self) -> Vec<String> {
+        self.requests.lock().iter().map(|(r, _)| r.clone()).collect()
+    }
+
+    /// What a HEAD would report.
+    pub fn info(&self) -> smartloop::model::downloader::artifact_downloader::RemoteFileInfo {
+        smartloop::model::downloader::artifact_downloader::RemoteFileInfo {
+            size: self.data.len() as u64,
+            accept_ranges: true,
+            etag: Some(self.etag.lock().clone()),
+            ..Default::default()
+        }
+    }
+}
+
+impl DownloadHttp for RangeServer {
+    fn head(&self, _url: &str) -> Result<HeadResponse, HttpError> {
+        let mut headers = Headers::new();
+        headers.insert("content-length".to_string(), self.data.len().to_string());
+        headers.insert("accept-ranges".to_string(), "bytes".to_string());
+        headers.insert("etag".to_string(), self.etag.lock().clone());
+        Ok(HeadResponse { status_code: 200, headers })
+    }
+
+    fn stream(&self, _url: &str, headers: &Headers, _timeout: StreamTimeout) -> Result<Box<dyn StreamResponse>, HttpError> {
+        let range = headers.get("Range").cloned().unwrap_or_default();
+        let if_range = headers.get("If-Range").cloned();
+        self.requests.lock().push((range.clone(), if_range.clone()));
+        let total = self.data.len() as u64;
+        let etag = self.etag.lock().clone();
+        let (first, last) = range
+            .strip_prefix("bytes=")
+            .and_then(|r| r.split_once('-'))
+            .map(|(a, b)| (a.parse::<u64>().unwrap(), b.parse::<u64>().unwrap_or(total - 1)))
+            .unwrap_or((0, total - 1));
+        if if_range.as_ref().is_some_and(|v| *v != etag) || range.is_empty() {
+            let pieces: Vec<&[u8]> = self.data.chunks(self.piece).collect();
+            return Ok(Box::new(FakeResp::new(200, &pieces).with_header("ETag", &etag)));
+        }
+        let cut = *self.cut_at.lock();
+        if cut.is_some_and(|c| first >= c) {
+            return Err(connect_error("unreachable"));
+        }
+        let stop = cut.map_or(last, |c| last.min(c - 1));
+        let body = &self.data[first as usize..=stop as usize];
+        let pieces: Vec<&[u8]> = body.chunks(self.piece).collect();
+        let mut resp = FakeResp::new(206, &pieces)
+            .with_header("Content-Range", &format!("bytes {first}-{last}/{total}"))
+            .with_header("ETag", &etag);
+        if stop < last {
+            resp = resp.failing_at(pieces.len(), read_error("cut"));
+        }
+        Ok(Box::new(resp))
+    }
+}

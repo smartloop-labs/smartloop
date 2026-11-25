@@ -124,3 +124,166 @@ mod test_resume_state {
         assert!(!weak.same_object(100, Some("W/\"x\""), None));
     }
 }
+
+/// A chunked download keeps what it wrote and picks up from there.
+mod test_chunked_resume {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use md5::{Digest, Md5};
+    use smartloop::model::downloader::artifact_downloader::{RemoteFileInfo, SLPArtifactDownloader};
+
+    use super::*;
+    use crate::shared::model_fakes::{RangeServer, test_logger};
+
+    fn data(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn downloader(server: &Arc<RangeServer>, workers: usize) -> SLPArtifactDownloader {
+        let dl = SLPArtifactDownloader::for_tests(None, test_logger(), None).with_http(Arc::clone(server) as _);
+        dl.cancel_token().set_instant_wait(true);
+        dl.set_chunk_workers(Some(workers));
+        dl
+    }
+
+    fn fetch(server: &Arc<RangeServer>, part: &Path) -> Result<(), smartloop::model::downloader::artifact_downloader::DownloadError> {
+        downloader(server, 1).download_file_chunked("w.gguf", "https://x/w", part, &server.info(), None)
+    }
+
+    #[test]
+    fn test_a_failed_download_resumes_from_what_arrived() {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("w.gguf.part");
+        let server = RangeServer::new(data(40));
+        *server.cut_at.lock() = Some(24);
+
+        assert!(fetch(&server, &part).is_err());
+        let saved = ResumeState::load(&part).expect("progress was saved");
+        assert_eq!(saved.done, vec![[0, 24]]);
+
+        // A new downloader, as after a restart.
+        *server.cut_at.lock() = None;
+        server.requests.lock().clear();
+        fetch(&server, &part).unwrap();
+
+        assert_eq!(std::fs::read(&part).unwrap(), server.data);
+        assert_eq!(server.ranges(), vec!["bytes=24-39".to_string()]);
+    }
+
+    #[test]
+    fn test_a_changed_object_starts_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("w.gguf.part");
+        let server = RangeServer::new(data(40));
+        *server.cut_at.lock() = Some(24);
+        assert!(fetch(&server, &part).is_err());
+
+        *server.cut_at.lock() = None;
+        *server.etag.lock() = "\"v2\"".to_string();
+        server.requests.lock().clear();
+        fetch(&server, &part).unwrap();
+
+        assert_eq!(server.ranges(), vec!["bytes=0-39".to_string()]);
+        assert_eq!(std::fs::read(&part).unwrap(), server.data);
+    }
+
+    #[test]
+    fn test_a_part_of_the_wrong_length_starts_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("w.gguf.part");
+        let server = RangeServer::new(data(40));
+        *server.cut_at.lock() = Some(24);
+        assert!(fetch(&server, &part).is_err());
+
+        std::fs::OpenOptions::new().write(true).open(&part).unwrap().set_len(30).unwrap();
+        *server.cut_at.lock() = None;
+        server.requests.lock().clear();
+        fetch(&server, &part).unwrap();
+        assert_eq!(server.ranges(), vec!["bytes=0-39".to_string()]);
+    }
+
+    #[test]
+    fn test_an_object_without_validators_keeps_no_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("w.gguf.part");
+        let server = RangeServer::new(data(40));
+        *server.cut_at.lock() = Some(24);
+        let info = RemoteFileInfo { etag: None, ..server.info() };
+        assert!(downloader(&server, 1).download_file_chunked("w.gguf", "https://x/w", &part, &info, None).is_err());
+        assert!(!state_path(&part).exists());
+    }
+
+    #[test]
+    fn test_parallel_ranges_resume_only_the_gaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("w.gguf.part");
+        let server = RangeServer::new(data(64));
+        let mut state = ResumeState::new(64, Some("\"v1\"".to_string()), None);
+        state.set_done(&IntervalSet::from_spans([(0, 16), (32, 48)]));
+        std::fs::write(&part, {
+            let mut bytes = vec![0u8; 64];
+            bytes[0..16].copy_from_slice(&server.data[0..16]);
+            bytes[32..48].copy_from_slice(&server.data[32..48]);
+            bytes
+        })
+        .unwrap();
+        state.save(&part).unwrap();
+
+        downloader(&server, 4).download_file_chunked("w.gguf", "https://x/w", &part, &server.info(), None).unwrap();
+
+        assert_eq!(std::fs::read(&part).unwrap(), server.data);
+        let mut fetched: Vec<(u64, u64)> = server
+            .ranges()
+            .iter()
+            .map(|r| {
+                let (a, b) = r.strip_prefix("bytes=").unwrap().split_once('-').unwrap();
+                (a.parse().unwrap(), b.parse().unwrap())
+            })
+            .collect();
+        fetched.sort();
+        let covered = IntervalSet::from_spans(fetched.iter().map(|(a, b)| (*a, b + 1)));
+        assert_eq!(covered.spans(), vec![(16, 32), (48, 64)]);
+    }
+
+    fn publish(server: &Arc<RangeServer>, dir: &Path, md5: Option<String>) -> Result<String, smartloop::model::downloader::artifact_downloader::DownloadError> {
+        let dl = downloader(server, 2);
+        dl.set_chunked_threshold(Some(1));
+        let info = RemoteFileInfo { md5, ..server.info() };
+        dl.download_file("w.gguf", "https://x/w", dir, &info, None)
+    }
+
+    #[test]
+    fn test_a_published_file_leaves_no_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = RangeServer::new(data(40));
+        *server.cut_at.lock() = Some(24);
+        assert!(publish(&server, tmp.path(), None).is_err());
+        assert!(state_path(&tmp.path().join("w.gguf.part")).exists());
+
+        *server.cut_at.lock() = None;
+        publish(&server, tmp.path(), Some(hex::encode(Md5::digest(&server.data)))).unwrap();
+        assert_eq!(std::fs::read(tmp.path().join("w.gguf")).unwrap(), server.data);
+        assert!(!tmp.path().join("w.gguf.part").exists());
+        assert!(!state_path(&tmp.path().join("w.gguf.part")).exists());
+    }
+
+    #[test]
+    fn test_a_resumed_file_that_fails_verification_restarts_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("w.gguf.part");
+        let server = RangeServer::new(data(40));
+        // A journal claiming bytes the .part doesn't actually hold.
+        let mut state = ResumeState::new(40, Some("\"v1\"".to_string()), None);
+        state.set_done(&IntervalSet::from_spans([(0, 24)]));
+        std::fs::write(&part, vec![0xEE; 40]).unwrap();
+        state.save(&part).unwrap();
+
+        publish(&server, tmp.path(), Some(hex::encode(Md5::digest(&server.data)))).unwrap();
+
+        assert_eq!(std::fs::read(tmp.path().join("w.gguf")).unwrap(), server.data);
+        let ranges = server.ranges();
+        assert!(ranges.iter().all(|r| r.as_str() != "bytes=0-23"), "first pass fetched only the gap");
+        assert!(ranges.iter().any(|r| r.starts_with("bytes=0-")), "second pass started over");
+    }
+}

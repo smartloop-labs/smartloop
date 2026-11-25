@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// A set of byte offsets as merged half-open intervals `[start, end)`.
@@ -183,5 +185,79 @@ impl ResumeState {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
+    }
+}
+
+/// Persist the journal at least this often while bytes are arriving.
+pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// Persist the journal after at most this many unflushed bytes.
+pub const FLUSH_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Records which spans of a `.part` have been written and persists them to
+/// the sidecar.  A flush syncs the `.part` before saving, and saves only the
+/// spans recorded before that sync, so the sidecar never claims bytes that
+/// might not be on disk.
+pub struct Journal {
+    part: PathBuf,
+    state: Mutex<ResumeState>,
+    written: Mutex<IntervalSet>,
+    /// When the last flush ran and how many bytes it covered.
+    flushed: Mutex<(Instant, u64)>,
+}
+
+impl Journal {
+    /// A journal for `part`, starting from `state` (whose `done` spans are
+    /// already on disk).
+    pub fn new(part: &Path, state: ResumeState) -> Self {
+        let written = state.done_set();
+        let bytes = written.len_bytes();
+        Self {
+            part: part.to_path_buf(),
+            state: Mutex::new(state),
+            written: Mutex::new(written),
+            flushed: Mutex::new((Instant::now(), bytes)),
+        }
+    }
+
+    /// Note that `[start, end)` has been written to the `.part`.
+    pub fn record(&self, start: u64, end: u64) {
+        self.written.lock().insert(start, end);
+    }
+
+    /// The spans recorded so far.
+    pub fn written(&self) -> IntervalSet {
+        self.written.lock().clone()
+    }
+
+    /// Flush when [`FLUSH_INTERVAL`] has passed or [`FLUSH_BYTES`] are
+    /// unflushed.  Skipped while another thread is flushing.
+    pub fn maybe_flush(&self) -> std::io::Result<()> {
+        let Some(mut flushed) = self.flushed.try_lock() else {
+            return Ok(());
+        };
+        let bytes = self.written.lock().len_bytes();
+        if flushed.0.elapsed() < FLUSH_INTERVAL && bytes.saturating_sub(flushed.1) < FLUSH_BYTES {
+            return Ok(());
+        }
+        let synced = self.sync_and_save()?;
+        *flushed = (Instant::now(), synced);
+        Ok(())
+    }
+
+    /// Sync the `.part` and save every span recorded before the sync.
+    pub fn flush(&self) -> std::io::Result<()> {
+        let mut flushed = self.flushed.lock();
+        let synced = self.sync_and_save()?;
+        *flushed = (Instant::now(), synced);
+        Ok(())
+    }
+
+    fn sync_and_save(&self) -> std::io::Result<u64> {
+        let snapshot = self.written.lock().clone();
+        std::fs::OpenOptions::new().write(true).open(&self.part)?.sync_data()?;
+        let mut state = self.state.lock();
+        state.set_done(&snapshot);
+        state.save(&self.part)?;
+        Ok(snapshot.len_bytes())
     }
 }
