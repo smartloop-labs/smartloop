@@ -323,7 +323,7 @@ mod test_tail_splitting {
 /// `ConnectionTuner`
 mod test_tuner {
     use super::*;
-    use smartloop::model::downloader::ranges::{ConnectionTuner, MIN_CONNECTIONS, PROBE_WINDOW, TuneStep};
+    use smartloop::model::downloader::ranges::{ConnectionTuner, MIN_CONNECTIONS, PROBE_WINDOW, REGROW_AFTER, TuneStep};
 
     /// Drive a tuner from `start` connections through windows whose total
     /// rate is `rate_for(limit)`; returns the limit after each window.
@@ -379,14 +379,53 @@ mod test_tuner {
     }
 
     #[test]
-    fn test_throttling_backs_off_and_stops_growth() {
+    fn test_throttling_backs_off_and_pauses_growth() {
         let mut tuner = ConnectionTuner::new(Duration::ZERO, 0);
         let window = (100 * MB) * PROBE_WINDOW.as_secs();
         assert_eq!(tuner.step(PROBE_WINDOW, window, 8).map(|s| s.to), Some(10));
         tuner.note_throttled();
         assert_eq!(tuner.step(PROBE_WINDOW * 2, 2 * window, 10).map(|s| s.to), Some(8));
-        // Throughput rises again, but growth stays off.
+        // Throughput rises again, but growth stays off for now.
         assert_eq!(tuner.step(PROBE_WINDOW * 3, 4 * window, 8), None);
+    }
+
+    /// Step a tuner at a steady 100 MB/s through window `n` at `limit`.
+    fn steady(tuner: &mut ConnectionTuner, n: u32, limit: usize) -> Option<usize> {
+        let window = (100 * MB) * PROBE_WINDOW.as_secs();
+        tuner.step(PROBE_WINDOW * n, window * n as u64, limit).map(|s| s.to)
+    }
+
+    #[test]
+    fn test_it_probes_upward_again_after_quiet_windows() {
+        let mut tuner = ConnectionTuner::new(Duration::ZERO, 0);
+        assert_eq!(steady(&mut tuner, 1, 8), Some(10));
+        tuner.note_throttled();
+        assert_eq!(steady(&mut tuner, 2, 10), Some(8));
+        for n in 3..2 + REGROW_AFTER {
+            assert_eq!(steady(&mut tuner, n, 8), None, "window {n} still holds");
+        }
+        assert_eq!(steady(&mut tuner, 2 + REGROW_AFTER, 8), Some(10));
+    }
+
+    #[test]
+    fn test_another_push_back_restarts_the_quiet_count() {
+        let mut tuner = ConnectionTuner::new(Duration::ZERO, 0);
+        tuner.note_throttled();
+        assert_eq!(steady(&mut tuner, 1, 8), Some(6));
+        assert_eq!(steady(&mut tuner, 2, 6), None);
+        tuner.note_throttled();
+        assert_eq!(steady(&mut tuner, 3, 6), Some(4));
+        for n in 4..3 + REGROW_AFTER {
+            assert_eq!(steady(&mut tuner, n, 4), None, "window {n} still holds");
+        }
+        assert_eq!(steady(&mut tuner, 3 + REGROW_AFTER, 4), Some(6));
+    }
+
+    #[test]
+    fn test_a_plateau_is_not_reprobed() {
+        // Holding because a step bought nothing is not a back-off.
+        let seen = drive(4, 4 + REGROW_AFTER as usize * 2, fiber);
+        assert!(seen[4..].iter().all(|&limit| limit == 12), "{seen:?}");
     }
 
     #[test]

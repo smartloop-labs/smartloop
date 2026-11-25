@@ -426,6 +426,9 @@ pub const MIN_GAIN: f64 = 0.10;
 /// Below this many bytes per second per connection the link is split so
 /// thin that more connections only lengthen the tail.
 pub const CROWDED_RATE: f64 = 512.0 * 1024.0;
+/// Clean windows after a back-off before the tuner probes upward again: a
+/// blip early in a long download shouldn't cap it for the rest.
+pub const REGROW_AFTER: u32 = 3;
 
 /// What the tuner decided after a probe window.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -439,7 +442,8 @@ pub struct TuneStep {
 /// Moves a download's connection count toward what its link can use: grow
 /// while each step still raises total throughput, hold once it stops, shrink
 /// when the per-connection rate shows the link is crowded, and back off when
-/// the server pushes back.
+/// the server pushes back (probing upward again once it has been quiet for
+/// [`REGROW_AFTER`] windows).
 #[derive(Debug)]
 pub struct ConnectionTuner {
     window_started: Duration,
@@ -449,12 +453,14 @@ pub struct ConnectionTuner {
     growing: bool,
     throttled: bool,
     errors: u32,
+    /// Clean windows since the last back-off, while waiting to regrow.
+    since_backoff: Option<u32>,
 }
 
 impl ConnectionTuner {
     /// A tuner whose first window starts at `now` with `received` bytes in.
     pub fn new(now: Duration, received: u64) -> Self {
-        Self { window_started: now, received_at_start: received, last_rate: None, growing: true, throttled: false, errors: 0 }
+        Self { window_started: now, received_at_start: received, last_rate: None, growing: true, throttled: false, errors: 0, since_backoff: None }
     }
 
     /// The server answered 429 or 503.
@@ -482,6 +488,16 @@ impl ConnectionTuner {
         self.errors = 0;
 
         let fewer = limit.saturating_sub(TUNE_STEP).max(MIN_CONNECTIONS).min(limit);
+        if pushed_back {
+            self.since_backoff = Some(0);
+        } else if let Some(clean) = self.since_backoff.as_mut() {
+            *clean += 1;
+            if *clean >= REGROW_AFTER {
+                self.since_backoff = None;
+                self.growing = true;
+                self.last_rate = None;
+            }
+        }
         let to = if pushed_back || rate / (limit as f64) < CROWDED_RATE {
             self.growing = false;
             fewer
