@@ -29,8 +29,8 @@ use crate::model::downloader::artifact_source::{
 use crate::model::downloader::cancellation::{CancelToken, DownloadCancelled};
 use crate::model::downloader::inflight::downloading;
 use crate::model::downloader::ranges::{
-    Clock, ConnectionPermits, InFlight, MAX_CONNECTIONS, MIN_SPLIT, RangeCursor, TransferStats, starting_connections,
-    system_clock,
+    Clock, ConnectionPermits, InFlight, MAX_CONNECTIONS, MIN_SPLIT, RangeCursor, TransferStats, Tuning,
+    starting_connections, system_clock,
 };
 use crate::model::downloader::resume::{IntervalSet, Journal, ResumeState};
 use crate::model::downloader::slp_downloader::{
@@ -982,6 +982,7 @@ impl Drop for DownloadScope<'_> {
     fn drop(&mut self) {
         *self.0.permits.lock() = None;
         *self.0.stats.lock() = None;
+        *self.0.tuning.lock() = None;
     }
 }
 
@@ -1012,6 +1013,8 @@ pub struct SLPArtifactDownloader {
     stats: Mutex<Option<Arc<TransferStats>>>,
     clock_override: Mutex<Option<Clock>>,
     min_split_override: Mutex<Option<u64>>,
+    /// The tuner of the download in progress, unless the count is fixed.
+    tuning: Mutex<Option<Arc<Tuning>>>,
 }
 
 impl SLPArtifactDownloader {
@@ -1045,6 +1048,7 @@ impl SLPArtifactDownloader {
             stats: Mutex::new(None),
             clock_override: Mutex::new(None),
             min_split_override: Mutex::new(None),
+            tuning: Mutex::new(None),
         }
     }
 
@@ -1070,6 +1074,7 @@ impl SLPArtifactDownloader {
             stats: Mutex::new(None),
             clock_override: Mutex::new(None),
             min_split_override: Mutex::new(None),
+            tuning: Mutex::new(None),
         }
     }
 
@@ -1394,8 +1399,12 @@ impl SLPArtifactDownloader {
             .sum();
         let fixed = *self.connections_override.lock();
         let permits = ConnectionPermits::new(fixed.unwrap_or_else(|| starting_connections(remaining)));
+        let stats = TransferStats::new(self.clock());
         *self.permits.lock() = Some(Arc::clone(&permits));
-        *self.stats.lock() = Some(TransferStats::new(self.clock()));
+        *self.stats.lock() = Some(Arc::clone(&stats));
+        if fixed.is_none() {
+            *self.tuning.lock() = Some(Tuning::new(Arc::clone(&permits), stats));
+        }
         let _scope = DownloadScope(self);
         self.logger.info(&format!(
             "Downloading {} file(s), {total_mb:.1} MB total, {:.1} MB to fetch, starting with {} connection(s)",
@@ -1664,6 +1673,7 @@ impl SLPArtifactDownloader {
             journal: None,
             if_range: None,
             stats: self.transfer_stats(),
+            tuning: None,
         };
         self.fetch_range(&file, &RangeCursor::new(start, end))
     }
@@ -1680,7 +1690,7 @@ impl SLPArtifactDownloader {
         // CHUNKED_THRESHOLD, so this pool is where a cancel usually lands.
         self.cancel_token().check(flat_name)?;
 
-        let mut attempt = |_attempt_no: u32| -> DownloadResult<()> {
+        let attempt = |_attempt_no: u32| -> DownloadResult<()> {
             let (cur_start, end) = cursor.position();
             if cur_start > end {
                 return Ok(()); // chunk already fully written by a prior attempt
@@ -1730,6 +1740,14 @@ impl SLPArtifactDownloader {
                     };
                     callback(DownloadProgress::new(flat_name, current, total_size, "downloading"));
                 }
+                if let Some(step) = file.tuning.as_ref().and_then(|t| t.tick()) {
+                    self.logger.info(&format!(
+                        "[tune] {} -> {} connections ({:.1} MB/s)",
+                        step.from,
+                        step.to,
+                        step.rate / (1024.0 * 1024.0)
+                    ));
+                }
                 let (next, end) = cursor.position();
                 if next > end {
                     break;
@@ -1749,8 +1767,19 @@ impl SLPArtifactDownloader {
             Ok(())
         };
 
+        let mut reported = |n: u32| {
+            let result = attempt(n);
+            if let (Err(DownloadError::Http(e)), Some(tuning)) = (&result, &file.tuning) {
+                match e {
+                    HttpError::Status { status_code: 429 | 503, .. } => tuning.note_throttled(),
+                    HttpError::Transport { kind: TransportErrorKind::LowSpeed, .. } => {}
+                    _ => tuning.note_error(),
+                }
+            }
+            result
+        };
         let (_, end) = cursor.position();
-        self.run_with_retries_progress(&format!("chunk {}", label(end)), &|| cursor.claimed(), &mut attempt)
+        self.run_with_retries_progress(&format!("chunk {}", label(end)), &|| cursor.claimed(), &mut reported)
     }
 
     /// Download a large file using parallel Range requests into `dest`.
@@ -1829,6 +1858,7 @@ impl SLPArtifactDownloader {
             journal,
             if_range: if_range_validator(info),
             stats: self.transfer_stats(),
+            tuning: self.tuning.lock().clone(),
         };
         let hook = self.download_chunk_hook.lock().clone();
         // Once a range has failed for good (its own retries spent), the
@@ -2144,6 +2174,7 @@ struct ChunkedFile<'a> {
     /// bytes of the new version.
     if_range: Option<String>,
     stats: Arc<TransferStats>,
+    tuning: Option<Arc<Tuning>>,
 }
 
 /// The `If-Range` value for `info`: its strong ETag, else Last-Modified.

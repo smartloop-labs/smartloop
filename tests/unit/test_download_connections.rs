@@ -319,3 +319,89 @@ mod test_tail_splitting {
         );
     }
 }
+
+/// `ConnectionTuner`
+mod test_tuner {
+    use super::*;
+    use smartloop::model::downloader::ranges::{ConnectionTuner, MIN_CONNECTIONS, PROBE_WINDOW, TuneStep};
+
+    /// Drive a tuner from `start` connections through windows whose total
+    /// rate is `rate_for(limit)`; returns the limit after each window.
+    fn drive(start: usize, windows: usize, rate_for: impl Fn(usize) -> f64) -> Vec<usize> {
+        let mut tuner = ConnectionTuner::new(Duration::ZERO, 0);
+        let (mut now, mut received, mut limit) = (Duration::ZERO, 0u64, start);
+        let mut seen = Vec::new();
+        for _ in 0..windows {
+            now += PROBE_WINDOW;
+            received += (rate_for(limit) * PROBE_WINDOW.as_secs_f64()) as u64;
+            if let Some(TuneStep { to, .. }) = tuner.step(now, received, limit) {
+                limit = to;
+            }
+            seen.push(limit);
+        }
+        seen
+    }
+
+    /// Each connection adds 10 MB/s up to a 100 MB/s link.
+    fn fiber(limit: usize) -> f64 {
+        (limit as f64 * 10.0 * MB as f64).min(100.0 * MB as f64)
+    }
+
+    #[test]
+    fn test_it_grows_while_throughput_rises_then_holds() {
+        let seen = drive(4, 8, fiber);
+        assert_eq!(seen, vec![6, 8, 10, 12, 12, 12, 12, 12]);
+    }
+
+    #[test]
+    fn test_it_never_passes_the_maximum() {
+        let seen = drive(8, 10, |limit| limit as f64 * 10.0 * MB as f64);
+        assert_eq!(*seen.last().unwrap(), MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn test_a_thinly_split_link_shrinks_until_each_connection_has_room() {
+        // 2.5 MB/s total, a 20 Mbit line: 640 KB/s each at 4 is enough.
+        let seen = drive(8, 4, |_| 2.5 * MB as f64);
+        assert_eq!(seen, vec![6, 4, 4, 4]);
+    }
+
+    #[test]
+    fn test_a_very_slow_link_shrinks_to_the_minimum() {
+        let seen = drive(8, 4, |_| 1.0 * MB as f64);
+        assert_eq!(seen, vec![6, 4, MIN_CONNECTIONS, MIN_CONNECTIONS]);
+    }
+
+    #[test]
+    fn test_it_does_not_decide_before_the_window_is_up() {
+        let mut tuner = ConnectionTuner::new(Duration::ZERO, 0);
+        assert_eq!(tuner.step(PROBE_WINDOW / 2, 100 * MB, 4), None);
+    }
+
+    #[test]
+    fn test_throttling_backs_off_and_stops_growth() {
+        let mut tuner = ConnectionTuner::new(Duration::ZERO, 0);
+        let window = (100 * MB) * PROBE_WINDOW.as_secs();
+        assert_eq!(tuner.step(PROBE_WINDOW, window, 8).map(|s| s.to), Some(10));
+        tuner.note_throttled();
+        assert_eq!(tuner.step(PROBE_WINDOW * 2, 2 * window, 10).map(|s| s.to), Some(8));
+        // Throughput rises again, but growth stays off.
+        assert_eq!(tuner.step(PROBE_WINDOW * 3, 4 * window, 8), None);
+    }
+
+    #[test]
+    fn test_a_burst_of_errors_counts_as_push_back() {
+        let mut tuner = ConnectionTuner::new(Duration::ZERO, 0);
+        for _ in 0..4 {
+            tuner.note_error();
+        }
+        let window = (100 * MB) * PROBE_WINDOW.as_secs();
+        assert_eq!(tuner.step(PROBE_WINDOW, window, 8).map(|s| s.to), Some(6));
+    }
+
+    #[test]
+    fn test_a_single_connection_is_not_shrunk_up_to_the_minimum() {
+        let mut tuner = ConnectionTuner::new(Duration::ZERO, 0);
+        assert_eq!(tuner.step(PROBE_WINDOW, 1024, 1), None);
+    }
+}

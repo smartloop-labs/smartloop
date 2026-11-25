@@ -203,6 +203,7 @@ pub struct TransferStats {
     /// Rates of connections open long enough to be judged.
     judged: Mutex<HashMap<u64, f64>>,
     total: Mutex<RateWindow>,
+    received: AtomicU64,
 }
 
 impl TransferStats {
@@ -214,6 +215,7 @@ impl TransferStats {
             next_id: AtomicU64::new(0),
             judged: Mutex::new(HashMap::new()),
             total: Mutex::new(RateWindow::new(now)),
+            received: AtomicU64::new(0),
         })
     }
 
@@ -229,6 +231,11 @@ impl TransferStats {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             window: RateWindow::new(self.now()),
         }
+    }
+
+    /// Bytes received across every connection so far.
+    pub fn received(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
     }
 
     /// Bytes per second across every connection over [`RATE_WINDOW`].
@@ -262,6 +269,7 @@ impl ConnectionMeter {
         let now = self.stats.now();
         self.window.add(now, bytes);
         self.stats.total.lock().add(now, bytes);
+        self.stats.received.fetch_add(bytes, Ordering::Relaxed);
         if self.window.mature(now) {
             if let Some(rate) = self.window.rate(now) {
                 self.stats.judged.lock().insert(self.id, rate);
@@ -406,5 +414,118 @@ impl InFlight {
         };
         cursors.push(Arc::clone(&taken));
         Some(taken)
+    }
+}
+
+/// How long the tuner watches one connection count before deciding.
+pub const PROBE_WINDOW: Duration = Duration::from_secs(10);
+/// Connections added or removed per step.
+pub const TUNE_STEP: usize = 2;
+/// Growth the last step must have bought to keep growing.
+pub const MIN_GAIN: f64 = 0.10;
+/// Below this many bytes per second per connection the link is split so
+/// thin that more connections only lengthen the tail.
+pub const CROWDED_RATE: f64 = 512.0 * 1024.0;
+
+/// What the tuner decided after a probe window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TuneStep {
+    pub from: usize,
+    pub to: usize,
+    /// Total bytes per second over the window.
+    pub rate: f64,
+}
+
+/// Moves a download's connection count toward what its link can use: grow
+/// while each step still raises total throughput, hold once it stops, shrink
+/// when the per-connection rate shows the link is crowded, and back off when
+/// the server pushes back.
+#[derive(Debug)]
+pub struct ConnectionTuner {
+    window_started: Duration,
+    received_at_start: u64,
+    /// Total rate of the previous window, to judge the last step by.
+    last_rate: Option<f64>,
+    growing: bool,
+    throttled: bool,
+    errors: u32,
+}
+
+impl ConnectionTuner {
+    /// A tuner whose first window starts at `now` with `received` bytes in.
+    pub fn new(now: Duration, received: u64) -> Self {
+        Self { window_started: now, received_at_start: received, last_rate: None, growing: true, throttled: false, errors: 0 }
+    }
+
+    /// The server answered 429 or 503.
+    pub fn note_throttled(&mut self) {
+        self.throttled = true;
+    }
+
+    /// A connection failed (not counting deliberate low-speed drops).
+    pub fn note_error(&mut self) {
+        self.errors += 1;
+    }
+
+    /// Decide after a full [`PROBE_WINDOW`]: `Some` when the limit should
+    /// change from `limit`, `None` to keep it (or while the window runs).
+    pub fn step(&mut self, now: Duration, received: u64, limit: usize) -> Option<TuneStep> {
+        let elapsed = now.saturating_sub(self.window_started);
+        if elapsed < PROBE_WINDOW {
+            return None;
+        }
+        let rate = received.saturating_sub(self.received_at_start) as f64 / elapsed.as_secs_f64();
+        let pushed_back = self.throttled || self.errors as usize >= (limit / 2).max(2);
+        self.window_started = now;
+        self.received_at_start = received;
+        self.throttled = false;
+        self.errors = 0;
+
+        let fewer = limit.saturating_sub(TUNE_STEP).max(MIN_CONNECTIONS).min(limit);
+        let to = if pushed_back || rate / (limit as f64) < CROWDED_RATE {
+            self.growing = false;
+            fewer
+        } else if self.growing && self.last_rate.is_none_or(|last| rate >= last * (1.0 + MIN_GAIN)) {
+            (limit + TUNE_STEP).min(MAX_CONNECTIONS)
+        } else {
+            self.growing = false;
+            limit
+        };
+        self.last_rate = Some(rate);
+        (to != limit).then_some(TuneStep { from: limit, to, rate })
+    }
+}
+
+/// A download's shared pool with the tuner that sizes it.
+pub struct Tuning {
+    pub permits: Arc<ConnectionPermits>,
+    pub stats: Arc<TransferStats>,
+    tuner: Mutex<ConnectionTuner>,
+}
+
+impl Tuning {
+    /// Tune `permits` from `stats`, starting now.
+    pub fn new(permits: Arc<ConnectionPermits>, stats: Arc<TransferStats>) -> Arc<Self> {
+        let tuner = ConnectionTuner::new(stats.now(), stats.received());
+        Arc::new(Self { permits, stats, tuner: Mutex::new(tuner) })
+    }
+
+    /// Step the tuner if its window is up and nobody else is; returns the
+    /// change made, if any.
+    pub fn tick(&self) -> Option<TuneStep> {
+        let mut tuner = self.tuner.try_lock()?;
+        let step = tuner.step(self.stats.now(), self.stats.received(), self.permits.limit())?;
+        self.permits.set_limit(step.to);
+        Some(step)
+    }
+
+    /// The server answered 429 or 503.
+    pub fn note_throttled(&self) {
+        self.tuner.lock().note_throttled();
+    }
+
+    /// A connection failed.
+    pub fn note_error(&self) {
+        self.tuner.lock().note_error();
     }
 }
