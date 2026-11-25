@@ -3,6 +3,7 @@
 pub mod artifact_downloader;
 pub mod artifact_source;
 pub mod cancellation;
+pub mod digest;
 pub mod hf_downloader;
 pub mod inflight;
 pub mod ranges;

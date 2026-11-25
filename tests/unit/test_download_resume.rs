@@ -132,6 +132,7 @@ mod test_chunked_resume {
 
     use md5::{Digest, Md5};
     use smartloop::model::downloader::artifact_downloader::{RemoteFileInfo, SLPArtifactDownloader};
+    use smartloop::model::downloader::digest::RemoteDigest;
 
     use super::*;
     use crate::shared::model_fakes::{RangeServer, test_logger};
@@ -249,7 +250,7 @@ mod test_chunked_resume {
     fn publish(server: &Arc<RangeServer>, dir: &Path, md5: Option<String>) -> Result<String, smartloop::model::downloader::artifact_downloader::DownloadError> {
         let dl = downloader(server, 2);
         dl.set_chunked_threshold(Some(1));
-        let info = RemoteFileInfo { md5, ..server.info() };
+        let info = RemoteFileInfo { digest: md5.map(RemoteDigest::Md5), ..server.info() };
         dl.download_file("w.gguf", "https://x/w", dir, &info, None)
     }
 

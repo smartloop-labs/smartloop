@@ -27,6 +27,7 @@ use crate::model::downloader::artifact_source::{
     entry_name,
 };
 use crate::model::downloader::cancellation::{CancelToken, DownloadCancelled};
+use crate::model::downloader::digest::{self, RemoteDigest, Verdict};
 use crate::model::downloader::inflight::downloading;
 use crate::model::downloader::ranges::{
     Clock, ConnectionPermits, InFlight, MAX_CONNECTIONS, MIN_SPLIT, RangeCursor, TransferStats, Tuning,
@@ -651,8 +652,8 @@ pub struct HeadResponse {
 pub struct RemoteFileInfo {
     /// Size in bytes; 0 when the server did not say.
     pub size: u64,
-    /// Hex MD5 from a single-part ETag.
-    pub md5: Option<String>,
+    /// The digest the ETag publishes, single-part or multipart.
+    pub digest: Option<RemoteDigest>,
     /// The server honours `Range: bytes=…`.
     pub accept_ranges: bool,
     /// The raw `ETag`, quotes included.
@@ -679,7 +680,7 @@ impl RemoteFileInfo {
         };
         Ok(Self {
             size,
-            md5: SLPArtifactDownloader::parse_remote_md5(headers),
+            digest: header_get(headers, "ETag").and_then(RemoteDigest::from_etag),
             accept_ranges: header_get(headers, "Accept-Ranges").unwrap_or("").eq_ignore_ascii_case("bytes"),
             etag: header_get(headers, "ETag").map(str::to_string),
             last_modified: header_get(headers, "Last-Modified").map(str::to_string),
@@ -1406,14 +1407,16 @@ impl SLPArtifactDownloader {
             let info = self.get_remote_file_info(url)?;
             let size = info.size;
 
-            if local_path.is_file() {
-                if let Some(remote) = &info.md5 {
-                    let local_md5 = Self::compute_local_md5(&local_path, None)?;
-                    if &local_md5 == remote {
-                        skipped += 1;
-                        continue;
-                    }
-                } else if size > 0 && std::fs::metadata(&local_path)?.len() == size {
+            if local_path.is_file() && size > 0 && std::fs::metadata(&local_path)?.len() == size {
+                // Right size and, when the ETag allows it, the right digest.
+                let current = match &info.digest {
+                    Some(expected) => !matches!(
+                        digest::verify(&local_path, expected, Some(&self.cancel_token()))?,
+                        Verdict::Mismatch { .. }
+                    ),
+                    None => true,
+                };
+                if current {
                     skipped += 1;
                     continue;
                 }
@@ -1581,18 +1584,24 @@ impl SLPArtifactDownloader {
 
             // No server-provided digest → can't verify; the atomic rename
             // below still guarantees we never publish a truncated file.
-            let Some(expected) = info.md5.as_deref() else {
+            let Some(expected) = info.digest.as_ref() else {
                 break;
             };
 
-            let local_md5 = Self::compute_local_md5(&part, Some(&self.cancel_token()))?;
-            if local_md5 == expected {
-                break;
-            }
+            let got = match digest::verify(&part, expected, Some(&self.cancel_token()))? {
+                Verdict::Match => break,
+                Verdict::Unverifiable => {
+                    self.logger.warning(&format!(
+                        "[verify] {flat_name}: no part size reproduces the ETag {expected}; not verified"
+                    ));
+                    break;
+                }
+                Verdict::Mismatch { got } => got,
+            };
 
             self.logger.warning(&format!(
                 "[verify] {flat_name} MD5 mismatch (attempt {verify_attempt}/{MAX_VERIFY_ATTEMPTS}): \
-                 expected {expected}, got {local_md5}"
+                 expected {expected}, got {got}"
             ));
             if verify_attempt == MAX_VERIFY_ATTEMPTS {
                 discard_part(&part)?;

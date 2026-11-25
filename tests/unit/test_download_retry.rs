@@ -476,7 +476,10 @@ mod test_the_probe {
             info,
             RemoteFileInfo {
                 size: 18_556_688_288,
-                md5: None,
+                digest: Some(smartloop::model::downloader::digest::RemoteDigest::Multipart {
+                    md5: "0123456789abcdef0123456789abcdef".to_string(),
+                    parts: 2213,
+                }),
                 accept_ranges: true,
                 etag: Some("\"0123456789abcdef0123456789abcdef-2213\"".to_string()),
                 last_modified: Some("Tue, 24 Nov 2026 10:00:00 GMT".to_string()),
@@ -546,7 +549,11 @@ mod test_verify_and_atomic_publish {
         let dl = downloader(None, Some(Arc::clone(&http)));
         // size below CHUNKED_THRESHOLD + supports_range=false -> simple path,
         // one stream call per verification attempt.
-        let info = RemoteFileInfo { size: 8, md5: remote_md5.map(str::to_string), ..RemoteFileInfo::default() };
+        let info = RemoteFileInfo {
+            size: 8,
+            digest: remote_md5.map(|m| smartloop::model::downloader::digest::RemoteDigest::Md5(m.to_string())),
+            ..RemoteFileInfo::default()
+        };
         let result = dl.download_file("model.gguf", "http://x/f", dir, &info, None);
         (http, result)
     }
