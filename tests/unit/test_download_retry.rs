@@ -146,6 +146,69 @@ mod test_run_with_retries {
     }
 }
 
+/// A failure after real progress does not use up the retry budget.
+mod test_progress_resets_the_budget {
+    use super::*;
+    use smartloop::model::downloader::artifact_downloader::PROGRESS_RESETS_RETRIES;
+    use std::cell::Cell;
+
+    #[test]
+    fn test_a_transfer_that_keeps_moving_outlasts_the_attempt_count() {
+        let dl = downloader(None, None);
+        let moved = Cell::new(0u64);
+        let mut calls = 0u32;
+        let result = dl.run_with_retries_progress("op", &|| moved.get(), &mut |_| {
+            calls += 1;
+            moved.set(moved.get() + PROGRESS_RESETS_RETRIES);
+            if calls <= 3 * MAX_DOWNLOAD_ATTEMPTS {
+                return Err(read_error("drop").into());
+            }
+            Ok(())
+        });
+        result.unwrap();
+        assert_eq!(calls, 3 * MAX_DOWNLOAD_ATTEMPTS + 1);
+    }
+
+    #[test]
+    fn test_a_trickle_still_runs_out() {
+        let dl = downloader(None, None);
+        let moved = Cell::new(0u64);
+        let mut calls = 0u32;
+        let err = dl
+            .run_with_retries_progress::<()>("op", &|| moved.get(), &mut |_| {
+                calls += 1;
+                moved.set(moved.get() + PROGRESS_RESETS_RETRIES - 1);
+                Err(read_error("drop").into())
+            })
+            .unwrap_err();
+        assert!(is_retryable_error(&err));
+        assert_eq!(calls, MAX_DOWNLOAD_ATTEMPTS);
+    }
+
+    #[test]
+    fn test_a_range_that_drops_every_megabyte_still_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("big.bin");
+        let mb = PROGRESS_RESETS_RETRIES as usize;
+        let pieces = 2 * MAX_DOWNLOAD_ATTEMPTS as usize;
+        std::fs::write(&dest, vec![0u8; mb * pieces]).unwrap();
+        let block = vec![7u8; mb];
+        let responses: Vec<FakeResp> = (0..pieces)
+            .map(|i| {
+                let resp = FakeResp::new(206, &[&block, &block]);
+                if i + 1 < pieces { resp.failing_at(1, read_error("drop")) } else { resp }
+            })
+            .collect();
+        let http = ScriptedHttp::new(responses);
+        let dl = downloader(None, Some(Arc::clone(&http)));
+        let counter = Mutex::new(0u64);
+        let size = (mb * pieces) as u64;
+        dl.download_chunk("http://x/file", &dest, 0, size - 1, "big.bin", size, &counter, None).unwrap();
+        assert_eq!(http.calls(), pieces);
+        assert!(std::fs::read(&dest).unwrap().iter().all(|b| *b == 7));
+    }
+}
+
 // ------------------------------------------------- Simple (single-stream) download
 
 /// `TestSimpleResume`

@@ -6,6 +6,7 @@
 //! atomic `.part` → final publish.  Errors keep their *kind* (transient vs.
 //! permanent, disk-full, cancelled) so the API layer can choose a status.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -98,6 +99,9 @@ pub fn segments_of(gaps: &[(u64, u64)], workers: u64) -> Vec<(u64, u64)> {
 /// network blip — during an outage, connection attempts fail almost instantly,
 /// so it's the backoff, not the attempt count alone, that spans the gap.
 pub const MAX_DOWNLOAD_ATTEMPTS: u32 = 8;
+/// Bytes an attempt must move before its failure stops counting toward
+/// [`MAX_DOWNLOAD_ATTEMPTS`].
+pub const PROGRESS_RESETS_RETRIES: u64 = 1024 * 1024;
 /// Seconds; first backoff.
 pub const RETRY_BASE_DELAY: f64 = 1.0;
 /// Seconds; backoff cap.
@@ -1180,8 +1184,24 @@ impl SLPArtifactDownloader {
         description: &str,
         attempt_fn: &mut dyn FnMut(u32) -> DownloadResult<T>,
     ) -> DownloadResult<T> {
-        for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+        self.run_with_retries_progress(description, &|| 0, attempt_fn)
+    }
+
+    /// [`Self::run_with_retries`] for a transfer that reports its bytes
+    /// written through `progress`.  A failed attempt that moved at least
+    /// [`PROGRESS_RESETS_RETRIES`] bytes does not count toward
+    /// [`MAX_DOWNLOAD_ATTEMPTS`]: the budget is for a connection that cannot
+    /// make headway, not for a long transfer that drops now and then.
+    pub fn run_with_retries_progress<T>(
+        &self,
+        description: &str,
+        progress: &dyn Fn() -> u64,
+        attempt_fn: &mut dyn FnMut(u32) -> DownloadResult<T>,
+    ) -> DownloadResult<T> {
+        let mut failures = 0u32;
+        for attempt in 1u32.. {
             self.cancel_token().check(description)?;
+            let before = progress();
             let exc = match attempt_fn(attempt) {
                 Ok(value) => return Ok(value),
                 Err(exc) => exc,
@@ -1189,12 +1209,16 @@ impl SLPArtifactDownloader {
             if exc.is_permission_error() || exc.is_cancelled() {
                 return Err(exc);
             }
-            if !is_retryable_error(&exc) || attempt == MAX_DOWNLOAD_ATTEMPTS {
+            if progress().saturating_sub(before) >= PROGRESS_RESETS_RETRIES {
+                failures = 0;
+            }
+            failures += 1;
+            if !is_retryable_error(&exc) || failures >= MAX_DOWNLOAD_ATTEMPTS {
                 return Err(exc);
             }
-            let delay = backoff_delay(attempt);
+            let delay = backoff_delay(failures);
             self.logger.warning(&format!(
-                "[retry] {description} failed (attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS}): {exc}. Retrying in {delay:.1}s"
+                "[retry] {description} failed (attempt {failures}/{MAX_DOWNLOAD_ATTEMPTS}): {exc}. Retrying in {delay:.1}s"
             ));
             // The one substitution that makes a cancel prompt during an
             // outage.  Backoff reaches 30s and the window is ~90s in total, so
@@ -1207,8 +1231,7 @@ impl SLPArtifactDownloader {
                 });
             }
         }
-        // Unreachable: the loop either returns or raises on the final attempt.
-        Err(DownloadError::runtime(format!("{description} exhausted retries"), None))
+        unreachable!("the retry loop returns from inside")
     }
 
     /// Probe a file's size, digest, validators and Range support.
@@ -1505,6 +1528,7 @@ impl SLPArtifactDownloader {
         progress_callback: Option<ProgressCallback>,
         supports_range: bool,
     ) -> DownloadResult<()> {
+        let moved = Cell::new(0u64); // bytes received across attempts
         let mut attempt = |attempt_no: u32| -> DownloadResult<()> {
             // Resume only from bytes written by a PRIOR attempt in this call —
             // the first attempt always starts clean, so a pre-existing corrupt
@@ -1544,6 +1568,7 @@ impl SLPArtifactDownloader {
                 self.cancel_token().check(flat_name)?;
                 file.write_all(&chunk)?;
                 downloaded += chunk.len() as u64;
+                moved.set(moved.get() + chunk.len() as u64);
                 if let Some(callback) = &progress_callback {
                     callback(DownloadProgress::new(flat_name, downloaded, size, "downloading"));
                 }
@@ -1557,7 +1582,7 @@ impl SLPArtifactDownloader {
             Ok(())
         };
 
-        self.run_with_retries(&format!("download {flat_name}"), &mut attempt)
+        self.run_with_retries_progress(&format!("download {flat_name}"), &|| moved.get(), &mut attempt)
     }
 
     /// Download a byte range to its file offset, retrying transient failures.
@@ -1595,7 +1620,7 @@ impl SLPArtifactDownloader {
     /// One range of `file`, `start..=end`, with retries.
     fn fetch_range(&self, file: &ChunkedFile<'_>, start: u64, end: u64) -> DownloadResult<()> {
         let ChunkedFile { url, dest, flat_name, size: total_size, .. } = *file;
-        let mut written = 0u64; // bytes of THIS chunk already flushed to disk
+        let written = Cell::new(0u64); // bytes of THIS chunk already on disk
 
         // On entry, so a range the pool starts after the flag was raised exits
         // before opening a socket.  Every model worth downloading is over
@@ -1603,7 +1628,7 @@ impl SLPArtifactDownloader {
         self.cancel_token().check(flat_name)?;
 
         let mut attempt = |_attempt_no: u32| -> DownloadResult<()> {
-            let cur_start = start + written;
+            let cur_start = start + written.get();
             if cur_start > end {
                 return Ok(()); // chunk already fully written by a prior attempt
             }
@@ -1623,11 +1648,11 @@ impl SLPArtifactDownloader {
             while let Some(mut chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
                 self.cancel_token().check(flat_name)?;
                 // Never write past the range, whatever the server sends.
-                let offset = start + written;
+                let offset = start + written.get();
                 let room = end + 1 - offset;
                 chunk.truncate(usize::try_from(room).unwrap_or(usize::MAX));
                 out.write_all(&chunk)?;
-                written += chunk.len() as u64;
+                written.set(written.get() + chunk.len() as u64);
                 if let Some(journal) = &file.journal {
                     journal.record(offset, offset + chunk.len() as u64);
                     journal.maybe_flush()?;
@@ -1640,17 +1665,17 @@ impl SLPArtifactDownloader {
                     };
                     callback(DownloadProgress::new(flat_name, current, total_size, "downloading"));
                 }
-                if start + written > end {
+                if start + written.get() > end {
                     break;
                 }
             }
-            if start + written <= end {
-                return Err(short_body(&format!("bytes {start}-{end} of {flat_name}"), written, end + 1 - start));
+            if start + written.get() <= end {
+                return Err(short_body(&format!("bytes {start}-{end} of {flat_name}"), written.get(), end + 1 - start));
             }
             Ok(())
         };
 
-        self.run_with_retries(&format!("chunk {start}-{end} of {flat_name}"), &mut attempt)
+        self.run_with_retries_progress(&format!("chunk {start}-{end} of {flat_name}"), &|| written.get(), &mut attempt)
     }
 
     /// Download a large file using parallel Range requests into `dest`.
