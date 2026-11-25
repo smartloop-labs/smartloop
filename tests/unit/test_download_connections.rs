@@ -254,3 +254,68 @@ mod test_low_speed_abort {
         assert!(is_retryable_error(&err));
     }
 }
+
+/// An idle connection takes half of the largest range still in flight.
+mod test_tail_splitting {
+    use super::*;
+    use crate::shared::model_fakes::{RangeServer, test_logger};
+    use smartloop::model::downloader::artifact_downloader::SLPArtifactDownloader;
+    use smartloop::model::downloader::ranges::{InFlight, RangeCursor};
+
+    #[test]
+    fn test_a_split_takes_the_upper_half_beyond_the_claim() {
+        let in_flight = InFlight::new(4);
+        let cursor = RangeCursor::new(0, 31);
+        in_flight.start(&cursor);
+        assert_eq!(cursor.claim(8), Some((0, 8)));
+
+        let taken = in_flight.split().unwrap();
+        assert_eq!(taken.position(), (20, 31));
+        assert_eq!(cursor.position(), (8, 19));
+        // The owner can no longer claim past its new end.
+        assert_eq!(cursor.claim(100), Some((8, 12)));
+        assert_eq!(cursor.claim(1), None);
+    }
+
+    #[test]
+    fn test_a_range_too_small_to_halve_is_left_alone() {
+        let in_flight = InFlight::new(16);
+        let cursor = RangeCursor::new(0, 30);
+        in_flight.start(&cursor);
+        assert!(!in_flight.splittable());
+        assert!(in_flight.split().is_none());
+    }
+
+    #[test]
+    fn test_a_failed_write_gives_its_claim_back() {
+        let cursor = RangeCursor::new(10, 19);
+        let (offset, _) = cursor.claim(4).unwrap();
+        cursor.unclaim(offset);
+        assert_eq!(cursor.position(), (10, 19));
+    }
+
+    #[test]
+    fn test_a_slow_last_range_is_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..64u8).collect();
+        let server = RangeServer::new(data.clone());
+        *server.slow_from.lock() = Some((0, Duration::from_millis(30)));
+        let dl = SLPArtifactDownloader::for_tests(None, test_logger(), None).with_http(Arc::clone(&server) as _);
+        dl.set_connections(Some(2));
+        dl.set_min_split(Some(4));
+
+        let part = tmp.path().join("w.part");
+        dl.download_file_chunked("w", "https://x/w", &part, &server.info(), None).unwrap();
+
+        assert_eq!(std::fs::read(&part).unwrap(), data);
+        let ranges = server.ranges();
+        assert!(
+            ranges.iter().any(|r| {
+                let (a, b) = r.strip_prefix("bytes=").unwrap().split_once('-').unwrap();
+                let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
+                a > 0 && a < 32 && b == 31
+            }),
+            "the slow first range was split: {ranges:?}"
+        );
+    }
+}

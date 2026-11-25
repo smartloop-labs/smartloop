@@ -290,3 +290,121 @@ impl Drop for ConnectionMeter {
         self.stats.judged.lock().remove(&self.id);
     }
 }
+
+/// Smallest piece an in-flight range is split into.  Below this, the round
+/// trip to open another request costs more than sharing the work saves.
+pub const MIN_SPLIT: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+struct CursorState {
+    /// First byte not yet claimed by the owner.
+    next: u64,
+    /// Last byte of the range (inclusive); lowered by a split.
+    end: u64,
+}
+
+/// One range being fetched: where its owner has got to, and where it ends.
+/// The owner claims bytes before writing them and a split only takes bytes
+/// beyond the claim, so the two never write the same byte.
+#[derive(Debug)]
+pub struct RangeCursor {
+    start: u64,
+    state: Mutex<CursorState>,
+}
+
+impl RangeCursor {
+    /// A cursor over `start..=end`.
+    pub fn new(start: u64, end: u64) -> Arc<Self> {
+        Arc::new(Self { start, state: Mutex::new(CursorState { next: start, end }) })
+    }
+
+    /// First byte of the range as it was handed out.
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// `(next unclaimed byte, last byte)`.
+    pub fn position(&self) -> (u64, u64) {
+        let state = self.state.lock();
+        (state.next, state.end)
+    }
+
+    /// Bytes the owner has claimed so far.
+    pub fn claimed(&self) -> u64 {
+        self.state.lock().next - self.start
+    }
+
+    /// Claim up to `len` bytes from the next unclaimed one; `None` when the
+    /// range is finished.
+    pub fn claim(&self, len: u64) -> Option<(u64, u64)> {
+        let mut state = self.state.lock();
+        if state.next > state.end || len == 0 {
+            return None;
+        }
+        let take = len.min(state.end + 1 - state.next);
+        let offset = state.next;
+        state.next += take;
+        Some((offset, take))
+    }
+
+    /// Give back a claim whose write failed.
+    pub fn unclaim(&self, offset: u64) {
+        let mut state = self.state.lock();
+        state.next = state.next.min(offset);
+    }
+
+    fn remaining(&self) -> u64 {
+        let state = self.state.lock();
+        (state.end + 1).saturating_sub(state.next)
+    }
+}
+
+/// The ranges of one file being fetched right now, so an idle connection
+/// can take half of the largest instead of waiting for it to finish.
+#[derive(Debug)]
+pub struct InFlight {
+    min_split: u64,
+    cursors: Mutex<Vec<Arc<RangeCursor>>>,
+}
+
+impl InFlight {
+    /// Ranges split no smaller than `min_split` bytes.
+    pub fn new(min_split: u64) -> Self {
+        Self { min_split: min_split.max(1), cursors: Mutex::new(Vec::new()) }
+    }
+
+    /// Track `cursor` until [`Self::finish`].
+    pub fn start(&self, cursor: &Arc<RangeCursor>) {
+        self.cursors.lock().push(Arc::clone(cursor));
+    }
+
+    /// Stop tracking `cursor`.
+    pub fn finish(&self, cursor: &Arc<RangeCursor>) {
+        self.cursors.lock().retain(|c| !Arc::ptr_eq(c, cursor));
+    }
+
+    /// Whether some range has enough left to split.
+    pub fn splittable(&self) -> bool {
+        self.cursors.lock().iter().any(|c| c.remaining() >= 2 * self.min_split)
+    }
+
+    /// Take the upper half of the range with the most bytes left, as a new
+    /// tracked range.  `None` when nothing has enough left to split.
+    pub fn split(&self) -> Option<Arc<RangeCursor>> {
+        let mut cursors = self.cursors.lock();
+        let largest = cursors.iter().max_by_key(|c| c.remaining())?;
+        let taken = {
+            let mut state = largest.state.lock();
+            let remaining = (state.end + 1).saturating_sub(state.next);
+            if remaining < 2 * self.min_split {
+                return None;
+            }
+            let mid = state.next + remaining / 2;
+            let taken = RangeCursor::new(mid, state.end);
+            state.end = mid - 1;
+            taken
+        };
+        cursors.push(Arc::clone(&taken));
+        Some(taken)
+    }
+}

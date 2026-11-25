@@ -282,6 +282,8 @@ pub struct RangeServer {
     pub piece: usize,
     /// Every `Range` (and `If-Range`) asked for, in order.
     pub requests: Mutex<Vec<(String, Option<String>)>>,
+    /// A request starting at this offset sleeps this long per piece.
+    pub slow_from: Mutex<Option<(u64, std::time::Duration)>>,
 }
 
 impl RangeServer {
@@ -293,6 +295,7 @@ impl RangeServer {
             cut_at: Mutex::new(None),
             piece: 4,
             requests: Mutex::new(Vec::new()),
+            slow_from: Mutex::new(None),
         })
     }
 
@@ -348,6 +351,9 @@ impl DownloadHttp for RangeServer {
             .with_header("ETag", &etag);
         if stop < last {
             resp = resp.failing_at(pieces.len(), read_error("cut"));
+        }
+        if let Some((_, pause)) = self.slow_from.lock().filter(|(at, _)| *at == first) {
+            resp = resp.with_on_chunk(move |_| std::thread::sleep(pause));
         }
         Ok(Box::new(resp))
     }

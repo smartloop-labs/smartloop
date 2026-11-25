@@ -29,7 +29,8 @@ use crate::model::downloader::artifact_source::{
 use crate::model::downloader::cancellation::{CancelToken, DownloadCancelled};
 use crate::model::downloader::inflight::downloading;
 use crate::model::downloader::ranges::{
-    Clock, ConnectionPermits, MAX_CONNECTIONS, TransferStats, starting_connections, system_clock,
+    Clock, ConnectionPermits, InFlight, MAX_CONNECTIONS, MIN_SPLIT, RangeCursor, TransferStats, starting_connections,
+    system_clock,
 };
 use crate::model::downloader::resume::{IntervalSet, Journal, ResumeState};
 use crate::model::downloader::slp_downloader::{
@@ -1010,6 +1011,7 @@ pub struct SLPArtifactDownloader {
     /// Throughput of the download in progress, shared by its files.
     stats: Mutex<Option<Arc<TransferStats>>>,
     clock_override: Mutex<Option<Clock>>,
+    min_split_override: Mutex<Option<u64>>,
 }
 
 impl SLPArtifactDownloader {
@@ -1042,6 +1044,7 @@ impl SLPArtifactDownloader {
             permits: Mutex::new(None),
             stats: Mutex::new(None),
             clock_override: Mutex::new(None),
+            min_split_override: Mutex::new(None),
         }
     }
 
@@ -1066,6 +1069,7 @@ impl SLPArtifactDownloader {
             permits: Mutex::new(None),
             stats: Mutex::new(None),
             clock_override: Mutex::new(None),
+            min_split_override: Mutex::new(None),
         }
     }
 
@@ -1123,6 +1127,11 @@ impl SLPArtifactDownloader {
     pub fn set_connections(&self, connections: Option<usize>) {
         *self.connections_override.lock() = connections;
         *self.permits.lock() = None;
+    }
+
+    /// Tests only: override `MIN_SPLIT` (`None` restores the default).
+    pub fn set_min_split(&self, bytes: Option<u64>) {
+        *self.min_split_override.lock() = bytes;
     }
 
     /// Tests only: read time from `clock` (`None` restores real time).
@@ -1656,13 +1665,15 @@ impl SLPArtifactDownloader {
             if_range: None,
             stats: self.transfer_stats(),
         };
-        self.fetch_range(&file, start, end)
+        self.fetch_range(&file, &RangeCursor::new(start, end))
     }
 
-    /// One range of `file`, `start..=end`, with retries.
-    fn fetch_range(&self, file: &ChunkedFile<'_>, start: u64, end: u64) -> DownloadResult<()> {
+    /// The range `cursor` covers, with retries.  The range's end can be
+    /// lowered by a split while it runs; the connection stops there.
+    fn fetch_range(&self, file: &ChunkedFile<'_>, cursor: &RangeCursor) -> DownloadResult<()> {
         let ChunkedFile { url, dest, flat_name, size: total_size, .. } = *file;
-        let written = Cell::new(0u64); // bytes of THIS chunk already on disk
+        let start = cursor.start();
+        let label = |end: u64| format!("bytes {start}-{end} of {flat_name}");
 
         // On entry, so a range the pool starts after the flag was raised exits
         // before opening a socket.  Every model worth downloading is over
@@ -1670,7 +1681,7 @@ impl SLPArtifactDownloader {
         self.cancel_token().check(flat_name)?;
 
         let mut attempt = |_attempt_no: u32| -> DownloadResult<()> {
-            let cur_start = start + written.get();
+            let (cur_start, end) = cursor.position();
             if cur_start > end {
                 return Ok(()); // chunk already fully written by a prior attempt
             }
@@ -1689,7 +1700,7 @@ impl SLPArtifactDownloader {
             out.seek(SeekFrom::Start(cur_start))?;
             let mut meter = file.stats.open();
             let mut slow = None;
-            while let Some(mut chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
+            while let Some(chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
                 self.cancel_token().check(flat_name)?;
                 meter.add(chunk.len() as u64);
                 if let Some(why) = meter.slowness() {
@@ -1698,42 +1709,48 @@ impl SLPArtifactDownloader {
                     // What arrived in this read is still written below.
                     slow = Some(why);
                 }
-                // Never write past the range, whatever the server sends.
-                let offset = start + written.get();
-                let room = end + 1 - offset;
-                chunk.truncate(usize::try_from(room).unwrap_or(usize::MAX));
-                out.write_all(&chunk)?;
-                written.set(written.get() + chunk.len() as u64);
+                // Never write past the range (which a split may have just
+                // shortened), whatever the server sends.
+                let Some((offset, take)) = cursor.claim(chunk.len() as u64) else {
+                    break;
+                };
+                if let Err(e) = out.write_all(&chunk[..take as usize]) {
+                    cursor.unclaim(offset);
+                    return Err(e.into());
+                }
                 if let Some(journal) = &file.journal {
-                    journal.record(offset, offset + chunk.len() as u64);
+                    journal.record(offset, offset + take);
                     journal.maybe_flush()?;
                 }
                 if let Some(callback) = &file.progress {
                     let current = {
                         let mut counter = file.counter.lock();
-                        *counter += chunk.len() as u64;
+                        *counter += take;
                         *counter
                     };
                     callback(DownloadProgress::new(flat_name, current, total_size, "downloading"));
                 }
-                if start + written.get() > end {
+                let (next, end) = cursor.position();
+                if next > end {
                     break;
                 }
                 if let Some(why) = slow {
                     return Err(HttpError::transport(
                         TransportErrorKind::LowSpeed,
-                        format!("bytes {start}-{end} of {flat_name}: connection {why}"),
+                        format!("{}: connection {why}", label(end)),
                     )
                     .into());
                 }
             }
-            if start + written.get() <= end {
-                return Err(short_body(&format!("bytes {start}-{end} of {flat_name}"), written.get(), end + 1 - start));
+            let (next, end) = cursor.position();
+            if next <= end {
+                return Err(short_body(&label(end), next - cur_start, end + 1 - cur_start));
             }
             Ok(())
         };
 
-        self.run_with_retries_progress(&format!("chunk {start}-{end} of {flat_name}"), &|| written.get(), &mut attempt)
+        let (_, end) = cursor.position();
+        self.run_with_retries_progress(&format!("chunk {}", label(end)), &|| cursor.claimed(), &mut attempt)
     }
 
     /// Download a large file using parallel Range requests into `dest`.
@@ -1819,23 +1836,43 @@ impl SLPArtifactDownloader {
         // fetching the rest of the file before the error is reported.
         let failed = AtomicBool::new(false);
         let queue = Mutex::new(chunks.into_iter().collect::<VecDeque<_>>());
-        let threads = self.connections_override.lock().unwrap_or(MAX_CONNECTIONS).min(queue.lock().len());
+        let threads = self.connections_override.lock().unwrap_or(MAX_CONNECTIONS);
         let token = self.cancel_token();
+        // Once the queue is empty an idle connection splits the largest range
+        // still in flight, so the tail is shared rather than left to one.
+        let in_flight = InFlight::new(self.min_split_override.lock().unwrap_or(MIN_SPLIT));
+        let nothing_left = || queue.lock().is_empty() && (hook.is_some() || !in_flight.splittable());
 
         let raised = run_workers(
             threads,
             || {
                 let _permit =
-                    permits.acquire(|| failed.load(Ordering::SeqCst) || token.cancelled() || queue.lock().is_empty())?;
-                let (start, end) = queue.lock().pop_front()?;
+                    permits.acquire(|| failed.load(Ordering::SeqCst) || token.cancelled() || nothing_left())?;
+                let next = queue.lock().pop_front();
+                let cursor = match next {
+                    Some((start, end)) => {
+                        let cursor = RangeCursor::new(start, end);
+                        in_flight.start(&cursor);
+                        cursor
+                    }
+                    None if hook.is_none() => {
+                        let cursor = in_flight.split()?;
+                        let (start, end) = cursor.position();
+                        self.logger.info(&format!("[split] {flat_name}: taking bytes {start}-{end} from a busy range"));
+                        cursor
+                    }
+                    None => return None,
+                };
+                let (start, end) = cursor.position();
                 let result = match &hook {
                     Some(hook) => hook(start, end),
-                    None => self.fetch_range(&file, start, end),
+                    None => self.fetch_range(&file, &cursor),
                 };
+                in_flight.finish(&cursor);
                 if result.is_err() {
                     failed.store(true, Ordering::SeqCst);
                 }
-                Some(((start, end), result))
+                Some(((start, cursor.position().1), result))
             },
             |((start, end), result)| match result {
                 Ok(()) => None,
