@@ -1323,7 +1323,31 @@ impl SLPArtifactDownloader {
     /// expected MD5 — is re-downloaded from scratch up to
     /// [`MAX_VERIFY_ATTEMPTS`] times before failing with
     /// `"<name>: MD5 verification failed after 3 attempts"`.
+    ///
+    /// When the remote file turns out to have changed under the download
+    /// (see [`SourceChanged`]) it is probed again and fetched once more from
+    /// the start.
     pub fn download_file(
+        &self,
+        filename: &str,
+        url: &str,
+        local_dir: &Path,
+        info: &RemoteFileInfo,
+        progress_callback: Option<ProgressCallback>,
+    ) -> DownloadResult<String> {
+        match self.download_file_once(filename, url, local_dir, info, progress_callback.clone()) {
+            Err(e) if caused_by_source_change(&e) => {
+                let flat_name = basename(filename);
+                self.logger.warning(&format!("[resume] {flat_name} changed on the server; starting it over: {e}"));
+                discard_part(&PathBuf::from(format!("{}.part", local_dir.join(flat_name).display())))?;
+                let info = self.get_remote_file_info(url)?;
+                self.download_file_once(filename, url, local_dir, &info, progress_callback)
+            }
+            other => other,
+        }
+    }
+
+    fn download_file_once(
         &self,
         filename: &str,
         url: &str,
@@ -1491,6 +1515,7 @@ impl SLPArtifactDownloader {
             counter: downloaded_counter,
             progress: progress_callback,
             journal: None,
+            if_range: None,
         };
         self.fetch_range(&file, start, end)
     }
@@ -1512,6 +1537,9 @@ impl SLPArtifactDownloader {
             }
             let mut headers = Headers::new();
             headers.insert("Range".to_string(), format!("bytes={cur_start}-{end}"));
+            if let Some(validator) = &file.if_range {
+                headers.insert("If-Range".to_string(), validator.clone());
+            }
             let mut resp = self.http.stream(url, &headers, STREAM_TIMEOUT)?;
             if resp.status_code() == 401 {
                 return Err(StaleDownloadURLError(UNAUTHORIZED_MSG.to_string()).into());
@@ -1631,6 +1659,7 @@ impl SLPArtifactDownloader {
             counter: &downloaded_counter,
             progress: progress_callback,
             journal,
+            if_range: if_range_validator(info),
         };
         let hook = self.download_chunk_hook.lock().clone();
         // Once a range has failed for good (its own retries spent), the
@@ -1914,6 +1943,29 @@ struct ChunkedFile<'a> {
     counter: &'a Mutex<u64>,
     progress: Option<ProgressCallback>,
     journal: Option<Journal>,
+    /// Sent as `If-Range`, so a changed object answers 200 rather than
+    /// bytes of the new version.
+    if_range: Option<String>,
+}
+
+/// The `If-Range` value for `info`: its strong ETag, else Last-Modified.
+fn if_range_validator(info: &RemoteFileInfo) -> Option<String> {
+    match info.etag.as_deref() {
+        Some(etag) if !crate::model::downloader::resume::is_weak_etag(etag) => Some(etag.to_string()),
+        _ => info.last_modified.clone(),
+    }
+}
+
+/// Whether `err` or anything in its cause chain is a [`SourceChanged`].
+fn caused_by_source_change(err: &DownloadError) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if matches!(e, DownloadError::SourceChanged(_)) {
+            return true;
+        }
+        current = e.cause();
+    }
+    false
 }
 
 /// Create `dest` as a `size`-byte file to write ranges into.

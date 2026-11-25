@@ -286,4 +286,38 @@ mod test_chunked_resume {
         assert!(ranges.iter().all(|r| r.as_str() != "bytes=0-23"), "first pass fetched only the gap");
         assert!(ranges.iter().any(|r| r.starts_with("bytes=0-")), "second pass started over");
     }
+
+    #[test]
+    fn test_every_range_carries_if_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = RangeServer::new(data(40));
+        downloader(&server, 2)
+            .download_file_chunked("w.gguf", "https://x/w", &tmp.path().join("w.gguf.part"), &server.info(), None)
+            .unwrap();
+        let requests = server.requests.lock();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|(_, if_range)| if_range.as_deref() == Some("\"v1\"")));
+    }
+
+    #[test]
+    fn test_a_file_changed_mid_download_is_fetched_again_from_the_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = RangeServer::new(data(40));
+        *server.cut_at.lock() = Some(24);
+        assert!(publish(&server, tmp.path(), None).is_err());
+
+        // Same size, new version; the caller still holds the old probe.
+        let stale = server.info();
+        *server.cut_at.lock() = None;
+        *server.etag.lock() = "\"v2\"".to_string();
+        server.requests.lock().clear();
+        let dl = downloader(&server, 1);
+        dl.set_chunked_threshold(Some(1));
+        dl.download_file("w.gguf", "https://x/w", tmp.path(), &stale, None).unwrap();
+
+        assert_eq!(std::fs::read(tmp.path().join("w.gguf")).unwrap(), server.data);
+        let requests = server.requests.lock().clone();
+        assert_eq!(requests[0], ("bytes=24-39".to_string(), Some("\"v1\"".to_string())));
+        assert_eq!(requests.last().unwrap(), &("bytes=0-39".to_string(), Some("\"v2\"".to_string())));
+    }
 }
