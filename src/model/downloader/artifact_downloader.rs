@@ -632,6 +632,42 @@ pub struct HeadResponse {
     pub headers: Headers,
 }
 
+/// What a probe learned about a remote file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteFileInfo {
+    /// Size in bytes; 0 when the server did not say.
+    pub size: u64,
+    /// Hex MD5 from a single-part ETag.
+    pub md5: Option<String>,
+    /// The server honours `Range: bytes=…`.
+    pub accept_ranges: bool,
+    /// The raw `ETag`, quotes included.
+    pub etag: Option<String>,
+    /// The raw `Last-Modified`.
+    pub last_modified: Option<String>,
+}
+
+impl RemoteFileInfo {
+    /// Read the validators, digest and Range support from probe headers,
+    /// with `content_length` as the size.
+    fn from_headers(headers: &Headers, content_length: Option<&str>) -> DownloadResult<Self> {
+        let size = match content_length {
+            Some(cl) if !cl.trim().is_empty() => cl
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| DownloadError::Value(format!("invalid literal for int() with base 10: '{cl}'")))?,
+            _ => 0,
+        };
+        Ok(Self {
+            size,
+            md5: SLPArtifactDownloader::parse_remote_md5(headers),
+            accept_ranges: header_get(headers, "Accept-Ranges").unwrap_or("").eq_ignore_ascii_case("bytes"),
+            etag: header_get(headers, "ETag").map(str::to_string),
+            last_modified: header_get(headers, "Last-Modified").map(str::to_string),
+        })
+    }
+}
+
 /// A streaming GET response (the body of `with httpx.stream(...) as resp`).
 /// Dropping it closes the connection.
 pub trait StreamResponse: Send {
@@ -1096,33 +1132,56 @@ impl SLPArtifactDownloader {
         Err(DownloadError::runtime(format!("{description} exhausted retries"), None))
     }
 
-    /// HEAD request to get file size, MD5 hash, and Range support.
+    /// Probe a file's size, digest, validators and Range support.
     ///
-    /// Retries transient failures; falls back to `(0, None, false)` when the
-    /// probe ultimately fails (callers then download single-stream,
-    /// unverified) — but propagates a cancel.
-    pub fn get_remote_file_info(&self, url: &str) -> DownloadResult<(u64, Option<String>, bool)> {
-        let mut attempt = |_attempt_no: u32| -> DownloadResult<(u64, Option<String>, bool)> {
+    /// HEAD first, retrying transient failures.  A server that refuses HEAD
+    /// (some signed URLs are valid for GET only) is asked with a one-byte
+    /// ranged GET instead.  A probe that still fails is returned as an error
+    /// rather than guessed at: without a size there is no chunking, resume
+    /// or verification, and a network that cannot answer a HEAD cannot carry
+    /// the transfer either.
+    pub fn get_remote_file_info(&self, url: &str) -> DownloadResult<RemoteFileInfo> {
+        let mut head = |_attempt_no: u32| -> DownloadResult<Option<RemoteFileInfo>> {
             let resp = self.http.head(url)?;
-            let size = match header_get(&resp.headers, "Content-Length") {
-                Some(cl) if !cl.is_empty() => cl.trim().parse::<u64>().map_err(|_| {
-                    DownloadError::Value(format!("invalid literal for int() with base 10: '{cl}'"))
-                })?,
-                _ => 0,
-            };
-            let md5 = Self::parse_remote_md5(&resp.headers);
-            let accept_ranges = header_get(&resp.headers, "Accept-Ranges").unwrap_or("").to_lowercase() == "bytes";
-            Ok((size, md5, accept_ranges))
+            if !(200..300).contains(&resp.status_code) {
+                if RETRYABLE_STATUS.contains(&resp.status_code) {
+                    return Err(HttpError::status(resp.status_code, format!("HEAD answered {}", resp.status_code)).into());
+                }
+                return Ok(None);
+            }
+            Ok(Some(RemoteFileInfo::from_headers(&resp.headers, header_get(&resp.headers, "Content-Length"))?))
         };
-        match self.run_with_retries("HEAD probe", &mut attempt) {
-            Ok(info) => Ok(info),
-            // Above the blanket fallback below, which is the whole reason this
-            // arm exists: swallowed here, a cancel would be reported as "no
-            // size, no digest, no Range support" and the file would go on to
-            // download single-stream and unverified.
-            Err(exc) if exc.is_cancelled() => Err(exc),
-            Err(_) => Ok((0, None, false)),
+        if let Some(info) = self.run_with_retries("HEAD probe", &mut head)? {
+            return Ok(info);
         }
+
+        let mut probe = |_attempt_no: u32| -> DownloadResult<RemoteFileInfo> {
+            let mut headers = Headers::new();
+            headers.insert("Range".to_string(), "bytes=0-0".to_string());
+            let resp = self.http.stream(url, &headers, STREAM_TIMEOUT)?;
+            if resp.status_code() == 401 {
+                return Err(StaleDownloadURLError(UNAUTHORIZED_MSG.to_string()).into());
+            }
+            resp.raise_for_status()?;
+            let mut lookup = Headers::new();
+            for name in ["ETag", "Last-Modified", "Content-Length"] {
+                if let Some(value) = resp.header(name) {
+                    lookup.insert(name.to_string(), value);
+                }
+            }
+            if resp.status_code() == 206 {
+                let total = resp.header("Content-Range").and_then(|v| parse_content_range(&v)).and_then(|r| r.2);
+                let mut info = RemoteFileInfo::from_headers(&lookup, None)?;
+                info.size = total.unwrap_or(0);
+                info.accept_ranges = total.is_some();
+                return Ok(info);
+            }
+            RemoteFileInfo::from_headers(&lookup, header_get(&lookup, "Content-Length")).map(|mut info| {
+                info.accept_ranges = false;
+                info
+            })
+        };
+        self.run_with_retries("GET probe", &mut probe)
     }
 
     /// Check, download, and verify a set of artifacts.  Shared by bootstrap
@@ -1150,7 +1209,8 @@ impl SLPArtifactDownloader {
             self.cancel_token().check("download")?;
             let flat_name = basename(filename);
             let local_path = local_dir.join(flat_name);
-            let (size, remote_md5, accept_ranges) = self.get_remote_file_info(url)?;
+            let info = self.get_remote_file_info(url)?;
+            let (size, remote_md5, accept_ranges) = (info.size, info.md5, info.accept_ranges);
 
             if local_path.is_file() {
                 if let Some(remote) = &remote_md5 {

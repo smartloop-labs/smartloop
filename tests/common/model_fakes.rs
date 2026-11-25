@@ -210,6 +210,16 @@ impl ScriptedHttp {
         })
     }
 
+    /// Stream calls answer with `responses` in order; HEAD answered by `head`.
+    pub fn with_head_and_responses(head: HeadFn, responses: Vec<FakeResp>) -> Arc<Self> {
+        Arc::new(ScriptedHttp {
+            responses: Mutex::new(responses.into()),
+            header_calls: Mutex::new(Vec::new()),
+            timeout_calls: Mutex::new(Vec::new()),
+            head: Some(head),
+        })
+    }
+
     /// How many stream calls were made.
     pub fn calls(&self) -> usize {
         self.header_calls.lock().len()

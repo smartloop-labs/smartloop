@@ -379,6 +379,97 @@ mod test_range_responses_are_checked {
     }
 }
 
+/// The probe reads size, validators and Range support, and asks with a
+/// ranged GET when HEAD is refused.
+mod test_the_probe {
+    use super::*;
+    use smartloop::model::downloader::artifact_downloader::{HeadResponse, Headers, RemoteFileInfo};
+
+    fn head_with(status_code: u16, pairs: &[(&str, &str)]) -> HeadResponse {
+        let mut headers = Headers::new();
+        for (k, v) in pairs {
+            headers.insert(k.to_lowercase(), v.to_string());
+        }
+        HeadResponse { status_code, headers }
+    }
+
+    #[test]
+    fn test_head_reads_size_validators_and_ranges() {
+        let http = ScriptedHttp::with_head(Box::new(|_| {
+            Ok(head_with(
+                200,
+                &[
+                    ("Content-Length", "18556688288"),
+                    ("Accept-Ranges", "bytes"),
+                    ("ETag", "\"0123456789abcdef0123456789abcdef-2213\""),
+                    ("Last-Modified", "Tue, 24 Nov 2026 10:00:00 GMT"),
+                ],
+            ))
+        }));
+        let info = downloader(None, Some(http)).get_remote_file_info("https://x/f").unwrap();
+        assert_eq!(
+            info,
+            RemoteFileInfo {
+                size: 18_556_688_288,
+                md5: None,
+                accept_ranges: true,
+                etag: Some("\"0123456789abcdef0123456789abcdef-2213\"".to_string()),
+                last_modified: Some("Tue, 24 Nov 2026 10:00:00 GMT".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_a_refused_head_falls_back_to_a_ranged_get() {
+        let get = FakeResp::new(206, &[b"A"])
+            .with_header("Content-Range", "bytes 0-0/4096")
+            .with_header("ETag", "\"abc\"");
+        let http = ScriptedHttp::with_head_and_responses(
+            Box::new(|_| Ok(head_with(403, &[("Content-Length", "312")]))),
+            vec![get],
+        );
+        let info = downloader(None, Some(Arc::clone(&http))).get_remote_file_info("https://x/f").unwrap();
+        assert_eq!(info.size, 4096, "not the error page's length");
+        assert!(info.accept_ranges);
+        assert_eq!(info.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(http.header_calls.lock()[0], range_header("bytes=0-0"));
+    }
+
+    #[test]
+    fn test_a_get_probe_answered_in_full_means_no_ranges() {
+        let get = FakeResp::new(200, &[b"ABCD"]).with_header("Content-Length", "4");
+        let http = ScriptedHttp::with_head_and_responses(Box::new(|_| Ok(head_with(405, &[]))), vec![get]);
+        let info = downloader(None, Some(http)).get_remote_file_info("https://x/f").unwrap();
+        assert_eq!(info.size, 4);
+        assert!(!info.accept_ranges);
+    }
+
+    #[test]
+    fn test_a_busy_head_is_retried() {
+        let calls = Arc::new(Mutex::new(0));
+        let count = Arc::clone(&calls);
+        let http = ScriptedHttp::with_head(Box::new(move |_| {
+            let mut n = count.lock();
+            *n += 1;
+            if *n == 1 {
+                return Ok(head_with(503, &[]));
+            }
+            Ok(head_with(200, &[("Content-Length", "8")]))
+        }));
+        let info = downloader(None, Some(http)).get_remote_file_info("https://x/f").unwrap();
+        assert_eq!(info.size, 8);
+        assert_eq!(*calls.lock(), 2);
+    }
+
+    #[test]
+    fn test_a_missing_file_is_an_error_not_a_guess() {
+        let get = FakeResp::new(404, &[]);
+        let http = ScriptedHttp::with_head_and_responses(Box::new(|_| Ok(head_with(404, &[]))), vec![get]);
+        let err = downloader(None, Some(http)).get_remote_file_info("https://x/f").unwrap_err();
+        assert_eq!(err.to_string(), "error");
+    }
+}
+
 // ------------------- MD5 verification + atomic (.part) publish, via download_file
 
 /// `TestVerifyAndAtomicPublish`

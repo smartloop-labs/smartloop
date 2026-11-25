@@ -345,9 +345,10 @@ mod test_the_head_probe {
     }
 
     #[test]
-    fn test_an_ordinary_probe_failure_still_falls_back() {
+    fn test_an_ordinary_probe_failure_is_returned() {
         let http = ScriptedHttp::with_head(Box::new(|_url| Err(connect_error("no dns"))));
         let dl = downloader(None, Some(http));
-        assert_eq!(dl.get_remote_file_info("https://x/f").unwrap(), (0, None, false));
+        let err = dl.get_remote_file_info("https://x/f").unwrap_err();
+        assert!(ad::is_transient_error(&err));
     }
 }
