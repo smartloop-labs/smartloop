@@ -28,7 +28,9 @@ use crate::model::downloader::artifact_source::{
 };
 use crate::model::downloader::cancellation::{CancelToken, DownloadCancelled};
 use crate::model::downloader::inflight::downloading;
-use crate::model::downloader::ranges::{ConnectionPermits, MAX_CONNECTIONS, starting_connections};
+use crate::model::downloader::ranges::{
+    Clock, ConnectionPermits, MAX_CONNECTIONS, TransferStats, starting_connections, system_clock,
+};
 use crate::model::downloader::resume::{IntervalSet, Journal, ResumeState};
 use crate::model::downloader::slp_downloader::{
     AggregateProgress, DownloadProgress, DownloadStubCall, ProgressCallback, SLPDownloader, SharedLogger,
@@ -50,6 +52,8 @@ pub fn max_workers() -> usize {
 
 /// 8 MB read buffer for simple downloads (and MD5 reads).
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+/// A body read returns what it has after this long, full buffer or not.
+pub const PARTIAL_CHUNK_AFTER: Duration = Duration::from_millis(250);
 /// 1 MB read buffer within each chunk.
 pub const RANGE_READ_SIZE: usize = 1024 * 1024;
 /// Files larger than this (100 MB) use chunked download.
@@ -818,7 +822,10 @@ impl StreamResponse for ReqwestStream {
     fn next_chunk(&mut self, chunk_size: usize) -> Result<Option<Vec<u8>>, HttpError> {
         let mut buf = vec![0u8; chunk_size.max(1)];
         let mut filled = 0usize;
-        while filled < buf.len() {
+        let started = std::time::Instant::now();
+        // Hand back what arrived after a short while rather than waiting for
+        // a full buffer, so a slow connection is still measured often.
+        while filled < buf.len() && (filled == 0 || started.elapsed() < PARTIAL_CHUNK_AFTER) {
             match self.response.read(&mut buf[filled..]) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
@@ -964,12 +971,13 @@ where
     })
 }
 
-/// Clears the download's shared connection pool when dropped.
-struct ClearOnDrop<'a>(&'a Mutex<Option<Arc<ConnectionPermits>>>);
+/// Clears a download's shared pool and stats when it ends.
+struct DownloadScope<'a>(&'a SLPArtifactDownloader);
 
-impl Drop for ClearOnDrop<'_> {
+impl Drop for DownloadScope<'_> {
     fn drop(&mut self) {
-        *self.0.lock() = None;
+        *self.0.permits.lock() = None;
+        *self.0.stats.lock() = None;
     }
 }
 
@@ -996,6 +1004,9 @@ pub struct SLPArtifactDownloader {
     chunked_threshold_override: Mutex<Option<u64>>,
     /// The connection pool of the download in progress, shared by its files.
     permits: Mutex<Option<Arc<ConnectionPermits>>>,
+    /// Throughput of the download in progress, shared by its files.
+    stats: Mutex<Option<Arc<TransferStats>>>,
+    clock_override: Mutex<Option<Clock>>,
 }
 
 impl SLPArtifactDownloader {
@@ -1026,6 +1037,8 @@ impl SLPArtifactDownloader {
             connections_override: Mutex::new(None),
             chunked_threshold_override: Mutex::new(None),
             permits: Mutex::new(None),
+            stats: Mutex::new(None),
+            clock_override: Mutex::new(None),
         }
     }
 
@@ -1048,6 +1061,8 @@ impl SLPArtifactDownloader {
             connections_override: Mutex::new(None),
             chunked_threshold_override: Mutex::new(None),
             permits: Mutex::new(None),
+            stats: Mutex::new(None),
+            clock_override: Mutex::new(None),
         }
     }
 
@@ -1105,6 +1120,23 @@ impl SLPArtifactDownloader {
     pub fn set_connections(&self, connections: Option<usize>) {
         *self.connections_override.lock() = connections;
         *self.permits.lock() = None;
+    }
+
+    /// Tests only: read time from `clock` (`None` restores real time).
+    pub fn set_clock(&self, clock: Option<Clock>) {
+        *self.clock_override.lock() = clock;
+    }
+
+    /// The throughput stats of the running download, else fresh ones.
+    pub fn transfer_stats(&self) -> Arc<TransferStats> {
+        if let Some(stats) = self.stats.lock().as_ref() {
+            return Arc::clone(stats);
+        }
+        TransferStats::new(self.clock())
+    }
+
+    fn clock(&self) -> Clock {
+        self.clock_override.lock().clone().unwrap_or_else(system_clock)
     }
 
     /// The connection pool for a download of `remaining` bytes: the one the
@@ -1346,7 +1378,8 @@ impl SLPArtifactDownloader {
         let fixed = *self.connections_override.lock();
         let permits = ConnectionPermits::new(fixed.unwrap_or_else(|| starting_connections(remaining)));
         *self.permits.lock() = Some(Arc::clone(&permits));
-        let _clear_permits = ClearOnDrop(&self.permits);
+        *self.stats.lock() = Some(TransferStats::new(self.clock()));
+        let _scope = DownloadScope(self);
         self.logger.info(&format!(
             "Downloading {} file(s), {total_mb:.1} MB total, {:.1} MB to fetch, starting with {} connection(s)",
             pending.len(),
@@ -1613,6 +1646,7 @@ impl SLPArtifactDownloader {
             progress: progress_callback,
             journal: None,
             if_range: None,
+            stats: self.transfer_stats(),
         };
         self.fetch_range(&file, start, end)
     }
@@ -1645,8 +1679,10 @@ impl SLPArtifactDownloader {
             check_range_response(resp.as_ref(), cur_start, end, total_size)?;
             let mut out = OpenOptions::new().read(true).write(true).open(dest)?;
             out.seek(SeekFrom::Start(cur_start))?;
+            let mut meter = file.stats.open();
             while let Some(mut chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
                 self.cancel_token().check(flat_name)?;
+                meter.add(chunk.len() as u64);
                 // Never write past the range, whatever the server sends.
                 let offset = start + written.get();
                 let room = end + 1 - offset;
@@ -1753,6 +1789,7 @@ impl SLPArtifactDownloader {
             progress: progress_callback,
             journal,
             if_range: if_range_validator(info),
+            stats: self.transfer_stats(),
         };
         let hook = self.download_chunk_hook.lock().clone();
         // Once a range has failed for good (its own retries spent), the
@@ -2047,6 +2084,7 @@ struct ChunkedFile<'a> {
     /// Sent as `If-Range`, so a changed object answers 200 rather than
     /// bytes of the new version.
     if_range: Option<String>,
+    stats: Arc<TransferStats>,
 }
 
 /// The `If-Range` value for `info`: its strong ETag, else Last-Modified.

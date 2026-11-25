@@ -111,3 +111,107 @@ mod test_shared_pool {
         assert!(peak >= 2, "peak {peak}: the pool was used");
     }
 }
+
+/// A clock tests move by hand.
+pub fn manual_clock() -> (smartloop::model::downloader::ranges::Clock, Arc<parking_lot::Mutex<Duration>>) {
+    let now = Arc::new(parking_lot::Mutex::new(Duration::ZERO));
+    let read = Arc::clone(&now);
+    (Arc::new(move || *read.lock()), now)
+}
+
+/// `TransferStats` and `ConnectionMeter`
+mod test_throughput {
+    use super::*;
+    use smartloop::model::downloader::ranges::{RATE_WINDOW, Slowness, TransferStats};
+
+    const KB: u64 = 1024;
+
+    /// Feed `meter` `rate` bytes per second for `secs` seconds.
+    fn run(meter: &mut smartloop::model::downloader::ranges::ConnectionMeter, now: &parking_lot::Mutex<Duration>, rate: u64, secs: u64) {
+        for _ in 0..secs {
+            *now.lock() += Duration::from_secs(1);
+            meter.add(rate);
+        }
+    }
+
+    #[test]
+    fn test_a_new_connection_is_not_judged() {
+        let (clock, now) = manual_clock();
+        let stats = TransferStats::new(clock);
+        let mut meter = stats.open();
+        run(&mut meter, &now, 1, RATE_WINDOW.as_secs() - 1);
+        assert_eq!(meter.slowness(), None);
+    }
+
+    #[test]
+    fn test_a_trickle_is_stalled() {
+        let (clock, now) = manual_clock();
+        let stats = TransferStats::new(clock);
+        let mut meter = stats.open();
+        run(&mut meter, &now, 8 * KB, RATE_WINDOW.as_secs());
+        assert!(matches!(meter.slowness(), Some(Slowness::Stalled { .. })));
+    }
+
+    #[test]
+    fn test_a_connection_far_behind_its_peers_is_slow() {
+        let (clock, now) = manual_clock();
+        let stats = TransferStats::new(clock);
+        let mut fast: Vec<_> = (0..3).map(|_| stats.open()).collect();
+        let mut slow = stats.open();
+        for _ in 0..RATE_WINDOW.as_secs() {
+            *now.lock() += Duration::from_secs(1);
+            for meter in &mut fast {
+                meter.add(4 * MB);
+            }
+            slow.add(512 * KB);
+        }
+        assert!(matches!(slow.slowness(), Some(Slowness::BehindPeers { .. })));
+        assert_eq!(fast[0].slowness(), None);
+        assert!(stats.total_rate() > 12.0 * MB as f64);
+    }
+
+    #[test]
+    fn test_a_link_that_is_slow_for_everyone_is_left_alone() {
+        let (clock, now) = manual_clock();
+        let stats = TransferStats::new(clock);
+        let mut meters: Vec<_> = (0..4).map(|_| stats.open()).collect();
+        for _ in 0..RATE_WINDOW.as_secs() {
+            *now.lock() += Duration::from_secs(1);
+            for meter in &mut meters {
+                meter.add(40 * KB);
+            }
+        }
+        assert!(meters.iter_mut().all(|m| m.slowness().is_none()));
+    }
+
+    #[test]
+    fn test_one_peer_is_not_enough_to_compare_against() {
+        let (clock, now) = manual_clock();
+        let stats = TransferStats::new(clock);
+        let mut fast = stats.open();
+        let mut slow = stats.open();
+        for _ in 0..RATE_WINDOW.as_secs() {
+            *now.lock() += Duration::from_secs(1);
+            fast.add(4 * MB);
+            slow.add(64 * KB);
+        }
+        assert_eq!(slow.slowness(), None);
+    }
+
+    #[test]
+    fn test_a_closed_connection_stops_counting_as_a_peer() {
+        let (clock, now) = manual_clock();
+        let stats = TransferStats::new(clock);
+        let mut fast: Vec<_> = (0..2).map(|_| stats.open()).collect();
+        let mut slow = stats.open();
+        for _ in 0..RATE_WINDOW.as_secs() {
+            *now.lock() += Duration::from_secs(1);
+            for meter in &mut fast {
+                meter.add(4 * MB);
+            }
+            slow.add(512 * KB);
+        }
+        fast.pop();
+        assert_eq!(slow.slowness(), None);
+    }
+}
