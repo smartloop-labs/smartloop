@@ -336,3 +336,56 @@ mod test_chunked_resume {
         assert_eq!(resumable_bytes(&tmp.path().join("none.part"), &server.info()), 0);
     }
 }
+
+/// Free space is checked before the first byte is fetched.
+mod test_disk_space {
+    use std::sync::Arc;
+
+    use smartloop::model::downloader::artifact_downloader::{SLPArtifactDownloader, is_disk_full};
+    use smartloop::model::downloader::artifact_source::ArtifactMap;
+
+    use crate::shared::model_fakes::{RangeServer, test_logger};
+
+    fn download(server: &Arc<RangeServer>, dir: &std::path::Path, free: u64) -> Result<std::path::PathBuf, smartloop::model::downloader::artifact_downloader::DownloadError> {
+        let dl = SLPArtifactDownloader::for_tests(None, test_logger(), None).with_http(Arc::clone(server) as _);
+        dl.cancel_token().set_instant_wait(true);
+        dl.set_connections(Some(2));
+        dl.set_chunked_threshold(Some(1));
+        dl.set_free_space(Some(free));
+        let mut artifacts = ArtifactMap::new();
+        artifacts.insert("w.gguf".to_string(), "https://x/w".to_string());
+        dl.download_artifacts(&artifacts, dir, None, "Model", dir, "w")
+    }
+
+    #[test]
+    fn test_too_little_space_fails_before_any_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = RangeServer::new(vec![1u8; 4000]);
+        let err = download(&server, tmp.path(), 3000).unwrap_err();
+        assert!(is_disk_full(&err));
+        assert!(err.to_string().contains("Not enough disk space"), "{err}");
+        assert_eq!(smartloop::api::routers::_errors::status_for(&err), 507);
+        assert!(server.ranges().is_empty());
+        assert!(!tmp.path().join("w.gguf.part").exists());
+    }
+
+    #[test]
+    fn test_bytes_a_resume_already_has_are_not_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = RangeServer::new((0..4000u32).map(|i| i as u8).collect());
+        *server.cut_at.lock() = Some(3000);
+        assert!(download(&server, tmp.path(), 1 << 20).is_err());
+
+        *server.cut_at.lock() = None;
+        download(&server, tmp.path(), 1100).unwrap();
+        assert_eq!(std::fs::read(tmp.path().join("w.gguf")).unwrap(), server.data);
+    }
+
+    #[test]
+    fn test_enough_space_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = RangeServer::new(vec![1u8; 4000]);
+        download(&server, tmp.path(), 4100).unwrap();
+        assert!(tmp.path().join("w.gguf").exists());
+    }
+}

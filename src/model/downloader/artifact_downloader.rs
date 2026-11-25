@@ -1015,6 +1015,7 @@ pub struct SLPArtifactDownloader {
     min_split_override: Mutex<Option<u64>>,
     /// The tuner of the download in progress, unless the count is fixed.
     tuning: Mutex<Option<Arc<Tuning>>>,
+    free_space_override: Mutex<Option<u64>>,
 }
 
 impl SLPArtifactDownloader {
@@ -1049,6 +1050,7 @@ impl SLPArtifactDownloader {
             clock_override: Mutex::new(None),
             min_split_override: Mutex::new(None),
             tuning: Mutex::new(None),
+            free_space_override: Mutex::new(None),
         }
     }
 
@@ -1075,6 +1077,7 @@ impl SLPArtifactDownloader {
             clock_override: Mutex::new(None),
             min_split_override: Mutex::new(None),
             tuning: Mutex::new(None),
+            free_space_override: Mutex::new(None),
         }
     }
 
@@ -1137,6 +1140,43 @@ impl SLPArtifactDownloader {
     /// Tests only: override `MIN_SPLIT` (`None` restores the default).
     pub fn set_min_split(&self, bytes: Option<u64>) {
         *self.min_split_override.lock() = bytes;
+    }
+
+    /// Tests only: report this many free bytes (`None` asks the disk).
+    pub fn set_free_space(&self, bytes: Option<u64>) {
+        *self.free_space_override.lock() = bytes;
+    }
+
+    /// Free bytes on the volume holding `dir`, if it can be found.
+    fn free_space(&self, dir: &Path) -> Option<u64> {
+        if let Some(bytes) = *self.free_space_override.lock() {
+            return Some(bytes);
+        }
+        let dir = dir.canonicalize().ok()?;
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        disks
+            .list()
+            .iter()
+            .filter(|disk| dir.starts_with(disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().as_os_str().len())
+            .map(|disk| disk.available_space())
+    }
+
+    /// Fail up front when `dir`'s volume cannot hold `needed` more bytes.
+    fn check_free_space(&self, dir: &Path, needed: u64) -> DownloadResult<()> {
+        let Some(free) = self.free_space(dir) else {
+            return Ok(());
+        };
+        let wanted = needed + needed / 100; // 1% headroom
+        if free >= wanted {
+            return Ok(());
+        }
+        let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        Err(classified(
+            format!("Not enough disk space: the download needs {:.1} GB and {:.1} GB is free", gb(wanted), gb(free)),
+            true,
+        )
+        .with_cause(std::io::Error::from_raw_os_error(libc::ENOSPC).into()))
     }
 
     /// Tests only: read time from `clock` (`None` restores real time).
@@ -1397,6 +1437,7 @@ impl SLPArtifactDownloader {
             .iter()
             .map(|p| p.info.size.saturating_sub(resumable_bytes(&part_path(local_dir, &p.filename), &p.info)))
             .sum();
+        self.check_free_space(local_dir, remaining)?;
         let fixed = *self.connections_override.lock();
         let permits = ConnectionPermits::new(fixed.unwrap_or_else(|| starting_connections(remaining)));
         let stats = TransferStats::new(self.clock());
