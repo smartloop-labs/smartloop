@@ -37,6 +37,7 @@ mod test_document_fanout;
 mod test_document_path_disclosure;
 mod test_download_cancel;
 mod test_download_registry;
+mod test_download_resume;
 mod test_download_retry;
 mod test_embedding_device;
 mod test_embedding_gguf_source;
