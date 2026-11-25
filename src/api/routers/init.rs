@@ -684,7 +684,8 @@ where
 /// `artifacts` carries a signed-URL map already resolved by the caller (see
 /// [`SLPArtifactDownloader::resolve_artifacts`]), so entitlement is settled
 /// before this stream opens and the URLs are minted once.  Progress frames
-/// are throttled to one per file per 0.5s (completed frames always pass); a
+/// are throttled to one per file per 0.5s (verifying and completed frames
+/// always pass); a
 /// keepalive is emitted after ~5s of silence.  A non-bootstrap download
 /// claims/releases the cancel registration on the download thread, and a
 /// cancelled download discards its partial bytes before re-raising
@@ -712,7 +713,7 @@ where
                 let now = Instant::now();
                 {
                     let mut last = last.lock();
-                    if progress.status != "completed" {
+                    if progress.status == "downloading" {
                         if let Some(prev) = last.get(&progress.filename) {
                             if now.duration_since(*prev) < Duration::from_millis(500) {
                                 return;
@@ -722,15 +723,16 @@ where
                     last.insert(progress.filename.clone(), now);
                 }
                 let mut d = progress.to_dict();
-                d["status"] = json!("downloading");
+                let verifying = progress.status == "verifying";
+                d["status"] = json!(if verifying { "verifying" } else { "downloading" });
                 if progress.total > 0 {
                     let percent = round1(progress.downloaded as f64 / progress.total as f64 * 100.0);
                     d["percent"] = json!(percent);
-                    d["message"] = json!(format!(
-                        "Downloading {}... {}%",
-                        progress.filename,
-                        py_float_str(percent)
-                    ));
+                    d["message"] = json!(if verifying {
+                        format!("Verifying {}...", progress.filename)
+                    } else {
+                        format!("Downloading {}... {}%", progress.filename, py_float_str(percent))
+                    });
                 }
                 queue.lock().push_back(d);
             })

@@ -1588,6 +1588,9 @@ impl SLPArtifactDownloader {
                 break;
             };
 
+            if let Some(callback) = &progress_callback {
+                callback(DownloadProgress::new(flat_name, size, size, "verifying"));
+            }
             let got = match digest::verify(&part, expected, Some(&self.cancel_token()))? {
                 Verdict::Match => break,
                 Verdict::Unverifiable => {

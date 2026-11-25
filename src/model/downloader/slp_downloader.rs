@@ -18,7 +18,8 @@ pub struct DownloadProgress {
     pub filename: String,
     pub downloaded: u64,
     pub total: u64,
-    /// `"downloading"` (default) or `"completed"`.
+    /// `"downloading"` (default), `"verifying"` (checking the finished bytes
+    /// against the server's digest) or `"completed"`.
     pub status: String,
 }
 
@@ -81,7 +82,10 @@ impl AggregateProgress {
         if self.total > 0 {
             downloaded = downloaded.min(self.total);
         }
-        callback(DownloadProgress::new(self.label.clone(), downloaded, self.total, "downloading"));
+        // A file being checked after its last byte reports that, so the bar
+        // does not look stuck while a large file is hashed.
+        let status = if progress.status == "verifying" { "verifying" } else { "downloading" };
+        callback(DownloadProgress::new(self.label.clone(), downloaded, self.total, status));
     }
 
     /// Emit a terminal 100% `completed` event for the whole download.

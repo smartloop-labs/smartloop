@@ -85,3 +85,18 @@ fn test_verifying_honours_a_cancel() {
     let digest = RemoteDigest::Md5("0".repeat(32));
     assert!(verify(&path, &digest, Some(&token)).unwrap_err().is_cancelled());
 }
+
+#[test]
+fn test_the_aggregate_bar_passes_verifying_through() {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use smartloop::model::downloader::slp_downloader::{AggregateProgress, DownloadProgress};
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let aggregate = AggregateProgress::new(10, Some(Arc::new(move |p: DownloadProgress| record.lock().push(p.status))), "M");
+    aggregate.call(DownloadProgress::new("a", 10, 10, "downloading"));
+    aggregate.call(DownloadProgress::new("a", 10, 10, "verifying"));
+    assert_eq!(*seen.lock(), vec!["downloading".to_string(), "verifying".to_string()]);
+}
