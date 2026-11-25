@@ -67,10 +67,8 @@ impl DownloadCancelled {
 
 /// This model is already downloading, so a second transfer was refused.
 ///
-/// Nothing serialized downloads on `model_id` before this: two calls wrote the
-/// same directory and each deleted the other's `.part` on its way in
-/// (`download_file` unlinks a pre-existing sidecar rather than resuming onto
-/// it), so both made progress and neither finished.
+/// Two transfers into one directory would write the same `.part` and its
+/// resume journal over each other.
 ///
 /// A `RuntimeError` subclass in Python; maps to HTTP 409.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
