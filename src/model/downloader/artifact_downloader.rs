@@ -165,6 +165,9 @@ pub enum TransportErrorKind {
     ReadTimeout,
     WriteTimeout,
     PoolTimeout,
+    /// The downloader dropped a connection that was far too slow; see
+    /// [`crate::model::downloader::ranges::Slowness`].
+    LowSpeed,
     Other,
 }
 
@@ -1248,6 +1251,11 @@ impl SLPArtifactDownloader {
             if !is_retryable_error(&exc) || failures >= MAX_DOWNLOAD_ATTEMPTS {
                 return Err(exc);
             }
+            if matches!(exc, DownloadError::Http(HttpError::Transport { kind: TransportErrorKind::LowSpeed, .. })) {
+                // Nothing is wrong with the server; ask again straight away.
+                self.logger.info(&format!("[slow] {exc}; reissuing"));
+                continue;
+            }
             let delay = backoff_delay(failures);
             self.logger.warning(&format!(
                 "[retry] {description} failed (attempt {failures}/{MAX_DOWNLOAD_ATTEMPTS}): {exc}. Retrying in {delay:.1}s"
@@ -1680,9 +1688,16 @@ impl SLPArtifactDownloader {
             let mut out = OpenOptions::new().read(true).write(true).open(dest)?;
             out.seek(SeekFrom::Start(cur_start))?;
             let mut meter = file.stats.open();
+            let mut slow = None;
             while let Some(mut chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
                 self.cancel_token().check(flat_name)?;
                 meter.add(chunk.len() as u64);
+                if let Some(why) = meter.slowness() {
+                    // Dropping `resp` closes the connection; the retry asks
+                    // again from the next unwritten byte on a fresh one.
+                    // What arrived in this read is still written below.
+                    slow = Some(why);
+                }
                 // Never write past the range, whatever the server sends.
                 let offset = start + written.get();
                 let room = end + 1 - offset;
@@ -1703,6 +1718,13 @@ impl SLPArtifactDownloader {
                 }
                 if start + written.get() > end {
                     break;
+                }
+                if let Some(why) = slow {
+                    return Err(HttpError::transport(
+                        TransportErrorKind::LowSpeed,
+                        format!("bytes {start}-{end} of {flat_name}: connection {why}"),
+                    )
+                    .into());
                 }
             }
             if start + written.get() <= end {

@@ -105,6 +105,12 @@ impl FakeResp {
         self
     }
 
+    /// Run `hook` with each chunk's index before handing it out.
+    pub fn with_on_chunk(mut self, hook: impl Fn(usize) + Send + 'static) -> Self {
+        self.on_chunk = Some(Box::new(hook));
+        self
+    }
+
     /// Add a response header.
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.insert(name.to_string(), value.to_string());

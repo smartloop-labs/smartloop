@@ -215,3 +215,42 @@ mod test_throughput {
         assert_eq!(slow.slowness(), None);
     }
 }
+
+/// A connection the meter calls slow is dropped and asked again.
+mod test_low_speed_abort {
+    use super::*;
+    use crate::shared::model_fakes::{FakeResp, ScriptedHttp, range_header};
+    use parking_lot::Mutex;
+    use smartloop::model::downloader::artifact_downloader::{DownloadError, HttpError, TransportErrorKind, is_retryable_error};
+
+    #[test]
+    fn test_a_stalled_connection_is_reissued_from_the_next_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("w.part");
+        std::fs::write(&dest, [0u8; 32]).unwrap();
+        let (clock, now) = manual_clock();
+        // 4 bytes every 10s: stalled once the 30s window is up, after CCCC.
+        let trickle = FakeResp::new(206, &[b"AAAA", b"BBBB", b"CCCC", b"DDDD", b"EEEE", b"FFFF"]).with_on_chunk({
+            let now = Arc::clone(&now);
+            move |_| *now.lock() += Duration::from_secs(10)
+        });
+        let rest = FakeResp::new(206, &[b"DDDDEEEEFFFFGGGGHHHH"]);
+        let http = ScriptedHttp::new(vec![trickle, rest]);
+        let dl = downloader(None, Some(Arc::clone(&http)));
+        dl.set_clock(Some(clock));
+
+        let counter = Mutex::new(0u64);
+        dl.download_chunk("https://x/w", &dest, 0, 31, "w.gguf", 32, &counter, None).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH");
+        let calls = http.header_calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1], range_header("bytes=12-31"));
+    }
+
+    #[test]
+    fn test_a_low_speed_abort_is_retryable() {
+        let err: DownloadError = HttpError::transport(TransportErrorKind::LowSpeed, "slow").into();
+        assert!(is_retryable_error(&err));
+    }
+}
