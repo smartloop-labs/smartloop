@@ -329,6 +329,24 @@ mod test_chunk_resume {
         assert_eq!(calls[0], range_header("bytes=0-7"));
         assert_eq!(calls[1], range_header("bytes=4-7"));
     }
+
+    /// A range gives up on a dead socket sooner than a whole-file stream: a
+    /// read that never returns is invisible to the low-speed check.
+    #[test]
+    fn test_ranges_use_the_tighter_read_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("big.bin");
+        std::fs::write(&dest, [0u8; 8]).unwrap();
+        let http = ScriptedHttp::new(vec![FakeResp::new(206, &[b"ABCDEFGH"])]);
+
+        let counter = Mutex::new(0u64);
+        let dl = downloader(None, Some(Arc::clone(&http)));
+        dl.download_chunk("http://x/file", &dest, 0, 7, "big.bin", 8, &counter, None).unwrap();
+
+        let timeout = http.timeout_calls.lock()[0];
+        assert_eq!(timeout, ad::RANGE_TIMEOUT);
+        assert!(timeout.read < STREAM_TIMEOUT.read);
+    }
 }
 
 /// A range response is used only when it is exactly the bytes asked for.

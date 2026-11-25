@@ -136,6 +136,11 @@ pub const STREAM_TIMEOUT: StreamTimeout = StreamTimeout {
     pool: Duration::from_secs(30),
 };
 
+/// Timeout of a chunked download's range requests.  A stalled range costs
+/// only a reissue from where it stopped, and a stall that never returns a
+/// read is invisible to the low-speed check, so the idle bound is tighter.
+pub const RANGE_TIMEOUT: StreamTimeout = StreamTimeout { read: Duration::from_secs(20), ..STREAM_TIMEOUT };
+
 /// Timeout of the HEAD probe (`httpx.head(..., timeout=30)`).
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -769,6 +774,8 @@ pub struct ReqwestDownloadHttp;
 static HEAD_CLIENT: OnceCell<reqwest::blocking::Client> = OnceCell::new();
 /// Shared streaming client for [`STREAM_TIMEOUT`].
 static STREAM_CLIENT: OnceCell<reqwest::blocking::Client> = OnceCell::new();
+/// Shared streaming client for [`RANGE_TIMEOUT`].
+static RANGE_CLIENT: OnceCell<reqwest::blocking::Client> = OnceCell::new();
 
 fn build_client(connect: Duration, io: Duration) -> Result<reqwest::blocking::Client, HttpError> {
     // The blocking client's `timeout` bounds each read of the body (and the
@@ -784,6 +791,9 @@ fn build_client(connect: Duration, io: Duration) -> Result<reqwest::blocking::Cl
 fn stream_client(timeout: StreamTimeout) -> Result<reqwest::blocking::Client, HttpError> {
     if timeout == STREAM_TIMEOUT {
         return STREAM_CLIENT.get_or_try_init(|| build_client(timeout.connect, timeout.read)).cloned();
+    }
+    if timeout == RANGE_TIMEOUT {
+        return RANGE_CLIENT.get_or_try_init(|| build_client(timeout.connect, timeout.read)).cloned();
     }
     build_client(timeout.connect, timeout.read)
 }
@@ -1753,7 +1763,7 @@ impl SLPArtifactDownloader {
             if let Some(validator) = &file.if_range {
                 headers.insert("If-Range".to_string(), validator.clone());
             }
-            let mut resp = self.http.stream(url, &headers, STREAM_TIMEOUT)?;
+            let mut resp = self.http.stream(url, &headers, RANGE_TIMEOUT)?;
             if resp.status_code() == 401 {
                 return Err(StaleDownloadURLError(UNAUTHORIZED_MSG.to_string()).into());
             }

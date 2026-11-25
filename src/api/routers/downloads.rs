@@ -36,7 +36,7 @@ pub const LOG_TARGET: &str = "smartloop.api.routers.downloads";
 /// Upper bound on the optional synchronous wait.  Long enough to cover the
 /// usual case — threads stop at the next 1-8MB chunk boundary and the tree is
 /// removed — without letting a caller hold a worker for the 60s a stalled
-/// socket can take (`STREAM_TIMEOUT.read`).
+/// socket can take (`STREAM_TIMEOUT.read`; `RANGE_TIMEOUT.read` for a range).
 pub const MAX_WAIT_MS: i64 = 5000;
 
 /// Query string of `DELETE /v1/downloads/{model_name}`.
