@@ -27,6 +27,7 @@ use crate::model::downloader::artifact_source::{
 };
 use crate::model::downloader::cancellation::{CancelToken, DownloadCancelled};
 use crate::model::downloader::inflight::downloading;
+use crate::model::downloader::ranges::{ConnectionPermits, MAX_CONNECTIONS, starting_connections};
 use crate::model::downloader::resume::{IntervalSet, Journal, ResumeState};
 use crate::model::downloader::slp_downloader::{
     AggregateProgress, DownloadProgress, DownloadStubCall, ProgressCallback, SLPDownloader, SharedLogger,
@@ -40,19 +41,10 @@ fn cpu_count() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
 
-/// Total concurrent connections budget (`min(32, cpu_count * 2)`).
-pub fn io_thread_budget() -> usize {
-    32.min(cpu_count() * 2)
-}
-
-/// Parallel file downloads (`min(4, cpu_count)`; capped: I/O-bound).
+/// Parallel file downloads (`min(4, cpu_count)`).  Connections are budgeted
+/// separately, across all files, by [`ConnectionPermits`].
 pub fn max_workers() -> usize {
     4.min(cpu_count())
-}
-
-/// Parallel chunk downloads per file (`max(2, io_thread_budget / max_workers)`).
-pub fn chunk_workers() -> usize {
-    2.max(io_thread_budget() / max_workers())
 }
 
 /// 8 MB read buffer for simple downloads (and MD5 reads).
@@ -934,6 +926,49 @@ where
     })
 }
 
+/// Run `work` on `threads` threads, each calling it until it returns `None`,
+/// and hand every result to `handle` as it lands.  `handle` returning
+/// `Some(err)` stops consuming and returns that error; work already running
+/// still finishes before this returns.
+fn run_workers<R, W, H>(threads: usize, work: W, mut handle: H) -> Option<DownloadError>
+where
+    R: Send,
+    W: Fn() -> Option<R> + Sync,
+    H: FnMut(R) -> Option<DownloadError>,
+{
+    if threads == 0 {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel::<R>();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let work = &work;
+            scope.spawn(move || {
+                while let Some(result) = work() {
+                    let _ = tx.send(result);
+                }
+            });
+        }
+        drop(tx);
+        for result in rx.iter() {
+            if let Some(err) = handle(result) {
+                return Some(err);
+            }
+        }
+        None
+    })
+}
+
+/// Clears the download's shared connection pool when dropped.
+struct ClearOnDrop<'a>(&'a Mutex<Option<Arc<ConnectionPermits>>>);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        *self.0.lock() = None;
+    }
+}
+
 /// Download model artifacts from URLs provided by an ArtifactSource.
 ///
 /// Fetches signed URLs via artifact sources, then downloads all files in
@@ -953,8 +988,10 @@ pub struct SLPArtifactDownloader {
     download_artifacts_hook: Mutex<Option<DownloadArtifactsHook>>,
     makedirs_hook: Mutex<Option<MakedirsHook>>,
     download_chunk_hook: Mutex<Option<DownloadChunkHook>>,
-    chunk_workers_override: Mutex<Option<usize>>,
+    connections_override: Mutex<Option<usize>>,
     chunked_threshold_override: Mutex<Option<u64>>,
+    /// The connection pool of the download in progress, shared by its files.
+    permits: Mutex<Option<Arc<ConnectionPermits>>>,
 }
 
 impl SLPArtifactDownloader {
@@ -982,8 +1019,9 @@ impl SLPArtifactDownloader {
             download_artifacts_hook: Mutex::new(None),
             makedirs_hook: Mutex::new(None),
             download_chunk_hook: Mutex::new(None),
-            chunk_workers_override: Mutex::new(None),
+            connections_override: Mutex::new(None),
             chunked_threshold_override: Mutex::new(None),
+            permits: Mutex::new(None),
         }
     }
 
@@ -1003,8 +1041,9 @@ impl SLPArtifactDownloader {
             download_artifacts_hook: Mutex::new(None),
             makedirs_hook: Mutex::new(None),
             download_chunk_hook: Mutex::new(None),
-            chunk_workers_override: Mutex::new(None),
+            connections_override: Mutex::new(None),
             chunked_threshold_override: Mutex::new(None),
+            permits: Mutex::new(None),
         }
     }
 
@@ -1057,9 +1096,26 @@ impl SLPArtifactDownloader {
         *self.download_chunk_hook.lock() = hook;
     }
 
-    /// Tests only: override `CHUNK_WORKERS` (`None` restores the default).
-    pub fn set_chunk_workers(&self, workers: Option<usize>) {
-        *self.chunk_workers_override.lock() = workers;
+    /// Tests only: use exactly this many connections, shared by every file
+    /// of a download (`None` restores the size-based start).
+    pub fn set_connections(&self, connections: Option<usize>) {
+        *self.connections_override.lock() = connections;
+        *self.permits.lock() = None;
+    }
+
+    /// The connection pool for a download of `remaining` bytes: the one the
+    /// running download set up, else a new one started by size.
+    fn connection_permits(&self, remaining: u64) -> Arc<ConnectionPermits> {
+        let mut slot = self.permits.lock();
+        if let Some(permits) = slot.as_ref() {
+            return Arc::clone(permits);
+        }
+        let fixed = *self.connections_override.lock();
+        let permits = ConnectionPermits::new(fixed.unwrap_or_else(|| starting_connections(remaining)));
+        if fixed.is_some() {
+            *slot = Some(Arc::clone(&permits));
+        }
+        permits
     }
 
     /// Tests only: override `CHUNKED_THRESHOLD` (`None` restores the default).
@@ -1260,7 +1316,20 @@ impl SLPArtifactDownloader {
 
         let total_bytes: u64 = pending.iter().map(|p| p.info.size).sum();
         let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
-        self.logger.info(&format!("Downloading {} file(s), {total_mb:.1} MB total", pending.len()));
+        let remaining: u64 = pending
+            .iter()
+            .map(|p| p.info.size.saturating_sub(resumable_bytes(&part_path(local_dir, &p.filename), &p.info)))
+            .sum();
+        let fixed = *self.connections_override.lock();
+        let permits = ConnectionPermits::new(fixed.unwrap_or_else(|| starting_connections(remaining)));
+        *self.permits.lock() = Some(Arc::clone(&permits));
+        let _clear_permits = ClearOnDrop(&self.permits);
+        self.logger.info(&format!(
+            "Downloading {} file(s), {total_mb:.1} MB total, {:.1} MB to fetch, starting with {} connection(s)",
+            pending.len(),
+            remaining as f64 / (1024.0 * 1024.0),
+            permits.limit()
+        ));
 
         // Roll the parallel per-file progress up into a single 0->100% bar so
         // the client sees one download, not the files fighting over the meter.
@@ -1339,7 +1408,7 @@ impl SLPArtifactDownloader {
             Err(e) if caused_by_source_change(&e) => {
                 let flat_name = basename(filename);
                 self.logger.warning(&format!("[resume] {flat_name} changed on the server; starting it over: {e}"));
-                discard_part(&PathBuf::from(format!("{}.part", local_dir.join(flat_name).display())))?;
+                discard_part(&part_path(local_dir, filename))?;
                 let info = self.get_remote_file_info(url)?;
                 self.download_file_once(filename, url, local_dir, &info, progress_callback)
             }
@@ -1363,7 +1432,7 @@ impl SLPArtifactDownloader {
         self.cancel_token().check(flat_name)?;
 
         let dest = local_dir.join(flat_name);
-        let part = PathBuf::from(format!("{}.part", dest.display()));
+        let part = part_path(local_dir, filename);
         let size_mb = size as f64 / (1024.0 * 1024.0);
         let threshold = self.chunked_threshold_override.lock().unwrap_or(CHUNKED_THRESHOLD);
         let chunked = info.accept_ranges && size >= threshold;
@@ -1381,6 +1450,9 @@ impl SLPArtifactDownloader {
             } else {
                 let reason = if !info.accept_ranges { "no Range support" } else { "below threshold" };
                 self.logger.info(&format!("Downloading {flat_name} ({size_mb:.1} MB) single-stream ({reason})"));
+                let token = self.cancel_token();
+                let _permit = self.connection_permits(size).acquire(|| token.cancelled());
+                self.cancel_token().check(flat_name)?;
                 self.download_file_simple(flat_name, url, &part, size, progress_callback.clone(), info.accept_ranges)?;
             }
 
@@ -1581,11 +1653,6 @@ impl SLPArtifactDownloader {
         self.run_with_retries(&format!("chunk {start}-{end} of {flat_name}"), &mut attempt)
     }
 
-    /// `CHUNK_WORKERS`, or the test override.
-    fn effective_chunk_workers(&self) -> usize {
-        self.chunk_workers_override.lock().unwrap_or_else(chunk_workers).max(1)
-    }
-
     /// Download a large file using parallel Range requests into `dest`.
     ///
     /// Picks up from `dest`'s `.part.state` journal when it describes this
@@ -1629,18 +1696,19 @@ impl SLPArtifactDownloader {
 
         // Small ranges on a shared queue, so every connection stays busy to
         // the end (see SEGMENT_SIZE).
-        let workers = self.effective_chunk_workers() as u64;
-        let chunks = segments_of(&done.missing(size), workers);
+        let permits = self.connection_permits(size - done.len_bytes());
+        let workers = permits.limit();
+        let chunks = segments_of(&done.missing(size), workers as u64);
         let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
         if done.is_empty() {
             self.logger.info(&format!(
-                "Downloading {flat_name} ({:.1} MB) over {workers} connections in {} ranges",
+                "Downloading {flat_name} ({:.1} MB) over up to {workers} connections in {} ranges",
                 mb(size),
                 chunks.len()
             ));
         } else {
             self.logger.info(&format!(
-                "Resuming {flat_name}: {:.1} of {:.1} MB already on disk, {} ranges left over {workers} connections",
+                "Resuming {flat_name}: {:.1} of {:.1} MB already on disk, {} ranges left",
                 mb(done.len_bytes()),
                 mb(size),
                 chunks.len()
@@ -1666,14 +1734,16 @@ impl SLPArtifactDownloader {
         // download fails: the ranges still queued are skipped, rather than
         // fetching the rest of the file before the error is reported.
         let failed = AtomicBool::new(false);
+        let queue = Mutex::new(chunks.into_iter().collect::<VecDeque<_>>());
+        let threads = self.connections_override.lock().unwrap_or(MAX_CONNECTIONS).min(queue.lock().len());
+        let token = self.cancel_token();
 
-        let raised = run_pool(
-            workers as usize,
-            chunks,
-            |(start, end)| {
-                if failed.load(Ordering::SeqCst) {
-                    return ((start, end), Ok(()));
-                }
+        let raised = run_workers(
+            threads,
+            || {
+                let _permit =
+                    permits.acquire(|| failed.load(Ordering::SeqCst) || token.cancelled() || queue.lock().is_empty())?;
+                let (start, end) = queue.lock().pop_front()?;
                 let result = match &hook {
                     Some(hook) => hook(start, end),
                     None => self.fetch_range(&file, start, end),
@@ -1681,7 +1751,7 @@ impl SLPArtifactDownloader {
                 if result.is_err() {
                     failed.store(true, Ordering::SeqCst);
                 }
-                ((start, end), result)
+                Some(((start, end), result))
             },
             |((start, end), result)| match result {
                 Ok(()) => None,
@@ -1705,6 +1775,12 @@ impl SLPArtifactDownloader {
                 }
             },
         );
+        // A cancel raised while waiting for a connection never reaches a
+        // range, so surface it here.
+        let raised = match raised {
+            None if token.cancelled() => Some(DownloadError::from(token.check(flat_name).unwrap_err())),
+            other => other,
+        };
 
         // A cancel discards the whole tree, so a final flush would only
         // delay it; anything else keeps what arrived for the next attempt.
@@ -1966,6 +2042,21 @@ fn caused_by_source_change(err: &DownloadError) -> bool {
         current = e.cause();
     }
     false
+}
+
+/// `<local_dir>/<basename>.part`.
+fn part_path(local_dir: &Path, filename: &str) -> PathBuf {
+    PathBuf::from(format!("{}.part", local_dir.join(basename(filename)).display()))
+}
+
+/// Bytes of `info`'s object a resume of `part` would not need to fetch.
+pub fn resumable_bytes(part: &Path, info: &RemoteFileInfo) -> u64 {
+    ResumeState::load(part)
+        .filter(|saved| {
+            saved.same_object(info.size, info.etag.as_deref(), info.last_modified.as_deref())
+                && std::fs::metadata(part).is_ok_and(|m| m.len() == info.size)
+        })
+        .map_or(0, |saved| saved.done_set().len_bytes())
 }
 
 /// Create `dest` as a `size`-byte file to write ranges into.

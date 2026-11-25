@@ -143,7 +143,7 @@ mod test_chunked_resume {
     fn downloader(server: &Arc<RangeServer>, workers: usize) -> SLPArtifactDownloader {
         let dl = SLPArtifactDownloader::for_tests(None, test_logger(), None).with_http(Arc::clone(server) as _);
         dl.cancel_token().set_instant_wait(true);
-        dl.set_chunk_workers(Some(workers));
+        dl.set_connections(Some(workers));
         dl
     }
 
@@ -319,5 +319,20 @@ mod test_chunked_resume {
         let requests = server.requests.lock().clone();
         assert_eq!(requests[0], ("bytes=24-39".to_string(), Some("\"v1\"".to_string())));
         assert_eq!(requests.last().unwrap(), &("bytes=0-39".to_string(), Some("\"v2\"".to_string())));
+    }
+
+    #[test]
+    fn test_resumable_bytes_count_only_a_matching_journal() {
+        use smartloop::model::downloader::artifact_downloader::resumable_bytes;
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("w.gguf.part");
+        let server = RangeServer::new(data(40));
+        *server.cut_at.lock() = Some(24);
+        assert!(fetch(&server, &part).is_err());
+
+        assert_eq!(resumable_bytes(&part, &server.info()), 24);
+        let other = RemoteFileInfo { etag: Some("\"v2\"".to_string()), ..server.info() };
+        assert_eq!(resumable_bytes(&part, &other), 0);
+        assert_eq!(resumable_bytes(&tmp.path().join("none.part"), &server.info()), 0);
     }
 }

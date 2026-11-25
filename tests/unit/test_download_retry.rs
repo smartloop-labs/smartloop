@@ -556,7 +556,7 @@ mod test_chunked_failure_keeps_its_kind {
     fn chunked(exc: fn() -> DownloadError) -> DownloadError {
         let tmp = tempfile::tempdir().unwrap();
         let dl = downloader(None, None);
-        dl.set_chunk_workers(Some(1));
+        dl.set_connections(Some(1));
         dl.set_download_chunk_hook(Some(Arc::new(move |_start, _end| Err(exc()))));
         dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), &RemoteFileInfo::sized(1024), None)
             .unwrap_err()
@@ -613,7 +613,7 @@ mod test_ranges_keep_every_connection_busy {
     fn test_every_range_is_fetched_once() {
         let tmp = tempfile::tempdir().unwrap();
         let dl = downloader(None, None);
-        dl.set_chunk_workers(Some(3));
+        dl.set_connections(Some(3));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = seen.clone();
         dl.set_download_chunk_hook(Some(Arc::new(move |start, end| {
@@ -631,7 +631,7 @@ mod test_ranges_keep_every_connection_busy {
     fn test_a_failed_range_stops_the_rest_of_the_queue() {
         let tmp = tempfile::tempdir().unwrap();
         let dl = downloader(None, None);
-        dl.set_chunk_workers(Some(1));
+        dl.set_connections(Some(1));
         let calls = Arc::new(Mutex::new(0usize));
         let count = calls.clone();
         dl.set_download_chunk_hook(Some(Arc::new(move |_start, _end| {

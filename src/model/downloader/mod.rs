@@ -5,6 +5,7 @@ pub mod artifact_source;
 pub mod cancellation;
 pub mod hf_downloader;
 pub mod inflight;
+pub mod ranges;
 pub mod resume;
 pub mod slp_downloader;
 
