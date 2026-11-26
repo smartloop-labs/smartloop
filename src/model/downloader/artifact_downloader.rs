@@ -1682,8 +1682,14 @@ impl SLPArtifactDownloader {
             if let Some(callback) = &progress_callback {
                 callback(DownloadProgress::new(flat_name, size, size, "verifying"));
             }
+            self.logger.info(&format!("[verify] {flat_name}: checking {size_mb:.1} MB against its ETag"));
+            let started = std::time::Instant::now();
             let got = match digest::verify(&part, expected, Some(&self.cancel_token()))? {
-                Verdict::Match => break,
+                Verdict::Match => {
+                    let secs = started.elapsed().as_secs_f64();
+                    self.logger.info(&format!("[verify] {flat_name}: verified in {secs:.1}s"));
+                    break;
+                }
                 Verdict::Unverifiable => {
                     self.logger.warning(&format!(
                         "[verify] {flat_name}: no part size reproduces the ETag {expected}; not verified"
