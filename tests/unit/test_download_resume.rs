@@ -172,6 +172,45 @@ mod test_chunked_resume {
         assert_eq!(server.ranges(), vec!["bytes=24-39".to_string()]);
     }
 
+    /// A shutdown stops the transfer but saves what arrived, so the next run
+    /// fetches only the rest.
+    #[test]
+    fn test_an_interrupted_download_keeps_its_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("w.gguf.part");
+        let server = RangeServer::new(data(40));
+        let dl = downloader(&server, 1);
+        let token = dl.cancel_token();
+        let progress: smartloop::model::downloader::slp_downloader::ProgressCallback =
+            Arc::new(move |p| if p.downloaded >= 16 { token.interrupt() });
+
+        let err = dl.download_file_chunked("w.gguf", "https://x/w", &part, &server.info(), Some(progress)).unwrap_err();
+        assert!(err.is_cancelled());
+        let saved = ResumeState::load(&part).expect("progress was saved");
+        let kept = IntervalSet::from_spans(saved.done.iter().map(|[a, b]| (*a, *b)));
+        assert!(kept.len_bytes() >= 16 && kept.len_bytes() < 40, "kept {:?}", saved.done);
+
+        server.requests.lock().clear();
+        fetch(&server, &part).unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), server.data);
+        assert_ne!(server.ranges(), vec!["bytes=0-39".to_string()]);
+    }
+
+    /// A user's cancel discards the tree anyway, so it doesn't stop to save.
+    #[test]
+    fn test_a_cancelled_download_does_not_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("w.gguf.part");
+        let server = RangeServer::new(data(40));
+        let dl = downloader(&server, 1);
+        let token = dl.cancel_token();
+        let progress: smartloop::model::downloader::slp_downloader::ProgressCallback =
+            Arc::new(move |p| if p.downloaded >= 16 { token.cancel() });
+
+        assert!(dl.download_file_chunked("w.gguf", "https://x/w", &part, &server.info(), Some(progress)).is_err());
+        assert!(ResumeState::load(&part).is_none_or(|s| s.done.is_empty()));
+    }
+
     #[test]
     fn test_a_changed_object_starts_over() {
         let tmp = tempfile::tempdir().unwrap();

@@ -651,10 +651,21 @@ where
     // stops a download" true rather than merely intended.
     let token = cancellation::begin(model_id)?;
     let _registration = Registration { model_id: model_id.to_string(), token: token.clone() };
-    downloader.set_cancel_token(token);
+    downloader.set_cancel_token(token.clone());
 
     let result = downloader.download(model_id, Some(on_progress), artifacts);
     if let Err(e) = &result {
+        if py_error_kind_of(e) == PyErrorKind::Cancelled && token.interrupted() {
+            // The server is shutting down: keep the bytes for the next run to
+            // resume, and answer as a retryable failure rather than a cancel
+            // the user didn't ask for.
+            tracing::info!(target: LOG_TARGET, "[resume] {model_id}: interrupted by shutdown, progress kept");
+            return Err(anyhow::Error::new(HTTPException::new(
+                503,
+                "Download interrupted because the server is shutting down. Enable the model again to resume it."
+                    .to_string(),
+            )));
+        }
         if py_error_kind_of(e) == PyErrorKind::Cancelled {
             // Before the registration is released, which is the point of
             // doing it here: the registration is what keeps a second download

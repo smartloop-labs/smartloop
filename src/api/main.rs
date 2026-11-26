@@ -1156,6 +1156,21 @@ async fn shutdown_signal(requested: Option<Arc<Notify>>) -> ServeExit {
     }
 }
 
+/// Start winding down once a shutdown signal arrives.
+///
+/// Graceful shutdown waits for open responses, and a model download is one
+/// for as long as it runs, so running downloads are interrupted: they stop at
+/// the next chunk and keep their bytes for the next run to resume.
+fn begin_shutdown() {
+    let interrupted = crate::model::downloader::cancellation::interrupt_all();
+    if interrupted > 0 {
+        tracing::info!(
+            target: LogTarget::SERVER,
+            "Interrupting {interrupted} download(s); they resume on the next run"
+        );
+    }
+}
+
 /// Log one request in common access-log form, with tokens redacted
 /// from the request line.
 async fn access_log(request: Request, next: Next) -> Response {
@@ -1220,6 +1235,7 @@ pub async fn serve_listener(
             let reason = shutdown_signal(shutdown).await;
             *exit_slot.lock() = reason;
             tracing::info!(target: LogTarget::SERVER, "Shutting down");
+            begin_shutdown();
         })
         .await;
 
@@ -1285,6 +1301,7 @@ pub async fn serve_on(host: &str, port: u16, shutdown: Option<Arc<Notify>>) -> a
             let reason = shutdown_signal(shutdown).await;
             *exit_slot.lock() = reason;
             tracing::info!(target: LogTarget::SERVER, "Shutting down");
+            begin_shutdown();
         })
         .await;
 

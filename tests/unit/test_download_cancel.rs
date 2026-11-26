@@ -356,3 +356,33 @@ mod test_the_head_probe {
         assert!(ad::is_transient_error(&err));
     }
 }
+
+/// A shutdown interrupts every running download, which keeps its bytes.
+mod test_interrupt {
+    use serial_test::serial;
+    use smartloop::model::downloader::cancellation;
+
+    /// Serial with the registry tests, which reset the shared registry.
+    #[test]
+    #[serial]
+    fn test_interrupt_all_stops_every_registered_download() {
+        let a = cancellation::begin_with_wait("test-interrupt/a", 0.0).unwrap();
+        let b = cancellation::begin_with_wait("test-interrupt/b", 0.0).unwrap();
+
+        assert!(cancellation::interrupt_all() >= 2);
+
+        for token in [&a, &b] {
+            assert!(token.cancelled());
+            assert!(token.interrupted());
+        }
+        cancellation::end("test-interrupt/a", &a);
+        cancellation::end("test-interrupt/b", &b);
+    }
+
+    #[test]
+    fn test_a_plain_cancel_is_not_an_interrupt() {
+        let token = super::cancelled_token();
+        assert!(token.cancelled());
+        assert!(!token.interrupted());
+    }
+}

@@ -2078,9 +2078,10 @@ impl SLPArtifactDownloader {
         };
 
         // A cancel discards the whole tree, so a final flush would only
-        // delay it; anything else keeps what arrived for the next attempt.
+        // delay it; anything else, an interrupt included, keeps what arrived
+        // for the next attempt.
         if let Some(journal) = &file.journal {
-            if !raised.as_ref().is_some_and(DownloadError::is_cancelled) {
+            if !raised.as_ref().is_some_and(DownloadError::is_cancelled) || token.interrupted() {
                 if let Err(e) = journal.flush() {
                     self.logger.warning(&format!("[resume] could not save progress of {flat_name}: {e}"));
                 }

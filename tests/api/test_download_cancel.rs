@@ -557,6 +557,64 @@ mod test_the_init_stream_answers_a_cancel {
 /// stream causes there would unregister a download still consuming bandwidth,
 /// and the user's next cancel would be answered `not_found`.
 ///
+/// A shutdown interrupts the download.  Unlike the user's cancel it keeps the
+/// partial bytes for the next run, and the stream says it can be retried.
+mod test_the_init_stream_answers_a_shutdown {
+    use super::*;
+
+    impl Fixture {
+        /// The transfer is running when the server shuts down.
+        fn interrupted_download(&self) {
+            self.downloads.set_download(Arc::new(|_call: DownloadStubCall| {
+                assert_eq!(cancellation::interrupt_all(), 1);
+                Err(DownloadCancelled::new("download cancelled").into())
+            }));
+            let mut artifacts = ArtifactMap::new();
+            artifacts.insert("weights.gguf".to_string(), "https://x/f".to_string());
+            self.downloads.resolve_to(artifacts);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_it_keeps_the_partial_bytes() {
+        let fx = Fixture::new(true);
+        fx.interrupted_download();
+        let model_dir = fx.partial_download();
+
+        fx.init().await;
+
+        assert!(model_dir.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_it_ends_with_a_retryable_error() {
+        let fx = Fixture::new(true);
+        fx.interrupted_download();
+
+        let (_status, text) = fx.init().await;
+
+        let frames = frames(&text);
+        assert!(!frames.iter().any(|(name, _)| name == "cancelled" || name == "complete"));
+        let (_, error) = frames.iter().find(|(name, _)| name == "error").expect("an error frame");
+        assert_eq!(error["code"], 503);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_it_does_not_mark_the_model_downloaded() {
+        let fx = Fixture::new(true);
+        fx.interrupted_download();
+
+        fx.init().await;
+
+        let ws_model = fx.workspace.read().get_model(Some(MODEL_NAME));
+        assert!(!ws_model.is_some_and(|m| m.downloaded));
+        assert!(cancellation::active_keys().is_empty());
+    }
+}
+
 /// Driven against `download_and_stream` rather than through `/v1/init`: the
 /// stream is where the ownership question lives, and the route around it would
 /// drag in the catalog seed, the model pipeline and the project setup for a
