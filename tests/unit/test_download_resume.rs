@@ -382,6 +382,48 @@ mod test_disk_space {
         assert_eq!(std::fs::read(tmp.path().join("w.gguf")).unwrap(), server.data);
     }
 
+    /// Space a running download still has to write is not free for the
+    /// next one; what it has received since starting is already on disk.
+    #[test]
+    fn test_space_owed_to_a_running_download_is_counted() {
+        use smartloop::model::downloader::artifact_downloader::DiskReservations;
+        use smartloop::model::downloader::ranges::{TransferStats, system_clock};
+
+        let reservations = DiskReservations::new();
+        let other = TransferStats::new(system_clock());
+        let held = reservations.hold(3000, &other);
+        let download_beside = |free: u64| {
+            let tmp = tempfile::tempdir().unwrap();
+            let server = RangeServer::new(vec![1u8; 4000]);
+            let dl = SLPArtifactDownloader::for_tests(None, test_logger(), None)
+                .with_http(Arc::clone(&server) as _)
+                .with_reservations(Arc::clone(&reservations));
+            dl.cancel_token().set_instant_wait(true);
+            dl.set_connections(Some(2));
+            dl.set_chunked_threshold(Some(1));
+            dl.set_free_space(Some(free));
+            let mut artifacts = ArtifactMap::new();
+            artifacts.insert("w.gguf".to_string(), "https://x/w".to_string());
+            (dl.download_artifacts(&artifacts, tmp.path(), None, "Model", tmp.path(), "w"), server)
+        };
+
+        // 6000 free, 3000 of it owed: 3000 left for a 4000-byte download.
+        let (result, server) = download_beside(6000);
+        let err = result.unwrap_err();
+        assert!(is_disk_full(&err));
+        assert!(err.to_string().contains("held for downloads in progress"), "{err}");
+        assert!(server.ranges().is_empty());
+
+        // The other download has since written 2000 of its 3000.
+        other.open().add(2000);
+        let (result, _) = download_beside(6000);
+        result.unwrap();
+        assert_eq!(reservations.owed(), 1000, "a finished download releases its claim");
+
+        drop(held);
+        assert_eq!(reservations.owed(), 0);
+    }
+
     #[test]
     fn test_enough_space_downloads() {
         let tmp = tempfile::tempdir().unwrap();

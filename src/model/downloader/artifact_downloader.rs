@@ -986,6 +986,67 @@ where
     })
 }
 
+/// Bytes the downloads already running still have to write.  A download's
+/// free-space check counts them as taken, so two large downloads started
+/// together can't both pass on the same free space.  Every model lives under
+/// one models directory, so this doesn't tell volumes apart.
+#[derive(Default)]
+pub struct DiskReservations {
+    next_id: std::sync::atomic::AtomicU64,
+    /// id -> (bytes owed when the download started, its throughput stats).
+    held: Mutex<std::collections::HashMap<u64, (u64, Arc<TransferStats>)>>,
+}
+
+/// The process's reservations, shared by every downloader but test ones.
+static DISK_RESERVATIONS: once_cell::sync::Lazy<Arc<DiskReservations>> =
+    once_cell::sync::Lazy::new(|| Arc::new(DiskReservations::default()));
+
+impl DiskReservations {
+    /// An empty set, apart from the process's own.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Bytes still owed to every running download: what each had to fetch
+    /// less what it has received since.
+    pub fn owed(&self) -> u64 {
+        Self::owed_by(&self.held.lock())
+    }
+
+    /// Reserve `bytes` for a download whose arrivals `stats` counts.
+    pub fn hold(self: &Arc<Self>, bytes: u64, stats: &Arc<TransferStats>) -> DiskReservation {
+        let mut held = self.held.lock();
+        self.insert(&mut held, bytes, stats)
+    }
+
+    fn owed_by(held: &std::collections::HashMap<u64, (u64, Arc<TransferStats>)>) -> u64 {
+        held.values().map(|(bytes, stats)| bytes.saturating_sub(stats.received())).sum()
+    }
+
+    fn insert(
+        self: &Arc<Self>,
+        held: &mut std::collections::HashMap<u64, (u64, Arc<TransferStats>)>,
+        bytes: u64,
+        stats: &Arc<TransferStats>,
+    ) -> DiskReservation {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        held.insert(id, (bytes, Arc::clone(stats)));
+        DiskReservation { owner: Arc::clone(self), id }
+    }
+}
+
+/// A running download's claim on free space; released when dropped.
+pub struct DiskReservation {
+    owner: Arc<DiskReservations>,
+    id: u64,
+}
+
+impl Drop for DiskReservation {
+    fn drop(&mut self) {
+        self.owner.held.lock().remove(&self.id);
+    }
+}
+
 /// Clears a download's shared pool and stats when it ends.
 struct DownloadScope<'a>(&'a SLPArtifactDownloader);
 
@@ -1027,6 +1088,8 @@ pub struct SLPArtifactDownloader {
     /// The tuner of the download in progress, unless the count is fixed.
     tuning: Mutex<Option<Arc<Tuning>>>,
     free_space_override: Mutex<Option<u64>>,
+    /// Space promised to the downloads already running.
+    reservations: Arc<DiskReservations>,
 }
 
 impl SLPArtifactDownloader {
@@ -1062,6 +1125,7 @@ impl SLPArtifactDownloader {
             min_split_override: Mutex::new(None),
             tuning: Mutex::new(None),
             free_space_override: Mutex::new(None),
+            reservations: Arc::clone(&DISK_RESERVATIONS),
         }
     }
 
@@ -1089,6 +1153,9 @@ impl SLPArtifactDownloader {
             min_split_override: Mutex::new(None),
             tuning: Mutex::new(None),
             free_space_override: Mutex::new(None),
+            // Tests run side by side in one process; each starts with no
+            // other download's claims unless it shares a set on purpose.
+            reservations: DiskReservations::new(),
         }
     }
 
@@ -1158,6 +1225,12 @@ impl SLPArtifactDownloader {
         *self.free_space_override.lock() = bytes;
     }
 
+    /// Tests only: share `reservations` with other downloaders.
+    pub fn with_reservations(mut self, reservations: Arc<DiskReservations>) -> Self {
+        self.reservations = reservations;
+        self
+    }
+
     /// Free bytes on the volume holding `dir`, if it can be found.
     fn free_space(&self, dir: &Path) -> Option<u64> {
         if let Some(bytes) = *self.free_space_override.lock() {
@@ -1173,21 +1246,29 @@ impl SLPArtifactDownloader {
             .map(|disk| disk.available_space())
     }
 
-    /// Fail up front when `dir`'s volume cannot hold `needed` more bytes.
-    fn check_free_space(&self, dir: &Path, needed: u64) -> DownloadResult<()> {
-        let Some(free) = self.free_space(dir) else {
-            return Ok(());
-        };
-        let wanted = needed + needed / 100; // 1% headroom
-        if free >= wanted {
-            return Ok(());
+    /// Fail up front when `dir`'s volume cannot hold `needed` more bytes on
+    /// top of what running downloads still owe; otherwise reserve them until
+    /// the returned claim drops.  `stats` counts what this download receives.
+    fn check_free_space(&self, dir: &Path, needed: u64, stats: &Arc<TransferStats>) -> DownloadResult<DiskReservation> {
+        // Checked and reserved under one lock so two downloads starting
+        // together see each other.
+        let mut held = self.reservations.held.lock();
+        if let Some(free) = self.free_space(dir) {
+            let owed = DiskReservations::owed_by(&held);
+            let wanted = needed + needed / 100; // 1% headroom
+            let available = free.saturating_sub(owed);
+            if available < wanted {
+                let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                let mut message =
+                    format!("Not enough disk space: the download needs {:.1} GB and {:.1} GB is free", gb(wanted), gb(available));
+                if owed > 0 {
+                    message.push_str(&format!(" ({:.1} GB more is held for downloads in progress)", gb(owed)));
+                }
+                return Err(classified(message, true)
+                    .with_cause(std::io::Error::from_raw_os_error(libc::ENOSPC).into()));
+            }
         }
-        let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-        Err(classified(
-            format!("Not enough disk space: the download needs {:.1} GB and {:.1} GB is free", gb(wanted), gb(free)),
-            true,
-        )
-        .with_cause(std::io::Error::from_raw_os_error(libc::ENOSPC).into()))
+        Ok(self.reservations.insert(&mut held, needed, stats))
     }
 
     /// Tests only: read time from `clock` (`None` restores real time).
@@ -1450,10 +1531,10 @@ impl SLPArtifactDownloader {
             .iter()
             .map(|p| p.info.size.saturating_sub(resumable_bytes(&part_path(local_dir, &p.filename), &p.info)))
             .sum();
-        self.check_free_space(local_dir, remaining)?;
+        let stats = TransferStats::new(self.clock());
+        let _reservation = self.check_free_space(local_dir, remaining, &stats)?;
         let fixed = *self.connections_override.lock();
         let permits = ConnectionPermits::new(fixed.unwrap_or_else(|| starting_connections(remaining)));
-        let stats = TransferStats::new(self.clock());
         *self.permits.lock() = Some(Arc::clone(&permits));
         *self.stats.lock() = Some(Arc::clone(&stats));
         if fixed.is_none() {
