@@ -973,6 +973,16 @@ fn test_an_abandoned_download_is_reclaimable() {
     assert_eq!(rows["google/gemma-4-e4b-it"]["group"], "unused");
 }
 
+#[test]
+#[serial]
+fn test_a_download_with_its_resume_journal_is_still_partial() {
+    let env = env("test_a_download_with_its_resume_journal_is_still_partial");
+    make_partial(&env.models_dir, "google/gemma-4-e4b-it", &[], &["weights.gguf.part", "weights.gguf.part.state"]);
+
+    let rows = by_model_id(&env.usage());
+    assert_eq!(rows["google/gemma-4-e4b-it"]["group"], "unused");
+}
+
 // ── TestOrphanProjectsSettleFirst ───────────────────────────────────────
 
 #[test]

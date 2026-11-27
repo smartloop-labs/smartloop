@@ -241,7 +241,7 @@ mod test_the_chunked_path {
         let dest = tmp.path().join("w.part");
         std::fs::write(&dest, [0u8; 24]).unwrap();
 
-        let resp = FakeResp::cancelling(&[&[b'a'; 8], &[b'b'; 8], &[b'c'; 8]], &token, 1);
+        let resp = FakeResp::cancelling(&[&[b'a'; 8], &[b'b'; 8], &[b'c'; 8]], &token, 1).with_status(206);
         let dl = downloader(Some(token.clone()), Some(ScriptedHttp::new(vec![resp])));
 
         let counter = Mutex::new(0u64);
@@ -274,7 +274,7 @@ mod test_the_chunked_path {
         let tmp = tempfile::tempdir().unwrap();
         let dl = downloader(Some(cancelled_token()), Some(ScriptedHttp::new(Vec::new())));
 
-        let err = dl.download_file_chunked("w.gguf", "https://x/f", &tmp.path().join("w.part"), 64, None).unwrap_err();
+        let err = dl.download_file_chunked("w.gguf", "https://x/f", &tmp.path().join("w.part"), &ad::RemoteFileInfo::sized(64), None).unwrap_err();
         assert!(matches!(err, DownloadError::Cancelled(_)));
     }
 }
@@ -283,13 +283,17 @@ mod test_the_chunked_path {
 mod test_the_file_level {
     use super::*;
 
+    fn simple_info(size: u64) -> ad::RemoteFileInfo {
+        ad::RemoteFileInfo { size, ..ad::RemoteFileInfo::default() }
+    }
+
     #[test]
     fn test_a_queued_file_never_opens_a_socket() {
         let tmp = tempfile::tempdir().unwrap();
         let stream = ScriptedHttp::new(Vec::new());
         let dl = downloader(Some(cancelled_token()), Some(Arc::clone(&stream)));
 
-        let err = dl.download_file("a/weights.gguf", "https://x/f", tmp.path(), 8, 0, None, false, None).unwrap_err();
+        let err = dl.download_file("a/weights.gguf", "https://x/f", tmp.path(), &simple_info(8), None).unwrap_err();
         assert!(err.is_cancelled());
         assert_eq!(stream.calls(), 0);
     }
@@ -301,7 +305,7 @@ mod test_the_file_level {
         let resp = FakeResp::cancelling(&[&[b'a'; 8], &[b'b'; 8]], &token, 1);
         let dl = downloader(Some(token.clone()), Some(ScriptedHttp::new(vec![resp])));
 
-        let err = dl.download_file("a/weights.gguf", "https://x/f", tmp.path(), 16, 0, None, false, None).unwrap_err();
+        let err = dl.download_file("a/weights.gguf", "https://x/f", tmp.path(), &simple_info(16), None).unwrap_err();
         assert!(err.is_cancelled());
 
         assert!(!tmp.path().join("weights.gguf").exists());
@@ -345,9 +349,40 @@ mod test_the_head_probe {
     }
 
     #[test]
-    fn test_an_ordinary_probe_failure_still_falls_back() {
+    fn test_an_ordinary_probe_failure_is_returned() {
         let http = ScriptedHttp::with_head(Box::new(|_url| Err(connect_error("no dns"))));
         let dl = downloader(None, Some(http));
-        assert_eq!(dl.get_remote_file_info("https://x/f").unwrap(), (0, None, false));
+        let err = dl.get_remote_file_info("https://x/f").unwrap_err();
+        assert!(ad::is_transient_error(&err));
+    }
+}
+
+/// A shutdown interrupts every running download, which keeps its bytes.
+mod test_interrupt {
+    use serial_test::serial;
+    use smartloop::model::downloader::cancellation;
+
+    /// Serial with the registry tests, which reset the shared registry.
+    #[test]
+    #[serial]
+    fn test_interrupt_all_stops_every_registered_download() {
+        let a = cancellation::begin_with_wait("test-interrupt/a", 0.0).unwrap();
+        let b = cancellation::begin_with_wait("test-interrupt/b", 0.0).unwrap();
+
+        assert!(cancellation::interrupt_all() >= 2);
+
+        for token in [&a, &b] {
+            assert!(token.cancelled());
+            assert!(token.interrupted());
+        }
+        cancellation::end("test-interrupt/a", &a);
+        cancellation::end("test-interrupt/b", &b);
+    }
+
+    #[test]
+    fn test_a_plain_cancel_is_not_an_interrupt() {
+        let token = super::cancelled_token();
+        assert!(token.cancelled());
+        assert!(!token.interrupted());
     }
 }

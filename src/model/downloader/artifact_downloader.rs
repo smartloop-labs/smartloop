@@ -6,6 +6,7 @@
 //! atomic `.part` → final publish.  Errors keep their *kind* (transient vs.
 //! permanent, disk-full, cancelled) so the API layer can choose a status.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -26,7 +27,13 @@ use crate::model::downloader::artifact_source::{
     entry_name,
 };
 use crate::model::downloader::cancellation::{CancelToken, DownloadCancelled};
+use crate::model::downloader::digest::{self, RemoteDigest, Verdict};
 use crate::model::downloader::inflight::downloading;
+use crate::model::downloader::ranges::{
+    Clock, ConnectionPermits, InFlight, MAX_CONNECTIONS, MIN_SPLIT, RangeCursor, TransferStats, Tuning,
+    starting_connections, system_clock,
+};
+use crate::model::downloader::resume::{IntervalSet, Journal, ResumeState};
 use crate::model::downloader::slp_downloader::{
     AggregateProgress, DownloadProgress, DownloadStubCall, ProgressCallback, SLPDownloader, SharedLogger,
     SharedWorkspace, download_stubs,
@@ -39,23 +46,16 @@ fn cpu_count() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
 
-/// Total concurrent connections budget (`min(32, cpu_count * 2)`).
-pub fn io_thread_budget() -> usize {
-    32.min(cpu_count() * 2)
-}
-
-/// Parallel file downloads (`min(4, cpu_count)`; capped: I/O-bound).
+/// Parallel file downloads (`min(4, cpu_count)`).  Connections are budgeted
+/// separately, across all files, by [`ConnectionPermits`].
 pub fn max_workers() -> usize {
     4.min(cpu_count())
 }
 
-/// Parallel chunk downloads per file (`max(2, io_thread_budget / max_workers)`).
-pub fn chunk_workers() -> usize {
-    2.max(io_thread_budget() / max_workers())
-}
-
 /// 8 MB read buffer for simple downloads (and MD5 reads).
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+/// A body read returns what it has after this long, full buffer or not.
+pub const PARTIAL_CHUNK_AFTER: Duration = Duration::from_millis(250);
 /// 1 MB read buffer within each chunk.
 pub const RANGE_READ_SIZE: usize = 1024 * 1024;
 /// Files larger than this (100 MB) use chunked download.
@@ -77,13 +77,22 @@ pub const SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 /// over `workers` connections: [`SEGMENT_SIZE`] each, smaller for a file
 /// that would otherwise give some connection nothing to do.
 pub fn segments(size: u64, workers: u64) -> Vec<(u64, u64)> {
-    let segment = SEGMENT_SIZE.min(size.div_ceil(workers.max(1))).max(1);
+    segments_of(&[(0, size)], workers)
+}
+
+/// [`segments`] over the half-open `gaps` still to fetch, sized by the bytes
+/// remaining in all of them together.
+pub fn segments_of(gaps: &[(u64, u64)], workers: u64) -> Vec<(u64, u64)> {
+    let remaining: u64 = gaps.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    let segment = SEGMENT_SIZE.min(remaining.div_ceil(workers.max(1))).max(1);
     let mut ranges = Vec::new();
-    let mut offset = 0u64;
-    while offset < size {
-        let end = (offset + segment - 1).min(size - 1);
-        ranges.push((offset, end));
-        offset = end + 1;
+    for &(start, end) in gaps {
+        let mut offset = start;
+        while offset < end {
+            let last = (offset + segment - 1).min(end - 1);
+            ranges.push((offset, last));
+            offset = last + 1;
+        }
     }
     ranges
 }
@@ -96,6 +105,9 @@ pub fn segments(size: u64, workers: u64) -> Vec<(u64, u64)> {
 /// network blip — during an outage, connection attempts fail almost instantly,
 /// so it's the backoff, not the attempt count alone, that spans the gap.
 pub const MAX_DOWNLOAD_ATTEMPTS: u32 = 8;
+/// Bytes an attempt must move before its failure stops counting toward
+/// [`MAX_DOWNLOAD_ATTEMPTS`].
+pub const PROGRESS_RESETS_RETRIES: u64 = 1024 * 1024;
 /// Seconds; first backoff.
 pub const RETRY_BASE_DELAY: f64 = 1.0;
 /// Seconds; backoff cap.
@@ -123,6 +135,11 @@ pub const STREAM_TIMEOUT: StreamTimeout = StreamTimeout {
     write: Duration::from_secs(30),
     pool: Duration::from_secs(30),
 };
+
+/// Timeout of a chunked download's range requests.  A stalled range costs
+/// only a reissue from where it stopped, and a stall that never returns a
+/// read is invisible to the low-speed check, so the idle bound is tighter.
+pub const RANGE_TIMEOUT: StreamTimeout = StreamTimeout { read: Duration::from_secs(20), ..STREAM_TIMEOUT };
 
 /// Timeout of the HEAD probe (`httpx.head(..., timeout=30)`).
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -155,6 +172,9 @@ pub enum TransportErrorKind {
     ReadTimeout,
     WriteTimeout,
     PoolTimeout,
+    /// The downloader dropped a connection that was far too slow; see
+    /// [`crate::model::downloader::ranges::Slowness`].
+    LowSpeed,
     Other,
 }
 
@@ -242,6 +262,14 @@ impl HttpError {
     }
 }
 
+/// The server answered a Range request with something other than that range:
+/// a 200 with the whole object, or a `Content-Range` for different bytes.  The
+/// object changed, or the server does not honour Range, so bytes already on
+/// disk cannot be joined with the response.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct SourceChanged(pub String);
+
 /// A signed URL was rejected mid-transfer, so a fresh one may well work.
 ///
 /// A connection-class error (not a permission error) because that is the
@@ -272,6 +300,9 @@ pub enum DownloadError {
     /// A stale signed URL (`StaleDownloadURLError`, a `ConnectionError`).
     #[error(transparent)]
     StaleUrl(#[from] StaleDownloadURLError),
+    /// The response did not match the requested range (see [`SourceChanged`]).
+    #[error(transparent)]
+    SourceChanged(#[from] SourceChanged),
     /// A classified transient failure (`ConnectionError`).
     #[error("{message}")]
     Connection {
@@ -355,7 +386,7 @@ impl DownloadError {
     /// `ConnectionError`s.
     pub fn is_connection_error(&self) -> bool {
         match self {
-            DownloadError::Connection { .. } | DownloadError::StaleUrl(_) => true,
+            DownloadError::Connection { .. } | DownloadError::StaleUrl(_) | DownloadError::SourceChanged(_) => true,
             DownloadError::Io(err) => is_connection_io(err),
             DownloadError::Source(err) => err.chain().any(|cause| {
                 cause.downcast_ref::<PlatformError>().is_some_and(PlatformError::is_connection)
@@ -541,6 +572,10 @@ pub fn is_transient_error(exc: &DownloadError) -> bool {
     if is_retryable_error(exc) {
         return true;
     }
+    if matches!(exc, DownloadError::SourceChanged(_)) {
+        // Fetching the file again from the start works.
+        return true;
+    }
     if let DownloadError::Http(HttpError::Status { status_code, .. }) = exc {
         return STALE_URL_STATUS.contains(status_code);
     }
@@ -617,6 +652,47 @@ pub struct HeadResponse {
     pub headers: Headers,
 }
 
+/// What a probe learned about a remote file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteFileInfo {
+    /// Size in bytes; 0 when the server did not say.
+    pub size: u64,
+    /// The digest the ETag publishes, single-part or multipart.
+    pub digest: Option<RemoteDigest>,
+    /// The server honours `Range: bytes=…`.
+    pub accept_ranges: bool,
+    /// The raw `ETag`, quotes included.
+    pub etag: Option<String>,
+    /// The raw `Last-Modified`.
+    pub last_modified: Option<String>,
+}
+
+impl RemoteFileInfo {
+    /// A Range-capable file of `size` bytes with no digest or validators.
+    pub fn sized(size: u64) -> Self {
+        Self { size, accept_ranges: true, ..Self::default() }
+    }
+
+    /// Read the validators, digest and Range support from probe headers,
+    /// with `content_length` as the size.
+    fn from_headers(headers: &Headers, content_length: Option<&str>) -> DownloadResult<Self> {
+        let size = match content_length {
+            Some(cl) if !cl.trim().is_empty() => cl
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| DownloadError::Value(format!("invalid literal for int() with base 10: '{cl}'")))?,
+            _ => 0,
+        };
+        Ok(Self {
+            size,
+            digest: header_get(headers, "ETag").and_then(RemoteDigest::from_etag),
+            accept_ranges: header_get(headers, "Accept-Ranges").unwrap_or("").eq_ignore_ascii_case("bytes"),
+            etag: header_get(headers, "ETag").map(str::to_string),
+            last_modified: header_get(headers, "Last-Modified").map(str::to_string),
+        })
+    }
+}
+
 /// A streaming GET response (the body of `with httpx.stream(...) as resp`).
 /// Dropping it closes the connection.
 pub trait StreamResponse: Send {
@@ -626,6 +702,59 @@ pub trait StreamResponse: Send {
     fn raise_for_status(&self) -> Result<(), HttpError>;
     /// Next body chunk of up to `chunk_size` bytes; `Ok(None)` at end of body.
     fn next_chunk(&mut self, chunk_size: usize) -> Result<Option<Vec<u8>>, HttpError>;
+    /// A response header, looked up case-insensitively.
+    fn header(&self, _name: &str) -> Option<String> {
+        None
+    }
+}
+
+/// `Content-Range: bytes <first>-<last>/<total>` as `(first, last, total)`;
+/// `total` is `None` for `*`.
+pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (span, total) = rest.split_once('/')?;
+    let (first, last) = span.trim().split_once('-')?;
+    let first = first.trim().parse().ok()?;
+    let last = last.trim().parse().ok()?;
+    let total = match total.trim() {
+        "*" => None,
+        t => Some(t.parse().ok()?),
+    };
+    (first <= last).then_some((first, last, total))
+}
+
+/// Check that a response to `Range: bytes=<start>-<end>` carries exactly that
+/// range of a `total_size`-byte object.
+fn check_range_response(resp: &dyn StreamResponse, start: u64, end: u64, total_size: u64) -> DownloadResult<()> {
+    if resp.status_code() != 206 {
+        return Err(SourceChanged(format!(
+            "asked for bytes {start}-{end} and got status {} instead of 206",
+            resp.status_code()
+        ))
+        .into());
+    }
+    if let Some(value) = resp.header("Content-Range") {
+        let matches = parse_content_range(&value).is_some_and(|(first, last, total)| {
+            first == start && last == end && total.is_none_or(|t| total_size == 0 || t == total_size)
+        });
+        if !matches {
+            return Err(SourceChanged(format!(
+                "asked for bytes {start}-{end} of {total_size} and got Content-Range '{value}'"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// A body that ended before the bytes it promised.  Retryable: the next
+/// attempt resumes from what arrived.
+fn short_body(what: &str, got: u64, expected: u64) -> DownloadError {
+    HttpError::transport(
+        TransportErrorKind::RemoteProtocol,
+        format!("{what}: body ended after {got} of {expected} bytes"),
+    )
+    .into()
 }
 
 /// The HTTP operations the downloader performs — a seam so tests can script
@@ -645,6 +774,8 @@ pub struct ReqwestDownloadHttp;
 static HEAD_CLIENT: OnceCell<reqwest::blocking::Client> = OnceCell::new();
 /// Shared streaming client for [`STREAM_TIMEOUT`].
 static STREAM_CLIENT: OnceCell<reqwest::blocking::Client> = OnceCell::new();
+/// Shared streaming client for [`RANGE_TIMEOUT`].
+static RANGE_CLIENT: OnceCell<reqwest::blocking::Client> = OnceCell::new();
 
 fn build_client(connect: Duration, io: Duration) -> Result<reqwest::blocking::Client, HttpError> {
     // The blocking client's `timeout` bounds each read of the body (and the
@@ -660,6 +791,9 @@ fn build_client(connect: Duration, io: Duration) -> Result<reqwest::blocking::Cl
 fn stream_client(timeout: StreamTimeout) -> Result<reqwest::blocking::Client, HttpError> {
     if timeout == STREAM_TIMEOUT {
         return STREAM_CLIENT.get_or_try_init(|| build_client(timeout.connect, timeout.read)).cloned();
+    }
+    if timeout == RANGE_TIMEOUT {
+        return RANGE_CLIENT.get_or_try_init(|| build_client(timeout.connect, timeout.read)).cloned();
     }
     build_client(timeout.connect, timeout.read)
 }
@@ -703,7 +837,10 @@ impl StreamResponse for ReqwestStream {
     fn next_chunk(&mut self, chunk_size: usize) -> Result<Option<Vec<u8>>, HttpError> {
         let mut buf = vec![0u8; chunk_size.max(1)];
         let mut filled = 0usize;
-        while filled < buf.len() {
+        let started = std::time::Instant::now();
+        // Hand back what arrived after a short while rather than waiting for
+        // a full buffer, so a slow connection is still measured often.
+        while filled < buf.len() && (filled == 0 || started.elapsed() < PARTIAL_CHUNK_AFTER) {
             match self.response.read(&mut buf[filled..]) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
@@ -716,6 +853,10 @@ impl StreamResponse for ReqwestStream {
         }
         buf.truncate(filled);
         Ok(Some(buf))
+    }
+
+    fn header(&self, name: &str) -> Option<String> {
+        self.response.headers().get(name).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
     }
 }
 
@@ -811,6 +952,112 @@ where
     })
 }
 
+/// Run `work` on `threads` threads, each calling it until it returns `None`,
+/// and hand every result to `handle` as it lands.  `handle` returning
+/// `Some(err)` stops consuming and returns that error; work already running
+/// still finishes before this returns.
+fn run_workers<R, W, H>(threads: usize, work: W, mut handle: H) -> Option<DownloadError>
+where
+    R: Send,
+    W: Fn() -> Option<R> + Sync,
+    H: FnMut(R) -> Option<DownloadError>,
+{
+    if threads == 0 {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel::<R>();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let work = &work;
+            scope.spawn(move || {
+                while let Some(result) = work() {
+                    let _ = tx.send(result);
+                }
+            });
+        }
+        drop(tx);
+        for result in rx.iter() {
+            if let Some(err) = handle(result) {
+                return Some(err);
+            }
+        }
+        None
+    })
+}
+
+/// Bytes the downloads already running still have to write.  A download's
+/// free-space check counts them as taken, so two large downloads started
+/// together can't both pass on the same free space.  Every model lives under
+/// one models directory, so this doesn't tell volumes apart.
+#[derive(Default)]
+pub struct DiskReservations {
+    next_id: std::sync::atomic::AtomicU64,
+    /// id -> (bytes owed when the download started, its throughput stats).
+    held: Mutex<std::collections::HashMap<u64, (u64, Arc<TransferStats>)>>,
+}
+
+/// The process's reservations, shared by every downloader but test ones.
+static DISK_RESERVATIONS: once_cell::sync::Lazy<Arc<DiskReservations>> =
+    once_cell::sync::Lazy::new(|| Arc::new(DiskReservations::default()));
+
+impl DiskReservations {
+    /// An empty set, apart from the process's own.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Bytes still owed to every running download: what each had to fetch
+    /// less what it has received since.
+    pub fn owed(&self) -> u64 {
+        Self::owed_by(&self.held.lock())
+    }
+
+    /// Reserve `bytes` for a download whose arrivals `stats` counts.
+    pub fn hold(self: &Arc<Self>, bytes: u64, stats: &Arc<TransferStats>) -> DiskReservation {
+        let mut held = self.held.lock();
+        self.insert(&mut held, bytes, stats)
+    }
+
+    fn owed_by(held: &std::collections::HashMap<u64, (u64, Arc<TransferStats>)>) -> u64 {
+        held.values().map(|(bytes, stats)| bytes.saturating_sub(stats.received())).sum()
+    }
+
+    fn insert(
+        self: &Arc<Self>,
+        held: &mut std::collections::HashMap<u64, (u64, Arc<TransferStats>)>,
+        bytes: u64,
+        stats: &Arc<TransferStats>,
+    ) -> DiskReservation {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        held.insert(id, (bytes, Arc::clone(stats)));
+        DiskReservation { owner: Arc::clone(self), id }
+    }
+}
+
+/// A running download's claim on free space; released when dropped.
+pub struct DiskReservation {
+    owner: Arc<DiskReservations>,
+    id: u64,
+}
+
+impl Drop for DiskReservation {
+    fn drop(&mut self) {
+        self.owner.held.lock().remove(&self.id);
+    }
+}
+
+/// Clears a download's shared pool and stats when it ends.
+struct DownloadScope<'a>(&'a SLPArtifactDownloader);
+
+impl Drop for DownloadScope<'_> {
+    fn drop(&mut self) {
+        *self.0.permits.lock() = None;
+        *self.0.stats.lock() = None;
+        *self.0.tuning.lock() = None;
+    }
+}
+
 /// Download model artifacts from URLs provided by an ArtifactSource.
 ///
 /// Fetches signed URLs via artifact sources, then downloads all files in
@@ -830,7 +1077,19 @@ pub struct SLPArtifactDownloader {
     download_artifacts_hook: Mutex<Option<DownloadArtifactsHook>>,
     makedirs_hook: Mutex<Option<MakedirsHook>>,
     download_chunk_hook: Mutex<Option<DownloadChunkHook>>,
-    chunk_workers_override: Mutex<Option<usize>>,
+    connections_override: Mutex<Option<usize>>,
+    chunked_threshold_override: Mutex<Option<u64>>,
+    /// The connection pool of the download in progress, shared by its files.
+    permits: Mutex<Option<Arc<ConnectionPermits>>>,
+    /// Throughput of the download in progress, shared by its files.
+    stats: Mutex<Option<Arc<TransferStats>>>,
+    clock_override: Mutex<Option<Clock>>,
+    min_split_override: Mutex<Option<u64>>,
+    /// The tuner of the download in progress, unless the count is fixed.
+    tuning: Mutex<Option<Arc<Tuning>>>,
+    free_space_override: Mutex<Option<u64>>,
+    /// Space promised to the downloads already running.
+    reservations: Arc<DiskReservations>,
 }
 
 impl SLPArtifactDownloader {
@@ -858,7 +1117,15 @@ impl SLPArtifactDownloader {
             download_artifacts_hook: Mutex::new(None),
             makedirs_hook: Mutex::new(None),
             download_chunk_hook: Mutex::new(None),
-            chunk_workers_override: Mutex::new(None),
+            connections_override: Mutex::new(None),
+            chunked_threshold_override: Mutex::new(None),
+            permits: Mutex::new(None),
+            stats: Mutex::new(None),
+            clock_override: Mutex::new(None),
+            min_split_override: Mutex::new(None),
+            tuning: Mutex::new(None),
+            free_space_override: Mutex::new(None),
+            reservations: Arc::clone(&DISK_RESERVATIONS),
         }
     }
 
@@ -878,7 +1145,17 @@ impl SLPArtifactDownloader {
             download_artifacts_hook: Mutex::new(None),
             makedirs_hook: Mutex::new(None),
             download_chunk_hook: Mutex::new(None),
-            chunk_workers_override: Mutex::new(None),
+            connections_override: Mutex::new(None),
+            chunked_threshold_override: Mutex::new(None),
+            permits: Mutex::new(None),
+            stats: Mutex::new(None),
+            clock_override: Mutex::new(None),
+            min_split_override: Mutex::new(None),
+            tuning: Mutex::new(None),
+            free_space_override: Mutex::new(None),
+            // Tests run side by side in one process; each starts with no
+            // other download's claims unless it shares a set on purpose.
+            reservations: DiskReservations::new(),
         }
     }
 
@@ -931,9 +1208,104 @@ impl SLPArtifactDownloader {
         *self.download_chunk_hook.lock() = hook;
     }
 
-    /// Tests only: override `CHUNK_WORKERS` (`None` restores the default).
-    pub fn set_chunk_workers(&self, workers: Option<usize>) {
-        *self.chunk_workers_override.lock() = workers;
+    /// Tests only: use exactly this many connections, shared by every file
+    /// of a download (`None` restores the size-based start).
+    pub fn set_connections(&self, connections: Option<usize>) {
+        *self.connections_override.lock() = connections;
+        *self.permits.lock() = None;
+    }
+
+    /// Tests only: override `MIN_SPLIT` (`None` restores the default).
+    pub fn set_min_split(&self, bytes: Option<u64>) {
+        *self.min_split_override.lock() = bytes;
+    }
+
+    /// Tests only: report this many free bytes (`None` asks the disk).
+    pub fn set_free_space(&self, bytes: Option<u64>) {
+        *self.free_space_override.lock() = bytes;
+    }
+
+    /// Tests only: share `reservations` with other downloaders.
+    pub fn with_reservations(mut self, reservations: Arc<DiskReservations>) -> Self {
+        self.reservations = reservations;
+        self
+    }
+
+    /// Free bytes on the volume holding `dir`, if it can be found.
+    fn free_space(&self, dir: &Path) -> Option<u64> {
+        if let Some(bytes) = *self.free_space_override.lock() {
+            return Some(bytes);
+        }
+        let dir = dir.canonicalize().ok()?;
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        disks
+            .list()
+            .iter()
+            .filter(|disk| dir.starts_with(disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().as_os_str().len())
+            .map(|disk| disk.available_space())
+    }
+
+    /// Fail up front when `dir`'s volume cannot hold `needed` more bytes on
+    /// top of what running downloads still owe; otherwise reserve them until
+    /// the returned claim drops.  `stats` counts what this download receives.
+    fn check_free_space(&self, dir: &Path, needed: u64, stats: &Arc<TransferStats>) -> DownloadResult<DiskReservation> {
+        // Checked and reserved under one lock so two downloads starting
+        // together see each other.
+        let mut held = self.reservations.held.lock();
+        if let Some(free) = self.free_space(dir) {
+            let owed = DiskReservations::owed_by(&held);
+            let wanted = needed + needed / 100; // 1% headroom
+            let available = free.saturating_sub(owed);
+            if available < wanted {
+                let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                let mut message =
+                    format!("Not enough disk space: the download needs {:.1} GB and {:.1} GB is free", gb(wanted), gb(available));
+                if owed > 0 {
+                    message.push_str(&format!(" ({:.1} GB more is held for downloads in progress)", gb(owed)));
+                }
+                return Err(classified(message, true)
+                    .with_cause(std::io::Error::from_raw_os_error(libc::ENOSPC).into()));
+            }
+        }
+        Ok(self.reservations.insert(&mut held, needed, stats))
+    }
+
+    /// Tests only: read time from `clock` (`None` restores real time).
+    pub fn set_clock(&self, clock: Option<Clock>) {
+        *self.clock_override.lock() = clock;
+    }
+
+    /// The throughput stats of the running download, else fresh ones.
+    pub fn transfer_stats(&self) -> Arc<TransferStats> {
+        if let Some(stats) = self.stats.lock().as_ref() {
+            return Arc::clone(stats);
+        }
+        TransferStats::new(self.clock())
+    }
+
+    fn clock(&self) -> Clock {
+        self.clock_override.lock().clone().unwrap_or_else(system_clock)
+    }
+
+    /// The connection pool for a download of `remaining` bytes: the one the
+    /// running download set up, else a new one started by size.
+    fn connection_permits(&self, remaining: u64) -> Arc<ConnectionPermits> {
+        let mut slot = self.permits.lock();
+        if let Some(permits) = slot.as_ref() {
+            return Arc::clone(permits);
+        }
+        let fixed = *self.connections_override.lock();
+        let permits = ConnectionPermits::new(fixed.unwrap_or_else(|| starting_connections(remaining)));
+        if fixed.is_some() {
+            *slot = Some(Arc::clone(&permits));
+        }
+        permits
+    }
+
+    /// Tests only: override `CHUNKED_THRESHOLD` (`None` restores the default).
+    pub fn set_chunked_threshold(&self, bytes: Option<u64>) {
+        *self.chunked_threshold_override.lock() = bytes;
     }
 
     /// The workspace's models directory (or the test override).
@@ -993,8 +1365,24 @@ impl SLPArtifactDownloader {
         description: &str,
         attempt_fn: &mut dyn FnMut(u32) -> DownloadResult<T>,
     ) -> DownloadResult<T> {
-        for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+        self.run_with_retries_progress(description, &|| 0, attempt_fn)
+    }
+
+    /// [`Self::run_with_retries`] for a transfer that reports its bytes
+    /// written through `progress`.  A failed attempt that moved at least
+    /// [`PROGRESS_RESETS_RETRIES`] bytes does not count toward
+    /// [`MAX_DOWNLOAD_ATTEMPTS`]: the budget is for a connection that cannot
+    /// make headway, not for a long transfer that drops now and then.
+    pub fn run_with_retries_progress<T>(
+        &self,
+        description: &str,
+        progress: &dyn Fn() -> u64,
+        attempt_fn: &mut dyn FnMut(u32) -> DownloadResult<T>,
+    ) -> DownloadResult<T> {
+        let mut failures = 0u32;
+        for attempt in 1u32.. {
             self.cancel_token().check(description)?;
+            let before = progress();
             let exc = match attempt_fn(attempt) {
                 Ok(value) => return Ok(value),
                 Err(exc) => exc,
@@ -1002,12 +1390,21 @@ impl SLPArtifactDownloader {
             if exc.is_permission_error() || exc.is_cancelled() {
                 return Err(exc);
             }
-            if !is_retryable_error(&exc) || attempt == MAX_DOWNLOAD_ATTEMPTS {
+            if progress().saturating_sub(before) >= PROGRESS_RESETS_RETRIES {
+                failures = 0;
+            }
+            failures += 1;
+            if !is_retryable_error(&exc) || failures >= MAX_DOWNLOAD_ATTEMPTS {
                 return Err(exc);
             }
-            let delay = backoff_delay(attempt);
+            if matches!(exc, DownloadError::Http(HttpError::Transport { kind: TransportErrorKind::LowSpeed, .. })) {
+                // Nothing is wrong with the server; ask again straight away.
+                self.logger.info(&format!("[slow] {exc}; reissuing"));
+                continue;
+            }
+            let delay = backoff_delay(failures);
             self.logger.warning(&format!(
-                "[retry] {description} failed (attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS}): {exc}. Retrying in {delay:.1}s"
+                "[retry] {description} failed (attempt {failures}/{MAX_DOWNLOAD_ATTEMPTS}): {exc}. Retrying in {delay:.1}s"
             ));
             // The one substitution that makes a cancel prompt during an
             // outage.  Backoff reaches 30s and the window is ~90s in total, so
@@ -1020,37 +1417,59 @@ impl SLPArtifactDownloader {
                 });
             }
         }
-        // Unreachable: the loop either returns or raises on the final attempt.
-        Err(DownloadError::runtime(format!("{description} exhausted retries"), None))
+        unreachable!("the retry loop returns from inside")
     }
 
-    /// HEAD request to get file size, MD5 hash, and Range support.
+    /// Probe a file's size, digest, validators and Range support.
     ///
-    /// Retries transient failures; falls back to `(0, None, false)` when the
-    /// probe ultimately fails (callers then download single-stream,
-    /// unverified) — but propagates a cancel.
-    pub fn get_remote_file_info(&self, url: &str) -> DownloadResult<(u64, Option<String>, bool)> {
-        let mut attempt = |_attempt_no: u32| -> DownloadResult<(u64, Option<String>, bool)> {
+    /// HEAD first, retrying transient failures.  A server that refuses HEAD
+    /// (some signed URLs are valid for GET only) is asked with a one-byte
+    /// ranged GET instead.  A probe that still fails is returned as an error
+    /// rather than guessed at: without a size there is no chunking, resume
+    /// or verification, and a network that cannot answer a HEAD cannot carry
+    /// the transfer either.
+    pub fn get_remote_file_info(&self, url: &str) -> DownloadResult<RemoteFileInfo> {
+        let mut head = |_attempt_no: u32| -> DownloadResult<Option<RemoteFileInfo>> {
             let resp = self.http.head(url)?;
-            let size = match header_get(&resp.headers, "Content-Length") {
-                Some(cl) if !cl.is_empty() => cl.trim().parse::<u64>().map_err(|_| {
-                    DownloadError::Value(format!("invalid literal for int() with base 10: '{cl}'"))
-                })?,
-                _ => 0,
-            };
-            let md5 = Self::parse_remote_md5(&resp.headers);
-            let accept_ranges = header_get(&resp.headers, "Accept-Ranges").unwrap_or("").to_lowercase() == "bytes";
-            Ok((size, md5, accept_ranges))
+            if !(200..300).contains(&resp.status_code) {
+                if RETRYABLE_STATUS.contains(&resp.status_code) {
+                    return Err(HttpError::status(resp.status_code, format!("HEAD answered {}", resp.status_code)).into());
+                }
+                return Ok(None);
+            }
+            Ok(Some(RemoteFileInfo::from_headers(&resp.headers, header_get(&resp.headers, "Content-Length"))?))
         };
-        match self.run_with_retries("HEAD probe", &mut attempt) {
-            Ok(info) => Ok(info),
-            // Above the blanket fallback below, which is the whole reason this
-            // arm exists: swallowed here, a cancel would be reported as "no
-            // size, no digest, no Range support" and the file would go on to
-            // download single-stream and unverified.
-            Err(exc) if exc.is_cancelled() => Err(exc),
-            Err(_) => Ok((0, None, false)),
+        if let Some(info) = self.run_with_retries("HEAD probe", &mut head)? {
+            return Ok(info);
         }
+
+        let mut probe = |_attempt_no: u32| -> DownloadResult<RemoteFileInfo> {
+            let mut headers = Headers::new();
+            headers.insert("Range".to_string(), "bytes=0-0".to_string());
+            let resp = self.http.stream(url, &headers, STREAM_TIMEOUT)?;
+            if resp.status_code() == 401 {
+                return Err(StaleDownloadURLError(UNAUTHORIZED_MSG.to_string()).into());
+            }
+            resp.raise_for_status()?;
+            let mut lookup = Headers::new();
+            for name in ["ETag", "Last-Modified", "Content-Length"] {
+                if let Some(value) = resp.header(name) {
+                    lookup.insert(name.to_string(), value);
+                }
+            }
+            if resp.status_code() == 206 {
+                let total = resp.header("Content-Range").and_then(|v| parse_content_range(&v)).and_then(|r| r.2);
+                let mut info = RemoteFileInfo::from_headers(&lookup, None)?;
+                info.size = total.unwrap_or(0);
+                info.accept_ranges = total.is_some();
+                return Ok(info);
+            }
+            RemoteFileInfo::from_headers(&lookup, header_get(&lookup, "Content-Length")).map(|mut info| {
+                info.accept_ranges = false;
+                info
+            })
+        };
+        self.run_with_retries("GET probe", &mut probe)
     }
 
     /// Check, download, and verify a set of artifacts.  Shared by bootstrap
@@ -1067,9 +1486,7 @@ impl SLPArtifactDownloader {
         struct Pending {
             filename: String,
             url: String,
-            size: u64,
-            supports_range: bool,
-            remote_md5: Option<String>,
+            info: RemoteFileInfo,
         }
         let mut pending: Vec<Pending> = Vec::new();
         let mut skipped = 0usize;
@@ -1078,28 +1495,25 @@ impl SLPArtifactDownloader {
             self.cancel_token().check("download")?;
             let flat_name = basename(filename);
             let local_path = local_dir.join(flat_name);
-            let (size, remote_md5, accept_ranges) = self.get_remote_file_info(url)?;
+            let info = self.get_remote_file_info(url)?;
+            let size = info.size;
 
-            if local_path.is_file() {
-                if let Some(remote) = &remote_md5 {
-                    let local_md5 = Self::compute_local_md5(&local_path, None)?;
-                    if &local_md5 == remote {
-                        skipped += 1;
-                        continue;
-                    }
-                } else if size > 0 && std::fs::metadata(&local_path)?.len() == size {
+            if local_path.is_file() && size > 0 && std::fs::metadata(&local_path)?.len() == size {
+                // Right size and, when the ETag allows it, the right digest.
+                let current = match &info.digest {
+                    Some(expected) => !matches!(
+                        digest::verify(&local_path, expected, Some(&self.cancel_token()))?,
+                        Verdict::Mismatch { .. }
+                    ),
+                    None => true,
+                };
+                if current {
                     skipped += 1;
                     continue;
                 }
             }
 
-            pending.push(Pending {
-                filename: filename.clone(),
-                url: url.clone(),
-                size,
-                supports_range: accept_ranges,
-                remote_md5,
-            });
+            pending.push(Pending { filename: filename.clone(), url: url.clone(), info });
         }
 
         if skipped > 0 {
@@ -1111,9 +1525,28 @@ impl SLPArtifactDownloader {
             return Ok(local_dir.to_path_buf());
         }
 
-        let total_bytes: u64 = pending.iter().map(|p| p.size).filter(|s| *s > 0).sum();
+        let total_bytes: u64 = pending.iter().map(|p| p.info.size).sum();
         let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
-        self.logger.info(&format!("Downloading {} file(s), {total_mb:.1} MB total", pending.len()));
+        let remaining: u64 = pending
+            .iter()
+            .map(|p| p.info.size.saturating_sub(resumable_bytes(&part_path(local_dir, &p.filename), &p.info)))
+            .sum();
+        let stats = TransferStats::new(self.clock());
+        let _reservation = self.check_free_space(local_dir, remaining, &stats)?;
+        let fixed = *self.connections_override.lock();
+        let permits = ConnectionPermits::new(fixed.unwrap_or_else(|| starting_connections(remaining)));
+        *self.permits.lock() = Some(Arc::clone(&permits));
+        *self.stats.lock() = Some(Arc::clone(&stats));
+        if fixed.is_none() {
+            *self.tuning.lock() = Some(Tuning::new(Arc::clone(&permits), stats));
+        }
+        let _scope = DownloadScope(self);
+        self.logger.info(&format!(
+            "Downloading {} file(s), {total_mb:.1} MB total, {:.1} MB to fetch, starting with {} connection(s)",
+            pending.len(),
+            remaining as f64 / (1024.0 * 1024.0),
+            permits.limit()
+        ));
 
         // Roll the parallel per-file progress up into a single 0->100% bar so
         // the client sees one download, not the files fighting over the meter.
@@ -1121,21 +1554,12 @@ impl SLPArtifactDownloader {
         let aggregate_callback = aggregate.as_callback();
 
         let mut failed: Vec<(String, DownloadError)> = Vec::new();
-        let jobs: Vec<(usize, Pending)> = pending.into_iter().enumerate().collect();
         let raised = run_pool(
             max_workers(),
-            jobs,
-            |(position, p)| {
-                let result = self.download_file(
-                    &p.filename,
-                    &p.url,
-                    local_dir,
-                    p.size,
-                    position,
-                    Some(aggregate_callback.clone()),
-                    p.supports_range,
-                    p.remote_md5.as_deref(),
-                );
+            pending,
+            |p| {
+                let result =
+                    self.download_file(&p.filename, &p.url, local_dir, &p.info, Some(aggregate_callback.clone()));
                 (p.filename, result)
             },
             |(filename, result)| match result {
@@ -1179,73 +1603,108 @@ impl SLPArtifactDownloader {
     ///
     /// Bytes are written to a `.part` sidecar so the final path only ever
     /// appears once the download is complete (and MD5-verified, when the
-    /// server provides a digest).  A corrupt download — bytes that finished
-    /// without a network error but don't match the expected MD5 — is
-    /// re-downloaded from scratch up to [`MAX_VERIFY_ATTEMPTS`] times before
-    /// failing with `"<name>: MD5 verification failed after 3 attempts"`.
-    #[allow(clippy::too_many_arguments)]
+    /// server provides a digest).  A chunked download resumes from whatever
+    /// its `.part.state` journal says is already on disk.  A corrupt download
+    /// — bytes that finished without a network error but don't match the
+    /// expected MD5 — is re-downloaded from scratch up to
+    /// [`MAX_VERIFY_ATTEMPTS`] times before failing with
+    /// `"<name>: MD5 verification failed after 3 attempts"`.
+    ///
+    /// When the remote file turns out to have changed under the download
+    /// (see [`SourceChanged`]) it is probed again and fetched once more from
+    /// the start.
     pub fn download_file(
         &self,
         filename: &str,
         url: &str,
         local_dir: &Path,
-        size: u64,
-        position: usize,
+        info: &RemoteFileInfo,
         progress_callback: Option<ProgressCallback>,
-        supports_range: bool,
-        remote_md5: Option<&str>,
     ) -> DownloadResult<String> {
-        let _ = position;
+        match self.download_file_once(filename, url, local_dir, info, progress_callback.clone()) {
+            Err(e) if caused_by_source_change(&e) => {
+                let flat_name = basename(filename);
+                self.logger.warning(&format!("[resume] {flat_name} changed on the server; starting it over: {e}"));
+                discard_part(&part_path(local_dir, filename))?;
+                let info = self.get_remote_file_info(url)?;
+                self.download_file_once(filename, url, local_dir, &info, progress_callback)
+            }
+            other => other,
+        }
+    }
+
+    fn download_file_once(
+        &self,
+        filename: &str,
+        url: &str,
+        local_dir: &Path,
+        info: &RemoteFileInfo,
+        progress_callback: Option<ProgressCallback>,
+    ) -> DownloadResult<String> {
         let flat_name = basename(filename);
+        let size = info.size;
 
         // On entry, so a worker the pool starts after the flag was raised
         // exits before opening a socket.
         self.cancel_token().check(flat_name)?;
 
         let dest = local_dir.join(flat_name);
-        let part = PathBuf::from(format!("{}.part", dest.display()));
+        let part = part_path(local_dir, filename);
         let size_mb = size as f64 / (1024.0 * 1024.0);
+        let threshold = self.chunked_threshold_override.lock().unwrap_or(CHUNKED_THRESHOLD);
+        let chunked = info.accept_ranges && size >= threshold;
 
         for verify_attempt in 1..=MAX_VERIFY_ATTEMPTS {
             self.cancel_token().check(flat_name)?;
-            // Start each verification attempt from a clean slate so we never
-            // resume onto bytes a previous corrupt attempt wrote.
-            if part.exists() {
-                std::fs::remove_file(&part)?;
+            // A failed verification restarts from nothing; only the first
+            // attempt may resume onto bytes already on disk.
+            if verify_attempt > 1 || !chunked {
+                discard_part(&part)?;
             }
 
-            if supports_range && size >= CHUNKED_THRESHOLD {
-                let workers = self.effective_chunk_workers();
-                let ranges = segments(size, workers as u64).len();
-                self.logger.info(&format!(
-                    "Downloading {flat_name} ({size_mb:.1} MB) over {workers} connections in {ranges} ranges"
-                ));
-                self.download_file_chunked(flat_name, url, &part, size, progress_callback.clone())?;
+            if chunked {
+                self.download_file_chunked(flat_name, url, &part, info, progress_callback.clone())?;
             } else {
-                let reason = if !supports_range { "no Range support" } else { "below threshold" };
+                let reason = if !info.accept_ranges { "no Range support" } else { "below threshold" };
                 self.logger.info(&format!("Downloading {flat_name} ({size_mb:.1} MB) single-stream ({reason})"));
-                self.download_file_simple(flat_name, url, &part, size, progress_callback.clone(), supports_range)?;
+                let token = self.cancel_token();
+                let _permit = self.connection_permits(size).acquire(|| token.cancelled());
+                self.cancel_token().check(flat_name)?;
+                self.download_file_simple(flat_name, url, &part, size, progress_callback.clone(), info.accept_ranges)?;
             }
 
             // No server-provided digest → can't verify; the atomic rename
             // below still guarantees we never publish a truncated file.
-            let Some(expected) = remote_md5 else {
+            let Some(expected) = info.digest.as_ref() else {
                 break;
             };
 
-            let local_md5 = Self::compute_local_md5(&part, Some(&self.cancel_token()))?;
-            if local_md5 == expected {
-                break;
+            if let Some(callback) = &progress_callback {
+                callback(DownloadProgress::new(flat_name, size, size, "verifying"));
             }
+            self.logger.info(&format!("[verify] {flat_name}: checking {size_mb:.1} MB against its ETag"));
+            let started = std::time::Instant::now();
+            let got = match digest::verify(&part, expected, Some(&self.cancel_token()))? {
+                Verdict::Match => {
+                    let secs = started.elapsed().as_secs_f64();
+                    self.logger.info(&format!("[verify] {flat_name}: verified in {secs:.1}s"));
+                    break;
+                }
+                Verdict::Unverifiable => {
+                    self.logger.warning(&format!(
+                        "[verify] {flat_name}: no part size reproduces the ETag {expected}; not verified"
+                    ));
+                    break;
+                }
+                Verdict::Mismatch { got } => got,
+            };
 
             self.logger.warning(&format!(
                 "[verify] {flat_name} MD5 mismatch (attempt {verify_attempt}/{MAX_VERIFY_ATTEMPTS}): \
-                 expected {expected}, got {local_md5}"
+                 expected {expected}, got {got}"
             ));
             if verify_attempt == MAX_VERIFY_ATTEMPTS {
-                if part.exists() {
-                    std::fs::remove_file(&part)?;
-                }
+                discard_part(&part)?;
                 return Err(DownloadError::runtime(
                     format!("{flat_name}: MD5 verification failed after {MAX_VERIFY_ATTEMPTS} attempts"),
                     None,
@@ -1255,6 +1714,7 @@ impl SLPArtifactDownloader {
 
         // Atomically publish: the final path appears only now, fully written.
         std::fs::rename(&part, &dest)?;
+        ResumeState::remove(&part)?;
 
         if let Some(callback) = &progress_callback {
             callback(DownloadProgress::new(flat_name, size, size, "completed"));
@@ -1277,6 +1737,7 @@ impl SLPArtifactDownloader {
         progress_callback: Option<ProgressCallback>,
         supports_range: bool,
     ) -> DownloadResult<()> {
+        let moved = Cell::new(0u64); // bytes received across attempts
         let mut attempt = |attempt_no: u32| -> DownloadResult<()> {
             // Resume only from bytes written by a PRIOR attempt in this call —
             // the first attempt always starts clean, so a pre-existing corrupt
@@ -1316,14 +1777,21 @@ impl SLPArtifactDownloader {
                 self.cancel_token().check(flat_name)?;
                 file.write_all(&chunk)?;
                 downloaded += chunk.len() as u64;
+                moved.set(moved.get() + chunk.len() as u64);
                 if let Some(callback) = &progress_callback {
                     callback(DownloadProgress::new(flat_name, downloaded, size, "downloading"));
                 }
             }
+            if size > 0 && downloaded < size {
+                return Err(short_body(flat_name, downloaded, size));
+            }
+            if size > 0 && downloaded > size {
+                return Err(SourceChanged(format!("{flat_name}: got {downloaded} bytes, expected {size}")).into());
+            }
             Ok(())
         };
 
-        self.run_with_retries(&format!("download {flat_name}"), &mut attempt)
+        self.run_with_retries_progress(&format!("download {flat_name}"), &|| moved.get(), &mut attempt)
     }
 
     /// Download a byte range to its file offset, retrying transient failures.
@@ -1345,106 +1813,246 @@ impl SLPArtifactDownloader {
         downloaded_counter: &Mutex<u64>,
         progress_callback: Option<ProgressCallback>,
     ) -> DownloadResult<()> {
-        let mut written = 0u64; // bytes of THIS chunk already flushed to disk
+        let file = ChunkedFile {
+            url,
+            dest,
+            flat_name,
+            size: total_size,
+            counter: downloaded_counter,
+            progress: progress_callback,
+            journal: None,
+            if_range: None,
+            stats: self.transfer_stats(),
+            tuning: None,
+        };
+        self.fetch_range(&file, &RangeCursor::new(start, end))
+    }
+
+    /// The range `cursor` covers, with retries.  The range's end can be
+    /// lowered by a split while it runs; the connection stops there.
+    fn fetch_range(&self, file: &ChunkedFile<'_>, cursor: &RangeCursor) -> DownloadResult<()> {
+        let ChunkedFile { url, dest, flat_name, size: total_size, .. } = *file;
+        let start = cursor.start();
+        let label = |end: u64| format!("bytes {start}-{end} of {flat_name}");
 
         // On entry, so a range the pool starts after the flag was raised exits
         // before opening a socket.  Every model worth downloading is over
         // CHUNKED_THRESHOLD, so this pool is where a cancel usually lands.
         self.cancel_token().check(flat_name)?;
 
-        let mut attempt = |_attempt_no: u32| -> DownloadResult<()> {
-            let cur_start = start + written;
+        let attempt = |_attempt_no: u32| -> DownloadResult<()> {
+            let (cur_start, end) = cursor.position();
             if cur_start > end {
                 return Ok(()); // chunk already fully written by a prior attempt
             }
             let mut headers = Headers::new();
             headers.insert("Range".to_string(), format!("bytes={cur_start}-{end}"));
-            let mut resp = self.http.stream(url, &headers, STREAM_TIMEOUT)?;
+            if let Some(validator) = &file.if_range {
+                headers.insert("If-Range".to_string(), validator.clone());
+            }
+            let mut resp = self.http.stream(url, &headers, RANGE_TIMEOUT)?;
             if resp.status_code() == 401 {
                 return Err(StaleDownloadURLError(UNAUTHORIZED_MSG.to_string()).into());
             }
             resp.raise_for_status()?;
-            let mut file = OpenOptions::new().read(true).write(true).open(dest)?;
-            file.seek(SeekFrom::Start(cur_start))?;
+            check_range_response(resp.as_ref(), cur_start, end, total_size)?;
+            let mut out = OpenOptions::new().read(true).write(true).open(dest)?;
+            out.seek(SeekFrom::Start(cur_start))?;
+            let mut meter = file.stats.open();
+            let mut slow = None;
             while let Some(chunk) = resp.next_chunk(RANGE_READ_SIZE)? {
                 self.cancel_token().check(flat_name)?;
-                file.write_all(&chunk)?;
-                written += chunk.len() as u64;
-                if let Some(callback) = &progress_callback {
+                meter.add(chunk.len() as u64);
+                if let Some(why) = meter.slowness() {
+                    // Dropping `resp` closes the connection; the retry asks
+                    // again from the next unwritten byte on a fresh one.
+                    // What arrived in this read is still written below.
+                    slow = Some(why);
+                }
+                // Never write past the range (which a split may have just
+                // shortened), whatever the server sends.
+                let Some((offset, take)) = cursor.claim(chunk.len() as u64) else {
+                    break;
+                };
+                if let Err(e) = out.write_all(&chunk[..take as usize]) {
+                    cursor.unclaim(offset);
+                    return Err(e.into());
+                }
+                if let Some(journal) = &file.journal {
+                    journal.record(offset, offset + take);
+                    journal.maybe_flush()?;
+                }
+                if let Some(callback) = &file.progress {
                     let current = {
-                        let mut counter = downloaded_counter.lock();
-                        *counter += chunk.len() as u64;
+                        let mut counter = file.counter.lock();
+                        *counter += take;
                         *counter
                     };
                     callback(DownloadProgress::new(flat_name, current, total_size, "downloading"));
                 }
+                if let Some(step) = file.tuning.as_ref().and_then(|t| t.tick()) {
+                    self.logger.info(&format!(
+                        "[tune] {} -> {} connections ({:.1} MB/s)",
+                        step.from,
+                        step.to,
+                        step.rate / (1024.0 * 1024.0)
+                    ));
+                }
+                let (next, end) = cursor.position();
+                if next > end {
+                    break;
+                }
+                if let Some(why) = slow {
+                    return Err(HttpError::transport(
+                        TransportErrorKind::LowSpeed,
+                        format!("{}: connection {why}", label(end)),
+                    )
+                    .into());
+                }
+            }
+            let (next, end) = cursor.position();
+            if next <= end {
+                return Err(short_body(&label(end), next - cur_start, end + 1 - cur_start));
             }
             Ok(())
         };
 
-        self.run_with_retries(&format!("chunk {start}-{end} of {flat_name}"), &mut attempt)
+        let mut reported = |n: u32| {
+            let result = attempt(n);
+            if let (Err(DownloadError::Http(e)), Some(tuning)) = (&result, &file.tuning) {
+                match e {
+                    HttpError::Status { status_code: 429 | 503, .. } => tuning.note_throttled(),
+                    HttpError::Transport { kind: TransportErrorKind::LowSpeed, .. } => {}
+                    _ => tuning.note_error(),
+                }
+            }
+            result
+        };
+        let (_, end) = cursor.position();
+        self.run_with_retries_progress(&format!("chunk {}", label(end)), &|| cursor.claimed(), &mut reported)
     }
 
-    /// `CHUNK_WORKERS`, or the test override.
-    fn effective_chunk_workers(&self) -> usize {
-        self.chunk_workers_override.lock().unwrap_or_else(chunk_workers).max(1)
-    }
-
-    /// Download a large file using parallel Range requests.
+    /// Download a large file using parallel Range requests into `dest`.
+    ///
+    /// Picks up from `dest`'s `.part.state` journal when it describes this
+    /// same object (size and validators) and `dest` is still the right
+    /// length; otherwise starts over on a freshly allocated file.  Progress
+    /// is journalled as it lands and flushed once more when the transfer
+    /// stops, so a failed or interrupted download resumes next time.
     pub fn download_file_chunked(
         &self,
         flat_name: &str,
         url: &str,
         dest: &Path,
-        size: u64,
+        info: &RemoteFileInfo,
         progress_callback: Option<ProgressCallback>,
     ) -> DownloadResult<()> {
-        // Pre-allocate the file.
-        {
-            let mut file = File::create(dest)?;
-            if size == 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
-            }
-            file.seek(SeekFrom::Start(size - 1))?;
-            file.write_all(&[0])?;
+        let size = info.size;
+        if size == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
         }
+        let fresh = ResumeState::new(size, info.etag.clone(), info.last_modified.clone());
+        let resumable = fresh.resumable();
+
+        let saved = ResumeState::load(dest).filter(|saved| {
+            resumable
+                && saved.same_object(size, info.etag.as_deref(), info.last_modified.as_deref())
+                && std::fs::metadata(dest).is_ok_and(|m| m.len() == size)
+        });
+        let done = match &saved {
+            Some(saved) => saved.done_set(),
+            None => {
+                ResumeState::remove(dest)?;
+                preallocate(dest, size)?;
+                IntervalSet::new()
+            }
+        };
+        let journal = resumable.then(|| {
+            let mut state = fresh;
+            state.set_done(&done);
+            Journal::new(dest, state)
+        });
 
         // Small ranges on a shared queue, so every connection stays busy to
         // the end (see SEGMENT_SIZE).
-        let workers = self.effective_chunk_workers() as u64;
-        let chunks = segments(size, workers);
+        let permits = self.connection_permits(size - done.len_bytes());
+        let workers = permits.limit();
+        let chunks = segments_of(&done.missing(size), workers as u64);
+        let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        if done.is_empty() {
+            self.logger.info(&format!(
+                "Downloading {flat_name} ({:.1} MB) over up to {workers} connections in {} ranges",
+                mb(size),
+                chunks.len()
+            ));
+        } else {
+            self.logger.info(&format!(
+                "Resuming {flat_name}: {:.1} of {:.1} MB already on disk, {} ranges left",
+                mb(done.len_bytes()),
+                mb(size),
+                chunks.len()
+            ));
+        }
 
-        let downloaded_counter = Mutex::new(0u64); // shared across threads
+        let downloaded_counter = Mutex::new(done.len_bytes()); // shared across threads
+        if let (Some(callback), false) = (&progress_callback, done.is_empty()) {
+            callback(DownloadProgress::new(flat_name, done.len_bytes(), size, "downloading"));
+        }
+        let file = ChunkedFile {
+            url,
+            dest,
+            flat_name,
+            size,
+            counter: &downloaded_counter,
+            progress: progress_callback,
+            journal,
+            if_range: if_range_validator(info),
+            stats: self.transfer_stats(),
+            tuning: self.tuning.lock().clone(),
+        };
         let hook = self.download_chunk_hook.lock().clone();
         // Once a range has failed for good (its own retries spent), the
         // download fails: the ranges still queued are skipped, rather than
         // fetching the rest of the file before the error is reported.
         let failed = AtomicBool::new(false);
+        let queue = Mutex::new(chunks.into_iter().collect::<VecDeque<_>>());
+        let threads = self.connections_override.lock().unwrap_or(MAX_CONNECTIONS);
+        let token = self.cancel_token();
+        // Once the queue is empty an idle connection splits the largest range
+        // still in flight, so the tail is shared rather than left to one.
+        let in_flight = InFlight::new(self.min_split_override.lock().unwrap_or(MIN_SPLIT));
+        let nothing_left = || queue.lock().is_empty() && (hook.is_some() || !in_flight.splittable());
 
-        let raised = run_pool(
-            workers as usize,
-            chunks,
-            |(start, end)| {
-                if failed.load(Ordering::SeqCst) {
-                    return ((start, end), Ok(()));
-                }
+        let raised = run_workers(
+            threads,
+            || {
+                let _permit =
+                    permits.acquire(|| failed.load(Ordering::SeqCst) || token.cancelled() || nothing_left())?;
+                let next = queue.lock().pop_front();
+                let cursor = match next {
+                    Some((start, end)) => {
+                        let cursor = RangeCursor::new(start, end);
+                        in_flight.start(&cursor);
+                        cursor
+                    }
+                    None if hook.is_none() => {
+                        let cursor = in_flight.split()?;
+                        let (start, end) = cursor.position();
+                        self.logger.info(&format!("[split] {flat_name}: taking bytes {start}-{end} from a busy range"));
+                        cursor
+                    }
+                    None => return None,
+                };
+                let (start, end) = cursor.position();
                 let result = match &hook {
                     Some(hook) => hook(start, end),
-                    None => self.download_chunk(
-                        url,
-                        dest,
-                        start,
-                        end,
-                        flat_name,
-                        size,
-                        &downloaded_counter,
-                        progress_callback.clone(),
-                    ),
+                    None => self.fetch_range(&file, &cursor),
                 };
+                in_flight.finish(&cursor);
                 if result.is_err() {
                     failed.store(true, Ordering::SeqCst);
                 }
-                ((start, end), result)
+                Some(((start, cursor.position().1), result))
             },
             |((start, end), result)| match result {
                 Ok(()) => None,
@@ -1468,6 +2076,23 @@ impl SLPArtifactDownloader {
                 }
             },
         );
+        // A cancel raised while waiting for a connection never reaches a
+        // range, so surface it here.
+        let raised = match raised {
+            None if token.cancelled() => Some(DownloadError::from(token.check(flat_name).unwrap_err())),
+            other => other,
+        };
+
+        // A cancel discards the whole tree, so a final flush would only
+        // delay it; anything else, an interrupt included, keeps what arrived
+        // for the next attempt.
+        if let Some(journal) = &file.journal {
+            if !raised.as_ref().is_some_and(DownloadError::is_cancelled) || token.interrupted() {
+                if let Err(e) = journal.flush() {
+                    self.logger.warning(&format!("[resume] could not save progress of {flat_name}: {e}"));
+                }
+            }
+        }
         match raised {
             Some(err) => Err(err),
             None => Ok(()),
@@ -1685,6 +2310,73 @@ impl SLPArtifactDownloader {
 
         self.run_download_artifacts(&artifacts, &local_dir, progress_callback, "Model", &display_model_name(&model_name))
     }
+}
+
+/// What every range of one chunked file shares.
+struct ChunkedFile<'a> {
+    url: &'a str,
+    dest: &'a Path,
+    flat_name: &'a str,
+    size: u64,
+    counter: &'a Mutex<u64>,
+    progress: Option<ProgressCallback>,
+    journal: Option<Journal>,
+    /// Sent as `If-Range`, so a changed object answers 200 rather than
+    /// bytes of the new version.
+    if_range: Option<String>,
+    stats: Arc<TransferStats>,
+    tuning: Option<Arc<Tuning>>,
+}
+
+/// The `If-Range` value for `info`: its strong ETag, else Last-Modified.
+fn if_range_validator(info: &RemoteFileInfo) -> Option<String> {
+    match info.etag.as_deref() {
+        Some(etag) if !crate::model::downloader::resume::is_weak_etag(etag) => Some(etag.to_string()),
+        _ => info.last_modified.clone(),
+    }
+}
+
+/// Whether `err` or anything in its cause chain is a [`SourceChanged`].
+fn caused_by_source_change(err: &DownloadError) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if matches!(e, DownloadError::SourceChanged(_)) {
+            return true;
+        }
+        current = e.cause();
+    }
+    false
+}
+
+/// `<local_dir>/<basename>.part`.
+fn part_path(local_dir: &Path, filename: &str) -> PathBuf {
+    PathBuf::from(format!("{}.part", local_dir.join(basename(filename)).display()))
+}
+
+/// Bytes of `info`'s object a resume of `part` would not need to fetch.
+pub fn resumable_bytes(part: &Path, info: &RemoteFileInfo) -> u64 {
+    ResumeState::load(part)
+        .filter(|saved| {
+            saved.same_object(info.size, info.etag.as_deref(), info.last_modified.as_deref())
+                && std::fs::metadata(part).is_ok_and(|m| m.len() == info.size)
+        })
+        .map_or(0, |saved| saved.done_set().len_bytes())
+}
+
+/// Create `dest` as a `size`-byte file to write ranges into.
+fn preallocate(dest: &Path, size: u64) -> std::io::Result<()> {
+    let mut file = File::create(dest)?;
+    file.seek(SeekFrom::Start(size - 1))?;
+    file.write_all(&[0])
+}
+
+/// Remove a `.part` and its journal.
+fn discard_part(part: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(part) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    ResumeState::remove(part)
 }
 
 /// Whether Python's `int(s, 16)` accepts `s`: optional surrounding

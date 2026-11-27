@@ -3,8 +3,11 @@
 pub mod artifact_downloader;
 pub mod artifact_source;
 pub mod cancellation;
+pub mod digest;
 pub mod hf_downloader;
 pub mod inflight;
+pub mod ranges;
+pub mod resume;
 pub mod slp_downloader;
 
 pub use artifact_downloader::SLPArtifactDownloader;

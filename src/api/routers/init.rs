@@ -651,10 +651,21 @@ where
     // stops a download" true rather than merely intended.
     let token = cancellation::begin(model_id)?;
     let _registration = Registration { model_id: model_id.to_string(), token: token.clone() };
-    downloader.set_cancel_token(token);
+    downloader.set_cancel_token(token.clone());
 
     let result = downloader.download(model_id, Some(on_progress), artifacts);
     if let Err(e) = &result {
+        if py_error_kind_of(e) == PyErrorKind::Cancelled && token.interrupted() {
+            // The server is shutting down: keep the bytes for the next run to
+            // resume, and answer as a retryable failure rather than a cancel
+            // the user didn't ask for.
+            tracing::info!(target: LOG_TARGET, "[resume] {model_id}: interrupted by shutdown, progress kept");
+            return Err(anyhow::Error::new(HTTPException::new(
+                503,
+                "Download interrupted because the server is shutting down. Enable the model again to resume it."
+                    .to_string(),
+            )));
+        }
         if py_error_kind_of(e) == PyErrorKind::Cancelled {
             // Before the registration is released, which is the point of
             // doing it here: the registration is what keeps a second download
@@ -684,7 +695,8 @@ where
 /// `artifacts` carries a signed-URL map already resolved by the caller (see
 /// [`SLPArtifactDownloader::resolve_artifacts`]), so entitlement is settled
 /// before this stream opens and the URLs are minted once.  Progress frames
-/// are throttled to one per file per 0.5s (completed frames always pass); a
+/// are throttled to one per file per 0.5s (verifying and completed frames
+/// always pass); a
 /// keepalive is emitted after ~5s of silence.  A non-bootstrap download
 /// claims/releases the cancel registration on the download thread, and a
 /// cancelled download discards its partial bytes before re-raising
@@ -712,7 +724,7 @@ where
                 let now = Instant::now();
                 {
                     let mut last = last.lock();
-                    if progress.status != "completed" {
+                    if progress.status == "downloading" {
                         if let Some(prev) = last.get(&progress.filename) {
                             if now.duration_since(*prev) < Duration::from_millis(500) {
                                 return;
@@ -722,15 +734,16 @@ where
                     last.insert(progress.filename.clone(), now);
                 }
                 let mut d = progress.to_dict();
-                d["status"] = json!("downloading");
+                let verifying = progress.status == "verifying";
+                d["status"] = json!(if verifying { "verifying" } else { "downloading" });
                 if progress.total > 0 {
                     let percent = round1(progress.downloaded as f64 / progress.total as f64 * 100.0);
                     d["percent"] = json!(percent);
-                    d["message"] = json!(format!(
-                        "Downloading {}... {}%",
-                        progress.filename,
-                        py_float_str(percent)
-                    ));
+                    d["message"] = json!(if verifying {
+                        format!("Verifying {}...", progress.filename)
+                    } else {
+                        format!("Downloading {}... {}%", progress.filename, py_float_str(percent))
+                    });
                 }
                 queue.lock().push_back(d);
             })

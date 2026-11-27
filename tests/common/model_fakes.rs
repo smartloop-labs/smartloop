@@ -81,6 +81,7 @@ pub struct FakeResp {
     index: usize,
     on_chunk: Option<ChunkHook>,
     closed: Arc<AtomicBool>,
+    headers: Headers,
 }
 
 impl FakeResp {
@@ -94,7 +95,26 @@ impl FakeResp {
             index: 0,
             on_chunk: None,
             closed: Arc::new(AtomicBool::new(false)),
+            headers: Headers::new(),
         }
+    }
+
+    /// Replace the status code.
+    pub fn with_status(mut self, status_code: u16) -> Self {
+        self.status_code = status_code;
+        self
+    }
+
+    /// Run `hook` with each chunk's index before handing it out.
+    pub fn with_on_chunk(mut self, hook: impl Fn(usize) + Send + 'static) -> Self {
+        self.on_chunk = Some(Box::new(hook));
+        self
+    }
+
+    /// Add a response header.
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.insert(name.to_string(), value.to_string());
+        self
     }
 
     /// Fail with `exc` when chunk `raise_at` would be yielded.
@@ -157,6 +177,10 @@ impl StreamResponse for FakeResp {
         }
         Ok(Some(chunk))
     }
+
+    fn header(&self, name: &str) -> Option<String> {
+        smartloop::model::downloader::artifact_downloader::header_get(&self.headers, name).map(str::to_string)
+    }
 }
 
 /// A HEAD replacement (`monkeypatch.setattr(ad.httpx, "head", ...)`).
@@ -186,6 +210,16 @@ impl ScriptedHttp {
     pub fn with_head(head: HeadFn) -> Arc<Self> {
         Arc::new(ScriptedHttp {
             responses: Mutex::new(VecDeque::new()),
+            header_calls: Mutex::new(Vec::new()),
+            timeout_calls: Mutex::new(Vec::new()),
+            head: Some(head),
+        })
+    }
+
+    /// Stream calls answer with `responses` in order; HEAD answered by `head`.
+    pub fn with_head_and_responses(head: HeadFn, responses: Vec<FakeResp>) -> Arc<Self> {
+        Arc::new(ScriptedHttp {
+            responses: Mutex::new(responses.into()),
             header_calls: Mutex::new(Vec::new()),
             timeout_calls: Mutex::new(Vec::new()),
             head: Some(head),
@@ -233,5 +267,94 @@ pub fn downloader(cancel: Option<CancelToken>, http: Option<Arc<ScriptedHttp>>) 
     match http {
         Some(http) => dl.with_http(http),
         None => dl,
+    }
+}
+
+/// A server for one object that answers `Range` requests from its bytes, so
+/// tests can run concurrent ranges without scripting their order.
+pub struct RangeServer {
+    pub data: Vec<u8>,
+    pub etag: Mutex<String>,
+    /// Bytes at or past this offset are unreachable: a body stops just
+    /// before it and a request starting there fails to connect.
+    pub cut_at: Mutex<Option<u64>>,
+    /// Body chunk size.
+    pub piece: usize,
+    /// Every `Range` (and `If-Range`) asked for, in order.
+    pub requests: Mutex<Vec<(String, Option<String>)>>,
+    /// A request starting at this offset sleeps this long per piece.
+    pub slow_from: Mutex<Option<(u64, std::time::Duration)>>,
+}
+
+impl RangeServer {
+    /// Serve `data` with a strong ETag.
+    pub fn new(data: Vec<u8>) -> Arc<Self> {
+        Arc::new(RangeServer {
+            data,
+            etag: Mutex::new("\"v1\"".to_string()),
+            cut_at: Mutex::new(None),
+            piece: 4,
+            requests: Mutex::new(Vec::new()),
+            slow_from: Mutex::new(None),
+        })
+    }
+
+    /// The `Range` headers requested, in order.
+    pub fn ranges(&self) -> Vec<String> {
+        self.requests.lock().iter().map(|(r, _)| r.clone()).collect()
+    }
+
+    /// What a HEAD would report.
+    pub fn info(&self) -> smartloop::model::downloader::artifact_downloader::RemoteFileInfo {
+        smartloop::model::downloader::artifact_downloader::RemoteFileInfo {
+            size: self.data.len() as u64,
+            accept_ranges: true,
+            etag: Some(self.etag.lock().clone()),
+            ..Default::default()
+        }
+    }
+}
+
+impl DownloadHttp for RangeServer {
+    fn head(&self, _url: &str) -> Result<HeadResponse, HttpError> {
+        let mut headers = Headers::new();
+        headers.insert("content-length".to_string(), self.data.len().to_string());
+        headers.insert("accept-ranges".to_string(), "bytes".to_string());
+        headers.insert("etag".to_string(), self.etag.lock().clone());
+        Ok(HeadResponse { status_code: 200, headers })
+    }
+
+    fn stream(&self, _url: &str, headers: &Headers, _timeout: StreamTimeout) -> Result<Box<dyn StreamResponse>, HttpError> {
+        let range = headers.get("Range").cloned().unwrap_or_default();
+        let if_range = headers.get("If-Range").cloned();
+        self.requests.lock().push((range.clone(), if_range.clone()));
+        let total = self.data.len() as u64;
+        let etag = self.etag.lock().clone();
+        let (first, last) = range
+            .strip_prefix("bytes=")
+            .and_then(|r| r.split_once('-'))
+            .map(|(a, b)| (a.parse::<u64>().unwrap(), b.parse::<u64>().unwrap_or(total - 1)))
+            .unwrap_or((0, total - 1));
+        if if_range.as_ref().is_some_and(|v| *v != etag) || range.is_empty() {
+            let pieces: Vec<&[u8]> = self.data.chunks(self.piece).collect();
+            return Ok(Box::new(FakeResp::new(200, &pieces).with_header("ETag", &etag)));
+        }
+        let cut = *self.cut_at.lock();
+        if cut.is_some_and(|c| first >= c) {
+            return Err(connect_error("unreachable"));
+        }
+        let stop = cut.map_or(last, |c| last.min(c - 1));
+        let body = &self.data[first as usize..=stop as usize];
+        let pieces: Vec<&[u8]> = body.chunks(self.piece).collect();
+        let mut resp = FakeResp::new(206, &pieces)
+            .with_header("Content-Range", &format!("bytes {first}-{last}/{total}"))
+            .with_header("ETag", &etag);
+        if stop < last {
+            resp = resp.failing_at(pieces.len(), read_error("cut"));
+        }
+        if let Some((_, pause)) = self.slow_from.lock().filter(|(at, _)| *at == first) {
+            resp = resp.with_on_chunk(move |_| std::thread::sleep(pause));
+        }
+        Ok(Box::new(resp))
     }
 }

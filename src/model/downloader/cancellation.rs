@@ -67,10 +67,8 @@ impl DownloadCancelled {
 
 /// This model is already downloading, so a second transfer was refused.
 ///
-/// Nothing serialized downloads on `model_id` before this: two calls wrote the
-/// same directory and each deleted the other's `.part` on its way in
-/// (`download_file` unlinks a pre-existing sidecar rather than resuming onto
-/// it), so both made progress and neither finished.
+/// Two transfers into one directory would write the same `.part` and its
+/// resume journal over each other.
 ///
 /// A `RuntimeError` subclass in Python; maps to HTTP 409.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -187,6 +185,9 @@ pub struct CancelToken {
     /// [`CancelToken::wait`] returns the cancelled state immediately instead of
     /// sleeping.
     instant_wait: Arc<AtomicBool>,
+    /// The stop came from the server shutting down, not from the user, so
+    /// the bytes that arrived are kept for the next run to resume.
+    interrupted: Arc<AtomicBool>,
 }
 
 impl Default for CancelToken {
@@ -198,12 +199,29 @@ impl Default for CancelToken {
 impl CancelToken {
     /// A fresh, uncancelled token.
     pub fn new() -> Self {
-        Self { event: Event::new(), done: Event::new(), instant_wait: Arc::new(AtomicBool::new(false)) }
+        Self {
+            event: Event::new(),
+            done: Event::new(),
+            instant_wait: Arc::new(AtomicBool::new(false)),
+            interrupted: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Ask this download to stop.  Idempotent.
     pub fn cancel(&self) {
         self.event.set();
+    }
+
+    /// Stop this download but keep what it wrote, for a shutdown.
+    pub fn interrupt(&self) {
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.event.set();
+    }
+
+    /// Whether the stop was an [`interrupt`](Self::interrupt), which keeps
+    /// the partial download.
+    pub fn interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::SeqCst)
     }
 
     /// Whether a stop has been requested.
@@ -331,6 +349,16 @@ pub fn end(model_id: &str, token: &CancelToken) {
         }
     }
     token.done.set();
+}
+
+/// Interrupt every registered download, keeping their bytes for resume.
+/// Returns how many there were.
+pub fn interrupt_all() -> usize {
+    let active = ACTIVE.lock();
+    for token in active.values() {
+        token.interrupt();
+    }
+    active.len()
 }
 
 /// The `model_id`s with a download registered (sorted), for status and tests.

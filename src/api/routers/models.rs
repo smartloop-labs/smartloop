@@ -112,7 +112,7 @@ fn classify_one(err: &(dyn StdError + 'static)) -> Option<PyErrorKind> {
         }
         #[allow(unreachable_patterns)]
         return match e {
-            DownloadError::StaleUrl(_) | DownloadError::Connection { .. } => {
+            DownloadError::StaleUrl(_) | DownloadError::Connection { .. } | DownloadError::SourceChanged(_) => {
                 Some(PyErrorKind::Connection)
             }
             DownloadError::Runtime { .. } => Some(PyErrorKind::Runtime),

@@ -16,6 +16,8 @@ use smartloop::model::downloader::artifact_downloader::{
 };
 use smartloop::model::downloader::slp_downloader::ProgressCallback;
 
+use smartloop::model::downloader::artifact_downloader::RemoteFileInfo;
+
 use crate::shared::model_fakes::{
     FakeResp, ScriptedHttp, connect_error, downloader, range_header, read_error, read_timeout, remote_protocol_error,
     status_error,
@@ -144,6 +146,69 @@ mod test_run_with_retries {
     }
 }
 
+/// A failure after real progress does not use up the retry budget.
+mod test_progress_resets_the_budget {
+    use super::*;
+    use smartloop::model::downloader::artifact_downloader::PROGRESS_RESETS_RETRIES;
+    use std::cell::Cell;
+
+    #[test]
+    fn test_a_transfer_that_keeps_moving_outlasts_the_attempt_count() {
+        let dl = downloader(None, None);
+        let moved = Cell::new(0u64);
+        let mut calls = 0u32;
+        let result = dl.run_with_retries_progress("op", &|| moved.get(), &mut |_| {
+            calls += 1;
+            moved.set(moved.get() + PROGRESS_RESETS_RETRIES);
+            if calls <= 3 * MAX_DOWNLOAD_ATTEMPTS {
+                return Err(read_error("drop").into());
+            }
+            Ok(())
+        });
+        result.unwrap();
+        assert_eq!(calls, 3 * MAX_DOWNLOAD_ATTEMPTS + 1);
+    }
+
+    #[test]
+    fn test_a_trickle_still_runs_out() {
+        let dl = downloader(None, None);
+        let moved = Cell::new(0u64);
+        let mut calls = 0u32;
+        let err = dl
+            .run_with_retries_progress::<()>("op", &|| moved.get(), &mut |_| {
+                calls += 1;
+                moved.set(moved.get() + PROGRESS_RESETS_RETRIES - 1);
+                Err(read_error("drop").into())
+            })
+            .unwrap_err();
+        assert!(is_retryable_error(&err));
+        assert_eq!(calls, MAX_DOWNLOAD_ATTEMPTS);
+    }
+
+    #[test]
+    fn test_a_range_that_drops_every_megabyte_still_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("big.bin");
+        let mb = PROGRESS_RESETS_RETRIES as usize;
+        let pieces = 2 * MAX_DOWNLOAD_ATTEMPTS as usize;
+        std::fs::write(&dest, vec![0u8; mb * pieces]).unwrap();
+        let block = vec![7u8; mb];
+        let responses: Vec<FakeResp> = (0..pieces)
+            .map(|i| {
+                let resp = FakeResp::new(206, &[&block, &block]);
+                if i + 1 < pieces { resp.failing_at(1, read_error("drop")) } else { resp }
+            })
+            .collect();
+        let http = ScriptedHttp::new(responses);
+        let dl = downloader(None, Some(Arc::clone(&http)));
+        let counter = Mutex::new(0u64);
+        let size = (mb * pieces) as u64;
+        dl.download_chunk("http://x/file", &dest, 0, size - 1, "big.bin", size, &counter, None).unwrap();
+        assert_eq!(http.calls(), pieces);
+        assert!(std::fs::read(&dest).unwrap().iter().all(|b| *b == 7));
+    }
+}
+
 // ------------------------------------------------- Simple (single-stream) download
 
 /// `TestSimpleResume`
@@ -264,6 +329,231 @@ mod test_chunk_resume {
         assert_eq!(calls[0], range_header("bytes=0-7"));
         assert_eq!(calls[1], range_header("bytes=4-7"));
     }
+
+    /// A range gives up on a dead socket sooner than a whole-file stream: a
+    /// read that never returns is invisible to the low-speed check.
+    #[test]
+    fn test_ranges_use_the_tighter_read_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("big.bin");
+        std::fs::write(&dest, [0u8; 8]).unwrap();
+        let http = ScriptedHttp::new(vec![FakeResp::new(206, &[b"ABCDEFGH"])]);
+
+        let counter = Mutex::new(0u64);
+        let dl = downloader(None, Some(Arc::clone(&http)));
+        dl.download_chunk("http://x/file", &dest, 0, 7, "big.bin", 8, &counter, None).unwrap();
+
+        let timeout = http.timeout_calls.lock()[0];
+        assert_eq!(timeout, ad::RANGE_TIMEOUT);
+        assert!(timeout.read < STREAM_TIMEOUT.read);
+    }
+}
+
+/// A range response is used only when it is exactly the bytes asked for.
+mod test_range_responses_are_checked {
+    use super::*;
+    use smartloop::model::downloader::artifact_downloader::{SourceChanged, is_transient_error, parse_content_range};
+
+    fn preallocated(dir: &std::path::Path) -> std::path::PathBuf {
+        let dest = dir.join("big.bin");
+        std::fs::write(&dest, [0u8; 8]).unwrap();
+        dest
+    }
+
+    fn fetch(dest: &std::path::Path, responses: Vec<FakeResp>) -> (Arc<ScriptedHttp>, Result<(), DownloadError>) {
+        let http = ScriptedHttp::new(responses);
+        let dl = downloader(None, Some(Arc::clone(&http)));
+        let counter = Mutex::new(0u64);
+        let result = dl.download_chunk("http://x/file", dest, 0, 7, "big.bin", 8, &counter, None);
+        (http, result)
+    }
+
+    #[test]
+    fn test_a_whole_object_answer_is_rejected_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let (http, result) = fetch(&dest, vec![FakeResp::new(200, &[b"ABCDEFGH"])]);
+        let err = result.unwrap_err();
+        assert!(matches!(err, DownloadError::SourceChanged(SourceChanged(_))));
+        assert!(is_transient_error(&err));
+        assert_eq!(http.calls(), 1, "not retried in place");
+        assert_eq!(std::fs::read(&dest).unwrap(), [0u8; 8]);
+    }
+
+    #[test]
+    fn test_a_content_range_for_other_bytes_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let resp = FakeResp::new(206, &[b"ABCDEFGH"]).with_header("Content-Range", "bytes 8-15/16");
+        let (_http, result) = fetch(&dest, vec![resp]);
+        assert!(matches!(result.unwrap_err(), DownloadError::SourceChanged(_)));
+        assert_eq!(std::fs::read(&dest).unwrap(), [0u8; 8]);
+    }
+
+    #[test]
+    fn test_a_content_range_for_a_different_size_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let resp = FakeResp::new(206, &[b"ABCDEFGH"]).with_header("Content-Range", "bytes 0-7/9");
+        let (_http, result) = fetch(&dest, vec![resp]);
+        assert!(matches!(result.unwrap_err(), DownloadError::SourceChanged(_)));
+    }
+
+    #[test]
+    fn test_a_matching_content_range_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let resp = FakeResp::new(206, &[b"ABCDEFGH"]).with_header("content-range", "bytes 0-7/8");
+        let (_http, result) = fetch(&dest, vec![resp]);
+        result.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ABCDEFGH");
+    }
+
+    #[test]
+    fn test_a_short_body_resumes_where_it_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let (http, result) =
+            fetch(&dest, vec![FakeResp::new(206, &[b"ABCD"]), FakeResp::new(206, &[b"EFGH"])]);
+        result.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ABCDEFGH");
+        let calls = http.header_calls.lock();
+        assert_eq!(calls[1], range_header("bytes=4-7"));
+    }
+
+    #[test]
+    fn test_a_short_body_that_never_completes_fails_retryably() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = preallocated(tmp.path());
+        let short: Vec<FakeResp> = (0..MAX_DOWNLOAD_ATTEMPTS).map(|_| FakeResp::new(206, &[])).collect();
+        let (_http, result) = fetch(&dest, short);
+        assert!(is_retryable_error(&result.unwrap_err()));
+    }
+
+    #[test]
+    fn test_bytes_past_the_range_are_not_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("big.bin");
+        std::fs::write(&dest, [0u8; 12]).unwrap();
+        let http = ScriptedHttp::new(vec![FakeResp::new(206, &[b"ABCDEFGHIJKL"])]);
+        let dl = downloader(None, Some(http));
+        let counter = Mutex::new(0u64);
+        dl.download_chunk("http://x/file", &dest, 0, 7, "big.bin", 12, &counter, None).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ABCDEFGH\0\0\0\0");
+    }
+
+    #[test]
+    fn test_a_simple_download_that_ends_short_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
+        let http = ScriptedHttp::new(vec![FakeResp::new(200, &[b"ABCD"]), FakeResp::new(206, &[b"EFGH"])]);
+        let dl = downloader(None, Some(Arc::clone(&http)));
+        dl.download_file_simple("file.bin", "http://x/file", &dest, 8, None, true).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ABCDEFGH");
+        assert_eq!(http.header_calls.lock()[1], range_header("bytes=4-"));
+    }
+
+    #[test]
+    fn test_content_range_parsing() {
+        assert_eq!(parse_content_range("bytes 0-7/8"), Some((0, 7, Some(8))));
+        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, 9, None)));
+        assert_eq!(parse_content_range("bytes */8"), None);
+        assert_eq!(parse_content_range("bytes 9-5/10"), None);
+    }
+}
+
+/// The probe reads size, validators and Range support, and asks with a
+/// ranged GET when HEAD is refused.
+mod test_the_probe {
+    use super::*;
+    use smartloop::model::downloader::artifact_downloader::{HeadResponse, Headers};
+
+    fn head_with(status_code: u16, pairs: &[(&str, &str)]) -> HeadResponse {
+        let mut headers = Headers::new();
+        for (k, v) in pairs {
+            headers.insert(k.to_lowercase(), v.to_string());
+        }
+        HeadResponse { status_code, headers }
+    }
+
+    #[test]
+    fn test_head_reads_size_validators_and_ranges() {
+        let http = ScriptedHttp::with_head(Box::new(|_| {
+            Ok(head_with(
+                200,
+                &[
+                    ("Content-Length", "18556688288"),
+                    ("Accept-Ranges", "bytes"),
+                    ("ETag", "\"0123456789abcdef0123456789abcdef-2213\""),
+                    ("Last-Modified", "Tue, 24 Nov 2026 10:00:00 GMT"),
+                ],
+            ))
+        }));
+        let info = downloader(None, Some(http)).get_remote_file_info("https://x/f").unwrap();
+        assert_eq!(
+            info,
+            RemoteFileInfo {
+                size: 18_556_688_288,
+                digest: Some(smartloop::model::downloader::digest::RemoteDigest::Multipart {
+                    md5: "0123456789abcdef0123456789abcdef".to_string(),
+                    parts: 2213,
+                }),
+                accept_ranges: true,
+                etag: Some("\"0123456789abcdef0123456789abcdef-2213\"".to_string()),
+                last_modified: Some("Tue, 24 Nov 2026 10:00:00 GMT".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_a_refused_head_falls_back_to_a_ranged_get() {
+        let get = FakeResp::new(206, &[b"A"])
+            .with_header("Content-Range", "bytes 0-0/4096")
+            .with_header("ETag", "\"abc\"");
+        let http = ScriptedHttp::with_head_and_responses(
+            Box::new(|_| Ok(head_with(403, &[("Content-Length", "312")]))),
+            vec![get],
+        );
+        let info = downloader(None, Some(Arc::clone(&http))).get_remote_file_info("https://x/f").unwrap();
+        assert_eq!(info.size, 4096, "not the error page's length");
+        assert!(info.accept_ranges);
+        assert_eq!(info.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(http.header_calls.lock()[0], range_header("bytes=0-0"));
+    }
+
+    #[test]
+    fn test_a_get_probe_answered_in_full_means_no_ranges() {
+        let get = FakeResp::new(200, &[b"ABCD"]).with_header("Content-Length", "4");
+        let http = ScriptedHttp::with_head_and_responses(Box::new(|_| Ok(head_with(405, &[]))), vec![get]);
+        let info = downloader(None, Some(http)).get_remote_file_info("https://x/f").unwrap();
+        assert_eq!(info.size, 4);
+        assert!(!info.accept_ranges);
+    }
+
+    #[test]
+    fn test_a_busy_head_is_retried() {
+        let calls = Arc::new(Mutex::new(0));
+        let count = Arc::clone(&calls);
+        let http = ScriptedHttp::with_head(Box::new(move |_| {
+            let mut n = count.lock();
+            *n += 1;
+            if *n == 1 {
+                return Ok(head_with(503, &[]));
+            }
+            Ok(head_with(200, &[("Content-Length", "8")]))
+        }));
+        let info = downloader(None, Some(http)).get_remote_file_info("https://x/f").unwrap();
+        assert_eq!(info.size, 8);
+        assert_eq!(*calls.lock(), 2);
+    }
+
+    #[test]
+    fn test_a_missing_file_is_an_error_not_a_guess() {
+        let get = FakeResp::new(404, &[]);
+        let http = ScriptedHttp::with_head_and_responses(Box::new(|_| Ok(head_with(404, &[]))), vec![get]);
+        let err = downloader(None, Some(http)).get_remote_file_info("https://x/f").unwrap_err();
+        assert_eq!(err.to_string(), "error");
+    }
 }
 
 // ------------------- MD5 verification + atomic (.part) publish, via download_file
@@ -277,7 +567,12 @@ mod test_verify_and_atomic_publish {
         let dl = downloader(None, Some(Arc::clone(&http)));
         // size below CHUNKED_THRESHOLD + supports_range=false -> simple path,
         // one stream call per verification attempt.
-        let result = dl.download_file("model.gguf", "http://x/f", dir, 8, 0, None, false, remote_md5);
+        let info = RemoteFileInfo {
+            size: 8,
+            digest: remote_md5.map(|m| smartloop::model::downloader::digest::RemoteDigest::Md5(m.to_string())),
+            ..RemoteFileInfo::default()
+        };
+        let result = dl.download_file("model.gguf", "http://x/f", dir, &info, None);
         (http, result)
     }
 
@@ -349,9 +644,9 @@ mod test_chunked_failure_keeps_its_kind {
     fn chunked(exc: fn() -> DownloadError) -> DownloadError {
         let tmp = tempfile::tempdir().unwrap();
         let dl = downloader(None, None);
-        dl.set_chunk_workers(Some(1));
+        dl.set_connections(Some(1));
         dl.set_download_chunk_hook(Some(Arc::new(move |_start, _end| Err(exc()))));
-        dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), 1024, None)
+        dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), &RemoteFileInfo::sized(1024), None)
             .unwrap_err()
     }
 
@@ -406,7 +701,7 @@ mod test_ranges_keep_every_connection_busy {
     fn test_every_range_is_fetched_once() {
         let tmp = tempfile::tempdir().unwrap();
         let dl = downloader(None, None);
-        dl.set_chunk_workers(Some(3));
+        dl.set_connections(Some(3));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = seen.clone();
         dl.set_download_chunk_hook(Some(Arc::new(move |start, end| {
@@ -414,7 +709,7 @@ mod test_ranges_keep_every_connection_busy {
             Ok(())
         })));
         let size = 3 * SEGMENT_SIZE + 10;
-        dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), size, None).unwrap();
+        dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), &RemoteFileInfo::sized(size), None).unwrap();
         let mut seen = seen.lock().clone();
         seen.sort();
         assert_eq!(seen, segments(size, 3));
@@ -424,7 +719,7 @@ mod test_ranges_keep_every_connection_busy {
     fn test_a_failed_range_stops_the_rest_of_the_queue() {
         let tmp = tempfile::tempdir().unwrap();
         let dl = downloader(None, None);
-        dl.set_chunk_workers(Some(1));
+        dl.set_connections(Some(1));
         let calls = Arc::new(Mutex::new(0usize));
         let count = calls.clone();
         dl.set_download_chunk_hook(Some(Arc::new(move |_start, _end| {
@@ -432,7 +727,7 @@ mod test_ranges_keep_every_connection_busy {
             Err(DownloadError::Value("corrupt".to_string()))
         })));
         let size = 10 * SEGMENT_SIZE;
-        assert!(dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), size, None).is_err());
+        assert!(dl.download_file_chunked("file.bin", "http://x/file", &tmp.path().join("file.bin"), &RemoteFileInfo::sized(size), None).is_err());
         assert_eq!(*calls.lock(), 1, "the other nine ranges aren't fetched");
     }
 }

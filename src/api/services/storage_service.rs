@@ -22,9 +22,10 @@
 //! which the framework cannot run without.
 //!
 //! One case overrides all of that: a directory holding only a `.part` sidecar
-//! is a download that died, and none of those reasons can be true of bytes
-//! that never finished arriving.  Such a tree is removable, because the next
-//! download deletes it anyway — see [`weights_state`].
+//! is a download that stopped, and none of those reasons can be true of bytes
+//! that never finished arriving.  The next download resumes from it, but it
+//! stays removable: cleanup is something the user asks for, and on a full disk
+//! that space is what blocks the download — see [`weights_state`].
 //!
 //! Except when the download has not died.  A transfer in progress leaves
 //! exactly the same thing on disk, so that override is gated on
@@ -677,15 +678,13 @@ pub fn scan_models(workspace: &Workspace, model_service: Option<&dyn StorageMode
             let path = join(&join(models_dir, &org), &repo);
             let loaded = entry.map(|e| resident.contains(&e.model_name)).unwrap_or(false);
 
-            // An abandoned download: a ``.part`` and nothing servable beside
-            // it.  This overrides the keep reasons below, because those all
-            // answer "is this model in use?" and none of them can be true of
-            // bytes that never finished arriving — ``enabled`` is the picker's
-            // flag, set when the user asked for the model, not when it landed.
-            // A half-downloaded tree is exactly what the next download click
-            // unlinks on its way to starting over, so keeping it reserves disk
-            // for something nothing will ever read — and on a full disk that
-            // deadlocks the user, since the only offer the UI can make is the
+            // A stopped download: a ``.part`` and nothing servable beside it.
+            // This overrides the keep reasons below, because those all answer
+            // "is this model in use?" and none of them can be true of bytes
+            // that never finished arriving — ``enabled`` is the picker's flag,
+            // set when the user asked for the model, not when it landed.  The
+            // next download resumes from it, but on a full disk keeping it
+            // deadlocks the user: the only offer the UI can make is the
             // download this space is blocking.
             let (has_weights, has_part) = weights_state(&path);
             let partial = has_part && !has_weights;
@@ -700,11 +699,9 @@ pub fn scan_models(workspace: &Workspace, model_service: Option<&dyn StorageMode
                 // Above the partial rule, not below it: the framework cannot
                 // run without the orchestrator or the embedder, so their retry
                 // is not a thing the user might choose — it is the next thing
-                // that happens.  That is what makes the deadlock argument above
-                // not apply here.  The retry unlinks the stale ``.part`` itself,
-                // so the space comes back either way and the sweep does not
-                // need to be the one to take it; deleting the tree only risks
-                // racing a writer nothing registered.
+                // that happens, and it resumes from the ``.part``.  Deleting
+                // the tree would only throw that progress away and risk racing
+                // a writer nothing registered.
                 Some("bundled".to_string())
             } else if partial && !loaded {
                 // ``loaded`` still wins: a resident context means this really
@@ -1499,7 +1496,8 @@ pub fn run_cleanup(model_service: Option<&dyn StorageModelService>, opts: Cleanu
 /// Remove what a cancelled download left behind, and clear its flags.
 ///
 /// Deletes `models/<org>/<repo>` outright rather than picking the `.part`
-/// sidecars out of it.  A vision model downloads its weights and its mmproj
+/// sidecars and their `.part.state` resume journals out of it, so a cancel
+/// is the one way a download does not resume.  A vision model downloads its weights and its mmproj
 /// projector in parallel, so a cancel routinely lands with one finished and
 /// one half-written — and a tree holding published weights and no projector is
 /// the shape `_gguf_exists` reads as "already available", which would make the

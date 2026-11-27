@@ -7,6 +7,7 @@ mod shared;
 mod common;
 mod test_auth;
 mod test_download_cancel;
+mod test_download_progress;
 mod test_init_access;
 mod test_init_adds_remote_model;
 mod test_init_needs_whole_weights;
