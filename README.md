@@ -9,7 +9,9 @@
 </p>
 <p align="center">Local agent harness for your documents. Extract information, generate content on your device</p>
 <p align="center">
-  <img src="https://img.shields.io/github/actions/workflow/status/smartloop-ai/smartloop/build.yml"/>
+  <a href="https://github.com/smartloop-labs/smartloop/actions/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/smartloop-labs/smartloop/build.yml"/></a>
+  <a href="https://github.com/smartloop-labs/smartloop/releases"><img alt="Release" src="https://img.shields.io/github/v/release/smartloop-labs/smartloop"/></a>
+  <a href="LICENSE"><img alt="License: BUSL-1.1" src="https://img.shields.io/badge/license-BUSL--1.1-blue.svg"/></a>
 </p>
 
 <img alt="Smartloop Demo" src="demo.gif" />
@@ -36,7 +38,7 @@ irm https://smartloop.ai/install.ps1 | iex
 > Requires a [Rust toolchain](https://rustup.rs/) (1.85+), CMake and a C/C++ compiler with libclang (Xcode command line tools on macOS, `build-essential cmake libclang-dev` on Debian/Ubuntu, Visual Studio Build Tools + LLVM on Windows). llama.cpp is compiled into the binary with the GPU backend for your platform — Metal on macOS, Vulkan on Linux/Windows (works with NVIDIA, AMD, and Intel GPUs), which additionally needs the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home).
 
 ```bash
-git clone https://github.com/smartloop-ai/smartloop.git
+git clone https://github.com/smartloop-labs/smartloop.git
 cd smartloop
 make build   # cargo build --release with the platform's GPU backend (metal / vulkan)
 make test    # verifies the CLI and runs the test suite
@@ -134,40 +136,24 @@ irm https://smartloop.ai/uninstall.ps1 | iex
 
 ### Usage
 
-To verify the installation, please type `slp --help`:
+`slp` runs the Smartloop agent on your machine. Start it in the background and check on it with:
 
 ```bash
-usage: slp [-h] [--version] [--resume CONVERSATION_ID] [-C PATH] {run,status,agent,token} ...
-
-AI Agent harness for extracting information and creating new content
-
-positional arguments:
-  {run,status,agent,token}
-                        Available commands
-    run                 Start interactive chat session
-    status              Show project status
-    agent               Agent management commands (start/stop/status/restart)
-    token               Manage your developer token
-
-options:
-  -h, --help            show this help message and exit
-  --version             show program's version number and exit
-  --resume CONVERSATION_ID
-                        Resume a previous conversation by session ID
-  -C PATH, --path PATH  Working directory to use (defaults to current directory)
+slp agent start     # start the agent (API on 127.0.0.1:38540)
+slp agent status    # is it running, and where
+slp agent restart   # restart it, e.g. after an update
+slp agent stop      # stop it
+slp --help          # all commands and options
 ```
 
+`start` and `restart` take `--host` and `--port` / `-p` (defaults: `$SLP_API_HOST` or `127.0.0.1`, `$SLP_API_PORT` or `38540`), `--no-service` to turn off auto-restart on crash, and `--no-supervised` to serve every project from one shared process instead of one process per project.
+
+Use it to extract information from your personal documents and do tasks for you, like writing guidelines or creating recipes. Build up skills for more specialized tasks like creating events, tickets, connecting external systems, or summarizing a blog post.
+
+Your projects live in `~/smartloop/<slug>`; that is where their skills and documents are copied.
 
 > [!TIP]
-> You can generate a developer token from the [Console](https://app.smartloop.ai/).
-
-
-Use it to extract information from your personal documents and do tasks for you, like writing guidelines, creating recipes, etc. Build up skills for more specialized tasks like creating events, tickets, connecting external systems, or summarizing a blog post.
-
-You projects live inside `~/smartloop/<slug>` directory and this is where skills , documents are copied.
-
-> [!TIP]
-> You can use this tool to build up your project and consume it via the OpenAI-compatible API to build solutions on top of it.
+> The agent serves an OpenAI-compatible API, so you can build your own solutions on top of your projects. You can generate a developer token from the [Console](https://app.smartloop.ai/).
 
 ### Requirements
 
@@ -178,6 +164,14 @@ You projects live inside `~/smartloop/<slug>` directory and this is where skills
 
 > [!NOTE]
 > macOS uses Metal for GPU acceleration automatically (Vulkan via MoltenVK is available as an alternative when building with `CARGO_FEATURES="metal vulkan"`). On Windows and Linux, the pre-built release uses Vulkan and ships the Vulkan loader, so any current GPU driver (NVIDIA, AMD, or Intel) is sufficient. To build from source with Vulkan support, install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home).
+
+### Contributing
+
+Issues and pull requests are welcome. For anything larger than a small fix, please open an issue first so we can agree on the approach. Run `make test` before sending a PR, and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+### Security
+
+Please report vulnerabilities privately, not in public issues. See [SECURITY.md](SECURITY.md).
 
 ### License
 

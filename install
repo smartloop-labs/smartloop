@@ -19,5 +19,5 @@ command -v mktemp >/dev/null 2>&1 || { echo "Error: mktemp is required" >&2; exi
 _f="$(mktemp)" || { echo "Error: cannot create temp file" >&2; exit 1; }
 trap 'rm -f "$_f"' EXIT
 
-curl -fsSL "https://raw.githubusercontent.com/smartloop-ai/smartloop/main/install.sh" -o "$_f"
+curl -fsSL "https://raw.githubusercontent.com/smartloop-labs/smartloop/main/install.sh" -o "$_f"
 exec bash "$_f" "$@"
