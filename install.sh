@@ -255,7 +255,7 @@ print_banner() {
     if command -v slp &>/dev/null; then
         echo -e "${MUTED}To get started:${NC}"
         echo -e ""
-        echo -e "  slp  ${MUTED}# Start the agent harness${NC}"
+        echo -e "  slp  ${MUTED}# Start the agent${NC}"
     else
         echo -e "${MUTED}To get started, restart your terminal or run:${NC}"
         echo -e ""
@@ -269,7 +269,7 @@ print_banner() {
         echo -e ""
         echo -e "${MUTED}Then run:${NC}"
         echo -e ""
-        echo -e "  slp  ${MUTED}# Start the agent harness${NC}"
+        echo -e "  slp  ${MUTED}# Start the agent${NC}"
     fi
 
     echo -e ""
