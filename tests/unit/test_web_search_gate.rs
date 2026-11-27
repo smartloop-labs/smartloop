@@ -49,10 +49,6 @@ impl GateLlm {
     fn new(verdict: Option<&str>) -> Arc<Self> {
         Arc::new(Self { verdict: verdict.map(str::to_string), prompts: Mutex::new(Vec::new()) })
     }
-
-    fn calls(&self) -> Vec<String> {
-        self.prompts.lock().clone()
-    }
 }
 
 impl BaseLLM for GateLlm {
@@ -190,56 +186,61 @@ fn turn(role: &str, content: &str) -> ConversationTurn {
 
 // ---------------------------------------------------------------- tests
 
-mod web_search_runs_alongside_local_context {
+/// Collect never searches the web: the model does, when it asks to, through
+/// the client's `web_search` tool.  Not even with search on for the project
+/// and nothing local to answer from.
+mod collect_never_searches {
     use super::*;
 
     #[test]
-    fn test_unrelated_feedback_does_not_suppress_web_search() {
+    fn test_no_local_hit_does_not_search() {
+        let searched = Arc::new(Mutex::new(Vec::new()));
+        let ex = explorer(&searched, true);
+
+        let ctx = collect(&ex, "what is the Hasselblad X2D II", FakeSearchService::default(), None, None, None, None);
+
+        assert!(searched_list(&searched).is_empty());
+        assert!(ctx.web_context.is_empty());
+        assert!(ctx.web_sources.is_empty());
+    }
+
+    #[test]
+    fn test_local_hits_are_still_collected() {
         let searched = Arc::new(Mutex::new(Vec::new()));
         let ex = explorer(&searched, true);
         let service = FakeSearchService {
             feedback: vec![chunk("f1", "Q: cat breeds?\nA: Siberian cats shed little.")],
+            workspace: vec![chunk("notes.md", "old notes")],
             ..Default::default()
         };
 
-        let ctx = collect(&ex, "what is the Hasselblad X2D II", service, None, None, None, None);
-
-        assert_eq!(searched_list(&searched), vec!["what is the Hasselblad X2D II"]);
-        assert!(!ctx.web_context.is_empty());
-        assert_eq!(ctx.web_sources, vec!["http://x"]);
-        assert!(!ctx.feedback_context.is_empty()); // local hit is still collected alongside
-    }
-
-    #[test]
-    fn test_indexed_document_does_not_suppress_web_search() {
-        let searched = Arc::new(Mutex::new(Vec::new()));
-        let ex = explorer(&searched, true);
-        let mut doc = Map::new();
-        doc.insert("document_name".into(), json!("cats.md"));
-        doc.insert("content".into(), json!("Siberian cats have a triple coat."));
-        let service = FakeSearchService { vector: Some((vec![doc], Vec::new())), ..Default::default() };
-
-        let ctx = collect(&ex, "what is the Hasselblad X2D II", service, None, None, None, None);
-
-        assert_eq!(searched_list(&searched), vec!["what is the Hasselblad X2D II"]);
-        assert!(!ctx.web_context.is_empty());
-        assert!(!ctx.vector_context.is_empty());
-    }
-
-    #[test]
-    fn test_workspace_hit_does_not_suppress_web_search() {
-        let searched = Arc::new(Mutex::new(Vec::new()));
-        let ex = explorer(&searched, true);
-        let service = FakeSearchService { workspace: vec![chunk("notes.md", "old notes")], ..Default::default() };
-
         let ctx = collect(&ex, "latest camera releases", service, Some("/tmp"), None, None, None);
 
-        assert_eq!(searched_list(&searched), vec!["latest camera releases"]);
-        assert!(!ctx.web_context.is_empty());
+        assert!(searched_list(&searched).is_empty());
+        assert!(ctx.web_context.is_empty());
+        assert!(!ctx.feedback_context.is_empty());
+    }
+
+    #[test]
+    fn test_a_follow_up_does_not_search() {
+        let searched = Arc::new(Mutex::new(Vec::new()));
+        let mut ex = explorer(&searched, true);
+        let llm: Arc<dyn BaseLLM> = GateLlm::new(Some("SEARCH"));
+        ex.llm = Some(llm);
+        let history = vec![
+            turn("user", "Show me latest local events"),
+            turn("assistant", "Jazz in the Park on Friday."),
+        ];
+
+        let ctx =
+            collect(&ex, "what about next weekend?", FakeSearchService::default(), None, None, Some(&history), None);
+
+        assert!(searched_list(&searched).is_empty());
+        assert!(ctx.web_context.is_empty());
     }
 }
 
-mod web_search_still_gated {
+mod mcp_alongside_no_search {
     use super::*;
 
     /// Resolves every directive to one read-only tool on the server asked.
@@ -258,15 +259,9 @@ mod web_search_still_gated {
         }
     }
 
-    /// A live tool result used to cancel the search outright.
-    ///
-    /// "Deliberately invoked" only meant the router picked the tool, not that
-    /// its output answered the question — so a query spanning both ("how does
-    /// our roadmap compare to what they announced") lost half its context.
-    /// Both are collected now; which one actually answers is synthesis's call,
-    /// and the explore assembly puts the local source first.
+    /// A connected server is still asked; the web is not.
     #[test]
-    fn test_mcp_tool_result_no_longer_suppresses_web_search() {
+    fn test_mcp_tool_result_is_collected_without_a_web_search() {
         let searched = Arc::new(Mutex::new(Vec::new()));
         let mut ex = explorer(&searched, true);
 
@@ -314,8 +309,8 @@ mod web_search_still_gated {
             Some("/tmp/p"),
         );
 
-        assert_eq!(searched_list(&searched), vec!["list my issues"]);
-        assert!(!ctx.web_context.is_empty());
+        assert!(searched_list(&searched).is_empty());
+        assert!(ctx.web_context.is_empty());
         assert!(!ctx.mcp_context.is_empty());
     }
 
@@ -430,141 +425,6 @@ mod feedback_relevance_floor {
         let svc = service((0..10).map(|_| chunk(0.10)).collect());
 
         assert_eq!(svc.search_feedback("refund window", 3).len(), 3);
-    }
-}
-
-/// A follow-up that reworks the previous answer must not search again.
-///
-/// "Show me latest local events" → "now create a table".  The second message
-/// carries none of the subject, so a fresh search returns pages about tables
-/// and drags them into the context and the citation list.
-mod follow_up_gate {
-    use super::*;
-
-    fn explorer_with_verdict(searched: &Arc<Mutex<Vec<String>>>, verdict: Option<&str>) -> (Explorer, Arc<GateLlm>) {
-        let llm = GateLlm::new(verdict);
-        let mut ex = explorer(searched, true);
-        let shared: Arc<dyn BaseLLM> = llm.clone();
-        ex.llm = Some(shared);
-        (ex, llm)
-    }
-
-    fn history() -> Vec<ConversationTurn> {
-        vec![
-            turn("user", "Show me latest local events"),
-            turn("assistant", "Jazz in the Park on Friday, Food Truck Rally Saturday."),
-        ]
-    }
-
-    #[test]
-    fn test_reformat_follow_up_does_not_search() {
-        let searched = Arc::new(Mutex::new(Vec::new()));
-        let (ex, _) = explorer_with_verdict(&searched, Some("REUSE"));
-
-        let history = history();
-        let ctx = collect(&ex, "now create a table", FakeSearchService::default(), None, None, Some(&history), None);
-
-        assert!(searched_list(&searched).is_empty());
-        assert!(ctx.web_context.is_empty());
-        assert!(ctx.web_sources.is_empty());
-    }
-
-    #[test]
-    fn test_new_information_follow_up_still_searches() {
-        let searched = Arc::new(Mutex::new(Vec::new()));
-        let (ex, _) = explorer_with_verdict(&searched, Some("SEARCH"));
-
-        let history = history();
-        let ctx =
-            collect(&ex, "what about next weekend?", FakeSearchService::default(), None, None, Some(&history), None);
-
-        assert_eq!(searched_list(&searched), vec!["what about next weekend?"]);
-        assert!(!ctx.web_context.is_empty());
-    }
-
-    #[test]
-    fn test_first_message_never_consults_the_gate() {
-        let searched = Arc::new(Mutex::new(Vec::new()));
-        let (ex, llm) = explorer_with_verdict(&searched, Some("REUSE"));
-
-        collect(&ex, "Show me latest local events", FakeSearchService::default(), None, None, None, None);
-
-        assert_eq!(searched_list(&searched), vec!["Show me latest local events"]);
-        assert!(llm.calls().is_empty());
-    }
-
-    #[test]
-    fn test_gate_sees_the_transcript_and_the_latest_message() {
-        let searched = Arc::new(Mutex::new(Vec::new()));
-        let (ex, llm) = explorer_with_verdict(&searched, Some("REUSE"));
-
-        let history = history();
-        collect(&ex, "now create a table", FakeSearchService::default(), None, None, Some(&history), None);
-
-        let calls = llm.calls();
-        let prompt = calls.last().expect("the gate asked the model");
-        assert!(prompt.contains("Show me latest local events"));
-        assert!(prompt.contains("Jazz in the Park"));
-        assert!(prompt.contains("Latest message: now create a table"));
-    }
-
-    #[test]
-    fn test_llm_failure_falls_open_to_searching() {
-        let searched = Arc::new(Mutex::new(Vec::new()));
-        let (ex, _) = explorer_with_verdict(&searched, None);
-
-        let history = history();
-        let ctx = collect(&ex, "now create a table", FakeSearchService::default(), None, None, Some(&history), None);
-
-        assert_eq!(searched_list(&searched), vec!["now create a table"]);
-        assert!(!ctx.web_context.is_empty());
-    }
-
-    fn anything_but_a_clear_reuse_searches(verdict: &str) {
-        let searched = Arc::new(Mutex::new(Vec::new()));
-        let (ex, _) = explorer_with_verdict(&searched, Some(verdict));
-
-        let history = history();
-        collect(&ex, "now create a table", FakeSearchService::default(), None, None, Some(&history), None);
-
-        assert_eq!(searched_list(&searched), vec!["now create a table"], "verdict {verdict:?}");
-    }
-
-    #[test]
-    fn test_anything_but_a_clear_reuse_searches_search() {
-        anything_but_a_clear_reuse_searches("SEARCH");
-    }
-
-    #[test]
-    fn test_anything_but_a_clear_reuse_searches_search_lowercase() {
-        anything_but_a_clear_reuse_searches("search");
-    }
-
-    #[test]
-    fn test_anything_but_a_clear_reuse_searches_search_padded() {
-        anything_but_a_clear_reuse_searches(" SEARCH\n");
-    }
-
-    #[test]
-    fn test_anything_but_a_clear_reuse_searches_unclear() {
-        anything_but_a_clear_reuse_searches("unclear");
-    }
-
-    #[test]
-    fn test_anything_but_a_clear_reuse_searches_empty() {
-        anything_but_a_clear_reuse_searches("");
-    }
-
-    #[test]
-    fn test_empty_history_entries_are_treated_as_no_history() {
-        let searched = Arc::new(Mutex::new(Vec::new()));
-        let (ex, llm) = explorer_with_verdict(&searched, Some("REUSE"));
-
-        let history = vec![turn("user", "")];
-        collect(&ex, "now create a table", FakeSearchService::default(), None, None, Some(&history), None);
-
-        assert_eq!(searched_list(&searched), vec!["now create a table"]);
-        assert!(llm.calls().is_empty());
     }
 }
 

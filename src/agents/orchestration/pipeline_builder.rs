@@ -1081,51 +1081,6 @@ impl PipelineBuilder {
             return plan_step_result(&node_id, step, &content, Some(&content));
         }
 
-        // WEB_SEARCH: run the WebSearchAgent (latest info/events) in-process
-        if step.step_type == StepType::WebSearch {
-            let query = step
-                .default_args
-                .as_ref()
-                .and_then(|a| a.get("query").cloned())
-                .filter(|q| !q.is_empty())
-                .or_else(|| Some(step.instruction.clone()).filter(|i| !i.is_empty()))
-                .unwrap_or_else(|| ctx.read().user_message.clone());
-            self.models.emit(
-                "web_search",
-                "processing",
-                "Searching the web for the latest information",
-            );
-            let agent = self.get_web_search_agent();
-            let progress = self.progress();
-            let content = agent.search(&query, None, None, Some(&progress));
-            // Record the URLs on the shared search context, exactly as the
-            // explore path does (see Explorer.collect).  _build_final_result
-            // reads them back as citations, so without this a plan that
-            // reaches the web through a WEB_SEARCH step answers from live
-            // pages while surfacing no reference links at all.
-            let extracts = agent.last_source_extracts();
-            let last_sources = agent.last_sources();
-            {
-                let mut sc = search_ctx.lock();
-                for url in &last_sources {
-                    if !sc.web_sources.contains(url) {
-                        sc.web_sources.push(url.clone());
-                    }
-                    if let Some(extract) = extracts.get(url) {
-                        sc.web_source_extracts.insert(url.clone(), extract.clone());
-                    }
-                }
-            }
-            tracing::info!(
-                target: LOG_TARGET,
-                "[web_search] step {}: {} chars, {} source(s)",
-                step.step,
-                content.chars().count(),
-                last_sources.len()
-            );
-            return plan_step_result(&node_id, step, &content, Some(&content));
-        }
-
         // EXPLORE: return pre-fetched search context (already collected)
         if step.step_type == StepType::Explore {
             // Local sources first, the web last. Everything above the web

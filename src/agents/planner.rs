@@ -248,9 +248,6 @@ pub enum StepType {
     /// Fetch a URL → markdown via the FetchAgent
     #[serde(rename = "fetch")]
     Fetch,
-    /// Pull latest info/events via the WebSearchAgent
-    #[serde(rename = "web_search")]
-    WebSearch,
     /// Walk the local filesystem tree + vector search
     #[serde(rename = "explore")]
     Explore,
@@ -269,7 +266,6 @@ impl StepType {
             StepType::Analyze => "analyze",
             StepType::Tool => "tool",
             StepType::Fetch => "fetch",
-            StepType::WebSearch => "web_search",
             StepType::Explore => "explore",
             StepType::Action => "action",
             StepType::Conversational => "conversational",
@@ -282,7 +278,6 @@ impl StepType {
             "analyze" => Some(StepType::Analyze),
             "tool" => Some(StepType::Tool),
             "fetch" => Some(StepType::Fetch),
-            "web_search" => Some(StepType::WebSearch),
             "explore" => Some(StepType::Explore),
             "action" => Some(StepType::Action),
             "conversational" => Some(StepType::Conversational),
@@ -1170,10 +1165,8 @@ impl Planner {
 
     /// The answer itself, written by the selected model.
     fn plan_conversation(&self, classification: &ClassificationResult, context: &PlanContext) -> ExecutionPlan {
-        // Web search is no longer keyword-routed here: when enabled on the
-        // project it runs as a parallel source in the collect step (see
-        // Explorer.collect_parallel), so latest-info context is gathered for
-        // every query without a brittle keyword gate.
+        // No web search is planned: the model searches only when it asks
+        // to, through the client's `web_search` tool.
         // One LARGE step on what the request routes on — vision for
         // attachments, else the answer tier — when a model is
         // selected; with none, nothing to plan: the router model
@@ -1610,10 +1603,11 @@ impl Planner {
             let action_kind = s.get("action_kind").and_then(opt_string);
             let local_action = if raw_step_type == Some("action") { action_kind.as_deref() } else { None };
 
-            // Smartloop runs no shell commands and writes no files: a step
-            // for either is the harness's to take from the final answer.
+            // Smartloop runs no shell commands, writes no files and doesn't
+            // search the web on its own: a step for any of them is the
+            // harness's, the web the model's own `web_search` tool call.
             if [FILE_WRITE_TOOL, BASH_TOOL].contains(&t_name)
-                || matches!(raw_step_type, Some("write" | "bash"))
+                || matches!(raw_step_type, Some("write" | "bash" | "web_search" | "search"))
                 || matches!(local_action, Some("write" | "bash"))
             {
                 tracing::info!(
@@ -1628,7 +1622,6 @@ impl Planner {
             // searching local files is an explore step.
             let mapped = raw_step_type.and_then(|raw| match raw {
                 "tool_call" | "mcp" => Some(StepType::Tool),
-                "web_search" | "search" => Some(StepType::WebSearch),
                 "conversation" => Some(StepType::Conversational),
                 "document" | "read" | "grep" => Some(StepType::Explore),
                 "action" if matches!(local_action, Some("read" | "grep")) => Some(StepType::Explore),
