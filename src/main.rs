@@ -25,7 +25,7 @@ use smartloop::server::{get_status, is_server_running, start_server, stop_server
 #[command(
     name = "slp",
     version = smartloop::VERSION,
-    about = "AI Agent harness for extracting information and creating new content"
+    about = "Orchestration framework for local AI agents"
 )]
 pub struct Cli {
     #[command(subcommand)]

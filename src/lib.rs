@@ -1,5 +1,5 @@
-//! Smartloop — AI agent harness for extracting information and creating new
-//! content.  Port of the `smartloop` Python package; the module tree mirrors
+//! Smartloop — orchestration framework for local AI agents.
+//! Port of the `smartloop` Python package; the module tree mirrors
 //! `smartloop/` one-to-one.
 
 //! Port of `smartloop/__init__.py`.

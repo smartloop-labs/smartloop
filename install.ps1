@@ -248,7 +248,7 @@ function Show-Banner {
     Write-Host ''
     Write-Muted 'To get started, open a new terminal and run:'
     Write-Host ''
-    Write-Host '  slp  ' -NoNewline; Write-Muted '# Start the agent harness'
+    Write-Host '  slp  ' -NoNewline; Write-Muted '# Start the agent'
     Write-Host ''
     Write-Muted 'For more information visit https://smartloop.ai/docs/intro/'
     Write-Host ''

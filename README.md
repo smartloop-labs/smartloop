@@ -7,18 +7,60 @@
     </picture>
   </a>
 </p>
-<p align="center">Local agent harness for your documents. Extract information, generate content on your device</p>
+<p align="center">Orchestration framework for local AI agents. Plan, retrieve, call tools and run models on your device</p>
 <p align="center">
   <a href="https://github.com/smartloop-labs/smartloop/actions/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/smartloop-labs/smartloop/build.yml"/></a>
   <a href="https://github.com/smartloop-labs/smartloop/releases"><img alt="Release" src="https://img.shields.io/github/v/release/smartloop-labs/smartloop"/></a>
   <a href="LICENSE"><img alt="License: BUSL-1.1" src="https://img.shields.io/badge/license-BUSL--1.1-blue.svg"/></a>
 </p>
 
-<img alt="Smartloop Demo" src="demo.gif" />
+Smartloop is a Rust library and the `slp` agent built from it. It is the orchestration layer behind an agent: it plans each turn, retrieves from your indexed documents, routes between local and hosted models, calls MCP tools and serves the result over an OpenAI-compatible API. The harness on top (the terminal UI, file edits, shell commands) belongs to the client.
+
+[Docent](https://github.com/smartloop-labs/docent), the local-first coding agent for the terminal, is built on it:
+
+<img width="822" alt="Docent, a coding agent built on smartloop: a reply editing two files, each shown as a diff, the status line and the prompt" src="img/docent.png" />
+
+### Using as a Rust crate
+
+The `smartloop` library (everything behind `slp`) can be embedded in another Rust project. It is not on crates.io; each release is published to the Cargo registry at `dl.smartloop.ai/crates/`. Register it in your project's `.cargo/config.toml`:
+
+```toml
+[registries.smartloop]
+index = "sparse+https://dl.smartloop.ai/crates/"
+```
+
+then depend on it from that registry:
+
+```toml
+[dependencies]
+smartloop = { version = "1.2.8", registry = "smartloop" }
+# Pick a GPU backend for llama.cpp:
+# smartloop = { version = "1.2.8", registry = "smartloop", features = ["metal"] }
+```
+
+Available features are `metal`, `vulkan` and `cuda` (forwarded to `llama-cpp-2`); with none, llama.cpp runs on the CPU. For example, to check whether the local agent is up:
+
+```rust
+use smartloop::config::AppSettings;
+use smartloop::server::{get_server_url, is_server_running};
+
+fn main() {
+    let settings = AppSettings::new();
+    let (host, port) = (settings.api_host.as_str(), settings.api_port);
+    println!(
+        "slp {} at {} running: {}",
+        smartloop::VERSION,
+        get_server_url(host, port),
+        is_server_running(host, port)
+    );
+}
+```
+
+Building the crate needs the same toolchain as building from source (CMake, libclang, and the Vulkan SDK when the `vulkan` feature is on).
 
 ### Installation
 
-In your terminal, type in the following command to install the agent harness:
+To run the orchestrator on its own as the `slp` agent, install it from your terminal:
 
 **macOS / Linux:**
 
@@ -80,47 +122,9 @@ Each turn has a request id that follows it from the supervisor to the project ag
 
 In the summary, a `*` on the index column means the turn stopped waiting for indexing at the 20s cap and answered while the pass carried on; `idx overlap` is how long indexing ran alongside the answer before pausing. Below the table come models loaded more than once (reload churn between turns) and how long indexing paused for turns. Clearing logs from Studio's storage screen empties the file too.
 
-### Using as a Rust crate
-
-The `smartloop` library (everything behind `slp`) can be embedded in another Rust project. It is not on crates.io; each release is published to the Cargo registry at `dl.smartloop.ai/crates/`. Register it in your project's `.cargo/config.toml`:
-
-```toml
-[registries.smartloop]
-index = "sparse+https://dl.smartloop.ai/crates/"
-```
-
-then depend on it from that registry:
-
-```toml
-[dependencies]
-smartloop = { version = "1.2.8", registry = "smartloop" }
-# Pick a GPU backend for llama.cpp:
-# smartloop = { version = "1.2.8", registry = "smartloop", features = ["metal"] }
-```
-
-Available features are `metal`, `vulkan` and `cuda` (forwarded to `llama-cpp-2`); with none, llama.cpp runs on the CPU. For example, to check whether the local agent is up:
-
-```rust
-use smartloop::config::AppSettings;
-use smartloop::server::{get_server_url, is_server_running};
-
-fn main() {
-    let settings = AppSettings::new();
-    let (host, port) = (settings.api_host.as_str(), settings.api_port);
-    println!(
-        "slp {} at {} running: {}",
-        smartloop::VERSION,
-        get_server_url(host, port),
-        is_server_running(host, port)
-    );
-}
-```
-
-Building the crate needs the same toolchain as building from source (CMake, libclang, and the Vulkan SDK when the `vulkan` feature is on).
-
 ### Uninstall
 
-Use the following command to uninstall the agent harness:
+Use the following command to uninstall `slp`:
 
 **macOS / Linux:**
 
