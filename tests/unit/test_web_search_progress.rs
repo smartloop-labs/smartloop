@@ -8,19 +8,17 @@
 //! one serial fetch per result), so the client sat on the previous step's
 //! status line for the whole search.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use smartloop::agents::fetch_agent::UrlFetcher;
-use smartloop::agents::mcp::explorer::{ConversationTurn, ProgressCallback, SearchContext};
+use smartloop::agents::mcp::explorer::{ProgressCallback, SearchContext};
 use smartloop::agents::web_search_agent::{ProgressCallback as AgentProgress, WebSearchAgent};
-use smartloop::llms::BaseLLM;
 
 use crate::shared::explorer_fixtures::{
     bare_explorer, messages, planned, recording_sink, EmptySearch, FakeWebSearch, ProgressEvent,
-    ScriptedLLM, ScriptedResolver,
+    ScriptedResolver,
 };
 
 // ── the agent reports each page as it is fetched ──────────────────────────
@@ -110,27 +108,15 @@ fn test_search_without_a_sink_still_works() {
     assert!(!search(&agent(2), 2, &["https://example.com/a"], None).is_empty());
 }
 
-// ── collect announces the search before it starts ─────────────────────────
+// ── collect never searches ────────────────────────────────────────────────
 //
-// Python patched `_search_vector` / `_search_feedback` / `_search_workspace`
-// to come back empty (here: a model service with nothing in it) and
-// `_needs_web_search` to `needed`.  The gate is not patchable here, so it is
-// driven the way production drives it: with no history the first message
-// always searches; a follow-up the model judges a rework (`REUSE`) does not.
+// The web is searched only when the model asks, through the client's
+// `web_search` tool, so collect neither searches nor announces a search, even
+// with search on for the project and nothing local to answer from.
 
-fn collect(enabled: bool, needed: bool, progress: Option<ProgressCallback>) -> (Arc<FakeWebSearch>, SearchContext) {
-    let web = FakeWebSearch::new(enabled, "WEB", &["https://example.com/a"]);
-    let (llm, history): (Option<Arc<dyn BaseLLM>>, Option<Vec<ConversationTurn>>) = if needed {
-        (None, None)
-    } else {
-        let turn = HashMap::from([
-            ("role".to_string(), "assistant".to_string()),
-            ("content".to_string(), "Here is what they announced.".to_string()),
-        ]);
-        (Some(ScriptedLLM::replying("REUSE")), Some(vec![turn]))
-    };
-    let ex = bare_explorer(llm, None, ScriptedResolver::returning(None), web.clone(), planned(vec![]));
-
+fn collect(progress: Option<ProgressCallback>) -> (Arc<FakeWebSearch>, SearchContext) {
+    let web = FakeWebSearch::new(true, "WEB", &["https://example.com/a"]);
+    let ex = bare_explorer(None, None, ScriptedResolver::returning(None), web.clone(), planned(vec![]));
     let ctx = ex.collect_parallel(
         "what did they announce today",
         Some(Arc::new(EmptySearch)),
@@ -139,7 +125,7 @@ fn collect(enabled: bool, needed: bool, progress: Option<ProgressCallback>) -> (
         None,
         None,
         None,
-        history.as_deref(),
+        None,
         None,
         None,
         progress,
@@ -149,41 +135,11 @@ fn collect(enabled: bool, needed: bool, progress: Option<ProgressCallback>) -> (
 }
 
 #[test]
-fn test_collect_announces_the_search_before_running_it() {
+fn test_collect_neither_searches_nor_announces_a_search() {
     let (sink, seen) = recording_sink();
-    collect(true, true, Some(sink));
+    let (web, ctx) = collect(Some(sink));
 
-    assert_eq!(events(&seen), vec!["Searching the web for the latest information".to_string()]);
-}
-
-/// Per-page events have to come from the agent, mid-fetch.
-#[test]
-fn test_collect_forwards_the_sink_to_the_agent() {
-    let (sink, _seen) = recording_sink();
-    let (web, _) = collect(true, true, Some(sink.clone()));
-
-    let searched = web.searched_with.lock();
-    let forwarded = searched.last().and_then(|(_, p)| p.clone()).expect("the search got a sink");
-    assert!(Arc::ptr_eq(&forwarded, &sink));
-}
-
-#[test]
-fn test_a_skipped_search_stays_silent() {
-    let (sink, seen) = recording_sink();
-    collect(false, true, Some(sink));
     assert!(seen.lock().is_empty());
-}
-
-/// A follow-up that only reworks the answer on screen searches nothing.
-#[test]
-fn test_a_search_not_needed_stays_silent() {
-    let (sink, seen) = recording_sink();
-    collect(true, false, Some(sink));
-    assert!(seen.lock().is_empty());
-}
-
-#[test]
-fn test_collect_without_a_sink_still_searches() {
-    let (_, ctx) = collect(true, true, None);
-    assert_eq!(ctx.web_context, "WEB");
+    assert!(web.searched_with.lock().is_empty());
+    assert_eq!(ctx.web_context, "");
 }

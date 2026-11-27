@@ -91,29 +91,12 @@ mod test_explore_ordering {
 mod test_sources_combine {
     use super::*;
 
-    fn web_gate_block() -> &'static str {
-        let src = EXPLORER_SRC;
-        let start = src
-            .find("web_search_agent.is_enabled()")
-            .expect("explorer never checks web_search_agent.is_enabled()");
-        window(src, start, 500)
-    }
-
+    /// Collect gathers the user's own material and never the web: the model
+    /// searches only when it asks, through the client's `web_search` tool.
     #[test]
-    fn test_a_live_mcp_result_no_longer_cancels_web_search() {
-        let block = web_gate_block();
-        assert!(
-            !block.contains("Skipping web search"),
-            "a live MCP tool result must not suppress the web search"
-        );
-    }
-
-    /// Combining sources must not lose the "now make it a table" check — that
-    /// one is about the *query*, not about competing sources.
-    #[test]
-    fn test_the_follow_up_gate_is_still_applied() {
-        let block = web_gate_block();
-        assert!(block.contains("needs_web_search"));
+    fn test_collect_never_searches_the_web() {
+        let src = method_source(EXPLORER_SRC, "collect_parallel");
+        assert!(!src.contains("web_search_agent"), "collect_parallel must not search the web");
     }
 
     /// Nothing else matching may skip it: the connected servers are one of the

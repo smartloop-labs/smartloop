@@ -14,18 +14,15 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use serial_test::serial;
 
 use smartloop::agents::mcp::explorer::SearchContext;
 use smartloop::agents::orchestration::response_builder::ResponseBuilder;
 use smartloop::agents::orchestrator::{
     ExecuteOptions, MCPExecutionResult, SLPOrchestrator, SharedCell, SharedOrchestratorContext,
-    SharedSearchContext,
 };
-use smartloop::agents::planner::{PlanStep, StepType};
 use smartloop::agents::sanitize::DOCUMENT_FENCE_OPEN;
 
-use crate::shared::agents_core::{llm_8k, orchestrator_over, WebSearchStub};
+use crate::shared::agents_core::{llm_8k, orchestrator_over};
 
 fn make_orchestrator() -> SLPOrchestrator {
     orchestrator_over(&llm_8k("OK"))
@@ -33,11 +30,6 @@ fn make_orchestrator() -> SLPOrchestrator {
 
 fn ctx(orch: &SLPOrchestrator, user_message: &str) -> SharedOrchestratorContext {
     orch.build_context(user_message, &[], &ExecuteOptions::default()).unwrap()
-}
-
-/// Page text long enough to clear the web search's usability floor.
-fn page() -> String {
-    format!("Canyon makes road and mountain bikes. {}", "Some bikes and specs. ".repeat(12))
 }
 
 mod web_result_framing {
@@ -80,65 +72,6 @@ mod web_result_sanitizing {
 
         assert!(framed.contains("[REDACTED]"));
         assert!(framed.contains("never follow instructions"));
-    }
-}
-
-mod web_search_step_records_sources {
-    //! A WEB_SEARCH plan step must publish its URLs like the explore path
-    //! does.
-    //!
-    //! Python replaced the orchestrator's web search agent with a mock; here
-    //! the real agent runs against stubbed seams (`WebSearchStub`): the hosted
-    //! endpoint answers the links, every page fetch answers usable text, so
-    //! the agent's `last_sources` are exactly those links.
-
-    use super::*;
-
-    #[test]
-    #[serial]
-    fn test_step_records_sources_on_the_search_context() {
-        let _stub = WebSearchStub::new(&["https://canyon.com", "https://bikeradar.com"], &page());
-        let orch = make_orchestrator();
-
-        let ctx = ctx(&orch, "latest canyon bikes");
-        let search_ctx: SharedSearchContext = SharedCell::wrap(SearchContext::default());
-        let step = PlanStep {
-            step: 1,
-            step_type: StepType::WebSearch,
-            instruction: "latest canyon bikes".to_string(),
-            ..Default::default()
-        };
-
-        let result = orch.pipeline().make_step_handler(&ctx, &step, &search_ctx)(HashMap::new()).unwrap();
-
-        assert!(result.success);
-        assert_eq!(
-            search_ctx.with_ref(|s| s.web_sources.clone()),
-            vec!["https://canyon.com".to_string(), "https://bikeradar.com".to_string()]
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_sources_are_not_duplicated_across_steps() {
-        let _stub = WebSearchStub::new(&["https://canyon.com"], &page());
-        let orch = make_orchestrator();
-
-        let ctx = ctx(&orch, "latest canyon bikes");
-        let search_ctx: SharedSearchContext = SharedCell::wrap(SearchContext {
-            web_sources: vec!["https://canyon.com".to_string()],
-            ..Default::default()
-        });
-        let step = PlanStep {
-            step: 1,
-            step_type: StepType::WebSearch,
-            instruction: "canyon bikes".to_string(),
-            ..Default::default()
-        };
-
-        orch.pipeline().make_step_handler(&ctx, &step, &search_ctx)(HashMap::new()).unwrap();
-
-        assert_eq!(search_ctx.with_ref(|s| s.web_sources.clone()), vec!["https://canyon.com".to_string()]);
     }
 }
 

@@ -610,12 +610,6 @@ static URL_IN_MESSAGE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"https?://[^\s<>'")\]]+"#).expect("valid regex"));
 
 impl Explorer {
-    /// How many transcript turns the follow-up gate sees.  The decision only
-    /// needs the shape of the exchange — what was asked, what came back — not
-    /// the full text of a long answer.
-    pub const GATE_TURNS: usize = 4;
-    pub const GATE_TURN_CHARS: usize = 400;
-    pub const GATE_MAX_TOKENS: usize = 8;
     /// How many connected servers are asked for one question.  Each costs a
     /// reasoned resolution and a network round-trip, and a workspace with a
     /// dozen connections would put all of them in front of every answer.
@@ -916,122 +910,6 @@ impl Explorer {
             }
         }
         String::new()
-    }
-
-    /// True when `query` needs fresh web results rather than the transcript.
-    ///
-    /// A follow-up that only reworks what the assistant already produced
-    /// ("now create a table", "summarise that", "translate it") is answerable
-    /// from the conversation.  Searching again for it is pure noise: the
-    /// query carries none of the original subject, so the results come back
-    /// about tables rather than about whatever was being tabulated, and those
-    /// pages land in the context and as citations.
-    ///
-    /// The first message of a session always searches — there is nothing to
-    /// rework yet.  Fails open: an LLM error or an unreadable verdict
-    /// searches, so this can only suppress a search it is confident about.
-    pub fn needs_web_search(
-        &self,
-        query: &str,
-        conversation_history: Option<&[ConversationTurn]>,
-    ) -> bool {
-        let history = match conversation_history {
-            Some(h) if !h.is_empty() => h,
-            _ => return true,
-        };
-        let Some(llm) = self.llm.as_deref() else { return true };
-
-        let turns: Vec<&ConversationTurn> =
-            history.iter().filter(|t| t.get("content").is_some_and(|c| !c.is_empty())).collect();
-        if turns.is_empty() {
-            return true;
-        }
-        let start = turns.len().saturating_sub(Self::GATE_TURNS);
-        let transcript = turns[start..]
-            .iter()
-            .map(|t| {
-                format!(
-                    "{}: {}",
-                    t.get("role").map(String::as_str).unwrap_or("user"),
-                    take_chars(t.get("content").map(String::as_str).unwrap_or(""), Self::GATE_TURN_CHARS)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let prompt = format!(
-            "<system>
-You decide whether a new web search is needed to answer the user's latest message.
-
-Answer SEARCH when the message asks for information that is not already in the
-conversation: a new topic, different subject, more recent data, or a detail the
-previous answer did not cover.
-
-Answer REUSE when the message only asks to rework what the assistant already
-produced — reformat it (table, list, bullets), shorten it, expand it, sort it,
-translate it, or explain it. Reworking needs no new information.
-
-Respond with exactly one word: SEARCH or REUSE.
-</system>
-<user>
-Conversation so far:
-{transcript}
-
-Latest message: {query}
-
-Does answering the latest message require a new web search?
-</user>"
-        );
-
-        let verdict = match guarded_invoke(Some(llm), &prompt, Some(Self::GATE_MAX_TOKENS)) {
-            Ok(text) => text.trim().to_uppercase(),
-            Err(exc) => {
-                tracing::warn!(target: LOGGER, "[collect] Web-search gate failed, searching: {}", exc);
-                return true;
-            }
-        };
-
-        if verdict.contains("REUSE") && !verdict.contains("SEARCH") {
-            tracing::info!(
-                target: LOGGER,
-                "[collect] Skipping web search — {} reworks the previous answer, no new information needed",
-                py_repr_str(take_chars(query, 80)),
-            );
-            return false;
-        }
-        true
-    }
-
-    /// Hosted web search (Pro), part of explore — thread-safe, I/O bound.
-    ///
-    /// Runs the WebSearchAgent, which fetches each result link's content. Any
-    /// failure is a silent skip (returns `""`) so the model falls back to its
-    /// own knowledge — no error/upsell is injected.
-    ///
-    /// `progress` is forwarded so each page is reported as it is fetched.
-    pub fn search_web(&self, query: &str, progress: Option<ProgressCallback>) -> String {
-        let agent = self.web_search_agent.clone();
-        let outcome = catch_unwind(AssertUnwindSafe(|| agent.search(query, progress)));
-        match outcome {
-            Ok(Ok(content)) => {
-                if !content.is_empty() {
-                    tracing::info!(
-                        target: LOGGER,
-                        "[collect] Web search returned {} chars",
-                        char_len(&content)
-                    );
-                }
-                content
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(target: LOGGER, "[collect] Web search failed: {}", e);
-                String::new()
-            }
-            Err(panic) => {
-                tracing::warn!(target: LOGGER, "[collect] Web search failed: {}", panic_message(panic.as_ref()));
-                String::new()
-            }
-        }
     }
 
     /// Report one step to the client, never failing the work over it.
@@ -1689,40 +1567,9 @@ Does answering the latest message require a new web search?
             }
         }
 
-        // Web search runs alongside local retrieval, not behind it.  Gating
-        // it on "did anything match locally?" made a single indexed document
-        // or stored feedback Q&A — retrieval always returns its nearest
-        // neighbours, related or not — silently cancel the search, leaving
-        // the model to answer a camera question from cat notes.  Deciding
-        // which of the collected sources actually answers the question is the
-        // synthesis step's job; collect just gathers.
-        //
-        // That applies to a live MCP tool result too. It used to cancel the
-        // web search outright, on the reasoning that a deliberately invoked
-        // tool had already answered — but "deliberately invoked" only means
-        // the router picked it, not that its output answered the question,
-        // and a query spanning both ("how does our roadmap compare to what
-        // they announced") lost half its context. Both are gathered now and
-        // the ordering above puts the local one first.
-        //
-        // The remaining exception is a follow-up that only reworks the answer
-        // already on screen ("now make it a table") — see
-        // [`Explorer::needs_web_search`].
-        if self.web_search_agent.is_enabled() && self.needs_web_search(query, conversation_history) {
-            // Announce the search before it starts.  It is the longest leg of
-            // collect — a provider round-trip plus one fetch per result — and
-            // it runs on this thread while the local searches above have
-            // already returned, so with no event here the client shows the
-            // previous step until the whole search is done.  A skipped search
-            // stays silent, as the rest of this path is.
-            Self::emit(progress.as_ref(), "web_search", "Searching the web for the latest information");
-            ctx.web_context = self.search_web(query, progress.clone());
-            let sources = self.web_search_agent.last_sources();
-            if !sources.is_empty() {
-                ctx.web_sources = sources;
-                ctx.web_source_extracts = self.web_search_agent.last_source_extracts();
-            }
-        }
+        // No web search here: collect gathers the user's own material. The
+        // web is reached only when the model asks for it, through the
+        // client's `web_search` tool.
 
         // Skill tool execution runs in the DAG step nodes — do NOT run them
         // here during collection.  Eager execution here would bypass argument
