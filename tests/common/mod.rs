@@ -2897,6 +2897,10 @@ pub mod api_chat {
         pub task_summary: Mutex<Option<String>>,
         /// Records `summarize_task` was called with.
         pub task_records: Mutex<Vec<String>>,
+        /// The framework's tools offered each turn (none by default).
+        pub framework_tools: Mutex<Vec<serde_json::Value>>,
+        /// `(name, arguments)` of every `run_framework_tool`.
+        pub framework_tool_calls: Mutex<Vec<(String, String)>>,
     }
 
     impl Default for FakeChatService {
@@ -2924,6 +2928,8 @@ pub mod api_chat {
                 index_hold: Mutex::new(Duration::ZERO),
                 task_summary: Mutex::new(None),
                 task_records: Mutex::new(Vec::new()),
+                framework_tools: Mutex::new(Vec::new()),
+                framework_tool_calls: Mutex::new(Vec::new()),
             }
         }
     }
@@ -3033,6 +3039,14 @@ pub mod api_chat {
         }
         fn current_work_dir(&self) -> Option<String> {
             self.work_dir.lock().clone()
+        }
+        fn framework_tools(&self) -> Vec<serde_json::Value> {
+            self.framework_tools.lock().clone()
+        }
+        fn run_framework_tool(&self, name: &str, arguments: &str, said: Box<dyn Fn(&str) + Send + Sync>) -> String {
+            self.framework_tool_calls.lock().push((name.to_string(), arguments.to_string()));
+            said("Reading example.com");
+            format!("result of {name}")
         }
         fn bind_work_dir(&self, dir: &str) -> bool {
             *self.work_dir.lock() = Some(dir.to_string());

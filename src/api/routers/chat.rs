@@ -28,6 +28,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::agents::orchestration::skill_processor::SkillProcessor;
+use crate::agents::web_tools;
 use crate::api::model::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     ChatStatusChunk, Choice, ChunkChoice, Citation, CitationSource, DeltaContent, Usage,
@@ -199,6 +200,19 @@ pub trait ChatService: Send + Sync {
     /// The user's folder the current project is bound to, or `None`.
     fn current_work_dir(&self) -> Option<String> {
         None
+    }
+    /// The framework's own tools this turn offers the model (`web_search`,
+    /// `web_fetch`; see [`web_tools`]), whose calls are run here rather than
+    /// handed to the client.  None when the current project has web search
+    /// turned off.
+    fn framework_tools(&self) -> Vec<Value> {
+        Vec::new()
+    }
+    /// Run the framework's tool `name` with the model's `arguments` (a JSON
+    /// object, as text): what goes back to the model.  Blocking.  `said`
+    /// hears each step as it happens.
+    fn run_framework_tool(&self, name: &str, _arguments: &str, _said: Box<dyn Fn(&str) + Send + Sync>) -> String {
+        format!("Error: there is no `{name}` tool.")
     }
     /// Bring the index of the current project's folder up to date, blocking
     /// until it is; `false` when there is nothing to index or it failed.
@@ -388,6 +402,21 @@ impl ChatService for ModelService {
         let model = self.model.read().clone()?;
         let ws = model.workspace.read();
         ws.current_project().map(|p| p.project_dir.clone())
+    }
+    fn framework_tools(&self) -> Vec<Value> {
+        // The project's switch, not whether a search would be served: signed
+        // out or over the allowance, the tool is still offered and says so,
+        // which tells the user more than a model that never tries.
+        let enabled = self
+            .model
+            .read()
+            .clone()
+            .and_then(|model| model.workspace.read().current_project().map(|p| p.web_search_enabled))
+            .unwrap_or(false);
+        if enabled { web_tools::definitions() } else { Vec::new() }
+    }
+    fn run_framework_tool(&self, name: &str, arguments: &str, said: Box<dyn Fn(&str) + Send + Sync>) -> String {
+        web_tools::run(name, arguments, said)
     }
     fn current_work_dir(&self) -> Option<String> {
         let model = self.model.read().clone()?;
@@ -876,6 +905,11 @@ fn chunk_frame(model: &str, delta: DeltaContent, finish_reason: Option<&str>) ->
 /// writing out a long call) before it says it is still waiting.
 pub const TOOL_TURN_STATUS_EVERY: Duration = Duration::from_secs(5);
 
+/// How many times in one turn the model may come back for the framework's
+/// tools (each time with as many calls as it likes).  Past this its calls are
+/// answered "not run", so a model that keeps searching still gets to answer.
+pub const MAX_FRAMEWORK_TOOL_ROUNDS: usize = 6;
+
 /// Whether the model answering for `capability` gets the client's tools: it
 /// calls functions natively (declares `tools` and its chat template renders
 /// them), whatever its size.  Any other model answers without them, and the
@@ -991,6 +1025,16 @@ pub fn reply_tool_calls(reply: &str) -> (String, Vec<Value>) {
         })
         .collect();
     (strip_tool_calls(reply), calls)
+}
+
+/// The newlines that start a new paragraph after `sent`: what is missing of a
+/// blank line, so text that already ends on one isn't pushed further down.
+fn paragraph_gap(sent: &str) -> &'static str {
+    match sent.len() - sent.trim_end_matches('\n').len() {
+        0 => "\n\n",
+        1 => "\n",
+        _ => "",
+    }
 }
 
 fn content_delta(content: impl Into<String>) -> DeltaContent {
@@ -2866,6 +2910,14 @@ fn stream_chunks_inner(
         // calls continues the turn, so it is not re-planned.
         let (request, mut tool_rounds) = split_tool_rounds(request);
         let client_tools: Option<Vec<Value>> = request.tools.clone().filter(|t| !t.is_empty());
+        // The framework's own tools (`web_search`, `web_fetch`) go to the model
+        // beside the client's, so every client has them without defining them.
+        // The calls the model makes of them are run here and the turn goes on;
+        // only the client's own calls travel back to it.  A client that sends
+        // a tool of the same name has replaced the framework's, and runs it.
+        let (turn_tools, framework_tool_names) =
+            web_tools::offered(client_tools.as_deref().unwrap_or_default(), svc.framework_tools());
+        let turn_tools = Some(turn_tools).filter(|t| !t.is_empty());
         let continuing = !tool_rounds.is_empty();
 
         // Load the session's recent history ONCE and share it between the
@@ -3348,11 +3400,11 @@ fn stream_chunks_inner(
             );
         }
 
-        // Client tools: offered to a response model that uses tools well,
-        // answered in one piece (text, then the calls it made, if any).  Any
-        // other model answers below without them, and the client falls back
-        // to its text protocol.
-        if let Some(tools) = client_tools.clone() {
+        // Tools, the client's and the framework's: offered to a response model
+        // that uses tools well, answered in one piece a round (text, then the
+        // calls it made, if any).  Any other model answers below without them,
+        // and the client falls back to its text protocol.
+        if let Some(tools) = turn_tools.clone() {
             let client = svc.model_client();
             let check = client.clone();
             let (eligible, label) = run_blocking(move || {
@@ -3362,8 +3414,9 @@ fn stream_chunks_inner(
             .await;
             tracing::info!(
                 target: LOG_TARGET,
-                "[tools] {} client tool(s), round {} → {}",
+                "[tools] {} tool(s), {} the framework's, round {} → {}",
                 tools.len(),
+                framework_tool_names.len(),
                 tool_rounds.iter().filter(|m| m["role"] == "tool").count(),
                 if eligible { "offered" } else { "not offered (model doesn't take them)" }
             );
@@ -3379,106 +3432,262 @@ fn stream_chunks_inner(
                     "data: {}\n\n",
                     py_json_dumps(&json!({"object": "chat.message_id", "message_id": message_id}))
                 );
-                let full = client_tool_prompt(&prompt, &tool_rounds, &tools);
-                let model = request.model.clone();
-                // Streamed: the answer's text reaches the client as it's
-                // written, and the calls it made come once it's done.  The
-                // stream isn't Send, so it is drained on its own thread and
-                // handed over a channel.
-                let (text_tx, mut text_rx) = unbounded_channel::<Result<String, String>>();
-                let cancel = cancelled.clone();
-                let client_tools_timer = timing::timer("chat.client_tools");
-                let worker = tokio::task::spawn_blocking(bind(move || {
-                    let _caller = timing::caller("chat.answer");
-                    match client.stream(&full, Some(&model), response_capability, Some(cancel), Some(false)) {
-                        Ok(stream) => {
-                            for item in stream {
-                                let sent = match item {
-                                    Ok(text) => text_tx.send(Ok(text)),
-                                    Err(e) => {
-                                        let _ = text_tx.send(Err(e.to_string()));
+                let waiting = if label.is_empty() { "Waiting for the model…".to_string() } else { format!("Waiting for {label}…") };
+                // What the model has said this turn, over every round: it may
+                // write before it calls one of the framework's tools, and again
+                // once it has the result.
+                let mut said = String::new();
+                // The text sent so far, to part one round's from the next.
+                let mut sent = String::new();
+                let mut framework_rounds = 0usize;
+                loop {
+                    let full = client_tool_prompt(&prompt, &tool_rounds, &tools);
+                    let model = request.model.clone();
+                    let client = client.clone();
+                    // Streamed: the answer's text reaches the client as it's
+                    // written, and the calls it made come once it's done.  The
+                    // stream isn't Send, so it is drained on its own thread and
+                    // handed over a channel.
+                    let (text_tx, mut text_rx) = unbounded_channel::<Result<String, String>>();
+                    let cancel = cancelled.clone();
+                    let client_tools_timer = timing::timer("chat.client_tools");
+                    let worker = tokio::task::spawn_blocking(bind(move || {
+                        let _caller = timing::caller("chat.answer");
+                        match client.stream(&full, Some(&model), response_capability, Some(cancel), Some(false)) {
+                            Ok(stream) => {
+                                for item in stream {
+                                    let sent = match item {
+                                        Ok(text) => text_tx.send(Ok(text)),
+                                        Err(e) => {
+                                            let _ = text_tx.send(Err(e.to_string()));
+                                            break;
+                                        }
+                                    };
+                                    if sent.is_err() {
                                         break;
                                     }
-                                };
-                                if sent.is_err() {
-                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = text_tx.send(Err(e.to_string()));
+                            }
+                        }
+                    }));
+                    let mut reply = String::new();
+                    let mut shown = 0usize;
+                    let mut failure: Option<String> = None;
+                    // A later round's text starts its own paragraph.
+                    let mut parted = said.is_empty();
+                    loop {
+                        match tokio::time::timeout(TOOL_TURN_STATUS_EVERY, text_rx.recv()).await {
+                            // Quiet a while (thinking, or writing a long call):
+                            // say it is still going.
+                            Err(_) => yield status_event("streaming", "processing", &waiting),
+                            Ok(None) => break,
+                            Ok(Some(Err(e))) => {
+                                failure = Some(e);
+                                break;
+                            }
+                            Ok(Some(Ok(text))) => {
+                                if reply.is_empty() {
+                                    timing::mark("first_token");
+                                }
+                                reply.push_str(&text);
+                                // Up to any tool-call markup, which never shows.
+                                let safe = streamable_end(&reply);
+                                if safe > shown {
+                                    if !parted && !reply[shown..safe].trim().is_empty() {
+                                        parted = true;
+                                        let gap = paragraph_gap(&sent);
+                                        if !gap.is_empty() {
+                                            sent.push_str(gap);
+                                            yield chunk_frame(&stream_model, content_delta(gap), None);
+                                        }
+                                    }
+                                    sent.push_str(&reply[shown..safe]);
+                                    yield chunk_frame(&stream_model, content_delta(reply[shown..safe].to_string()), None);
+                                    shown = safe;
                                 }
                             }
                         }
-                        Err(e) => {
-                            let _ = text_tx.send(Err(e.to_string()));
-                        }
                     }
-                }));
-                let waiting = if label.is_empty() { "Waiting for the model…".to_string() } else { format!("Waiting for {label}…") };
-                let mut reply = String::new();
-                let mut shown = 0usize;
-                let mut failure: Option<String> = None;
-                loop {
-                    match tokio::time::timeout(TOOL_TURN_STATUS_EVERY, text_rx.recv()).await {
-                        // Quiet a while (thinking, or writing a long call):
-                        // say it is still going.
-                        Err(_) => yield status_event("streaming", "processing", &waiting),
-                        Ok(None) => break,
-                        Ok(Some(Err(e))) => {
-                            failure = Some(e);
-                            break;
-                        }
-                        Ok(Some(Ok(text))) => {
-                            if reply.is_empty() {
-                                timing::mark("first_token");
-                            }
-                            reply.push_str(&text);
-                            // Up to any tool-call markup, which never shows.
-                            let safe = streamable_end(&reply);
-                            if safe > shown {
-                                yield chunk_frame(&stream_model, content_delta(reply[shown..safe].to_string()), None);
-                                shown = safe;
-                            }
-                        }
+                    let worker_result = worker.await;
+                    drop(client_tools_timer);
+                    if let Err(e) = worker_result {
+                        failure.get_or_insert_with(|| match e.try_into_panic() {
+                            Ok(payload) => panic_message(payload.as_ref()),
+                            Err(e) => e.to_string(),
+                        });
                     }
-                }
-                let worker_result = worker.await;
-                drop(client_tools_timer);
-                if let Err(e) = worker_result {
-                    failure.get_or_insert_with(|| match e.try_into_panic() {
-                        Ok(payload) => panic_message(payload.as_ref()),
-                        Err(e) => e.to_string(),
-                    });
-                }
-                // A local model's failure comes back as answer text.
-                if failure.is_none() && reply.starts_with("Error generating response") {
-                    failure = Some(reply.clone());
-                }
-                match failure {
-                    None => {
-                        // What the model said after its calls, if anything.
-                        let (rest, calls) = held_back_tail(&reply, shown);
-                        if !rest.is_empty() {
-                            yield chunk_frame(&stream_model, content_delta(rest), None);
-                        }
-                        let text = strip_tool_calls(&reply);
-                        if calls.is_empty() {
-                            yield chunk_frame(&stream_model, DeltaContent::default(), Some("stop"));
-                            if let Some(session_id) = request.session_id.as_deref().filter(|s| !s.is_empty()) {
-                                svc.append_to_session(session_id, "assistant", &text, None, Some(&message_id));
+                    // A local model's failure comes back as answer text.
+                    if failure.is_none() && reply.starts_with("Error generating response") {
+                        failure = Some(reply.clone());
+                    }
+                    if let Some(error) = failure {
+                        tracing::error!(target: LOG_TARGET, "[tools] tools turn failed: {error}");
+                        yield status_event("streaming", "error", &error);
+                        yield chunk_frame(&stream_model, content_delta(error), Some("stop"));
+                        break;
+                    }
+
+                    // What the model said after its calls, if anything.
+                    let (rest, calls) = held_back_tail(&reply, shown);
+                    if !rest.is_empty() {
+                        if !parted && !rest.trim().is_empty() {
+                            let gap = paragraph_gap(&sent);
+                            if !gap.is_empty() {
+                                sent.push_str(gap);
+                                yield chunk_frame(&stream_model, content_delta(gap), None);
                             }
-                        } else {
+                        }
+                        sent.push_str(&rest);
+                        yield chunk_frame(&stream_model, content_delta(rest), None);
+                    }
+                    let text = strip_tool_calls(&reply);
+                    if !text.is_empty() {
+                        if !said.is_empty() {
+                            said.push_str("\n\n");
+                        }
+                        said.push_str(&text);
+                    }
+                    let prompt_tokens = svc.count_tokens(&prompt);
+                    let completion_tokens = svc.count_tokens(&reply);
+                    svc.push_token_usage(project_id.as_deref(), &request.model, prompt_tokens, completion_tokens);
+
+                    // The framework's calls are run here; the client's go back
+                    // to it.  A reply that makes both runs the framework's
+                    // first: the model asks for the client's again with those
+                    // results in hand, since the client can only answer calls
+                    // it was sent.
+                    let (ours, theirs): (Vec<Value>, Vec<Value>) = calls
+                        .into_iter()
+                        .partition(|call| framework_tool_names.iter().any(|name| name == web_tools::tool_name(call)));
+                    let stopped = cancelled.load(Ordering::SeqCst);
+                    // A model still calling after being told its lookups are
+                    // spent is not going to answer; end the turn on what it said.
+                    let runaway = framework_rounds > MAX_FRAMEWORK_TOOL_ROUNDS;
+                    if ours.is_empty() || stopped || runaway {
+                        if !theirs.is_empty() && ours.is_empty() {
                             yield chunk_frame(
                                 &stream_model,
-                                DeltaContent { tool_calls: Some(calls), ..Default::default() },
+                                DeltaContent { tool_calls: Some(theirs), ..Default::default() },
                                 None,
                             );
                             yield chunk_frame(&stream_model, DeltaContent::default(), Some("tool_calls"));
+                            break;
                         }
-                        let prompt_tokens = svc.count_tokens(&prompt);
-                        let completion_tokens = svc.count_tokens(&reply);
-                        svc.push_token_usage(project_id.as_deref(), &request.model, prompt_tokens, completion_tokens);
+                        // The answer.  A turn the framework's tools alone were
+                        // offered on is an ordinary chat turn (no client is
+                        // running a tool loop), so it ends the way one does
+                        // below: its sources checked, its usage and citations
+                        // sent.
+                        let mut verified: Option<Vec<CitationDict>> = None;
+                        if client_tools.is_none() {
+                            let shared: Option<SharedCitations> =
+                                citations.clone().filter(|c| !c.is_empty()).map(|c| Arc::new(Mutex::new(c)));
+                            if let Some(shared) = shared
+                                && !said.is_empty()
+                            {
+                                yield status_event("citations", "processing", "Checking sources...");
+                                let citations_timer = timing::timer("chat.citations");
+                                let found = verified_citations_async(shared, said.clone(), svc.clone(), None).await;
+                                drop(citations_timer);
+                                let unload_svc = svc.clone();
+                                spawn_detached_blocking(move || unload_svc.unload_embedding_model());
+                                let message = if found.is_empty() {
+                                    "No sources used".to_string()
+                                } else {
+                                    format!("{} source(s) cited", found.len())
+                                };
+                                yield status_event("citations", "completed", &message);
+                                verified = Some(found);
+                            }
+                        }
+                        if let Some(session_id) = request.session_id.as_deref().filter(|s| !s.is_empty())
+                            && !said.is_empty()
+                        {
+                            svc.append_to_session(session_id, "assistant", &said, verified.as_deref(), Some(&message_id));
+                        }
+                        if client_tools.is_none() {
+                            if !said.is_empty() {
+                                let usage_payload = py_json_dumps(&json!({
+                                    "object": "chat.usage",
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "total_tokens": prompt_tokens + completion_tokens,
+                                    "max_context_tokens": svc.get_max_context_tokens(),
+                                }));
+                                yield format!("data: {usage_payload}\n\n");
+                            }
+                            let cited = verified.as_deref().map(citation_models).filter(|models| !models.is_empty());
+                            if let Some(cited) = cited {
+                                let payload = py_json_dumps(&json!({"object": "chat.citations", "citations": cited}));
+                                yield format!("data: {payload}\n\n");
+                            }
+                            yield status_event("streaming", "completed", "Response complete");
+                        }
+                        yield chunk_frame(&stream_model, DeltaContent::default(), Some("stop"));
+                        break;
                     }
-                    Some(error) => {
-                        tracing::error!(target: LOG_TARGET, "[tools] client-tools turn failed: {error}");
-                        yield status_event("streaming", "error", &error);
-                        yield chunk_frame(&stream_model, content_delta(error), Some("stop"));
+
+                    framework_rounds += 1;
+                    let spent = framework_rounds > MAX_FRAMEWORK_TOOL_ROUNDS;
+                    // The round as the model's template reads it: arguments as
+                    // objects, as `split_tool_rounds` leaves a client's.
+                    let round_calls: Vec<Value> = ours
+                        .iter()
+                        .cloned()
+                        .map(|mut call| {
+                            if let Some(args) = call.pointer_mut("/function/arguments")
+                                && let Some(text) = args.as_str()
+                            {
+                                *args = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
+                            }
+                            call
+                        })
+                        .collect();
+                    tool_rounds.push(json!({"role": "assistant", "content": text, "tool_calls": round_calls}));
+                    for call in &ours {
+                        let id = call["id"].as_str().unwrap_or_default().to_string();
+                        let name = web_tools::tool_name(call).to_string();
+                        let arguments =
+                            call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}").to_string();
+                        let result = if spent {
+                            "Not run: this turn's web lookups are used up. Answer now from what you have.".to_string()
+                        } else {
+                            tracing::info!(target: LOG_TARGET, "[tools] running {name} {arguments}");
+                            yield status_event("tools", "processing", &web_tools::describe(&name, &arguments));
+                            // Each step the tool reports ("Reading docs.rs")
+                            // is passed on as it happens; the channel closes
+                            // when the tool is done.
+                            let (said_tx, mut said_rx) = unbounded_channel::<String>();
+                            let tool_svc = svc.clone();
+                            let tool_name = name.clone();
+                            let tools_timer = timing::timer("chat.framework_tool");
+                            let job = tokio::task::spawn_blocking(bind(move || {
+                                tool_svc.run_framework_tool(
+                                    &tool_name,
+                                    &arguments,
+                                    Box::new(move |message: &str| {
+                                        let _ = said_tx.send(message.to_string());
+                                    }),
+                                )
+                            }));
+                            while let Some(message) = said_rx.recv().await {
+                                yield status_event("tools", "processing", &message);
+                            }
+                            let result = match job.await {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    tracing::error!(target: LOG_TARGET, "[tools] {name} failed: {e}");
+                                    yield status_event("tools", "error", &format!("{name} failed"));
+                                    format!("The `{name}` tool failed ({e}). Go on without it.")
+                                }
+                            };
+                            drop(tools_timer);
+                            result
+                        };
+                        tool_rounds.push(json!({"role": "tool", "tool_call_id": id, "name": name, "content": result}));
                     }
                 }
                 yield "data: [DONE]\n\n".to_string();
