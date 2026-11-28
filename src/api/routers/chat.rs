@@ -201,10 +201,9 @@ pub trait ChatService: Send + Sync {
     fn current_work_dir(&self) -> Option<String> {
         None
     }
-    /// The framework's own tools this turn offers the model (`web_search`,
-    /// `web_fetch`; see [`web_tools`]), whose calls are run here rather than
-    /// handed to the client.  None when the current project has web search
-    /// turned off.
+    /// The framework's own tools, offered to the model on every turn
+    /// (`web_search`, `web_fetch`; see [`web_tools`]), whose calls are run
+    /// here rather than handed to the client.
     fn framework_tools(&self) -> Vec<Value> {
         Vec::new()
     }
@@ -404,16 +403,11 @@ impl ChatService for ModelService {
         ws.current_project().map(|p| p.project_dir.clone())
     }
     fn framework_tools(&self) -> Vec<Value> {
-        // The project's switch, not whether a search would be served: signed
-        // out or over the allowance, the tool is still offered and says so,
-        // which tells the user more than a model that never tries.
-        let enabled = self
-            .model
-            .read()
-            .clone()
-            .and_then(|model| model.workspace.read().current_project().map(|p| p.web_search_enabled))
-            .unwrap_or(false);
-        if enabled { web_tools::definitions() } else { Vec::new() }
+        // Always, with no switch and whatever a search would come to: the
+        // model decides when to search, and signed out or over the allowance
+        // the tool says so, which tells the user more than a model that
+        // never tries.
+        web_tools::definitions()
     }
     fn run_framework_tool(&self, name: &str, arguments: &str, said: Box<dyn Fn(&str) + Send + Sync>) -> String {
         web_tools::run(name, arguments, said)
@@ -2915,14 +2909,10 @@ fn stream_chunks_inner(
         // The calls the model makes of them are run here and the turn goes on;
         // only the client's own calls travel back to it.  A client that sends
         // a tool of the same name has replaced the framework's, and runs it.
-        // The request's own word on web search wins over the project's switch.
-        let framework_tools = match request.web_search {
-            Some(true) => web_tools::definitions(),
-            Some(false) => Vec::new(),
-            None => svc.framework_tools(),
-        };
+        // They are offered on every turn, with no switch: whether to search is
+        // the model's to decide, call by call.
         let (turn_tools, framework_tool_names) =
-            web_tools::offered(client_tools.as_deref().unwrap_or_default(), framework_tools);
+            web_tools::offered(client_tools.as_deref().unwrap_or_default(), svc.framework_tools());
         let turn_tools = Some(turn_tools).filter(|t| !t.is_empty());
         let continuing = !tool_rounds.is_empty();
 

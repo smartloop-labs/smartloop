@@ -378,31 +378,12 @@ async fn test_a_model_that_keeps_searching_is_told_to_answer() {
 #[tokio::test]
 #[serial]
 async fn test_no_framework_tools_leaves_a_plain_turn_as_it_was() {
-    // Web search off for the project: nothing is offered, and a client with
-    // no tools of its own gets the ordinary answer.
+    // A service with no tools of its own to offer: a client with none
+    // either gets the ordinary answer.
     let (svc, prompts) = rounds(&["unused"]);
     svc.framework_tools.lock().clear();
     let events = run(plain_turn(), &svc).await;
 
     assert_eq!(text(&events), "plain");
     assert!(prompts.lock().is_empty(), "no tools turn was run");
-}
-
-#[tokio::test]
-#[serial]
-async fn test_a_request_says_whether_it_wants_web_search() {
-    // The project's switch is off, and the request asks for search anyway
-    // (docent, which has no switch): the tools are offered and run.
-    let (svc, prompts) = rounds(&[SEARCH_CALL, "Found it."]);
-    svc.framework_tools.lock().clear();
-    let events = run(ChatCompletionRequest { web_search: Some(true), ..plain_turn() }, &svc).await;
-    assert_eq!(svc.framework_tool_calls.lock().len(), 1);
-    assert_eq!(finish(&events).as_deref(), Some("stop"));
-    assert!(prompts.lock()[0].contains("web_search"));
-
-    // The switch is on, and the request declines: a plain turn.
-    let (svc, prompts) = rounds(&["unused"]);
-    let events = run(ChatCompletionRequest { web_search: Some(false), ..plain_turn() }, &svc).await;
-    assert_eq!(text(&events), "plain");
-    assert!(prompts.lock().is_empty());
 }

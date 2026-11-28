@@ -2,7 +2,8 @@
 //!
 //! They live here, with the agents that do their work, so every client gets
 //! them from one place: the chat endpoint offers them to the model with each
-//! turn and runs the calls itself (see `api::routers::chat`), and a client
+//! turn (always: whether to search is the model's to decide, not a switch's)
+//! and runs the calls itself (see `api::routers::chat`), and a client
 //! that links the framework can take the same definitions and run them in
 //! process.  A client extends the set by sending tools of its own with the
 //! request, and replaces one of these by sending a tool of the same name,
