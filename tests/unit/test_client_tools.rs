@@ -362,17 +362,50 @@ async fn test_a_client_that_sends_a_tool_of_the_same_name_runs_it_itself() {
 
 #[tokio::test]
 #[serial]
-async fn test_a_model_that_keeps_searching_is_told_to_answer() {
-    // It never stops calling: past the limit its calls are answered "not
-    // run", and the turn ends instead of going round forever.
+async fn test_a_model_that_keeps_searching_is_made_to_answer() {
+    // It never stops calling: past the limit the framework's tools are
+    // withdrawn and it is asked to answer, and the turn ends there instead of
+    // going round until the window is full.
     let (svc, prompts) = rounds(&[SEARCH_CALL]);
     let events = run(plain_turn(), &svc).await;
 
     assert_eq!(finish(&events).as_deref(), Some("stop"));
+    assert!(tool_calls(&events).is_empty(), "nothing is handed to a client with no tools");
     assert_eq!(svc.framework_tool_calls.lock().len(), MAX_FRAMEWORK_TOOL_ROUNDS);
     let prompts = prompts.lock().clone();
-    assert_eq!(prompts.len(), MAX_FRAMEWORK_TOOL_ROUNDS + 2);
-    assert!(prompts.last().unwrap().contains("web lookups are used up"));
+    assert_eq!(prompts.len(), MAX_FRAMEWORK_TOOL_ROUNDS + 1);
+    let last = prompts.last().unwrap();
+    assert!(last.starts_with("<slp_tools>[]"), "no tool is offered on the closing round");
+    assert!(last.contains("Answer my question now"), "{last}");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_lookups_with_no_answer_say_so() {
+    // Calls and nothing else, every round: the client still gets an answer
+    // to show, not an empty one.
+    let (svc, _) = rounds(&["<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"x\"}}</tool_call>"]);
+    let events = run(plain_turn(), &svc).await;
+    assert_eq!(finish(&events).as_deref(), Some("stop"));
+    assert!(text(&events).contains("couldn't put an answer together"), "{}", text(&events));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_tool_nobody_offered_is_answered_here_not_sent_to_the_client() {
+    // The model makes up a tool. A client with no tools has nothing to run
+    // it with, so the error goes back to the model and the turn goes on.
+    let (svc, prompts) = rounds(&[
+        "<tool_call>{\"name\": \"browse\", \"arguments\": {\"url\": \"https://a.b\"}}</tool_call>",
+        "Here is the answer.",
+    ]);
+    let events = run(plain_turn(), &svc).await;
+
+    assert!(tool_calls(&events).is_empty());
+    assert_eq!(finish(&events).as_deref(), Some("stop"));
+    assert_eq!(text(&events), "Here is the answer.");
+    assert!(svc.framework_tool_calls.lock().is_empty());
+    assert!(prompts.lock()[1].contains("there is no `browse` tool"), "{}", prompts.lock()[1]);
 }
 
 #[tokio::test]
