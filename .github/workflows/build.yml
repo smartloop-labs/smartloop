@@ -294,8 +294,16 @@ jobs:
         with:
           key: windows-amd64-vulkan
 
+      # On a cold cache the first MSBuild pass fails in llama.cpp's
+      # vulkan-shaders-gen ExternalProject: its install step runs before its
+      # configure step has written cmake_install.cmake. Configure and build
+      # still complete, so a second pass over the same build directory passes.
       - name: Build slp binary
-        run: make build-binary
+        run: |
+          make build-binary || {
+            echo "::warning::First build pass failed; retrying over the same build directory"
+            make build-binary
+          }
 
       - name: Verify build
         run: |
