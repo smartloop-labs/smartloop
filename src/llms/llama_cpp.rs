@@ -695,15 +695,57 @@ impl BaseLLM for LlamaCpp {
     }
 
     fn stream<'a>(&'a self, prompt: &str, options: CallOptions) -> GenerationStream<'a> {
-        // A tools prompt is answered in one piece through `call`, which hands
-        // the tools and the conversation to the chat template; the reply,
-        // calls and all, comes back as one chunk.
+        // A tools prompt streams like any other: its text reaches the caller
+        // as it is written, so an answer that follows a tool's result is not
+        // held back until its last token.  The tools and the conversation go
+        // to the chat template as `call` hands them; a call the model writes
+        // arrives as text in its own markup, which the caller holds back and
+        // parses once the reply is whole.
         if split_tools(prompt).1.is_some() {
-            let text = match self.call(prompt, None, options) {
-                Ok(text) => text,
-                Err(e) => std::panic::panic_any(e.to_string()),
+            let guard = self.context_lock().lock();
+            let (body, tools) = split_tools(prompt);
+            let tools = tools.filter(|_| self.supports_native_tools());
+            // A tool conversation is rendered by the template as it is; it is
+            // never truncated, since a cut would break its JSON.
+            let conversation = split_messages(body).filter(|_| tools.is_some());
+            let body = if conversation.is_some() { body.to_string() } else { self.fit_prompt_for(body, &options) };
+            tracing::info!(
+                target: LOG_TARGET,
+                "Generating response | prompt_tokens={}{}",
+                self.num_tokens(&body).unwrap_or(0),
+                tools.as_ref().map(|t| format!(" tools={}", t.len())).unwrap_or_default()
+            );
+            let messages = self.create_messages_from_prompt(&body);
+            let available_tokens = options.max_tokens.unwrap_or_else(|| self.get_available_tokens(&body));
+            let chunks = {
+                let _override = self.thinking_override(Some(Self::requested_thinking(&options)));
+                let _budget = self.thinking_for_budget(Some(available_tokens));
+                let mut request = self.completion_request(&messages, available_tokens, true);
+                request.tools = tools;
+                if let Some(conversation) = conversation {
+                    request.messages = conversation;
+                }
+                self.model.create_chat_completion(request)
             };
-            return Box::new(std::iter::once(GenerationChunk { text }));
+            let chunks = match chunks {
+                Ok(output) => Some(output.into_chunks()),
+                Err(e) => {
+                    tracing::error!(target: LOG_TARGET, "Generation failed: {e}");
+                    None
+                }
+            };
+            return Box::new(LlamaCppStream {
+                llm: self,
+                prompt: body,
+                chunks,
+                thinking: ThinkingFilter::new(),
+                chunk_count: 0,
+                start_time: time_now(),
+                first_token_at: None,
+                opening_at: None,
+                finished: false,
+                _guard: guard,
+            });
         }
         let guard = self.context_lock().lock();
 

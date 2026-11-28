@@ -900,9 +900,18 @@ fn chunk_frame(model: &str, delta: DeltaContent, finish_reason: Option<&str>) ->
 pub const TOOL_TURN_STATUS_EVERY: Duration = Duration::from_secs(5);
 
 /// How many times in one turn the model may come back for the framework's
-/// tools (each time with as many calls as it likes).  Past this its calls are
-/// answered "not run", so a model that keeps searching still gets to answer.
-pub const MAX_FRAMEWORK_TOOL_ROUNDS: usize = 6;
+/// tools (each time with as many calls as it likes).  Past this they are
+/// withdrawn and it is asked to answer: a small model otherwise searches and
+/// reads on, round after round, until its window is full and it says nothing.
+pub const MAX_FRAMEWORK_TOOL_ROUNDS: usize = 3;
+
+/// What the model is told on the round after its last lookup.
+const ANSWER_NOW: &str =
+    "Answer my question now, from what your lookups returned. Do not call a tool again.";
+
+/// What a turn says when its lookups ran and the model still wrote no answer.
+const NO_ANSWER_AFTER_LOOKUPS: &str =
+    "I looked this up but couldn't put an answer together from what came back. Try asking again, or more specifically.";
 
 /// Whether the model answering for `capability` gets the client's tools: it
 /// calls functions natively (declares `tools` and its chat template renders
@@ -3439,8 +3448,33 @@ fn stream_chunks_inner(
                 // The text sent so far, to part one round's from the next.
                 let mut sent = String::new();
                 let mut framework_rounds = 0usize;
+                // A tool's result is cut to a share of the model's window, and
+                // older ones are stubbed as the rounds go on: three pages a
+                // search would otherwise fill a small window in a few rounds.
+                let result_chars = (max_ctx / 2).clamp(3_000, 24_000);
+                let client_tool_names: Vec<String> = client_tools
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|tool| web_tools::tool_name(tool).to_string())
+                    .collect();
                 loop {
-                    let full = client_tool_prompt(&tools_prompt, &tool_rounds, &tools);
+                    // Past the limit the framework's tools are withdrawn: the
+                    // model has what its lookups returned, and what is left is
+                    // to answer.
+                    let closing = framework_rounds >= MAX_FRAMEWORK_TOOL_ROUNDS;
+                    let full = if closing {
+                        let kept: Vec<Value> = tools
+                            .iter()
+                            .filter(|tool| !framework_tool_names.iter().any(|name| name == web_tools::tool_name(tool)))
+                            .cloned()
+                            .collect();
+                        let mut rounds = tool_rounds.clone();
+                        rounds.push(json!({"role": "user", "content": ANSWER_NOW}));
+                        client_tool_prompt(&prompt, &rounds, &kept)
+                    } else {
+                        client_tool_prompt(&tools_prompt, &tool_rounds, &tools)
+                    };
                     let model = request.model.clone();
                     let client = client.clone();
                     // Streamed: the answer's text reaches the client as it's
@@ -3557,15 +3591,25 @@ fn stream_chunks_inner(
                     // to it.  A reply that makes both runs the framework's
                     // first: the model asks for the client's again with those
                     // results in hand, since the client can only answer calls
-                    // it was sent.
-                    let (ours, theirs): (Vec<Value>, Vec<Value>) = calls
-                        .into_iter()
-                        .partition(|call| framework_tool_names.iter().any(|name| name == web_tools::tool_name(call)));
+                    // it was sent.  A call of a tool nobody offered (a name the
+                    // model made up) is answered here too, with the error: it
+                    // never goes to a client that has no such tool to run.
+                    let (mut ours, mut theirs, mut stray) = (Vec::new(), Vec::new(), Vec::new());
+                    for call in calls {
+                        let name = web_tools::tool_name(&call);
+                        if !closing && framework_tool_names.iter().any(|n| n == name) {
+                            ours.push(call);
+                        } else if client_tool_names.iter().any(|n| n == name) {
+                            theirs.push(call);
+                        } else {
+                            stray.push(call);
+                        }
+                    }
                     let stopped = cancelled.load(Ordering::SeqCst);
-                    // A model still calling after being told its lookups are
-                    // spent is not going to answer; end the turn on what it said.
-                    let runaway = framework_rounds > MAX_FRAMEWORK_TOOL_ROUNDS;
-                    if ours.is_empty() || stopped || runaway {
+                    // On the closing round a stray call is the model not
+                    // answering after all: the turn ends on what it said.
+                    let answered_here = !ours.is_empty() || (!stray.is_empty() && !closing);
+                    if !answered_here || stopped {
                         if !theirs.is_empty() && ours.is_empty() {
                             yield chunk_frame(
                                 &stream_model,
@@ -3574,6 +3618,12 @@ fn stream_chunks_inner(
                             );
                             yield chunk_frame(&stream_model, DeltaContent::default(), Some("tool_calls"));
                             break;
+                        }
+                        // Lookups ran and nothing was written: say so, rather
+                        // than hand the client an empty answer.
+                        if said.is_empty() && framework_rounds > 0 && !stopped {
+                            said.push_str(NO_ANSWER_AFTER_LOOKUPS);
+                            yield chunk_frame(&stream_model, content_delta(NO_ANSWER_AFTER_LOOKUPS), None);
                         }
                         // The answer.  A turn the framework's tools alone were
                         // offered on is an ordinary chat turn (no client is
@@ -3630,11 +3680,11 @@ fn stream_chunks_inner(
                     }
 
                     framework_rounds += 1;
-                    let spent = framework_rounds > MAX_FRAMEWORK_TOOL_ROUNDS;
                     // The round as the model's template reads it: arguments as
                     // objects, as `split_tool_rounds` leaves a client's.
                     let round_calls: Vec<Value> = ours
                         .iter()
+                        .chain(stray.iter())
                         .cloned()
                         .map(|mut call| {
                             if let Some(args) = call.pointer_mut("/function/arguments")
@@ -3651,43 +3701,52 @@ fn stream_chunks_inner(
                         let name = web_tools::tool_name(call).to_string();
                         let arguments =
                             call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}").to_string();
-                        let result = if spent {
-                            "Not run: this turn's web lookups are used up. Answer now from what you have.".to_string()
-                        } else {
-                            tracing::info!(target: LOG_TARGET, "[tools] running {name} {arguments}");
-                            yield status_event("tools", "processing", &web_tools::describe(&name, &arguments));
-                            // Each step the tool reports ("Reading docs.rs")
-                            // is passed on as it happens; the channel closes
-                            // when the tool is done.
-                            let (said_tx, mut said_rx) = unbounded_channel::<String>();
-                            let tool_svc = svc.clone();
-                            let tool_name = name.clone();
-                            let tools_timer = timing::timer("chat.framework_tool");
-                            let job = tokio::task::spawn_blocking(bind(move || {
-                                tool_svc.run_framework_tool(
-                                    &tool_name,
-                                    &arguments,
-                                    Box::new(move |message: &str| {
-                                        let _ = said_tx.send(message.to_string());
-                                    }),
-                                )
-                            }));
-                            while let Some(message) = said_rx.recv().await {
-                                yield status_event("tools", "processing", &message);
+                        tracing::info!(target: LOG_TARGET, "[tools] running {name} {arguments}");
+                        yield status_event("tools", "processing", &web_tools::describe(&name, &arguments));
+                        // Each step the tool reports ("Reading docs.rs") is
+                        // passed on as it happens; the channel closes when the
+                        // tool is done.
+                        let (said_tx, mut said_rx) = unbounded_channel::<String>();
+                        let tool_svc = svc.clone();
+                        let tool_name = name.clone();
+                        let tools_timer = timing::timer("chat.framework_tool");
+                        let job = tokio::task::spawn_blocking(bind(move || {
+                            tool_svc.run_framework_tool(
+                                &tool_name,
+                                &arguments,
+                                Box::new(move |message: &str| {
+                                    let _ = said_tx.send(message.to_string());
+                                }),
+                            )
+                        }));
+                        while let Some(message) = said_rx.recv().await {
+                            yield status_event("tools", "processing", &message);
+                        }
+                        let result = match job.await {
+                            Ok(result) => web_tools::clip(result, result_chars),
+                            Err(e) => {
+                                tracing::error!(target: LOG_TARGET, "[tools] {name} failed: {e}");
+                                yield status_event("tools", "error", &format!("{name} failed"));
+                                format!("The `{name}` tool failed ({e}). Go on without it.")
                             }
-                            let result = match job.await {
-                                Ok(result) => result,
-                                Err(e) => {
-                                    tracing::error!(target: LOG_TARGET, "[tools] {name} failed: {e}");
-                                    yield status_event("tools", "error", &format!("{name} failed"));
-                                    format!("The `{name}` tool failed ({e}). Go on without it.")
-                                }
-                            };
-                            drop(tools_timer);
-                            result
                         };
+                        drop(tools_timer);
                         tool_rounds.push(json!({"role": "tool", "tool_call_id": id, "name": name, "content": result}));
                     }
+                    for call in &stray {
+                        let id = call["id"].as_str().unwrap_or_default().to_string();
+                        let name = web_tools::tool_name(call).to_string();
+                        tracing::warn!(target: LOG_TARGET, "[tools] the model called `{name}`, which nobody offered");
+                        let known: Vec<&str> =
+                            tools.iter().map(web_tools::tool_name).filter(|n| !n.is_empty()).collect();
+                        let result = format!("Error: there is no `{name}` tool. The tools are: {}.", known.join(", "));
+                        tool_rounds.push(json!({"role": "tool", "tool_call_id": id, "name": name, "content": result}));
+                    }
+                    // Older results give way to newer ones, so the rounds stay
+                    // inside the window however many there are.
+                    let rounds = std::mem::take(&mut tool_rounds);
+                    let compact_svc = svc.clone();
+                    tool_rounds = run_blocking(move || compact_tool_rounds(rounds, &*compact_svc, max_ctx / 2)).await;
                 }
                 yield "data: [DONE]\n\n".to_string();
                 return;

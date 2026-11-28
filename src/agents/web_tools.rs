@@ -125,7 +125,9 @@ pub fn guidance(ours: &[String]) -> Option<String> {
             "WEB: You can search the web. For anything current (news, events, weather, prices, scores, schedules, \
              releases, versions) or anything you aren't sure of, call the `{WEB_SEARCH}` tool before you answer, and \
              answer from what it returns, citing the URLs. Never say you can't browse the internet or lack real-time \
-             access: search instead. Don't search for what the conversation or the provided data already answers."
+             access: search instead. One search is usually enough: answer from its results, and search or read \
+             again only when they don't answer the question. Don't search for what the conversation or the provided \
+             data already answers."
         ));
     }
     if has(WEB_FETCH) {
@@ -142,6 +144,16 @@ pub fn with_guidance(prompt: &str, ours: &[String]) -> String {
         Some(at) => format!("{}\n{}{}", &prompt[..at], guidance, &prompt[at..]),
         None => format!("<system>{guidance}</system>\n{prompt}"),
     }
+}
+
+/// `result` cut to `max_chars`, saying so: a tool's result has to leave the
+/// model room to answer in.
+pub fn clip(result: String, max_chars: usize) -> String {
+    if result.chars().count() <= max_chars {
+        return result;
+    }
+    let kept: String = result.chars().take(max_chars).collect();
+    format!("{}\n\n[Cut here to fit. Call `{WEB_FETCH}` on a URL above for more of that page.]", kept.trim_end())
 }
 
 /// What to say a call is doing, for the client's progress line.
@@ -334,6 +346,14 @@ mod tests {
         assert!(!fetch_only.contains("web_search") && fetch_only.contains("web_fetch"));
         assert_eq!(guidance(&[]), None);
         assert_eq!(with_guidance("<system>x</system>", &[]), "<system>x</system>");
+    }
+
+    #[test]
+    fn a_long_result_is_cut_and_says_so() {
+        assert_eq!(clip("short".to_string(), 100), "short");
+        let cut = clip("é".repeat(500), 100);
+        assert_eq!(cut.matches('é').count(), 100);
+        assert!(cut.ends_with("for more of that page.]"), "{cut}");
     }
 
     #[test]
