@@ -11,7 +11,10 @@ use serial_test::serial;
 
 use smartloop::api::model::chat::{ChatCompletionRequest, ChatMessage, Role};
 use parking_lot::Mutex;
-use smartloop::api::routers::chat::{reply_tool_calls, split_tool_rounds, stream_chunks, streamable_end, ChatService};
+use smartloop::agents::web_tools;
+use smartloop::api::routers::chat::{
+    reply_tool_calls, split_tool_rounds, stream_chunks, streamable_end, ChatService, MAX_FRAMEWORK_TOOL_ROUNDS,
+};
 use smartloop::model::spec::MODEL_SPECS;
 
 use crate::shared::api_chat::{chunk, FakeChatService};
@@ -248,4 +251,139 @@ async fn test_text_that_only_looks_like_a_call_still_shows() {
     assert_eq!(text(&events), "Use the <function= syntax.");
     assert!(tool_calls(&events).is_empty());
     assert_eq!(finish(&events).as_deref(), Some("stop"));
+}
+
+// ------------------------------------------------- the framework's own tools
+
+const SEARCH_CALL: &str =
+    "Let me check.\n<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust 2024 edition\"}}</tool_call>";
+
+/// A service offering the framework's tools whose model answers each round of
+/// a tools turn with the next of `replies`, recording its prompts.
+fn rounds(replies: &[&str]) -> (Arc<FakeChatService>, Arc<Mutex<Vec<String>>>) {
+    publish_models();
+    let prompts: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = prompts.clone();
+    let replies: Vec<String> = replies.iter().map(|r| r.to_string()).collect();
+    let svc = Arc::new(FakeChatService::with_stream(move |prompt, _| {
+        if !prompt.starts_with("<slp_tools>") {
+            return Box::new(vec![Ok(chunk("plain"))].into_iter());
+        }
+        let mut seen = seen.lock();
+        let reply = replies[seen.len().min(replies.len() - 1)].clone();
+        seen.push(prompt.to_string());
+        Box::new(vec![Ok(chunk(&reply))].into_iter())
+    }));
+    *svc.device.label.lock() = Some("ct-cloud".to_string());
+    *svc.device.native_tools.lock() = true;
+    *svc.framework_tools.lock() = web_tools::definitions();
+    (svc, prompts)
+}
+
+fn statuses(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e["object"] == "chat.status")
+        .filter_map(|e| e["message"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A turn from a client with no tools of its own.
+fn plain_turn() -> ChatCompletionRequest {
+    ChatCompletionRequest { tools: None, ..first_turn() }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_the_framework_runs_its_own_tool_and_the_turn_goes_on() {
+    let (svc, prompts) = rounds(&[SEARCH_CALL, "The 2024 edition is stable."]);
+    let events = run(plain_turn(), &svc).await;
+
+    // The call never reaches the client: it was run here, and the model
+    // answered with the result in the same response.
+    assert!(tool_calls(&events).is_empty(), "the framework's call is not the client's to run");
+    assert_eq!(finish(&events).as_deref(), Some("stop"));
+    assert_eq!(text(&events), "Let me check.\n\nThe 2024 edition is stable.");
+    assert_eq!(
+        svc.framework_tool_calls.lock().clone(),
+        vec![("web_search".to_string(), "{\"query\":\"rust 2024 edition\"}".to_string())]
+    );
+
+    // What it is doing is said as it happens.
+    let said = statuses(&events);
+    assert!(said.iter().any(|m| m == "Searching the web for \"rust 2024 edition\""), "{said:?}");
+    assert!(said.iter().any(|m| m == "Reading example.com"), "{said:?}");
+
+    // The second round carries the call and its result to the model.
+    let prompts = prompts.lock().clone();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("web_search") && prompts[0].contains("web_fetch"), "both tools are offered");
+    assert!(prompts[0].contains("WEB: You can search the web."), "and the model is told it can use them");
+    assert!(prompts[1].contains("result of web_search"), "{}", prompts[1]);
+
+    // One turn in the session: the user's message, then all the model said.
+    let writes = svc.session_writes.lock().clone();
+    assert_eq!(writes.iter().map(|w| w.1.as_str()).collect::<Vec<_>>(), vec!["user", "assistant"]);
+    assert_eq!(writes[1].2, "Let me check.\n\nThe 2024 edition is stable.");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_client_extends_the_frameworks_tools_with_its_own() {
+    // docent's `bash` rides beside the framework's tools; its call goes back
+    // to the client, as before.
+    let (svc, prompts) = rounds(&["<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}</tool_call>"]);
+    let events = run(first_turn(), &svc).await;
+
+    let prompt = prompts.lock()[0].clone();
+    assert!(prompt.contains("bash") && prompt.contains("web_search"), "the client's tool and the framework's");
+    let calls = tool_calls(&events);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "bash");
+    assert_eq!(finish(&events).as_deref(), Some("tool_calls"));
+    assert!(svc.framework_tool_calls.lock().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_client_that_sends_a_tool_of_the_same_name_runs_it_itself() {
+    let (svc, _) = rounds(&[SEARCH_CALL]);
+    let mut request = first_turn();
+    request.tools = Some(vec![json!({"type": "function", "function": {"name": "web_search", "parameters": {
+        "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}})]);
+    let events = run(request, &svc).await;
+
+    let calls = tool_calls(&events);
+    assert_eq!(calls.len(), 1, "the client's own web_search comes back to it");
+    assert_eq!(calls[0]["function"]["name"], "web_search");
+    assert_eq!(finish(&events).as_deref(), Some("tool_calls"));
+    assert!(svc.framework_tool_calls.lock().is_empty(), "the framework does not run a tool the client replaced");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_model_that_keeps_searching_is_told_to_answer() {
+    // It never stops calling: past the limit its calls are answered "not
+    // run", and the turn ends instead of going round forever.
+    let (svc, prompts) = rounds(&[SEARCH_CALL]);
+    let events = run(plain_turn(), &svc).await;
+
+    assert_eq!(finish(&events).as_deref(), Some("stop"));
+    assert_eq!(svc.framework_tool_calls.lock().len(), MAX_FRAMEWORK_TOOL_ROUNDS);
+    let prompts = prompts.lock().clone();
+    assert_eq!(prompts.len(), MAX_FRAMEWORK_TOOL_ROUNDS + 2);
+    assert!(prompts.last().unwrap().contains("web lookups are used up"));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_no_framework_tools_leaves_a_plain_turn_as_it_was() {
+    // A service with no tools of its own to offer: a client with none
+    // either gets the ordinary answer.
+    let (svc, prompts) = rounds(&["unused"]);
+    svc.framework_tools.lock().clear();
+    let events = run(plain_turn(), &svc).await;
+
+    assert_eq!(text(&events), "plain");
+    assert!(prompts.lock().is_empty(), "no tools turn was run");
 }

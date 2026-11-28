@@ -12,6 +12,7 @@ pub mod planner;
 pub mod prompt_agent;
 pub mod sanitize;
 pub mod web_search_agent;
+pub mod web_tools;
 
 pub use prompt_agent::{DocumentInput, PromptAgent, PromptResponse};
 pub use planner::Planner;
