@@ -110,6 +110,39 @@ pub fn offered(client: &[Value], framework: Vec<Value>) -> (Vec<Value>, Vec<Stri
     (tools, ours)
 }
 
+/// What the system prompt says of the framework's tools on offer (`ours`,
+/// the names it runs this turn), or `None` when it runs none.
+///
+/// The definitions alone don't do it: the system prompt has the model answer
+/// from what it knows, and a small model reads that as "I can't browse" and
+/// never looks at the tools.  So it is told outright that it can.
+pub fn guidance(ours: &[String]) -> Option<String> {
+    let has = |name: &str| ours.iter().any(|n| n == name);
+    let mut lines = Vec::new();
+    if has(WEB_SEARCH) {
+        lines.push(format!(
+            "WEB: You can search the web. For anything current (news, events, weather, prices, scores, schedules, \
+             releases, versions) or anything you aren't sure of, call the `{WEB_SEARCH}` tool before you answer, and \
+             answer from what it returns, citing the URLs. Never say you can't browse the internet or lack real-time \
+             access: search instead. Don't search for what the conversation or the provided data already answers."
+        ));
+    }
+    if has(WEB_FETCH) {
+        lines.push(format!("To read a page or PDF whose URL you have, call the `{WEB_FETCH}` tool."));
+    }
+    if lines.is_empty() { None } else { Some(lines.join(" ")) }
+}
+
+/// `prompt` (the flattened turn, opening with its `<system>` block) with the
+/// [`guidance`] for `ours` added to the end of that block.
+pub fn with_guidance(prompt: &str, ours: &[String]) -> String {
+    let Some(guidance) = guidance(ours) else { return prompt.to_string() };
+    match prompt.find("</system>") {
+        Some(at) => format!("{}\n{}{}", &prompt[..at], guidance, &prompt[at..]),
+        None => format!("<system>{guidance}</system>\n{prompt}"),
+    }
+}
+
 /// What to say a call is doing, for the client's progress line.
 pub fn describe(name: &str, arguments: &str) -> String {
     match name {
@@ -287,6 +320,19 @@ mod tests {
         let (tools, ours) = offered(&[], definitions());
         assert_eq!(tools.len(), 2);
         assert_eq!(ours.len(), 2);
+    }
+
+    #[test]
+    fn the_model_is_told_it_can_search() {
+        let both = vec![WEB_SEARCH.to_string(), WEB_FETCH.to_string()];
+        let prompt = with_guidance("<system>Be helpful.</system>\n<user>news?</user>", &both);
+        assert!(prompt.starts_with("<system>Be helpful.\nWEB: You can search the web."), "{prompt}");
+        assert!(prompt.contains("`web_fetch` tool.</system>\n<user>news?</user>"), "{prompt}");
+        // Only what the framework runs: a client that replaced the search says its own.
+        let fetch_only = guidance(&[WEB_FETCH.to_string()]).unwrap();
+        assert!(!fetch_only.contains("web_search") && fetch_only.contains("web_fetch"));
+        assert_eq!(guidance(&[]), None);
+        assert_eq!(with_guidance("<system>x</system>", &[]), "<system>x</system>");
     }
 
     #[test]

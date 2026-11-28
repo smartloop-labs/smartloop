@@ -2915,8 +2915,14 @@ fn stream_chunks_inner(
         // The calls the model makes of them are run here and the turn goes on;
         // only the client's own calls travel back to it.  A client that sends
         // a tool of the same name has replaced the framework's, and runs it.
+        // The request's own word on web search wins over the project's switch.
+        let framework_tools = match request.web_search {
+            Some(true) => web_tools::definitions(),
+            Some(false) => Vec::new(),
+            None => svc.framework_tools(),
+        };
         let (turn_tools, framework_tool_names) =
-            web_tools::offered(client_tools.as_deref().unwrap_or_default(), svc.framework_tools());
+            web_tools::offered(client_tools.as_deref().unwrap_or_default(), framework_tools);
         let turn_tools = Some(turn_tools).filter(|t| !t.is_empty());
         let continuing = !tool_rounds.is_empty();
 
@@ -3437,11 +3443,14 @@ fn stream_chunks_inner(
                 // write before it calls one of the framework's tools, and again
                 // once it has the result.
                 let mut said = String::new();
+                // The model is told it can search: offered the tools alone, a
+                // small one still answers that it can't browse.
+                let tools_prompt = web_tools::with_guidance(&prompt, &framework_tool_names);
                 // The text sent so far, to part one round's from the next.
                 let mut sent = String::new();
                 let mut framework_rounds = 0usize;
                 loop {
-                    let full = client_tool_prompt(&prompt, &tool_rounds, &tools);
+                    let full = client_tool_prompt(&tools_prompt, &tool_rounds, &tools);
                     let model = request.model.clone();
                     let client = client.clone();
                     // Streamed: the answer's text reaches the client as it's

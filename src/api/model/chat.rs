@@ -128,6 +128,12 @@ pub struct ChatCompletionRequest {
     /// OpenAI `tool_choice`; only `"auto"` is honoured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// Whether this turn offers the model the framework's web tools
+    /// (`web_search`, `web_fetch`), which the framework runs.  Left out, the
+    /// project's web search switch decides; a client with no such switch of
+    /// its own (docent, where search is always on) says `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<bool>,
 }
 
 impl Default for ChatCompletionRequest {
@@ -149,6 +155,7 @@ impl Default for ChatCompletionRequest {
             additional_message_params: None,
             tools: None,
             tool_choice: None,
+            web_search: None,
         }
     }
 }
